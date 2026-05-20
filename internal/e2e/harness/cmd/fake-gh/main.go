@@ -66,6 +66,11 @@ type pullRequestState struct {
 	Reviews           []map[string]any    `json:"reviews,omitempty"`
 	StatusCheckRollup []map[string]any    `json:"statusCheckRollup,omitempty"`
 	MergeStateStatus  string              `json:"mergeStateStatus,omitempty"`
+	Mergeable         *bool               `json:"mergeable,omitempty"`
+	MergeableState    string              `json:"mergeableState,omitempty"`
+	MergedAt          string              `json:"mergedAt,omitempty"`
+	AutoMerge         map[string]any      `json:"autoMerge,omitempty"`
+	CheckRuns         []map[string]any    `json:"checkRuns,omitempty"`
 	Threads           []reviewThreadState `json:"threads,omitempty"`
 }
 type reviewThreadState struct {
@@ -211,6 +216,12 @@ func handleAPI(mode string, st state, stdin string) error {
 			return err
 		}
 	}
+	if handled, err := handlePullRequestAPI(st, route); handled || err != nil {
+		return err
+	}
+	if handled, err := handleCheckRunsAPI(st, route); handled || err != nil {
+		return err
+	}
 	if strings.HasSuffix(route, "/comments") && strings.EqualFold(flagValue(args, "--method"), "POST") {
 		_, _ = fmt.Fprintln(os.Stdout, `{"id":1,"html_url":"https://example.test/issues/comments/1"}`)
 		return nil
@@ -238,6 +249,75 @@ func handleAPI(mode string, st state, stdin string) error {
 	_, _ = fmt.Fprintln(os.Stdout, `{"id":1,"number":1,"title":"fake issue"}`)
 	_ = stdin
 	return nil
+}
+
+func handlePullRequestAPI(st state, route string) (bool, error) {
+	const marker = "repos/"
+	if !strings.HasPrefix(route, marker) || !strings.Contains(route, "/pulls/") || strings.Contains(route, "/reviews") {
+		return false, nil
+	}
+	rest := strings.TrimPrefix(route, marker)
+	parts := strings.Split(rest, "/")
+	if len(parts) < 4 || parts[2] != "pulls" {
+		return false, nil
+	}
+	prNumber, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil {
+		return false, nil
+	}
+	pr, ok := lookupPullRequest(st, parts[0]+"/"+parts[1], prNumber)
+	if !ok {
+		return false, nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"number":          pr.Number,
+		"title":           pr.Title,
+		"body":            pr.Body,
+		"url":             pr.URL,
+		"html_url":        pr.URL,
+		"state":           strings.ToLower(pr.State),
+		"created_at":      pr.CreatedAt,
+		"updated_at":      pr.UpdatedAt,
+		"closed_at":       pr.ClosedAt,
+		"merged_at":       pr.MergedAt,
+		"labels":          pullRequestFieldValue(pr, "labels"),
+		"head":            map[string]any{"ref": pr.HeadRefName, "sha": pr.HeadSHA},
+		"base":            map[string]any{"ref": pr.BaseRefName, "sha": pr.BaseSHA},
+		"mergeable":       pr.Mergeable,
+		"mergeable_state": firstNonEmpty(pr.MergeableState, pr.MergeStateStatus),
+		"auto_merge":      pr.AutoMerge,
+	})
+	if err != nil {
+		return true, err
+	}
+	_, _ = fmt.Fprintln(os.Stdout, string(payload))
+	return true, nil
+}
+
+func handleCheckRunsAPI(st state, route string) (bool, error) {
+	const marker = "repos/"
+	if !strings.HasPrefix(route, marker) || !strings.Contains(route, "/commits/") || !strings.HasSuffix(route, "/check-runs") {
+		return false, nil
+	}
+	rest := strings.TrimPrefix(route, marker)
+	parts := strings.Split(rest, "/")
+	if len(parts) < 5 || parts[2] != "commits" {
+		return false, nil
+	}
+	repo := parts[0] + "/" + parts[1]
+	ref := parts[3]
+	for _, pr := range st.PullRequests {
+		candidate := hydratePullRequest(pr)
+		if candidate.Repo == repo && candidate.HeadSHA == ref {
+			payload, err := json.Marshal(map[string]any{"total_count": len(candidate.CheckRuns), "check_runs": candidate.CheckRuns})
+			if err != nil {
+				return true, err
+			}
+			_, _ = fmt.Fprintln(os.Stdout, string(payload))
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func handlePullRequestReviews(st *state, args []string, stdin string, route string) (bool, error) {
@@ -635,6 +715,9 @@ func hydratePullRequest(pr pullRequestState) pullRequestState {
 	if pr.MergeStateStatus == "" {
 		pr.MergeStateStatus = "CLEAN"
 	}
+	if pr.MergeableState == "" {
+		pr.MergeableState = strings.ToLower(pr.MergeStateStatus)
+	}
 	if pr.UpdatedAt == "" {
 		pr.UpdatedAt = "2026-05-12T00:00:00Z"
 	}
@@ -698,6 +781,14 @@ func pullRequestFieldValue(pr pullRequestState, field string) any {
 		return pr.StatusCheckRollup
 	case "mergeStateStatus":
 		return pr.MergeStateStatus
+	case "mergeable":
+		return pr.Mergeable
+	case "mergeable_state":
+		return pr.MergeableState
+	case "merged_at":
+		return pr.MergedAt
+	case "auto_merge":
+		return pr.AutoMerge
 	default:
 		return defaultValue(field)
 	}

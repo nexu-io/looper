@@ -26,6 +26,7 @@ const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
 const triageCommentMarker = "<!-- looper:coordinator:triage -->"
 const dispatchFailureCommentMarker = "<!-- looper:coordinator:dispatch-failure -->"
 const cycleCommentMarker = "<!-- looper:coordinator:cycle -->"
+const mergeWatchCommentMarkerPrefix = "<!-- looper:coordinator:merge-watch"
 
 type DiscoveryInput struct {
 	ProjectID string
@@ -67,6 +68,11 @@ type GitHubGateway interface {
 	RemoveIssueLabels(context.Context, githubinfra.IssueLabelsInput) error
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
+	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
+	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
+	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
+	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
 }
 
 type RepositoryInspector interface {
@@ -96,12 +102,14 @@ type Runner struct {
 
 	mu                sync.Mutex
 	lastTickByProject map[string]time.Time
+	watchLocks        map[string]*sync.Mutex
 }
 
 type loadedIssue struct {
-	summary githubinfra.IssueSummary
-	detail  githubinfra.IssueDetail
-	issue   triage.Issue
+	summary     githubinfra.IssueSummary
+	detail      githubinfra.IssueDetail
+	issue       triage.Issue
+	rawTimeline []map[string]any
 }
 
 type dependencyState struct {
@@ -139,6 +147,7 @@ func New(options Options) *Runner {
 		inspector:         inspector,
 		disclosure:        options.Disclosure,
 		lastTickByProject: map[string]time.Time{},
+		watchLocks:        map[string]*sync.Mutex{},
 	}
 }
 
@@ -177,20 +186,28 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		loaded = append(loaded, issue)
 	}
+	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.Repo, project.RepoPath, loaded, config.ProjectRoleConfigs(*r.config, input.ProjectID))
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	activeLoaded := filterLoadedIssues(loaded, mergeWatchRetriggers)
 
-	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, roleCfg.Dependencies)
+	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, roleCfg.Dependencies)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	if err := r.applyDependencyActions(ctx, input.Repo, project.RepoPath, triageCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
-	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, deps); err != nil {
+	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
 
 	processed := 0
 	for _, loadedIssue := range loaded {
+		if _, skip := mergeWatchRetriggers[loadedIssue.issue.Number]; skip {
+			continue
+		}
 		if _, skip := deps.retriageIssueNumbers[loadedIssue.issue.Number]; skip {
 			continue
 		}
@@ -217,6 +234,20 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 	return DiscoveryResult{Ticked: true}, nil
+}
+
+func filterLoadedIssues(loaded []loadedIssue, skipped map[int64]struct{}) []loadedIssue {
+	if len(skipped) == 0 {
+		return loaded
+	}
+	filtered := make([]loadedIssue, 0, len(loaded))
+	for _, item := range loaded {
+		if _, skip := skipped[item.issue.Number]; skip {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func (r *Runner) buildDispatchDependencyGraph(ctx context.Context, repo, cwd string, depsCfg config.CoordinatorDependenciesConfig, dispatchCfg dispatch.Config, loaded []loadedCoordinatorIssue, now time.Time) (*depgraph.DependencyGraph, error) {
@@ -843,7 +874,7 @@ func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, summary github
 	for _, event := range timeline {
 		issue.Timeline = append(issue.Timeline, triage.TimelineEvent{Event: strings.TrimSpace(asString(event["event"])), CreatedAt: firstNonEmpty(asString(event["created_at"]), asString(event["createdAt"])), Label: timelineLabelName(event)})
 	}
-	return loadedIssue{summary: summary, detail: detail, issue: issue}, nil
+	return loadedIssue{summary: summary, detail: detail, issue: issue, rawTimeline: append([]map[string]any(nil), timeline...)}, nil
 }
 
 func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles config.RoleConfigs) dispatch.Config {

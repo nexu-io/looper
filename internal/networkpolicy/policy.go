@@ -99,7 +99,7 @@ func evaluateTarget(policy ProjectPolicy, labels []string) ClaimDecision {
 		return ClaimDecision{Reason: "multiple looper:target:<node_name> labels present", MatchMode: MatchModeNone}
 	}
 	targetLabel := targetLabels[0]
-	targetNode := strings.TrimPrefix(targetLabel, targetPrefix)
+	targetNode := trimTargetPrefix(targetLabel)
 	if !strings.EqualFold(strings.TrimSpace(targetNode), strings.TrimSpace(policy.NodeName)) {
 		return ClaimDecision{Reason: fmt.Sprintf("target label %s does not match local node %s", targetLabel, strings.TrimSpace(policy.NodeName)), MatchMode: MatchModeNone, TargetLabel: targetLabel}
 	}
@@ -115,6 +115,17 @@ func collectTargetLabels(labels []string) []string {
 		}
 	}
 	return result
+}
+
+func trimTargetPrefix(label string) string {
+	trimmed := strings.TrimSpace(label)
+	if len(trimmed) < len(targetPrefix) {
+		return trimmed
+	}
+	if strings.EqualFold(trimmed[:len(targetPrefix)], targetPrefix) {
+		return trimmed[len(targetPrefix):]
+	}
+	return trimmed
 }
 
 func matchLocalIdentity(policy ProjectPolicy, users []GitHubUser) (bool, MatchMode) {

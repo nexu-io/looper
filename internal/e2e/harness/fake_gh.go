@@ -79,6 +79,11 @@ type GHPullRequest struct {
 	Reviews           []map[string]any `json:"reviews,omitempty"`
 	StatusCheckRollup []map[string]any `json:"statusCheckRollup,omitempty"`
 	MergeStateStatus  string           `json:"mergeStateStatus,omitempty"`
+	Mergeable         *bool            `json:"mergeable,omitempty"`
+	MergeableState    string           `json:"mergeableState,omitempty"`
+	MergedAt          string           `json:"mergedAt,omitempty"`
+	AutoMerge         map[string]any   `json:"autoMerge,omitempty"`
+	CheckRuns         []map[string]any `json:"checkRuns,omitempty"`
 	Threads           []GHThread       `json:"threads,omitempty"`
 }
 
