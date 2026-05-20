@@ -550,6 +550,9 @@ func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Actio
 	if len(intersectExactLabels(action.TriggerLabels, desired)) > 0 {
 		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
 	}
+	if hasExactLabel(issue.Labels, dispatch.DispatchPlan) {
+		return workerAdmissionIntent{}
+	}
 	if len(intersectExactLabels(issue.Labels, desired)) > 0 {
 		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
 	}
@@ -1569,10 +1572,10 @@ func removeExistingLabels(labels []string, existing []string) []string {
 }
 
 func nonExactTargetLabels(labels []string, keep string) []string {
-	prefix := protocol.TargetLabelForNode("")
+	prefix := strings.ToLower(protocol.TargetLabelForNode(""))
 	out := []string{}
 	for _, label := range labels {
-		if !strings.HasPrefix(label, prefix) || label == keep {
+		if !strings.HasPrefix(strings.ToLower(label), prefix) || strings.EqualFold(label, keep) {
 			continue
 		}
 		out = append(out, label)
