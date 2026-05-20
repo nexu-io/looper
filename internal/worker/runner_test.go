@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -72,6 +73,22 @@ func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
 	}
 	if loop == nil || loop.Type != "worker" || loop.TargetType != "issue" || loop.TargetID == nil || *loop.TargetID != "issue:acme/looper:46" {
 		t.Fatalf("loop = %#v, want worker issue loop for issue 46", loop)
+	}
+}
+
+func TestDiscoverIssuesRoutedModeRequiresMatchingTargetLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"worker"}, AssigneeUsers: []networkpolicy.GitHubUser{{Login: "worker", ID: 42}}, Labels: []string{"looper:worker-ready", "looper:target:blue"}}}}
+	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "worker", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want routed mismatch skipped", result)
 	}
 }
 

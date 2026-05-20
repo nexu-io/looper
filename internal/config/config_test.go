@@ -2022,6 +2022,7 @@ func TestNoCustomInstructionsCLIOverrideAcceptsExplicitFalse(t *testing.T) {
 func TestLoadFileUsesDefaultConfigPathWhenUnset(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)

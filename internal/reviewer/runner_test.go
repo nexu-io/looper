@@ -16,6 +16,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
@@ -83,6 +84,36 @@ func TestDiscoverPullRequestSkipsIneligiblePullRequest(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
 		t.Fatalf("result = %#v, want skipped targeted discovery with no loop", result)
+	}
+}
+
+func TestDiscoverPullRequestRoutedModeRequiresMatchingTargetLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "reviewer", reviewRequests: []string{"reviewer"}, labels: []string{"looper:target:blue"}}
+	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequest() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want routed mismatch skipped", result)
+	}
+}
+
+func TestRunFilterStepSkipsRoutedPullRequestWhenReviewRequestRemoved(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "routed_claim_ineligible" {
+		t.Fatalf("checkpoint = %#v, want routed_claim_ineligible skip", checkpoint)
 	}
 }
 
@@ -7311,7 +7342,11 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 		headSHA = "abc123"
 	}
 	author := g.effectiveAuthor()
-	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, Author: author, ReviewRequests: reviewRequests, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", Author: author, ReviewRequests: reviewRequests}}, nil
+	users := make([]networkpolicy.GitHubUser, 0, len(reviewRequests))
+	for _, login := range reviewRequests {
+		users = append(users, networkpolicy.GitHubUser{Login: login})
+	}
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, Author: author, ReviewRequests: reviewRequests, ReviewRequestUsers: users, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", Author: author, ReviewRequests: reviewRequests, ReviewRequestUsers: users}}, nil
 }
 
 func (g *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
@@ -7366,7 +7401,11 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	if diff == "" {
 		diff = "diff --git a/a.ts b/a.ts"
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+	users := make([]networkpolicy.GitHubUser, 0, len(reviewRequests))
+	for _, login := range reviewRequests {
+		users = append(users, networkpolicy.GitHubUser{Login: login})
+	}
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
 }
 
 func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {

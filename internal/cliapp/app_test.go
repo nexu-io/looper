@@ -2206,6 +2206,7 @@ func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2398,6 +2399,7 @@ func TestConfigMigrateForceOverwritesExistingDestinationAndCreatesBackup(t *test
 func TestConfigMigrateDefaultPathCreatesCanonicalTOMLAndPreservesLegacyJSON(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2446,6 +2448,7 @@ func TestConfigMigrateRejectsPositionalArguments(t *testing.T) {
 func TestConfigMigrateDefaultPathFailsClearlyWhenCanonicalDefaultAlreadyExists(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
