@@ -337,7 +337,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					}
 					return &restored, nil
 				}
-				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch)
+				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch, input.ExpectedWorktreePath)
 				if err != nil {
 					return nil, err
 				}
@@ -834,7 +834,7 @@ func (g *Gateway) matchesRestoreCheckoutMode(ctx context.Context, worktreePath s
 	return currentBranch == branch, nil
 }
 
-func (g *Gateway) shouldReplaceStoredWorktreeOnRestoreMismatch(ctx context.Context, worktreePath string, checkoutMode CheckoutMode, branch string) (bool, error) {
+func (g *Gateway) shouldReplaceStoredWorktreeOnRestoreMismatch(ctx context.Context, worktreePath string, checkoutMode CheckoutMode, branch, expectedWorktreePath string) (bool, error) {
 	if checkoutMode == CheckoutModeDetached {
 		return false, nil
 	}
@@ -844,7 +844,7 @@ func (g *Gateway) shouldReplaceStoredWorktreeOnRestoreMismatch(ctx context.Conte
 		return false, err
 	}
 	if currentBranch == "" {
-		return false, nil
+		return normalizeComparablePath(worktreePath) == normalizeComparablePath(expectedWorktreePath), nil
 	}
 	return currentBranch != branch, nil
 }
