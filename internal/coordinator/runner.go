@@ -601,6 +601,12 @@ func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cw
 		return err
 	}
 	exactTarget := protocol.TargetLabelForNode(selected.NodeName)
+	labelsToRemove := nonExactTargetLabels(issue.Labels, exactTarget)
+	if len(labelsToRemove) > 0 {
+		if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToRemove, CWD: cwd}); err != nil {
+			return err
+		}
+	}
 	if !hasExactLabel(issue.Labels, exactTarget) {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{exactTarget}, CWD: cwd}); err != nil {
 			return err
@@ -1540,6 +1546,18 @@ func removeExistingLabels(labels []string, existing []string) []string {
 		if !hasExactLabel(existing, label) {
 			out = append(out, label)
 		}
+	}
+	return out
+}
+
+func nonExactTargetLabels(labels []string, keep string) []string {
+	prefix := protocol.TargetLabelForNode("")
+	out := []string{}
+	for _, label := range labels {
+		if !strings.HasPrefix(label, prefix) || label == keep {
+			continue
+		}
+		out = append(out, label)
 	}
 	return out
 }

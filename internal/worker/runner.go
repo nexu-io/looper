@@ -3338,10 +3338,7 @@ func safeIssueQueryLabel(labels []string) string {
 
 func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy, requiredTargetLabel string) ([]IssueSummary, error) {
 	if strings.TrimSpace(requiredTargetLabel) != "" {
-		queryInput := input
-		queryInput.Label = requiredTargetLabel
-		queryInput.Labels = []string{requiredTargetLabel}
-		return r.github.ListOpenIssues(ctx, queryInput)
+		return r.listOpenIssuesForTargetedDiscovery(ctx, input, policy, requiredTargetLabel)
 	}
 	if policy.LabelMode != config.LabelModeAny {
 		input.Labels = uniqueNonEmptyLabels(policy.Labels)
@@ -3356,6 +3353,38 @@ func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenI
 	for _, label := range queryLabels {
 		queryInput := input
 		queryInput.Label = label
+		issues, err := r.github.ListOpenIssues(ctx, queryInput)
+		if err != nil {
+			return nil, err
+		}
+		issuePages = append(issuePages, issues)
+	}
+	return mergeIssuePages(issuePages, effectiveIssueLimit(input.Limit)), nil
+}
+
+func (r *Runner) listOpenIssuesForTargetedDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy, requiredTargetLabel string) ([]IssueSummary, error) {
+	targetLabel := strings.TrimSpace(requiredTargetLabel)
+	if targetLabel == "" {
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	queryLabels := uniqueNonEmptyLabels(policy.Labels)
+	if len(queryLabels) == 0 {
+		queryInput := input
+		queryInput.Labels = []string{targetLabel}
+		queryInput.Label = targetLabel
+		return r.github.ListOpenIssues(ctx, queryInput)
+	}
+	if policy.LabelMode != config.LabelModeAny {
+		queryInput := input
+		queryInput.Labels = append([]string{targetLabel}, queryLabels...)
+		queryInput.Label = safeIssueQueryLabel(queryInput.Labels)
+		return r.github.ListOpenIssues(ctx, queryInput)
+	}
+	issuePages := make([][]IssueSummary, 0, len(queryLabels))
+	for _, label := range queryLabels {
+		queryInput := input
+		queryInput.Labels = []string{targetLabel, label}
+		queryInput.Label = safeIssueQueryLabel(queryInput.Labels)
 		issues, err := r.github.ListOpenIssues(ctx, queryInput)
 		if err != nil {
 			return nil, err

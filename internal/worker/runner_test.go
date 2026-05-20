@@ -213,6 +213,40 @@ func TestDiscoverIssuesQueriesEachServerSideLabelWhenConfiguredWithAnyLabelMode(
 	}
 }
 
+func TestDiscoverIssuesRoutedProjectCombinesTargetLabelWithAnyTriggerQueries(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}
+	fixture.cfg.Network = config.NetworkConfig{NodeName: "worker-1", GitHubLogin: "octocat"}
+	fixture.cfg.Roles.Worker.AutoDiscovery = true
+	fixture.cfg.Roles.Worker.Triggers.Labels = []string{"team:alpha", "team:beta"}
+	fixture.cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAny
+	github := &fakeGitHubGateway{
+		currentLogin: "octocat",
+		issues: []IssueSummary{{
+			Number:        47,
+			Title:         "Targeted",
+			Labels:        []string{"team:beta", "looper:worker-ready", protocol.TargetLabelForNode("worker-1")},
+			AssigneeUsers: []networkpolicy.GitHubUser{{Login: "octocat"}},
+		}},
+	}
+	network := &stubWorkerNetwork{status: protocol.NodeStatusResponse{Membership: protocol.Membership{NodeName: "worker-1"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg, Network: network})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listIssueCalls) != 2 {
+		t.Fatalf("listIssueCalls = %#v, want two routed label queries", github.listIssueCalls)
+	}
+	for i, want := range []string{"team:alpha", "team:beta"} {
+		got := github.listIssueCalls[i].Labels
+		if len(got) != 2 || got[0] != protocol.TargetLabelForNode("worker-1") || got[1] != want {
+			t.Fatalf("listIssueCalls[%d].Labels = %#v, want target + %q", i, got, want)
+		}
+	}
+}
+
 func TestDiscoverIssuesPreservesExistingWorkerMetadataOnRediscovery(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

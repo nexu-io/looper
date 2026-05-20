@@ -467,6 +467,34 @@ func TestRunnerRoutedImplementAdmissionRepairsHumanWorkerReadyIntent(t *testing.
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:worker-bot", "add:looper:target:worker-1"})
 }
 
+func TestRunnerRoutedImplementAdmissionRetargetsIssueToSingleWorker(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
+		Memberships: []protocol.Membership{
+			{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}, Capabilities: protocol.NodeCapabilities{Roles: []string{"coordinator"}}},
+			{NodeID: "worker-1", NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "worker-bot"}, TargetLabels: []string{protocol.TargetLabelForNode("worker-1")}, Capabilities: protocol.NodeCapabilities{Roles: []string{"worker"}, DynamicLoad: 1}, LastHeartbeatAt: timePtr(fixture.now)},
+			{NodeID: "worker-2", NodeName: "worker-2", GitHub: protocol.GitHubIdentity{NumericID: 102, Login: "worker-bot-2"}, TargetLabels: []string{protocol.TargetLabelForNode("worker-2")}, Capabilities: protocol.NodeCapabilities{Roles: []string{"worker"}, DynamicLoad: 2}, LastHeartbeatAt: timePtr(fixture.now)},
+		},
+		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 8, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 5, Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-2")}}}
+	fixture.github.details[5] = githubinfra.IssueDetail{Number: 5, Title: "Retarget me", Author: "octo", URL: "https://github.com/acme/looper/issues/5", CreatedAt: fixture.now.Add(-2 * time.Hour).Format(time.RFC3339), Labels: []string{"looper:worker-ready", protocol.TargetLabelForNode("worker-2")}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertOrderedOps(t, fixture.github.ops, []string{"assign:worker-bot", "remove:looper:target:worker-2", "add:looper:target:worker-1"})
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 5, protocol.TargetLabelForNode("worker-2")); got != 1 {
+		t.Fatalf("removed target label count = %d, want 1", got)
+	}
+}
+
 func TestRunnerRoutedImplementAdmissionSkipsDuplicateIdentityWorkers(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)
