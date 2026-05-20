@@ -610,14 +610,18 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 		reviewerLabels    []string
 		fixerLabels       []string
 		prLabels          []string
+		reviewRequests    []string
+		prComments        []map[string]any
 		wantAssigned      []int64
 	}{
 		{name: "pool has slack without downstream pending", maxConcurrentRuns: 3, running: 1, readyIssues: []int64{1, 2, 3}, wantAssigned: []int64{1, 2}},
 		{name: "pool would saturate without downstream pending", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, wantAssigned: []int64{1}},
-		{name: "pool would saturate with pending reviewer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", wantAssigned: nil},
-		{name: "pool would saturate with pending fixer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", wantAssigned: nil},
-		{name: "pool would saturate with pending reviewer work without label filters", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{}, prLabels: []string{}, wantAssigned: nil},
-		{name: "pool would saturate with pending fixer work without label filters", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", fixerLabels: []string{}, prLabels: []string{}, wantAssigned: nil},
+		{name: "pool would saturate with pending reviewer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewRequests: []string{"looper"}, wantAssigned: nil},
+		{name: "pool would saturate with pending fixer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", prComments: []map[string]any{{"id": "comment-1", "threadId": "thread-1", "body": "fix this"}}, wantAssigned: nil},
+		{name: "pool would saturate without reviewer request even without label filters", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{}, prLabels: []string{}, wantAssigned: []int64{1}},
+		{name: "pool would saturate without actionable fixer work even without label filters", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", fixerLabels: []string{}, prLabels: []string{}, wantAssigned: []int64{1}},
+		{name: "pool would saturate with pending reviewer work without label filters when requested", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{}, prLabels: []string{}, reviewRequests: []string{"looper"}, wantAssigned: nil},
+		{name: "pool would saturate with pending fixer work without label filters when actionable", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", fixerLabels: []string{}, prLabels: []string{}, prComments: []map[string]any{{"id": "comment-1", "threadId": "thread-1", "body": "fix this"}}, wantAssigned: nil},
 		{name: "pool has slack with pending reviewer work", maxConcurrentRuns: 4, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", wantAssigned: []int64{1, 2}},
 	}
 
@@ -653,7 +657,7 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 				if tc.prLabels != nil {
 					labels = tc.prLabels
 				}
-				fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: labels}
+				fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: labels, ReviewRequests: tc.reviewRequests, Comments: tc.prComments}
 			}
 			seedRunningQueueItems(t, fixture, tc.running)
 
@@ -677,7 +681,7 @@ func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
 	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
 	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/implement"})
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
-	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: []string{"looper:review"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: []string{"looper:review"}, ReviewRequests: []string{"looper"}}
 	seedRunningQueueItems(t, fixture, 1)
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {

@@ -761,12 +761,15 @@ func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, repo, cwd st
 	if r == nil || r.config == nil || r.repos == nil || r.github == nil {
 		return false, nil
 	}
+	reviewerConfig := r.config.Roles.Reviewer.Discovery.Triggers
 	reviewerLabels := downstreamLabels.reviewer
 	fixerLabels := downstreamLabels.fixer
 	active, err := r.activeQueueItemsByPR(ctx)
 	if err != nil {
 		return false, err
 	}
+	currentLogin := ""
+	loadedCurrentLogin := false
 	for _, issue := range loaded {
 		prs, err := r.github.ListLinkedPullRequests(ctx, githubinfra.LinkedPullRequestsInput{Repo: repo, IssueNumber: issue.issue.Number, CWD: cwd})
 		if err != nil {
@@ -781,17 +784,58 @@ func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, repo, cwd st
 				return false, err
 			}
 			prKey := queuePullRequestKey(repo, pr.Number)
-			reviewerPending := len(reviewerLabels) == 0 || labelsMatch(detail.Labels, reviewerLabels, downstreamLabels.reviewerMode)
-			if reviewerPending && !active["reviewer"][prKey] {
-				return true, nil
+			if !active["reviewer"][prKey] {
+				if !loadedCurrentLogin && (reviewerConfig.RequireReviewRequest || !reviewerConfig.EnableSelfReview) {
+					lookupLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+					if err != nil {
+						return false, err
+					}
+					currentLogin = normalizeLogin(lookupLogin)
+					loadedCurrentLogin = true
+				}
+				if reviewerWorkPending(detail, currentLogin, reviewerConfig, reviewerLabels, downstreamLabels.reviewerMode) {
+					return true, nil
+				}
 			}
-			fixerPending := len(fixerLabels) == 0 || labelsMatch(detail.Labels, fixerLabels, downstreamLabels.fixerMode)
-			if fixerPending && !active["fixer"][prKey] {
+			if !active["fixer"][prKey] && fixerWorkPending(detail, fixerLabels, downstreamLabels.fixerMode) {
 				return true, nil
 			}
 		}
 	}
 	return false, nil
+}
+
+func reviewerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.ReviewerRoleTriggersConfig, requiredLabels []string, labelMode config.LabelMode) bool {
+	if !trigger.IncludeDrafts && detail.IsDraft {
+		return false
+	}
+	if !trigger.EnableSelfReview && normalizeLogin(detail.Author) != "" && normalizeLogin(detail.Author) == normalizeLogin(currentLogin) {
+		return false
+	}
+	if trigger.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		return false
+	}
+	return labelsMatch(detail.Labels, requiredLabels, labelMode)
+}
+
+func fixerWorkPending(detail githubinfra.PullRequestDetail, requiredLabels []string, labelMode config.LabelMode) bool {
+	if !labelsMatch(detail.Labels, requiredLabels, labelMode) {
+		return false
+	}
+	if detail.HasConflicts {
+		return true
+	}
+	for _, comment := range detail.Comments {
+		if !commentResolved(comment) {
+			return true
+		}
+	}
+	for _, check := range detail.Checks {
+		if failingCheck(check) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) activeQueueItemsByPR(ctx context.Context) (map[string]map[string]bool, error) {
@@ -823,7 +867,10 @@ func queuePullRequestKey(repo string, prNumber int64) string {
 }
 
 func labelsMatch(labels, expected []string, mode config.LabelMode) bool {
-	if len(labels) == 0 || len(expected) == 0 {
+	if len(expected) == 0 {
+		return true
+	}
+	if len(labels) == 0 {
 		return false
 	}
 	available := make(map[string]struct{}, len(labels))
@@ -844,6 +891,46 @@ func labelsMatch(labels, expected []string, mode config.LabelMode) bool {
 		return matches == len(expected)
 	}
 	return matches > 0
+}
+
+func normalizeLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(login))
+}
+
+func isCurrentUserRequested(requested []string, currentLogin string) bool {
+	currentLogin = normalizeLogin(currentLogin)
+	if currentLogin == "" {
+		return false
+	}
+	for _, login := range requested {
+		if normalizeLogin(login) == currentLogin {
+			return true
+		}
+	}
+	return false
+}
+
+func commentResolved(comment map[string]any) bool {
+	if state, ok := comment["state"].(string); ok && strings.EqualFold(strings.TrimSpace(state), "resolved") {
+		return true
+	}
+	if resolved, ok := comment["isResolved"].(bool); ok && resolved {
+		return true
+	}
+	return false
+}
+
+func failingCheck(check map[string]any) bool {
+	state, _ := check["conclusion"].(string)
+	if strings.TrimSpace(state) == "" {
+		state, _ = check["state"].(string)
+	}
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyHumanDependencyGate(action dispatch.Action, issueNumber int64, deps dependencyState) dispatch.Action {
