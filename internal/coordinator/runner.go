@@ -219,7 +219,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err := r.applyDependencyActions(ctx, input.Repo, project.RepoPath, triageCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
-	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps, downstreamLabels); err != nil {
+	if err := r.applyDispatches(ctx, input.ProjectID, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps, downstreamLabels); err != nil {
 		return DiscoveryResult{}, err
 	}
 
@@ -629,9 +629,9 @@ func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, t
 	return nil
 }
 
-func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
+func (r *Runner) applyDispatches(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
 	if dispatchCfg.Mode == dispatch.ModeAutonomous {
-		return r.applyAutonomousDispatches(ctx, repo, cwd, loaded, triageCfg, dispatchCfg, deps, downstreamLabels)
+		return r.applyAutonomousDispatches(ctx, projectID, repo, cwd, loaded, triageCfg, dispatchCfg, deps, downstreamLabels)
 	}
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -652,7 +652,7 @@ func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded [
 	return nil
 }
 
-func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
+func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
 	ready := make([]autonomousDispatchCandidate, 0, len(loaded))
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -677,7 +677,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string
 		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: labelsMatch(action.TriggerLabels, downstreamLabels.worker, downstreamLabels.workerMode)})
 	}
 	sortAutonomousDispatchCandidates(ready)
-	budget, err := r.dispatchBudget(ctx, repo, cwd, loaded, ready, downstreamLabels)
+	budget, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
 	if err != nil {
 		return err
 	}
@@ -713,7 +713,7 @@ func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) 
 	})
 }
 
-func (r *Runner) dispatchBudget(ctx context.Context, repo, cwd string, loaded []loadedIssue, ready []autonomousDispatchCandidate, downstreamLabels downstreamTriggerLabels) (int, error) {
+func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, ready []autonomousDispatchCandidate, downstreamLabels downstreamTriggerLabels) (int, error) {
 	if r == nil || r.config == nil || r.config.Scheduler.MaxConcurrentRuns <= 0 {
 		return int(^uint(0) >> 1), nil
 	}
@@ -735,7 +735,7 @@ func (r *Runner) dispatchBudget(ctx context.Context, repo, cwd string, loaded []
 		return 0, nil
 	}
 	if running+readyWorkers >= maxConcurrentRuns {
-		pending, err := r.hasPendingReviewerOrFixerWork(ctx, repo, cwd, loaded, downstreamLabels)
+		pending, err := r.hasPendingReviewerOrFixerWork(ctx, projectID, repo, cwd, loaded, downstreamLabels)
 		if err != nil {
 			return 0, err
 		}
@@ -757,11 +757,13 @@ func (r *Runner) runningQueueItems(ctx context.Context) (int, error) {
 	return int(count), nil
 }
 
-func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, repo, cwd string, loaded []loadedIssue, downstreamLabels downstreamTriggerLabels) (bool, error) {
+func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, downstreamLabels downstreamTriggerLabels) (bool, error) {
 	if r == nil || r.config == nil || r.repos == nil || r.github == nil {
 		return false, nil
 	}
-	reviewerConfig := r.config.Roles.Reviewer.Discovery.Triggers
+	roles := config.ProjectRoleConfigs(*r.config, projectID)
+	reviewerConfig := roles.Reviewer.Discovery.Triggers
+	fixerConfig := roles.Fixer.Triggers
 	reviewerLabels := downstreamLabels.reviewer
 	fixerLabels := downstreamLabels.fixer
 	active, err := r.activeQueueItemsByPR(ctx)
@@ -784,20 +786,20 @@ func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, repo, cwd st
 				return false, err
 			}
 			prKey := queuePullRequestKey(repo, pr.Number)
-			if !active["reviewer"][prKey] {
-				if !loadedCurrentLogin && (reviewerConfig.RequireReviewRequest || !reviewerConfig.EnableSelfReview) {
-					lookupLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
-					if err != nil {
-						return false, err
-					}
-					currentLogin = normalizeLogin(lookupLogin)
-					loadedCurrentLogin = true
+			if !loadedCurrentLogin && (reviewerConfig.RequireReviewRequest || !reviewerConfig.EnableSelfReview || fixerConfig.AuthorFilter != config.FixerAuthorFilterAny) {
+				lookupLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+				if err != nil {
+					return false, err
 				}
+				currentLogin = normalizeLogin(lookupLogin)
+				loadedCurrentLogin = true
+			}
+			if !active["reviewer"][prKey] {
 				if reviewerWorkPending(detail, currentLogin, reviewerConfig, reviewerLabels, downstreamLabels.reviewerMode) {
 					return true, nil
 				}
 			}
-			if !active["fixer"][prKey] && fixerWorkPending(detail, fixerLabels, downstreamLabels.fixerMode) {
+			if !active["fixer"][prKey] && fixerWorkPending(detail, currentLogin, fixerConfig, fixerLabels, downstreamLabels.fixerMode) {
 				return true, nil
 			}
 		}
@@ -818,7 +820,13 @@ func reviewerWorkPending(detail githubinfra.PullRequestDetail, currentLogin stri
 	return labelsMatch(detail.Labels, requiredLabels, labelMode)
 }
 
-func fixerWorkPending(detail githubinfra.PullRequestDetail, requiredLabels []string, labelMode config.LabelMode) bool {
+func fixerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.FixerRoleTriggersConfig, requiredLabels []string, labelMode config.LabelMode) bool {
+	if !trigger.IncludeDrafts && detail.IsDraft {
+		return false
+	}
+	if trigger.AuthorFilter != config.FixerAuthorFilterAny && normalizeLogin(detail.Author) != "" && normalizeLogin(detail.Author) != normalizeLogin(currentLogin) {
+		return false
+	}
 	if !labelsMatch(detail.Labels, requiredLabels, labelMode) {
 		return false
 	}

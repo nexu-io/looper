@@ -610,18 +610,24 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 		reviewerLabels    []string
 		fixerLabels       []string
 		prLabels          []string
+		prAuthor          string
+		prIsDraft         bool
 		reviewRequests    []string
 		prComments        []map[string]any
+		currentLogin      string
+		projectRoles      *config.PartialRoleConfigs
 		wantAssigned      []int64
 	}{
 		{name: "pool has slack without downstream pending", maxConcurrentRuns: 3, running: 1, readyIssues: []int64{1, 2, 3}, wantAssigned: []int64{1, 2}},
 		{name: "pool would saturate without downstream pending", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, wantAssigned: []int64{1}},
 		{name: "pool would saturate with pending reviewer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewRequests: []string{"looper"}, wantAssigned: nil},
 		{name: "pool would saturate with pending fixer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", prComments: []map[string]any{{"id": "comment-1", "threadId": "thread-1", "body": "fix this"}}, wantAssigned: nil},
+		{name: "pool would saturate with project reviewer override", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", prAuthor: "octocat", currentLogin: "looper", projectRoles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{RequireReviewRequest: boolPtr(false)}}}}, wantAssigned: nil},
 		{name: "pool would saturate without reviewer request even without label filters", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{}, prLabels: []string{}, wantAssigned: []int64{1}},
 		{name: "pool would saturate without actionable fixer work even without label filters", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", fixerLabels: []string{}, prLabels: []string{}, wantAssigned: []int64{1}},
 		{name: "pool would saturate with pending reviewer work without label filters when requested", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{}, prLabels: []string{}, reviewRequests: []string{"looper"}, wantAssigned: nil},
 		{name: "pool would saturate with pending fixer work without label filters when actionable", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", fixerLabels: []string{}, prLabels: []string{}, prComments: []map[string]any{{"id": "comment-1", "threadId": "thread-1", "body": "fix this"}}, wantAssigned: nil},
+		{name: "pool ignores fixer work for draft from another author", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", prAuthor: "octocat", prIsDraft: true, currentLogin: "looper", prComments: []map[string]any{{"id": "comment-1", "threadId": "thread-1", "body": "fix this"}}, wantAssigned: []int64{1}},
 		{name: "pool has slack with pending reviewer work", maxConcurrentRuns: 4, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", wantAssigned: []int64{1, 2}},
 	}
 
@@ -645,6 +651,12 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 				fixerLabels = []string{"looper:fix"}
 			}
 			fixture.runner.config.Roles.Fixer.Triggers.Labels = fixerLabels
+			if tc.currentLogin != "" {
+				fixture.github.currentLogin = tc.currentLogin
+			}
+			if tc.projectRoles != nil {
+				fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Roles: tc.projectRoles}}
+			}
 			for _, issueNumber := range tc.readyIssues {
 				seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
 			}
@@ -657,7 +669,14 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 				if tc.prLabels != nil {
 					labels = tc.prLabels
 				}
-				fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: labels, ReviewRequests: tc.reviewRequests, Comments: tc.prComments}
+				author := tc.prAuthor
+				if author == "" {
+					author = "looper"
+					if tc.downstreamType == "reviewer" {
+						author = "octocat"
+					}
+				}
+				fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: author, IsDraft: tc.prIsDraft, Labels: labels, ReviewRequests: tc.reviewRequests, Comments: tc.prComments}
 			}
 			seedRunningQueueItems(t, fixture, tc.running)
 
@@ -842,6 +861,7 @@ type stubCoordinatorGitHub struct {
 	branchProtection     map[string]githubinfra.BranchProtection
 	failBranchProtection map[string]error
 	addedPRLabels        []githubinfra.PullRequestLabelsInput
+	currentLogin         string
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -890,9 +910,15 @@ func (s *stubCoordinatorGitHub) ListIssueBlockedBy(_ context.Context, input gith
 	return out, nil
 }
 func (s *stubCoordinatorGitHub) GetCurrentUserLogin(context.Context, string) (string, error) {
+	if s.currentLogin != "" {
+		return s.currentLogin, nil
+	}
 	return "looper", nil
 }
 func (s *stubCoordinatorGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
+	if s.currentLogin != "" {
+		return s.currentLogin, nil
+	}
 	return "looper", nil
 }
 func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githubinfra.IssueTimelineInput) ([]map[string]any, error) {
