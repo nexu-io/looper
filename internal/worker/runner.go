@@ -716,15 +716,22 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	login := ""
-	if policy.RequireAssigneeCurrentUser && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		login = normalizeLogin(login)
+		if login != "" {
+			policy.RoutedClaimPolicy.GitHubLogin = login
+		}
+	} else if policy.RequireAssigneeCurrentUser {
 		var err error
 		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		login = normalizeLogin(login)
-	} else if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		login = normalizeLogin(policy.RoutedClaimPolicy.GitHubLogin)
 	}
 	if policy.RequireAssigneeCurrentUser && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil

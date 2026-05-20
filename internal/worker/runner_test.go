@@ -92,6 +92,30 @@ func TestDiscoverIssuesRoutedModeRequiresMatchingTargetLabel(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesRoutedModeRefreshesLoginFallbackFromGitHub(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "new-worker", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", AssigneeUsers: []networkpolicy.GitHubUser{{Login: "new-worker"}}, Labels: []string{"looper:worker-ready", "looper:target:red"}}}}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Network = config.NetworkConfig{NodeName: "red", GitHubLogin: "old-worker"}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || len(result.CreatedLoopIDs) != 1 || result.Skipped != 0 {
+		t.Fatalf("result = %#v, want routed issue discovered with refreshed login fallback", result)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
+	}
+}
+
 func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -3283,6 +3307,7 @@ func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add
 
 type fakeGitHubGateway struct {
 	currentLogin            string
+	currentLoginCalls       int
 	issues                  []IssueSummary
 	listIssueCalls          []ListOpenIssuesInput
 	openPRs                 []PullRequestSummary
@@ -3317,6 +3342,7 @@ type fakeGitHubGateway struct {
 }
 
 func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	f.currentLoginCalls++
 	if f.currentLogin == "" {
 		return "octocat", nil
 	}
