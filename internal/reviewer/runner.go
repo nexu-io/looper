@@ -29,6 +29,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
@@ -141,40 +142,42 @@ func (s *discoveryLockSet) With(key string, fn func() error) error {
 }
 
 type PullRequestSummary struct {
-	Number         int64
-	Title          string
-	State          string
-	IsDraft        bool
-	ReviewDecision string
-	Labels         []string
-	HeadSHA        string
-	BaseSHA        string
-	HasConflicts   bool
-	Author         string
-	ReviewRequests []string
-	Reviews        []map[string]any
+	Number             int64
+	Title              string
+	State              string
+	IsDraft            bool
+	ReviewDecision     string
+	Labels             []string
+	HeadSHA            string
+	BaseSHA            string
+	HasConflicts       bool
+	Author             string
+	ReviewRequests     []string
+	ReviewRequestUsers []networkpolicy.GitHubUser
+	Reviews            []map[string]any
 }
 
 type PullRequestDetail struct {
-	Number         int64
-	Title          string
-	Body           string
-	State          string
-	IsDraft        bool
-	ReviewDecision string
-	Labels         []string
-	HeadSHA        string
-	BaseSHA        string
-	HeadRefName    string
-	BaseRefName    string
-	Author         string
-	ReviewRequests []string
-	HasConflicts   bool
-	ChecksSummary  string
-	Diff           string
-	Comments       []map[string]any
-	IssueComments  []map[string]any
-	Reviews        []map[string]any
+	Number             int64
+	Title              string
+	Body               string
+	State              string
+	IsDraft            bool
+	ReviewDecision     string
+	Labels             []string
+	HeadSHA            string
+	BaseSHA            string
+	HeadRefName        string
+	BaseRefName        string
+	Author             string
+	ReviewRequests     []string
+	ReviewRequestUsers []networkpolicy.GitHubUser
+	HasConflicts       bool
+	ChecksSummary      string
+	Diff               string
+	Comments           []map[string]any
+	IssueComments      []map[string]any
+	Reviews            []map[string]any
 }
 
 type CreateWorktreeInput struct {
@@ -453,6 +456,7 @@ type DiscoveryPolicy struct {
 	LabelMode                 config.LabelMode
 	IncludeSpecReviewingLabel bool
 	SpecReviewingLabel        string
+	RoutedClaimPolicy         networkpolicy.ProjectPolicy
 }
 
 type Runner struct {
@@ -523,6 +527,7 @@ type ProcessResult struct {
 type reviewerCheckpoint struct {
 	ResumePolicy                 string                      `json:"resumePolicy,omitempty"`
 	Detail                       *checkpointDetail           `json:"detail,omitempty"`
+	RoutedClaimMatchMode         string                      `json:"routedClaimMatchMode,omitempty"`
 	ClaimedLockKey               string                      `json:"claimedLockKey,omitempty"`
 	Snapshot                     *checkpointSnapshot         `json:"snapshot,omitempty"`
 	Worktree                     *checkpointWorktree         `json:"worktree,omitempty"`
@@ -535,22 +540,23 @@ type reviewerCheckpoint struct {
 }
 
 type checkpointDetail struct {
-	Title          string           `json:"title,omitempty"`
-	State          string           `json:"state,omitempty"`
-	IsDraft        bool             `json:"isDraft,omitempty"`
-	ReviewDecision string           `json:"reviewDecision,omitempty"`
-	Labels         []string         `json:"labels,omitempty"`
-	HeadSHA        string           `json:"headSha,omitempty"`
-	BaseSHA        string           `json:"baseSha,omitempty"`
-	HeadRefName    string           `json:"headRefName,omitempty"`
-	BaseRefName    string           `json:"baseRefName,omitempty"`
-	Author         string           `json:"author,omitempty"`
-	ReviewRequests []string         `json:"reviewRequests,omitempty"`
-	HasConflicts   bool             `json:"hasConflicts,omitempty"`
-	CurrentLogin   string           `json:"currentLogin,omitempty"`
-	Reviews        []map[string]any `json:"reviews,omitempty"`
-	Comments       []map[string]any `json:"comments,omitempty"`
-	IssueComments  []map[string]any `json:"issueComments,omitempty"`
+	Title              string                     `json:"title,omitempty"`
+	State              string                     `json:"state,omitempty"`
+	IsDraft            bool                       `json:"isDraft,omitempty"`
+	ReviewDecision     string                     `json:"reviewDecision,omitempty"`
+	Labels             []string                   `json:"labels,omitempty"`
+	HeadSHA            string                     `json:"headSha,omitempty"`
+	BaseSHA            string                     `json:"baseSha,omitempty"`
+	HeadRefName        string                     `json:"headRefName,omitempty"`
+	BaseRefName        string                     `json:"baseRefName,omitempty"`
+	Author             string                     `json:"author,omitempty"`
+	ReviewRequests     []string                   `json:"reviewRequests,omitempty"`
+	ReviewRequestUsers []networkpolicy.GitHubUser `json:"reviewRequestUsers,omitempty"`
+	HasConflicts       bool                       `json:"hasConflicts,omitempty"`
+	CurrentLogin       string                     `json:"currentLogin,omitempty"`
+	Reviews            []map[string]any           `json:"reviews,omitempty"`
+	Comments           []map[string]any           `json:"comments,omitempty"`
+	IssueComments      []map[string]any           `json:"issueComments,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -957,7 +963,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		return nil
 	}
 	requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
-	if requireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, *currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin) {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, *currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin) {
 		result.Skipped++
 		return nil
 	}
@@ -1045,11 +1051,17 @@ func prEligibleForDiscovery(pr PullRequestSummary, currentLogin string, policy D
 	if isSelfAuthoredPR(pr.Author, currentLogin, policy) {
 		return false
 	}
-	if policy.RequireReviewRequest && !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireReviewRequest && !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
 		return false
 	}
 	if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 		return false
+	}
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, pr.Labels, pr.ReviewRequestUsers)
+		if !decision.Allowed {
+			return false
+		}
 	}
 	return true
 }
@@ -1059,7 +1071,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel}
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.ReviewerAutoMergeConfig {
@@ -1203,6 +1215,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
+		return ProcessResult{}, err
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -1400,6 +1415,22 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
 
+func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord) error {
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) || r.github == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
+		return nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, CWD: project.RepoPath})
+	if err != nil {
+		return err
+	}
+	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, detail.Labels, detail.ReviewRequestUsers)
+	if !decision.Allowed {
+		return &loopError{message: fmt.Sprintf("Skipped routed pull request %s#%d: %s", *queueItem.Repo, *queueItem.PRNumber, decision.Reason), kind: FailureManualIntervention}
+	}
+	return nil
+}
+
 type stepInput struct {
 	Project    storage.ProjectRecord
 	Loop       storage.LoopRecord
@@ -1502,7 +1533,7 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 }
 
 func checkpointDetailFromDetail(detail PullRequestDetail) *checkpointDetail {
-	return &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
+	return &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), ReviewRequestUsers: cloneGitHubUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
 }
 
 func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
@@ -1525,6 +1556,9 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	currentLogin := ""
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		currentLogin = normalizeLogin(policy.RoutedClaimPolicy.GitHubLogin)
+	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "ready_label"
@@ -1542,7 +1576,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && !policy.EnableSelfReview {
-		if currentLogin == "" {
+		if currentLogin == "" && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -1558,7 +1592,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && r.loopConfig.StopOnApproved {
-		if currentLogin == "" {
+		if currentLogin == "" && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -1576,7 +1610,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
-		if currentLogin == "" {
+		if currentLogin == "" && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -1598,7 +1632,16 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Detail.HeadSHA)
-	if requireReviewRequest {
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
+		if !decision.Allowed {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped routed pull request %s#%d: %s", input.Repo, input.PRNumber, decision.Reason)
+			checkpoint.SkipKind = "routed_claim_ineligible"
+			return checkpoint, nil
+		}
+		checkpoint.RoutedClaimMatchMode = string(decision.MatchMode)
+	}
+	if requireReviewRequest && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		if currentLogin == "" {
 			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
@@ -5098,7 +5141,7 @@ func containsAnyString(values []any, target string) bool {
 }
 
 func summaryFromDetail(detail PullRequestDetail) PullRequestSummary {
-	return PullRequestSummary{Number: detail.Number, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HasConflicts: detail.HasConflicts, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), Reviews: cloneObjectSlice(detail.Reviews)}
+	return PullRequestSummary{Number: detail.Number, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HasConflicts: detail.HasConflicts, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), ReviewRequestUsers: cloneGitHubUsers(detail.ReviewRequestUsers), Reviews: cloneObjectSlice(detail.Reviews)}
 }
 
 func normalizePRState(value string) string {
@@ -5623,6 +5666,13 @@ func cloneStrings(values []string) []string {
 		return nil
 	}
 	return append([]string(nil), values...)
+}
+
+func cloneGitHubUsers(values []networkpolicy.GitHubUser) []networkpolicy.GitHubUser {
+	if values == nil {
+		return nil
+	}
+	return append([]networkpolicy.GitHubUser(nil), values...)
 }
 
 func cloneObjectSlice(values []map[string]any) []map[string]any {

@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -55,7 +56,9 @@ type loadedCoordinatorIssue struct {
 
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
+	ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
+	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
@@ -138,6 +141,15 @@ type issueOrder struct {
 	index        int
 }
 
+type downstreamTriggerLabels struct {
+	reviewer     []string
+	reviewerMode config.LabelMode
+	fixer        []string
+	fixerMode    config.LabelMode
+	worker       []string
+	workerMode   config.LabelMode
+}
+
 func New(options Options) *Runner {
 	now := options.Now
 	if now == nil {
@@ -185,7 +197,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
-	dispatchCfg := roleConfigToDispatchConfig(roleCfg, config.ProjectRoleConfigs(*r.config, input.ProjectID))
+	projectRoles := config.ProjectRoleConfigs(*r.config, input.ProjectID)
+	dispatchCfg := roleConfigToDispatchConfig(roleCfg, projectRoles)
+	downstreamLabels := downstreamTriggerLabels{
+		reviewer:     append([]string(nil), projectRoles.Reviewer.Discovery.Triggers.Labels...),
+		reviewerMode: projectRoles.Reviewer.Discovery.Triggers.LabelMode,
+		fixer:        append([]string(nil), projectRoles.Fixer.Triggers.Labels...),
+		fixerMode:    projectRoles.Fixer.Triggers.LabelMode,
+		worker:       append([]string(nil), projectRoles.Worker.Triggers.Labels...),
+		workerMode:   projectRoles.Worker.Triggers.LabelMode,
+	}
 	loaded := make([]loadedIssue, 0, len(issues))
 	for _, summary := range issues {
 		if ShouldSkipIssue(IssueSummary{Number: summary.Number, Labels: summary.Labels}, roleCfg, sweeperCfg) {
@@ -210,7 +231,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err := r.applyDependencyActions(ctx, input.Repo, project.RepoPath, triageCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
-	if err := r.applyDispatches(ctx, input.ProjectID, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps); err != nil {
+	if err := r.applyDispatches(ctx, input.ProjectID, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps, downstreamLabels); err != nil {
 		return DiscoveryResult{}, err
 	}
 
@@ -805,9 +826,9 @@ func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, t
 	return nil
 }
 
-func (r *Runner) applyDispatches(ctx context.Context, projectID string, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+func (r *Runner) applyDispatches(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
 	if dispatchCfg.Mode == dispatch.ModeAutonomous {
-		return r.applyAutonomousDispatches(ctx, projectID, repo, cwd, loaded, triageCfg, dispatchCfg, deps)
+		return r.applyAutonomousDispatches(ctx, projectID, repo, cwd, loaded, triageCfg, dispatchCfg, deps, downstreamLabels)
 	}
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -828,7 +849,7 @@ func (r *Runner) applyDispatches(ctx context.Context, projectID string, repo, cw
 	return nil
 }
 
-func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID string, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
 	ready := make([]autonomousDispatchCandidate, 0, len(loaded))
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -853,17 +874,25 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID string
 				}
 			}
 		}
-		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number]})
+		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue)})
 	}
 	sortAutonomousDispatchCandidates(ready)
-	budget := r.dispatchBudget()
-	for index, candidate := range ready {
-		if index >= budget {
+	budget, preemptWorkers, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
+	if err != nil {
+		return err
+	}
+	dispatched := 0
+	for _, candidate := range ready {
+		if preemptWorkers && candidate.worker {
+			continue
+		}
+		if dispatched >= budget {
 			break
 		}
 		if err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg); err != nil {
 			return err
 		}
+		dispatched++
 	}
 	return nil
 }
@@ -872,6 +901,7 @@ type autonomousDispatchCandidate struct {
 	issue  triage.Issue
 	action dispatch.Action
 	order  issueOrder
+	worker bool
 }
 
 func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) {
@@ -884,11 +914,227 @@ func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) 
 	})
 }
 
-func (r *Runner) dispatchBudget() int {
+func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, ready []autonomousDispatchCandidate, downstreamLabels downstreamTriggerLabels) (int, bool, error) {
 	if r == nil || r.config == nil || r.config.Scheduler.MaxConcurrentRuns <= 0 {
-		return int(^uint(0) >> 1)
+		return int(^uint(0) >> 1), false, nil
 	}
-	return r.config.Scheduler.MaxConcurrentRuns
+	maxConcurrentRuns := r.config.Scheduler.MaxConcurrentRuns
+	running, err := r.runningQueueItems(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	if running >= maxConcurrentRuns {
+		return 0, false, nil
+	}
+	budget := maxConcurrentRuns - running
+	readyWorkers := 0
+	for _, candidate := range ready[:min(len(ready), budget)] {
+		if candidate.worker {
+			readyWorkers++
+		}
+	}
+	if readyWorkers > 0 && running+readyWorkers >= maxConcurrentRuns {
+		pending, err := r.hasPendingReviewerOrFixerWork(ctx, projectID, repo, cwd, loaded, downstreamLabels)
+		if err != nil {
+			return 0, false, err
+		}
+		if pending {
+			return budget, true, nil
+		}
+	}
+	return budget, false, nil
+}
+
+func (r *Runner) runningQueueItems(ctx context.Context) (int, error) {
+	if r == nil || r.repos == nil || r.repos.Queue == nil {
+		return 0, nil
+	}
+	count, err := r.repos.Queue.CountByStatus(ctx, "running")
+	if err != nil {
+		return 0, err
+	}
+	return int(count), nil
+}
+
+func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, downstreamLabels downstreamTriggerLabels) (bool, error) {
+	if r == nil || r.config == nil || r.repos == nil || r.github == nil {
+		return false, nil
+	}
+	roles := config.ProjectRoleConfigs(*r.config, projectID)
+	reviewerConfig := roles.Reviewer.Discovery.Triggers
+	fixerConfig := roles.Fixer.Triggers
+	reviewerLabels := downstreamLabels.reviewer
+	fixerLabels := downstreamLabels.fixer
+	active, err := r.activeQueueItemsByPR(ctx)
+	if err != nil {
+		return false, err
+	}
+	currentLogin := ""
+	loadedCurrentLogin := false
+	for _, issue := range loaded {
+		prs, err := r.github.ListLinkedPullRequests(ctx, githubinfra.LinkedPullRequestsInput{Repo: repo, IssueNumber: issue.issue.Number, CWD: cwd})
+		if err != nil {
+			return false, err
+		}
+		for _, pr := range prs {
+			if !strings.EqualFold(strings.TrimSpace(pr.State), "OPEN") {
+				continue
+			}
+			detail, err := r.github.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: pr.Number, CWD: cwd})
+			if err != nil {
+				return false, err
+			}
+			prKey := queuePullRequestKey(repo, pr.Number)
+			if !loadedCurrentLogin && (reviewerConfig.RequireReviewRequest || !reviewerConfig.EnableSelfReview || fixerConfig.AuthorFilter != config.FixerAuthorFilterAny) {
+				lookupLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+				if err != nil {
+					return false, err
+				}
+				currentLogin = normalizeLogin(lookupLogin)
+				loadedCurrentLogin = true
+			}
+			if !active["reviewer"][prKey] {
+				if reviewerWorkPending(detail, currentLogin, reviewerConfig, reviewerLabels, downstreamLabels.reviewerMode) {
+					return true, nil
+				}
+			}
+			if !active["fixer"][prKey] && fixerWorkPending(detail, currentLogin, fixerConfig, fixerLabels, downstreamLabels.fixerMode) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func reviewerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.ReviewerRoleTriggersConfig, requiredLabels []string, labelMode config.LabelMode) bool {
+	if !trigger.IncludeDrafts && detail.IsDraft {
+		return false
+	}
+	if !trigger.EnableSelfReview && normalizeLogin(detail.Author) != "" && normalizeLogin(detail.Author) == normalizeLogin(currentLogin) {
+		return false
+	}
+	if trigger.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		return false
+	}
+	return labelsMatch(detail.Labels, requiredLabels, labelMode)
+}
+
+func fixerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.FixerRoleTriggersConfig, requiredLabels []string, labelMode config.LabelMode) bool {
+	if !trigger.IncludeDrafts && detail.IsDraft {
+		return false
+	}
+	if trigger.AuthorFilter != config.FixerAuthorFilterAny && normalizeLogin(detail.Author) != "" && normalizeLogin(detail.Author) != normalizeLogin(currentLogin) {
+		return false
+	}
+	if !labelsMatch(detail.Labels, requiredLabels, labelMode) {
+		return false
+	}
+	if detail.HasConflicts {
+		return true
+	}
+	for _, comment := range detail.Comments {
+		if !commentResolved(comment) {
+			return true
+		}
+	}
+	for _, check := range detail.Checks {
+		if failingCheck(check) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runner) activeQueueItemsByPR(ctx context.Context) (map[string]map[string]bool, error) {
+	active := map[string]map[string]bool{"reviewer": {}, "fixer": {}}
+	if r == nil || r.repos == nil || r.repos.Queue == nil {
+		return active, nil
+	}
+	items, err := r.repos.Queue.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if item.Status != "queued" && item.Status != "running" {
+			continue
+		}
+		if item.Repo == nil || item.PRNumber == nil {
+			continue
+		}
+		if _, ok := active[item.Type]; !ok {
+			continue
+		}
+		active[item.Type][queuePullRequestKey(*item.Repo, *item.PRNumber)] = true
+	}
+	return active, nil
+}
+
+func queuePullRequestKey(repo string, prNumber int64) string {
+	return fmt.Sprintf("%s#%d", repo, prNumber)
+}
+
+func isWorkerDispatch(issue triage.Issue) bool {
+	return specpr.HasLabel(issue.Labels, dispatch.DispatchImplement)
+}
+
+func labelsMatch(labels, expected []string, mode config.LabelMode) bool {
+	if len(expected) == 0 {
+		return true
+	}
+	if mode == config.LabelModeAny {
+		for _, label := range expected {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, label := range expected {
+		if !specpr.HasLabel(labels, label) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(login))
+}
+
+func isCurrentUserRequested(requested []string, currentLogin string) bool {
+	currentLogin = normalizeLogin(currentLogin)
+	if currentLogin == "" {
+		return false
+	}
+	for _, login := range requested {
+		if normalizeLogin(login) == currentLogin {
+			return true
+		}
+	}
+	return false
+}
+
+func commentResolved(comment map[string]any) bool {
+	if state, ok := comment["state"].(string); ok && strings.EqualFold(strings.TrimSpace(state), "resolved") {
+		return true
+	}
+	if resolved, ok := comment["isResolved"].(bool); ok && resolved {
+		return true
+	}
+	return false
+}
+
+func failingCheck(check map[string]any) bool {
+	state, _ := check["conclusion"].(string)
+	if strings.TrimSpace(state) == "" {
+		state, _ = check["state"].(string)
+	}
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyHumanDependencyGate(action dispatch.Action, issueNumber int64, deps dependencyState) dispatch.Action {
@@ -1174,7 +1420,7 @@ func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode 
 		if project.ID != projectID {
 			continue
 		}
-		if project.Network != nil && project.Network.Mode != "" {
+		if project.Network.Mode != "" {
 			return project.Network.Mode
 		}
 		break

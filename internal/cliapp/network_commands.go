@@ -205,7 +205,7 @@ func (r *commandRuntime) localProjectCountsAndIdentity(ctx context.Context) (loc
 		return 0, 0, protocol.GitHubIdentity{}, err
 	}
 	for _, project := range loaded.Config.Projects {
-		if project.Network != nil && project.Network.Mode == config.ProjectNetworkModeRouted {
+		if project.Network.Mode == config.ProjectNetworkModeRouted {
 			routed++
 		} else {
 			local++
@@ -225,9 +225,9 @@ func (r *commandRuntime) updateAllProjectNetworkModes(mode config.ProjectNetwork
 		return err
 	}
 	for index := range loaded.Config.Projects {
-		loaded.Config.Projects[index].Network = &config.ProjectNetworkConfig{Mode: mode}
+		loaded.Config.Projects[index].Network = config.ProjectNetworkConfig{Mode: mode}
 		if mode == config.ProjectNetworkModeOff {
-			loaded.Config.Projects[index].Network = nil
+			loaded.Config.Projects[index].Network = config.ProjectNetworkConfig{}
 		}
 	}
 	partial := loaded.Partial
@@ -235,14 +235,19 @@ func (r *commandRuntime) updateAllProjectNetworkModes(mode config.ProjectNetwork
 	if projects == nil {
 		materialized := make([]config.PartialProjectRefConfig, len(loaded.Config.Projects))
 		for index, project := range loaded.Config.Projects {
-			materialized[index] = config.PartialProjectRefConfig{ID: project.ID, Name: project.Name, RepoPath: project.RepoPath, Path: project.Path, BaseBranch: project.BaseBranch, WorktreeRoot: project.WorktreeRoot, Network: project.Network, Roles: project.Roles}
+			materialized[index] = config.PartialProjectRefConfig{ID: project.ID, Name: project.Name, RepoPath: project.RepoPath, Path: project.Path, BaseBranch: project.BaseBranch, WorktreeRoot: project.WorktreeRoot, Roles: project.Roles}
+			if project.Network.Mode != config.ProjectNetworkModeOff {
+				projectMode := project.Network.Mode
+				materialized[index].Network = &config.PartialProjectNetworkConfig{Mode: &projectMode}
+			}
 		}
 		projects = &materialized
 	}
 	for index := range *projects {
 		(*projects)[index].Network = nil
 		if mode != config.ProjectNetworkModeOff {
-			(*projects)[index].Network = &config.ProjectNetworkConfig{Mode: mode}
+			projectMode := config.NetworkMode(mode)
+			(*projects)[index].Network = &config.PartialProjectNetworkConfig{Mode: &projectMode}
 		}
 	}
 	partial.Projects = projects

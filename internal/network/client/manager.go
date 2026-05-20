@@ -186,7 +186,7 @@ func (m *Manager) dynamicLoad(ctx context.Context) int {
 
 func countProjectModes(cfg config.Config) (routed int, local int) {
 	for _, project := range cfg.Projects {
-		if project.Network != nil && project.Network.Mode == config.ProjectNetworkModeRouted {
+		if project.Network.Mode == config.ProjectNetworkModeRouted {
 			routed++
 		} else {
 			local++

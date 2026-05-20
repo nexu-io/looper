@@ -2208,6 +2208,7 @@ func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2400,6 +2401,7 @@ func TestConfigMigrateForceOverwritesExistingDestinationAndCreatesBackup(t *test
 func TestConfigMigrateDefaultPathCreatesCanonicalTOMLAndPreservesLegacyJSON(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -2448,6 +2450,7 @@ func TestConfigMigrateRejectsPositionalArguments(t *testing.T) {
 func TestConfigMigrateDefaultPathFailsClearlyWhenCanonicalDefaultAlreadyExists(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("os.MkdirAll() error = %v", err)
@@ -4422,10 +4425,10 @@ func TestNetworkLeaveRemovesLocalStateWhenProjectModeUpdateFails(t *testing.T) {
 	homeDir := t.TempDir()
 	configDir := t.TempDir()
 	configPath := filepath.Join(configDir, "config.json")
-	configPayload := map[string]any{
-		"projects": []map[string]any{{"id": "project-1", "name": "Repo", "path": t.TempDir(), "network": map[string]any{"mode": "routed"}}},
-	}
-	raw, err := json.Marshal(configPayload)
+	projectPath := t.TempDir()
+	raw, err := config.MarshalConfigFile(configPath, config.PartialConfig{
+		Projects: &[]config.PartialProjectRefConfig{{ID: "project-1", Name: "Repo", Path: projectPath}},
+	})
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}

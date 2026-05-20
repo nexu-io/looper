@@ -8,12 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var closesIssuePattern = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b`)
 
 const (
 	envFakeGHMode        = "LOOPER_E2E_FAKE_GH_MODE"
@@ -158,6 +161,9 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		}
 		return emitDefaultJSON(key, fields)
 	case "pr merge":
+		if err := handlePullRequestMerge(&st, os.Args[1:]); err != nil {
+			return err
+		}
 		_, _ = fmt.Fprintln(os.Stdout, "{}")
 		return nil
 	case "issue list", "pr list":
@@ -177,6 +183,86 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		_, _ = fmt.Fprintln(os.Stdout, "{}")
 		return nil
 	}
+}
+
+func handlePullRequestMerge(st *state, args []string) error {
+	prNumberValue := firstNonFlag(args[2:])
+	if strings.TrimSpace(prNumberValue) == "" {
+		return nil
+	}
+	prNumber, err := strconv.ParseInt(strings.TrimSpace(prNumberValue), 10, 64)
+	if err != nil {
+		return nil
+	}
+	repo := strings.TrimSpace(flagValue(args, "--repo"))
+	if repo == "" {
+		return nil
+	}
+	key := fmt.Sprintf("%s#%d", repo, prNumber)
+	pr, ok := st.PullRequests[key]
+	if !ok {
+		return nil
+	}
+	if slices.Contains(args, "--auto") {
+		pr.AutoMerge = map[string]any{
+			"enabledBy":   map[string]any{"login": firstNonEmpty(st.CurrentUserLogin, "looper")},
+			"mergeMethod": pullRequestMergeMethod(args),
+		}
+		pr.UpdatedAt = firstNonEmpty(pr.UpdatedAt, "2026-05-12T00:00:00Z")
+		st.PullRequests[key] = pr
+		return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
+	}
+	pr.State = "MERGED"
+	pr.ClosedAt = firstNonEmpty(pr.ClosedAt, "2026-05-12T00:00:00Z")
+	pr.MergedAt = firstNonEmpty(pr.MergedAt, pr.ClosedAt)
+	pr.UpdatedAt = firstNonEmpty(pr.UpdatedAt, "2026-05-12T00:00:00Z")
+	st.PullRequests[key] = pr
+	for _, match := range closesIssuePattern.FindAllStringSubmatch(pr.Body, -1) {
+		issueNumber, convErr := strconv.ParseInt(match[1], 10, 64)
+		if convErr != nil {
+			continue
+		}
+		closeLinkedIssueRoute(st, repo, issueNumber)
+	}
+	return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
+}
+
+func pullRequestMergeMethod(args []string) string {
+	switch {
+	case slices.Contains(args, "--rebase"):
+		return "REBASE"
+	case slices.Contains(args, "--merge"):
+		return "MERGE"
+	default:
+		return "SQUASH"
+	}
+}
+
+func closeLinkedIssueRoute(st *state, repo string, issueNumber int64) {
+	route := fmt.Sprintf("repos/%s/issues/%d", normalizeRouteRepoPath(repo), issueNumber)
+	payload, ok := st.Routes[route]
+	if !ok {
+		return
+	}
+	var issue map[string]any
+	if err := json.Unmarshal(payload, &issue); err != nil {
+		return
+	}
+	issue["state"] = "closed"
+	issue["state_reason"] = "completed"
+	updated, err := json.Marshal(issue)
+	if err != nil {
+		return
+	}
+	st.Routes[route] = updated
+}
+
+func normalizeRouteRepoPath(repo string) string {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 3 {
+		return parts[1] + "/" + parts[2]
+	}
+	return strings.TrimSpace(repo)
 }
 
 func handleAPI(mode string, st state, stdin string) error {

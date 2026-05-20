@@ -49,54 +49,56 @@ type Gateway struct {
 }
 
 type PullRequestSummary struct {
-	Number            int64
-	Title             string
-	URL               string
-	State             string
-	UpdatedAt         string
-	IsDraft           bool
-	ReviewDecision    string
-	Labels            []string
-	HeadRefName       string
-	BaseRefName       string
-	HeadSHA           string
-	BaseSHA           string
-	HasConflicts      bool
-	Author            string
-	AuthorAssociation string
-	ReviewRequests    []string
-	Reviews           []map[string]any
+	Number             int64
+	Title              string
+	URL                string
+	State              string
+	UpdatedAt          string
+	IsDraft            bool
+	ReviewDecision     string
+	Labels             []string
+	HeadRefName        string
+	BaseRefName        string
+	HeadSHA            string
+	BaseSHA            string
+	HasConflicts       bool
+	Author             string
+	AuthorAssociation  string
+	ReviewRequests     []string
+	ReviewRequestUsers []GitHubUser
+	Reviews            []map[string]any
 }
 
 type PullRequestDetail struct {
-	Number            int64
-	Title             string
-	Body              string
-	URL               string
-	State             string
-	CreatedAt         string
-	UpdatedAt         string
-	ClosedAt          string
-	IsDraft           bool
-	ReviewDecision    string
-	Labels            []string
-	HeadRefName       string
-	BaseRefName       string
-	HeadSHA           string
-	BaseSHA           string
-	Author            string
-	AuthorAssociation string
-	CommentCount      int
-	ReviewRequests    []string
-	HasConflicts      bool
-	Comments          []map[string]any
-	IssueComments     []CommentInfo
-	Reviews           []map[string]any
-	Checks            []map[string]any
-	Mergeable         *bool
-	MergeableState    string
-	MergedAt          string
-	AutoMerge         *PullRequestAutoMerge
+	Number             int64
+	Title              string
+	Body               string
+	URL                string
+	State              string
+	CreatedAt          string
+	UpdatedAt          string
+	ClosedAt           string
+	IsDraft            bool
+	ReviewDecision     string
+	Labels             []string
+	HeadRefName        string
+	BaseRefName        string
+	HeadSHA            string
+	BaseSHA            string
+	Author             string
+	AuthorAssociation  string
+	CommentCount       int
+	ReviewRequests     []string
+	ReviewRequestUsers []GitHubUser
+	HasConflicts       bool
+	Comments           []map[string]any
+	IssueComments      []CommentInfo
+	Reviews            []map[string]any
+	Checks             []map[string]any
+	Mergeable          *bool
+	MergeableState     string
+	MergedAt           string
+	AutoMerge          *PullRequestAutoMerge
 }
 
 type PullRequestAutoMerge struct {
@@ -201,6 +203,11 @@ type PullRequestReviewState struct {
 	LastReviewAt        string
 }
 
+type GitHubUser struct {
+	Login string
+	ID    int64
+}
+
 type PullRequestHeadAndAuthor struct {
 	HeadSHA string
 	Author  string
@@ -240,6 +247,7 @@ type IssueSummary struct {
 	Author            string
 	AuthorAssociation string
 	Assignees         []string
+	AssigneeUsers     []GitHubUser
 	Labels            []string
 	IsPullRequest     bool
 }
@@ -257,6 +265,7 @@ type IssueDetail struct {
 	Author            string
 	AuthorAssociation string
 	Assignees         []string
+	AssigneeUsers     []GitHubUser
 	Labels            []string
 	IsPullRequest     bool
 	CommentCount      int
@@ -659,23 +668,24 @@ func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPul
 	out := make([]PullRequestSummary, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, PullRequestSummary{
-			Number:            asInt64(row["number"]),
-			Title:             asString(row["title"]),
-			URL:               asString(row["url"]),
-			State:             asString(row["state"]),
-			UpdatedAt:         asString(row["updatedAt"]),
-			IsDraft:           asBool(row["isDraft"]),
-			ReviewDecision:    asString(row["reviewDecision"]),
-			Labels:            extractLabelNames(row["labels"]),
-			HeadRefName:       asString(row["headRefName"]),
-			BaseRefName:       asString(row["baseRefName"]),
-			HeadSHA:           asString(row["headRefOid"]),
-			BaseSHA:           asString(row["baseRefOid"]),
-			HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
-			Author:            extractAuthor(row["author"]),
-			AuthorAssociation: asString(row["authorAssociation"]),
-			ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
-			Reviews:           toObjectSlice(row["reviews"]),
+			Number:             asInt64(row["number"]),
+			Title:              asString(row["title"]),
+			URL:                asString(row["url"]),
+			State:              asString(row["state"]),
+			UpdatedAt:          asString(row["updatedAt"]),
+			IsDraft:            asBool(row["isDraft"]),
+			ReviewDecision:     asString(row["reviewDecision"]),
+			Labels:             extractLabelNames(row["labels"]),
+			HeadRefName:        asString(row["headRefName"]),
+			BaseRefName:        asString(row["baseRefName"]),
+			HeadSHA:            asString(row["headRefOid"]),
+			BaseSHA:            asString(row["baseRefOid"]),
+			HasConflicts:       asString(row["mergeStateStatus"]) == "DIRTY",
+			Author:             extractAuthor(row["author"]),
+			AuthorAssociation:  asString(row["authorAssociation"]),
+			ReviewRequests:     extractReviewRequestLogins(row["reviewRequests"]),
+			ReviewRequestUsers: extractReviewRequestUsers(row["reviewRequests"]),
+			Reviews:            toObjectSlice(row["reviews"]),
 		})
 	}
 	return out, nil
@@ -764,6 +774,7 @@ func (g *Gateway) listOpenIssuesRaw(ctx context.Context, input ListOpenIssuesInp
 			Author:            extractAuthor(row["author"]),
 			AuthorAssociation: asString(row["authorAssociation"]),
 			Assignees:         extractActorLogins(row["assignees"]),
+			AssigneeUsers:     extractActorUsers(row["assignees"]),
 			Labels:            extractLabelNames(row["labels"]),
 		})
 	}
@@ -831,6 +842,7 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
 		Assignees:         extractActorLogins(row["assignees"]),
+		AssigneeUsers:     extractActorUsers(row["assignees"]),
 		Labels:            extractLabelNames(row["labels"]),
 		IsPullRequest:     row["pull_request"] != nil,
 		CommentCount:      len(commentRows),
@@ -1252,34 +1264,35 @@ func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestI
 		return PullRequestDetail{}, err
 	}
 	return PullRequestDetail{
-		Number:            asInt64(row["number"]),
-		Title:             asString(row["title"]),
-		Body:              asString(row["body"]),
-		URL:               asString(row["url"]),
-		State:             asString(row["state"]),
-		CreatedAt:         asString(row["createdAt"]),
-		UpdatedAt:         asString(row["updatedAt"]),
-		ClosedAt:          asString(row["closedAt"]),
-		IsDraft:           asBool(row["isDraft"]),
-		ReviewDecision:    asString(row["reviewDecision"]),
-		Labels:            extractLabelNames(row["labels"]),
-		HeadRefName:       asString(row["headRefName"]),
-		BaseRefName:       asString(row["baseRefName"]),
-		HeadSHA:           asString(row["headRefOid"]),
-		BaseSHA:           asString(row["baseRefOid"]),
-		Author:            extractAuthor(row["author"]),
-		AuthorAssociation: asString(row["authorAssociation"]),
-		CommentCount:      len(toObjectSlice(row["comments"])),
-		ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
-		HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
-		Comments:          threads,
-		IssueComments:     extractCommentInfos(toObjectSlice(row["comments"])),
-		Reviews:           toObjectSlice(row["reviews"]),
-		Checks:            toObjectSlice(row["statusCheckRollup"]),
-		Mergeable:         boolPtrFromValue(row["mergeable"]),
-		MergeableState:    asString(row["mergeable_state"]),
-		MergedAt:          asString(row["merged_at"]),
-		AutoMerge:         extractAutoMerge(row["auto_merge"]),
+		Number:             asInt64(row["number"]),
+		Title:              asString(row["title"]),
+		Body:               asString(row["body"]),
+		URL:                asString(row["url"]),
+		State:              asString(row["state"]),
+		CreatedAt:          asString(row["createdAt"]),
+		UpdatedAt:          asString(row["updatedAt"]),
+		ClosedAt:           asString(row["closedAt"]),
+		IsDraft:            asBool(row["isDraft"]),
+		ReviewDecision:     asString(row["reviewDecision"]),
+		Labels:             extractLabelNames(row["labels"]),
+		HeadRefName:        asString(row["headRefName"]),
+		BaseRefName:        asString(row["baseRefName"]),
+		HeadSHA:            asString(row["headRefOid"]),
+		BaseSHA:            asString(row["baseRefOid"]),
+		Author:             extractAuthor(row["author"]),
+		AuthorAssociation:  asString(row["authorAssociation"]),
+		CommentCount:       len(toObjectSlice(row["comments"])),
+		ReviewRequests:     extractReviewRequestLogins(row["reviewRequests"]),
+		ReviewRequestUsers: extractReviewRequestUsers(row["reviewRequests"]),
+		HasConflicts:       asString(row["mergeStateStatus"]) == "DIRTY",
+		Comments:           threads,
+		IssueComments:      extractCommentInfos(toObjectSlice(row["comments"])),
+		Reviews:            toObjectSlice(row["reviews"]),
+		Checks:             toObjectSlice(row["statusCheckRollup"]),
+		Mergeable:          boolPtrFromValue(row["mergeable"]),
+		MergeableState:     asString(row["mergeable_state"]),
+		MergedAt:           asString(row["merged_at"]),
+		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}, nil
 }
 
@@ -3244,43 +3257,74 @@ func extractOID(value any) string {
 }
 
 func extractReviewRequestLogins(value any) []string {
-	items, ok := value.([]any)
-	if !ok {
-		return []string{}
-	}
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		if login := extractReviewRequestLogin(item); login != "" {
-			out = append(out, login)
+	users := extractReviewRequestUsers(value)
+	out := make([]string, 0, len(users))
+	for _, user := range users {
+		if user.Login != "" {
+			out = append(out, user.Login)
 		}
 	}
 	return out
 }
 
-func extractReviewRequestLogin(value any) string {
+func extractReviewRequestUsers(value any) []GitHubUser {
+	items, ok := value.([]any)
+	if !ok {
+		return []GitHubUser{}
+	}
+	out := make([]GitHubUser, 0, len(items))
+	for _, item := range items {
+		if user, ok := extractReviewRequestUser(item); ok {
+			out = append(out, user)
+		}
+	}
+	return out
+}
+
+func extractReviewRequestUser(value any) (GitHubUser, bool) {
 	row, ok := value.(map[string]any)
 	if !ok {
-		return ""
+		return GitHubUser{}, false
 	}
 	if asString(row["__typename"]) == "User" {
-		return asString(row["login"])
+		login := asString(row["login"])
+		if login == "" {
+			return GitHubUser{}, false
+		}
+		return GitHubUser{Login: login, ID: asInt64(firstNonNil(row["databaseId"], row["id"]))}, true
 	}
 	reviewer, _ := row["requestedReviewer"].(map[string]any)
 	if asString(reviewer["__typename"]) == "User" {
-		return asString(reviewer["login"])
+		login := asString(reviewer["login"])
+		if login == "" {
+			return GitHubUser{}, false
+		}
+		return GitHubUser{Login: login, ID: asInt64(firstNonNil(reviewer["databaseId"], reviewer["id"]))}, true
 	}
-	return ""
+	return GitHubUser{}, false
 }
 
 func extractActorLogins(value any) []string {
+	users := extractActorUsers(value)
+	out := make([]string, 0, len(users))
+	for _, user := range users {
+		if user.Login != "" {
+			out = append(out, user.Login)
+		}
+	}
+	return out
+}
+
+func extractActorUsers(value any) []GitHubUser {
 	items, ok := value.([]any)
 	if !ok {
-		return []string{}
+		return []GitHubUser{}
 	}
-	out := make([]string, 0, len(items))
+	out := make([]GitHubUser, 0, len(items))
 	for _, item := range items {
 		if login := extractAuthor(item); login != "" {
-			out = append(out, login)
+			row, _ := item.(map[string]any)
+			out = append(out, GitHubUser{Login: login, ID: asInt64(firstNonNil(row["databaseId"], row["id"]))})
 		}
 	}
 	return out

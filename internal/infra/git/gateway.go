@@ -337,8 +337,13 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					}
 					return &restored, nil
 				}
-
-				g.tryRemoveWorktree(ctx, input.RepoPath, stored.WorktreePath)
+				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch, input.ExpectedWorktreePath)
+				if err != nil {
+					return nil, err
+				}
+				if shouldReplace {
+					g.tryRemoveWorktree(ctx, input.RepoPath, stored.WorktreePath)
+				}
 			}
 		}
 	}
@@ -830,6 +835,21 @@ func (g *Gateway) matchesRestoreCheckoutMode(ctx context.Context, worktreePath s
 	return currentBranch == branch, nil
 }
 
+func (g *Gateway) shouldReplaceStoredWorktreeOnRestoreMismatch(ctx context.Context, worktreePath string, checkoutMode CheckoutMode, branch, expectedWorktreePath string) (bool, error) {
+	if checkoutMode == CheckoutModeDetached {
+		return false, nil
+	}
+
+	currentBranch, err := g.getCurrentBranch(ctx, worktreePath)
+	if err != nil {
+		return false, err
+	}
+	if currentBranch == "" {
+		return normalizeComparablePath(worktreePath) == normalizeComparablePath(expectedWorktreePath), nil
+	}
+	return currentBranch != branch, nil
+}
+
 func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath string) {
 	if err := g.runGit(ctx, repoPath, nil, "worktree", "remove", "--force", worktreePath); err != nil {
 		return
@@ -956,6 +976,9 @@ func isRetryableFetchRefLockRace(args []string, err error) bool {
 
 func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 	if input.PRNumber != 0 {
+		if normalizeCheckoutMode(input.CheckoutMode) == CheckoutModeDetached {
+			return fmt.Sprintf("looper-fix-%s-pr-%d-detached", sanitizeBranchName(input.ProjectID), input.PRNumber)
+		}
 		return fmt.Sprintf("looper-fix-%s-pr-%d", sanitizeBranchName(input.ProjectID), input.PRNumber)
 	}
 

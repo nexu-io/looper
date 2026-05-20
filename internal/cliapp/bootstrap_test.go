@@ -480,6 +480,7 @@ func TestEnsureBootstrapConfigPreservesExplicitYAMLFormat(t *testing.T) {
 func TestBootstrapDefaultPathReusesExistingLegacyDefaultConfig(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 	looperHome := filepath.Join(homeDir, ".looper")
 	if err := os.MkdirAll(looperHome, 0o755); err != nil {
 		t.Fatalf("MkdirAll(looperHome) error = %v", err)
@@ -513,6 +514,7 @@ func TestBootstrapDefaultPathReusesExistingLegacyDefaultConfig(t *testing.T) {
 func TestBootstrapDefaultPathPrefersCanonicalTOMLWhenNoDefaultExists(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("LOOPER_CONFIG", "")
 
 	runtime := newCommandRuntime(New(Deps{}), nil)
 	resolvedPath, err := runtime.resolveBootstrapConfigPath(t.TempDir())

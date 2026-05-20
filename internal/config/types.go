@@ -274,15 +274,30 @@ type PackageConfig struct {
 	RequireBackupBeforeMigrate bool   `json:"requireBackupBeforeMigrate"`
 }
 
-type ProjectNetworkMode string
+type NetworkMode string
 
 const (
-	ProjectNetworkModeOff    ProjectNetworkMode = "off"
-	ProjectNetworkModeRouted ProjectNetworkMode = "routed"
+	NetworkModeOff    NetworkMode = "off"
+	NetworkModeRouted NetworkMode = "routed"
 )
 
+type ProjectNetworkMode = NetworkMode
+
+const (
+	ProjectNetworkModeOff    = NetworkModeOff
+	ProjectNetworkModeRouted = NetworkModeRouted
+)
+
+type NetworkConfig struct {
+	Enrolled         bool   `json:"enrolled"`
+	LoopernetBaseURL string `json:"loopernetBaseUrl"`
+	NodeName         string `json:"nodeName"`
+	GitHubLogin      string `json:"githubLogin"`
+	GitHubUserID     int64  `json:"githubUserId,omitempty"`
+}
+
 type ProjectNetworkConfig struct {
-	Mode ProjectNetworkMode `json:"mode"`
+	Mode NetworkMode `json:"mode,omitempty"`
 }
 
 type DefaultsConfig struct {
@@ -561,15 +576,15 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
-	ID           string                `json:"id"`
-	Name         string                `json:"name"`
-	RepoPath     string                `json:"repoPath"`
-	Path         string                `json:"path,omitempty"`
-	BaseBranch   *string               `json:"baseBranch,omitempty"`
-	WorktreeRoot *string               `json:"worktreeRoot,omitempty"`
-	Network      *ProjectNetworkConfig `json:"network,omitempty"`
-	Webhook      ProjectWebhookConfig  `json:"webhook,omitempty"`
-	Roles        *PartialRoleConfigs   `json:"roles,omitempty"`
+	ID           string               `json:"id"`
+	Name         string               `json:"name"`
+	RepoPath     string               `json:"repoPath"`
+	Path         string               `json:"path,omitempty"`
+	BaseBranch   *string              `json:"baseBranch,omitempty"`
+	WorktreeRoot *string              `json:"worktreeRoot,omitempty"`
+	Network      ProjectNetworkConfig `json:"network,omitempty"`
+	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
+	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -583,10 +598,14 @@ type PartialProjectRefConfig struct {
 	Path         string                       `json:"path,omitempty"`
 	BaseBranch   *string                      `json:"baseBranch,omitempty"`
 	WorktreeRoot *string                      `json:"worktreeRoot,omitempty"`
-	Network      *ProjectNetworkConfig        `json:"network,omitempty"`
+	Network      *PartialProjectNetworkConfig `json:"network,omitempty"`
 	Webhook      *PartialProjectWebhookConfig `json:"webhook,omitempty"`
 	Instructions map[string]string            `json:"instructions,omitempty"`
 	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
+}
+
+type PartialProjectNetworkConfig struct {
+	Mode *NetworkMode `json:"mode,omitempty"`
 }
 
 type PartialProjectWebhookConfig struct {
@@ -598,6 +617,7 @@ type Config struct {
 	Storage       StorageConfig      `json:"storage"`
 	Scheduler     SchedulerConfig    `json:"scheduler"`
 	Webhook       WebhookConfig      `json:"webhook"`
+	Network       NetworkConfig      `json:"network"`
 	Agent         AgentConfig        `json:"agent"`
 	Logging       LoggingConfig      `json:"logging"`
 	Notifications NotificationConfig `json:"notifications"`
@@ -725,6 +745,14 @@ type PartialPackageConfig struct {
 	AutoUpgradeEnabled         *bool   `json:"autoUpgradeEnabled,omitempty"`
 	AutoMigrateOnStartup       *bool   `json:"autoMigrateOnStartup,omitempty"`
 	RequireBackupBeforeMigrate *bool   `json:"requireBackupBeforeMigrate,omitempty"`
+}
+
+type PartialNetworkConfig struct {
+	Enrolled         *bool   `json:"enrolled,omitempty"`
+	LoopernetBaseURL *string `json:"loopernetBaseUrl,omitempty"`
+	NodeName         *string `json:"nodeName,omitempty"`
+	GitHubLogin      *string `json:"githubLogin,omitempty"`
+	GitHubUserID     *int64  `json:"githubUserId,omitempty"`
 }
 
 type PartialDefaultsConfig struct {
@@ -1004,6 +1032,7 @@ type PartialConfig struct {
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`
 	Webhook        *PartialWebhookConfig      `json:"webhook,omitempty"`
+	Network        *PartialNetworkConfig      `json:"network,omitempty"`
 	Agent          *PartialAgentConfig        `json:"agent,omitempty"`
 	Logging        *PartialLoggingConfig      `json:"logging,omitempty"`
 	Notifications  *PartialNotificationConfig `json:"notifications,omitempty"`

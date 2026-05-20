@@ -43,6 +43,12 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
+      "network": {
+        "enrolled": false,
+        "githubLogin": "",
+        "loopernetBaseUrl": "",
+        "nodeName": ""
+      },
       "agent": {
         "params": {},
         "env": {},

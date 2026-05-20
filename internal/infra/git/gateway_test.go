@@ -290,7 +290,7 @@ func TestGatewayPushesHeadToRequestedRemoteBranch(t *testing.T) {
 	}
 }
 
-func TestGatewayRecreatesAttachedBranchWorktreeForDetachedMode(t *testing.T) {
+func TestGatewayCreatesSeparateDetachedWorktreeForAttachedBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
 	fixture.createLocalFeatureRepo(t)
@@ -305,40 +305,69 @@ func TestGatewayRecreatesAttachedBranchWorktreeForDetachedMode(t *testing.T) {
 	}
 
 	detached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached})
+	if err != nil {
+		t.Fatalf("CreateWorktree(detached) error = %v", err)
+	}
+	if detached.WorktreePath == attached.WorktreePath {
+		t.Fatalf("detached worktree path = %q, want separate path from attached worktree", detached.WorktreePath)
+	}
+	if got := stringsTrimSpace(runGit(t, detached.WorktreePath, "branch", "--show-current")); got != "" {
+		t.Fatalf("detached branch = %q, want empty", got)
+	}
+	if _, err := os.Stat(attached.WorktreePath); err != nil {
+		t.Fatalf("attached worktree missing after detached create: %v", err)
+	}
+}
+
+func TestGatewayCreatesSeparateAttachedWorktreeForDetachedBranch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+
+	detached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached})
+	if err != nil {
+		t.Fatalf("CreateWorktree(detached) error = %v", err)
+	}
+	if got := stringsTrimSpace(runGit(t, detached.WorktreePath, "branch", "--show-current")); got != "" {
+		t.Fatalf("detached branch = %q, want empty", got)
+	}
+
+	attached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("CreateWorktree(attached) error = %v", err)
+	}
+	if attached.WorktreePath == detached.WorktreePath {
+		t.Fatalf("attached worktree path = %q, want separate path from detached worktree", attached.WorktreePath)
+	}
+	if got := stringsTrimSpace(runGit(t, attached.WorktreePath, "branch", "--show-current")); got != "feature/fixer" {
+		t.Fatalf("attached branch = %q, want feature/fixer", got)
+	}
+	if _, err := os.Stat(detached.WorktreePath); err != nil {
+		t.Fatalf("detached worktree missing after attached create: %v", err)
+	}
+}
+
+func TestGatewayRecreatesBranchNamedWorktreeAsDetachedAtSamePath(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+
+	attached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("CreateWorktree(attached) error = %v", err)
+	}
+
+	detached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", CheckoutMode: CheckoutModeDetached})
 	if err != nil {
 		t.Fatalf("CreateWorktree(detached) error = %v", err)
 	}
 	if detached.WorktreePath != attached.WorktreePath {
-		t.Fatalf("detached worktree path = %q, want %q", detached.WorktreePath, attached.WorktreePath)
+		t.Fatalf("detached path = %q, want %q", detached.WorktreePath, attached.WorktreePath)
 	}
 	if got := stringsTrimSpace(runGit(t, detached.WorktreePath, "branch", "--show-current")); got != "" {
 		t.Fatalf("detached branch = %q, want empty", got)
-	}
-}
-
-func TestGatewayRecreatesDetachedWorktreeForBranchMode(t *testing.T) {
-	ctx := context.Background()
-	fixture := newFixture(t)
-	fixture.createLocalFeatureRepo(t)
-	gateway := fixture.gateway()
-
-	detached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached})
-	if err != nil {
-		t.Fatalf("CreateWorktree(detached) error = %v", err)
-	}
-	if got := stringsTrimSpace(runGit(t, detached.WorktreePath, "branch", "--show-current")); got != "" {
-		t.Fatalf("detached branch = %q, want empty", got)
-	}
-
-	attached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42})
-	if err != nil {
-		t.Fatalf("CreateWorktree(attached) error = %v", err)
-	}
-	if attached.WorktreePath != detached.WorktreePath {
-		t.Fatalf("attached worktree path = %q, want %q", attached.WorktreePath, detached.WorktreePath)
-	}
-	if got := stringsTrimSpace(runGit(t, attached.WorktreePath, "branch", "--show-current")); got != "feature/fixer" {
-		t.Fatalf("attached branch = %q, want feature/fixer", got)
 	}
 }
 
@@ -353,6 +382,30 @@ func TestGatewayRecreatesStoredAttachedWorktreeWhenOnWrongBranch(t *testing.T) {
 		t.Fatalf("CreateWorktree() error = %v", err)
 	}
 	runGit(t, worktree.WorktreePath, "checkout", "feature/other")
+
+	restored, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("CreateWorktree(recreated) error = %v", err)
+	}
+	if restored.WorktreePath != worktree.WorktreePath {
+		t.Fatalf("restored path = %q, want %q", restored.WorktreePath, worktree.WorktreePath)
+	}
+	if got := stringsTrimSpace(runGit(t, restored.WorktreePath, "branch", "--show-current")); got != "feature/fixer" {
+		t.Fatalf("restored branch = %q, want feature/fixer", got)
+	}
+}
+
+func TestGatewayRecreatesStoredAttachedWorktreeWhenDetached(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	runGit(t, worktree.WorktreePath, "checkout", "HEAD")
 
 	restored, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42})
 	if err != nil {
@@ -395,7 +448,7 @@ func TestGatewayRecreatesWorktreeWhenStoredRowPointsAtDeletedPath(t *testing.T) 
 	fixture.createMainOnlyRepo(t)
 	gateway := fixture.gateway()
 
-	missingWorktreePath := filepath.Join(fixture.worktreeRoot, "looper-fix-project_1-pr-42")
+	missingWorktreePath := filepath.Join(fixture.worktreeRoot, "looper-fix-project_1-pr-42-detached")
 	metadata := `{"recovered":false}`
 	baseBranch := "main"
 	if err := fixture.repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{ID: "missing-record", ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreePath: missingWorktreePath, Branch: "feature/fixer", BaseBranch: &baseBranch, Status: "active", MetadataJSON: &metadata, CreatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout), UpdatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout)}); err != nil {
@@ -650,8 +703,6 @@ func TestGatewayResolveDetachedStartPointPropagatesFetchFailure(t *testing.T) {
 }
 
 func TestGatewayRetriesFetchWhenRemoteTrackingRefWasUpdatedConcurrently(t *testing.T) {
-	t.Parallel()
-
 	ctx := context.Background()
 	gitPath := writeFakeGit(t, `#!/bin/sh
 count_file="$FAKE_GIT_COUNT"
@@ -936,9 +987,17 @@ func runGitCommand(cwd string, args ...string) (string, error) {
 
 func writeFakeGit(t *testing.T, script string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "git")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile(%q) error = %v", path, err)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "git")
+	tmpPath := filepath.Join(dir, "git.tmp")
+	if err := os.WriteFile(tmpPath, []byte(script), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", tmpPath, err)
+	}
+	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		t.Fatalf("Chmod(%q) error = %v", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		t.Fatalf("Rename(%q, %q) error = %v", tmpPath, path, err)
 	}
 	return path
 }

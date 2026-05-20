@@ -103,6 +103,12 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
+      "network": {
+        "enrolled": false,
+        "githubLogin": "",
+        "loopernetBaseUrl": "",
+        "nodeName": ""
+      },
       "agent": {
         "vendor": "opencode",
         "params": {
@@ -409,6 +415,9 @@
         {
           "id": "demo",
           "name": "Demo",
+          "network": {
+            "mode": "off"
+          },
           "repoPath": "__TMP__/repo",
           "webhook": {}
         }

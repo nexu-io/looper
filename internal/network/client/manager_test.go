@@ -73,7 +73,7 @@ func TestManagerReportsIdentityDriftAndRemoteReachability(t *testing.T) {
 	gh := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
 		return shell.Result{Stdout: `{"login":"current-user","id":202}`}, nil
 	}})
-	cfg := config.Config{Projects: []config.ProjectRefConfig{{ID: "demo-local", Network: nil}, {ID: "demo-routed", Network: &config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}, Roles: config.RoleConfigs{Worker: config.WorkerRoleConfig{AutoDiscovery: true}, Reviewer: config.ReviewerRoleConfig{Discovery: config.ReviewerRoleDiscoveryConfig{AutoDiscovery: true}}}}
+	cfg := config.Config{Projects: []config.ProjectRefConfig{{ID: "demo-local"}, {ID: "demo-routed", Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}, Roles: config.RoleConfigs{Worker: config.WorkerRoleConfig{AutoDiscovery: true}, Reviewer: config.ReviewerRoleConfig{Discovery: config.ReviewerRoleDiscoveryConfig{AutoDiscovery: true}}}}
 	manager := NewManager(statePath, cfg, nil, gh)
 	if err := manager.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -128,7 +128,7 @@ func TestManagerClearsIdentityDriftAfterIdentityMatches(t *testing.T) {
 		defer mu.Unlock()
 		return shell.Result{Stdout: fmt.Sprintf(`{"login":%q,"id":%d}`, identity.Login, identity.NumericID)}, nil
 	}})
-	manager := NewManager(statePath, config.Config{Projects: []config.ProjectRefConfig{{ID: "demo-routed", Network: &config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}}, nil, gh)
+	manager := NewManager(statePath, config.Config{Projects: []config.ProjectRefConfig{{ID: "demo-routed", Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}}, nil, gh)
 	if err := manager.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
