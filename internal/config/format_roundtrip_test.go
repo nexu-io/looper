@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -36,6 +37,30 @@ func TestCanonicalDomainsRoundTripAcrossStructuredFormats(t *testing.T) {
 					t.Fatalf("%s domain mismatch after %s round trip\nactual: %#v\nwant: %#v", name, format, extract(roundTripped), extract(original))
 				}
 			})
+		}
+	}
+}
+
+func TestMarshalConfigFilePreservesIntegerTOMLNumbers(t *testing.T) {
+	mode := WebhookModeTunnel
+	listenPort := 17311
+	publicBaseURL := "https://looper.example.test"
+	fallback := 300
+	partial := PartialConfig{Webhook: &PartialWebhookConfig{Enabled: fixtureBoolPtr(true), Mode: &mode, ListenPort: &listenPort, PublicBaseURL: &publicBaseURL, FallbackPollIntervalSeconds: &fallback}}
+
+	raw, err := MarshalConfigFile("config.toml", partial)
+	if err != nil {
+		t.Fatalf("MarshalConfigFile() error = %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{"fallbackPollIntervalSeconds = 300", "listenPort = 17311"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("MarshalConfigFile() missing %q:\n%s", want, text)
+		}
+	}
+	for _, notWant := range []string{"fallbackPollIntervalSeconds = 300.0", "listenPort = 17311.0"} {
+		if strings.Contains(text, notWant) {
+			t.Fatalf("MarshalConfigFile() contained %q:\n%s", notWant, text)
 		}
 	}
 }

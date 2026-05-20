@@ -907,9 +907,9 @@ func (w *webhookRuntime) runForwarder(repo string) {
 				localStderrTail = appendTail(localStderrTail, line, webhookForwarderStderrTailLines)
 			})
 		}()
+		pipes.Wait()
 		err = cmd.Wait()
 		close(stopKillDone)
-		pipes.Wait()
 		exitedAt := formatJavaScriptISOString(w.currentTime().UTC())
 		message := ""
 		if err != nil {

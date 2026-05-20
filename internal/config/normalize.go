@@ -1384,6 +1384,14 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 	return cloned
 }
 
+func cloneProjectNetworkConfig(config *ProjectNetworkConfig) *ProjectNetworkConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	return &cloned
+}
+
 func mergeLegacyProjectInstructionsIntoRoles(roles *PartialRoleConfigs, instructions map[string]string) *PartialRoleConfigs {
 	if len(instructions) == 0 {
 		return roles

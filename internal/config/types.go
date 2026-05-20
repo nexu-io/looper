@@ -281,6 +281,13 @@ const (
 	NetworkModeRouted NetworkMode = "routed"
 )
 
+type ProjectNetworkMode = NetworkMode
+
+const (
+	ProjectNetworkModeOff    = NetworkModeOff
+	ProjectNetworkModeRouted = NetworkModeRouted
+)
+
 type NetworkConfig struct {
 	Enrolled         bool   `json:"enrolled"`
 	LoopernetBaseURL string `json:"loopernetBaseUrl"`

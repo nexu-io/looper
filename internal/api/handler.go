@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
@@ -736,6 +737,7 @@ type statusResponse struct {
 	Scheduler     statusScheduler     `json:"scheduler"`
 	Webhook       statusWebhook       `json:"webhook"`
 	Loops         statusLoops         `json:"loops"`
+	Network       any                 `json:"network,omitempty"`
 	Safety        statusSafety        `json:"safety"`
 	Notifications statusNotifications `json:"notifications"`
 	Tools         statusTools         `json:"tools"`
@@ -1025,6 +1027,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 		},
 		Webhook: summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:   loopCounts,
+		Network: h.buildNetworkStatusResponse(),
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -1043,6 +1046,13 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Osascript: hasValue(h.context.Config.Tools.OsascriptPath),
 		},
 	}, nil
+}
+
+func (h *Handler) buildNetworkStatusResponse() any {
+	if runtimeWithNetwork, ok := any(h.context.Runtime).(interface{ NetworkStatus() networkclient.Status }); ok {
+		return runtimeWithNetwork.NetworkStatus()
+	}
+	return nil
 }
 
 type storageState struct {
