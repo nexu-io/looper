@@ -174,6 +174,10 @@ func DefaultConfig(cwd string) (Config, error) {
 					APITimeoutSeconds: 10,
 					APIRetryAttempts:  3,
 				},
+				MergeWatch: CoordinatorMergeWatchConfig{
+					TransientRetries:         3,
+					MaxIndeterminateDuration: "15m",
+				},
 			},
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,

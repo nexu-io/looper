@@ -229,6 +229,10 @@
             "apiTimeoutSeconds": 10,
             "apiRetryAttempts": 3
           },
+          "mergeWatch": {
+            "maxIndeterminateDuration": "15m",
+            "transientRetries": 3
+          },
           "dispatch": {
             "mode": "human-gated",
             "humanGate": {

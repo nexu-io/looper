@@ -537,12 +537,18 @@ type CoordinatorDependenciesConfig struct {
 	APIRetryAttempts  int  `json:"apiRetryAttempts"`
 }
 
+type CoordinatorMergeWatchConfig struct {
+	TransientRetries         int    `json:"transientRetries"`
+	MaxIndeterminateDuration string `json:"maxIndeterminateDuration"`
+}
+
 type CoordinatorRoleConfig struct {
 	Enabled      bool                          `json:"enabled"`
 	PollInterval string                        `json:"pollInterval"`
 	Triage       CoordinatorTriageConfig       `json:"triage"`
 	Dispatch     CoordinatorDispatchConfig     `json:"dispatch"`
 	Dependencies CoordinatorDependenciesConfig `json:"dependencies"`
+	MergeWatch   CoordinatorMergeWatchConfig   `json:"mergeWatch"`
 }
 
 type RoleConfigs struct {
@@ -970,12 +976,18 @@ type PartialCoordinatorDependenciesConfig struct {
 	APIRetryAttempts  *int  `json:"apiRetryAttempts,omitempty"`
 }
 
+type PartialCoordinatorMergeWatchConfig struct {
+	TransientRetries         *int    `json:"transientRetries,omitempty"`
+	MaxIndeterminateDuration *string `json:"maxIndeterminateDuration,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
 	Enabled      *bool                                 `json:"enabled,omitempty"`
 	PollInterval *string                               `json:"pollInterval,omitempty"`
 	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
 	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
 	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
+	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
 }
 
 type PartialRoleConfigs struct {

@@ -771,6 +771,9 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	if partial.Dependencies != nil {
 		mergeCoordinatorDependenciesConfig(&config.Dependencies, *partial.Dependencies)
 	}
+	if partial.MergeWatch != nil {
+		mergeCoordinatorMergeWatchConfig(&config.MergeWatch, *partial.MergeWatch)
+	}
 }
 
 func mergeCoordinatorTriageConfig(config *CoordinatorTriageConfig, partial PartialCoordinatorTriageConfig) {
@@ -842,6 +845,15 @@ func mergeCoordinatorDependenciesConfig(config *CoordinatorDependenciesConfig, p
 	}
 	if partial.APIRetryAttempts != nil {
 		config.APIRetryAttempts = *partial.APIRetryAttempts
+	}
+}
+
+func mergeCoordinatorMergeWatchConfig(config *CoordinatorMergeWatchConfig, partial PartialCoordinatorMergeWatchConfig) {
+	if partial.TransientRetries != nil {
+		config.TransientRetries = *partial.TransientRetries
+	}
+	if partial.MaxIndeterminateDuration != nil {
+		config.MaxIndeterminateDuration = *partial.MaxIndeterminateDuration
 	}
 }
 

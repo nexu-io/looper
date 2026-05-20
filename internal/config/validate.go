@@ -789,6 +789,16 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 			*issues = append(*issues, ValidationIssue{Path: path + ".dependencies.apiRetryAttempts", Message: "must be a positive integer when dependencies are enabled"})
 		}
 	}
+	if config.MergeWatch.TransientRetries <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.transientRetries", Message: "must be a positive integer"})
+	}
+	if strings.TrimSpace(config.MergeWatch.MaxIndeterminateDuration) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be a non-empty duration string"})
+	} else if duration, err := time.ParseDuration(strings.TrimSpace(config.MergeWatch.MaxIndeterminateDuration)); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be a valid time.Duration string"})
+	} else if duration <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be greater than 0"})
+	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},
 		{Path: path + ".triage.disposition.outOfScopeLabel", Value: config.Triage.Disposition.OutOfScopeLabel},

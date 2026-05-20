@@ -93,6 +93,32 @@ type PullRequestDetail struct {
 	IssueComments     []CommentInfo
 	Reviews           []map[string]any
 	Checks            []map[string]any
+	Mergeable         *bool
+	MergeableState    string
+	MergedAt          string
+	AutoMerge         *PullRequestAutoMerge
+}
+
+type PullRequestAutoMerge struct {
+	EnabledBy   string
+	MergeMethod string
+}
+
+type PullRequestCheckRuns struct {
+	TotalCount int
+	CheckRuns  []PullRequestCheckRun
+	Statuses   []PullRequestStatus
+}
+
+type PullRequestCheckRun struct {
+	Name       string
+	Status     string
+	Conclusion string
+}
+
+type PullRequestStatus struct {
+	Context string
+	State   string
 }
 
 type CommentInfo struct {
@@ -201,6 +227,7 @@ type BranchProtectionInput struct {
 type BranchProtection struct {
 	Enabled           bool
 	HasRequiredChecks bool
+	RequiredChecks    []string
 }
 
 type IssueSummary struct {
@@ -288,6 +315,12 @@ type UpdateIssueCommentInput struct {
 	CWD       string
 }
 
+type DeleteIssueCommentInput struct {
+	Repo      string
+	CommentID int64
+	CWD       string
+}
+
 type CloseIssueInput struct {
 	Repo        string
 	IssueNumber int64
@@ -307,6 +340,12 @@ type EnableAutoMergeInput struct {
 	Strategy config.ReviewerAutoMergeStrategy
 	HeadSHA  string
 	CWD      string
+}
+
+type PullRequestCheckRunsInput struct {
+	Repo string
+	Ref  string
+	CWD  string
 }
 
 type SubmitReviewInput struct {
@@ -1005,6 +1044,16 @@ func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueComme
 	return err
 }
 
+func (g *Gateway) DeleteIssueComment(ctx context.Context, input DeleteIssueCommentInput) error {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/comments/%d", repo, input.CommentID), "--method", "DELETE"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
 func (g *Gateway) CloseIssue(ctx context.Context, input CloseIssueInput) error {
 	reason, err := validateCloseIssueStateReason(input.StateReason)
 	if err != nil {
@@ -1147,15 +1196,28 @@ func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectio
 	}
 	requiredStatusChecks, _ := row["required_status_checks"].(map[string]any)
 	hasRequiredChecks := false
+	requiredChecks := []string{}
 	if requiredStatusChecks != nil {
-		if len(toObjectSlice(requiredStatusChecks["checks"])) > 0 {
+		for _, check := range toObjectSlice(requiredStatusChecks["checks"]) {
+			name := firstNonEmpty(asString(check["context"]), asString(check["name"]))
+			if strings.TrimSpace(name) != "" {
+				requiredChecks = append(requiredChecks, name)
+			}
+		}
+		if len(requiredChecks) > 0 {
 			hasRequiredChecks = true
 		}
 		if contexts, ok := requiredStatusChecks["contexts"].([]any); ok && len(contexts) > 0 {
 			hasRequiredChecks = true
+			for _, context := range contexts {
+				name := asString(context)
+				if strings.TrimSpace(name) != "" {
+					requiredChecks = append(requiredChecks, name)
+				}
+			}
 		}
 	}
-	return BranchProtection{Enabled: true, HasRequiredChecks: hasRequiredChecks}, nil
+	return BranchProtection{Enabled: true, HasRequiredChecks: hasRequiredChecks, RequiredChecks: uniqueStrings(requiredChecks)}, nil
 }
 
 func compactIssueAssignees(values []string) []string {
@@ -1214,7 +1276,95 @@ func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestI
 		IssueComments:     extractCommentInfos(toObjectSlice(row["comments"])),
 		Reviews:           toObjectSlice(row["reviews"]),
 		Checks:            toObjectSlice(row["statusCheckRollup"]),
+		Mergeable:         boolPtrFromValue(row["mergeable"]),
+		MergeableState:    asString(row["mergeable_state"]),
+		MergedAt:          asString(row["merged_at"]),
+		AutoMerge:         extractAutoMerge(row["auto_merge"]),
 	}, nil
+}
+
+func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return PullRequestDetail{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return PullRequestDetail{}, err
+	}
+	return PullRequestDetail{
+		Number:         asInt64(row["number"]),
+		Title:          asString(row["title"]),
+		Body:           asString(row["body"]),
+		URL:            firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
+		State:          asString(row["state"]),
+		CreatedAt:      firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
+		UpdatedAt:      firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
+		ClosedAt:       firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
+		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
+		Labels:         extractLabelNames(row["labels"]),
+		HeadRefName:    nestedString(row, "head", "ref"),
+		BaseRefName:    nestedString(row, "base", "ref"),
+		HeadSHA:        nestedString(row, "head", "sha"),
+		BaseSHA:        nestedString(row, "base", "sha"),
+		Mergeable:      boolPtrFromValue(row["mergeable"]),
+		MergeableState: firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"])),
+		AutoMerge:      extractAutoMerge(row["auto_merge"]),
+	}, nil
+}
+
+func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/commits/%s/check-runs", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return PullRequestCheckRuns{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return PullRequestCheckRuns{}, err
+	}
+	statusArgs := []string{"api", fmt.Sprintf("repos/%s/commits/%s/status", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		statusArgs = append(statusArgs, "--hostname", hostname)
+	}
+	statusResult, err := g.runGh(ctx, input.CWD, "", statusArgs...)
+	if err != nil {
+		return PullRequestCheckRuns{}, err
+	}
+	statusRow, err := decodeJSONObject(statusResult.Stdout)
+	if err != nil {
+		return PullRequestCheckRuns{}, err
+	}
+	checkRuns := toObjectSlice(row["check_runs"])
+	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
+	for _, checkRun := range checkRuns {
+		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"])})
+	}
+	statuses := toObjectSlice(statusRow["statuses"])
+	out.Statuses = make([]PullRequestStatus, 0, len(statuses))
+	seenContexts := map[string]struct{}{}
+	for _, status := range statuses {
+		contextName := asString(status["context"])
+		key := strings.ToLower(strings.TrimSpace(contextName))
+		if key == "" {
+			continue
+		}
+		if _, ok := seenContexts[key]; ok {
+			continue
+		}
+		seenContexts[key] = struct{}{}
+		out.Statuses = append(out.Statuses, PullRequestStatus{Context: contextName, State: asString(status["state"])})
+	}
+	return out, nil
 }
 
 func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRequestsInput) ([]LinkedPullRequest, error) {
@@ -3205,6 +3355,14 @@ func asBool(value any) bool {
 	return ok && typed
 }
 
+func boolPtrFromValue(value any) *bool {
+	typed, ok := value.(bool)
+	if !ok {
+		return nil
+	}
+	return &typed
+}
+
 func asInt64(value any) int64 {
 	switch typed := value.(type) {
 	case float64:
@@ -3260,6 +3418,46 @@ func valueOr(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func nestedString(value map[string]any, path ...string) string {
+	current := any(value)
+	for _, part := range path {
+		next, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current = next[part]
+	}
+	return asString(current)
+}
+
+func extractAutoMerge(value any) *PullRequestAutoMerge {
+	row, ok := value.(map[string]any)
+	if !ok || row == nil {
+		return nil
+	}
+	return &PullRequestAutoMerge{
+		EnabledBy:   extractAuthor(firstNonNil(row["enabled_by"], row["enabledBy"])),
+		MergeMethod: firstNonEmpty(asString(row["merge_method"]), asString(row["mergeMethod"])),
+	}
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, strings.TrimSpace(value))
+	}
+	return out
 }
 
 func ternary[T any](condition bool, truthy, falsy T) T {
