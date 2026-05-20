@@ -678,12 +678,15 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue)})
 	}
 	sortAutonomousDispatchCandidates(ready)
-	budget, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
+	budget, preemptWorkers, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
 	if err != nil {
 		return err
 	}
 	dispatched := 0
 	for _, candidate := range ready {
+		if preemptWorkers && candidate.worker {
+			continue
+		}
 		if dispatched >= budget {
 			break
 		}
@@ -712,17 +715,17 @@ func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) 
 	})
 }
 
-func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, ready []autonomousDispatchCandidate, downstreamLabels downstreamTriggerLabels) (int, error) {
+func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, ready []autonomousDispatchCandidate, downstreamLabels downstreamTriggerLabels) (int, bool, error) {
 	if r == nil || r.config == nil || r.config.Scheduler.MaxConcurrentRuns <= 0 {
-		return int(^uint(0) >> 1), nil
+		return int(^uint(0) >> 1), false, nil
 	}
 	maxConcurrentRuns := r.config.Scheduler.MaxConcurrentRuns
 	running, err := r.runningQueueItems(ctx)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if running >= maxConcurrentRuns {
-		return 0, nil
+		return 0, false, nil
 	}
 	budget := maxConcurrentRuns - running
 	readyWorkers := 0
@@ -734,13 +737,13 @@ func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string
 	if readyWorkers > 0 && running+readyWorkers >= maxConcurrentRuns {
 		pending, err := r.hasPendingReviewerOrFixerWork(ctx, projectID, repo, cwd, loaded, downstreamLabels)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		if pending {
-			return 0, nil
+			return budget, true, nil
 		}
 	}
-	return budget, nil
+	return budget, false, nil
 }
 
 func (r *Runner) runningQueueItems(ctx context.Context) (int, error) {
