@@ -748,6 +748,27 @@ func TestRunnerAutonomousDispatchPreemptionCountsWorkerDispatchesFromDispatchTyp
 	assertAssignedIssueNumbers(t, fixture.github.assigned, nil)
 }
 
+func TestRunnerAutonomousDispatchPreemptionOnlyCountsWorkersWithinTickBudget(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/plan"})
+	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/implement"})
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: []string{"looper:review"}, ReviewRequests: []string{"looper"}}
+	seedRunningQueueItems(t, fixture, 1)
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1})
+}
+
 func TestRunnerMatchesHostnameQualifiedRepoDependencies(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)

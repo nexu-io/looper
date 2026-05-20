@@ -724,8 +724,9 @@ func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string
 	if running >= maxConcurrentRuns {
 		return 0, nil
 	}
+	budget := maxConcurrentRuns - running
 	readyWorkers := 0
-	for _, candidate := range ready {
+	for _, candidate := range ready[:min(len(ready), budget)] {
 		if candidate.worker {
 			readyWorkers++
 		}
@@ -739,7 +740,7 @@ func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string
 			return 0, nil
 		}
 	}
-	return maxConcurrentRuns - running, nil
+	return budget, nil
 }
 
 func (r *Runner) runningQueueItems(ctx context.Context) (int, error) {
