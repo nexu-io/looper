@@ -51,7 +51,9 @@ type loadedCoordinatorIssue struct {
 
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
+	ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
+	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
@@ -120,6 +122,15 @@ type issueOrder struct {
 	index        int
 }
 
+type downstreamTriggerLabels struct {
+	reviewer     []string
+	reviewerMode config.LabelMode
+	fixer        []string
+	fixerMode    config.LabelMode
+	worker       []string
+	workerMode   config.LabelMode
+}
+
 func New(options Options) *Runner {
 	now := options.Now
 	if now == nil {
@@ -165,7 +176,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
-	dispatchCfg := roleConfigToDispatchConfig(roleCfg, config.ProjectRoleConfigs(*r.config, input.ProjectID))
+	projectRoles := config.ProjectRoleConfigs(*r.config, input.ProjectID)
+	dispatchCfg := roleConfigToDispatchConfig(roleCfg, projectRoles)
+	downstreamLabels := downstreamTriggerLabels{
+		reviewer:     append([]string(nil), projectRoles.Reviewer.Discovery.Triggers.Labels...),
+		reviewerMode: projectRoles.Reviewer.Discovery.Triggers.LabelMode,
+		fixer:        append([]string(nil), projectRoles.Fixer.Triggers.Labels...),
+		fixerMode:    projectRoles.Fixer.Triggers.LabelMode,
+		worker:       append([]string(nil), projectRoles.Worker.Triggers.Labels...),
+		workerMode:   projectRoles.Worker.Triggers.LabelMode,
+	}
 	loaded := make([]loadedIssue, 0, len(issues))
 	for _, summary := range issues {
 		if ShouldSkipIssue(IssueSummary{Number: summary.Number, Labels: summary.Labels}, roleCfg, sweeperCfg) {
@@ -185,7 +205,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err := r.applyDependencyActions(ctx, input.Repo, project.RepoPath, triageCfg, deps); err != nil {
 		return DiscoveryResult{}, err
 	}
-	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, deps); err != nil {
+	if err := r.applyDispatches(ctx, input.Repo, project.RepoPath, loaded, triageCfg, dispatchCfg, deps, downstreamLabels); err != nil {
 		return DiscoveryResult{}, err
 	}
 
@@ -578,9 +598,9 @@ func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, t
 	return nil
 }
 
-func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
 	if dispatchCfg.Mode == dispatch.ModeAutonomous {
-		return r.applyAutonomousDispatches(ctx, repo, cwd, loaded, triageCfg, dispatchCfg, deps)
+		return r.applyAutonomousDispatches(ctx, repo, cwd, loaded, triageCfg, dispatchCfg, deps, downstreamLabels)
 	}
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -601,7 +621,7 @@ func (r *Runner) applyDispatches(ctx context.Context, repo, cwd string, loaded [
 	return nil
 }
 
-func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState) error {
+func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, deps dependencyState, downstreamLabels downstreamTriggerLabels) error {
 	ready := make([]autonomousDispatchCandidate, 0, len(loaded))
 	for _, item := range loaded {
 		if _, skip := deps.retriageIssueNumbers[item.issue.Number]; skip {
@@ -623,13 +643,20 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, repo, cwd string
 				}
 			}
 		}
-		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number]})
+		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: labelsMatch(action.TriggerLabels, downstreamLabels.worker, downstreamLabels.workerMode)})
 	}
 	sortAutonomousDispatchCandidates(ready)
-	budget := r.dispatchBudget()
-	for index, candidate := range ready {
-		if index >= budget {
-			break
+	budget, err := r.dispatchBudget(ctx, repo, cwd, loaded, ready, downstreamLabels)
+	if err != nil {
+		return err
+	}
+	workersDispatched := 0
+	for _, candidate := range ready {
+		if candidate.worker {
+			if workersDispatched >= budget {
+				continue
+			}
+			workersDispatched++
 		}
 		if err := r.applyDispatchAction(ctx, repo, cwd, candidate.issue, candidate.action); err != nil {
 			return err
@@ -642,6 +669,7 @@ type autonomousDispatchCandidate struct {
 	issue  triage.Issue
 	action dispatch.Action
 	order  issueOrder
+	worker bool
 }
 
 func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) {
@@ -654,11 +682,138 @@ func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) 
 	})
 }
 
-func (r *Runner) dispatchBudget() int {
+func (r *Runner) dispatchBudget(ctx context.Context, repo, cwd string, loaded []loadedIssue, ready []autonomousDispatchCandidate, downstreamLabels downstreamTriggerLabels) (int, error) {
 	if r == nil || r.config == nil || r.config.Scheduler.MaxConcurrentRuns <= 0 {
-		return int(^uint(0) >> 1)
+		return int(^uint(0) >> 1), nil
 	}
-	return r.config.Scheduler.MaxConcurrentRuns
+	maxConcurrentRuns := r.config.Scheduler.MaxConcurrentRuns
+	running, err := r.runningQueueItems(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if running >= maxConcurrentRuns {
+		return 0, nil
+	}
+	readyWorkers := 0
+	for _, candidate := range ready {
+		if candidate.worker {
+			readyWorkers++
+		}
+	}
+	if readyWorkers == 0 {
+		return 0, nil
+	}
+	if running+readyWorkers >= maxConcurrentRuns {
+		pending, err := r.hasPendingReviewerOrFixerWork(ctx, repo, cwd, loaded, downstreamLabels)
+		if err != nil {
+			return 0, err
+		}
+		if pending {
+			return 0, nil
+		}
+	}
+	return maxConcurrentRuns - running, nil
+}
+
+func (r *Runner) runningQueueItems(ctx context.Context) (int, error) {
+	if r == nil || r.repos == nil || r.repos.Queue == nil {
+		return 0, nil
+	}
+	count, err := r.repos.Queue.CountByStatus(ctx, "running")
+	if err != nil {
+		return 0, err
+	}
+	return int(count), nil
+}
+
+func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, repo, cwd string, loaded []loadedIssue, downstreamLabels downstreamTriggerLabels) (bool, error) {
+	if r == nil || r.config == nil || r.repos == nil || r.github == nil {
+		return false, nil
+	}
+	reviewerLabels := downstreamLabels.reviewer
+	fixerLabels := downstreamLabels.fixer
+	if len(reviewerLabels) == 0 && len(fixerLabels) == 0 {
+		return false, nil
+	}
+	active, err := r.activeQueueItemsByPR(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, issue := range loaded {
+		prs, err := r.github.ListLinkedPullRequests(ctx, githubinfra.LinkedPullRequestsInput{Repo: repo, IssueNumber: issue.issue.Number, CWD: cwd})
+		if err != nil {
+			return false, err
+		}
+		for _, pr := range prs {
+			if !strings.EqualFold(strings.TrimSpace(pr.State), "OPEN") {
+				continue
+			}
+			detail, err := r.github.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: pr.Number, CWD: cwd})
+			if err != nil {
+				return false, err
+			}
+			prKey := queuePullRequestKey(repo, pr.Number)
+			if labelsMatch(detail.Labels, reviewerLabels, downstreamLabels.reviewerMode) && !active["reviewer"][prKey] {
+				return true, nil
+			}
+			if labelsMatch(detail.Labels, fixerLabels, downstreamLabels.fixerMode) && !active["fixer"][prKey] {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (r *Runner) activeQueueItemsByPR(ctx context.Context) (map[string]map[string]bool, error) {
+	active := map[string]map[string]bool{"reviewer": {}, "fixer": {}}
+	if r == nil || r.repos == nil || r.repos.Queue == nil {
+		return active, nil
+	}
+	items, err := r.repos.Queue.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if item.Status != "queued" && item.Status != "running" {
+			continue
+		}
+		if item.Repo == nil || item.PRNumber == nil {
+			continue
+		}
+		if _, ok := active[item.Type]; !ok {
+			continue
+		}
+		active[item.Type][queuePullRequestKey(*item.Repo, *item.PRNumber)] = true
+	}
+	return active, nil
+}
+
+func queuePullRequestKey(repo string, prNumber int64) string {
+	return fmt.Sprintf("%s#%d", repo, prNumber)
+}
+
+func labelsMatch(labels, expected []string, mode config.LabelMode) bool {
+	if len(labels) == 0 || len(expected) == 0 {
+		return false
+	}
+	available := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		available[trimmed] = struct{}{}
+	}
+	matches := 0
+	for _, label := range expected {
+		if _, ok := available[strings.TrimSpace(label)]; ok {
+			matches++
+		}
+	}
+	if mode == config.LabelModeAll {
+		return matches == len(expected)
+	}
+	return matches > 0
 }
 
 func applyHumanDependencyGate(action dispatch.Action, issueNumber int64, deps dependencyState) dispatch.Action {

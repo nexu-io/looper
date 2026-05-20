@@ -8,12 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var closesIssuePattern = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b`)
 
 const (
 	envFakeGHMode        = "LOOPER_E2E_FAKE_GH_MODE"
@@ -153,6 +156,9 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		}
 		return emitDefaultJSON(key, fields)
 	case "pr merge":
+		if err := handlePullRequestMerge(&st, os.Args[1:]); err != nil {
+			return err
+		}
 		_, _ = fmt.Fprintln(os.Stdout, "{}")
 		return nil
 	case "issue list", "pr list":
@@ -172,6 +178,57 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		_, _ = fmt.Fprintln(os.Stdout, "{}")
 		return nil
 	}
+}
+
+func handlePullRequestMerge(st *state, args []string) error {
+	prNumberValue := firstNonFlag(args[2:])
+	if strings.TrimSpace(prNumberValue) == "" {
+		return nil
+	}
+	prNumber, err := strconv.ParseInt(strings.TrimSpace(prNumberValue), 10, 64)
+	if err != nil {
+		return nil
+	}
+	repo := strings.TrimSpace(flagValue(args, "--repo"))
+	if repo == "" {
+		return nil
+	}
+	key := fmt.Sprintf("%s#%d", repo, prNumber)
+	pr, ok := st.PullRequests[key]
+	if !ok {
+		return nil
+	}
+	pr.State = "MERGED"
+	pr.ClosedAt = firstNonEmpty(pr.ClosedAt, "2026-05-12T00:00:00Z")
+	pr.UpdatedAt = firstNonEmpty(pr.UpdatedAt, "2026-05-12T00:00:00Z")
+	st.PullRequests[key] = pr
+	for _, match := range closesIssuePattern.FindAllStringSubmatch(pr.Body, -1) {
+		issueNumber, convErr := strconv.ParseInt(match[1], 10, 64)
+		if convErr != nil {
+			continue
+		}
+		closeLinkedIssueRoute(st, repo, issueNumber)
+	}
+	return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
+}
+
+func closeLinkedIssueRoute(st *state, repo string, issueNumber int64) {
+	route := fmt.Sprintf("repos/%s/issues/%d", repo, issueNumber)
+	payload, ok := st.Routes[route]
+	if !ok {
+		return
+	}
+	var issue map[string]any
+	if err := json.Unmarshal(payload, &issue); err != nil {
+		return
+	}
+	issue["state"] = "closed"
+	issue["state_reason"] = "completed"
+	updated, err := json.Marshal(issue)
+	if err != nil {
+		return
+	}
+	st.Routes[route] = updated
 }
 
 func handleAPI(mode string, st state, stdin string) error {

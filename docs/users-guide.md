@@ -158,6 +158,8 @@ Autonomous dispatch stops immediately when any veto signal is present:
 
 `looper:hold` is the operator-facing global hold contract for Coordinator dispatch.
 
+`looper:hold` blocks Coordinator's autonomous Dispatch, but it does not directly block Reviewer's `gh pr merge --auto` call once a PR is already open. If `looper:hold` causes the linked Issue to skip re-Triage, merge-watch's `BranchProtectionChanged` re-Triage action becomes a silent no-op, which is the intended hold semantic.
+
 ## 6. Planner: from issue to spec PR
 
 ### Start it manually
@@ -239,6 +241,31 @@ If reviewer considers the spec review clean, it will:
 
 - there are no unresolved review threads
 - the review decision is not `CHANGES_REQUESTED`
+
+### Reviewer auto-merge
+
+Reviewer can close a Looper code Issue end-to-end without a human pressing Merge.
+
+Prerequisites:
+
+- branch protection on the base branch with required checks
+- repo-level **Allow auto-merge** enabled
+- repo-level merge strategy enabled for the configured strategy (`squash`, `merge`, or `rebase`)
+- linked Issue body includes a `## Acceptance criteria` section
+
+Configuration lives under `roles.reviewer.autoMerge.*`, with the usual `projects[].roles.reviewer.autoMerge.*` overrides for project-specific repos.
+
+When auto-merge is enabled and the PR is in scope, Reviewer verifies every acceptance-criteria checkbox against the diff before it submits APPROVE. The approval body includes a per-criterion evidence section pointing at files and lines. If every criterion passes, Reviewer calls `gh pr merge --auto`; GitHub branch protection remains the authority for whether the PR actually merges.
+
+Comment markers used by this flow:
+
+- `<!-- looper:reviewer:criteria-fail -->` — Reviewer found at least one acceptance criterion without satisfying evidence in the diff and returned the linked Issue to re-Triage
+- `<!-- looper:reviewer:automerge-refused -->` — Reviewer approved the PR, but GitHub repo settings or branch protection refused the auto-merge opt-in
+- `<!-- looper:coordinator:merge-watch retries=N -->` — Coordinator is watching a merge-pending PR and carrying retry state on the linked Issue
+
+Human override is silent: if someone clicks **Disable auto-merge** on the PR, Looper respects it and does not re-enable auto-merge just because an earlier Reviewer pass opted in.
+
+Auto-merge is not engaged for Spec PRs, PRs whose linked Issue has no `## Acceptance criteria` section, or PRs outside the configured auto-merge scope.
 
 ## 8. Fixer: repair a PR based on review feedback
 

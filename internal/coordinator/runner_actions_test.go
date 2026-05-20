@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -536,9 +537,9 @@ func TestRunnerTieBreaksAutonomousDispatchByParentSubIssueOrder(t *testing.T) {
 	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
 	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
 	seedParentIssue(fixture, 10)
-	seedDispatchIssue(fixture, 11)
-	seedDispatchIssue(fixture, 12)
-	seedDispatchIssue(fixture, 13)
+	seedDispatchIssueWithLabels(fixture, 11, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 12, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 13, []string{"triaged", "dispatch/implement"})
 	fixture.github.subIssues[10] = []githubinfra.DependencyIssue{{Number: 12}, {Number: 11}, {Number: 13}}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
@@ -563,9 +564,9 @@ func TestRunnerTieBreakFallsBackToAscendingIssueNumber(t *testing.T) {
 	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
 	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
 	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
-	seedDispatchIssue(fixture, 22)
-	seedDispatchIssue(fixture, 21)
-	seedDispatchIssue(fixture, 23)
+	seedDispatchIssueWithLabels(fixture, 22, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 21, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 23, []string{"triaged", "dispatch/implement"})
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -584,9 +585,9 @@ func TestRunnerTieBreakFallsBackWhenSubIssueLookupFails(t *testing.T) {
 	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
 	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
 	seedParentIssue(fixture, 10)
-	seedDispatchIssue(fixture, 22)
-	seedDispatchIssue(fixture, 21)
-	seedDispatchIssue(fixture, 23)
+	seedDispatchIssueWithLabels(fixture, 22, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 21, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 23, []string{"triaged", "dispatch/implement"})
 	fixture.github.subIssueErr[10] = errors.New("sub issue api unavailable")
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
@@ -595,6 +596,87 @@ func TestRunnerTieBreakFallsBackWhenSubIssueLookupFails(t *testing.T) {
 	if fixture.github.assigned[0].IssueNumber != 21 || fixture.github.assigned[1].IssueNumber != 22 {
 		t.Fatalf("assigned order = %d,%d, want 21,22", fixture.github.assigned[0].IssueNumber, fixture.github.assigned[1].IssueNumber)
 	}
+}
+
+func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		maxConcurrentRuns int
+		running           int
+		readyIssues       []int64
+		downstreamType    string
+		wantAssigned      []int64
+	}{
+		{name: "pool has slack without downstream pending", maxConcurrentRuns: 3, running: 1, readyIssues: []int64{1, 2, 3}, wantAssigned: []int64{1, 2}},
+		{name: "pool would saturate without downstream pending", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, wantAssigned: []int64{1}},
+		{name: "pool would saturate with pending reviewer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", wantAssigned: nil},
+		{name: "pool would saturate with pending fixer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", wantAssigned: nil},
+		{name: "pool has slack with pending reviewer work", maxConcurrentRuns: 4, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", wantAssigned: []int64{1, 2}},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newCoordinatorFixture(t)
+			fixture.runner.config.Roles.Coordinator.Enabled = true
+			fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
+			fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+			fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+			fixture.runner.config.Scheduler.MaxConcurrentRuns = tc.maxConcurrentRuns
+			fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+			fixture.runner.config.Roles.Fixer.Triggers.Labels = []string{"looper:fix"}
+			for _, issueNumber := range tc.readyIssues {
+				seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+			}
+			if tc.downstreamType != "" {
+				fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+				labels := []string{"looper:review"}
+				if tc.downstreamType == "fixer" {
+					labels = []string{"looper:fix"}
+				}
+				fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: labels}
+			}
+			seedRunningQueueItems(t, fixture, tc.running)
+
+			if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+				t.Fatalf("DiscoverIssues() error = %v", err)
+			}
+			assertAssignedIssueNumbers(t, fixture.github.assigned, tc.wantAssigned)
+		})
+	}
+}
+
+func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/implement"})
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: []string{"looper:review"}}
+	seedRunningQueueItems(t, fixture, 1)
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() first tick error = %v", err)
+	}
+	if len(fixture.github.assigned) != 0 {
+		t.Fatalf("assigned on first tick = %v, want none", assignedIssueNumbers(fixture.github.assigned))
+	}
+
+	clearRunningQueueItems(t, fixture)
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 3
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() second tick error = %v", err)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
 }
 
 func TestRunnerMatchesHostnameQualifiedRepoDependencies(t *testing.T) {
@@ -688,7 +770,7 @@ func newCoordinatorFixture(t *testing.T) coordinatorFixture {
 	}
 	cfg.Disclosure.Enabled = true
 	cfg.Disclosure.Channels.IssueComment = true
-	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, subIssueErr: map[int64]error{}}
+	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}})
 	return coordinatorFixture{runner: runner, github: github, cfg: &cfg, projectID: projectID, now: now, coord: coord}
 }
@@ -718,6 +800,8 @@ type stubCoordinatorGitHub struct {
 	timeline            map[int64][]map[string]any
 	blockedBy           map[int64][]githubinfra.DependencyIssue
 	subIssues           map[int64][]githubinfra.DependencyIssue
+	linkedPullRequests  map[int64][]githubinfra.LinkedPullRequest
+	pullRequests        map[int64]githubinfra.PullRequestDetail
 	subIssueErr         map[int64]error
 	blockedByReads      int
 	blockedByIssueReads int
@@ -738,6 +822,9 @@ func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.List
 }
 func (s *stubCoordinatorGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	return s.details[input.IssueNumber], nil
+}
+func (s *stubCoordinatorGitHub) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	return s.pullRequests[input.PRNumber], nil
 }
 func (s *stubCoordinatorGitHub) GetIssueState(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueState, error) {
 	detail := s.details[input.IssueNumber]
@@ -793,6 +880,9 @@ func (s *stubCoordinatorGitHub) ListBlockedByIssues(_ context.Context, input git
 		return nil, err
 	}
 	return append([]githubinfra.DependencyIssue(nil), s.blockedBy[input.IssueNumber]...), nil
+}
+func (s *stubCoordinatorGitHub) ListLinkedPullRequests(_ context.Context, input githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error) {
+	return append([]githubinfra.LinkedPullRequest(nil), s.linkedPullRequests[input.IssueNumber]...), nil
 }
 func (s *stubCoordinatorGitHub) ListSubIssues(_ context.Context, input githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error) {
 	if err := s.subIssueErr[input.IssueNumber]; err != nil {
@@ -946,6 +1036,60 @@ func countRemovedIssueOperations(inputs []githubinfra.IssueLabelsInput, issueNum
 		}
 	}
 	return count
+}
+
+func seedRunningQueueItems(t *testing.T, fixture coordinatorFixture, count int) {
+	t.Helper()
+	repos := storage.NewRepositories(fixture.coord.DB())
+	for index := 0; index < count; index++ {
+		repo := "acme/looper"
+		prNumber := int64(index + 1)
+		if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+			ID:          fmt.Sprintf("queue_running_%d", index+1),
+			ProjectID:   &fixture.projectID,
+			Type:        "worker",
+			TargetType:  "issue",
+			TargetID:    fmt.Sprintf("issue:%d", index+1),
+			Repo:        &repo,
+			PRNumber:    &prNumber,
+			Priority:    1,
+			Status:      "running",
+			AvailableAt: fixture.now.Format(time.RFC3339),
+			MaxAttempts: 1,
+			CreatedAt:   fixture.now.Format(time.RFC3339),
+			UpdatedAt:   fixture.now.Format(time.RFC3339),
+		}); err != nil {
+			t.Fatalf("Queue.Upsert() error = %v", err)
+		}
+	}
+}
+
+func clearRunningQueueItems(t *testing.T, fixture coordinatorFixture) {
+	t.Helper()
+	if _, err := fixture.coord.DB().ExecContext(context.Background(), `DELETE FROM queue_items WHERE status = 'running'`); err != nil {
+		t.Fatalf("delete running queue items: %v", err)
+	}
+}
+
+func assertAssignedIssueNumbers(t *testing.T, assigned []githubinfra.IssueAssigneesInput, want []int64) {
+	t.Helper()
+	got := assignedIssueNumbers(assigned)
+	if len(got) != len(want) {
+		t.Fatalf("assigned issues = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("assigned issues = %v, want %v", got, want)
+		}
+	}
+}
+
+func assignedIssueNumbers(assigned []githubinfra.IssueAssigneesInput) []int64 {
+	out := make([]int64, 0, len(assigned))
+	for _, input := range assigned {
+		out = append(out, input.IssueNumber)
+	}
+	return out
 }
 
 func hasAssignedIssue(inputs []githubinfra.IssueAssigneesInput, issueNumber int64) bool {
