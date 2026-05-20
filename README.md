@@ -210,5 +210,6 @@ Build artifacts go to `dist/` and are gitignored — don't edit generated files.
 - `looperd` fails fast on invalid config; runtime paths must be writable
 - The managed daemon binary lives at `~/.looper/bin/looperd`
 - Daemon-managed worktrees live under `~/.looper/worktrees/`, grouped by repo and project
+- `looper worktree cleanup` dry-runs Looper-managed worktree cleanup; `--confirm` removes eligible clean terminal worktrees without deleting branches
 - When `notifications.osascript.enabled=true`, `osascript` must resolve on startup
 - Automation is poll-driven, not webhook-driven — keep `looperd` running and `gh` installed and authenticated for the loop to fire

@@ -148,6 +148,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Daemon.WorkingDirectory == "" {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
+	if config.Daemon.WorktreeCleanup.IntervalSeconds < 60 {
+		issues = append(issues, ValidationIssue{Path: "daemon.worktreeCleanup.intervalSeconds", Message: "must be an integer >= 60"})
+	}
 
 	if strings.TrimSpace(config.Package.Distribution) == "" {
 		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})

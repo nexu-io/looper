@@ -17,6 +17,7 @@ Subcommands:
   upgrade    Check or upgrade Looper installations
   labels     GitHub label commands
   queue      Queue inspection and maintenance commands
+  worktree   Worktree maintenance commands
   loop       Loop commands
   work       Create a worker run
   plan       Create a planner run

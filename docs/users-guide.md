@@ -387,6 +387,7 @@ Typical usage:
 - `looper ps`: see which loops are currently running
 - `looper logs <id> --follow`: stream logs live
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
+- `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
 - `looper stop <id>`: stop an active loop
 
 ## 13. Minimal end-to-end example

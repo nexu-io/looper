@@ -124,6 +124,11 @@ func DefaultConfig(cwd string) (Config, error) {
 			ShutdownTimeoutMS:      1000,
 			WorkingDirectory:       cwd,
 			Environment:            map[string]string{},
+			WorktreeCleanup: WorktreeCleanupConfig{
+				Enabled:         true,
+				DryRun:          false,
+				IntervalSeconds: 3600,
+			},
 		},
 		Package: PackageConfig{
 			Distribution:               "github-release",

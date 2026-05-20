@@ -191,6 +191,11 @@
         "workingDirectory": "__TMP__/launchd-workdir",
         "environment": {
           "LAUNCHD": "1"
+        },
+        "worktreeCleanup": {
+          "enabled": true,
+          "dryRun": false,
+          "intervalSeconds": 3600
         }
       },
       "package": {

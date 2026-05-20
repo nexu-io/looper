@@ -27,6 +27,7 @@ import (
 	"github.com/nexu-io/looper/internal/runs"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
+	"github.com/nexu-io/looper/internal/worktreecleanup"
 )
 
 type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error)
@@ -99,33 +100,34 @@ type Runtime struct {
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
 
-	mu                 sync.RWMutex
-	startedAt          *time.Time
-	recovery           RecoverySummary
-	stopped            bool
-	services           Services
-	startErr           error
-	startOnce          sync.Once
-	shutdownOnce       sync.Once
-	shutdownCh         chan struct{}
-	schedulerStop      chan struct{}
-	schedulerDone      chan struct{}
-	schedulerWake      chan struct{}
-	schedulerClaimWake chan struct{}
-	schedulerCancel    context.CancelFunc
-	schedulerTasks     *schedulerTaskTracker
-	recoveryCancel     context.CancelFunc
-	recoveryDone       chan struct{}
-	activeExecutions   *ActiveExecutionRegistry
-	githubGateway      *githubinfra.Gateway
-	webhook            *webhookRuntime
-	webhookDaemonLock  *daemonLock
-	webhookForwarder   WebhookForwarder
-	networkManager     *networkclient.Manager
-	schedulerDisabled  bool
-	startupReadyOnce   sync.Once
-	startupReadyErr    error
-	ownershipAcquired  bool
+	mu                  sync.RWMutex
+	startedAt           *time.Time
+	recovery            RecoverySummary
+	stopped             bool
+	services            Services
+	startErr            error
+	startOnce           sync.Once
+	shutdownOnce        sync.Once
+	shutdownCh          chan struct{}
+	schedulerStop       chan struct{}
+	schedulerDone       chan struct{}
+	schedulerWake       chan struct{}
+	schedulerClaimWake  chan struct{}
+	schedulerCancel     context.CancelFunc
+	schedulerTasks      *schedulerTaskTracker
+	recoveryCancel      context.CancelFunc
+	recoveryDone        chan struct{}
+	activeExecutions    *ActiveExecutionRegistry
+	githubGateway       *githubinfra.Gateway
+	webhook             *webhookRuntime
+	webhookDaemonLock   *daemonLock
+	webhookForwarder    WebhookForwarder
+	networkManager      *networkclient.Manager
+	schedulerDisabled   bool
+	startupReadyOnce    sync.Once
+	startupReadyErr     error
+	ownershipAcquired   bool
+	lastWorktreeCleanup *time.Time
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -991,6 +993,44 @@ func (r *Runtime) executeSchedulerTick(ctx context.Context) {
 	if err := tick(ctx, services); err != nil && r.logger != nil {
 		r.logger.Warn("looperd scheduler tick failed", map[string]any{"error": err.Error()})
 	}
+	if err := r.maybeRunWorktreeCleanup(ctx, services); err != nil && r.logger != nil {
+		r.logger.Warn("looperd worktree cleanup failed", map[string]any{"error": err.Error()})
+	}
+}
+
+func (r *Runtime) maybeRunWorktreeCleanup(ctx context.Context, services Services) error {
+	cfg := r.config.Daemon.WorktreeCleanup
+	if !cfg.Enabled || services.Repositories == nil {
+		return nil
+	}
+	interval := time.Duration(cfg.IntervalSeconds) * time.Second
+	nowFunc := r.now
+	if nowFunc == nil {
+		nowFunc = time.Now
+	}
+	now := nowFunc()
+	r.mu.Lock()
+	if r.lastWorktreeCleanup != nil && interval > 0 && now.Sub(*r.lastWorktreeCleanup) < interval {
+		r.mu.Unlock()
+		return nil
+	}
+	r.lastWorktreeCleanup = &now
+	r.mu.Unlock()
+
+	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: services.Repositories, Now: r.now})
+	result, err := worktreecleanup.Run(ctx, worktreecleanup.Options{
+		Config: r.config,
+		Repos:  services.Repositories,
+		Git:    gitGateway,
+		DryRun: cfg.DryRun,
+	})
+	if err != nil {
+		return err
+	}
+	if r.logger != nil && result.Summary.Inspected > 0 {
+		r.logger.Info("looperd worktree cleanup completed", map[string]any{"dryRun": result.DryRun, "summary": result.Summary})
+	}
+	return nil
 }
 
 func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Services) error {

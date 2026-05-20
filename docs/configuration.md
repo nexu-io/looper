@@ -350,6 +350,11 @@ logDir = "/Users/you/.looper/logs"
 workingDirectory = "/absolute/path/to/where/you/start/looperd"
 shutdownTimeoutMs = 1000
 
+[daemon.worktreeCleanup]
+enabled = true
+dryRun = false
+intervalSeconds = 3600
+
 [daemon.environment]
 EXAMPLE_FLAG = "1"
 
@@ -852,3 +857,44 @@ Make sure the daemon user can write to:
 - `daemon.logDir`
 - `daemon.workingDirectory`
 - the default worktree root under `~/.looper/worktrees`
+
+## Worktree cleanup
+
+Looper records worktrees it creates for planner, reviewer, fixer, and worker loops. The daemon periodically inspects those Looper-managed records and removes only clean worktree checkouts that are no longer referenced by active loop state.
+
+Defaults:
+
+- `daemon.worktreeCleanup.enabled = true`
+- `daemon.worktreeCleanup.dryRun = false`
+- `daemon.worktreeCleanup.intervalSeconds = 3600`
+
+To disable automatic cleanup:
+
+```toml
+[daemon.worktreeCleanup]
+enabled = false
+```
+
+To keep automatic inspection enabled without deleting anything:
+
+```toml
+[daemon.worktreeCleanup]
+enabled = true
+dryRun = true
+```
+
+Manual inspection is always dry-run by default:
+
+```bash
+looper worktree cleanup
+looper worktree cleanup --dry-run
+```
+
+Run one immediate cleanup pass with the same safety rules:
+
+```bash
+looper worktree cleanup --confirm
+looper worktree cleanup --json
+```
+
+Cleanup removes Looper-managed worktree checkouts only. It does not delete branches, skips dirty worktrees, preserves worktrees referenced by active loop state, and does not automatically delete filesystem-only orphan directories that are not present in Looper's worktree records.

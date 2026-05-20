@@ -171,6 +171,11 @@
         "workingDirectory": "__TMP__/workspace",
         "environment": {
           "FROM_FILE": "1"
+        },
+        "worktreeCleanup": {
+          "enabled": true,
+          "dryRun": false,
+          "intervalSeconds": 3600
         }
       },
       "package": {
