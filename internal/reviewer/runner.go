@@ -735,18 +735,13 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	currentLogin := ""
-	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		currentLogin = normalizeLogin(policy.RoutedClaimPolicy.GitHubLogin)
-	}
-	if (policy.RequireReviewRequest || !policy.EnableSelfReview) && (!networkpolicy.IsRouted(policy.RoutedClaimPolicy) || currentLogin != "") {
-		if currentLogin == "" {
-			var err error
-			currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-			if err != nil {
-				return DiscoveryResult{}, err
-			}
-			currentLogin = normalizeLogin(currentLogin)
+	if policy.RequireReviewRequest || !policy.EnableSelfReview {
+		var err error
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
 		}
+		currentLogin = normalizeLogin(currentLogin)
 	}
 	result := DiscoveryResult{}
 	seen := map[string]struct{}{}
@@ -850,17 +845,12 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 
 	currentLogin := ""
-	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		currentLogin = normalizeLogin(policy.RoutedClaimPolicy.GitHubLogin)
-	}
-	if (policy.RequireReviewRequest || !policy.EnableSelfReview) && (!networkpolicy.IsRouted(policy.RoutedClaimPolicy) || currentLogin != "") {
-		if currentLogin == "" {
-			currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-			if err != nil {
-				return DiscoveryResult{}, err
-			}
-			currentLogin = normalizeLogin(currentLogin)
+	if policy.RequireReviewRequest || !policy.EnableSelfReview {
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
 		}
+		currentLogin = normalizeLogin(currentLogin)
 	}
 	pr := summaryFromDetail(detail)
 	result := DiscoveryResult{}
