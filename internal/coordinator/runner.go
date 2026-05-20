@@ -682,17 +682,15 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 	if err != nil {
 		return err
 	}
-	workersDispatched := 0
+	dispatched := 0
 	for _, candidate := range ready {
-		if candidate.worker {
-			if workersDispatched >= budget {
-				continue
-			}
-			workersDispatched++
+		if dispatched >= budget {
+			break
 		}
 		if err := r.applyDispatchAction(ctx, repo, cwd, candidate.issue, candidate.action); err != nil {
 			return err
 		}
+		dispatched++
 	}
 	return nil
 }
@@ -732,10 +730,7 @@ func (r *Runner) dispatchBudget(ctx context.Context, projectID, repo, cwd string
 			readyWorkers++
 		}
 	}
-	if readyWorkers == 0 {
-		return 0, nil
-	}
-	if running+readyWorkers >= maxConcurrentRuns {
+	if readyWorkers > 0 && running+readyWorkers >= maxConcurrentRuns {
 		pending, err := r.hasPendingReviewerOrFixerWork(ctx, projectID, repo, cwd, loaded, downstreamLabels)
 		if err != nil {
 			return 0, err

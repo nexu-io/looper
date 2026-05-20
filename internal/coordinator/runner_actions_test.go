@@ -606,6 +606,7 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 		maxConcurrentRuns int
 		running           int
 		readyIssues       []int64
+		readyLabels       []string
 		downstreamType    string
 		reviewerLabels    []string
 		fixerLabels       []string
@@ -620,7 +621,9 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 	}{
 		{name: "pool has slack without downstream pending", maxConcurrentRuns: 3, running: 1, readyIssues: []int64{1, 2, 3}, wantAssigned: []int64{1, 2}},
 		{name: "pool would saturate without downstream pending", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, wantAssigned: []int64{1}},
+		{name: "pool would saturate with non-worker ready work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, readyLabels: []string{"triaged", "dispatch/plan"}, wantAssigned: []int64{1}},
 		{name: "pool would saturate with pending reviewer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewRequests: []string{"looper"}, wantAssigned: nil},
+		{name: "pool would saturate with pending reviewer work and only non-worker ready work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, readyLabels: []string{"triaged", "dispatch/plan"}, downstreamType: "reviewer", reviewRequests: []string{"looper"}, wantAssigned: []int64{1}},
 		{name: "pool would saturate with pending reviewer work when labels differ only by case", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{"Looper:Review"}, prLabels: []string{"looper:review"}, reviewRequests: []string{"looper"}, wantAssigned: nil},
 		{name: "pool would saturate with pending fixer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", prComments: []map[string]any{{"id": "comment-1", "threadId": "thread-1", "body": "fix this"}}, wantAssigned: nil},
 		{name: "pool would saturate with project reviewer override", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", prAuthor: "octocat", currentLogin: "looper", projectRoles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{RequireReviewRequest: boolPtr(false)}}}}, wantAssigned: nil},
@@ -658,8 +661,12 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 			if tc.projectRoles != nil {
 				fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Roles: tc.projectRoles}}
 			}
+			readyLabels := tc.readyLabels
+			if readyLabels == nil {
+				readyLabels = []string{"triaged", "dispatch/implement"}
+			}
 			for _, issueNumber := range tc.readyIssues {
-				seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+				seedDispatchIssueWithLabels(fixture, issueNumber, readyLabels)
 			}
 			if tc.downstreamType != "" {
 				fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}

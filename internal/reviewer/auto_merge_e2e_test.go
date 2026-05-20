@@ -17,7 +17,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestReviewerAutoMergeClosesIssueAndUnblocksDependentDispatchWithFakeGH(t *testing.T) {
+func TestReviewerAutoMergeWaitsForMergeBeforeUnblockingDependentDispatchWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{
 		"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"},
@@ -119,13 +119,14 @@ func TestReviewerAutoMergeClosesIssueAndUnblocksDependentDispatchWithFakeGH(t *t
 	assertOrderedText(t, string(logBytes),
 		`"argv":["api","repos/acme/looper/pulls/42/reviews","--method","POST","--input","-","--include"]`,
 		`"argv":["pr","merge","42","--repo","acme/looper","--auto","--squash","--match-head-commit","abc123"]`,
-		`"argv":["api","repos/acme/looper/issues/2/assignees","--method","POST","-f","assignees[]=octocat"]`,
-		`"argv":["api","repos/acme/looper/issues/2/labels","--method","POST","-f","labels[]=looper:plan"]`,
 	)
 	state = readFakeGHState(t, fakeGH.StatePath)
-	mergedPR := state.PullRequests["acme/looper#42"]
-	if mergedPR.State != "MERGED" {
-		t.Fatalf("pull request state = %q, want MERGED", mergedPR.State)
+	pendingPR := state.PullRequests["acme/looper#42"]
+	if pendingPR.State != "OPEN" {
+		t.Fatalf("pull request state = %q, want OPEN while auto-merge is pending", pendingPR.State)
+	}
+	if pendingPR.AutoMerge == nil {
+		t.Fatal("pull request auto-merge metadata = nil, want pending auto-merge state")
 	}
 	issueOnePayload, ok := state.Routes["repos/acme/looper/issues/1"]
 	if !ok {
@@ -135,12 +136,53 @@ func TestReviewerAutoMergeClosesIssueAndUnblocksDependentDispatchWithFakeGH(t *t
 	if err != nil {
 		t.Fatalf("Marshal(issue #1 route) error = %v", err)
 	}
-	if !strings.Contains(string(issueOneJSON), `"state":"closed"`) {
-		t.Fatalf("issue #1 route = %s, want closed state", string(issueOneJSON))
+	if !strings.Contains(string(issueOneJSON), `"state":"open"`) {
+		t.Fatalf("issue #1 route = %s, want open state before merge completes", string(issueOneJSON))
+	}
+	if strings.Contains(string(logBytes), `"argv":["api","repos/acme/looper/issues/2/labels","--method","POST","-f","labels[]=looper:plan"]`) {
+		t.Fatalf("dependent issue dispatched before auto-merge completed:\n%s", string(logBytes))
 	}
 	if !strings.Contains(string(logBytes), criteriaVerificationHeading) {
 		t.Fatalf("invocation log missing criteria verification heading:\n%s", string(logBytes))
 	}
+
+	state.PullRequests["acme/looper#42"] = harness.GHPullRequest{
+		Number:         pendingPR.Number,
+		Repo:           pendingPR.Repo,
+		Title:          pendingPR.Title,
+		Body:           pendingPR.Body,
+		URL:            pendingPR.URL,
+		State:          "MERGED",
+		CreatedAt:      pendingPR.CreatedAt,
+		UpdatedAt:      pendingPR.UpdatedAt,
+		ClosedAt:       "2026-05-12T00:00:00Z",
+		IsDraft:        pendingPR.IsDraft,
+		ReviewDecision: pendingPR.ReviewDecision,
+		Labels:         pendingPR.Labels,
+		HeadRefName:    pendingPR.HeadRefName,
+		BaseRefName:    pendingPR.BaseRefName,
+		HeadSHA:        pendingPR.HeadSHA,
+		BaseSHA:        pendingPR.BaseSHA,
+		Author:         pendingPR.Author,
+		ReviewRequests: pendingPR.ReviewRequests,
+		MergedAt:       "2026-05-12T00:00:00Z",
+	}
+	state.Routes["repos/acme/looper/issues/1"] = json.RawMessage(`{"number":1,"title":"Parent","body":"## Acceptance criteria\n- ship app change\n- add more\n","html_url":"https://example.test/issues/1","state":"closed","state_reason":"completed","created_at":"2026-04-11T10:00:00Z","updated_at":"2026-05-12T00:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"}]}`)
+	fakeGH.WriteState(t, state)
+
+	if _, err := coordinatorRunner.DiscoverIssues(ctx, coordpkg.DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		logBytes, _ := os.ReadFile(fakeGH.InvocationLog)
+		t.Fatalf("Coordinator third tick error = %v\ninvocations:\n%s", err, string(logBytes))
+	}
+	logBytes, err = os.ReadFile(fakeGH.InvocationLog)
+	if err != nil {
+		t.Fatalf("ReadFile(invocation log) error = %v", err)
+	}
+	assertOrderedText(t, string(logBytes),
+		`"argv":["pr","merge","42","--repo","acme/looper","--auto","--squash","--match-head-commit","abc123"]`,
+		`"argv":["api","repos/acme/looper/issues/2/assignees","--method","POST","-f","assignees[]=octocat"]`,
+		`"argv":["api","repos/acme/looper/issues/2/labels","--method","POST","-f","labels[]=looper:plan"]`,
+	)
 }
 
 type coordStubLLM struct{}

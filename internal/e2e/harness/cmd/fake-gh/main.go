@@ -203,8 +203,18 @@ func handlePullRequestMerge(st *state, args []string) error {
 	if !ok {
 		return nil
 	}
+	if slices.Contains(args, "--auto") {
+		pr.AutoMerge = map[string]any{
+			"enabledBy":   map[string]any{"login": firstNonEmpty(st.CurrentUserLogin, "looper")},
+			"mergeMethod": pullRequestMergeMethod(args),
+		}
+		pr.UpdatedAt = firstNonEmpty(pr.UpdatedAt, "2026-05-12T00:00:00Z")
+		st.PullRequests[key] = pr
+		return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
+	}
 	pr.State = "MERGED"
 	pr.ClosedAt = firstNonEmpty(pr.ClosedAt, "2026-05-12T00:00:00Z")
+	pr.MergedAt = firstNonEmpty(pr.MergedAt, pr.ClosedAt)
 	pr.UpdatedAt = firstNonEmpty(pr.UpdatedAt, "2026-05-12T00:00:00Z")
 	st.PullRequests[key] = pr
 	for _, match := range closesIssuePattern.FindAllStringSubmatch(pr.Body, -1) {
@@ -215,6 +225,17 @@ func handlePullRequestMerge(st *state, args []string) error {
 		closeLinkedIssueRoute(st, repo, issueNumber)
 	}
 	return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
+}
+
+func pullRequestMergeMethod(args []string) string {
+	switch {
+	case slices.Contains(args, "--rebase"):
+		return "REBASE"
+	case slices.Contains(args, "--merge"):
+		return "MERGE"
+	default:
+		return "SQUASH"
+	}
 }
 
 func closeLinkedIssueRoute(st *state, repo string, issueNumber int64) {
