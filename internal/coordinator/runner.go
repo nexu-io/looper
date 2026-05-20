@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -674,7 +675,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 				}
 			}
 		}
-		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: labelsMatch(action.TriggerLabels, downstreamLabels.worker, downstreamLabels.workerMode)})
+		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue)})
 	}
 	sortAutonomousDispatchCandidates(ready)
 	budget, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
@@ -874,31 +875,28 @@ func queuePullRequestKey(repo string, prNumber int64) string {
 	return fmt.Sprintf("%s#%d", repo, prNumber)
 }
 
+func isWorkerDispatch(issue triage.Issue) bool {
+	return specpr.HasLabel(issue.Labels, dispatch.DispatchImplement)
+}
+
 func labelsMatch(labels, expected []string, mode config.LabelMode) bool {
 	if len(expected) == 0 {
 		return true
 	}
-	if len(labels) == 0 {
+	if mode == config.LabelModeAny {
+		for _, label := range expected {
+			if specpr.HasLabel(labels, label) {
+				return true
+			}
+		}
 		return false
 	}
-	available := make(map[string]struct{}, len(labels))
-	for _, label := range labels {
-		trimmed := strings.TrimSpace(label)
-		if trimmed == "" {
-			continue
-		}
-		available[trimmed] = struct{}{}
-	}
-	matches := 0
 	for _, label := range expected {
-		if _, ok := available[strings.TrimSpace(label)]; ok {
-			matches++
+		if !specpr.HasLabel(labels, label) {
+			return false
 		}
 	}
-	if mode == config.LabelModeAll {
-		return matches == len(expected)
-	}
-	return matches > 0
+	return true
 }
 
 func normalizeLogin(login string) string {

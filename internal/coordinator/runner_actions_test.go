@@ -621,6 +621,7 @@ func TestRunnerAutonomousDispatchConcurrencyPreemption(t *testing.T) {
 		{name: "pool has slack without downstream pending", maxConcurrentRuns: 3, running: 1, readyIssues: []int64{1, 2, 3}, wantAssigned: []int64{1, 2}},
 		{name: "pool would saturate without downstream pending", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, wantAssigned: []int64{1}},
 		{name: "pool would saturate with pending reviewer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewRequests: []string{"looper"}, wantAssigned: nil},
+		{name: "pool would saturate with pending reviewer work when labels differ only by case", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{"Looper:Review"}, prLabels: []string{"looper:review"}, reviewRequests: []string{"looper"}, wantAssigned: nil},
 		{name: "pool would saturate with pending fixer work", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "fixer", prComments: []map[string]any{{"id": "comment-1", "threadId": "thread-1", "body": "fix this"}}, wantAssigned: nil},
 		{name: "pool would saturate with project reviewer override", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", prAuthor: "octocat", currentLogin: "looper", projectRoles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{RequireReviewRequest: boolPtr(false)}}}}, wantAssigned: nil},
 		{name: "pool would saturate without reviewer request even without label filters", maxConcurrentRuns: 2, running: 1, readyIssues: []int64{1, 2}, downstreamType: "reviewer", reviewerLabels: []string{}, prLabels: []string{}, wantAssigned: []int64{1}},
@@ -716,6 +717,28 @@ func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
 		t.Fatalf("DiscoverIssues() second tick error = %v", err)
 	}
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
+}
+
+func TestRunnerAutonomousDispatchPreemptionCountsWorkerDispatchesFromDispatchType(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.PollInterval = "0s"
+	fixture.runner.config.Roles.Coordinator.Dispatch.Mode = "autonomous"
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.runner.config.Scheduler.MaxConcurrentRuns = 2
+	fixture.runner.config.Roles.Worker.Triggers.Labels = []string{"looper:worker", "team:backend"}
+	fixture.runner.config.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement", "looper:worker"})
+	seedDispatchIssueWithLabels(fixture, 2, []string{"triaged", "dispatch/implement"})
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Labels: []string{"looper:review"}, ReviewRequests: []string{"looper"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, nil)
 }
 
 func TestRunnerMatchesHostnameQualifiedRepoDependencies(t *testing.T) {
