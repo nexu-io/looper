@@ -650,8 +650,6 @@ func TestGatewayResolveDetachedStartPointPropagatesFetchFailure(t *testing.T) {
 }
 
 func TestGatewayRetriesFetchWhenRemoteTrackingRefWasUpdatedConcurrently(t *testing.T) {
-	t.Parallel()
-
 	ctx := context.Background()
 	gitPath := writeFakeGit(t, `#!/bin/sh
 count_file="$FAKE_GIT_COUNT"
@@ -936,9 +934,17 @@ func runGitCommand(cwd string, args ...string) (string, error) {
 
 func writeFakeGit(t *testing.T, script string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "git")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile(%q) error = %v", path, err)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "git")
+	tmpPath := filepath.Join(dir, "git.tmp")
+	if err := os.WriteFile(tmpPath, []byte(script), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", tmpPath, err)
+	}
+	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		t.Fatalf("Chmod(%q) error = %v", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		t.Fatalf("Rename(%q, %q) error = %v", tmpPath, path, err)
 	}
 	return path
 }
