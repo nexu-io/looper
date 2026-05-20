@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -49,8 +51,35 @@ func normalizeConfigEncodingValue(value any) (any, error) {
 		return nil, fmt.Errorf("normalize config for encoding: %w", err)
 	}
 	var normalized any
-	if err := json.Unmarshal(raw, &normalized); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&normalized); err != nil {
 		return nil, fmt.Errorf("normalize config for encoding: %w", err)
 	}
-	return normalized, nil
+	return normalizeJSONNumbers(normalized), nil
+}
+
+func normalizeJSONNumbers(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			typed[key] = normalizeJSONNumbers(child)
+		}
+		return typed
+	case []any:
+		for index, child := range typed {
+			typed[index] = normalizeJSONNumbers(child)
+		}
+		return typed
+	case json.Number:
+		if integer, err := strconv.ParseInt(typed.String(), 10, 64); err == nil {
+			return integer
+		}
+		if floating, err := strconv.ParseFloat(typed.String(), 64); err == nil {
+			return floating
+		}
+		return typed.String()
+	default:
+		return value
+	}
 }
