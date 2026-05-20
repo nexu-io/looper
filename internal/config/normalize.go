@@ -1272,6 +1272,7 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Path:         project.Path,
 			BaseBranch:   cloneStringPtr(project.BaseBranch),
 			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
+			Network:      cloneProjectNetworkConfig(project.Network),
 			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
@@ -1329,6 +1330,9 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			Path:     project.Path,
 			Roles:    roles,
 		}
+		if project.Network != nil && project.Network.Mode != "" {
+			cloned[index].Network = cloneProjectNetworkConfig(project.Network)
+		}
 		if project.Webhook != nil && project.Webhook.Mode != nil {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode
 		}
@@ -1343,6 +1347,14 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 	}
 
 	return cloned
+}
+
+func cloneProjectNetworkConfig(config *ProjectNetworkConfig) *ProjectNetworkConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	return &cloned
 }
 
 func mergeLegacyProjectInstructionsIntoRoles(roles *PartialRoleConfigs, instructions map[string]string) *PartialRoleConfigs {

@@ -22,6 +22,7 @@ func TestConfigMigrateDryRunPreviewsCanonicalTOMLWithoutWritingDestination(t *te
 	}
 	legacy := `{
 		"defaults": {"allowAutoApprove": true, "fixAllPullRequests": true},
+		"webhook": {"enabled": true, "mode": "tunnel", "listenPort": 17311, "publicBaseUrl": "https://looper.example.test", "fallbackPollIntervalSeconds": 300},
 		"reviewer": {"reviewEvents": {"blocking": "REQUEST_CHANGES"}},
 		"roles": {"reviewer": {"autoDiscovery": true, "triggers": {"requireReviewRequest": true}, "specReview": {"includeReviewingLabel": true}}},
 		"projects": [{"id": "project_1", "name": "Repo", "path": "/tmp/repo", "instructions": {"reviewer": "be careful"}, "roles": {"reviewer": {"autoDiscovery": true, "triggers": {"requireReviewRequest": true}}}}],
@@ -46,9 +47,14 @@ func TestConfigMigrateDryRunPreviewsCanonicalTOMLWithoutWritingDestination(t *te
 			t.Fatalf("dry-run preview unexpectedly contained %q:\n%s", notWant, stdout)
 		}
 	}
-	for _, want := range []string{"Preview migration:", "[roles.reviewer.behavior.reviewEvents]", "clean = 'APPROVE'", "authorFilter = 'any'", "repoPath = '/tmp/repo'", "[projects.roles.reviewer.discovery]"} {
+	for _, want := range []string{"Preview migration:", "fallbackPollIntervalSeconds = 300", "listenPort = 17311", "[roles.reviewer.behavior.reviewEvents]", "clean = 'APPROVE'", "authorFilter = 'any'", "repoPath = '/tmp/repo'", "[projects.roles.reviewer.discovery]"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("dry-run preview missing %q:\n%s", want, stdout)
+		}
+	}
+	for _, notWant := range []string{"fallbackPollIntervalSeconds = 300.0", "listenPort = 17311.0"} {
+		if strings.Contains(stdout, notWant) {
+			t.Fatalf("dry-run preview unexpectedly contained %q:\n%s", notWant, stdout)
 		}
 	}
 

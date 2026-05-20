@@ -22,6 +22,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/loops"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/runs"
 	"github.com/nexu-io/looper/internal/storage"
@@ -120,6 +121,7 @@ type Runtime struct {
 	webhook            *webhookRuntime
 	webhookDaemonLock  *daemonLock
 	webhookForwarder   WebhookForwarder
+	networkManager     *networkclient.Manager
 	schedulerDisabled  bool
 	startupReadyOnce   sync.Once
 	startupReadyErr    error
@@ -225,6 +227,8 @@ func (r *Runtime) Stop(reason string) {
 		r.stopped = true
 		forwarder := r.webhookForwarder
 		r.webhookForwarder = nil
+		networkManager := r.networkManager
+		r.networkManager = nil
 		coordinator := r.services.Coordinator
 		repositories := r.services.Repositories
 		ownershipAcquired := r.ownershipAcquired
@@ -242,6 +246,9 @@ func (r *Runtime) Stop(reason string) {
 
 		if forwarder != nil {
 			forwarder.Close()
+		}
+		if networkManager != nil {
+			networkManager.Stop()
 		}
 		if coordinator != nil {
 			if err := coordinator.Close(); err != nil && r.logger != nil {
@@ -290,6 +297,24 @@ func (r *Runtime) WebhookForwarder() WebhookForwarder {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.webhookForwarder
+}
+
+func (r *Runtime) NetworkStatus() networkclient.Status {
+	r.mu.RLock()
+	manager := r.networkManager
+	r.mu.RUnlock()
+	if manager == nil {
+		return networkclient.Status{}
+	}
+	return manager.Status()
+}
+
+func runtimeHomeDirOrEmpty() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return homeDir
 }
 
 func (r *Runtime) Config() config.Config {
@@ -560,11 +585,15 @@ func (r *Runtime) start(ctx context.Context) error {
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
+	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
 	r.webhookDaemonLock = lock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 
 	if r.deferRecovery {
+		if r.networkManager != nil {
+			_ = r.networkManager.Start(context.Background())
+		}
 		started = true
 		return nil
 	}
@@ -616,6 +645,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.recovery = recoverySummary
 		r.ownershipAcquired = true
 		r.mu.Unlock()
+		if r.networkManager != nil {
+			if err := r.networkManager.Start(ctx); err != nil {
+				r.startupReadyErr = err
+				return
+			}
+		}
 
 		if r.webhook != nil {
 			if err := r.webhook.Start(repositories); err != nil {

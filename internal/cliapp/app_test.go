@@ -23,10 +23,12 @@ import (
 	"github.com/nexu-io/looper/internal/api"
 	"github.com/nexu-io/looper/internal/config"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/network/client"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/worker"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/spf13/cobra"
 )
 
 func runApp(t *testing.T, args ...string) (int, string, string) {
@@ -4231,6 +4233,262 @@ func derefString(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func TestNetworkJoinRemovesLocalStateWhenProjectEnrollmentRollbackFails(t *testing.T) {
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.json")
+	ghPath := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"user\" ]; then\n  printf '{\"login\":\"worker-1\",\"id\":101}'\n  exit 0\nfi\nprintf 'unexpected gh invocation: %s\\n' \"$*\" >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	configPayload := map[string]any{
+		"tools":    map[string]any{"ghPath": ghPath},
+		"projects": []map[string]any{{"id": "project-1", "name": "Repo", "path": t.TempDir()}},
+	}
+	raw, err := json.Marshal(configPayload)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var leaveCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/join":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"networkId":"net-1","nodeId":"node-1","nodeToken":"node-token"}`))
+		case "/v1/leave":
+			leaveCalls++
+			if got, want := r.Header.Get("Authorization"), "Bearer node-token"; got != want {
+				t.Fatalf("leave auth header = %q, want %q", got, want)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		Getwd:   func() (string, error) { return configDir, nil },
+		WriteFile: func(path string, data []byte, perm os.FileMode) error {
+			if strings.HasSuffix(path, ".tmp") {
+				return errors.New("write config temp: permission denied")
+			}
+			return os.WriteFile(path, data, perm)
+		},
+	}), []string{"--config", configPath})
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.Flags().String("key", "", "")
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().Bool("no-enroll-projects", false, "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("key", "join-1"); err != nil {
+		t.Fatalf("set key flag: %v", err)
+	}
+	if err := cmd.Flags().Set("name", "worker-1"); err != nil {
+		t.Fatalf("set name flag: %v", err)
+	}
+
+	err = runtime.networkJoin(cmd, []string{server.URL})
+	if err == nil {
+		t.Fatal("networkJoin() error = nil, want temp config write failure")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "write config temp: permission denied") {
+		t.Fatalf("error = %q, want temp config write failure", err)
+	}
+	if leaveCalls != 1 {
+		t.Fatalf("leave calls = %d, want 1", leaveCalls)
+	}
+	if _, err := os.Stat(filepath.Join(homeDir, ".looper", "network.json")); !os.IsNotExist(err) {
+		t.Fatalf("network state file still present: %v", err)
+	}
+}
+
+func TestNetworkJoinPreservesLocalStateWhenProjectEnrollmentRollbackLeaveFails(t *testing.T) {
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.json")
+	ghPath := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"user\" ]; then\n  printf '{\"login\":\"worker-1\",\"id\":101}'\n  exit 0\nfi\nprintf 'unexpected gh invocation: %s\\n' \"$*\" >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	configPayload := map[string]any{
+		"tools":    map[string]any{"ghPath": ghPath},
+		"projects": []map[string]any{{"id": "project-1", "name": "Repo", "path": t.TempDir()}},
+	}
+	raw, err := json.Marshal(configPayload)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var leaveCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/join":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"networkId":"net-1","nodeId":"node-1","nodeToken":"node-token"}`))
+		case "/v1/leave":
+			leaveCalls++
+			if got, want := r.Header.Get("Authorization"), "Bearer node-token"; got != want {
+				t.Fatalf("leave auth header = %q, want %q", got, want)
+			}
+			http.Error(w, "rollback unavailable", http.StatusBadGateway)
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		Getwd:   func() (string, error) { return configDir, nil },
+		WriteFile: func(path string, data []byte, perm os.FileMode) error {
+			if strings.HasSuffix(path, ".tmp") {
+				return errors.New("write config temp: permission denied")
+			}
+			return os.WriteFile(path, data, perm)
+		},
+	}), []string{"--config", configPath})
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.Flags().String("key", "", "")
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().Bool("no-enroll-projects", false, "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("key", "join-1"); err != nil {
+		t.Fatalf("set key flag: %v", err)
+	}
+	if err := cmd.Flags().Set("name", "worker-1"); err != nil {
+		t.Fatalf("set name flag: %v", err)
+	}
+
+	err = runtime.networkJoin(cmd, []string{server.URL})
+	if err == nil {
+		t.Fatal("networkJoin() error = nil, want rollback leave failure")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "write config temp: permission denied") {
+		t.Fatalf("error = %q, want temp config write failure", err)
+	}
+	if !strings.Contains(err.Error(), "status 502") {
+		t.Fatalf("error = %q, want rollback leave failure", err)
+	}
+	if leaveCalls != 1 {
+		t.Fatalf("leave calls = %d, want 1", leaveCalls)
+	}
+	state, loadErr := client.LoadState(filepath.Join(homeDir, ".looper", "network.json"))
+	if loadErr != nil {
+		t.Fatalf("LoadState() error = %v, want preserved local state", loadErr)
+	}
+	if state.NodeToken != "node-token" {
+		t.Fatalf("saved node token = %q, want preserved token", state.NodeToken)
+	}
+	if state.URL != server.URL {
+		t.Fatalf("saved url = %q, want %q", state.URL, server.URL)
+	}
+}
+
+func TestNetworkLeaveRemovesLocalStateWhenProjectModeUpdateFails(t *testing.T) {
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.json")
+	configPayload := map[string]any{
+		"projects": []map[string]any{{"id": "project-1", "name": "Repo", "path": t.TempDir(), "network": map[string]any{"mode": "routed"}}},
+	}
+	raw, err := json.Marshal(configPayload)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := client.SaveState(client.DefaultStatePath(homeDir), client.LocalState{URL: "http://127.0.0.1", NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", NodeToken: "node-token"}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	var leaveCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/leave" {
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		leaveCalls++
+		if got, want := r.Header.Get("Authorization"), "Bearer node-token"; got != want {
+			t.Fatalf("leave auth header = %q, want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	if err := client.SaveState(client.DefaultStatePath(homeDir), client.LocalState{URL: server.URL, NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", NodeToken: "node-token"}); err != nil {
+		t.Fatalf("save state with server url: %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		Getwd:   func() (string, error) { return configDir, nil },
+		WriteFile: func(path string, data []byte, perm os.FileMode) error {
+			if strings.HasSuffix(path, ".tmp") {
+				return errors.New("write config temp: permission denied")
+			}
+			return os.WriteFile(path, data, perm)
+		},
+	}), []string{"--config", configPath})
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.Flags().Bool("json", false, "")
+
+	err = runtime.networkLeave(cmd, nil)
+	if err == nil {
+		t.Fatal("networkLeave() error = nil, want temp config write failure")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(err.Error(), "write config temp: permission denied") {
+		t.Fatalf("error = %q, want temp config write failure", err)
+	}
+	if leaveCalls != 1 {
+		t.Fatalf("leave calls = %d, want 1", leaveCalls)
+	}
+	if _, err := os.Stat(filepath.Join(homeDir, ".looper", "network.json")); !os.IsNotExist(err) {
+		t.Fatalf("network state file still present: %v", err)
+	}
 }
 
 func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
@@ -202,6 +204,70 @@ func TestRuntimeStartClosesCoordinatorWhenCompleteStartupFails(t *testing.T) {
 	}
 
 	rt.Stop("cleanup after failed startup")
+}
+
+func TestRuntimeCompleteStartupDoesNotStartSchedulerWhenNetworkManagerStartFails(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	vendor := config.AgentVendorOpenCode
+	cfg.Agent.Vendor = &vendor
+
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{
+		BackupDir:  backupDir,
+		Migrations: storage.EmbeddedMigrations,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	defer func() { _ = coordinator.Close() }()
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	repositories := storage.NewRepositories(coordinator.DB())
+	startedAt := time.Now().UTC()
+	statePath := filepath.Join(workingDir, ".looper", "network.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("{"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	rt := &Runtime{
+		config:           cfg,
+		logger:           &testLogger{},
+		now:              func() time.Time { return startedAt },
+		shutdownTimeout:  time.Second,
+		startedAt:        &startedAt,
+		services:         Services{Coordinator: coordinator, Repositories: repositories},
+		networkManager:   networkclient.NewManager(statePath, cfg, repositories, nil),
+		startupReadyOnce: sync.Once{},
+	}
+
+	err = rt.CompleteStartup(context.Background())
+	if err == nil {
+		t.Fatal("CompleteStartup() error = nil, want malformed network state error")
+	}
+	if !strings.Contains(err.Error(), "decode network state") {
+		t.Fatalf("CompleteStartup() error = %q, want malformed network state error", err)
+	}
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.schedulerDone != nil {
+		t.Fatal("schedulerDone != nil, want scheduler side effects skipped on network manager start failure")
+	}
+	if rt.schedulerStop != nil {
+		t.Fatal("schedulerStop != nil, want scheduler side effects skipped on network manager start failure")
+	}
 }
 
 func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {

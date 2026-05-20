@@ -241,6 +241,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".name", Message: "must be a non-empty string"})
 		}
 
+		networkMode := ProjectNetworkModeOff
+		if project.Network != nil && project.Network.Mode != "" {
+			networkMode = project.Network.Mode
+		}
+		if networkMode != ProjectNetworkModeOff && networkMode != ProjectNetworkModeRouted {
+			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: fmt.Sprintf("must be one of: %s, %s", ProjectNetworkModeOff, ProjectNetworkModeRouted)})
+		}
+
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
 		}

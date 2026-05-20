@@ -139,6 +139,23 @@
               "stopped": 0
             }
           },
+          "network": {
+            "configured": false,
+            "github": {
+              "numericId": 0
+            },
+            "currentGithub": {
+              "numericId": 0
+            },
+            "cloudReachable": false,
+            "lease": {
+              "name": "",
+              "fencingToken": 0
+            },
+            "routedProjects": 0,
+            "localProjects": 0,
+            "identityDrift": false
+          },
           "safety": {
             "allowAutoCommit": true,
             "allowAutoPush": true,
