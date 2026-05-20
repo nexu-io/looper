@@ -1954,6 +1954,25 @@ func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID strin
 	return scanWorktrees(rows)
 }
 
+func (r *WorktreesRepository) ListCleanupCandidates(ctx context.Context, limit int) ([]WorktreeRecord, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT *
+		FROM worktrees
+		WHERE status != 'cleaned'
+		ORDER BY updated_at ASC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list worktree cleanup candidates: %w", err)
+	}
+	defer rows.Close()
+
+	return scanWorktrees(rows)
+}
+
 func boolToInt(value bool) int {
 	if value {
 		return 1

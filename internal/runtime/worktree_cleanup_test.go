@@ -1,0 +1,238 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nexu-io/looper/internal/config"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/storage"
+)
+
+func TestWorktreeCleanupPassCleansEligibleCheckout(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_clean", "feature/clean", true)
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {{Path: worktree.WorktreePath, Branch: worktree.Branch}}},
+		clean:  map[string]bool{worktree.WorktreePath: true},
+		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
+			if input.WorktreePath != worktree.WorktreePath {
+				t.Fatalf("CleanupWorktree().WorktreePath = %q, want %q", input.WorktreePath, worktree.WorktreePath)
+			}
+			updated := worktree
+			nowISO := fixture.now.Format("2006-01-02T15:04:05.000Z")
+			updated.Status = "cleaned"
+			updated.CleanedAt = &nowISO
+			updated.UpdatedAt = nowISO
+			return fixture.repos.Worktrees.Upsert(context.Background(), updated)
+		},
+	}
+
+	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+
+	if summary.LastStatus != "completed" || summary.Cleaned != 1 || summary.Failed != 0 {
+		t.Fatalf("summary = %#v, want completed cleaned=1 failed=0", summary)
+	}
+	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), worktree.ID)
+	if err != nil {
+		t.Fatalf("Worktrees.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Status != "cleaned" || stored.CleanedAt == nil {
+		t.Fatalf("stored worktree = %#v, want cleaned with cleaned_at", stored)
+	}
+	events := fixture.events(t)
+	if !containsWorktreeCleanupEvent(events, "worktree.cleanup.started") || !containsWorktreeCleanupEvent(events, "worktree.cleanup.cleaned") || !containsWorktreeCleanupEvent(events, "worktree.cleanup.completed") {
+		t.Fatalf("events = %#v, want started/cleaned/completed", events)
+	}
+}
+
+func TestWorktreeCleanupPassSkipsDirtyCheckout(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_dirty", "feature/dirty", true)
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {{Path: worktree.WorktreePath, Branch: worktree.Branch}}},
+		clean:  map[string]bool{worktree.WorktreePath: false},
+	}
+
+	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+
+	if summary.LastStatus != "completed" || summary.Skipped != 1 || summary.Cleaned != 0 || len(git.cleanupCalls) != 0 {
+		t.Fatalf("summary = %#v cleanupCalls=%#v, want skipped dirty checkout", summary, git.cleanupCalls)
+	}
+	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), worktree.ID)
+	if err != nil {
+		t.Fatalf("Worktrees.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Status != "active" {
+		t.Fatalf("stored worktree = %#v, want active", stored)
+	}
+	events := fixture.events(t)
+	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.skipped", "dirty_git_status") {
+		t.Fatalf("events = %#v, want dirty_git_status skip", events)
+	}
+}
+
+func TestWorktreeCleanupPassRecordsFailureAndContinues(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	failing := fixture.seedWorktree(t, "wt_fail", "feature/fail", true)
+	clean := fixture.seedWorktree(t, "wt_after_fail", "feature/after-fail", true)
+	cleanupErr := errors.New("git worktree remove failed")
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
+			{Path: failing.WorktreePath, Branch: failing.Branch},
+			{Path: clean.WorktreePath, Branch: clean.Branch},
+		}},
+		clean: map[string]bool{failing.WorktreePath: true, clean.WorktreePath: true},
+		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
+			if input.WorktreePath == failing.WorktreePath {
+				return cleanupErr
+			}
+			updated, err := fixture.repos.Worktrees.GetByID(context.Background(), "wt_after_fail")
+			if err != nil {
+				return err
+			}
+			nowISO := fixture.now.Format("2006-01-02T15:04:05.000Z")
+			updated.Status = "cleaned"
+			updated.CleanedAt = &nowISO
+			updated.UpdatedAt = nowISO
+			return fixture.repos.Worktrees.Upsert(context.Background(), *updated)
+		},
+	}
+
+	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+
+	if summary.LastStatus != "failed" || summary.Failed != 1 || summary.Cleaned != 1 || !strings.Contains(summary.LastError, cleanupErr.Error()) {
+		t.Fatalf("summary = %#v, want failed=1 cleaned=1 last error", summary)
+	}
+	if len(git.cleanupCalls) != 2 {
+		t.Fatalf("cleanupCalls = %#v, want both candidates attempted", git.cleanupCalls)
+	}
+}
+
+type worktreeCleanupFixture struct {
+	runtime *Runtime
+	config  config.Config
+	repos   *storage.Repositories
+	project storage.ProjectRecord
+	root    string
+	now     time.Time
+}
+
+func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
+	t.Helper()
+	root := t.TempDir()
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Daemon.WorktreeCleanup.Enabled = true
+	cfg.Daemon.WorktreeCleanup.MaxPerTick = 10
+	worktreeRoot := filepath.Join(root, "worktrees")
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoPath) error = %v", err)
+	}
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktreeRoot) error = %v", err)
+	}
+	now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	project := storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: repoPath, BaseBranch: stringPtr("main"), MetadataJSON: stringPtr(`{"worktreeRoot":"` + worktreeRoot + `"}`), CreatedAt: now.Format("2006-01-02T15:04:05.000Z"), UpdatedAt: now.Format("2006-01-02T15:04:05.000Z")}
+	if err := repos.Projects.Upsert(context.Background(), project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	rt := New(Options{Config: cfg, Now: func() time.Time { return now }, WorktreeCleanupInitialDelay: -1})
+	return worktreeCleanupFixture{
+		runtime: rt,
+		config:  cfg,
+		repos:   repos,
+		project: project,
+		root:    worktreeRoot,
+		now:     now,
+	}
+}
+
+func (f worktreeCleanupFixture) seedWorktree(t *testing.T, id, branch string, createDir bool) storage.WorktreeRecord {
+	t.Helper()
+	path := filepath.Join(f.root, id)
+	if createDir {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll(worktree) error = %v", err)
+		}
+	}
+	nowISO := f.now.Format("2006-01-02T15:04:05.000Z")
+	record := storage.WorktreeRecord{ID: id, ProjectID: f.project.ID, RepoPath: f.project.RepoPath, WorktreePath: path, Branch: branch, BaseBranch: stringPtr("main"), Status: "active", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := f.repos.Worktrees.Upsert(context.Background(), record); err != nil {
+		t.Fatalf("Worktrees.Upsert() error = %v", err)
+	}
+	return record
+}
+
+func (f worktreeCleanupFixture) events(t *testing.T) []storage.EventLogRecord {
+	t.Helper()
+	events, err := f.repos.Events.List(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("Events.List() error = %v", err)
+	}
+	return events
+}
+
+type fakeWorktreeCleanupGit struct {
+	listed       map[string][]gitinfra.WorktreeListEntry
+	clean        map[string]bool
+	cleanupCalls []gitinfra.CleanupWorktreeInput
+	onCleanup    func(gitinfra.CleanupWorktreeInput) error
+}
+
+func (f *fakeWorktreeCleanupGit) ListWorktrees(_ context.Context, repoPath string) ([]gitinfra.WorktreeListEntry, error) {
+	return append([]gitinfra.WorktreeListEntry{}, f.listed[repoPath]...), nil
+}
+
+func (f *fakeWorktreeCleanupGit) WorktreeClean(_ context.Context, worktreePath string) (bool, error) {
+	return f.clean[worktreePath], nil
+}
+
+func (f *fakeWorktreeCleanupGit) CleanupWorktree(_ context.Context, input gitinfra.CleanupWorktreeInput) error {
+	f.cleanupCalls = append(f.cleanupCalls, input)
+	if f.onCleanup != nil {
+		return f.onCleanup(input)
+	}
+	return nil
+}
+
+func containsWorktreeCleanupEvent(events []storage.EventLogRecord, eventType string) bool {
+	for _, event := range events {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func containsWorktreeCleanupEventPayload(events []storage.EventLogRecord, eventType, needle string) bool {
+	for _, event := range events {
+		if event.EventType == eventType && strings.Contains(event.PayloadJSON, needle) {
+			return true
+		}
+	}
+	return false
+}

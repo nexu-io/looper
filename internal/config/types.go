@@ -257,14 +257,22 @@ const (
 )
 
 type DaemonConfig struct {
-	Mode                   DaemonMode          `json:"mode"`
-	RestartPolicy          DaemonRestartPolicy `json:"restartPolicy"`
-	RestartThrottleSeconds int                 `json:"restartThrottleSeconds"`
-	PlistPath              *string             `json:"plistPath,omitempty"`
-	LogDir                 string              `json:"logDir"`
-	ShutdownTimeoutMS      int                 `json:"shutdownTimeoutMs"`
-	WorkingDirectory       string              `json:"workingDirectory"`
-	Environment            map[string]string   `json:"environment"`
+	Mode                   DaemonMode            `json:"mode"`
+	RestartPolicy          DaemonRestartPolicy   `json:"restartPolicy"`
+	RestartThrottleSeconds int                   `json:"restartThrottleSeconds"`
+	PlistPath              *string               `json:"plistPath,omitempty"`
+	LogDir                 string                `json:"logDir"`
+	ShutdownTimeoutMS      int                   `json:"shutdownTimeoutMs"`
+	WorkingDirectory       string                `json:"workingDirectory"`
+	Environment            map[string]string     `json:"environment"`
+	WorktreeCleanup        WorktreeCleanupConfig `json:"worktreeCleanup"`
+}
+
+type WorktreeCleanupConfig struct {
+	Enabled         bool `json:"enabled"`
+	DryRun          bool `json:"dryRun"`
+	IntervalSeconds int  `json:"intervalSeconds"`
+	MaxPerTick      int  `json:"maxPerTick"`
 }
 
 type PackageConfig struct {
@@ -704,14 +712,22 @@ type PartialToolPathsConfig struct {
 }
 
 type PartialDaemonConfig struct {
-	Mode                   *DaemonMode          `json:"mode,omitempty"`
-	RestartPolicy          *DaemonRestartPolicy `json:"restartPolicy,omitempty"`
-	RestartThrottleSeconds *int                 `json:"restartThrottleSeconds,omitempty"`
-	PlistPath              *string              `json:"plistPath,omitempty"`
-	LogDir                 *string              `json:"logDir,omitempty"`
-	ShutdownTimeoutMS      *int                 `json:"shutdownTimeoutMs,omitempty"`
-	WorkingDirectory       *string              `json:"workingDirectory,omitempty"`
-	Environment            map[string]string    `json:"environment,omitempty"`
+	Mode                   *DaemonMode                   `json:"mode,omitempty"`
+	RestartPolicy          *DaemonRestartPolicy          `json:"restartPolicy,omitempty"`
+	RestartThrottleSeconds *int                          `json:"restartThrottleSeconds,omitempty"`
+	PlistPath              *string                       `json:"plistPath,omitempty"`
+	LogDir                 *string                       `json:"logDir,omitempty"`
+	ShutdownTimeoutMS      *int                          `json:"shutdownTimeoutMs,omitempty"`
+	WorkingDirectory       *string                       `json:"workingDirectory,omitempty"`
+	Environment            map[string]string             `json:"environment,omitempty"`
+	WorktreeCleanup        *PartialWorktreeCleanupConfig `json:"worktreeCleanup,omitempty"`
+}
+
+type PartialWorktreeCleanupConfig struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	DryRun          *bool `json:"dryRun,omitempty"`
+	IntervalSeconds *int  `json:"intervalSeconds,omitempty"`
+	MaxPerTick      *int  `json:"maxPerTick,omitempty"`
 }
 
 type PartialPackageConfig struct {

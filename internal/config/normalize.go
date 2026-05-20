@@ -560,6 +560,25 @@ func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
 	if partial.Environment != nil {
 		config.Environment = mergeStringMap(config.Environment, partial.Environment)
 	}
+
+	if partial.WorktreeCleanup != nil {
+		mergeWorktreeCleanupConfig(&config.WorktreeCleanup, *partial.WorktreeCleanup)
+	}
+}
+
+func mergeWorktreeCleanupConfig(config *WorktreeCleanupConfig, partial PartialWorktreeCleanupConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.DryRun != nil {
+		config.DryRun = *partial.DryRun
+	}
+	if partial.IntervalSeconds != nil {
+		config.IntervalSeconds = *partial.IntervalSeconds
+	}
+	if partial.MaxPerTick != nil {
+		config.MaxPerTick = *partial.MaxPerTick
+	}
 }
 
 func mergePackageConfig(config *PackageConfig, partial PartialPackageConfig) {

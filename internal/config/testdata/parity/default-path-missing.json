@@ -104,7 +104,13 @@
         "restartThrottleSeconds": 10,
         "logDir": "__TMP__/runtime-logs",
         "workingDirectory": "__TMP__/runtime",
-        "environment": {}
+        "environment": {},
+        "worktreeCleanup": {
+          "enabled": false,
+          "dryRun": false,
+          "intervalSeconds": 3600,
+          "maxPerTick": 10
+        }
       },
       "package": {
         "distribution": "github-release",

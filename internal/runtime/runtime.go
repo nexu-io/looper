@@ -56,16 +56,17 @@ type RecoveryOrphanAgentCleanup struct {
 }
 
 type Options struct {
-	Config                 config.Config
-	Logger                 bootstrap.Logger
-	Now                    func() time.Time
-	ShutdownTimeout        time.Duration
-	OpenSQLiteCoordinator  OpenSQLiteCoordinatorFunc
-	SyncConfiguredProjects SyncConfiguredProjectsFunc
-	RunSchedulerTick       RunSchedulerTickFunc
-	ReadProcessCommand     ReadProcessCommandFunc
-	SignalProcess          SignalProcessFunc
-	DeferRecovery          bool
+	Config                      config.Config
+	Logger                      bootstrap.Logger
+	Now                         func() time.Time
+	ShutdownTimeout             time.Duration
+	WorktreeCleanupInitialDelay time.Duration
+	OpenSQLiteCoordinator       OpenSQLiteCoordinatorFunc
+	SyncConfiguredProjects      SyncConfiguredProjectsFunc
+	RunSchedulerTick            RunSchedulerTickFunc
+	ReadProcessCommand          ReadProcessCommandFunc
+	SignalProcess               SignalProcessFunc
+	DeferRecovery               bool
 }
 
 type Services struct {
@@ -99,33 +100,39 @@ type Runtime struct {
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
 
-	mu                 sync.RWMutex
-	startedAt          *time.Time
-	recovery           RecoverySummary
-	stopped            bool
-	services           Services
-	startErr           error
-	startOnce          sync.Once
-	shutdownOnce       sync.Once
-	shutdownCh         chan struct{}
-	schedulerStop      chan struct{}
-	schedulerDone      chan struct{}
-	schedulerWake      chan struct{}
-	schedulerClaimWake chan struct{}
-	schedulerCancel    context.CancelFunc
-	schedulerTasks     *schedulerTaskTracker
-	recoveryCancel     context.CancelFunc
-	recoveryDone       chan struct{}
-	activeExecutions   *ActiveExecutionRegistry
-	githubGateway      *githubinfra.Gateway
-	webhook            *webhookRuntime
-	webhookDaemonLock  *daemonLock
-	webhookForwarder   WebhookForwarder
-	networkManager     *networkclient.Manager
-	schedulerDisabled  bool
-	startupReadyOnce   sync.Once
-	startupReadyErr    error
-	ownershipAcquired  bool
+	mu                          sync.RWMutex
+	startedAt                   *time.Time
+	recovery                    RecoverySummary
+	stopped                     bool
+	services                    Services
+	startErr                    error
+	startOnce                   sync.Once
+	shutdownOnce                sync.Once
+	shutdownCh                  chan struct{}
+	schedulerStop               chan struct{}
+	schedulerDone               chan struct{}
+	schedulerWake               chan struct{}
+	schedulerClaimWake          chan struct{}
+	schedulerCancel             context.CancelFunc
+	schedulerTasks              *schedulerTaskTracker
+	worktreeCleanupStop         chan struct{}
+	worktreeCleanupDone         chan struct{}
+	worktreeCleanupCancel       context.CancelFunc
+	worktreeCleanupRunning      bool
+	worktreeCleanupInitialDelay time.Duration
+	worktreeCleanupStatus       WorktreeCleanupStatus
+	recoveryCancel              context.CancelFunc
+	recoveryDone                chan struct{}
+	activeExecutions            *ActiveExecutionRegistry
+	githubGateway               *githubinfra.Gateway
+	webhook                     *webhookRuntime
+	webhookDaemonLock           *daemonLock
+	webhookForwarder            WebhookForwarder
+	networkManager              *networkclient.Manager
+	schedulerDisabled           bool
+	startupReadyOnce            sync.Once
+	startupReadyErr             error
+	ownershipAcquired           bool
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -168,21 +175,22 @@ func New(options Options) *Runtime {
 	}
 
 	rt := &Runtime{
-		config:                 options.Config,
-		logger:                 options.Logger,
-		now:                    now,
-		openSQLiteCoordinator:  openSQLiteCoordinator,
-		syncConfiguredProjects: syncConfiguredProjects,
-		runSchedulerTick:       runSchedulerTick,
-		customSchedulerTick:    customSchedulerTick,
-		readProcessCommand:     readProcessCommand,
-		signalProcess:          signalProcess,
-		shutdownTimeout:        shutdownTimeout,
-		deferRecovery:          options.DeferRecovery,
-		recovery:               createEmptyRecoverySummary(),
-		shutdownCh:             make(chan struct{}),
-		activeExecutions:       NewActiveExecutionRegistry(),
-		webhook:                newWebhookRuntime(options.Config, options.Logger, now),
+		config:                      options.Config,
+		logger:                      options.Logger,
+		now:                         now,
+		openSQLiteCoordinator:       openSQLiteCoordinator,
+		syncConfiguredProjects:      syncConfiguredProjects,
+		runSchedulerTick:            runSchedulerTick,
+		customSchedulerTick:         customSchedulerTick,
+		readProcessCommand:          readProcessCommand,
+		signalProcess:               signalProcess,
+		shutdownTimeout:             shutdownTimeout,
+		worktreeCleanupInitialDelay: options.WorktreeCleanupInitialDelay,
+		deferRecovery:               options.DeferRecovery,
+		recovery:                    createEmptyRecoverySummary(),
+		shutdownCh:                  make(chan struct{}),
+		activeExecutions:            NewActiveExecutionRegistry(),
+		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 	}
 	if rt.webhook != nil {
 		rt.webhook.forwarder = rt.WebhookForwarder
@@ -220,6 +228,7 @@ func (r *Runtime) Stop(reason string) {
 		}
 
 		r.stopDeferredReviewerRecovery()
+		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
 
@@ -663,6 +672,9 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 		if !schedulerDisabled {
 			r.startSchedulerLoop()
+		}
+		if r.config.Daemon.WorktreeCleanup.Enabled {
+			r.startWorktreeCleanupLoop()
 		}
 		r.startDeferredReviewerRecovery(githubGateway)
 
