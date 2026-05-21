@@ -51,6 +51,8 @@ That means `loopernet` never becomes the source of truth for Issue admission or 
 
 ## 1b. Routed setup and recovery
 
+Before enrolling Nodes, deploy exactly one active `loopernet` instance per Network. For container examples, persistence requirements, and the current non-HA constraint, see [loopernet deployment](loopernet-deployment.md).
+
 Typical Routed rollout:
 
 1. join each Node to `loopernet` with `looper network join <url> --key ... --name <node>`

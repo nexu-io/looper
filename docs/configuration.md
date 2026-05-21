@@ -38,6 +38,8 @@ Operational notes:
 
 The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
 
+For runtime deployment details — container image, required environment variables, persistence, and the current single-instance recommendation — see [loopernet deployment](loopernet-deployment.md).
+
 ## Webhook delivery modes
 
 `webhook.enabled=true` supports two delivery modes:

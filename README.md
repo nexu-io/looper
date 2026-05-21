@@ -148,7 +148,7 @@ In Routed mode:
 - the `loopernet` Coordinator lease is only a fencing gate for mutation rights; if the lease is stale, Coordinator must stop mutating GitHub.
 - polling stays enabled as drift recovery if webhook ingress or SSE wakeups are missed; it is not the primary wakeup path.
 
-For setup, identity strategy, and recovery steps, see **[docs/users-guide.md](docs/users-guide.md)** and **[docs/configuration.md](docs/configuration.md)**. The formal authority rules live in ADRs **[0007](docs/adr/0007-coordinator-admission-assignment-authority.md)** through **[0011](docs/adr/0011-coordinator-control-plane-for-routed-projects-v1.md)**.
+For setup, identity strategy, recovery steps, and `loopernet` deployment, see **[docs/users-guide.md](docs/users-guide.md)**, **[docs/configuration.md](docs/configuration.md)**, and **[docs/loopernet-deployment.md](docs/loopernet-deployment.md)**. The formal authority rules live in ADRs **[0007](docs/adr/0007-coordinator-admission-assignment-authority.md)** through **[0011](docs/adr/0011-coordinator-control-plane-for-routed-projects-v1.md)**.
 
 ## Command cheatsheet
 
