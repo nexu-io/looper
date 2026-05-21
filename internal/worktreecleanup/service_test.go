@@ -93,6 +93,34 @@ func TestPlanRespectsMaxPerTick(t *testing.T) {
 	assertDecision(t, result, "wt_c", ActionSkipped, "maxPerTick limit reached")
 }
 
+func TestPlanDoesNotCrossMatchSharedBranchAcrossProjects(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFixture(t)
+	old := fixture.now.Add(-10 * 24 * time.Hour)
+	fixture.project("project_2", "/tmp/other")
+
+	fixture.worktreeForProject("project_1", "wt_precise", "looper/shared", old)
+	fixture.worktreeForProject("project_2", "wt_same_branch", "looper/shared", old)
+	fixture.loop("loop_precise", "failed", "wt_precise", "looper/shared", old)
+
+	fixture.worktreeForProject("project_1", "wt_branch_only", "looper/branch-only", old)
+	fixture.worktreeForProject("project_2", "wt_branch_only_other", "looper/branch-only", old)
+	fixture.loopWithMetadata("project_1", "loop_branch_only", "failed", `{"branch":"looper/branch-only"}`, old)
+
+	service := fixture.service()
+	service.Config.IncludeOrphans = true
+	result, err := service.Plan(context.Background())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+
+	assertDecision(t, result, "wt_precise", ActionSkipped, "referenced by protected loop status failed")
+	assertDecision(t, result, "wt_same_branch", ActionWouldClean, "eligible in dry-run plan")
+	assertDecision(t, result, "wt_branch_only", ActionSkipped, "referenced by protected loop status failed")
+	assertDecision(t, result, "wt_branch_only_other", ActionWouldClean, "eligible in dry-run plan")
+}
+
 type cleanupFixture struct {
 	t     *testing.T
 	repos *storage.Repositories
@@ -119,6 +147,14 @@ func newFixture(t *testing.T) cleanupFixture {
 	return cleanupFixture{t: t, repos: repos, now: now}
 }
 
+func (f *cleanupFixture) project(id, repoPath string) {
+	f.t.Helper()
+	nowISO := iso(f.now)
+	if err := f.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: id, Name: id, RepoPath: repoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		f.t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+}
+
 func (f *cleanupFixture) service() *Service {
 	return &Service{
 		Repos: f.repos,
@@ -136,16 +172,26 @@ func (f *cleanupFixture) service() *Service {
 
 func (f *cleanupFixture) worktree(id, branch string, updatedAt time.Time) {
 	f.t.Helper()
-	if err := f.repos.Worktrees.Upsert(context.Background(), storage.WorktreeRecord{ID: id, ProjectID: "project_1", RepoPath: "/tmp/looper", WorktreePath: "/tmp/worktrees/" + id, Branch: branch, Status: "active", CreatedAt: iso(updatedAt), UpdatedAt: iso(updatedAt)}); err != nil {
+	f.worktreeForProject("project_1", id, branch, updatedAt)
+}
+
+func (f *cleanupFixture) worktreeForProject(projectID, id, branch string, updatedAt time.Time) {
+	f.t.Helper()
+	if err := f.repos.Worktrees.Upsert(context.Background(), storage.WorktreeRecord{ID: id, ProjectID: projectID, RepoPath: "/tmp/looper", WorktreePath: "/tmp/worktrees/" + id, Branch: branch, Status: "active", CreatedAt: iso(updatedAt), UpdatedAt: iso(updatedAt)}); err != nil {
 		f.t.Fatalf("Worktrees.Upsert() error = %v", err)
 	}
 }
 
 func (f *cleanupFixture) loop(id, status, worktreeID, branch string, updatedAt time.Time) {
 	f.t.Helper()
-	f.seq++
 	metadata := `{"worktreeId":"` + worktreeID + `","branch":"` + branch + `"}`
-	if err := f.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: id, Seq: f.seq, ProjectID: "project_1", Type: "worker", TargetType: "project", Status: status, MetadataJSON: &metadata, CreatedAt: iso(updatedAt), UpdatedAt: iso(updatedAt)}); err != nil {
+	f.loopWithMetadata("project_1", id, status, metadata, updatedAt)
+}
+
+func (f *cleanupFixture) loopWithMetadata(projectID, id, status, metadata string, updatedAt time.Time) {
+	f.t.Helper()
+	f.seq++
+	if err := f.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: id, Seq: f.seq, ProjectID: projectID, Type: "worker", TargetType: "project", Status: status, MetadataJSON: &metadata, CreatedAt: iso(updatedAt), UpdatedAt: iso(updatedAt)}); err != nil {
 		f.t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 }

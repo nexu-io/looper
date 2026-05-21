@@ -47,9 +47,10 @@ type Reference struct {
 }
 
 type worktreeRef struct {
-	ID     string
-	Path   string
-	Branch string
+	ProjectID string
+	ID        string
+	Path      string
+	Branch    string
 }
 
 type candidateState struct {
@@ -174,6 +175,8 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 			if loop, ok := loopsByID[*item.LoopID]; ok {
 				ref = fillRefFromLoop(ref, loop)
 			}
+		} else if item.ProjectID != nil && ref.ProjectID == "" {
+			ref.ProjectID = *item.ProjectID
 		}
 		for index := range states {
 			if !matchesRef(states[index].worktree, ref) {
@@ -273,8 +276,14 @@ func protectsLoopStatus(status string) bool {
 }
 
 func fillRefFromLoop(ref worktreeRef, loop storage.LoopRecord) worktreeRef {
+	if ref.ProjectID == "" {
+		ref.ProjectID = loop.ProjectID
+	}
 	if loop.MetadataJSON != nil {
 		metadataRef, _ := refFromJSON(loop.MetadataJSON)
+		if ref.ProjectID == "" {
+			ref.ProjectID = metadataRef.ProjectID
+		}
 		if ref.ID == "" {
 			ref.ID = metadataRef.ID
 		}
@@ -299,6 +308,9 @@ func refFromJSON(raw *string) (worktreeRef, bool) {
 	ref := refFromMap(value)
 	if nested, ok := value["worktree"].(map[string]any); ok {
 		nestedRef := refFromMap(nested)
+		if ref.ProjectID == "" {
+			ref.ProjectID = nestedRef.ProjectID
+		}
 		if ref.ID == "" {
 			ref.ID = nestedRef.ID
 		}
@@ -314,9 +326,10 @@ func refFromJSON(raw *string) (worktreeRef, bool) {
 
 func refFromMap(value map[string]any) worktreeRef {
 	return worktreeRef{
-		ID:     firstString(value["worktreeId"], value["id"]),
-		Path:   firstString(value["worktreePath"], value["path"]),
-		Branch: firstString(value["branch"]),
+		ProjectID: firstString(value["projectId"], value["projectID"], value["project_id"]),
+		ID:        firstString(value["worktreeId"], value["id"]),
+		Path:      firstString(value["worktreePath"], value["path"]),
+		Branch:    firstString(value["branch"]),
 	}
 }
 
@@ -330,13 +343,19 @@ func firstString(values ...any) string {
 }
 
 func matchesRef(worktree storage.WorktreeRecord, ref worktreeRef) bool {
-	if ref.ID != "" && ref.ID == worktree.ID {
-		return true
+	if ref.ID != "" {
+		return ref.ID == worktree.ID
 	}
-	if ref.Path != "" && ref.Path == worktree.WorktreePath {
-		return true
+	if ref.Path != "" {
+		return ref.Path == worktree.WorktreePath
 	}
-	return ref.Branch != "" && ref.Branch == worktree.Branch
+	if ref.Branch == "" {
+		return false
+	}
+	if ref.ProjectID != "" && ref.ProjectID != worktree.ProjectID {
+		return false
+	}
+	return ref.Branch == worktree.Branch
 }
 
 func markProjectParseFailure(states []candidateState, projectID string, reference Reference) {
