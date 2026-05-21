@@ -1806,6 +1806,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
 		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(existing.HeadRefName, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
+				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			}
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
@@ -1822,6 +1825,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, nil
 	}
 	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
+		if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
+			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		}
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	ahead, err := r.workerBranchAheadOfBase(ctx, input.Project, work, worktree)
@@ -3239,6 +3245,14 @@ func buildWorkerSlug(title string) string {
 		return "update"
 	}
 	return value
+}
+
+func shouldRestartWorkerFromDiscoverAfterPushFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "non-fast-forward") || strings.Contains(message, "remote head changed")
 }
 
 func buildWorkerLoopHash(loopID string) string {

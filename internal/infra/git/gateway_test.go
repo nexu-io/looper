@@ -290,6 +290,37 @@ func TestGatewayPushesHeadToRequestedRemoteBranch(t *testing.T) {
 	}
 }
 
+func TestGatewayCreatesAttachedWorktreeFromRemoteOnlyBranch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	fixture.createUnfetchedRemoteBranch(t, "looper/715-error-exporting-apresentations-f1db7b9a10e512af")
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "looper/715-error-exporting-apresentations-f1db7b9a10e512af",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	remoteHeadSHA := stringsTrimSpace(runGit(t, fixture.remotePath, "rev-parse", "refs/heads/looper/715-error-exporting-apresentations-f1db7b9a10e512af"))
+	worktreeHeadSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+	if worktreeHeadSHA != remoteHeadSHA {
+		t.Fatalf("worktree HEAD = %q, want remote branch head %q", worktreeHeadSHA, remoteHeadSHA)
+	}
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "branch", "--show-current")); got != "looper/715-error-exporting-apresentations-f1db7b9a10e512af" {
+		t.Fatalf("branch = %q, want remote-only branch checkout", got)
+	}
+	if got := stringsTrimSpace(runGitMaybe(t, fixture.repoPath, "show-ref", "--verify", "refs/remotes/origin/looper/715-error-exporting-apresentations-f1db7b9a10e512af")); got == "" {
+		t.Fatal("origin remote-tracking branch missing after CreateWorktree()")
+	}
+}
+
 func TestGatewayCreatesSeparateDetachedWorktreeForAttachedBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

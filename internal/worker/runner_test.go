@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
@@ -2650,6 +2651,47 @@ func TestProcessClaimedItemFindsExistingPRAfterPushAndStampsWorkerDisclosure(t *
 	}
 	if !strings.Contains(github.updatePRBodyCalls[0].Body, "runner=worker") {
 		t.Fatalf("updated body = %q, want worker disclosure footer", github.updatePRBodyCalls[0].Body)
+	}
+}
+
+func TestProcessClaimedItemRestartsFromDiscoverAfterNonFastForwardPush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/715-error-exporting-apresentations-f1db7b9a10e512af", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}, pushErrors: []error{errors.New("git push rejected (non-fast-forward)")}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}, {Status: "completed", Summary: "done again", Stdout: "ok", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	firstClaim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	first, err := runner.ProcessClaimedItem(context.Background(), *firstClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
+		t.Fatalf("first = %#v, want retryable non-fast-forward failure", first)
+	}
+	run, err := fixture.repos.Runs.GetByID(context.Background(), first.RunID)
+	if err != nil {
+		t.Fatalf("Runs.GetByID(first) error = %v", err)
+	}
+	checkpoint, err := parseCheckpoint(run.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint(first) error = %v", err)
+	}
+	if checkpoint.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+
+	fixture.advance(5 * time.Second)
+	secondClaim, _ := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	second, err := runner.ProcessClaimedItem(context.Background(), *secondClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(second) error = %v", err)
+	}
+	if second.Status != "success" || second.PullRequestNumber != 101 {
+		t.Fatalf("second = %#v, want success after restart from discover", second)
+	}
+	if len(git.createCalls) != 2 {
+		t.Fatalf("len(git.createCalls) = %d, want 2 after restarting from discover", len(git.createCalls))
 	}
 }
 

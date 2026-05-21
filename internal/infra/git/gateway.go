@@ -237,7 +237,11 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		if branchExists {
 			args = append(args, worktreePath, input.Branch)
 		} else {
-			args = append(args, "-b", input.Branch, worktreePath, input.BaseBranch)
+			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.Branch, input.BaseBranch)
+			if err != nil {
+				return storage.WorktreeRecord{}, err
+			}
+			args = append(args, "-b", input.Branch, worktreePath, startPoint)
 		}
 		if err := g.runGit(ctx, input.RepoPath, nil, args...); err != nil {
 			return storage.WorktreeRecord{}, err
@@ -282,6 +286,29 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 
 	return record, nil
 
+}
+
+func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branch, baseBranch string) (string, error) {
+	hasRemote, err := g.hasRemote(ctx, repoPath, "origin")
+	if err != nil {
+		return "", err
+	}
+	if !hasRemote {
+		return baseBranch, nil
+	}
+
+	remoteBranchExists, err := g.remoteBranchExists(ctx, repoPath, "origin", branch)
+	if err != nil {
+		return "", err
+	}
+	if !remoteBranchExists {
+		return baseBranch, nil
+	}
+	remoteRef := "refs/remotes/origin/" + branch
+	if err := g.runGit(ctx, repoPath, nil, "fetch", "origin", fmt.Sprintf("refs/heads/%s:%s", branch, remoteRef)); err != nil {
+		return "", err
+	}
+	return "origin/" + branch, nil
 }
 
 func (g *Gateway) ListWorktrees(ctx context.Context, repoPath string) ([]WorktreeListEntry, error) {
@@ -680,15 +707,15 @@ func (g *Gateway) branchExists(ctx context.Context, repoPath, branch string) (bo
 }
 
 func (g *Gateway) remoteBranchExists(ctx context.Context, repoPath, remote, branch string) (bool, error) {
-	_, err := g.runGitResult(ctx, repoPath, nil, "show-ref", "--quiet", "--verify", "refs/remotes/"+remote+"/"+branch)
-	if err == nil {
-		return true, nil
+	result, err := g.runGitResult(ctx, repoPath, nil, "ls-remote", "--heads", remote, "refs/heads/"+branch)
+	if err != nil {
+		var commandErr *shell.CommandExecutionError
+		if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 2 {
+			return false, nil
+		}
+		return false, err
 	}
-	var commandErr *shell.CommandExecutionError
-	if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
-		return false, nil
-	}
-	return false, err
+	return strings.TrimSpace(result.Stdout) != "", nil
 }
 
 func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWorktreeInput) (string, error) {
