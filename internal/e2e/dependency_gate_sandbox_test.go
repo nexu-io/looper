@@ -90,12 +90,14 @@ func TestGitHubSandboxDependencyGateScenarios(t *testing.T) {
 		waitForSandboxIssueLabel(t, sb, dependent.Number, "looper:plan")
 	})
 
-	t.Run("cycle issues are returned to retriage with stamped comments", func(t *testing.T) {
+	t.Run("GitHub rejects blocked_by cycle creation", func(t *testing.T) {
 		left := createDependencyGateIssue(t, sb, "cycle left")
 		right := createDependencyGateIssue(t, sb, "cycle right")
 		defer closeSandboxIssueIfOpen(t, sb, left.Number, "not_planned")
 		defer closeSandboxIssueIfOpen(t, sb, right.Number, "not_planned")
 		linkSandboxBlockedBy(t, sb, left.Number, right.ID)
+		// Real GitHub rejects cycles before coordinator discovery can observe them.
+		// Coordinator-side cycle re-triage remains covered by TestCoordinatorCycleHandlingWithFakeGH.
 		output, err := runSandboxCommand("", sb.CmdEnv, "gh", "api", fmt.Sprintf("repos/%s/issues/%d/dependencies/blocked_by", sb.Repo, right.Number), "--method", "POST", "-H", "X-GitHub-Api-Version: 2026-03-10", "-F", fmt.Sprintf("issue_id=%d", left.ID))
 		if err == nil {
 			t.Fatalf("expected GitHub to reject cycle creation, but request succeeded: %s", output)
