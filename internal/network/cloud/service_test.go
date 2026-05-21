@@ -3,6 +3,9 @@ package cloud
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -309,6 +312,63 @@ func TestCoordinatorLeaseRevalidateProbesTarget(t *testing.T) {
 	if resp.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("failed revalidate status = %d, want 412", resp.StatusCode)
 	}
+}
+
+func TestWebhookSecretAndSignatureValidation(t *testing.T) {
+	server, service := newTestHTTPServer(t)
+	defer server.Close()
+	defer service.Close()
+	joinNode(t, server.URL, createJoinKey(t, server.URL), "worker-1", 101)
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/github/webhook-secret", nil)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("secret request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/github/webhook-secret status = %d, want 200", resp.StatusCode)
+	}
+	var secretPayload map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&secretPayload); err != nil {
+		t.Fatalf("decode secret payload: %v", err)
+	}
+	secret := secretPayload["secret"]
+	body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/github/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "delivery-1")
+	req.Header.Set("X-Hub-Signature-256", githubSignature(secret, body))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("webhook request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /v1/github/webhook status = %d, want 202", resp.StatusCode)
+	}
+	status := getStatus(t, server.URL)
+	if status.Webhook.DeliveriesReceived != 1 || status.Webhook.LastRepo != "acme/looper" {
+		t.Fatalf("webhook health = %#v, want recorded delivery", status.Webhook)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/v1/github/webhook", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", githubSignature("wrong-secret", body))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("invalid webhook request error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("invalid signature status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func githubSignature(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 func TestCoordinatorLeaseRevalidateRejectsRedirectTarget(t *testing.T) {

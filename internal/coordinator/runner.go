@@ -615,16 +615,18 @@ func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cw
 		}
 		return false, err
 	}
-	exactTarget := protocol.TargetLabelForNode(selected.NodeName)
-	labelsToRemove := nonExactTargetLabels(issue.Labels, exactTarget)
-	if len(labelsToRemove) > 0 {
-		if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToRemove, CWD: cwd}); err != nil {
+	targetPlan, err := protocol.PlanExactTarget(issue.Labels, selected.NodeName)
+	if err != nil {
+		return false, err
+	}
+	if len(targetPlan.Remove) > 0 {
+		if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: targetPlan.Remove, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
 	}
-	if !hasExactLabel(issue.Labels, exactTarget) {
-		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{exactTarget}, CWD: cwd}); err != nil {
+	if len(targetPlan.Add) > 0 {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: targetPlan.Add, CWD: cwd}); err != nil {
 			return false, err
 		}
 		mutated = true
@@ -667,7 +669,7 @@ func selectEligibleWorkerNode(members []protocol.Membership, now time.Time) (pro
 		if member.LastHeartbeatAt == nil || member.LastHeartbeatAt.Before(now.Add(-2*protocol.DefaultLeaseTTL)) {
 			continue
 		}
-		if !hasExactLabel(member.TargetLabels, protocol.TargetLabelForNode(member.NodeName)) {
+		if !protocol.HasExactTarget(member.TargetLabels, member.NodeName) || len(protocol.CollectTargetLabels(member.TargetLabels)) != 1 {
 			continue
 		}
 		eligible = append(eligible, member)
@@ -1567,18 +1569,6 @@ func removeExistingLabels(labels []string, existing []string) []string {
 		if !hasExactLabel(existing, label) {
 			out = append(out, label)
 		}
-	}
-	return out
-}
-
-func nonExactTargetLabels(labels []string, keep string) []string {
-	prefix := strings.ToLower(protocol.TargetLabelForNode(""))
-	out := []string{}
-	for _, label := range labels {
-		if !strings.HasPrefix(strings.ToLower(label), prefix) || strings.EqualFold(label, keep) {
-			continue
-		}
-		out = append(out, label)
 	}
 	return out
 }

@@ -5,11 +5,11 @@ import (
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/network/protocol"
 )
 
 const (
 	workerReadyLabel = "looper:worker-ready"
-	targetPrefix     = "looper:target:"
 )
 
 type GitHubUser struct {
@@ -91,7 +91,7 @@ func EvaluateReviewer(policy ProjectPolicy, labels []string, reviewRequests []Gi
 }
 
 func evaluateTarget(policy ProjectPolicy, labels []string) ClaimDecision {
-	targetLabels := collectTargetLabels(labels)
+	targetLabels := protocol.CollectTargetLabels(labels)
 	if len(targetLabels) == 0 {
 		return ClaimDecision{Reason: "missing looper:target:<node_name> label", MatchMode: MatchModeNone}
 	}
@@ -99,33 +99,11 @@ func evaluateTarget(policy ProjectPolicy, labels []string) ClaimDecision {
 		return ClaimDecision{Reason: "multiple looper:target:<node_name> labels present", MatchMode: MatchModeNone}
 	}
 	targetLabel := targetLabels[0]
-	targetNode := trimTargetPrefix(targetLabel)
-	if !strings.EqualFold(strings.TrimSpace(targetNode), strings.TrimSpace(policy.NodeName)) {
+	targetNode, _ := protocol.ParseTargetLabel(targetLabel)
+	if strings.TrimSpace(targetNode) != strings.TrimSpace(policy.NodeName) {
 		return ClaimDecision{Reason: fmt.Sprintf("target label %s does not match local node %s", targetLabel, strings.TrimSpace(policy.NodeName)), MatchMode: MatchModeNone, TargetLabel: targetLabel}
 	}
 	return ClaimDecision{Allowed: true, MatchMode: MatchModeNone, TargetLabel: targetLabel}
-}
-
-func collectTargetLabels(labels []string) []string {
-	result := make([]string, 0, 1)
-	for _, label := range labels {
-		trimmed := strings.TrimSpace(label)
-		if strings.HasPrefix(strings.ToLower(trimmed), targetPrefix) {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
-func trimTargetPrefix(label string) string {
-	trimmed := strings.TrimSpace(label)
-	if len(trimmed) < len(targetPrefix) {
-		return trimmed
-	}
-	if strings.EqualFold(trimmed[:len(targetPrefix)], targetPrefix) {
-		return trimmed[len(targetPrefix):]
-	}
-	return trimmed
 }
 
 func matchLocalIdentity(policy ProjectPolicy, users []GitHubUser) (bool, MatchMode) {

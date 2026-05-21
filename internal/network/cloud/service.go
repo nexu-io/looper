@@ -21,15 +21,19 @@ import (
 var errUnauthorized = errors.New("unauthorized")
 var randRead = rand.Read
 
+const webhookSecretMetaKey = "github_webhook_secret"
+
 const leaseRevalidationProbeTimeout = 2 * time.Second
 
 type Service struct {
-	config  Config
-	db      *sql.DB
-	now     func() time.Time
-	leaseMu sync.Mutex
-	mu      sync.Mutex
-	subs    map[chan protocol.AuditEnvelope]struct{}
+	config    Config
+	db        *sql.DB
+	now       func() time.Time
+	leaseMu   sync.Mutex
+	webhookMu sync.Mutex
+	mu        sync.Mutex
+	subs      map[chan protocol.AuditEnvelope]struct{}
+	webhook   protocol.WebhookHealth
 }
 
 func Open(ctx context.Context, cfg Config) (*Service, error) {
@@ -89,6 +93,31 @@ func (s *Service) NetworkID(ctx context.Context) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'network_id'`).Scan(&id)
 	return id, err
+}
+
+func (s *Service) WebhookSecret(ctx context.Context) (string, error) {
+	s.webhookMu.Lock()
+	defer s.webhookMu.Unlock()
+	var existing string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, webhookSecretMetaKey).Scan(&existing)
+	if err == nil && strings.TrimSpace(existing) != "" {
+		return existing, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	secret, err := randomToken(32)
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)`, webhookSecretMetaKey, secret); err != nil {
+		return "", err
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, webhookSecretMetaKey).Scan(&existing)
+	if err != nil {
+		return "", err
+	}
+	return existing, nil
 }
 
 func (s *Service) CreateJoinKey(ctx context.Context) (string, error) {
@@ -356,7 +385,7 @@ func (s *Service) Status(ctx context.Context) (protocol.StatusResponse, error) {
 	if err != nil {
 		return protocol.StatusResponse{}, err
 	}
-	return protocol.StatusResponse{NetworkID: networkID, Lease: lease, Memberships: members, Warnings: warnings}, nil
+	return protocol.StatusResponse{NetworkID: networkID, Lease: lease, Memberships: members, Webhook: s.webhookHealth(), Warnings: warnings}, nil
 }
 
 func (s *Service) NodeStatus(ctx context.Context, nodeToken string) (protocol.NodeStatusResponse, error) {
@@ -381,7 +410,7 @@ func (s *Service) NodeStatus(ctx context.Context, nodeToken string) (protocol.No
 		return protocol.NodeStatusResponse{}, err
 	}
 	member.NodeID = nodeID
-	return protocol.NodeStatusResponse{NetworkID: networkID, Membership: member, Memberships: members, Lease: lease, Warnings: warnings, CloudReachable: true, CurrentGitHub: member.GitHub, IdentityDrift: member.Capabilities.IdentityDrift, IdentityDriftReason: member.Capabilities.DriftReason}, nil
+	return protocol.NodeStatusResponse{NetworkID: networkID, Membership: member, Memberships: members, Lease: lease, Webhook: s.webhookHealth(), Warnings: warnings, CloudReachable: true, CurrentGitHub: member.GitHub, IdentityDrift: member.Capabilities.IdentityDrift, IdentityDriftReason: member.Capabilities.DriftReason}, nil
 }
 
 func (s *Service) currentLease(ctx context.Context) (protocol.CoordinatorLease, error) {
@@ -606,6 +635,29 @@ func randomToken(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func (s *Service) RecordWebhookDelivery(eventType, deliveryID, repo string) {
+	now := s.now().UTC()
+	s.webhookMu.Lock()
+	s.webhook.DeliveriesReceived++
+	s.webhook.LastDeliveryAt = &now
+	s.webhook.LastDeliveryID = strings.TrimSpace(deliveryID)
+	s.webhook.LastEvent = strings.TrimSpace(eventType)
+	s.webhook.LastRepo = strings.TrimSpace(repo)
+	s.webhookMu.Unlock()
+	payload, _ := json.Marshal(map[string]string{"event": strings.TrimSpace(eventType), "deliveryId": strings.TrimSpace(deliveryID), "repo": strings.TrimSpace(repo)})
+	s.publish(protocol.AuditEnvelope{Event: "webhook.received", OccurredAt: now, Payload: payload})
+}
+
+func (s *Service) webhookHealth() protocol.WebhookHealth {
+	s.webhookMu.Lock()
+	health := s.webhook
+	s.webhookMu.Unlock()
+	s.mu.Lock()
+	health.EventSubscribers = len(s.subs)
+	s.mu.Unlock()
+	return health
 }
 
 func (s *Service) Subscribe() (<-chan protocol.AuditEnvelope, func()) {

@@ -37,17 +37,11 @@ func TestEvaluateReviewerFallsBackToLoginWhenNumericIDsUnavailable(t *testing.T)
 	}
 }
 
-func TestEvaluateTargetAcceptsCaseInsensitiveTargetPrefix(t *testing.T) {
+func TestEvaluateTargetRejectsNonCanonicalTargetPrefix(t *testing.T) {
 	t.Parallel()
 	policy := ProjectPolicy{Mode: config.NetworkModeRouted, NodeName: "red", GitHubLogin: "worker"}
 	decision := EvaluateWorker(policy, []string{"looper:worker-ready", "Looper:Target:red"}, []GitHubUser{{Login: "worker"}})
-	if !decision.Allowed {
-		t.Fatalf("decision = %#v, want allowed worker claim for mixed-case target prefix", decision)
-	}
-	if decision.TargetLabel != "Looper:Target:red" {
-		t.Fatalf("decision.TargetLabel = %q, want original label preserved", decision.TargetLabel)
-	}
-	if decision.MatchMode != MatchModeLoginFallback {
-		t.Fatalf("decision.MatchMode = %q, want login fallback", decision.MatchMode)
+	if decision.Allowed || decision.Reason == "" {
+		t.Fatalf("decision = %#v, want mixed-case target label rejected", decision)
 	}
 }

@@ -160,3 +160,46 @@ func TestManagerClearsIdentityDriftAfterIdentityMatches(t *testing.T) {
 	status := manager.Status()
 	t.Fatalf("final drift status = %v reason=%q, want cleared", status.IdentityDrift, status.DriftReason)
 }
+
+func TestManagerAcquiresAndRenewsCoordinatorLeaseForEligibleNode(t *testing.T) {
+	ctx := context.Background()
+	service, err := cloud.Open(ctx, cloud.Config{DBPath: filepath.Join(t.TempDir(), "net.sqlite"), AdminToken: "admin-token", ProtocolVersion: protocol.CurrentVersion, MinimumDaemonVersion: "0.0.0"})
+	if err != nil {
+		t.Fatalf("cloud.Open() error = %v", err)
+	}
+	defer service.Close()
+	server := cloud.NewServer(cloud.Config{AdminToken: "admin-token"}, service)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	joinKey, _ := service.CreateJoinKey(ctx)
+	joinResp, err := New(httpServer.URL, "", httpServer.Client()).Join(ctx, protocol.JoinRequest{ProtocolVersion: protocol.CurrentVersion, DaemonVersion: "0.0.0", JoinKey: joinKey, NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}})
+	if err != nil {
+		t.Fatalf("Join() error = %v", err)
+	}
+	statePath := filepath.Join(t.TempDir(), "network.json")
+	if err := SaveState(statePath, LocalState{URL: httpServer.URL, NetworkID: joinResp.NetworkID, NodeID: joinResp.NodeID, NodeName: "worker-1", NodeToken: joinResp.NodeToken, GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}}); err != nil {
+		t.Fatalf("SaveState() error = %v", err)
+	}
+	gh := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `{"login":"stored-user","id":101}`}, nil
+	}})
+	manager := NewManager(statePath, config.Config{Projects: []config.ProjectRefConfig{{ID: "demo-routed", Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}, Roles: config.RoleConfigs{Coordinator: config.CoordinatorRoleConfig{Enabled: true}}}, nil, gh)
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer manager.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status := manager.Status()
+		if status.Lease.FencingToken > 0 && status.Lease.HolderNodeID == joinResp.NodeID {
+			if status.LeaseAction == "" {
+				t.Fatal("Status().LeaseAction = empty, want acquire or renew action")
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("manager status = %#v, want acquired coordinator lease", manager.Status())
+}

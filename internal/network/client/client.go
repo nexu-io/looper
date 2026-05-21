@@ -56,6 +56,40 @@ func (c *Client) RevalidateLease(ctx context.Context, req protocol.CoordinatorLe
 	return c.request(ctx, http.MethodPost, "/v1/coordinator-lease/revalidate", c.nodeToken, req, nil)
 }
 
+func (c *Client) AcquireLease(ctx context.Context, req protocol.CoordinatorLeaseAcquireRequest) (protocol.CoordinatorLease, error) {
+	var out protocol.CoordinatorLease
+	if err := c.request(ctx, http.MethodPost, "/v1/coordinator-lease/acquire", c.nodeToken, req, &out); err != nil {
+		return protocol.CoordinatorLease{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) RenewLease(ctx context.Context, req protocol.CoordinatorLeaseRenewRequest) (protocol.CoordinatorLease, error) {
+	var out protocol.CoordinatorLease
+	if err := c.request(ctx, http.MethodPost, "/v1/coordinator-lease/renew", c.nodeToken, req, &out); err != nil {
+		return protocol.CoordinatorLease{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) ExpireLease(ctx context.Context, fencingToken int64) (protocol.CoordinatorLease, error) {
+	var out protocol.CoordinatorLease
+	if err := c.request(ctx, http.MethodPost, "/v1/coordinator-lease/expire", c.nodeToken, map[string]any{"fencingToken": fencingToken}, &out); err != nil {
+		return protocol.CoordinatorLease{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) WebhookSecret(ctx context.Context) (string, error) {
+	var out struct {
+		Secret string `json:"secret"`
+	}
+	if err := c.request(ctx, http.MethodGet, "/v1/github/webhook-secret", c.nodeToken, nil, &out); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out.Secret), nil
+}
+
 func (c *Client) request(ctx context.Context, method, path, token string, body any, out any) error {
 	var reader *bytes.Reader
 	if body == nil {

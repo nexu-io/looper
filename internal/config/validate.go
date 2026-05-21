@@ -360,6 +360,9 @@ func validateNetworkNodeName(nodeName string) error {
 	if strings.Contains(trimmed, ":") {
 		return fmt.Errorf("must not contain ':' so it can form looper:target:<node_name>")
 	}
+	if len(trimmed) > 32 {
+		return fmt.Errorf("must be 32 characters or fewer so it can form looper:target:<node_name>")
+	}
 	if !networkNodeNamePattern.MatchString(trimmed) {
 		return fmt.Errorf("must contain only letters, numbers, '.', '_' or '-' so it can form looper:target:<node_name>")
 	}

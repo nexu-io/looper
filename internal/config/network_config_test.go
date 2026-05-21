@@ -74,3 +74,19 @@ func TestValidateReportsInvalidProjectNetworkModeOnce(t *testing.T) {
 		t.Fatalf("network.mode issue count = %d, want 1; issues=%#v", count, validationErr.Issues)
 	}
 }
+
+func TestValidateRejectsOverlongNetworkNodeName(t *testing.T) {
+	t.Parallel()
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Planner.AutoDiscovery = false
+	cfg.Roles.Fixer.AutoDiscovery = false
+	cfg.Network = NetworkConfig{Enrolled: true, LoopernetBaseURL: "https://loopernet.example.com", NodeName: strings.Repeat("a", 33), GitHubLogin: "worker", GitHubUserID: 42}
+	cfg.Projects = []ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: ProjectNetworkConfig{Mode: NetworkModeRouted}}}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "32 characters or fewer") {
+		t.Fatalf("ValidateWithOptions() error = %v, want node-name length validation", err)
+	}
+}
