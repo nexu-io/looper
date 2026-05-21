@@ -389,9 +389,12 @@ workingDirectory = "/absolute/path/to/where/you/start/looperd"
 shutdownTimeoutMs = 1000
 
 [daemon.worktreeCleanup]
-enabled = true
-dryRun = false
-intervalSeconds = 3600
+enabled = false
+interval = "24h"
+retentionDays = 7
+maxPerTick = 10
+includeOrphans = false
+dryRun = true
 
 [daemon.environment]
 EXAMPLE_FLAG = "1"
