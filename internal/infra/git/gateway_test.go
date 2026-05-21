@@ -187,9 +187,6 @@ func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
 	fixture.createMainOnlyRepo(t)
-	writeFile(t, filepath.Join(fixture.repoPath, ".gitignore"), "*.log\n")
-	runGit(t, fixture.repoPath, "add", ".gitignore")
-	runGit(t, fixture.repoPath, "commit", "-m", "ignore logs")
 	gateway := fixture.gateway()
 
 	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
@@ -202,6 +199,10 @@ func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateWorktree() error = %v", err)
 	}
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".gitignore"), "*.log\n")
+	runGit(t, worktree.WorktreePath, "add", ".gitignore")
+	runGit(t, worktree.WorktreePath, "commit", "-m", "ignore logs")
+	runGit(t, worktree.WorktreePath, "config", "status.showIgnored", "matching")
 
 	writeFile(t, filepath.Join(worktree.WorktreePath, "debug.log"), "ignored\n")
 	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)

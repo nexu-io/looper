@@ -908,7 +908,7 @@ type statusEntry struct {
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all")
+	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
 	if err != nil {
 		return nil, err
 	}
@@ -920,6 +920,9 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 			continue
 		}
 		if len(line) < 3 {
+			continue
+		}
+		if line[:2] == "!!" {
 			continue
 		}
 		entries = append(entries, statusEntry{Code: line[:2], Path: strings.TrimSpace(line[3:])})
