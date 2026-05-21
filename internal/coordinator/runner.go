@@ -1179,7 +1179,7 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 		if routed {
 			authority = authority || routedReviewAssignmentAuthority(projectID, routedMemberships, detail)
 		} else {
-			authority = authority || labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode)
+			authority = authority || reviewAssignmentMatchesTrigger(detail, trigger)
 		}
 		if !authority {
 			continue
@@ -1347,10 +1347,17 @@ func reviewAssignmentMatchesTrigger(detail githubinfra.PullRequestDetail, trigge
 	if !trigger.IncludeDrafts && detail.IsDraft {
 		return false
 	}
+	if trigger.RequireReviewRequest && !hasRequestedReviewerAuthority(detail) {
+		return false
+	}
 	if !labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode) {
 		return false
 	}
 	return true
+}
+
+func hasRequestedReviewerAuthority(detail githubinfra.PullRequestDetail) bool {
+	return len(detail.ReviewRequests) > 0 || len(detail.ReviewRequestUsers) > 0
 }
 
 func reviewAssignmentEligible(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig, candidate reviewAssignmentCandidate, targetLabel string) bool {
@@ -1429,7 +1436,7 @@ func candidateKey(login string, id int64) string {
 
 func leaseProbeURL(repo string, prNumber int64) string {
 	parts := strings.Split(strings.TrimSpace(repo), "/")
-	if len(parts) >= 3 && strings.Contains(parts[0], ".") {
+	if len(parts) >= 3 && strings.TrimSpace(parts[0]) != "" {
 		return fmt.Sprintf("https://%s/%s/%s/pull/%d", parts[0], parts[1], parts[2], prNumber)
 	}
 	return fmt.Sprintf("https://github.com/%s/pull/%d", strings.TrimSpace(repo), prNumber)

@@ -1675,6 +1675,7 @@ func TestRunnerAssignsReviewerInLocalOnlyMode(t *testing.T) {
 	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
 	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
 	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
 	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
@@ -1685,6 +1686,26 @@ func TestRunnerAssignsReviewerInLocalOnlyMode(t *testing.T) {
 	}
 	if len(fixture.github.addedPRLabels) != 0 {
 		t.Fatalf("addedPRLabels = %#v, want no routed target label", fixture.github.addedPRLabels)
+	}
+}
+
+func TestRunnerSkipsLocalReviewerAssignmentWithoutReviewRequestWhenRequired(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.currentLogin = "reviewer"
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = true
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 0 {
+		t.Fatalf("addedReviewers = %#v, want no reviewer request without explicit review request", fixture.github.addedReviewers)
 	}
 }
 
@@ -1819,6 +1840,13 @@ func TestRunnerStopsBeforeTargetLabelWhenLeaseRevalidationFails(t *testing.T) {
 	}
 	if len(fixture.github.addedPRLabels) != 0 {
 		t.Fatalf("addedPRLabels = %#v, want target label withheld after lease loss", fixture.github.addedPRLabels)
+	}
+}
+
+func TestLeaseProbeURLPreservesSingleLabelHost(t *testing.T) {
+	t.Parallel()
+	if got := leaseProbeURL("ghe/owner/repo", 91); got != "https://ghe/owner/repo/pull/91" {
+		t.Fatalf("leaseProbeURL() = %q, want single-label host preserved", got)
 	}
 }
 
