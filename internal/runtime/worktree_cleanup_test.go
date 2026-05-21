@@ -81,6 +81,60 @@ func TestWorktreeCleanupPassSkipsDirtyCheckout(t *testing.T) {
 	}
 }
 
+func TestWorktreeCleanupPassDoesNotStarveNewerCandidateAfterSkip(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	fixture.config.Daemon.WorktreeCleanup.MaxPerTick = 1
+	oldDirty := fixture.seedWorktreeAt(t, "wt_old_dirty", "feature/old-dirty", true, fixture.now.Add(-2*time.Hour))
+	newClean := fixture.seedWorktreeAt(t, "wt_new_clean", "feature/new-clean", true, fixture.now.Add(-time.Hour))
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
+			{Path: oldDirty.WorktreePath, Branch: oldDirty.Branch},
+			{Path: newClean.WorktreePath, Branch: newClean.Branch},
+		}},
+		clean: map[string]bool{oldDirty.WorktreePath: false, newClean.WorktreePath: true},
+		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
+			if input.WorktreePath != newClean.WorktreePath {
+				t.Fatalf("CleanupWorktree().WorktreePath = %q, want %q", input.WorktreePath, newClean.WorktreePath)
+			}
+			updated := newClean
+			nowISO := formatJavaScriptISOString(fixture.now)
+			updated.Status = "cleaned"
+			updated.CleanedAt = &nowISO
+			updated.UpdatedAt = nowISO
+			return fixture.repos.Worktrees.Upsert(context.Background(), updated)
+		},
+	}
+
+	first := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+	if first.LastStatus != "completed" || first.Skipped != 1 || first.Cleaned != 0 {
+		t.Fatalf("first summary = %#v, want skipped old dirty worktree", first)
+	}
+
+	second := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+	if second.LastStatus != "completed" || second.Cleaned != 1 || second.Skipped != 0 {
+		t.Fatalf("second summary = %#v, want newer clean worktree cleaned", second)
+	}
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("cleanupCalls = %#v, want one clean candidate cleanup", git.cleanupCalls)
+	}
+	storedDirty, err := fixture.repos.Worktrees.GetByID(context.Background(), oldDirty.ID)
+	if err != nil {
+		t.Fatalf("Worktrees.GetByID(old dirty) error = %v", err)
+	}
+	if got, want := storedDirty.UpdatedAt, formatJavaScriptISOString(fixture.now); got != want {
+		t.Fatalf("old dirty UpdatedAt = %q, want cleanup attempt timestamp %q", got, want)
+	}
+	storedClean, err := fixture.repos.Worktrees.GetByID(context.Background(), newClean.ID)
+	if err != nil {
+		t.Fatalf("Worktrees.GetByID(new clean) error = %v", err)
+	}
+	if storedClean == nil || storedClean.Status != "cleaned" {
+		t.Fatalf("stored clean worktree = %#v, want cleaned", storedClean)
+	}
+}
+
 func TestWorktreeCleanupPassRecordsFailureAndContinues(t *testing.T) {
 	t.Parallel()
 
@@ -173,13 +227,18 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 
 func (f worktreeCleanupFixture) seedWorktree(t *testing.T, id, branch string, createDir bool) storage.WorktreeRecord {
 	t.Helper()
+	return f.seedWorktreeAt(t, id, branch, createDir, f.now)
+}
+
+func (f worktreeCleanupFixture) seedWorktreeAt(t *testing.T, id, branch string, createDir bool, updatedAt time.Time) storage.WorktreeRecord {
+	t.Helper()
 	path := filepath.Join(f.root, id)
 	if createDir {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			t.Fatalf("MkdirAll(worktree) error = %v", err)
 		}
 	}
-	nowISO := f.now.Format("2006-01-02T15:04:05.000Z")
+	nowISO := formatJavaScriptISOString(updatedAt)
 	record := storage.WorktreeRecord{ID: id, ProjectID: f.project.ID, RepoPath: f.project.RepoPath, WorktreePath: path, Branch: branch, BaseBranch: stringPtr("main"), Status: "active", CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := f.repos.Worktrees.Upsert(context.Background(), record); err != nil {
 		t.Fatalf("Worktrees.Upsert() error = %v", err)

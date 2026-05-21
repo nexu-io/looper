@@ -300,14 +300,29 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 }
 
 func (r *Runtime) recordWorktreeCleanupSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) worktreeCleanupCandidateResult {
+	if err := r.touchWorktreeCleanupAttempt(ctx, repos, candidate); err != nil {
+		message := err.Error()
+		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.failed", &candidate, map[string]any{"message": message})
+		return worktreeCleanupCandidateResult{status: "failed", message: message}
+	}
 	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.skipped", &candidate, map[string]any{"reason": reason})
 	return worktreeCleanupCandidateResult{status: "skipped", message: reason}
 }
 
 func (r *Runtime) recordWorktreeCleanupFailure(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, err error) worktreeCleanupCandidateResult {
 	message := err.Error()
+	if touchErr := r.touchWorktreeCleanupAttempt(ctx, repos, candidate); touchErr != nil {
+		message = message + "; " + touchErr.Error()
+	}
 	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.failed", &candidate, map[string]any{"message": message})
 	return worktreeCleanupCandidateResult{status: "failed", message: message}
+}
+
+func (r *Runtime) touchWorktreeCleanupAttempt(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord) error {
+	if repos == nil || repos.Worktrees == nil || candidate.ID == "" {
+		return nil
+	}
+	return repos.Worktrees.TouchCleanupAttempt(ctx, candidate.ID, formatJavaScriptISOString(r.now().UTC()))
 }
 
 func (r *Runtime) appendWorktreeCleanupEvent(ctx context.Context, repos *storage.Repositories, eventType string, candidate *storage.WorktreeRecord, payload map[string]any) error {

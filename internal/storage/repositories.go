@@ -1973,6 +1973,19 @@ func (r *WorktreesRepository) ListCleanupCandidates(ctx context.Context, limit i
 	return scanWorktrees(rows)
 }
 
+func (r *WorktreesRepository) TouchCleanupAttempt(ctx context.Context, id, updatedAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE worktrees
+		SET updated_at = ?
+		WHERE id = ? AND status != 'cleaned'
+	`, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("touch worktree cleanup attempt: %w", err)
+	}
+
+	return nil
+}
+
 func boolToInt(value bool) int {
 	if value {
 		return 1
