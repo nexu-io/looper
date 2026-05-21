@@ -717,7 +717,10 @@ func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWor
 
 func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branch, baseBranch string) (string, error) {
 	startPoint, ok, err := g.resolveDetachedStartPointRef(ctx, repoPath, branch)
-	if err == nil && ok {
+	if err != nil {
+		return "", err
+	}
+	if ok {
 		return startPoint, nil
 	}
 

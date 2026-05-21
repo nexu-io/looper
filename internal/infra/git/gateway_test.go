@@ -287,32 +287,27 @@ func TestGatewayAttachedWorktreeFallsBackToRemoteOnlyBaseBranch(t *testing.T) {
 	}
 }
 
-func TestGatewayAttachedWorktreeFallsBackToLocalBaseBranchWhenRemoteProbeFails(t *testing.T) {
+func TestGatewayAttachedWorktreeFailsWhenWorkerBranchLookupErrors(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
 	fixture.createMainOnlyRepo(t)
+	branch := "worker/offline-main-fallback"
+	fixture.createUnfetchedRemoteBranch(t, branch)
 	runGit(t, fixture.repoPath, "remote", "set-url", "origin", filepath.Join(fixture.rootDir, "missing-remote.git"))
 	gateway := fixture.gateway()
 
-	localBaseSHA := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "main"))
-	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+	_, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
 		ProjectID:    fixture.projectID,
 		RepoPath:     fixture.repoPath,
 		WorktreeRoot: fixture.worktreeRoot,
-		Branch:       "worker/offline-main-fallback",
+		Branch:       branch,
 		BaseBranch:   "main",
 	})
-	if err != nil {
-		t.Fatalf("CreateWorktree() error = %v", err)
+	if err == nil {
+		t.Fatal("CreateWorktree() error = nil, want branch lookup failure")
 	}
-
-	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "branch", "--show-current")); got != "worker/offline-main-fallback" {
-		t.Fatalf("attached branch name = %q, want worker/offline-main-fallback", got)
-	}
-
-	worktreeHeadSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
-	if worktreeHeadSHA != localBaseSHA {
-		t.Fatalf("attached HEAD = %q, want %q", worktreeHeadSHA, localBaseSHA)
+	if !strings.Contains(err.Error(), "git ls-remote --heads origin "+branch) {
+		t.Fatalf("CreateWorktree() error = %v, want worker branch lookup failure", err)
 	}
 }
 
