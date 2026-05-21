@@ -1717,7 +1717,7 @@ func TestRunnerAssignsReviewerAndTargetInRoutedMode(t *testing.T) {
 	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
-		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
 		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
 	}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
@@ -1744,7 +1744,7 @@ func TestRunnerAssignsReviewerAndTargetInRoutedModeWhenLocalAutoDiscoveryDisable
 	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
-		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
 		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
 	}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
@@ -1767,8 +1767,8 @@ func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{
-			{NodeID: "node-red", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
-			{NodeID: "node-blue", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+			{NodeID: "node-red", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+			{NodeID: "node-blue", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
 		},
 		Lease: protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
 	}
@@ -1795,8 +1795,8 @@ func TestRunnerExcludesSelfReviewCandidatesDuringRoutedAssignment(t *testing.T) 
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership: protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
 		Memberships: []protocol.Membership{
-			{NodeID: "node-self", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "octo", NumericID: 11}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
-			{NodeID: "node-other", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+			{NodeID: "node-self", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "octo", NumericID: 11}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+			{NodeID: "node-other", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
 		},
 		Lease: protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
 	}
@@ -1822,7 +1822,7 @@ func TestRunnerStopsBeforeTargetLabelWhenLeaseRevalidationFails(t *testing.T) {
 	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
-		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
 		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
 	}
 	fixture.network.revalidateErrs = []error{nil, errors.New("lost lease")}
@@ -1850,6 +1850,60 @@ func TestLeaseProbeURLPreservesSingleLabelHost(t *testing.T) {
 	}
 }
 
+func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestWhenRequired(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(true)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 0 || len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("mutations = reviewers:%#v labels:%#v, want no routed assignment without explicit review request", fixture.github.addedReviewers, fixture.github.addedPRLabels)
+	}
+	if len(fixture.network.revalidateRequests) != 0 {
+		t.Fatalf("revalidateRequests = %#v, want no lease revalidation when assignment authority is absent", fixture.network.revalidateRequests)
+	}
+	if len(fixture.github.ops) != 0 {
+		t.Fatalf("ops = %#v, want no GitHub mutations", fixture.github.ops)
+	}
+}
+
+func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestForLegacyCapabilityPayload(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 0 || len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("mutations = reviewers:%#v labels:%#v, want legacy payloads to fail closed without explicit review request authority", fixture.github.addedReviewers, fixture.github.addedPRLabels)
+	}
+}
+
 func TestRunnerSkipsRoutedAssignmentWhenNoEligibleReviewerNodeExists(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)
@@ -1858,7 +1912,7 @@ func TestRunnerSkipsRoutedAssignmentWhenNoEligibleReviewerNodeExists(t *testing.
 	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 	fixture.network.status = protocol.NodeStatusResponse{
 		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
-		Memberships: []protocol.Membership{{NodeID: "node-self", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "octo", NumericID: 11}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Memberships: []protocol.Membership{{NodeID: "node-self", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "octo", NumericID: 11}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
 		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
 	}
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}

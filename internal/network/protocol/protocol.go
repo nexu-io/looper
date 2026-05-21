@@ -24,11 +24,12 @@ type GitHubIdentity struct {
 }
 
 type ReviewerProjectCapability struct {
-	ProjectID        string   `json:"projectId"`
-	IncludeDrafts    bool     `json:"includeDrafts"`
-	EnableSelfReview bool     `json:"enableSelfReview"`
-	Labels           []string `json:"labels,omitempty"`
-	LabelMode        string   `json:"labelMode,omitempty"`
+	ProjectID            string   `json:"projectId"`
+	IncludeDrafts        bool     `json:"includeDrafts"`
+	RequireReviewRequest *bool    `json:"requireReviewRequest,omitempty"`
+	EnableSelfReview     bool     `json:"enableSelfReview"`
+	Labels               []string `json:"labels,omitempty"`
+	LabelMode            string   `json:"labelMode,omitempty"`
 }
 
 type NodeCapabilities struct {

@@ -1340,7 +1340,11 @@ func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Me
 }
 
 func reviewerTriggerFromCapability(capability protocol.ReviewerProjectCapability) config.ReviewerRoleTriggersConfig {
-	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, EnableSelfReview: capability.EnableSelfReview, Labels: append([]string(nil), capability.Labels...), LabelMode: config.LabelMode(capability.LabelMode)}
+	requireReviewRequest := true
+	if capability.RequireReviewRequest != nil {
+		requireReviewRequest = *capability.RequireReviewRequest
+	}
+	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, RequireReviewRequest: requireReviewRequest, EnableSelfReview: capability.EnableSelfReview, Labels: append([]string(nil), capability.Labels...), LabelMode: config.LabelMode(capability.LabelMode)}
 }
 
 func reviewAssignmentMatchesTrigger(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) bool {

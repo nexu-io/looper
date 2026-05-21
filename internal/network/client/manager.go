@@ -232,7 +232,8 @@ func reviewerProjectCapabilities(cfg config.Config) []protocol.ReviewerProjectCa
 		if !roles.Reviewer.Discovery.AutoDiscovery {
 			continue
 		}
-		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: string(roles.Reviewer.Discovery.Triggers.LabelMode)})
+		requireReviewRequest := roles.Reviewer.Discovery.Triggers.RequireReviewRequest
+		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: &requireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: string(roles.Reviewer.Discovery.Triggers.LabelMode)})
 	}
 	slices.SortFunc(capabilities, func(a, b protocol.ReviewerProjectCapability) int {
 		return strings.Compare(a.ProjectID, b.ProjectID)
