@@ -293,16 +293,18 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "queue",
 				short:           "Queue inspection and maintenance commands",
-				helpSubcommands: []helpSubcommand{{name: "stats", description: "Show queue eligibility stats"}, {name: "list", description: "List queue items"}, {name: "cleanup", description: "Clean stale queue items"}},
+				helpSubcommands: []helpSubcommand{{name: "stats", description: "Show queue eligibility stats"}, {name: "list", description: "List queue items"}, {name: "failed", description: "List failed queue items"}, {name: "cleanup", description: "Clean stale queue items"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
 					"$ looper queue stats",
 					"$ looper queue list --eligible",
+					"$ looper queue failed --type reviewer",
 					"$ looper queue cleanup --stale",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "stats", short: "Show queue eligibility stats", runE: runtime.queueStats}),
 					newCommand(commandSpec{use: "list", short: "List queue items", runE: runtime.queueList, localFlags: []flagSpec{boolFlag("eligible", "Only list currently eligible queued items")}}),
+					newCommand(commandSpec{use: "failed", short: "List failed queue items", runE: runtime.queueFailed, localFlags: []flagSpec{stringFlag("type", "type", "Filter by queue item type"), stringFlag("project", "projectId", "Filter by project id"), stringFlag("limit", "count", "Maximum number of failed queue items to list")}}),
 					newCommand(commandSpec{use: "cleanup", short: "Clean stale queue items", runE: runtime.queueCleanup, localFlags: []flagSpec{boolFlag("stale", "Cancel queued items blocked by terminal loops")}}),
 				},
 			}),
@@ -318,14 +320,18 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "loop",
 				short:           "Loop commands",
-				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}},
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "inspect", description: "Inspect loop diagnostics"}, {name: "failures", description: "List failed loop diagnostics"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
 					"$ looper loop list",
+					"$ looper loop inspect 42",
+					"$ looper loop failures --type reviewer",
 					"$ looper loop start --type reviewer --pr acme/looper#42",
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List loops", runE: runtime.loopList}),
+					newCommand(commandSpec{use: "inspect <seq|loopId|runId>", short: "Inspect loop diagnostics", args: cobra.ExactArgs(1), runE: runtime.loopInspect}),
+					newCommand(commandSpec{use: "failures", short: "List failed loop diagnostics", runE: runtime.loopFailures, localFlags: []flagSpec{stringFlag("type", "type", "Filter by loop type"), stringFlag("project", "projectId", "Filter by project id"), stringFlag("limit", "count", "Maximum number of failed loops to list")}}),
 					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("type", "type", "Loop type"), stringFlag("pr", "repo#number", "Pull request reference"), stringFlag("project", "projectId", "Project id")}}),
 					newCommand(commandSpec{use: "pause [id]", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause, localFlags: []flagSpec{stringFlag("id", "id", "Loop id")}}),
 				},

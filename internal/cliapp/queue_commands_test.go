@@ -131,6 +131,39 @@ func TestQueueListCommandListsQueuedItemsAndFiltersEligible(t *testing.T) {
 	}
 }
 
+func TestQueueFailedCommandListsFailedItems(t *testing.T) {
+	t.Parallel()
+
+	configPath, _ := writeQueueCommandFixture(t)
+	exitCode, stdout, stderr := runApp(t, "queue", "failed", "--type", "reviewer", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([queue failed]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	var decoded struct {
+		Count int `json:"count"`
+		Items []struct {
+			QueueItem struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			} `json:"queueItem"`
+			Diagnosis struct {
+				FailureClass string `json:"failureClass"`
+				Retryable    *bool  `json:"retryable"`
+			} `json:"diagnosis"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v\noutput=%q", err, stdout)
+	}
+	if decoded.Count != 1 || len(decoded.Items) != 1 {
+		t.Fatalf("queue failed output = %#v, want one item", decoded)
+	}
+	item := decoded.Items[0]
+	if item.QueueItem.ID != "qi_failed" || item.QueueItem.Status != "failed" || item.Diagnosis.FailureClass != "github_transient" || item.Diagnosis.Retryable == nil || !*item.Diagnosis.Retryable {
+		t.Fatalf("queue failed item = %#v, want retryable github_transient failed item", item)
+	}
+}
+
 func writeQueueCommandFixture(t *testing.T) (string, *storage.Repositories) {
 	t.Helper()
 	root := t.TempDir()
@@ -155,11 +188,20 @@ func writeQueueCommandFixture(t *testing.T) (string, *storage.Repositories) {
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale", Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "terminated", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Loops.Upsert(loop_stale) error = %v", err)
 	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_failed", Seq: 3, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: "failed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_failed) error = %v", err)
+	}
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "qi_eligible", ProjectID: &projectID, LoopID: stringPtr("loop_eligible"), Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "eligible", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(qi_eligible) error = %v", err)
 	}
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "qi_stale", ProjectID: &projectID, LoopID: stringPtr("loop_stale"), Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "stale", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(qi_stale) error = %v", err)
+	}
+	lastError := `Command exited with code 1: Post "https://api.github.com/graphql": EOF`
+	lastErrorKind := "retryable_transient"
+	prNumber := int64(42)
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "qi_failed", ProjectID: &projectID, LoopID: stringPtr("loop_failed"), Type: "reviewer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "failed", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 2, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_failed) error = %v", err)
 	}
 	configPath := filepath.Join(root, "config.json")
 	raw, err := json.Marshal(map[string]any{"storage": map[string]any{"dbPath": dbPath}})

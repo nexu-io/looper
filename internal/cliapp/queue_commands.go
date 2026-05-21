@@ -124,6 +124,10 @@ func (r *commandRuntime) queueCleanup(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) withQueueRepositories(ctx context.Context, fn func(*storage.Repositories) error) error {
+	return r.withLocalRepositories(ctx, fn)
+}
+
+func (r *commandRuntime) withLocalRepositories(ctx context.Context, fn func(*storage.Repositories) error) error {
 	loaded, err := r.loadConfig()
 	if err != nil {
 		return err
@@ -139,28 +143,32 @@ func (r *commandRuntime) withQueueRepositories(ctx context.Context, fn func(*sto
 func queueItemOutputs(items []storage.QueueItemRecord) []queueItemCommandOutput {
 	outputs := make([]queueItemCommandOutput, 0, len(items))
 	for _, item := range items {
-		outputs = append(outputs, queueItemCommandOutput{
-			ID:            item.ID,
-			ProjectID:     item.ProjectID,
-			LoopID:        item.LoopID,
-			Type:          item.Type,
-			TargetType:    item.TargetType,
-			TargetID:      item.TargetID,
-			Repo:          item.Repo,
-			PRNumber:      item.PRNumber,
-			Priority:      item.Priority,
-			Status:        item.Status,
-			AvailableAt:   item.AvailableAt,
-			Attempts:      item.Attempts,
-			MaxAttempts:   item.MaxAttempts,
-			LockKey:       item.LockKey,
-			LastError:     item.LastError,
-			LastErrorKind: item.LastErrorKind,
-			CreatedAt:     item.CreatedAt,
-			UpdatedAt:     item.UpdatedAt,
-		})
+		outputs = append(outputs, queueItemOutput(item))
 	}
 	return outputs
+}
+
+func queueItemOutput(item storage.QueueItemRecord) queueItemCommandOutput {
+	return queueItemCommandOutput{
+		ID:            item.ID,
+		ProjectID:     item.ProjectID,
+		LoopID:        item.LoopID,
+		Type:          item.Type,
+		TargetType:    item.TargetType,
+		TargetID:      item.TargetID,
+		Repo:          item.Repo,
+		PRNumber:      item.PRNumber,
+		Priority:      item.Priority,
+		Status:        item.Status,
+		AvailableAt:   item.AvailableAt,
+		Attempts:      item.Attempts,
+		MaxAttempts:   item.MaxAttempts,
+		LockKey:       item.LockKey,
+		LastError:     item.LastError,
+		LastErrorKind: item.LastErrorKind,
+		CreatedAt:     item.CreatedAt,
+		UpdatedAt:     item.UpdatedAt,
+	}
 }
 
 func writeHumanQueueStats(w io.Writer, output queueStatsOutput) error {

@@ -69,7 +69,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		{args: []string{"config", "--help"}, subcommands: []string{"get       Get a config value", "set       Set a config value", "unset     Unset a config value", "validate  Validate the active config file", "show      Show active config", "edit      Edit the active config file", "migrate   Migrate a config file to canonical format"}},
 		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
-		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
+		{args: []string{"loop", "--help"}, subcommands: []string{"list      List loops", "inspect   Inspect loop diagnostics", "failures  List failed loop diagnostics", "start     Start a loop", "pause     Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
 		{args: []string{"run", "--help"}, subcommands: []string{"list   List runs", "stats  Show recent run stats"}},
 	}
