@@ -16,6 +16,28 @@ The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`
 
 Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The webhook forwarder lock uses OS file locking and is not designed for NFS-style shared filesystems. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
 
+## Network mode summary
+
+Looper has two project-level network modes:
+
+- `projects[].network.mode = "off"` — local-only operation. `looper:target:*` labels are ignored and the classic single-Node assignee/review-request behavior stays unchanged.
+- `projects[].network.mode = "routed"` — multi-Node operation coordinated through `loopernet`.
+
+Authority stays split on purpose:
+
+- GitHub work intent stays on GitHub: `looper:worker-ready` for Worker and GitHub review requests for Reviewer.
+- exactly one `looper:target:<node_name>` label is the exact-Node authority in Routed mode.
+- the `loopernet` lease is a mutation fence for Coordinator only; it does not become the source of truth for work intent.
+
+Operational notes:
+
+- `loopernet` centralizes webhook ingress and Node wakeups, but it must not mutate GitHub on its own.
+- Coordinator writes coarse GitHub authority first, then writes the exact target label last.
+- polling remains enabled as fallback and drift recovery when webhook delivery or SSE wakeups are missed.
+- if you use `looper network join` without `--no-enroll-projects`, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
+
+The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
+
 ## Webhook delivery modes
 
 `webhook.enabled=true` supports two delivery modes:

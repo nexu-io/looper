@@ -34,6 +34,37 @@ Also make sure:
 - `gh` is authenticated with the target GitHub account
 - `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
 
+## 1a. Local-only vs Routed projects
+
+Looper supports two project modes:
+
+- `network.mode=off` — local-only. Worker claims `looper:worker-ready` Issues assigned to the local GitHub user, Reviewer claims PRs with a review request for the local GitHub user, and `looper:target:*` labels do nothing.
+- `network.mode=routed` — multi-Node. `loopernet` receives centralized webhook ingress, fans out wakeups to Nodes, and exposes the Coordinator lease used for fencing.
+
+Routed mode keeps authorities separate:
+
+- GitHub remains the work-intent authority.
+- `looper:target:<node_name>` is only the exact-Node authority.
+- the lease only decides which Coordinator may mutate GitHub.
+
+That means `loopernet` never becomes the source of truth for Issue admission or PR review assignment, and it must not mutate GitHub directly.
+
+## 1b. Routed setup and recovery
+
+Typical Routed rollout:
+
+1. join each Node to `loopernet` with `looper network join <url> --key ... --name <node>`
+2. disable unsupported routed auto-discovery (`planner` and `fixer`) before opting projects into `network.mode=routed`
+3. keep Worker and Reviewer identities stable per Node; duplicate GitHub identities are safe only because the exact target label disambiguates which Node may claim
+4. restart `looperd` and confirm `looper network status --verbose` shows membership, identity, and lease state
+
+Operator recovery rules:
+
+- if the target label is removed, duplicated, changed, or stale before work starts, Worker/Reviewer will not claim it
+- if `looper:worker-ready`, the GitHub assignee, or the review request disappears before processing starts, the queued item becomes unclaimable
+- if webhook ingress or SSE wakeups degrade, polling continues as a fallback so Coordinator can repair drift
+- if a stale target label remains after lease loss or a partial GitHub mutation, let Coordinator reconciliation repair or remove it before retrying
+
 ## 2. Project auto-detection from the current directory
 
 Looper can often infer the target project from your current working directory.
