@@ -237,7 +237,11 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		if branchExists {
 			args = append(args, worktreePath, input.Branch)
 		} else {
-			args = append(args, "-b", input.Branch, worktreePath, input.BaseBranch)
+			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.BaseBranch)
+			if err != nil {
+				return storage.WorktreeRecord{}, err
+			}
+			args = append(args, "-b", input.Branch, worktreePath, startPoint)
 		}
 		if err := g.runGit(ctx, input.RepoPath, nil, args...); err != nil {
 			return storage.WorktreeRecord{}, err
@@ -709,6 +713,17 @@ func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWor
 	}
 
 	return "", fmt.Errorf("resolve detached start point: no local or remote ref found for branch %q or base branch %q", input.Branch, input.BaseBranch)
+}
+
+func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, baseBranch string) (string, error) {
+	startPoint, ok, err := g.resolveDetachedStartPointRef(ctx, repoPath, baseBranch)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		return startPoint, nil
+	}
+	return "", fmt.Errorf("resolve attached start point: no local or remote ref found for base branch %q", baseBranch)
 }
 
 func (g *Gateway) resolveDetachedStartPointRef(ctx context.Context, repoPath, branch string) (string, bool, error) {

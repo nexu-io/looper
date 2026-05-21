@@ -602,8 +602,9 @@ type loopError struct {
 }
 
 type loopUpsertResult struct {
-	record  storage.LoopRecord
-	created bool
+	record      storage.LoopRecord
+	created     bool
+	skipEnqueue bool
 }
 
 func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error {
@@ -774,7 +775,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" {
+		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" {
 			result.Skipped++
 			continue
 		}
@@ -2324,8 +2325,12 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 		return loopUpsertResult{}, err
 	}
 	for _, existing := range existingLoops {
-		if existing.Type == "worker" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
+		if workerLoopTracksIssue(existing, project.ID, repo, issue.Number) {
 			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
+			prLinked := existing.TargetType == "pull_request" || derefInt64(existing.PRNumber) > 0
+			if prLinked {
+				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
+			}
 			updated := existing
 			updated.Repo = &repo
 			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
@@ -3263,6 +3268,21 @@ func buildIssueTargetID(repo string, issueNumber int64) string {
 
 func buildWorkerIssueDedupeKey(projectID, repo string, issueNumber int64) string {
 	return fmt.Sprintf("worker:%s:%s:%d", projectID, repo, issueNumber)
+}
+
+func workerLoopTracksIssue(loop storage.LoopRecord, projectID, repo string, issueNumber int64) bool {
+	if loop.Type != "worker" || loop.ProjectID != projectID {
+		return false
+	}
+	if loop.TargetType == "issue" && derefString(loop.TargetID) == buildIssueTargetID(repo, issueNumber) {
+		return true
+	}
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if int64FromAny(workerMeta["issueNumber"]) != issueNumber {
+		return false
+	}
+	trackedRepo := firstNonEmpty(stringFromAnyDefault(workerMeta["issueRepo"]), stringFromAnyDefault(workerMeta["repo"]), derefString(loop.Repo))
+	return strings.EqualFold(trackedRepo, repo)
 }
 
 func buildWorkerDiscoveryFingerprint(repo, baseBranch string, issue IssueSummary) string {
