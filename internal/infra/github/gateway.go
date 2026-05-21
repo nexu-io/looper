@@ -927,31 +927,27 @@ func (g *Gateway) listDependencyIssues(ctx context.Context, input ViewIssueInput
 
 func (g *Gateway) FindAnyIssueNumber(ctx context.Context, repo string, cwd string) (int64, error) {
 	hostname, repoName := splitRepoHostname(repo)
-	for page := 1; ; page++ {
-		args := []string{"api", fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page)}
-		if hostname != "" {
-			args = append(args, "--hostname", hostname)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues?state=all&per_page=100", repoName)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range rows {
+		if row["pull_request"] != nil {
+			continue
 		}
-		result, err := g.runGh(ctx, cwd, "", args...)
-		if err != nil {
-			return 0, err
-		}
-		rows, err := decodeJSONArray(result.Stdout)
-		if err != nil {
-			return 0, err
-		}
-		if len(rows) == 0 {
-			return 0, nil
-		}
-		for _, row := range rows {
-			if row["pull_request"] != nil {
-				continue
-			}
-			if issueNumber := asInt64(row["number"]); issueNumber > 0 {
-				return issueNumber, nil
-			}
+		if issueNumber := asInt64(row["number"]); issueNumber > 0 {
+			return issueNumber, nil
 		}
 	}
+	return 0, nil
 }
 
 func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {

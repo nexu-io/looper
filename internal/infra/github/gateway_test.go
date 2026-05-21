@@ -1451,10 +1451,10 @@ func TestFindAnyIssueNumberSkipsPullRequests(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues?state=all&per_page=100&page=1" {
+		if got := strings.Join(options.Args, " "); got != "api --paginate --slurp repos/acme/looper/issues?state=all&per_page=100" {
 			t.Fatalf("unexpected gh args: %q", got)
 		}
-		return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}},{"number":7}]`}, nil
+		return shell.Result{Stdout: `[[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}},{"number":7}]]`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	issueNumber, err := gateway.FindAnyIssueNumber(context.Background(), "acme/looper", "")
@@ -1466,20 +1466,14 @@ func TestFindAnyIssueNumberSkipsPullRequests(t *testing.T) {
 	}
 }
 
-func TestFindAnyIssueNumberContinuesPastFivePages(t *testing.T) {
+func TestFindAnyIssueNumberHandlesPaginatedSlurpPages(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch args {
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=1", "api repos/acme/looper/issues?state=all&per_page=100&page=2", "api repos/acme/looper/issues?state=all&per_page=100&page=3", "api repos/acme/looper/issues?state=all&per_page=100&page=4", "api repos/acme/looper/issues?state=all&per_page=100&page=5":
-			return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}}]`}, nil
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=6":
-			return shell.Result{Stdout: `[{"number":7}]`}, nil
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
+		if got := strings.Join(options.Args, " "); got != "api --paginate --slurp repos/acme/looper/issues?state=all&per_page=100" {
+			t.Fatalf("unexpected gh args: %q", got)
 		}
+		return shell.Result{Stdout: `[[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}}],[{"number":7}]]`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	issueNumber, err := gateway.FindAnyIssueNumber(context.Background(), "acme/looper", "")
@@ -1487,10 +1481,10 @@ func TestFindAnyIssueNumberContinuesPastFivePages(t *testing.T) {
 		t.Fatalf("FindAnyIssueNumber() error = %v", err)
 	}
 	if issueNumber != 7 {
-		t.Fatalf("FindAnyIssueNumber() = %d, want issue discovered after page five", issueNumber)
+		t.Fatalf("FindAnyIssueNumber() = %d, want issue discovered in later slurped page", issueNumber)
 	}
-	if len(runner.calls) != 6 {
-		t.Fatalf("FindAnyIssueNumber() calls = %d, want six pages probed", len(runner.calls))
+	if len(runner.calls) != 1 {
+		t.Fatalf("FindAnyIssueNumber() calls = %d, want one slurped request", len(runner.calls))
 	}
 }
 
