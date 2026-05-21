@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,7 +121,7 @@ func (m *Manager) Status() Status {
 func (m *Manager) tick(ctx context.Context, state LocalState) {
 	current, _ := m.currentGitHubIdentity(ctx)
 	routed, local := countProjectModes(m.config)
-	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), CoordinatorEligible: routed > 0 && m.config.Roles.Coordinator.Enabled, RoutedProjects: routed, LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
+	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), CoordinatorEligible: routed > 0 && m.config.Roles.Coordinator.Enabled, RoutedProjects: routed, RoutedProjectIDs: routedProjectIDs(m.config), ReviewerProjects: reviewerProjectCapabilities(m.config), LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
 	drift, reason := identityDrift(state.GitHub, current)
 	capabilities.IdentityDrift = drift
 	capabilities.DriftReason = reason
@@ -207,6 +209,35 @@ func supportedRoles(cfg config.Config) []string {
 		roles = append(roles, "reviewer")
 	}
 	return roles
+}
+
+func routedProjectIDs(cfg config.Config) []string {
+	ids := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		if project.Network.Mode == config.ProjectNetworkModeRouted && strings.TrimSpace(project.ID) != "" {
+			ids = append(ids, strings.TrimSpace(project.ID))
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func reviewerProjectCapabilities(cfg config.Config) []protocol.ReviewerProjectCapability {
+	capabilities := make([]protocol.ReviewerProjectCapability, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		if project.Network.Mode != config.ProjectNetworkModeRouted || strings.TrimSpace(project.ID) == "" {
+			continue
+		}
+		roles := config.ProjectRoleConfigs(cfg, project.ID)
+		if !roles.Reviewer.Discovery.AutoDiscovery {
+			continue
+		}
+		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: string(roles.Reviewer.Discovery.Triggers.LabelMode)})
+	}
+	slices.SortFunc(capabilities, func(a, b protocol.ReviewerProjectCapability) int {
+		return strings.Compare(a.ProjectID, b.ProjectID)
+	})
+	return capabilities
 }
 
 func identityDrift(expected, current protocol.GitHubIdentity) (bool, string) {

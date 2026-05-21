@@ -23,14 +23,24 @@ type GitHubIdentity struct {
 	Login     string `json:"login,omitempty"`
 }
 
+type ReviewerProjectCapability struct {
+	ProjectID        string   `json:"projectId"`
+	IncludeDrafts    bool     `json:"includeDrafts"`
+	EnableSelfReview bool     `json:"enableSelfReview"`
+	Labels           []string `json:"labels,omitempty"`
+	LabelMode        string   `json:"labelMode,omitempty"`
+}
+
 type NodeCapabilities struct {
-	Roles               []string `json:"roles,omitempty"`
-	CoordinatorEligible bool     `json:"coordinatorEligible"`
-	RoutedProjects      int      `json:"routedProjects"`
-	LocalProjects       int      `json:"localProjects"`
-	DynamicLoad         int      `json:"dynamicLoad"`
-	IdentityDrift       bool     `json:"identityDrift"`
-	DriftReason         string   `json:"driftReason,omitempty"`
+	Roles               []string                    `json:"roles,omitempty"`
+	CoordinatorEligible bool                        `json:"coordinatorEligible"`
+	RoutedProjects      int                         `json:"routedProjects"`
+	RoutedProjectIDs    []string                    `json:"routedProjectIds,omitempty"`
+	ReviewerProjects    []ReviewerProjectCapability `json:"reviewerProjects,omitempty"`
+	LocalProjects       int                         `json:"localProjects"`
+	DynamicLoad         int                         `json:"dynamicLoad"`
+	IdentityDrift       bool                        `json:"identityDrift"`
+	DriftReason         string                      `json:"driftReason,omitempty"`
 }
 
 type AuditEnvelope struct {
@@ -123,6 +133,7 @@ type StatusResponse struct {
 type NodeStatusResponse struct {
 	NetworkID           string           `json:"networkId"`
 	Membership          Membership       `json:"membership"`
+	Memberships         []Membership     `json:"memberships,omitempty"`
 	Lease               CoordinatorLease `json:"lease"`
 	Warnings            []string         `json:"warnings,omitempty"`
 	CloudReachable      bool             `json:"cloudReachable"`

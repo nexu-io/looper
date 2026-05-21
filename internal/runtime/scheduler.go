@@ -1004,11 +1004,12 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 	})
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
-		Repos:  repos,
-		GitHub: githubGateway,
-		Config: &cfg,
-		Logger: logger,
-		Now:    now,
+		Repos:   repos,
+		GitHub:  githubGateway,
+		Config:  &cfg,
+		Logger:  logger,
+		Now:     now,
+		Network: coordinatorrole.NewLoopernetGateway(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json")),
 		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
 			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,

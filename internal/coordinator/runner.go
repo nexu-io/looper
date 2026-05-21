@@ -17,8 +17,11 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/dispatch"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -53,6 +56,7 @@ type loadedCoordinatorIssue struct {
 
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
+	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
 	ListLinkedPullRequests(context.Context, githubinfra.LinkedPullRequestsInput) ([]githubinfra.LinkedPullRequest, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
@@ -72,7 +76,9 @@ type GitHubGateway interface {
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
+	AddPullRequestReviewers(context.Context, githubinfra.PullRequestReviewersInput) error
 	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
@@ -90,6 +96,7 @@ type Options struct {
 	Now        func() time.Time
 	TriageLLM  triage.LLM
 	Inspector  RepositoryInspector
+	Network    NetworkGateway
 	Disclosure *config.DisclosureConfig
 }
 
@@ -101,6 +108,7 @@ type Runner struct {
 	now        func() time.Time
 	triageLLM  triage.LLM
 	inspector  RepositoryInspector
+	network    NetworkGateway
 	disclosure *config.DisclosureConfig
 
 	mu                sync.Mutex
@@ -157,6 +165,7 @@ func New(options Options) *Runner {
 		now:               now,
 		triageLLM:         options.TriageLLM,
 		inspector:         inspector,
+		network:           options.Network,
 		disclosure:        options.Disclosure,
 		lastTickByProject: map[string]time.Time{},
 		watchLocks:        map[string]*sync.Mutex{},
@@ -221,6 +230,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	if err := r.applyDispatches(ctx, input.ProjectID, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, deps, downstreamLabels); err != nil {
+		return DiscoveryResult{}, err
+	}
+	if err := r.applyReviewAssignments(ctx, input.ProjectID, input.Repo, project.RepoPath); err != nil {
 		return DiscoveryResult{}, err
 	}
 
@@ -900,6 +912,283 @@ func labelsMatch(labels, expected []string, mode config.LabelMode) bool {
 
 func normalizeLogin(login string) string {
 	return strings.ToLower(strings.TrimSpace(login))
+}
+
+type reviewAssignmentCandidate struct {
+	NodeName  string
+	Login     string
+	NumericID int64
+}
+
+func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cwd string) error {
+	if r == nil || r.github == nil || r.config == nil {
+		return nil
+	}
+	roles := config.ProjectRoleConfigs(*r.config, projectID)
+	trigger := roles.Reviewer.Discovery.Triggers
+	policy := networkpolicy.ProjectPolicyForProject(*r.config, projectID)
+	if !roles.Reviewer.Discovery.AutoDiscovery {
+		return nil
+	}
+	summaries, err := r.github.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: 100})
+	if err != nil {
+		return err
+	}
+	prNumbers := make([]int64, 0, len(summaries))
+	for _, summary := range summaries {
+		if summary.Number > 0 {
+			prNumbers = append(prNumbers, summary.Number)
+		}
+	}
+	sort.Slice(prNumbers, func(i, j int) bool { return prNumbers[i] < prNumbers[j] })
+	for _, prNumber := range prNumbers {
+		detail, err := r.github.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(strings.TrimSpace(detail.State), "open") {
+			continue
+		}
+		authority := labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode) || len(detail.ReviewRequests) > 0 || len(detail.ReviewRequestUsers) > 0
+		if !authority {
+			continue
+		}
+		if networkpolicy.IsRouted(policy) {
+			if err := r.applyRoutedReviewAssignment(ctx, projectID, repo, cwd, detail, trigger); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := r.applyLocalReviewAssignment(ctx, repo, cwd, detail, trigger); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runner) applyLocalReviewAssignment(ctx context.Context, repo, cwd string, detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) error {
+	login, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err != nil {
+		return err
+	}
+	candidate := reviewAssignmentCandidate{Login: normalizeLogin(login)}
+	requested := requestedReviewerAuthority(detail.ReviewRequests, detail.ReviewRequestUsers)
+	if len(requested) > 0 && !requestedReviewerMatches(requested, candidate) {
+		if err := r.recordReviewAssignmentStatus(ctx, repo, detail.Number, "no-eligible-node"); err != nil {
+			return err
+		}
+		return nil
+	}
+	if !reviewAssignmentEligible(detail, trigger, candidate, "") {
+		if err := r.recordReviewAssignmentStatus(ctx, repo, detail.Number, "no-eligible-node"); err != nil {
+			return err
+		}
+		return nil
+	}
+	if isCurrentUserRequested(detail.ReviewRequests, candidate.Login) {
+		return nil
+	}
+	return r.github.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: repo, PRNumber: detail.Number, Reviewers: []string{candidate.Login}, CWD: cwd})
+}
+
+func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, repo, cwd string, detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) error {
+	if r.network == nil {
+		return nil
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if status.Membership.NodeID == "" || status.Lease.HolderNodeID != status.Membership.NodeID {
+		return nil
+	}
+	candidate, ok := chooseReviewerCandidate(projectID, status.Memberships, detail, trigger)
+	if !ok {
+		if err := r.recordReviewAssignmentStatus(ctx, repo, detail.Number, "no-eligible-node"); err != nil {
+			return err
+		}
+		return nil
+	}
+	wantLabel := protocol.TargetLabelForNode(candidate.NodeName)
+	needReviewRequest := !isCurrentUserRequested(detail.ReviewRequests, candidate.Login)
+	currentTargets := targetLabels(detail.Labels)
+	needTargetRepair := len(currentTargets) != 1 || !strings.EqualFold(strings.TrimSpace(currentTargets[0]), wantLabel)
+	if !needReviewRequest && !needTargetRepair {
+		return nil
+	}
+	if needTargetRepair && len(currentTargets) > 0 {
+		if err := r.revalidateCoordinatorLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
+			return err
+		}
+		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: currentTargets, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	if needReviewRequest {
+		if err := r.revalidateCoordinatorLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
+			return err
+		}
+		if err := r.github.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: repo, PRNumber: detail.Number, Reviewers: []string{candidate.Login}, CWD: cwd}); err != nil {
+			return err
+		}
+	}
+	if !needTargetRepair {
+		return nil
+	}
+	if err := r.revalidateCoordinatorLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
+		return err
+	}
+	return r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: []string{wantLabel}, CWD: cwd})
+}
+
+func (r *Runner) revalidateCoordinatorLease(ctx context.Context, repo string, prNumber int64, fencingToken int64) error {
+	if r.network == nil {
+		return nil
+	}
+	return r.network.RevalidateLease(ctx, protocol.CoordinatorLeaseRevalidateRequest{FencingToken: fencingToken, URL: leaseProbeURL(repo, prNumber)})
+}
+
+func chooseReviewerCandidate(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail, _ config.ReviewerRoleTriggersConfig) (reviewAssignmentCandidate, bool) {
+	requested := requestedReviewerAuthority(detail.ReviewRequests, detail.ReviewRequestUsers)
+	candidates := make([]reviewAssignmentCandidate, 0, len(memberships))
+	for _, member := range memberships {
+		if member.NodeName == "" || normalizeLogin(member.GitHub.Login) == "" {
+			continue
+		}
+		if member.Capabilities.RoutedProjects <= 0 {
+			continue
+		}
+		projectCapability, ok := reviewerProjectCapability(member.Capabilities.ReviewerProjects, projectID)
+		if !ok {
+			continue
+		}
+		candidate := reviewAssignmentCandidate{NodeName: member.NodeName, Login: normalizeLogin(member.GitHub.Login), NumericID: member.GitHub.NumericID}
+		if len(requested) > 0 && !requestedReviewerMatches(requested, candidate) {
+			continue
+		}
+		if !reviewAssignmentEligible(detail, reviewerTriggerFromCapability(projectCapability), candidate, protocol.TargetLabelForNode(candidate.NodeName)) {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Login == candidates[j].Login {
+			return candidates[i].NodeName < candidates[j].NodeName
+		}
+		return candidates[i].Login < candidates[j].Login
+	})
+	if len(candidates) == 0 {
+		return reviewAssignmentCandidate{}, false
+	}
+	return candidates[0], true
+}
+
+func reviewerProjectCapability(capabilities []protocol.ReviewerProjectCapability, projectID string) (protocol.ReviewerProjectCapability, bool) {
+	for _, capability := range capabilities {
+		if capability.ProjectID == projectID {
+			return capability, true
+		}
+	}
+	return protocol.ReviewerProjectCapability{}, false
+}
+
+func reviewerTriggerFromCapability(capability protocol.ReviewerProjectCapability) config.ReviewerRoleTriggersConfig {
+	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, EnableSelfReview: capability.EnableSelfReview, Labels: append([]string(nil), capability.Labels...), LabelMode: config.LabelMode(capability.LabelMode)}
+}
+
+func reviewAssignmentEligible(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig, candidate reviewAssignmentCandidate, targetLabel string) bool {
+	if !trigger.IncludeDrafts && detail.IsDraft {
+		return false
+	}
+	if !labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode) {
+		return false
+	}
+	if !trigger.EnableSelfReview && normalizeLogin(detail.Author) == candidate.Login {
+		return false
+	}
+	labels := append([]string(nil), detail.Labels...)
+	if targetLabel != "" {
+		labels = append(removeTargetLabels(labels), targetLabel)
+	}
+	users := make([]networkpolicy.GitHubUser, 0, len(detail.ReviewRequestUsers)+1)
+	for _, user := range detail.ReviewRequestUsers {
+		users = append(users, networkpolicy.GitHubUser{Login: user.Login, ID: user.ID})
+	}
+	users = append(users, networkpolicy.GitHubUser{Login: candidate.Login, ID: candidate.NumericID})
+	policy := networkpolicy.ProjectPolicy{Mode: config.NetworkModeRouted, NodeName: candidate.NodeName, GitHubLogin: candidate.Login, GitHubUserID: candidate.NumericID}
+	if targetLabel != "" && !networkpolicy.EvaluateReviewer(policy, labels, users).Allowed {
+		return false
+	}
+	return true
+}
+
+func targetLabels(labels []string) []string {
+	result := make([]string, 0, 1)
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if strings.HasPrefix(strings.ToLower(trimmed), "looper:target:") {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func removeTargetLabels(labels []string) []string {
+	result := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "looper:target:") {
+			continue
+		}
+		result = append(result, label)
+	}
+	return result
+}
+
+func requestedReviewerAuthority(requests []string, users []githubinfra.GitHubUser) map[string]bool {
+	allowed := map[string]bool{}
+	for _, request := range requests {
+		if normalizeLogin(request) != "" {
+			allowed[candidateKey(normalizeLogin(request), 0)] = true
+		}
+	}
+	for _, user := range users {
+		if user.ID > 0 {
+			allowed[candidateKey("", user.ID)] = true
+		}
+		if normalizeLogin(user.Login) != "" {
+			allowed[candidateKey(normalizeLogin(user.Login), 0)] = true
+		}
+	}
+	return allowed
+}
+
+func requestedReviewerMatches(allowed map[string]bool, candidate reviewAssignmentCandidate) bool {
+	return allowed[candidateKey(candidate.Login, candidate.NumericID)] || allowed[candidateKey(candidate.Login, 0)]
+}
+
+func candidateKey(login string, id int64) string {
+	if id > 0 {
+		return fmt.Sprintf("id:%d", id)
+	}
+	return "login:" + normalizeLogin(login)
+}
+
+func leaseProbeURL(repo string, prNumber int64) string {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) >= 3 && strings.Contains(parts[0], ".") {
+		return fmt.Sprintf("https://%s/%s/%s/pull/%d", parts[0], parts[1], parts[2], prNumber)
+	}
+	return fmt.Sprintf("https://github.com/%s/pull/%d", strings.TrimSpace(repo), prNumber)
+}
+
+func (r *Runner) recordReviewAssignmentStatus(ctx context.Context, repo string, prNumber int64, status string) error {
+	if r == nil || r.repos == nil || r.repos.Events == nil || strings.TrimSpace(status) == "" {
+		return nil
+	}
+	payload := fmt.Sprintf(`{"repo":%q,"prNumber":%d,"status":%q}`, repo, prNumber, status)
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", repo, prNumber)
+	return r.repos.Events.Append(ctx, storage.EventLogRecord{ID: eventlog.NewEventID("event"), EventType: "pr.review.assignment", EntityType: &entityType, EntityID: &entityID, PayloadJSON: payload, CreatedAt: r.now().UTC().Format(time.RFC3339Nano)})
 }
 
 func isCurrentUserRequested(requested []string, currentLogin string) bool {
