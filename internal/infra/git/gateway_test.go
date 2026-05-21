@@ -885,6 +885,26 @@ func TestGatewayRemoteBranchExistsTreatsOnlyExitCode1AsMissing(t *testing.T) {
 	}
 }
 
+func TestGatewayRemoteBranchExistsUsesFetchedTrackingRef(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	branch := "feature/fixer"
+	fixture.createRemoteRepo(t, branch)
+	runGit(t, fixture.repoPath, "fetch", "origin", fmt.Sprintf("refs/heads/%s:refs/remotes/origin/%s", branch, branch))
+	runGit(t, fixture.repoPath, "remote", "set-url", "origin", filepath.Join(fixture.rootDir, "missing-remote.git"))
+	gateway := fixture.gateway()
+
+	exists, err := gateway.remoteBranchExists(ctx, fixture.repoPath, "origin", branch)
+	if err != nil {
+		t.Fatalf("remoteBranchExists(fetched tracking ref) error = %v", err)
+	}
+	if !exists {
+		t.Fatal("remoteBranchExists(fetched tracking ref) = false, want true")
+	}
+}
+
 func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *testing.T) {
 	t.Parallel()
 

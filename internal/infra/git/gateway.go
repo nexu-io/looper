@@ -684,15 +684,15 @@ func (g *Gateway) branchExists(ctx context.Context, repoPath, branch string) (bo
 }
 
 func (g *Gateway) remoteBranchExists(ctx context.Context, repoPath, remote, branch string) (bool, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "ls-remote", "--heads", remote, "refs/heads/"+branch)
-	if err != nil {
-		var commandErr *shell.CommandExecutionError
-		if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 2 {
-			return false, nil
-		}
-		return false, err
+	_, err := g.runGitResult(ctx, repoPath, nil, "show-ref", "--quiet", "--verify", "refs/remotes/"+remote+"/"+branch)
+	if err == nil {
+		return true, nil
 	}
-	return strings.TrimSpace(result.Stdout) != "", nil
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWorktreeInput) (string, error) {
