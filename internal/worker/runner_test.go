@@ -2654,10 +2654,10 @@ func TestProcessClaimedItemFindsExistingPRAfterPushAndStampsWorkerDisclosure(t *
 	}
 }
 
-func TestProcessClaimedItemRestartsFromDiscoverAfterNonFastForwardPush(t *testing.T) {
+func TestProcessClaimedItemRestartsFromDiscoverAfterFetchFirstPushReject(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/715-error-exporting-apresentations-f1db7b9a10e512af", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}, pushErrors: []error{errors.New("git push rejected (non-fast-forward)")}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/715-error-exporting-apresentations-f1db7b9a10e512af", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}, pushErrors: []error{errors.New("! [rejected] HEAD -> refs/heads/looper/worker (fetch first)\nerror: failed to push some refs")}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}, {Status: "completed", Summary: "done again", Stdout: "ok", ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
 
@@ -2667,7 +2667,7 @@ func TestProcessClaimedItemRestartsFromDiscoverAfterNonFastForwardPush(t *testin
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
 	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume {
-		t.Fatalf("first = %#v, want retryable non-fast-forward failure", first)
+		t.Fatalf("first = %#v, want retryable fetch-first push failure", first)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), first.RunID)
 	if err != nil {

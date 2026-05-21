@@ -3252,7 +3252,7 @@ func shouldRestartWorkerFromDiscoverAfterPushFailure(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "non-fast-forward") || strings.Contains(message, "remote head changed")
+	return strings.Contains(message, "non-fast-forward") || strings.Contains(message, "remote head changed") || strings.Contains(message, "fetch first")
 }
 
 func buildWorkerLoopHash(loopID string) string {
