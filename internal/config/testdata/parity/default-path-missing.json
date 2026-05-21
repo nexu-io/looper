@@ -43,6 +43,12 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
+      "network": {
+        "enrolled": false,
+        "githubLogin": "",
+        "loopernetBaseUrl": "",
+        "nodeName": ""
+      },
       "agent": {
         "params": {},
         "env": {},
@@ -150,6 +156,10 @@
             "enabled": false,
             "apiTimeoutSeconds": 10,
             "apiRetryAttempts": 3
+          },
+          "mergeWatch": {
+            "maxIndeterminateDuration": "15m",
+            "transientRetries": 3
           },
           "dispatch": {
             "mode": "human-gated",

@@ -18,18 +18,22 @@ import (
 )
 
 type networkStatusOutput struct {
-	Configured     bool                       `json:"configured"`
-	Membership     *protocol.Membership       `json:"membership,omitempty"`
-	NodeName       string                     `json:"nodeName,omitempty"`
-	GitHub         protocol.GitHubIdentity    `json:"github"`
-	CurrentGitHub  protocol.GitHubIdentity    `json:"currentGithub"`
-	Warnings       []string                   `json:"warnings,omitempty"`
-	CloudReachable bool                       `json:"cloudReachable"`
-	Lease          *protocol.CoordinatorLease `json:"lease,omitempty"`
-	RoutedProjects int                        `json:"routedProjects"`
-	LocalProjects  int                        `json:"localProjects"`
-	IdentityDrift  bool                       `json:"identityDrift"`
-	DriftReason    string                     `json:"driftReason,omitempty"`
+	Configured       bool                       `json:"configured"`
+	Membership       *protocol.Membership       `json:"membership,omitempty"`
+	LeaseHolder      *protocol.Membership       `json:"leaseHolder,omitempty"`
+	NodeName         string                     `json:"nodeName,omitempty"`
+	GitHub           protocol.GitHubIdentity    `json:"github"`
+	CurrentGitHub    protocol.GitHubIdentity    `json:"currentGithub"`
+	Warnings         []string                   `json:"warnings,omitempty"`
+	CloudReachable   bool                       `json:"cloudReachable"`
+	Lease            *protocol.CoordinatorLease `json:"lease,omitempty"`
+	RoutedProjects   int                        `json:"routedProjects"`
+	LocalProjects    int                        `json:"localProjects"`
+	IdentityDrift    bool                       `json:"identityDrift"`
+	IdentityFallback bool                       `json:"identityFallback,omitempty"`
+	LeaseAction      string                     `json:"leaseAction,omitempty"`
+	LeaseError       string                     `json:"leaseError,omitempty"`
+	DriftReason      string                     `json:"driftReason,omitempty"`
 }
 
 func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
@@ -149,6 +153,7 @@ func (r *commandRuntime) resolveNetworkStatus(ctx context.Context) (networkStatu
 		return networkStatusOutput{}, err
 	}
 	status := networkStatusOutput{Configured: true, NodeName: state.NodeName, GitHub: state.GitHub, CurrentGitHub: current, LocalProjects: local, RoutedProjects: routed}
+	status.IdentityFallback = current.Login != "" && current.NumericID == 0
 	if drift, reason := githubIdentityDrift(state.GitHub, current); drift {
 		status.IdentityDrift = true
 		status.DriftReason = reason
@@ -159,6 +164,7 @@ func (r *commandRuntime) resolveNetworkStatus(ctx context.Context) (networkStatu
 		status.Lease = &remote.Lease
 		membership := remote.Membership
 		status.Membership = &membership
+		status.LeaseHolder = findMembershipByNodeID(remote.Memberships, remote.Lease.HolderNodeID)
 		status.Warnings = append([]string{}, remote.Warnings...)
 		if remote.IdentityDrift {
 			status.IdentityDrift = true
@@ -205,7 +211,7 @@ func (r *commandRuntime) localProjectCountsAndIdentity(ctx context.Context) (loc
 		return 0, 0, protocol.GitHubIdentity{}, err
 	}
 	for _, project := range loaded.Config.Projects {
-		if project.Network != nil && project.Network.Mode == config.ProjectNetworkModeRouted {
+		if project.Network.Mode == config.ProjectNetworkModeRouted {
 			routed++
 		} else {
 			local++
@@ -225,9 +231,9 @@ func (r *commandRuntime) updateAllProjectNetworkModes(mode config.ProjectNetwork
 		return err
 	}
 	for index := range loaded.Config.Projects {
-		loaded.Config.Projects[index].Network = &config.ProjectNetworkConfig{Mode: mode}
+		loaded.Config.Projects[index].Network = config.ProjectNetworkConfig{Mode: mode}
 		if mode == config.ProjectNetworkModeOff {
-			loaded.Config.Projects[index].Network = nil
+			loaded.Config.Projects[index].Network = config.ProjectNetworkConfig{}
 		}
 	}
 	partial := loaded.Partial
@@ -235,14 +241,19 @@ func (r *commandRuntime) updateAllProjectNetworkModes(mode config.ProjectNetwork
 	if projects == nil {
 		materialized := make([]config.PartialProjectRefConfig, len(loaded.Config.Projects))
 		for index, project := range loaded.Config.Projects {
-			materialized[index] = config.PartialProjectRefConfig{ID: project.ID, Name: project.Name, RepoPath: project.RepoPath, Path: project.Path, BaseBranch: project.BaseBranch, WorktreeRoot: project.WorktreeRoot, Network: project.Network, Roles: project.Roles}
+			materialized[index] = config.PartialProjectRefConfig{ID: project.ID, Name: project.Name, RepoPath: project.RepoPath, Path: project.Path, BaseBranch: project.BaseBranch, WorktreeRoot: project.WorktreeRoot, Roles: project.Roles}
+			if project.Network.Mode != config.ProjectNetworkModeOff {
+				projectMode := project.Network.Mode
+				materialized[index].Network = &config.PartialProjectNetworkConfig{Mode: &projectMode}
+			}
 		}
 		projects = &materialized
 	}
 	for index := range *projects {
 		(*projects)[index].Network = nil
 		if mode != config.ProjectNetworkModeOff {
-			(*projects)[index].Network = &config.ProjectNetworkConfig{Mode: mode}
+			projectMode := config.NetworkMode(mode)
+			(*projects)[index].Network = &config.PartialProjectNetworkConfig{Mode: &projectMode}
 		}
 	}
 	partial.Projects = projects
@@ -275,13 +286,21 @@ func githubIdentityDrift(expected, current protocol.GitHubIdentity) (bool, strin
 
 func writeHumanNetworkStatus(w io.Writer, status networkStatusOutput, verbose bool) error {
 	printSection(w, "Network", [][2]any{{"configured", status.Configured}, {"cloudReachable", status.CloudReachable}, {"nodeName", status.NodeName}, {"githubLogin", status.GitHub.Login}, {"githubNumericId", status.GitHub.NumericID}, {"currentGithubLogin", status.CurrentGitHub.Login}, {"currentGithubNumericId", status.CurrentGitHub.NumericID}, {"identityDrift", status.IdentityDrift}, {"routedProjects", status.RoutedProjects}, {"localProjects", status.LocalProjects}})
+	if status.IdentityFallback {
+		fmt.Fprintln(w)
+		printSection(w, "Identity fallback", [][2]any{{"warning", "current GitHub identity is using login fallback because no numeric ID is available"}})
+	}
 	if status.DriftReason != "" {
 		fmt.Fprintln(w)
 		printSection(w, "Identity drift", [][2]any{{"reason", status.DriftReason}})
 	}
 	if status.Lease != nil {
 		fmt.Fprintln(w)
-		printSection(w, "Coordinator lease", [][2]any{{"holderNodeId", status.Lease.HolderNodeID}, {"fencingToken", status.Lease.FencingToken}, {"expiresAt", status.Lease.ExpiresAt}})
+		rows := [][2]any{{"holderNodeId", status.Lease.HolderNodeID}, {"fencingToken", status.Lease.FencingToken}, {"expiresAt", status.Lease.ExpiresAt}, {"leaseAction", status.LeaseAction}, {"leaseError", status.LeaseError}}
+		if status.LeaseHolder != nil {
+			rows = append(rows, [2]any{"holderNodeName", status.LeaseHolder.NodeName}, [2]any{"holderGithubLogin", status.LeaseHolder.GitHub.Login})
+		}
+		printSection(w, "Coordinator lease", rows)
 	}
 	if verbose && status.Membership != nil {
 		fmt.Fprintln(w)
@@ -303,6 +322,20 @@ func networkStringValue(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func findMembershipByNodeID(memberships []protocol.Membership, nodeID string) *protocol.Membership {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return nil
+	}
+	for _, member := range memberships {
+		if strings.TrimSpace(member.NodeID) == nodeID {
+			copy := member
+			return &copy
+		}
+	}
+	return nil
 }
 
 func isNotExist(err error) bool {

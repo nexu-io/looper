@@ -25,6 +25,8 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -77,24 +79,26 @@ type PullRequestSummary struct {
 }
 
 type IssueSummary struct {
-	Number    int64
-	Title     string
-	Body      string
-	URL       string
-	Assignees []string
-	Labels    []string
+	Number        int64
+	Title         string
+	Body          string
+	URL           string
+	Assignees     []string
+	AssigneeUsers []networkpolicy.GitHubUser
+	Labels        []string
 }
 
 type PullRequestDetail struct {
-	Number         int64
-	Title          string
-	Body           string
-	URL            string
-	State          string
-	HeadRefName    string
-	BaseRefName    string
-	HeadSHA        string
-	ReviewRequests []string
+	Number             int64
+	Title              string
+	Body               string
+	URL                string
+	State              string
+	HeadRefName        string
+	BaseRefName        string
+	HeadSHA            string
+	ReviewRequests     []string
+	ReviewRequestUsers []networkpolicy.GitHubUser
 }
 
 type IssueDetail struct {
@@ -104,6 +108,8 @@ type IssueDetail struct {
 	URL           string
 	State         string
 	IsPullRequest bool
+	AssigneeUsers []networkpolicy.GitHubUser
+	Labels        []string
 }
 
 type IssueCommentInput struct {
@@ -387,6 +393,10 @@ type AgentExecutionStartedInput struct {
 
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
+type NetworkStatusGateway interface {
+	Status(context.Context) (protocol.NodeStatusResponse, error)
+}
+
 type RunCompletedInput struct {
 	ProjectID         string
 	LoopID            string
@@ -429,6 +439,7 @@ type Options struct {
 	OnRunCompleted                  RunCompletedFunc
 	DiscoveryPolicy                 DiscoveryPolicy
 	OnQueueItemEnqueued             func()
+	Network                         NetworkStatusGateway
 }
 
 type DiscoveryPolicy struct {
@@ -436,6 +447,7 @@ type DiscoveryPolicy struct {
 	Labels                     []string
 	LabelMode                  config.LabelMode
 	RequireAssigneeCurrentUser bool
+	RoutedClaimPolicy          networkpolicy.ProjectPolicy
 }
 
 type Runner struct {
@@ -467,6 +479,7 @@ type Runner struct {
 	onRunCompleted          RunCompletedFunc
 	discoveryPolicy         DiscoveryPolicy
 	onQueueItemEnqueued     func()
+	network                 NetworkStatusGateway
 }
 
 type ProcessResult struct {
@@ -498,17 +511,18 @@ type workerInput struct {
 	SpecPath string `json:"specPath,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
-	IssueRepo      string   `json:"issueRepo,omitempty"`
-	BaseBranch     string   `json:"baseBranch,omitempty"`
-	ExecutionMode  string   `json:"executionMode,omitempty"`
-	IssueNumber    int64    `json:"issueNumber,omitempty"`
-	IssueURL       string   `json:"issueUrl,omitempty"`
-	PRNumber       int64    `json:"prNumber,omitempty"`
-	PRTitle        string   `json:"prTitle,omitempty"`
-	Branch         string   `json:"branch,omitempty"`
-	HeadSHA        string   `json:"headSha,omitempty"`
-	AutoDiscovered bool     `json:"autoDiscovered,omitempty"`
-	Reviewers      []string `json:"reviewers,omitempty"`
+	IssueRepo            string   `json:"issueRepo,omitempty"`
+	BaseBranch           string   `json:"baseBranch,omitempty"`
+	ExecutionMode        string   `json:"executionMode,omitempty"`
+	IssueNumber          int64    `json:"issueNumber,omitempty"`
+	IssueURL             string   `json:"issueUrl,omitempty"`
+	PRNumber             int64    `json:"prNumber,omitempty"`
+	PRTitle              string   `json:"prTitle,omitempty"`
+	Branch               string   `json:"branch,omitempty"`
+	HeadSHA              string   `json:"headSha,omitempty"`
+	AutoDiscovered       bool     `json:"autoDiscovered,omitempty"`
+	RoutedClaimMatchMode string   `json:"routedClaimMatchMode,omitempty"`
+	Reviewers            []string `json:"reviewers,omitempty"`
 }
 
 type workerCheckpoint struct {
@@ -686,6 +700,7 @@ func New(options Options) *Runner {
 		onRunCompleted:          options.OnRunCompleted,
 		discoveryPolicy:         policy,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
+		network:                 options.Network,
 	}
 }
 
@@ -709,7 +724,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	login := ""
-	if policy.RequireAssigneeCurrentUser {
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		login = normalizeLogin(login)
+		if login != "" {
+			policy.RoutedClaimPolicy.GitHubLogin = login
+		}
+	} else if policy.RequireAssigneeCurrentUser {
 		var err error
 		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
@@ -717,20 +741,28 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		login = normalizeLogin(login)
 	}
-	if policy.RequireAssigneeCurrentUser && login == "" {
+	if policy.RequireAssigneeCurrentUser && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	assigneeFilter := ""
-	if policy.RequireAssigneeCurrentUser {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
+	requiredTargetLabel, err := r.requiredTargetLabel(ctx, project.ID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy, requiredTargetLabel)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
 		if !shouldClaimWorkerIssue(issue, login, policy) {
+			result.Skipped++
+			continue
+		}
+		if requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
 			result.Skipped++
 			continue
 		}
@@ -760,7 +792,40 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Worker.AutoDiscovery, Labels: append([]string(nil), roles.Worker.Triggers.Labels...), LabelMode: roles.Worker.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Worker.Triggers.RequireAssigneeCurrentUser}
+	return DiscoveryPolicy{AutoDiscovery: roles.Worker.AutoDiscovery, Labels: append([]string(nil), roles.Worker.Triggers.Labels...), LabelMode: roles.Worker.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Worker.Triggers.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+}
+
+func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {
+	if r.projectNetworkMode(projectID) != config.ProjectNetworkModeRouted {
+		return "", nil
+	}
+	if r.network == nil {
+		return "", fmt.Errorf("worker network status is not configured")
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(status.Membership.NodeName) == "" {
+		return "", fmt.Errorf("worker network status is missing node name")
+	}
+	return protocol.TargetLabelForNode(status.Membership.NodeName), nil
+}
+
+func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode {
+	if r == nil || r.projectRoleConfig == nil {
+		return config.ProjectNetworkModeOff
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Network.Mode != "" {
+			return project.Network.Mode
+		}
+		break
+	}
+	return config.ProjectNetworkModeOff
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -848,6 +913,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
+		return ProcessResult{}, err
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -1020,6 +1088,33 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &checkpoint, finalIssueClaimStatus, summary)
 	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
+}
+
+func (r *Runner) revalidateRoutedWorkerClaim(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord) error {
+	policy := r.discoveryPolicyForProject(project.ID)
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) || r.github == nil || loop.TargetType != "issue" {
+		return nil
+	}
+	repo := derefString(loop.Repo)
+	if repo == "" {
+		repo = derefString(queueItem.Repo)
+	}
+	issueNumber := parseIssueNumberFromTargetID(derefString(loop.TargetID))
+	if issueNumber == 0 {
+		issueNumber = parseIssueNumberFromTargetID(queueItem.TargetID)
+	}
+	if repo == "" || issueNumber == 0 {
+		return nil
+	}
+	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: project.RepoPath})
+	if err != nil {
+		return err
+	}
+	decision := networkpolicy.EvaluateWorker(policy.RoutedClaimPolicy, issue.Labels, issue.AssigneeUsers)
+	if !decision.Allowed {
+		return &loopError{message: fmt.Sprintf("Skipped routed worker claim for %s#%d: %s", repo, issueNumber, decision.Reason), kind: FailureManualIntervention}
+	}
+	return nil
 }
 
 func (r *Runner) executeStep(ctx context.Context, step WorkerStep, input stepInput) (workerCheckpoint, error) {
@@ -1814,6 +1909,14 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: lookupRepo, IssueNumber: work.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return workerInput{}, err
+		}
+		policy := r.discoveryPolicyForProject(project.ID)
+		if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+			decision := networkpolicy.EvaluateWorker(policy.RoutedClaimPolicy, issue.Labels, issue.AssigneeUsers)
+			if !decision.Allowed {
+				return workerInput{}, &loopError{message: fmt.Sprintf("Skipped routed worker claim for %s#%d: %s", lookupRepo, work.IssueNumber, decision.Reason), kind: FailureManualIntervention}
+			}
+			work.RoutedClaimMatchMode = string(decision.MatchMode)
 		}
 		if err := validateWorkerIssueTarget(lookupRepo, work.IssueNumber, issue); err != nil {
 			return workerInput{}, err
@@ -2955,7 +3058,7 @@ func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, discl
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; commit only relevant non-secret changes if needed; do not push branches, create pull requests, update pull request metadata, or otherwise change remote review state.",
 		lifecycle.DisclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
 		"Because remote PR actions are disabled for this run, do not create or update PR bodies; any PR disclosure stamping can only happen during a later Looper-managed remote reconciliation step.",
-		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" only for local commits you completed and \"none\" for disabled remote actions.",
+		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; set each action to a plain string source like \"agent\" or \"none\", not a nested object.",
 		fmt.Sprintf("Expected lifecycle runner=%q branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", runner, branch, baseBranch, false, false, true),
 	}, "\n")
 }
@@ -3211,6 +3314,13 @@ func hasLabel(labels []string, target string) bool {
 }
 
 func shouldClaimWorkerIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		if !labelsMatch(issue.Labels, policy.Labels, policy.LabelMode) {
+			return false
+		}
+		decision := networkpolicy.EvaluateWorker(policy.RoutedClaimPolicy, issue.Labels, issue.AssigneeUsers)
+		return decision.Allowed
+	}
 	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
 		return false
 	}
@@ -3226,7 +3336,10 @@ func safeIssueQueryLabel(labels []string) string {
 	return ""
 }
 
-func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy) ([]IssueSummary, error) {
+func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy, requiredTargetLabel string) ([]IssueSummary, error) {
+	if strings.TrimSpace(requiredTargetLabel) != "" {
+		return r.listOpenIssuesForTargetedDiscovery(ctx, input, policy, requiredTargetLabel)
+	}
 	if policy.LabelMode != config.LabelModeAny {
 		input.Labels = uniqueNonEmptyLabels(policy.Labels)
 		input.Label = safeIssueQueryLabel(input.Labels)
@@ -3240,6 +3353,38 @@ func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenI
 	for _, label := range queryLabels {
 		queryInput := input
 		queryInput.Label = label
+		issues, err := r.github.ListOpenIssues(ctx, queryInput)
+		if err != nil {
+			return nil, err
+		}
+		issuePages = append(issuePages, issues)
+	}
+	return mergeIssuePages(issuePages, effectiveIssueLimit(input.Limit)), nil
+}
+
+func (r *Runner) listOpenIssuesForTargetedDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy, requiredTargetLabel string) ([]IssueSummary, error) {
+	targetLabel := strings.TrimSpace(requiredTargetLabel)
+	if targetLabel == "" {
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	queryLabels := uniqueNonEmptyLabels(policy.Labels)
+	if len(queryLabels) == 0 {
+		queryInput := input
+		queryInput.Labels = []string{targetLabel}
+		queryInput.Label = targetLabel
+		return r.github.ListOpenIssues(ctx, queryInput)
+	}
+	if policy.LabelMode != config.LabelModeAny {
+		queryInput := input
+		queryInput.Labels = append([]string{targetLabel}, queryLabels...)
+		queryInput.Label = safeIssueQueryLabel(queryInput.Labels)
+		return r.github.ListOpenIssues(ctx, queryInput)
+	}
+	issuePages := make([][]IssueSummary, 0, len(queryLabels))
+	for _, label := range queryLabels {
+		queryInput := input
+		queryInput.Labels = []string{targetLabel, label}
+		queryInput.Label = safeIssueQueryLabel(queryInput.Labels)
 		issues, err := r.github.ListOpenIssues(ctx, queryInput)
 		if err != nil {
 			return nil, err

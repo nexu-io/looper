@@ -44,16 +44,42 @@ func TestJoinRoundTripAndVersionValidation(t *testing.T) {
 }
 
 func TestValidateNodeName(t *testing.T) {
-	valid := []string{"node1", "worker-1", "a1", "abc-123"}
+	valid := []string{"node1", "worker-1", "a1", "abc-123", "Worker_2", "node.blue"}
 	for _, name := range valid {
 		if err := ValidateNodeName(name); err != nil {
 			t.Fatalf("ValidateNodeName(%q) error = %v", name, err)
 		}
 	}
-	invalid := []string{"", " worker-1", "worker-1 ", "Worker", "-node", "node-", "node_name", strings.Repeat("a", 33)}
+	invalid := []string{"", " worker-1", "worker-1 ", "node:name", strings.Repeat("a", 33)}
 	for _, name := range invalid {
 		if err := ValidateNodeName(name); err == nil {
 			t.Fatalf("ValidateNodeName(%q) error = nil, want error", name)
 		}
+	}
+}
+
+func TestExactTargetHelpers(t *testing.T) {
+	t.Parallel()
+	if nodeName, ok := ParseTargetLabel("looper:target:worker-1"); !ok || nodeName != "worker-1" {
+		t.Fatalf("ParseTargetLabel() = (%q, %t), want (%q, true)", nodeName, ok, "worker-1")
+	}
+	if _, ok := ParseTargetLabel("Looper:Target:worker-1"); ok {
+		t.Fatal("ParseTargetLabel() accepted mixed-case target label, want false")
+	}
+	plan, err := PlanExactTarget([]string{"bug", "looper:target:worker-2", "looper:target:worker-3"}, "worker-1")
+	if err != nil {
+		t.Fatalf("PlanExactTarget() error = %v", err)
+	}
+	if plan.DesiredLabel != "looper:target:worker-1" {
+		t.Fatalf("plan.DesiredLabel = %q, want looper:target:worker-1", plan.DesiredLabel)
+	}
+	if len(plan.Add) != 1 || plan.Add[0] != plan.DesiredLabel {
+		t.Fatalf("plan.Add = %v, want [%q]", plan.Add, plan.DesiredLabel)
+	}
+	if len(plan.Remove) != 2 {
+		t.Fatalf("plan.Remove = %v, want 2 stale target labels", plan.Remove)
+	}
+	if !HasExactTarget([]string{"looper:target:worker-1"}, "worker-1") {
+		t.Fatal("HasExactTarget() = false, want true")
 	}
 }

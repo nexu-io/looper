@@ -9,9 +9,13 @@ import (
 const DefaultServerPort = 17310
 
 func DefaultLooperHome() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		resolvedHomeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		homeDir = resolvedHomeDir
 	}
 
 	return filepath.Join(homeDir, ".looper"), nil
@@ -78,6 +82,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			PublicBaseURL:               "",
 			FallbackPollIntervalSeconds: 300,
 		},
+		Network: NetworkConfig{},
 		Agent: AgentConfig{
 			Params:       map[string]any{},
 			Env:          map[string]string{},
@@ -178,6 +183,10 @@ func DefaultConfig(cwd string) (Config, error) {
 					Enabled:           false,
 					APITimeoutSeconds: 10,
 					APIRetryAttempts:  3,
+				},
+				MergeWatch: CoordinatorMergeWatchConfig{
+					TransientRetries:         3,
+					MaxIndeterminateDuration: "15m",
 				},
 			},
 			Planner: PlannerRoleConfig{

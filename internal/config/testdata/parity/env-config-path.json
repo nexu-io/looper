@@ -121,6 +121,12 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
+      "network": {
+        "enrolled": false,
+        "githubLogin": "",
+        "loopernetBaseUrl": "",
+        "nodeName": ""
+      },
       "agent": {
         "vendor": "codex",
         "model": "gpt-5",
@@ -233,6 +239,10 @@
             "enabled": false,
             "apiTimeoutSeconds": 10,
             "apiRetryAttempts": 3
+          },
+          "mergeWatch": {
+            "maxIndeterminateDuration": "15m",
+            "transientRetries": 3
           },
           "dispatch": {
             "mode": "human-gated",
@@ -430,6 +440,9 @@
         {
           "id": "alpha",
           "name": "Alpha",
+          "network": {
+            "mode": "off"
+          },
           "repoPath": "__TMP__/alpha-repo",
           "baseBranch": "develop",
           "webhook": {},

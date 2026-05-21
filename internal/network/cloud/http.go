@@ -2,6 +2,9 @@ package cloud
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +38,8 @@ func NewServer(cfg Config, service *Service) *Server {
 	mux.HandleFunc("/v1/coordinator-lease/expire", s.nodeOnly(s.handleExpireLease))
 	mux.HandleFunc("/v1/coordinator-lease/revalidate", s.nodeOnly(s.handleRevalidateLease))
 	mux.HandleFunc("/v1/events", s.nodeOnly(s.handleEvents))
+	mux.HandleFunc("/v1/github/webhook-secret", s.adminOnly(s.handleGitHubWebhookSecret))
+	mux.HandleFunc("/v1/github/webhook", s.handleGitHubWebhook)
 	s.httpServer = &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 30 * time.Second}
 	return s
 }
@@ -267,6 +272,73 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeError(w, http.StatusInternalServerError, "streaming is not supported")
+}
+
+func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	secret, err := s.service.WebhookSecret(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !validGitHubSignature(secret, body, r.Header.Get("X-Hub-Signature-256")) {
+		writeError(w, http.StatusUnauthorized, "invalid signature")
+		return
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(body, &payload)
+	repo := ""
+	if repository, ok := payload["repository"].(map[string]any); ok {
+		repo = strings.TrimSpace(asString(repository["full_name"]))
+	}
+	s.service.RecordWebhookDelivery(r.Header.Get("X-GitHub-Event"), r.Header.Get("X-GitHub-Delivery"), repo)
+	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleGitHubWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	secret, err := s.service.WebhookSecret(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"secret": secret})
+}
+
+func asString(value any) string {
+	if value == nil {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return fmt.Sprint(value)
+}
+
+func validGitHubSignature(secret string, body []byte, signature string) bool {
+	signature = strings.TrimSpace(signature)
+	if !strings.HasPrefix(signature, "sha256=") || secret == "" {
+		return false
+	}
+	provided, err := hex.DecodeString(strings.TrimPrefix(signature, "sha256="))
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	expected := mac.Sum(nil)
+	return hmac.Equal(expected, provided)
 }
 
 func writeCompatibilityError(w http.ResponseWriter, err error) {

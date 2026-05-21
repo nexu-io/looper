@@ -8,12 +8,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var closesIssuePattern = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b`)
 
 const (
 	envFakeGHMode        = "LOOPER_E2E_FAKE_GH_MODE"
@@ -66,6 +69,11 @@ type pullRequestState struct {
 	Reviews           []map[string]any    `json:"reviews,omitempty"`
 	StatusCheckRollup []map[string]any    `json:"statusCheckRollup,omitempty"`
 	MergeStateStatus  string              `json:"mergeStateStatus,omitempty"`
+	Mergeable         *bool               `json:"mergeable,omitempty"`
+	MergeableState    string              `json:"mergeableState,omitempty"`
+	MergedAt          string              `json:"mergedAt,omitempty"`
+	AutoMerge         map[string]any      `json:"autoMerge,omitempty"`
+	CheckRuns         []map[string]any    `json:"checkRuns,omitempty"`
 	Threads           []reviewThreadState `json:"threads,omitempty"`
 }
 type reviewThreadState struct {
@@ -153,6 +161,9 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		}
 		return emitDefaultJSON(key, fields)
 	case "pr merge":
+		if err := handlePullRequestMerge(&st, os.Args[1:]); err != nil {
+			return err
+		}
 		_, _ = fmt.Fprintln(os.Stdout, "{}")
 		return nil
 	case "issue list", "pr list":
@@ -172,6 +183,86 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		_, _ = fmt.Fprintln(os.Stdout, "{}")
 		return nil
 	}
+}
+
+func handlePullRequestMerge(st *state, args []string) error {
+	prNumberValue := firstNonFlag(args[2:])
+	if strings.TrimSpace(prNumberValue) == "" {
+		return nil
+	}
+	prNumber, err := strconv.ParseInt(strings.TrimSpace(prNumberValue), 10, 64)
+	if err != nil {
+		return nil
+	}
+	repo := strings.TrimSpace(flagValue(args, "--repo"))
+	if repo == "" {
+		return nil
+	}
+	key := fmt.Sprintf("%s#%d", repo, prNumber)
+	pr, ok := st.PullRequests[key]
+	if !ok {
+		return nil
+	}
+	if slices.Contains(args, "--auto") {
+		pr.AutoMerge = map[string]any{
+			"enabledBy":   map[string]any{"login": firstNonEmpty(st.CurrentUserLogin, "looper")},
+			"mergeMethod": pullRequestMergeMethod(args),
+		}
+		pr.UpdatedAt = firstNonEmpty(pr.UpdatedAt, "2026-05-12T00:00:00Z")
+		st.PullRequests[key] = pr
+		return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
+	}
+	pr.State = "MERGED"
+	pr.ClosedAt = firstNonEmpty(pr.ClosedAt, "2026-05-12T00:00:00Z")
+	pr.MergedAt = firstNonEmpty(pr.MergedAt, pr.ClosedAt)
+	pr.UpdatedAt = firstNonEmpty(pr.UpdatedAt, "2026-05-12T00:00:00Z")
+	st.PullRequests[key] = pr
+	for _, match := range closesIssuePattern.FindAllStringSubmatch(pr.Body, -1) {
+		issueNumber, convErr := strconv.ParseInt(match[1], 10, 64)
+		if convErr != nil {
+			continue
+		}
+		closeLinkedIssueRoute(st, repo, issueNumber)
+	}
+	return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
+}
+
+func pullRequestMergeMethod(args []string) string {
+	switch {
+	case slices.Contains(args, "--rebase"):
+		return "REBASE"
+	case slices.Contains(args, "--merge"):
+		return "MERGE"
+	default:
+		return "SQUASH"
+	}
+}
+
+func closeLinkedIssueRoute(st *state, repo string, issueNumber int64) {
+	route := fmt.Sprintf("repos/%s/issues/%d", normalizeRouteRepoPath(repo), issueNumber)
+	payload, ok := st.Routes[route]
+	if !ok {
+		return
+	}
+	var issue map[string]any
+	if err := json.Unmarshal(payload, &issue); err != nil {
+		return
+	}
+	issue["state"] = "closed"
+	issue["state_reason"] = "completed"
+	updated, err := json.Marshal(issue)
+	if err != nil {
+		return
+	}
+	st.Routes[route] = updated
+}
+
+func normalizeRouteRepoPath(repo string) string {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 3 {
+		return parts[1] + "/" + parts[2]
+	}
+	return strings.TrimSpace(repo)
 }
 
 func handleAPI(mode string, st state, stdin string) error {
@@ -211,6 +302,12 @@ func handleAPI(mode string, st state, stdin string) error {
 			return err
 		}
 	}
+	if handled, err := handlePullRequestAPI(st, route); handled || err != nil {
+		return err
+	}
+	if handled, err := handleCheckRunsAPI(st, route); handled || err != nil {
+		return err
+	}
 	if strings.HasSuffix(route, "/comments") && strings.EqualFold(flagValue(args, "--method"), "POST") {
 		_, _ = fmt.Fprintln(os.Stdout, `{"id":1,"html_url":"https://example.test/issues/comments/1"}`)
 		return nil
@@ -238,6 +335,75 @@ func handleAPI(mode string, st state, stdin string) error {
 	_, _ = fmt.Fprintln(os.Stdout, `{"id":1,"number":1,"title":"fake issue"}`)
 	_ = stdin
 	return nil
+}
+
+func handlePullRequestAPI(st state, route string) (bool, error) {
+	const marker = "repos/"
+	if !strings.HasPrefix(route, marker) || !strings.Contains(route, "/pulls/") || strings.Contains(route, "/reviews") {
+		return false, nil
+	}
+	rest := strings.TrimPrefix(route, marker)
+	parts := strings.Split(rest, "/")
+	if len(parts) < 4 || parts[2] != "pulls" {
+		return false, nil
+	}
+	prNumber, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil {
+		return false, nil
+	}
+	pr, ok := lookupPullRequest(st, parts[0]+"/"+parts[1], prNumber)
+	if !ok {
+		return false, nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"number":          pr.Number,
+		"title":           pr.Title,
+		"body":            pr.Body,
+		"url":             pr.URL,
+		"html_url":        pr.URL,
+		"state":           strings.ToLower(pr.State),
+		"created_at":      pr.CreatedAt,
+		"updated_at":      pr.UpdatedAt,
+		"closed_at":       pr.ClosedAt,
+		"merged_at":       pr.MergedAt,
+		"labels":          pullRequestFieldValue(pr, "labels"),
+		"head":            map[string]any{"ref": pr.HeadRefName, "sha": pr.HeadSHA},
+		"base":            map[string]any{"ref": pr.BaseRefName, "sha": pr.BaseSHA},
+		"mergeable":       pr.Mergeable,
+		"mergeable_state": firstNonEmpty(pr.MergeableState, pr.MergeStateStatus),
+		"auto_merge":      pr.AutoMerge,
+	})
+	if err != nil {
+		return true, err
+	}
+	_, _ = fmt.Fprintln(os.Stdout, string(payload))
+	return true, nil
+}
+
+func handleCheckRunsAPI(st state, route string) (bool, error) {
+	const marker = "repos/"
+	if !strings.HasPrefix(route, marker) || !strings.Contains(route, "/commits/") || !strings.HasSuffix(route, "/check-runs") {
+		return false, nil
+	}
+	rest := strings.TrimPrefix(route, marker)
+	parts := strings.Split(rest, "/")
+	if len(parts) < 5 || parts[2] != "commits" {
+		return false, nil
+	}
+	repo := parts[0] + "/" + parts[1]
+	ref := parts[3]
+	for _, pr := range st.PullRequests {
+		candidate := hydratePullRequest(pr)
+		if candidate.Repo == repo && candidate.HeadSHA == ref {
+			payload, err := json.Marshal(map[string]any{"total_count": len(candidate.CheckRuns), "check_runs": candidate.CheckRuns})
+			if err != nil {
+				return true, err
+			}
+			_, _ = fmt.Fprintln(os.Stdout, string(payload))
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func handlePullRequestReviews(st *state, args []string, stdin string, route string) (bool, error) {
@@ -635,6 +801,9 @@ func hydratePullRequest(pr pullRequestState) pullRequestState {
 	if pr.MergeStateStatus == "" {
 		pr.MergeStateStatus = "CLEAN"
 	}
+	if pr.MergeableState == "" {
+		pr.MergeableState = strings.ToLower(pr.MergeStateStatus)
+	}
 	if pr.UpdatedAt == "" {
 		pr.UpdatedAt = "2026-05-12T00:00:00Z"
 	}
@@ -698,6 +867,14 @@ func pullRequestFieldValue(pr pullRequestState, field string) any {
 		return pr.StatusCheckRollup
 	case "mergeStateStatus":
 		return pr.MergeStateStatus
+	case "mergeable":
+		return pr.Mergeable
+	case "mergeable_state":
+		return pr.MergeableState
+	case "merged_at":
+		return pr.MergedAt
+	case "auto_merge":
+		return pr.AutoMerge
 	default:
 		return defaultValue(field)
 	}

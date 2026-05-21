@@ -16,9 +16,17 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func coordinatorFakeGHSchema() harness.GHSchema {
+	return harness.GHSchema{JSONFieldAllowlist: map[string][]string{
+		"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"},
+		"pr list":    {"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"},
+		"pr view":    {"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"},
+	}}
+}
+
 func TestCoordinatorHappyPathWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -78,7 +86,7 @@ func TestCoordinatorHappyPathWithFakeGH(t *testing.T) {
 
 func TestCoordinatorHumanDispatchWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -117,7 +125,7 @@ func TestCoordinatorHumanDispatchWithFakeGH(t *testing.T) {
 
 func TestCoordinatorHumanDispatchBlockedByDependencyWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -158,7 +166,7 @@ func TestCoordinatorHumanDispatchBlockedByDependencyWithFakeGH(t *testing.T) {
 
 func TestCoordinatorAutonomousDispatchWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -197,7 +205,7 @@ func TestCoordinatorAutonomousDispatchWithFakeGH(t *testing.T) {
 
 func TestCoordinatorAutonomousDispatchWaitsForBlockedByCompletionWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -258,7 +266,7 @@ func TestCoordinatorAutonomousDispatchWaitsForBlockedByCompletionWithFakeGH(t *t
 
 func TestCoordinatorCycleHandlingWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -302,7 +310,7 @@ func TestCoordinatorCycleHandlingWithFakeGH(t *testing.T) {
 
 func TestCoordinatorNotPlannedRetriageWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -338,15 +346,15 @@ func TestCoordinatorNotPlannedRetriageWithFakeGH(t *testing.T) {
 
 func TestCoordinatorTieBreakWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":10,"title":"Parent","body":"p","url":"https://example.test/issues/10","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[]},{"number":11,"title":"A","body":"a","url":"https://example.test/issues/11","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]},{"number":12,"title":"B","body":"b","url":"https://example.test/issues/12","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]},{"number":13,"title":"C","body":"c","url":"https://example.test/issues/13","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
+	fakeGH.WriteState(t, harness.GHState{Commands: map[string]any{"issue list": map[string]any{"stdout": json.RawMessage(`[{"number":10,"title":"Parent","body":"p","url":"https://example.test/issues/10","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[]},{"number":11,"title":"A","body":"a","url":"https://example.test/issues/11","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]},{"number":12,"title":"B","body":"b","url":"https://example.test/issues/12","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]},{"number":13,"title":"C","body":"c","url":"https://example.test/issues/13","state":"open","updatedAt":"2026-05-14T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}]`)}, "label create": map[string]any{"stdout": json.RawMessage(`{}`)}}, Routes: map[string]any{
 		"repos/acme/looper/issues/10":                         json.RawMessage(`{"number":10,"title":"Parent","body":"p","html_url":"https://example.test/issues/10","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[]}`),
-		"repos/acme/looper/issues/11":                         json.RawMessage(`{"number":11,"title":"A","body":"a","html_url":"https://example.test/issues/11","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
-		"repos/acme/looper/issues/12":                         json.RawMessage(`{"number":12,"title":"B","body":"b","html_url":"https://example.test/issues/12","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
-		"repos/acme/looper/issues/13":                         json.RawMessage(`{"number":13,"title":"C","body":"c","html_url":"https://example.test/issues/13","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+		"repos/acme/looper/issues/11":                         json.RawMessage(`{"number":11,"title":"A","body":"a","html_url":"https://example.test/issues/11","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}`),
+		"repos/acme/looper/issues/12":                         json.RawMessage(`{"number":12,"title":"B","body":"b","html_url":"https://example.test/issues/12","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}`),
+		"repos/acme/looper/issues/13":                         json.RawMessage(`{"number":13,"title":"C","body":"c","html_url":"https://example.test/issues/13","state":"open","state_reason":"","created_at":"2026-05-14T09:00:00Z","updated_at":"2026-05-14T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/implement"}]}`),
 		"repos/acme/looper/issues/10/comments":                json.RawMessage(`[[]]`),
 		"repos/acme/looper/issues/11/comments":                json.RawMessage(`[[]]`),
 		"repos/acme/looper/issues/12/comments":                json.RawMessage(`[[]]`),
@@ -384,9 +392,9 @@ func TestCoordinatorTieBreakWithFakeGH(t *testing.T) {
 	assertOrderedText(t, string(logBytes),
 		`"argv":["api","--paginate","--slurp","repos/acme/looper/issues/10/sub_issues"`,
 		`"argv":["api","repos/acme/looper/issues/12/assignees","--method","POST","-f","assignees[]=octocat"`,
-		`"argv":["api","repos/acme/looper/issues/12/labels","--method","POST","-f","labels[]=looper:plan"`,
+		`"argv":["api","repos/acme/looper/issues/12/labels","--method","POST","-f","labels[]=looper:worker-ready"`,
 		`"argv":["api","repos/acme/looper/issues/11/assignees","--method","POST","-f","assignees[]=octocat"`,
-		`"argv":["api","repos/acme/looper/issues/11/labels","--method","POST","-f","labels[]=looper:plan"`,
+		`"argv":["api","repos/acme/looper/issues/11/labels","--method","POST","-f","labels[]=looper:worker-ready"`,
 	)
 	if strings.Contains(string(logBytes), `repos/acme/looper/issues/13/assignees`) {
 		t.Fatal("third child should remain queued for next tick")

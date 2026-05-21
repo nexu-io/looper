@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,21 +18,25 @@ import (
 )
 
 type Status struct {
-	Configured      bool                      `json:"configured"`
-	NetworkID       string                    `json:"networkId,omitempty"`
-	NodeID          string                    `json:"nodeId,omitempty"`
-	NodeName        string                    `json:"nodeName,omitempty"`
-	GitHub          protocol.GitHubIdentity   `json:"github"`
-	CurrentGitHub   protocol.GitHubIdentity   `json:"currentGithub"`
-	CloudReachable  bool                      `json:"cloudReachable"`
-	Warnings        []string                  `json:"warnings,omitempty"`
-	Lease           protocol.CoordinatorLease `json:"lease"`
-	RoutedProjects  int                       `json:"routedProjects"`
-	LocalProjects   int                       `json:"localProjects"`
-	IdentityDrift   bool                      `json:"identityDrift"`
-	DriftReason     string                    `json:"driftReason,omitempty"`
-	Membership      *protocol.Membership      `json:"membership,omitempty"`
-	LastHeartbeatAt *time.Time                `json:"lastHeartbeatAt,omitempty"`
+	Configured       bool                      `json:"configured"`
+	NetworkID        string                    `json:"networkId,omitempty"`
+	NodeID           string                    `json:"nodeId,omitempty"`
+	NodeName         string                    `json:"nodeName,omitempty"`
+	GitHub           protocol.GitHubIdentity   `json:"github"`
+	CurrentGitHub    protocol.GitHubIdentity   `json:"currentGithub"`
+	CloudReachable   bool                      `json:"cloudReachable"`
+	Warnings         []string                  `json:"warnings,omitempty"`
+	Lease            protocol.CoordinatorLease `json:"lease"`
+	RoutedProjects   int                       `json:"routedProjects"`
+	LocalProjects    int                       `json:"localProjects"`
+	IdentityDrift    bool                      `json:"identityDrift"`
+	DriftReason      string                    `json:"driftReason,omitempty"`
+	IdentityFallback bool                      `json:"identityFallback,omitempty"`
+	LeaseAction      string                    `json:"leaseAction,omitempty"`
+	LeaseError       string                    `json:"leaseError,omitempty"`
+	LeaseHolder      *protocol.Membership      `json:"leaseHolder,omitempty"`
+	Membership       *protocol.Membership      `json:"membership,omitempty"`
+	LastHeartbeatAt  *time.Time                `json:"lastHeartbeatAt,omitempty"`
 }
 
 type Manager struct {
@@ -119,7 +125,7 @@ func (m *Manager) Status() Status {
 func (m *Manager) tick(ctx context.Context, state LocalState) {
 	current, _ := m.currentGitHubIdentity(ctx)
 	routed, local := countProjectModes(m.config)
-	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), CoordinatorEligible: routed > 0 && m.config.Roles.Coordinator.Enabled, RoutedProjects: routed, LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
+	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), CoordinatorEligible: routed > 0 && m.config.Roles.Coordinator.Enabled, RoutedProjects: routed, RoutedProjectIDs: routedProjectIDs(m.config), ReviewerProjects: reviewerProjectCapabilities(m.config), LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
 	drift, reason := identityDrift(state.GitHub, current)
 	capabilities.IdentityDrift = drift
 	capabilities.DriftReason = reason
@@ -148,12 +154,70 @@ func (m *Manager) tick(ctx context.Context, state LocalState) {
 	m.mu.Unlock()
 	status, err := api.Status(ctx)
 	if err == nil {
+		lease := status.Lease
+		leaseAction, leaseErr := m.reconcileLease(ctx, api, state, current, capabilities, status)
+		if leaseAction != "" || leaseErr != "" {
+			refreshed, refreshErr := api.Status(ctx)
+			if refreshErr == nil {
+				status = refreshed
+				lease = refreshed.Lease
+			}
+		}
+		warnings := append([]string{}, status.Warnings...)
+		if current.Login != "" && current.NumericID == 0 {
+			warnings = append(warnings, "current GitHub identity is using login fallback because no numeric ID is available")
+		}
 		m.mu.Lock()
-		m.status.Lease = status.Lease
+		m.status.Lease = lease
+		m.status.LeaseAction = leaseAction
+		m.status.LeaseError = leaseErr
+		m.status.LeaseHolder = findMembershipByNodeID(status.Memberships, lease.HolderNodeID)
 		m.status.Membership = &status.Membership
-		m.status.Warnings = status.Warnings
+		m.status.Warnings = warnings
+		m.status.IdentityFallback = current.Login != "" && current.NumericID == 0
 		m.mu.Unlock()
 	}
+}
+
+func (m *Manager) reconcileLease(ctx context.Context, api *Client, state LocalState, current protocol.GitHubIdentity, capabilities protocol.NodeCapabilities, status protocol.NodeStatusResponse) (string, string) {
+	eligible := capabilities.CoordinatorEligible && !capabilities.IdentityDrift && current.Login != "" && current.NumericID > 0
+	holdsLease := status.Lease.HolderNodeID != "" && status.Lease.HolderNodeID == state.NodeID && status.Lease.ExpiresAt != nil && status.Lease.ExpiresAt.After(m.now().UTC())
+	if holdsLease && !eligible {
+		if _, err := api.ExpireLease(ctx, status.Lease.FencingToken); err != nil {
+			return "expire_failed", err.Error()
+		}
+		return "expired", ""
+	}
+	if !eligible {
+		return "", ""
+	}
+	if holdsLease {
+		if _, err := api.RenewLease(ctx, protocol.CoordinatorLeaseRenewRequest{FencingToken: status.Lease.FencingToken}); err != nil {
+			return "renew_failed", err.Error()
+		}
+		return "renewed", ""
+	}
+	if status.Lease.HolderNodeID == "" || status.Lease.ExpiresAt == nil || !status.Lease.ExpiresAt.After(m.now().UTC()) {
+		if _, err := api.AcquireLease(ctx, protocol.CoordinatorLeaseAcquireRequest{}); err != nil {
+			return "acquire_failed", err.Error()
+		}
+		return "acquired", ""
+	}
+	return "", ""
+}
+
+func findMembershipByNodeID(memberships []protocol.Membership, nodeID string) *protocol.Membership {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return nil
+	}
+	for _, member := range memberships {
+		if strings.TrimSpace(member.NodeID) == nodeID {
+			copy := member
+			return &copy
+		}
+	}
+	return nil
 }
 
 func (m *Manager) currentGitHubIdentity(ctx context.Context) (protocol.GitHubIdentity, error) {
@@ -186,7 +250,7 @@ func (m *Manager) dynamicLoad(ctx context.Context) int {
 
 func countProjectModes(cfg config.Config) (routed int, local int) {
 	for _, project := range cfg.Projects {
-		if project.Network != nil && project.Network.Mode == config.ProjectNetworkModeRouted {
+		if project.Network.Mode == config.ProjectNetworkModeRouted {
 			routed++
 		} else {
 			local++
@@ -207,6 +271,36 @@ func supportedRoles(cfg config.Config) []string {
 		roles = append(roles, "reviewer")
 	}
 	return roles
+}
+
+func routedProjectIDs(cfg config.Config) []string {
+	ids := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		if project.Network.Mode == config.ProjectNetworkModeRouted && strings.TrimSpace(project.ID) != "" {
+			ids = append(ids, strings.TrimSpace(project.ID))
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func reviewerProjectCapabilities(cfg config.Config) []protocol.ReviewerProjectCapability {
+	capabilities := make([]protocol.ReviewerProjectCapability, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		if project.Network.Mode != config.ProjectNetworkModeRouted || strings.TrimSpace(project.ID) == "" {
+			continue
+		}
+		roles := config.ProjectRoleConfigs(cfg, project.ID)
+		if !roles.Reviewer.Discovery.AutoDiscovery {
+			continue
+		}
+		requireReviewRequest := roles.Reviewer.Discovery.Triggers.RequireReviewRequest
+		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: &requireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: string(roles.Reviewer.Discovery.Triggers.LabelMode)})
+	}
+	slices.SortFunc(capabilities, func(a, b protocol.ReviewerProjectCapability) int {
+		return strings.Compare(a.ProjectID, b.ProjectID)
+	})
+	return capabilities
 }
 
 func identityDrift(expected, current protocol.GitHubIdentity) (bool, string) {

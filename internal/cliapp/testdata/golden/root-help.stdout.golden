@@ -7,6 +7,7 @@ Version:
 Subcommands:
   status     Show service status
   network    Network membership commands
+  netadmin   Network repo operator commands
   webhook    Webhook configuration and status
   bootstrap  Run first-time setup
   version    Show Looper version
