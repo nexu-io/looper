@@ -169,22 +169,11 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 	case "issue list", "pr list":
 		fields := requestedJSONFields(os.Args[1:])
 		allowed := schemaDoc.JSONFieldAllowlist[key]
-		if len(allowed) == 0 && key == "pr list" {
-			allowed = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
-		}
 		if len(allowed) == 0 && mode == "strict" {
 			return fmt.Errorf("missing fake-gh allowlist for %s", key)
 		}
 		if err := validateFields(key, fields, allowed); err != nil {
 			return err
-		}
-		if key == "pr list" {
-			if payload, ok, err := buildPullRequestListJSON(st, fields); err != nil {
-				return err
-			} else if ok {
-				_, _ = fmt.Fprintln(os.Stdout, string(payload))
-				return nil
-			}
 		}
 		return emitDefaultJSON(key, fields)
 	default:
@@ -761,29 +750,6 @@ func buildPullRequestViewJSON(st state, fields []string) ([]byte, bool, error) {
 		row[field] = pullRequestFieldValue(pr, field)
 	}
 	payload, err := json.Marshal(row)
-	return payload, true, err
-}
-
-func buildPullRequestListJSON(st state, fields []string) ([]byte, bool, error) {
-	if len(st.PullRequests) == 0 {
-		payload, err := json.Marshal([]map[string]any{})
-		return payload, true, err
-	}
-	rows := make([]map[string]any, 0, len(st.PullRequests))
-	for _, current := range st.PullRequests {
-		pr := hydratePullRequest(current)
-		row := map[string]any{}
-		for _, field := range fields {
-			row[field] = pullRequestFieldValue(pr, field)
-		}
-		rows = append(rows, row)
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		left, _ := rows[i]["number"].(int64)
-		right, _ := rows[j]["number"].(int64)
-		return left < right
-	})
-	payload, err := json.Marshal(rows)
 	return payload, true, err
 }
 

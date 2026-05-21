@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -392,6 +393,10 @@ type AgentExecutionStartedInput struct {
 
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
+type NetworkStatusGateway interface {
+	Status(context.Context) (protocol.NodeStatusResponse, error)
+}
+
 type RunCompletedInput struct {
 	ProjectID         string
 	LoopID            string
@@ -434,6 +439,7 @@ type Options struct {
 	OnRunCompleted                  RunCompletedFunc
 	DiscoveryPolicy                 DiscoveryPolicy
 	OnQueueItemEnqueued             func()
+	Network                         NetworkStatusGateway
 }
 
 type DiscoveryPolicy struct {
@@ -473,6 +479,7 @@ type Runner struct {
 	onRunCompleted          RunCompletedFunc
 	discoveryPolicy         DiscoveryPolicy
 	onQueueItemEnqueued     func()
+	network                 NetworkStatusGateway
 }
 
 type ProcessResult struct {
@@ -693,6 +700,7 @@ func New(options Options) *Runner {
 		onRunCompleted:          options.OnRunCompleted,
 		discoveryPolicy:         policy,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
+		network:                 options.Network,
 	}
 }
 
@@ -740,13 +748,21 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
+	requiredTargetLabel, err := r.requiredTargetLabel(ctx, project.ID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy, requiredTargetLabel)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
 		if !shouldClaimWorkerIssue(issue, login, policy) {
+			result.Skipped++
+			continue
+		}
+		if requiredTargetLabel != "" && !hasLabel(issue.Labels, requiredTargetLabel) {
 			result.Skipped++
 			continue
 		}
@@ -777,6 +793,39 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
 	return DiscoveryPolicy{AutoDiscovery: roles.Worker.AutoDiscovery, Labels: append([]string(nil), roles.Worker.Triggers.Labels...), LabelMode: roles.Worker.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Worker.Triggers.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+}
+
+func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {
+	if r.projectNetworkMode(projectID) != config.ProjectNetworkModeRouted {
+		return "", nil
+	}
+	if r.network == nil {
+		return "", fmt.Errorf("worker network status is not configured")
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(status.Membership.NodeName) == "" {
+		return "", fmt.Errorf("worker network status is missing node name")
+	}
+	return protocol.TargetLabelForNode(status.Membership.NodeName), nil
+}
+
+func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode {
+	if r == nil || r.projectRoleConfig == nil {
+		return config.ProjectNetworkModeOff
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Network.Mode != "" {
+			return project.Network.Mode
+		}
+		break
+	}
+	return config.ProjectNetworkModeOff
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -3287,7 +3336,10 @@ func safeIssueQueryLabel(labels []string) string {
 	return ""
 }
 
-func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy) ([]IssueSummary, error) {
+func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy, requiredTargetLabel string) ([]IssueSummary, error) {
+	if strings.TrimSpace(requiredTargetLabel) != "" {
+		return r.listOpenIssuesForTargetedDiscovery(ctx, input, policy, requiredTargetLabel)
+	}
 	if policy.LabelMode != config.LabelModeAny {
 		input.Labels = uniqueNonEmptyLabels(policy.Labels)
 		input.Label = safeIssueQueryLabel(input.Labels)
@@ -3301,6 +3353,38 @@ func (r *Runner) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenI
 	for _, label := range queryLabels {
 		queryInput := input
 		queryInput.Label = label
+		issues, err := r.github.ListOpenIssues(ctx, queryInput)
+		if err != nil {
+			return nil, err
+		}
+		issuePages = append(issuePages, issues)
+	}
+	return mergeIssuePages(issuePages, effectiveIssueLimit(input.Limit)), nil
+}
+
+func (r *Runner) listOpenIssuesForTargetedDiscovery(ctx context.Context, input ListOpenIssuesInput, policy DiscoveryPolicy, requiredTargetLabel string) ([]IssueSummary, error) {
+	targetLabel := strings.TrimSpace(requiredTargetLabel)
+	if targetLabel == "" {
+		return r.github.ListOpenIssues(ctx, input)
+	}
+	queryLabels := uniqueNonEmptyLabels(policy.Labels)
+	if len(queryLabels) == 0 {
+		queryInput := input
+		queryInput.Labels = []string{targetLabel}
+		queryInput.Label = targetLabel
+		return r.github.ListOpenIssues(ctx, queryInput)
+	}
+	if policy.LabelMode != config.LabelModeAny {
+		queryInput := input
+		queryInput.Labels = append([]string{targetLabel}, queryLabels...)
+		queryInput.Label = safeIssueQueryLabel(queryInput.Labels)
+		return r.github.ListOpenIssues(ctx, queryInput)
+	}
+	issuePages := make([][]IssueSummary, 0, len(queryLabels))
+	for _, label := range queryLabels {
+		queryInput := input
+		queryInput.Labels = []string{targetLabel, label}
+		queryInput.Label = safeIssueQueryLabel(queryInput.Labels)
 		issues, err := r.github.ListOpenIssues(ctx, queryInput)
 		if err != nil {
 			return nil, err

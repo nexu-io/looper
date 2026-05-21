@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,7 @@ const triageCommentMarker = "<!-- looper:coordinator:triage -->"
 const dispatchFailureCommentMarker = "<!-- looper:coordinator:dispatch-failure -->"
 const cycleCommentMarker = "<!-- looper:coordinator:cycle -->"
 const mergeWatchCommentMarkerPrefix = "<!-- looper:coordinator:merge-watch"
+const noEligibleNodeStatus = "no-eligible-node"
 
 type DiscoveryInput struct {
 	ProjectID string
@@ -96,8 +98,8 @@ type Options struct {
 	Now        func() time.Time
 	TriageLLM  triage.LLM
 	Inspector  RepositoryInspector
-	Network    NetworkGateway
 	Disclosure *config.DisclosureConfig
+	Network    NetworkGateway
 }
 
 type Runner struct {
@@ -108,8 +110,8 @@ type Runner struct {
 	now        func() time.Time
 	triageLLM  triage.LLM
 	inspector  RepositoryInspector
-	network    NetworkGateway
 	disclosure *config.DisclosureConfig
+	network    NetworkGateway
 
 	mu                sync.Mutex
 	lastTickByProject map[string]time.Time
@@ -492,34 +494,243 @@ func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, iss
 	return nil
 }
 
-func (r *Runner) applyDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) error {
+func (r *Runner) applyDispatchAction(ctx context.Context, projectID string, repo string, cwd string, issue triage.Issue, action dispatch.Action, dispatchCfg dispatch.Config) (bool, error) {
 	if strings.TrimSpace(action.FailureCommentBody) != "" {
 		if err := r.postOrEditDispatchFailureComment(ctx, repo, cwd, issue.Number, action.FailureCommentBody); err != nil {
-			return err
+			return false, err
 		}
 		if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
-			return r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd})
+			if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
+				return false, err
+			}
 		}
-		return nil
+		return true, nil
 	}
+	if intent := r.workerAdmissionIntent(issue, action, dispatchCfg); intent.Active {
+		if r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted {
+			return r.applyRoutedWorkerAdmission(ctx, repo, cwd, issue, action, intent)
+		}
+		return r.applyLocalWorkerAdmission(ctx, repo, cwd, issue, action, intent.TriggerLabels)
+	}
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, action)
+
+}
+
+func (r *Runner) applyGenericDispatchAction(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action) (bool, error) {
+	mutated := false
 	if strings.TrimSpace(action.AssignTo) != "" {
 		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{action.AssignTo}, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	labelsToAdd := removeExistingLabels(action.TriggerLabels, issue.Labels)
 	if len(labelsToAdd) > 0 {
 		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
-			return err
+			return false, err
 		}
+		mutated = true
 	}
 	if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
 		if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
-			return err
+			return false, err
+		}
+		mutated = true
+	}
+	return mutated, nil
+}
+
+type workerAdmissionIntent struct {
+	Active        bool
+	TriggerLabels []string
+}
+
+func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Action, cfg dispatch.Config) workerAdmissionIntent {
+	desired := append([]string(nil), cfg.WorkerTriggerLabels...)
+	if len(desired) == 0 {
+		return workerAdmissionIntent{}
+	}
+	if len(intersectExactLabels(action.TriggerLabels, desired)) > 0 {
+		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
+	}
+	if hasExactLabel(issue.Labels, dispatch.DispatchPlan) {
+		return workerAdmissionIntent{}
+	}
+	if len(intersectExactLabels(issue.Labels, desired)) > 0 {
+		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
+	}
+	return workerAdmissionIntent{}
+}
+
+func (r *Runner) applyLocalWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, triggerLabels []string) (bool, error) {
+	localAction := action
+	localAction.TriggerLabels = triggerLabels
+	return r.applyGenericDispatchAction(ctx, repo, cwd, issue, localAction)
+}
+
+func (r *Runner) applyRoutedWorkerAdmission(ctx context.Context, repo string, cwd string, issue triage.Issue, action dispatch.Action, intent workerAdmissionIntent) (bool, error) {
+	mutated := false
+	if r.network == nil {
+		return false, fmt.Errorf("coordinator network admission is not configured")
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !r.currentNodeHoldsLease(status) {
+		return false, nil
+	}
+	selected, ok := selectEligibleWorkerNode(status.Memberships, r.now().UTC())
+	if !ok {
+		if err := r.postOrEditDispatchFailureComment(ctx, repo, cwd, issue.Number, fmt.Sprintf("Coordinator can’t route this implementation Issue right now because no eligible Worker Node is available (`%s`).", noEligibleNodeStatus)); err != nil {
+			return false, err
+		}
+		mutated = true
+		if action.ReactionCommentID != 0 {
+			if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: dispatch.ReactionFailure, CWD: cwd}); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+	if err := r.revalidateCoordinatorLease(ctx, issue.URL, status.Lease.FencingToken); err != nil {
+		if isStaleCoordinatorLeaseError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if login := strings.TrimSpace(selected.GitHub.Login); login != "" {
+		if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{login}, CWD: cwd}); err != nil {
+			return false, err
+		}
+		mutated = true
+	}
+	labelsToAdd := removeExistingLabels(intent.TriggerLabels, issue.Labels)
+	if len(labelsToAdd) > 0 {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToAdd, CWD: cwd}); err != nil {
+			return false, err
+		}
+		mutated = true
+	}
+	if err := r.revalidateCoordinatorLease(ctx, issue.URL, status.Lease.FencingToken); err != nil {
+		if isStaleCoordinatorLeaseError(err) {
+			return mutated, nil
+		}
+		return false, err
+	}
+	exactTarget := protocol.TargetLabelForNode(selected.NodeName)
+	labelsToRemove := nonExactTargetLabels(issue.Labels, exactTarget)
+	if len(labelsToRemove) > 0 {
+		if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: labelsToRemove, CWD: cwd}); err != nil {
+			return false, err
+		}
+		mutated = true
+	}
+	if !hasExactLabel(issue.Labels, exactTarget) {
+		if err := r.github.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issue.Number, Labels: []string{exactTarget}, CWD: cwd}); err != nil {
+			return false, err
+		}
+		mutated = true
+	}
+	if action.ReactionCommentID != 0 && strings.TrimSpace(action.ReactionContent) != "" {
+		if err := r.github.AddIssueReaction(ctx, githubinfra.CreateIssueReactionInput{Repo: repo, CommentID: action.ReactionCommentID, Content: action.ReactionContent, CWD: cwd}); err != nil {
+			return false, err
+		}
+		mutated = true
+	}
+	return mutated, nil
+}
+
+func (r *Runner) currentNodeHoldsLease(status protocol.NodeStatusResponse) bool {
+	if status.Lease.FencingToken == 0 || strings.TrimSpace(status.Lease.HolderNodeID) == "" {
+		return false
+	}
+	if status.Lease.ExpiresAt == nil || !status.Lease.ExpiresAt.After(r.now().UTC()) {
+		return false
+	}
+	return strings.TrimSpace(status.Lease.HolderNodeID) == strings.TrimSpace(status.Membership.NodeID)
+}
+
+func (r *Runner) revalidateCoordinatorLease(ctx context.Context, issueURL string, fencingToken int64) error {
+	if r.network == nil || fencingToken == 0 {
+		return nil
+	}
+	return r.network.RevalidateLease(ctx, protocol.CoordinatorLeaseRevalidateRequest{FencingToken: fencingToken, URL: revalidateProbeURL(issueURL), Method: "GET"})
+}
+
+func selectEligibleWorkerNode(members []protocol.Membership, now time.Time) (protocol.Membership, bool) {
+	eligible := make([]protocol.Membership, 0, len(members))
+	for _, member := range members {
+		if !memberHasRole(member, "worker") || member.DuplicateWarning || member.Capabilities.IdentityDrift {
+			continue
+		}
+		if strings.TrimSpace(member.NodeName) == "" || strings.TrimSpace(member.GitHub.Login) == "" {
+			continue
+		}
+		if member.LastHeartbeatAt == nil || member.LastHeartbeatAt.Before(now.Add(-2*protocol.DefaultLeaseTTL)) {
+			continue
+		}
+		if !hasExactLabel(member.TargetLabels, protocol.TargetLabelForNode(member.NodeName)) {
+			continue
+		}
+		eligible = append(eligible, member)
+	}
+	if len(eligible) == 0 {
+		return protocol.Membership{}, false
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		if eligible[i].Capabilities.DynamicLoad != eligible[j].Capabilities.DynamicLoad {
+			return eligible[i].Capabilities.DynamicLoad < eligible[j].Capabilities.DynamicLoad
+		}
+		return eligible[i].NodeName < eligible[j].NodeName
+	})
+	return eligible[0], true
+}
+
+func memberHasRole(member protocol.Membership, want string) bool {
+	for _, role := range member.Capabilities.Roles {
+		if strings.EqualFold(strings.TrimSpace(role), strings.TrimSpace(want)) {
+			return true
 		}
 	}
-	return nil
+	return false
+}
 
+func intersectExactLabels(left []string, right []string) []string {
+	if len(left) == 0 || len(right) == 0 {
+		return nil
+	}
+	set := map[string]struct{}{}
+	for _, label := range right {
+		set[label] = struct{}{}
+	}
+	out := []string{}
+	for _, label := range left {
+		if _, ok := set[label]; ok {
+			out = append(out, label)
+		}
+	}
+	return out
+}
+
+func revalidateProbeURL(issueURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(issueURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.TrimSpace(issueURL)
+	}
+	parsed.Path = "/"
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func isStaleCoordinatorLeaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "stale coordinator lease token") || strings.Contains(message, "coordinator lease is already held")
 }
 
 func (r *Runner) buildDependencyState(ctx context.Context, repo, cwd string, loaded []loadedIssue, triageCfg triage.Config, dispatchCfg dispatch.Config, depsCfg config.CoordinatorDependenciesConfig) (dependencyState, error) {
@@ -656,8 +867,8 @@ func (r *Runner) applyDispatches(ctx context.Context, projectID, repo, cwd strin
 		}
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
 		action = applyHumanDependencyGate(action, item.issue.Number, deps)
-		if r.hasDispatchWork(action) {
-			if err := r.applyDispatchAction(ctx, repo, cwd, item.issue, action); err != nil {
+		if r.hasDispatchWork(action) || r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
+			if _, err := r.applyDispatchAction(ctx, projectID, repo, cwd, item.issue, action, dispatchCfg); err != nil {
 				return err
 			}
 		}
@@ -676,7 +887,10 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 			return err
 		}
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
-		if !r.hasDispatchWork(action) || strings.TrimSpace(action.FailureCommentBody) != "" {
+		if strings.TrimSpace(action.FailureCommentBody) != "" {
+			continue
+		}
+		if !r.hasDispatchWork(action) && !r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
 			continue
 		}
 		if deps.enabled {
@@ -702,10 +916,13 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 		if dispatched >= budget {
 			break
 		}
-		if err := r.applyDispatchAction(ctx, repo, cwd, candidate.issue, candidate.action); err != nil {
+		mutated, err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg)
+		if err != nil {
 			return err
 		}
-		dispatched++
+		if mutated {
+			dispatched++
+		}
 	}
 	return nil
 }
@@ -1017,7 +1234,7 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 		return nil
 	}
 	if needTargetRepair && len(currentTargets) > 0 {
-		if err := r.revalidateCoordinatorLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
+		if err := r.revalidatePullRequestLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
 			return err
 		}
 		if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: currentTargets, CWD: cwd}); err != nil {
@@ -1025,7 +1242,7 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 		}
 	}
 	if needReviewRequest {
-		if err := r.revalidateCoordinatorLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
+		if err := r.revalidatePullRequestLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
 			return err
 		}
 		if err := r.github.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: repo, PRNumber: detail.Number, Reviewers: []string{candidate.Login}, CWD: cwd}); err != nil {
@@ -1035,13 +1252,13 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 	if !needTargetRepair {
 		return nil
 	}
-	if err := r.revalidateCoordinatorLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
+	if err := r.revalidatePullRequestLease(ctx, repo, detail.Number, status.Lease.FencingToken); err != nil {
 		return err
 	}
 	return r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: detail.Number, Labels: []string{wantLabel}, CWD: cwd})
 }
 
-func (r *Runner) revalidateCoordinatorLease(ctx context.Context, repo string, prNumber int64, fencingToken int64) error {
+func (r *Runner) revalidatePullRequestLease(ctx context.Context, repo string, prNumber int64, fencingToken int64) error {
 	if r.network == nil {
 		return nil
 	}
@@ -1502,6 +1719,22 @@ func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.
 	return project, roles.Coordinator, roles.Sweeper, nil
 }
 
+func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode {
+	if r == nil || r.config == nil {
+		return config.ProjectNetworkModeOff
+	}
+	for _, project := range r.config.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Network.Mode != "" {
+			return project.Network.Mode
+		}
+		break
+	}
+	return config.ProjectNetworkModeOff
+}
+
 func (r *Runner) shouldRunTick(projectID string) bool {
 	interval := r.pollInterval(projectID)
 	if interval <= 0 {
@@ -1614,6 +1847,18 @@ func removeExistingLabels(labels []string, existing []string) []string {
 		if !hasExactLabel(existing, label) {
 			out = append(out, label)
 		}
+	}
+	return out
+}
+
+func nonExactTargetLabels(labels []string, keep string) []string {
+	prefix := strings.ToLower(protocol.TargetLabelForNode(""))
+	out := []string{}
+	for _, label := range labels {
+		if !strings.HasPrefix(strings.ToLower(label), prefix) || strings.EqualFold(label, keep) {
+			continue
+		}
+		out = append(out, label)
 	}
 	return out
 }
