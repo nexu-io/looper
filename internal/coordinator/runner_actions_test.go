@@ -1714,6 +1714,29 @@ func TestRunnerAssignsReviewerAndTargetInRoutedMode(t *testing.T) {
 	}
 }
 
+func TestRunnerAssignsReviewerAndTargetInRoutedModeWhenLocalAutoDiscoveryDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Reviewer.Discovery.AutoDiscovery = false
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"add-reviewers:reviewer", "add-pr:looper:target:blue"})
+}
+
 func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)

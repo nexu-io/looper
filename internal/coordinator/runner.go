@@ -1144,8 +1144,17 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 	roles := config.ProjectRoleConfigs(*r.config, projectID)
 	trigger := roles.Reviewer.Discovery.Triggers
 	policy := networkpolicy.ProjectPolicyForProject(*r.config, projectID)
-	if !roles.Reviewer.Discovery.AutoDiscovery {
+	routed := networkpolicy.IsRouted(policy)
+	if !roles.Reviewer.Discovery.AutoDiscovery && !routed {
 		return nil
+	}
+	var routedMemberships []protocol.Membership
+	if routed && r.network != nil {
+		status, err := r.network.Status(ctx)
+		if err != nil {
+			return err
+		}
+		routedMemberships = append([]protocol.Membership(nil), status.Memberships...)
 	}
 	summaries, err := r.github.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: 100})
 	if err != nil {
@@ -1166,11 +1175,16 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 		if !strings.EqualFold(strings.TrimSpace(detail.State), "open") {
 			continue
 		}
-		authority := labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode) || len(detail.ReviewRequests) > 0 || len(detail.ReviewRequestUsers) > 0
+		authority := len(detail.ReviewRequests) > 0 || len(detail.ReviewRequestUsers) > 0
+		if routed {
+			authority = authority || routedReviewAssignmentAuthority(projectID, routedMemberships, detail)
+		} else {
+			authority = authority || labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode)
+		}
 		if !authority {
 			continue
 		}
-		if networkpolicy.IsRouted(policy) {
+		if routed {
 			if err := r.applyRoutedReviewAssignment(ctx, projectID, repo, cwd, detail, trigger); err != nil {
 				return err
 			}
@@ -1309,15 +1323,38 @@ func reviewerProjectCapability(capabilities []protocol.ReviewerProjectCapability
 	return protocol.ReviewerProjectCapability{}, false
 }
 
+func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail) bool {
+	for _, member := range memberships {
+		if member.Capabilities.RoutedProjects <= 0 {
+			continue
+		}
+		projectCapability, ok := reviewerProjectCapability(member.Capabilities.ReviewerProjects, projectID)
+		if !ok {
+			continue
+		}
+		if reviewAssignmentMatchesTrigger(detail, reviewerTriggerFromCapability(projectCapability)) {
+			return true
+		}
+	}
+	return false
+}
+
 func reviewerTriggerFromCapability(capability protocol.ReviewerProjectCapability) config.ReviewerRoleTriggersConfig {
 	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, EnableSelfReview: capability.EnableSelfReview, Labels: append([]string(nil), capability.Labels...), LabelMode: config.LabelMode(capability.LabelMode)}
 }
 
-func reviewAssignmentEligible(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig, candidate reviewAssignmentCandidate, targetLabel string) bool {
+func reviewAssignmentMatchesTrigger(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) bool {
 	if !trigger.IncludeDrafts && detail.IsDraft {
 		return false
 	}
 	if !labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode) {
+		return false
+	}
+	return true
+}
+
+func reviewAssignmentEligible(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig, candidate reviewAssignmentCandidate, targetLabel string) bool {
+	if !reviewAssignmentMatchesTrigger(detail, trigger) {
 		return false
 	}
 	if !trigger.EnableSelfReview && normalizeLogin(detail.Author) == candidate.Login {
