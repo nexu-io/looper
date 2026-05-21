@@ -718,6 +718,10 @@ func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWor
 func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, baseBranch string) (string, error) {
 	startPoint, ok, err := g.resolveDetachedStartPointRef(ctx, repoPath, baseBranch)
 	if err != nil {
+		branchExists, branchErr := g.branchExists(ctx, repoPath, baseBranch)
+		if branchErr == nil && branchExists {
+			return baseBranch, nil
+		}
 		return "", err
 	}
 	if ok {
