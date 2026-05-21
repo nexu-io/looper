@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreecleanup"
 )
 
 func TestWorktreeCleanupPassCleansEligibleCheckout(t *testing.T) {
@@ -201,6 +202,54 @@ func TestWorktreeCleanupPassRespectsRetentionAndOrphanPolicy(t *testing.T) {
 	}
 }
 
+func TestCleanupWorktreeCandidateSkipsQueueItemInsertedAfterPlanning(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_queue_after_plan", "feature/queue-after-plan", true)
+	plan, err := (&worktreecleanup.Service{
+		Repos:  fixture.repos,
+		Config: fixture.config.Daemon.WorktreeCleanup,
+		Now:    func() time.Time { return fixture.now },
+	}).Plan(context.Background())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	if len(plan.Decisions) != 1 || plan.Decisions[0].Action != worktreecleanup.ActionWouldClean {
+		t.Fatalf("plan.Decisions = %#v, want worktree selected before queue item exists", plan.Decisions)
+	}
+
+	fixture.seedQueueForWorktree(t, "queue_after_plan", worktree, "queued")
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {{Path: worktree.WorktreePath, Branch: worktree.Branch}}},
+		clean:  map[string]bool{worktree.WorktreePath: true},
+		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
+			t.Fatalf("CleanupWorktree() called for %q, want queued worktree skipped", input.WorktreePath)
+			return nil
+		},
+	}
+
+	result := fixture.runtime.cleanupWorktreeCandidate(context.Background(), fixture.repos, git, fixture.config, worktree)
+
+	if result.status != "skipped" || result.message != "active_queue_item_references_worktree" {
+		t.Fatalf("result = %#v, want active queue skip", result)
+	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("cleanupCalls = %#v, want no cleanup", git.cleanupCalls)
+	}
+	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), worktree.ID)
+	if err != nil {
+		t.Fatalf("Worktrees.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Status != "active" {
+		t.Fatalf("stored worktree = %#v, want active", stored)
+	}
+	events := fixture.events(t)
+	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.skipped", "active_queue_item_references_worktree") {
+		t.Fatalf("events = %#v, want active queue skip", events)
+	}
+}
+
 func TestWorktreeCleanupPassRecordsFailureAndContinues(t *testing.T) {
 	t.Parallel()
 
@@ -323,6 +372,29 @@ func (f *worktreeCleanupFixture) seedLoopForWorktree(t *testing.T, id string, wo
 	record := storage.LoopRecord{ID: id, Seq: f.seq, ProjectID: worktree.ProjectID, Type: "worker", TargetType: "project", Status: status, MetadataJSON: &metadata, CreatedAt: formatJavaScriptISOString(updatedAt), UpdatedAt: formatJavaScriptISOString(updatedAt)}
 	if err := f.repos.Loops.Upsert(context.Background(), record); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+}
+
+func (f worktreeCleanupFixture) seedQueueForWorktree(t *testing.T, id string, worktree storage.WorktreeRecord, status string) {
+	t.Helper()
+	payload := `{"worktreeId":"` + worktree.ID + `","branch":"` + worktree.Branch + `","worktreePath":"` + worktree.WorktreePath + `"}`
+	if err := f.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          id,
+		ProjectID:   &worktree.ProjectID,
+		Type:        "worker",
+		TargetType:  "project",
+		TargetID:    worktree.ProjectID,
+		DedupeKey:   "worker:" + id,
+		Priority:    storage.QueuePriorityWorker,
+		Status:      status,
+		AvailableAt: formatJavaScriptISOString(f.now),
+		Attempts:    0,
+		MaxAttempts: 3,
+		PayloadJSON: &payload,
+		CreatedAt:   formatJavaScriptISOString(f.now),
+		UpdatedAt:   formatJavaScriptISOString(f.now),
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 }
 

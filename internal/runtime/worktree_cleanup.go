@@ -272,6 +272,11 @@ func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.R
 	} else if active {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "active_loop_or_run_references_worktree")
 	}
+	if active, err := worktreeCleanupCandidateActiveQueue(ctx, repos, candidate); err != nil {
+		return r.recordWorktreeCleanupFailure(ctx, repos, candidate, err)
+	} else if active {
+		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "active_queue_item_references_worktree")
+	}
 
 	listed, listErr := gitGateway.ListWorktrees(ctx, project.RepoPath)
 	if listErr != nil {
@@ -412,6 +417,32 @@ func worktreeCleanupCandidateActive(ctx context.Context, repos *storage.Reposito
 			return false, err
 		}
 		if run != nil && jsonContainsWorktree(run.CheckpointJSON, candidate) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func worktreeCleanupCandidateActiveQueue(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord) (bool, error) {
+	items, err := repos.Queue.List(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range items {
+		if item.Status != "queued" && item.Status != "running" {
+			continue
+		}
+		if jsonContainsWorktree(item.PayloadJSON, candidate) {
+			return true, nil
+		}
+		if item.LoopID == nil {
+			continue
+		}
+		loop, err := repos.Loops.GetByID(ctx, *item.LoopID)
+		if err != nil {
+			return false, err
+		}
+		if loop != nil && loop.ProjectID == candidate.ProjectID && jsonContainsWorktree(loop.MetadataJSON, candidate) {
 			return true, nil
 		}
 	}
