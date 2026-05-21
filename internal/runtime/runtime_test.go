@@ -1572,6 +1572,44 @@ func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *
 	}
 }
 
+func TestRuntimeWorktreeCleanupFailureDoesNotAdvanceIntervalGate(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Daemon.WorktreeCleanup.Enabled = true
+	cfg.Daemon.WorktreeCleanup.IntervalSeconds = 3600
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID:       "project_1",
+		Name:     "Looper",
+		RepoPath: filepath.Join(workingDir, "repo"),
+	}}
+
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
+	repositories := storage.NewRepositories(coordinator.DB())
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("Coordinator.Close() error = %v", err)
+	}
+
+	now := time.Date(2026, time.May, 21, 10, 0, 0, 0, time.UTC)
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now:    func() time.Time { return now },
+	})
+
+	if err := rt.maybeRunWorktreeCleanup(context.Background(), Services{Repositories: repositories}); err == nil {
+		t.Fatal("maybeRunWorktreeCleanup() error = nil, want repository failure")
+	}
+	if rt.lastWorktreeCleanup != nil {
+		t.Fatalf("lastWorktreeCleanup = %v, want nil after failed cleanup", *rt.lastWorktreeCleanup)
+	}
+}
+
 func TestRuntimeRecordWebhookDeliveryTriggersSchedulerTick(t *testing.T) {
 	t.Parallel()
 

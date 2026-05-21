@@ -1014,7 +1014,6 @@ func (r *Runtime) maybeRunWorktreeCleanup(ctx context.Context, services Services
 		r.mu.Unlock()
 		return nil
 	}
-	r.lastWorktreeCleanup = &now
 	r.mu.Unlock()
 
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: services.Repositories, Now: r.now})
@@ -1027,6 +1026,9 @@ func (r *Runtime) maybeRunWorktreeCleanup(ctx context.Context, services Services
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
+	r.lastWorktreeCleanup = &now
+	r.mu.Unlock()
 	if r.logger != nil && result.Summary.Inspected > 0 {
 		r.logger.Info("looperd worktree cleanup completed", map[string]any{"dryRun": result.DryRun, "summary": result.Summary})
 	}
