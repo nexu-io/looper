@@ -175,6 +175,17 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.Behavior.Loop.MinPublishIntervalSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
 	}
+	if config.Roles.Reviewer.Behavior.Retry.AutoRecoveryMaxAttempts < 1 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.retry.autoRecoveryMaxAttempts", Message: "must be a positive integer"})
+	}
+	if config.Roles.Reviewer.Behavior.Retry.MaxDelayMS < 1 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.retry.maxDelayMs", Message: "must be a positive integer"})
+	}
+	for index, pattern := range config.Roles.Reviewer.Behavior.Retry.ExtraTransientErrorPatterns {
+		if strings.TrimSpace(pattern) == "" {
+			issues = append(issues, ValidationIssue{Path: fmt.Sprintf("roles.reviewer.behavior.retry.extraTransientErrorPatterns[%d]", index), Message: "must be a non-empty string"})
+		}
+	}
 	if !isValidReviewerScope(config.Roles.Reviewer.Behavior.Scope) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.scope", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges)})
 	}

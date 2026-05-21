@@ -1081,6 +1081,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,
 		RetryBaseDelay:          retryBaseDelay,
 		RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
+		RetryPolicy:             cfg.Roles.Reviewer.Behavior.Retry,
 		OnQueueItemEnqueued:     requestWake,
 		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})

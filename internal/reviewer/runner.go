@@ -442,6 +442,7 @@ type Options struct {
 	LooperCLIPath           string
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
+	RetryPolicy             config.ReviewerRetryConfig
 	HeadChangePollInterval  time.Duration
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
@@ -487,6 +488,8 @@ type Runner struct {
 	looperCLIPath           string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
+	retryPolicy             config.ReviewerRetryConfig
+	retryMaxDelay           time.Duration
 	headChangePollInterval  time.Duration
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
@@ -512,8 +515,6 @@ type DiscoveryResult struct {
 	CreatedLoopIDs []string
 	Skipped        int
 }
-
-const maxReviewerAutoRecoveryAttempts = 3
 
 type ProcessResult struct {
 	LoopID      string
@@ -638,6 +639,11 @@ func New(options Options) *Runner {
 	if retryMax <= 0 {
 		retryMax = defaultRetryMax
 	}
+	retryPolicy := config.NormalizeReviewerRetryConfig(options.RetryPolicy)
+	retryMaxDelay := time.Duration(retryPolicy.MaxDelayMS) * time.Millisecond
+	if retryMaxDelay <= 0 {
+		retryMaxDelay = maxRetryDelay
+	}
 	headChangePollInterval := options.HeadChangePollInterval
 	if headChangePollInterval <= 0 {
 		headChangePollInterval = defaultHeadChangePollInterval
@@ -700,6 +706,8 @@ func New(options Options) *Runner {
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
+		retryPolicy:             retryPolicy,
+		retryMaxDelay:           retryMaxDelay,
 		headChangePollInterval:  headChangePollInterval,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
@@ -1495,7 +1503,7 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 		if attempt >= maxAttempts || !r.isTransientExternalFailure(err) {
 			break
 		}
-		delay := retryDelay(r.retryBaseDelay, attempt, err)
+		delay := retryDelay(r.retryBaseDelay, attempt, err, r.retryMaxDelay)
 		if r.shouldSkipTransientRetryDelayForNativeResume(ctx, input.Loop.ID, err) {
 			delay = 0
 		}
@@ -3754,7 +3762,7 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 	if err != nil {
 		return nil, err
 	}
-	requeued, err := r.requeueFailedReviewerQueueItem(ctx, loop.ID, queueID, nowISO, latestQueue)
+	requeued, err := r.requeueFailedReviewerQueueItem(ctx, loop.ID, queueID, nowISO, latestQueue, reason)
 	if err != nil {
 		return nil, err
 	}
@@ -3792,8 +3800,8 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 	return &updated, nil
 }
 
-func (r *Runner) requeueFailedReviewerQueueItem(ctx context.Context, loopID, queueID, queuedAt string, queue *storage.QueueItemRecord) (int64, error) {
-	if queue != nil && isRetryableTransientWithRemainingAttempts(*queue) {
+func (r *Runner) requeueFailedReviewerQueueItem(ctx context.Context, loopID, queueID, queuedAt string, queue *storage.QueueItemRecord, reason string) (int64, error) {
+	if queue != nil && (isRetryableTransientWithRemainingAttempts(*queue) || reason == "enhanced_transient_match_attempts_remaining") {
 		return r.repos.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, queueID, queuedAt, queue.Attempts)
 	}
 	return r.repos.Queue.RequeueFailedByID(ctx, loopID, queueID, queuedAt)
@@ -3820,7 +3828,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if reason, _ := stringFromAny(loopMeta["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
 		return false, "", reason, nil
 	}
-	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
+	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= r.retryPolicy.AutoRecoveryMaxAttempts {
 		return false, "", "auto_recovery_attempt_cap", nil
 	}
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
@@ -3881,6 +3889,16 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if latestMessage == "" {
 		latestMessage = derefString(latestQueue.LastError)
 	}
+	if r.retryPolicy.RecoverExistingMatchedFailures && queueHasRemainingAttempts(*latestQueue) && r.isEnhancedTransientMessage(latestMessage) {
+		approved, err := approvedByCurrentUser()
+		if err != nil {
+			return false, "", "", err
+		}
+		if approved {
+			return false, "", "approved", nil
+		}
+		return true, latestQueue.ID, "enhanced_transient_match_attempts_remaining", nil
+	}
 	if isKnownReviewerRediscoveryGuardrail(latestMessage) && isReviewerRediscoveryRunStep(latestRun) {
 		approved, err := approvedByCurrentUser()
 		if err != nil {
@@ -3898,6 +3916,10 @@ func isRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bo
 	if derefString(queue.LastErrorKind) != string(FailureRetryableTransient) {
 		return false
 	}
+	return queueHasRemainingAttempts(queue)
+}
+
+func queueHasRemainingAttempts(queue storage.QueueItemRecord) bool {
 	nextAttempts := queue.Attempts + 1
 	return queue.MaxAttempts > 0 && nextAttempts < queue.MaxAttempts
 }
@@ -4089,7 +4111,7 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
 	if isRetryableFailure(kind) && nextAttempts < queueItem.MaxAttempts {
-		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, nextAttempts)))
+		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, nextAttempts, r.retryMaxDelay)))
 		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
@@ -4141,6 +4163,9 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	if isTransientModelProviderError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
+	if r.isEnhancedTransientFailure(err) {
+		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
 	return &loopError{message: err.Error(), kind: FailureNonRetryable}
 }
 
@@ -4151,11 +4176,25 @@ func (r *Runner) isTransientExternalFailure(err error) bool {
 	if githubinfra.IsTransientError(err) || isTransientModelProviderError(err) {
 		return true
 	}
+	if r.isEnhancedTransientFailure(err) {
+		return true
+	}
 	var loopErr *loopError
 	if errors.As(err, &loopErr) {
-		return loopErr.kind == FailureRetryableTransient && isTransientModelProviderMessage(loopErr.message)
+		return loopErr.kind == FailureRetryableTransient && (isTransientModelProviderMessage(loopErr.message) || r.isEnhancedTransientMessage(loopErr.message))
 	}
 	return false
+}
+
+func (r *Runner) isEnhancedTransientFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return r.isEnhancedTransientMessage(err.Error()) || config.ReviewerRetryMessageMatches(r.retryPolicy, githubinfra.ErrorMessage(err))
+}
+
+func (r *Runner) isEnhancedTransientMessage(message string) bool {
+	return config.ReviewerRetryMessageMatches(r.retryPolicy, message)
 }
 
 func (r *Runner) markAgentExecutionNativeResumePendingForTransientProvider(ctx context.Context, executionID string, message string) bool {
@@ -5527,29 +5566,38 @@ func (p pendingReviewCheckpoint) clone() *pendingReviewCheckpoint {
 	return &copyValue
 }
 
-func backoffDelay(base time.Duration, attempts int64) time.Duration {
+func backoffDelay(base time.Duration, attempts int64, maxDelay time.Duration) time.Duration {
+	if maxDelay <= 0 {
+		maxDelay = maxRetryDelay
+	}
 	delay := base
 	for i := int64(1); i < attempts; i++ {
 		delay *= 2
 	}
-	if delay > maxRetryDelay {
-		return maxRetryDelay
+	if delay > maxDelay {
+		return maxDelay
 	}
 	return delay
 }
 
-func retryDelay(base time.Duration, attempts int64, err error) time.Duration {
+func retryDelay(base time.Duration, attempts int64, err error, maxDelay time.Duration) time.Duration {
+	if maxDelay <= 0 {
+		maxDelay = maxRetryDelay
+	}
 	if delay, ok := retryAfterDelay(err); ok {
-		if delay > maxRetryDelay {
-			return maxRetryDelay
+		if delay > maxDelay {
+			return maxDelay
 		}
 		return delay
 	}
-	return jitterDelay(backoffDelay(base, attempts))
+	return jitterDelay(backoffDelay(base, attempts, maxDelay), maxDelay)
 }
 
-func jitterDelay(delay time.Duration) time.Duration {
-	if delay <= 0 || delay >= maxRetryDelay {
+func jitterDelay(delay time.Duration, maxDelay time.Duration) time.Duration {
+	if maxDelay <= 0 {
+		maxDelay = maxRetryDelay
+	}
+	if delay <= 0 || delay >= maxDelay {
 		return delay
 	}
 	maxJitter := delay / retryJitterDivisor
@@ -5561,8 +5609,8 @@ func jitterDelay(delay time.Duration) time.Duration {
 		return delay
 	}
 	delay += time.Duration(n.Int64())
-	if delay > maxRetryDelay {
-		return maxRetryDelay
+	if delay > maxDelay {
+		return maxDelay
 	}
 	return delay
 }

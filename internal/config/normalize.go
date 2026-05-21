@@ -140,6 +140,9 @@ func mergePartialReviewerConfigWithCanonicalPriority(canonical *PartialReviewerC
 	if canonical.Loop == nil {
 		canonical.Loop = legacy.Loop
 	}
+	if canonical.Retry == nil {
+		canonical.Retry = legacy.Retry
+	}
 	if canonical.Scope == nil {
 		canonical.Scope = legacy.Scope
 	}
@@ -669,6 +672,9 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.Loop != nil {
 		mergeReviewerLoopConfig(&config.Loop, *partial.Loop)
 	}
+	if partial.Retry != nil {
+		mergeReviewerRetryConfig(&config.Retry, *partial.Retry)
+	}
 	if partial.Scope != nil {
 		config.Scope = *partial.Scope
 	}
@@ -689,6 +695,25 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.ThreadResolution != nil {
 		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
 	}
+}
+
+func mergeReviewerRetryConfig(config *ReviewerRetryConfig, partial PartialReviewerRetryConfig) {
+	if partial.EnhancedTransientClassification != nil {
+		config.EnhancedTransientClassification = *partial.EnhancedTransientClassification
+	}
+	if partial.ExtraTransientErrorPatterns != nil {
+		config.ExtraTransientErrorPatterns = append([]string(nil), (*partial.ExtraTransientErrorPatterns)...)
+	}
+	if partial.RecoverExistingMatchedFailures != nil {
+		config.RecoverExistingMatchedFailures = *partial.RecoverExistingMatchedFailures
+	}
+	if partial.AutoRecoveryMaxAttempts != nil {
+		config.AutoRecoveryMaxAttempts = *partial.AutoRecoveryMaxAttempts
+	}
+	if partial.MaxDelayMS != nil {
+		config.MaxDelayMS = *partial.MaxDelayMS
+	}
+	*config = NormalizeReviewerRetryConfig(*config)
 }
 
 func mergeReviewerNativeResumeConfig(config *ReviewerNativeResumeConfig, partial PartialReviewerNativeResumeConfig) {
@@ -1369,6 +1394,14 @@ func clonePartialReviewerConfig(config *PartialReviewerConfig) *PartialReviewerC
 		loop := *config.Loop
 		cloned.Loop = &loop
 	}
+	if config.Retry != nil {
+		retry := *config.Retry
+		if config.Retry.ExtraTransientErrorPatterns != nil {
+			patterns := append([]string(nil), (*config.Retry.ExtraTransientErrorPatterns)...)
+			retry.ExtraTransientErrorPatterns = &patterns
+		}
+		cloned.Retry = &retry
+	}
 	if config.ReviewEvents != nil {
 		reviewEvents := *config.ReviewEvents
 		cloned.ReviewEvents = &reviewEvents
@@ -1574,6 +1607,14 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			if configs.Reviewer.Behavior.Loop != nil {
 				loop := *configs.Reviewer.Behavior.Loop
 				behavior.Loop = &loop
+			}
+			if configs.Reviewer.Behavior.Retry != nil {
+				retry := *configs.Reviewer.Behavior.Retry
+				if configs.Reviewer.Behavior.Retry.ExtraTransientErrorPatterns != nil {
+					patterns := append([]string(nil), (*configs.Reviewer.Behavior.Retry.ExtraTransientErrorPatterns)...)
+					retry.ExtraTransientErrorPatterns = &patterns
+				}
+				behavior.Retry = &retry
 			}
 			if configs.Reviewer.Behavior.ReviewEvents != nil {
 				reviewEvents := *configs.Reviewer.Behavior.ReviewEvents

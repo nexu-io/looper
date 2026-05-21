@@ -338,12 +338,21 @@ type ReviewerLoopConfig struct {
 
 type ReviewerConfig struct {
 	Loop                    ReviewerLoopConfig             `json:"loop"`
+	Retry                   ReviewerRetryConfig            `json:"retry"`
 	Scope                   ReviewerScope                  `json:"scope"`
 	PublishMode             ReviewerPublishMode            `json:"publishMode"`
 	ReviewEvents            ReviewerReviewEventsConfig     `json:"reviewEvents"`
 	DetectDuplicateFindings bool                           `json:"detectDuplicateFindings"`
 	NativeResume            ReviewerNativeResumeConfig     `json:"nativeResume"`
 	ThreadResolution        ReviewerThreadResolutionConfig `json:"threadResolution"`
+}
+
+type ReviewerRetryConfig struct {
+	EnhancedTransientClassification bool     `json:"enhancedTransientClassification"`
+	ExtraTransientErrorPatterns     []string `json:"extraTransientErrorPatterns"`
+	RecoverExistingMatchedFailures  bool     `json:"recoverExistingMatchedFailures"`
+	AutoRecoveryMaxAttempts         int      `json:"autoRecoveryMaxAttempts"`
+	MaxDelayMS                      int      `json:"maxDelayMs"`
 }
 
 type ReviewerReviewEventsConfig struct {
@@ -803,6 +812,7 @@ type PartialReviewerLoopConfig struct {
 
 type PartialReviewerConfig struct {
 	Loop                    *PartialReviewerLoopConfig             `json:"loop,omitempty"`
+	Retry                   *PartialReviewerRetryConfig            `json:"retry,omitempty"`
 	Scope                   *ReviewerScope                         `json:"scope,omitempty"`
 	PublishMode             *ReviewerPublishMode                   `json:"publishMode,omitempty"`
 	ReviewEvents            *PartialReviewerReviewEventsConfig     `json:"reviewEvents,omitempty"`
@@ -810,6 +820,14 @@ type PartialReviewerConfig struct {
 	DedupeFindings          *bool                                  `json:"dedupeFindings,omitempty"`
 	NativeResume            *PartialReviewerNativeResumeConfig     `json:"nativeResume,omitempty"`
 	ThreadResolution        *PartialReviewerThreadResolutionConfig `json:"threadResolution,omitempty"`
+}
+
+type PartialReviewerRetryConfig struct {
+	EnhancedTransientClassification *bool     `json:"enhancedTransientClassification,omitempty"`
+	ExtraTransientErrorPatterns     *[]string `json:"extraTransientErrorPatterns,omitempty"`
+	RecoverExistingMatchedFailures  *bool     `json:"recoverExistingMatchedFailures,omitempty"`
+	AutoRecoveryMaxAttempts         *int      `json:"autoRecoveryMaxAttempts,omitempty"`
+	MaxDelayMS                      *int      `json:"maxDelayMs,omitempty"`
 }
 
 type PartialReviewerReviewEventsConfig struct {

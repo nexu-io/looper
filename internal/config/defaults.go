@@ -8,6 +8,11 @@ import (
 
 const DefaultServerPort = 17310
 
+const (
+	DefaultReviewerAutoRecoveryMaxAttempts = 3
+	DefaultReviewerRetryMaxDelayMS         = 60000
+)
+
 func DefaultLooperHome() (string, error) {
 	homeDir := os.Getenv("HOME")
 	if homeDir == "" {
@@ -229,6 +234,7 @@ func DefaultConfig(cwd string) (Config, error) {
 						StopOnReadyLabel:          true,
 						StopOnIdenticalOutput:     true,
 					},
+					Retry:                   DefaultReviewerRetryConfig(),
 					Scope:                   ReviewerScopeChangedRanges,
 					PublishMode:             ReviewerPublishModeSingleReview,
 					ReviewEvents:            ReviewerReviewEventsConfig{Clean: ReviewerReviewEventApprove, Blocking: ReviewerReviewEventRequestChanges},
@@ -319,6 +325,16 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil
+}
+
+func DefaultReviewerRetryConfig() ReviewerRetryConfig {
+	return ReviewerRetryConfig{
+		EnhancedTransientClassification: false,
+		ExtraTransientErrorPatterns:     []string{},
+		RecoverExistingMatchedFailures:  false,
+		AutoRecoveryMaxAttempts:         DefaultReviewerAutoRecoveryMaxAttempts,
+		MaxDelayMS:                      DefaultReviewerRetryMaxDelayMS,
+	}
 }
 
 func DefaultDisclosureConfig() DisclosureConfig {

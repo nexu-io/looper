@@ -1272,12 +1272,14 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
 			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
+			retry:            config.NormalizeReviewerRetryConfig(r.config.Roles.Reviewer.Behavior.Retry),
 		}
 		if reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
 		}
 		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
-			recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO)
+			failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
+			recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
 			if err != nil {
 				return RecoverySummary{}, err
 			}
@@ -1475,6 +1477,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
 			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
+			retry:            config.NormalizeReviewerRetryConfig(r.config.Roles.Reviewer.Behavior.Retry),
 		}
 		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
@@ -1499,7 +1502,8 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		if currentLoop == nil || !shouldAutoRecoverFailedReviewerLoop(*currentLoop, latestRun, latestQueue, policy) {
 			continue
 		}
-		recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO)
+		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
+		recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
 		if err != nil {
 			return requeued, err
 		}
@@ -1992,8 +1996,6 @@ func createEmptyRecoverySummary() RecoverySummary {
 	}
 }
 
-const maxReviewerAutoRecoveryAttempts = 3
-
 type runtimeReviewerCheckpoint struct {
 	ResumePolicy string `json:"resumePolicy,omitempty"`
 	Detail       *struct {
@@ -2012,6 +2014,7 @@ type runtimeReviewerRecoveryPolicy struct {
 	stopOnApproved   bool
 	stopOnReadyLabel bool
 	currentLogin     string
+	retry            config.ReviewerRetryConfig
 }
 
 func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, loop storage.LoopRecord, latestRun *storage.RunRecord, policy runtimeReviewerRecoveryPolicy) (string, bool) {
@@ -2075,7 +2078,8 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if reason, _ := runtimeStringFromAny(loopMeta["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
 		return false
 	}
-	if runtimeIntFromAny(loopMeta["autoRecoveryAttempts"]) >= maxReviewerAutoRecoveryAttempts {
+	policy.retry = config.NormalizeReviewerRetryConfig(policy.retry)
+	if runtimeIntFromAny(loopMeta["autoRecoveryAttempts"]) >= policy.retry.AutoRecoveryMaxAttempts {
 		return false
 	}
 	checkpoint := parseRuntimeReviewerCheckpoint(latestRun.CheckpointJSON)
@@ -2105,11 +2109,11 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 		return false
 	}
 	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), queueMessage)
-	return (queueKind == loops.FailureKindRetryableAfterResume && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review")) || isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
+	return (queueKind == loops.FailureKindRetryableAfterResume && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review")) || isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || runtimeRecoverableEnhancedTransient(policy.retry, *latestQueue, failureSummary) || (isKnownReviewerRediscoveryGuardrail(failureSummary) && isRuntimeReviewerRediscoveryRunStep(latestRun))
 }
 
-func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories *storage.Repositories, loopID string, latestQueue *storage.QueueItemRecord, queuedAt string) (int64, error) {
-	if latestQueue != nil && isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) {
+func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories *storage.Repositories, loopID string, latestQueue *storage.QueueItemRecord, queuedAt string, policy runtimeReviewerRecoveryPolicy, matchedMessage string) (int64, error) {
+	if latestQueue != nil && (isRuntimeRetryableTransientWithRemainingAttempts(*latestQueue) || runtimeRecoverableEnhancedTransient(policy.retry, *latestQueue, matchedMessage)) {
 		return repositories.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, latestQueue.ID, queuedAt, latestQueue.Attempts)
 	}
 	if latestQueue == nil {
@@ -2122,6 +2126,15 @@ func isRuntimeRetryableTransientWithRemainingAttempts(queue storage.QueueItemRec
 	if derefString(queue.LastErrorKind) != "retryable_transient" {
 		return false
 	}
+	return runtimeQueueHasRemainingAttempts(queue)
+}
+
+func runtimeRecoverableEnhancedTransient(policy config.ReviewerRetryConfig, queue storage.QueueItemRecord, message string) bool {
+	policy = config.NormalizeReviewerRetryConfig(policy)
+	return policy.RecoverExistingMatchedFailures && runtimeQueueHasRemainingAttempts(queue) && config.ReviewerRetryMessageMatches(policy, message)
+}
+
+func runtimeQueueHasRemainingAttempts(queue storage.QueueItemRecord) bool {
 	nextAttempts := queue.Attempts + 1
 	return queue.MaxAttempts > 0 && nextAttempts < queue.MaxAttempts
 }

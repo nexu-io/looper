@@ -218,7 +218,7 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 		{name: "follow updates disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", FollowUpdates: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "legacy budget termination metadata", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", TerminationReason: "max_wall_clock"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
-		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: maxReviewerAutoRecoveryAttempts}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: config.DefaultReviewerAutoRecoveryMaxAttempts}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -237,6 +237,65 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReviewerFailedLoopRecoveryEnhancedTransientIsOptIn(t *testing.T) {
+	t.Parallel()
+	message := `Post "https://api.github.com/graphql": EOF`
+	pr := PullRequestSummary{Number: 42, State: "OPEN"}
+
+	t.Run("default remains non recoverable", func(t *testing.T) {
+		t.Parallel()
+		fixture := newRunnerFixture(t)
+		loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
+		runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+		loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+		eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, pr)
+		if err != nil {
+			t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+		}
+		if eligible || reason != "not_whitelisted" {
+			t.Fatalf("eligible=%v reason=%q, want not_whitelisted", eligible, reason)
+		}
+	})
+
+	t.Run("enabled recovers and preserves attempt count", func(t *testing.T) {
+		t.Parallel()
+		fixture := newRunnerFixture(t)
+		loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
+		runner := New(Options{
+			DB:            fixture.coordinator.DB(),
+			Repos:         fixture.repos,
+			GitHub:        &fakeGitHubGateway{},
+			Git:           &fakeGitGateway{},
+			AgentExecutor: &fakeAgentExecutor{},
+			Logger:        fixture.logger,
+			Now:           fixture.now,
+			LoopConfig:    config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+			RetryPolicy: config.ReviewerRetryConfig{
+				EnhancedTransientClassification: true,
+				RecoverExistingMatchedFailures:  true,
+			},
+		})
+		loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+		eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, pr)
+		if err != nil {
+			t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+		}
+		if !eligible || reason != "enhanced_transient_match_attempts_remaining" {
+			t.Fatalf("eligible=%v reason=%q, want enhanced transient recovery", eligible, reason)
+		}
+		if _, err := runner.recoverFailedReviewerLoop(context.Background(), *loop, pr); err != nil {
+			t.Fatalf("recoverFailedReviewerLoop() error = %v", err)
+		}
+		queue, err := fixture.repos.Queue.GetByID(context.Background(), queueID)
+		if err != nil || queue == nil {
+			t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
+		}
+		if queue.Status != "queued" || queue.Attempts != 1 || queue.LastError != nil || queue.LastErrorKind != nil {
+			t.Fatalf("queue = %#v, want requeued with original attempts and cleared error", queue)
+		}
+	})
 }
 
 func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
@@ -276,7 +335,7 @@ func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForLocalBlockers(
 		wantReason string
 	}{
 		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, wantReason: "loop_disabled"},
-		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: maxReviewerAutoRecoveryAttempts}, wantReason: "auto_recovery_attempt_cap"},
+		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: config.DefaultReviewerAutoRecoveryMaxAttempts}, wantReason: "auto_recovery_attempt_cap"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -5509,6 +5568,37 @@ func TestIsTransientExternalFailureDetectsWrappedGitHubStatus(t *testing.T) {
 	}
 }
 
+func TestEnhancedTransientClassificationIsOptIn(t *testing.T) {
+	err := &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: `Post "https://api.github.com/graphql": EOF`}}
+
+	defaultRunner := New(Options{})
+	if got := defaultRunner.classifyFailure(err); got.kind != FailureNonRetryable {
+		t.Fatalf("default classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	}
+	if defaultRunner.isTransientExternalFailure(err) {
+		t.Fatal("default isTransientExternalFailure() = true, want false")
+	}
+
+	enabledRunner := New(Options{RetryPolicy: config.ReviewerRetryConfig{EnhancedTransientClassification: true}})
+	if got := enabledRunner.classifyFailure(err); got.kind != FailureRetryableTransient {
+		t.Fatalf("enabled classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	}
+	if !enabledRunner.isTransientExternalFailure(err) {
+		t.Fatal("enabled isTransientExternalFailure() = false, want true")
+	}
+}
+
+func TestEnhancedTransientClassificationHonorsExtraPatterns(t *testing.T) {
+	err := fmt.Errorf("custom provider temporarily unavailable")
+	runner := New(Options{RetryPolicy: config.ReviewerRetryConfig{
+		EnhancedTransientClassification: true,
+		ExtraTransientErrorPatterns:     []string{"temporarily unavailable"},
+	}})
+	if got := runner.classifyFailure(err); got.kind != FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	}
+}
+
 func TestIsTransientExternalFailureDetectsModelProviderHTTPAndNetworkFailures(t *testing.T) {
 	runner := New(Options{})
 	for _, message := range []string{
@@ -5526,14 +5616,17 @@ func TestIsTransientExternalFailureDetectsModelProviderHTTPAndNetworkFailures(t 
 }
 
 func TestRetryDelayHonorsRetryAfterAndCapsBackoff(t *testing.T) {
-	if got := retryDelay(time.Second, 1, fmt.Errorf("anthropic overloaded; retry-after: 7")); got != 7*time.Second {
+	if got := retryDelay(time.Second, 1, fmt.Errorf("anthropic overloaded; retry-after: 7"), maxRetryDelay); got != 7*time.Second {
 		t.Fatalf("retryDelay(retry-after) = %v, want 7s", got)
 	}
-	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120")); got != maxRetryDelay {
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), maxRetryDelay); got != maxRetryDelay {
 		t.Fatalf("retryDelay(capped retry-after) = %v, want %v", got, maxRetryDelay)
 	}
-	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded")); got != maxRetryDelay {
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded"), maxRetryDelay); got != maxRetryDelay {
 		t.Fatalf("retryDelay(capped exponential) = %v, want %v", got, maxRetryDelay)
+	}
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), 10*time.Second); got != 10*time.Second {
+		t.Fatalf("retryDelay(custom capped retry-after) = %v, want 10s", got)
 	}
 }
 
@@ -5542,7 +5635,7 @@ func TestRetryDelayAddsBoundedJitter(t *testing.T) {
 	wantMin := 2 * base
 	wantMax := wantMin + wantMin/retryJitterDivisor
 	for i := 0; i < 20; i++ {
-		got := retryDelay(base, 2, fmt.Errorf("anthropic overloaded"))
+		got := retryDelay(base, 2, fmt.Errorf("anthropic overloaded"), maxRetryDelay)
 		if got < wantMin || got > wantMax {
 			t.Fatalf("retryDelay(jittered) = %v, want between %v and %v", got, wantMin, wantMax)
 		}

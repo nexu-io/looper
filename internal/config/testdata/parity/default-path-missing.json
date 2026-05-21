@@ -212,6 +212,13 @@
               "stopOnReadyLabel": true,
               "stopOnIdenticalOutput": true
             },
+            "retry": {
+              "enhancedTransientClassification": false,
+              "extraTransientErrorPatterns": [],
+              "recoverExistingMatchedFailures": false,
+              "autoRecoveryMaxAttempts": 3,
+              "maxDelayMs": 60000
+            },
             "scope": "changed_ranges",
             "publishMode": "single_review",
             "reviewEvents": {

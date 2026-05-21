@@ -244,6 +244,9 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventRequestChanges {
 		t.Fatalf("reviewer blocking review event default = %q, want %q", got, ReviewerReviewEventRequestChanges)
 	}
+	if got := cfg.Roles.Reviewer.Behavior.Retry; got.EnhancedTransientClassification || got.RecoverExistingMatchedFailures || len(got.ExtraTransientErrorPatterns) != 0 || got.AutoRecoveryMaxAttempts != DefaultReviewerAutoRecoveryMaxAttempts || got.MaxDelayMS != DefaultReviewerRetryMaxDelayMS {
+		t.Fatalf("reviewer retry defaults = %#v", got)
+	}
 	if got := reviewerEnableSelfReviewValue(t, cfg.Roles.Reviewer.Discovery.Triggers); got {
 		t.Fatalf("reviewer enableSelfReview default = %v, want false", got)
 	}
@@ -284,6 +287,71 @@ func TestAgentTimeoutConfigOverrides(t *testing.T) {
 	got := loaded.Config.Agent.Timeouts
 	if got.PlannerSeconds != 1200 || got.PlannerMaxRuntimeSeconds != 1200 || got.WorkerSeconds != 4200 || got.WorkerMaxRuntimeSeconds != 4200 || got.ReviewerSeconds != 2100 || got.ReviewerMaxRuntimeSeconds != 2100 || got.FixerSeconds != 1800 || got.FixerMaxRuntimeSeconds != 1800 {
 		t.Fatalf("agent timeouts = %#v", got)
+	}
+}
+
+func TestNormalizeMergesReviewerRetryConfig(t *testing.T) {
+	patterns := []string{"  custom EOF  ", "custom EOF", "Connection closed by"}
+	cfg, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Behavior: &PartialReviewerConfig{Retry: &PartialReviewerRetryConfig{
+		EnhancedTransientClassification: boolPtr(true),
+		ExtraTransientErrorPatterns:     &patterns,
+		RecoverExistingMatchedFailures:  boolPtr(true),
+		AutoRecoveryMaxAttempts:         intPtr(7),
+		MaxDelayMS:                      intPtr(15000),
+	}}}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	got := cfg.Roles.Reviewer.Behavior.Retry
+	if !got.EnhancedTransientClassification || !got.RecoverExistingMatchedFailures || got.AutoRecoveryMaxAttempts != 7 || got.MaxDelayMS != 15000 {
+		t.Fatalf("reviewer retry config = %#v", got)
+	}
+	if !reflectStringSlicesEqual(got.ExtraTransientErrorPatterns, []string{"custom EOF", "Connection closed by"}) {
+		t.Fatalf("extra transient patterns = %#v", got.ExtraTransientErrorPatterns)
+	}
+}
+
+func TestReviewerRetryMessageMatchesOnlyWhenEnhancedClassificationEnabled(t *testing.T) {
+	policy := ReviewerRetryConfig{EnhancedTransientClassification: false}
+	message := `Post "https://api.github.com/graphql": EOF`
+	if ReviewerRetryMessageMatches(policy, message) {
+		t.Fatal("ReviewerRetryMessageMatches(default) = true, want false")
+	}
+	policy.EnhancedTransientClassification = true
+	if !ReviewerRetryMessageMatches(policy, message) {
+		t.Fatal("ReviewerRetryMessageMatches(enabled GraphQL EOF) = false, want true")
+	}
+	custom := ReviewerRetryConfig{EnhancedTransientClassification: true, ExtraTransientErrorPatterns: []string{"provider temporarily unavailable"}}
+	if !ReviewerRetryMessageMatches(custom, "custom provider temporarily unavailable") {
+		t.Fatal("ReviewerRetryMessageMatches(extra pattern) = false, want true")
+	}
+}
+
+func TestValidateRejectsInvalidReviewerRetryConfig(t *testing.T) {
+	cfg, err := Normalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Retry.AutoRecoveryMaxAttempts = 0
+	cfg.Roles.Reviewer.Behavior.Retry.MaxDelayMS = 0
+	cfg.Roles.Reviewer.Behavior.Retry.ExtraTransientErrorPatterns = []string{" "}
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want ConfigValidationError")
+	}
+	validationErr := &ConfigValidationError{}
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %T, want ConfigValidationError", err)
+	}
+	for _, path := range []string{
+		"roles.reviewer.behavior.retry.autoRecoveryMaxAttempts",
+		"roles.reviewer.behavior.retry.maxDelayMs",
+		"roles.reviewer.behavior.retry.extraTransientErrorPatterns[0]",
+	} {
+		if !validationIssuesContainPath(validationErr.Issues, path) {
+			t.Fatalf("validation issues = %#v, missing %s", validationErr.Issues, path)
+		}
 	}
 }
 
@@ -3647,4 +3715,13 @@ func intPtr(value int) *int {
 
 func labelModePtr(value LabelMode) *LabelMode {
 	return &value
+}
+
+func validationIssuesContainPath(issues []ValidationIssue, path string) bool {
+	for _, issue := range issues {
+		if issue.Path == path {
+			return true
+		}
+	}
+	return false
 }

@@ -2304,6 +2304,34 @@ func TestShouldAutoRecoverFailedReviewerLoopAllowsRetryableTransientWithAttempts
 	}
 }
 
+func TestShouldAutoRecoverFailedReviewerLoopAllowsEnhancedMatchedTransientWhenConfigured(t *testing.T) {
+	t.Parallel()
+	errorKind := "non_retryable"
+	errorMessage := `git fetch origin refs/pull/42/head:refs/remotes/origin/pr-42-head: Connection closed by 198.18.0.96 port 443`
+	step := "review"
+	checkpoint := `{"resumePolicy":"replay_step","detail":{"state":"OPEN","reviewDecision":"","labels":[]}}`
+	loop := storage.LoopRecord{ID: "loop_recover", Type: "reviewer", Status: "failed", MetadataJSON: stringPtr(`{"loop":{"enabled":true,"consecutiveFailures":1}}`)}
+	run := storage.RunRecord{ID: "run_recover", LoopID: "loop_recover", Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage}
+	queue := storage.QueueItemRecord{ID: "queue_recover", LoopID: stringPtr("loop_recover"), Status: "failed", Attempts: 1, MaxAttempts: 5, LastError: &errorMessage, LastErrorKind: &errorKind}
+
+	defaultPolicy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true}
+	if shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, defaultPolicy) {
+		t.Fatal("shouldAutoRecoverFailedReviewerLoop(default) = true, want false")
+	}
+
+	enabledPolicy := runtimeReviewerRecoveryPolicy{stopOnApproved: true, stopOnReadyLabel: true, retry: config.ReviewerRetryConfig{
+		EnhancedTransientClassification: true,
+		RecoverExistingMatchedFailures:  true,
+	}}
+	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, enabledPolicy) {
+		t.Fatal("shouldAutoRecoverFailedReviewerLoop(enabled) = false, want true")
+	}
+	queue.Attempts = 4
+	if shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, enabledPolicy) {
+		t.Fatal("shouldAutoRecoverFailedReviewerLoop(enabled final attempt) = true, want false")
+	}
+}
+
 func TestShouldAutoRecoverFailedReviewerLoopIgnoresApprovalByAnotherUser(t *testing.T) {
 	t.Parallel()
 	errorKind := "retryable_after_resume"

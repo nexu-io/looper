@@ -52,6 +52,31 @@ var configFieldRegistry = map[string]configField{
 	"reviewer.reviewEvents.blocking": reviewerReviewEventField("reviewer.reviewEvents.blocking", "LOOPER_REVIEWER_REVIEW_EVENTS_BLOCKING", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_BLOCKING", "reviewer-blocking-review-event", "roles-reviewer-behavior-review-events-blocking", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Blocking }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Blocking
 	}),
+	"roles.reviewer.behavior.retry.enhancedTransientClassification": boolField("roles.reviewer.behavior.retry.enhancedTransientClassification", "", "", func(c config.Config) any {
+		return c.Roles.Reviewer.Behavior.Retry.EnhancedTransientClassification
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRetry(p).EnhancedTransientClassification
+	}),
+	"roles.reviewer.behavior.retry.extraTransientErrorPatterns": stringListField("roles.reviewer.behavior.retry.extraTransientErrorPatterns", "", func(c config.Config) any {
+		return c.Roles.Reviewer.Behavior.Retry.ExtraTransientErrorPatterns
+	}, func(p *config.PartialConfig) **[]string {
+		return &ensurePartialReviewerRetry(p).ExtraTransientErrorPatterns
+	}),
+	"roles.reviewer.behavior.retry.recoverExistingMatchedFailures": boolField("roles.reviewer.behavior.retry.recoverExistingMatchedFailures", "", "", func(c config.Config) any {
+		return c.Roles.Reviewer.Behavior.Retry.RecoverExistingMatchedFailures
+	}, func(p *config.PartialConfig) **bool {
+		return &ensurePartialReviewerRetry(p).RecoverExistingMatchedFailures
+	}),
+	"roles.reviewer.behavior.retry.autoRecoveryMaxAttempts": positiveIntField("roles.reviewer.behavior.retry.autoRecoveryMaxAttempts", "", "", func(c config.Config) any {
+		return c.Roles.Reviewer.Behavior.Retry.AutoRecoveryMaxAttempts
+	}, func(p *config.PartialConfig) **int {
+		return &ensurePartialReviewerRetry(p).AutoRecoveryMaxAttempts
+	}),
+	"roles.reviewer.behavior.retry.maxDelayMs": positiveIntField("roles.reviewer.behavior.retry.maxDelayMs", "", "", func(c config.Config) any {
+		return c.Roles.Reviewer.Behavior.Retry.MaxDelayMS
+	}, func(p *config.PartialConfig) **int {
+		return &ensurePartialReviewerRetry(p).MaxDelayMS
+	}),
 	"roles.planner.autoDiscovery":      boolField("roles.planner.autoDiscovery", "LOOPER_ROLES_PLANNER_AUTO_DISCOVERY", "", func(c config.Config) any { return c.Roles.Planner.AutoDiscovery }, func(p *config.PartialConfig) **bool { return &ensurePartialPlannerRole(p).AutoDiscovery }),
 	"roles.planner.instructions":       stringField("roles.planner.instructions", "", "", func(c config.Config) any { return c.Roles.Planner.Instructions }, func(p *config.PartialConfig) **string { return &ensurePartialPlannerRole(p).Instructions }),
 	"roles.planner.triggers.labels":    stringListField("roles.planner.triggers.labels", "LOOPER_ROLES_PLANNER_TRIGGERS_LABELS", func(c config.Config) any { return c.Roles.Planner.Triggers.Labels }, func(p *config.PartialConfig) **[]string { return &ensurePartialPlannerTriggers(p).Labels }),
@@ -1375,6 +1400,17 @@ func ensurePartialReviewerReviewEvents(partial *config.PartialConfig) *config.Pa
 	return reviewer.Behavior.ReviewEvents
 }
 
+func ensurePartialReviewerRetry(partial *config.PartialConfig) *config.PartialReviewerRetryConfig {
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.Behavior == nil {
+		reviewer.Behavior = &config.PartialReviewerConfig{}
+	}
+	if reviewer.Behavior.Retry == nil {
+		reviewer.Behavior.Retry = &config.PartialReviewerRetryConfig{}
+	}
+	return reviewer.Behavior.Retry
+}
+
 func ensurePartialInstructions(partial *config.PartialConfig) *config.PartialInstructionsConfig {
 	if partial.Instructions == nil {
 		partial.Instructions = &config.PartialInstructionsConfig{}
@@ -1554,6 +1590,16 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 	case "roles.reviewer.behavior.reviewEvents.blocking", "reviewer.reviewEvents.blocking":
 		return (partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.ReviewEvents != nil && partial.Roles.Reviewer.Behavior.ReviewEvents.Blocking != nil) ||
 			(partial.LegacyReviewer != nil && partial.LegacyReviewer.ReviewEvents != nil && partial.LegacyReviewer.ReviewEvents.Blocking != nil)
+	case "roles.reviewer.behavior.retry.enhancedTransientClassification":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.Retry != nil && partial.Roles.Reviewer.Behavior.Retry.EnhancedTransientClassification != nil
+	case "roles.reviewer.behavior.retry.extraTransientErrorPatterns":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.Retry != nil && partial.Roles.Reviewer.Behavior.Retry.ExtraTransientErrorPatterns != nil
+	case "roles.reviewer.behavior.retry.recoverExistingMatchedFailures":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.Retry != nil && partial.Roles.Reviewer.Behavior.Retry.RecoverExistingMatchedFailures != nil
+	case "roles.reviewer.behavior.retry.autoRecoveryMaxAttempts":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.Retry != nil && partial.Roles.Reviewer.Behavior.Retry.AutoRecoveryMaxAttempts != nil
+	case "roles.reviewer.behavior.retry.maxDelayMs":
+		return partial.Roles != nil && partial.Roles.Reviewer != nil && partial.Roles.Reviewer.Behavior != nil && partial.Roles.Reviewer.Behavior.Retry != nil && partial.Roles.Reviewer.Behavior.Retry.MaxDelayMS != nil
 	case "roles.planner.autoDiscovery":
 		return partial.Roles != nil && partial.Roles.Planner != nil && partial.Roles.Planner.AutoDiscovery != nil
 	case "roles.planner.instructions":
