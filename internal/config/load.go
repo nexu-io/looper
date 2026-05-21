@@ -82,7 +82,7 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	configPath := ""
 	if parsedCLI.hasConfigPath {
 		configPath = parsedCLI.configPath
-	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok {
+	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok && strings.TrimSpace(envConfigPath) != "" {
 		configPath = envConfigPath
 	} else if options.ConfigPath != "" {
 		configPath = options.ConfigPath

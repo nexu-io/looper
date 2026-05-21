@@ -6,10 +6,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
 )
+
+var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 type ValidationIssue struct {
 	Path    string
@@ -148,6 +151,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Daemon.WorkingDirectory == "" {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
+	validateWorktreeCleanupConfig(config.Daemon.WorktreeCleanup, "daemon.worktreeCleanup", &issues)
 
 	if strings.TrimSpace(config.Package.Distribution) == "" {
 		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
@@ -241,14 +245,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".name", Message: "must be a non-empty string"})
 		}
 
-		networkMode := ProjectNetworkModeOff
-		if project.Network != nil && project.Network.Mode != "" {
-			networkMode = project.Network.Mode
-		}
-		if networkMode != ProjectNetworkModeOff && networkMode != ProjectNetworkModeRouted {
-			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: fmt.Sprintf("must be one of: %s, %s", ProjectNetworkModeOff, ProjectNetworkModeRouted)})
-		}
-
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
 		}
@@ -257,6 +253,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if !isValidWebhookModeOrEmpty(project.Webhook.Mode) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
+		}
+		if !isValidNetworkMode(project.Network.Mode) {
+			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: fmt.Sprintf("must be one of: %s, %s", NetworkModeOff, NetworkModeRouted)})
 		}
 		if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, &project) {
 			validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
@@ -279,6 +278,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
+		}
+		if normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
+			validateRoutedProjectPrerequisites(config, effectiveProjectRoles, prefix, &issues)
 		}
 	}
 
@@ -308,6 +310,66 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	return nil
 }
 
+func validateRoutedProjectPrerequisites(config Config, roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if !config.Network.Enrolled {
+		*issues = append(*issues, ValidationIssue{Path: "network.enrolled", Message: fmt.Sprintf("must be true when %s.network.mode is %s; join a Network or set the project back to %s", prefix, NetworkModeRouted, NetworkModeOff)})
+	}
+	parsedLoopernetURL, err := url.Parse(strings.TrimSpace(config.Network.LoopernetBaseURL))
+	if err != nil || parsedLoopernetURL.Scheme == "" || parsedLoopernetURL.Host == "" {
+		*issues = append(*issues, ValidationIssue{Path: "network.loopernetBaseUrl", Message: fmt.Sprintf("must be an absolute URL with a host when %s.network.mode is %s", prefix, NetworkModeRouted)})
+	}
+	if err := validateNetworkNodeName(config.Network.NodeName); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: "network.nodeName", Message: fmt.Sprintf("%v when %s.network.mode is %s", err, prefix, NetworkModeRouted)})
+	}
+	if config.Network.GitHubUserID < 0 {
+		*issues = append(*issues, ValidationIssue{Path: "network.githubUserId", Message: "must be a positive integer when configured"})
+	}
+	if strings.TrimSpace(config.Network.GitHubLogin) == "" {
+		*issues = append(*issues, ValidationIssue{Path: "network.githubLogin", Message: fmt.Sprintf("must be configured when %s.network.mode is %s so routed claims can fall back when numeric GitHub IDs are unavailable", prefix, NetworkModeRouted)})
+	}
+	if roles.Planner.AutoDiscovery {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.planner.autoDiscovery", Message: "must be false for routed projects; planner routed execution is not supported yet"})
+	}
+	if roles.Fixer.AutoDiscovery {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.fixer.autoDiscovery", Message: "must be false for routed projects; fixer routed execution is not supported yet"})
+	}
+}
+
+func isValidNetworkMode(mode NetworkMode) bool {
+	return normalizeNetworkMode(mode) == NetworkModeOff || normalizeNetworkMode(mode) == NetworkModeRouted
+}
+
+func normalizeNetworkMode(mode NetworkMode) NetworkMode {
+	switch strings.TrimSpace(string(mode)) {
+	case "", string(NetworkModeOff):
+		return NetworkModeOff
+	case string(NetworkModeRouted):
+		return NetworkModeRouted
+	default:
+		return mode
+	}
+}
+
+func validateNetworkNodeName(nodeName string) error {
+	trimmed := strings.TrimSpace(nodeName)
+	if trimmed == "" {
+		return fmt.Errorf("must be a non-empty string")
+	}
+	if trimmed != nodeName {
+		return fmt.Errorf("must not contain leading or trailing whitespace")
+	}
+	if strings.Contains(trimmed, ":") {
+		return fmt.Errorf("must not contain ':' so it can form looper:target:<node_name>")
+	}
+	if len(trimmed) > 32 {
+		return fmt.Errorf("must be 32 characters or fewer so it can form looper:target:<node_name>")
+	}
+	if !networkNodeNamePattern.MatchString(trimmed) {
+		return fmt.Errorf("must contain only letters, numbers, '.', '_' or '-' so it can form looper:target:<node_name>")
+	}
+	return nil
+}
+
 func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]ValidationIssue) {
 	if config.ListenPort < 1024 || config.ListenPort > 65535 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".listenPort", Message: "must be an integer between 1024 and 65535 when webhook mode is tunnel"})
@@ -315,6 +377,20 @@ func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]Va
 	parsed, err := url.Parse(config.PublicBaseURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		*issues = append(*issues, ValidationIssue{Path: path + ".publicBaseUrl", Message: "must be a valid https URL with a host when webhook mode is tunnel"})
+	}
+}
+
+func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, issues *[]ValidationIssue) {
+	if strings.TrimSpace(config.Interval) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a non-empty duration string"})
+	} else if duration, err := time.ParseDuration(config.Interval); err != nil || duration <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a positive duration"})
+	}
+	if config.RetentionDays < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must be an integer >= 0"})
+	}
+	if config.MaxPerTick < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
 	}
 }
 
@@ -788,6 +864,16 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 		if config.Dependencies.APIRetryAttempts <= 0 {
 			*issues = append(*issues, ValidationIssue{Path: path + ".dependencies.apiRetryAttempts", Message: "must be a positive integer when dependencies are enabled"})
 		}
+	}
+	if config.MergeWatch.TransientRetries <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.transientRetries", Message: "must be a positive integer"})
+	}
+	if strings.TrimSpace(config.MergeWatch.MaxIndeterminateDuration) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be a non-empty duration string"})
+	} else if duration, err := time.ParseDuration(strings.TrimSpace(config.MergeWatch.MaxIndeterminateDuration)); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be a valid time.Duration string"})
+	} else if duration <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be greater than 0"})
 	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},

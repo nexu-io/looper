@@ -397,6 +397,43 @@ func TestGetBranchProtectionReturnsEmptyOnMissingProtectionFromStdout(t *testing
 	}
 }
 
+func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		args := strings.Join(options.Args, " ")
+		switch call {
+		case 1:
+			if args != "api repos/acme/looper/commits/abc123/check-runs -H Accept: application/vnd.github+json" {
+				t.Fatalf("unexpected gh args: %q", args)
+			}
+			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success"}]}`}, nil
+		case 2:
+			if args != "api repos/acme/looper/commits/abc123/status -H Accept: application/vnd.github+json" {
+				t.Fatalf("unexpected gh args: %q", args)
+			}
+			return shell.Result{Stdout: `{"statuses":[{"context":"legacy-ci","state":"success"},{"context":"legacy-ci","state":"failure"},{"context":"lint","state":"pending"}]}`}, nil
+		default:
+			t.Fatalf("unexpected extra gh call: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	runs, err := gateway.ListPullRequestCheckRuns(context.Background(), PullRequestCheckRunsInput{Repo: "acme/looper", Ref: "abc123"})
+	if err != nil {
+		t.Fatalf("ListPullRequestCheckRuns() error = %v", err)
+	}
+	if len(runs.CheckRuns) != 1 || runs.CheckRuns[0].Name != "unit" {
+		t.Fatalf("CheckRuns = %#v, want decoded check run", runs.CheckRuns)
+	}
+	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
+		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
+	}
+}
+
 func TestGetPullRequestHeadAndAuthorUsesNarrowPRView(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -1429,18 +1466,17 @@ func TestFindAnyIssueNumberSkipsPullRequests(t *testing.T) {
 	}
 }
 
-func TestFindAnyIssueNumberContinuesPastFivePages(t *testing.T) {
+func TestFindAnyIssueNumberChecksLaterPages(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch args {
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=1", "api repos/acme/looper/issues?state=all&per_page=100&page=2", "api repos/acme/looper/issues?state=all&per_page=100&page=3", "api repos/acme/looper/issues?state=all&per_page=100&page=4", "api repos/acme/looper/issues?state=all&per_page=100&page=5":
+		switch got := strings.Join(options.Args, " "); got {
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=1":
 			return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}}]`}, nil
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=6":
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=2":
 			return shell.Result{Stdout: `[{"number":7}]`}, nil
 		default:
-			t.Fatalf("unexpected gh args: %q", args)
+			t.Fatalf("unexpected gh args: %q", got)
 			return shell.Result{}, nil
 		}
 	}
@@ -1450,10 +1486,10 @@ func TestFindAnyIssueNumberContinuesPastFivePages(t *testing.T) {
 		t.Fatalf("FindAnyIssueNumber() error = %v", err)
 	}
 	if issueNumber != 7 {
-		t.Fatalf("FindAnyIssueNumber() = %d, want issue discovered after page five", issueNumber)
+		t.Fatalf("FindAnyIssueNumber() = %d, want issue discovered on later page", issueNumber)
 	}
-	if len(runner.calls) != 6 {
-		t.Fatalf("FindAnyIssueNumber() calls = %d, want six pages probed", len(runner.calls))
+	if len(runner.calls) != 2 {
+		t.Fatalf("FindAnyIssueNumber() calls = %d, want two paged requests", len(runner.calls))
 	}
 }
 

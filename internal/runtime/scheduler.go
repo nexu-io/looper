@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,9 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
@@ -149,6 +153,35 @@ type workerRunCompletedNotificationInput struct {
 	PullRequestURL    string
 }
 
+type coordinatorNetworkGateway struct {
+	statePath string
+	client    *http.Client
+}
+
+func (g coordinatorNetworkGateway) Status(ctx context.Context) (protocol.NodeStatusResponse, error) {
+	api, err := g.api()
+	if err != nil {
+		return protocol.NodeStatusResponse{}, err
+	}
+	return api.Status(ctx)
+}
+
+func (g coordinatorNetworkGateway) RevalidateLease(ctx context.Context, req protocol.CoordinatorLeaseRevalidateRequest) error {
+	api, err := g.api()
+	if err != nil {
+		return err
+	}
+	return api.RevalidateLease(ctx, req)
+}
+
+func (g coordinatorNetworkGateway) api() (*networkclient.Client, error) {
+	state, err := networkclient.LoadState(g.statePath)
+	if err != nil {
+		return nil, err
+	}
+	return networkclient.New(state.URL, state.NodeToken, g.client), nil
+}
+
 type plannerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
@@ -180,6 +213,17 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 
 func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
 	return a.gateway.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: input.Repo, IssueNumber: input.IssueNumber, Assignees: input.Assignees, CWD: input.CWD})
+}
+
+func networkPolicyUsers(users []githubinfra.GitHubUser) []networkpolicy.GitHubUser {
+	if users == nil {
+		return nil
+	}
+	converted := make([]networkpolicy.GitHubUser, 0, len(users))
+	for _, user := range users {
+		converted = append(converted, networkpolicy.GitHubUser{Login: user.Login, ID: user.ID})
+	}
+	return converted
 }
 
 func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input planner.ListOpenPullRequestsInput) ([]planner.PullRequestSummary, error) {
@@ -289,7 +333,7 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 	}
 	result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, Reviews: pr.Reviews})
+		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(pr.ReviewRequestUsers), Reviews: pr.Reviews})
 	}
 	return result, nil
 }
@@ -303,7 +347,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
-	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
+	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
@@ -681,7 +725,7 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 	}
 	result := make([]worker.IssueSummary, 0, len(issues))
 	for _, issue := range issues {
-		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
+		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
 	}
 	return result, nil
 }
@@ -699,7 +743,7 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 	if err != nil {
 		return worker.PullRequestDetail{}, err
 	}
-	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, ReviewRequests: detail.ReviewRequests}, nil
+	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers)}, nil
 }
 
 func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
@@ -707,7 +751,7 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 	if err != nil {
 		return worker.IssueDetail{}, err
 	}
-	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, State: issue.State, IsPullRequest: issue.IsPullRequest}, nil
+	return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, State: issue.State, IsPullRequest: issue.IsPullRequest, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels}, nil
 }
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
@@ -992,11 +1036,12 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 	})
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
-		Repos:  repos,
-		GitHub: githubGateway,
-		Config: &cfg,
-		Logger: logger,
-		Now:    now,
+		Repos:   repos,
+		GitHub:  githubGateway,
+		Config:  &cfg,
+		Logger:  logger,
+		Now:     now,
+		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
 		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
 			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
@@ -1096,6 +1141,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		Disclosure:          &cfg.Disclosure,
 		AgentRuntime:        agentRuntime,
 		CustomInstructions:  &cfg,
+		Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
 		AgentModel:          cfg.Agent.Model,
 		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,

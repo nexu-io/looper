@@ -14,23 +14,35 @@ const (
 	DefaultLeaseName   = "coordinator"
 	DefaultLeaseTTL    = 30 * time.Second
 	MinimumDaemonField = "daemonVersion"
+	TargetLabelPrefix  = "looper:target:"
 )
 
-var nodeNamePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$`)
+var nodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,32}$`)
 
 type GitHubIdentity struct {
 	NumericID int64  `json:"numericId"`
 	Login     string `json:"login,omitempty"`
 }
 
+type ReviewerProjectCapability struct {
+	ProjectID            string   `json:"projectId"`
+	IncludeDrafts        bool     `json:"includeDrafts"`
+	RequireReviewRequest *bool    `json:"requireReviewRequest,omitempty"`
+	EnableSelfReview     bool     `json:"enableSelfReview"`
+	Labels               []string `json:"labels,omitempty"`
+	LabelMode            string   `json:"labelMode,omitempty"`
+}
+
 type NodeCapabilities struct {
-	Roles               []string `json:"roles,omitempty"`
-	CoordinatorEligible bool     `json:"coordinatorEligible"`
-	RoutedProjects      int      `json:"routedProjects"`
-	LocalProjects       int      `json:"localProjects"`
-	DynamicLoad         int      `json:"dynamicLoad"`
-	IdentityDrift       bool     `json:"identityDrift"`
-	DriftReason         string   `json:"driftReason,omitempty"`
+	Roles               []string                    `json:"roles,omitempty"`
+	CoordinatorEligible bool                        `json:"coordinatorEligible"`
+	RoutedProjects      int                         `json:"routedProjects"`
+	RoutedProjectIDs    []string                    `json:"routedProjectIds,omitempty"`
+	ReviewerProjects    []ReviewerProjectCapability `json:"reviewerProjects,omitempty"`
+	LocalProjects       int                         `json:"localProjects"`
+	DynamicLoad         int                         `json:"dynamicLoad"`
+	IdentityDrift       bool                        `json:"identityDrift"`
+	DriftReason         string                      `json:"driftReason,omitempty"`
 }
 
 type AuditEnvelope struct {
@@ -92,6 +104,15 @@ type CoordinatorLease struct {
 	ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
 }
 
+type WebhookHealth struct {
+	DeliveriesReceived int        `json:"deliveriesReceived"`
+	LastDeliveryAt     *time.Time `json:"lastDeliveryAt,omitempty"`
+	LastDeliveryID     string     `json:"lastDeliveryId,omitempty"`
+	LastEvent          string     `json:"lastEvent,omitempty"`
+	LastRepo           string     `json:"lastRepo,omitempty"`
+	EventSubscribers   int        `json:"eventSubscribers"`
+}
+
 type CoordinatorLeaseAcquireRequest struct {
 	TTLSeconds int `json:"ttlSeconds,omitempty"`
 }
@@ -117,13 +138,16 @@ type StatusResponse struct {
 	NetworkID   string           `json:"networkId"`
 	Lease       CoordinatorLease `json:"lease"`
 	Memberships []Membership     `json:"memberships"`
+	Webhook     WebhookHealth    `json:"webhook"`
 	Warnings    []string         `json:"warnings,omitempty"`
 }
 
 type NodeStatusResponse struct {
 	NetworkID           string           `json:"networkId"`
 	Membership          Membership       `json:"membership"`
+	Memberships         []Membership     `json:"memberships,omitempty"`
 	Lease               CoordinatorLease `json:"lease"`
+	Webhook             WebhookHealth    `json:"webhook"`
 	Warnings            []string         `json:"warnings,omitempty"`
 	CloudReachable      bool             `json:"cloudReachable"`
 	CurrentGitHub       GitHubIdentity   `json:"currentGithub"`
@@ -132,7 +156,80 @@ type NodeStatusResponse struct {
 }
 
 func TargetLabelForNode(nodeName string) string {
-	return "looper:target:" + strings.TrimSpace(nodeName)
+	return TargetLabelPrefix + strings.TrimSpace(nodeName)
+}
+
+type ExactTargetPlan struct {
+	DesiredLabel string   `json:"desiredLabel,omitempty"`
+	Current      []string `json:"current,omitempty"`
+	Add          []string `json:"add,omitempty"`
+	Remove       []string `json:"remove,omitempty"`
+}
+
+func ParseTargetLabel(label string) (string, bool) {
+	trimmed := strings.TrimSpace(label)
+	if !strings.HasPrefix(trimmed, TargetLabelPrefix) {
+		return "", false
+	}
+	nodeName := strings.TrimSpace(strings.TrimPrefix(trimmed, TargetLabelPrefix))
+	if err := ValidateNodeName(nodeName); err != nil {
+		return "", false
+	}
+	return nodeName, true
+}
+
+func CollectTargetLabels(labels []string) []string {
+	result := make([]string, 0, 1)
+	for _, label := range labels {
+		if _, ok := ParseTargetLabel(label); ok {
+			result = append(result, strings.TrimSpace(label))
+		}
+	}
+	return result
+}
+
+func CollectTargetLikeLabels(labels []string) []string {
+	result := make([]string, 0, 1)
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		if strings.HasPrefix(strings.ToLower(trimmed), strings.ToLower(TargetLabelPrefix)) {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func PlanExactTarget(labels []string, nodeName string) (ExactTargetPlan, error) {
+	if err := ValidateNodeName(nodeName); err != nil {
+		return ExactTargetPlan{}, err
+	}
+	desired := TargetLabelForNode(nodeName)
+	plan := ExactTargetPlan{DesiredLabel: desired, Current: CollectTargetLikeLabels(labels)}
+	for _, label := range plan.Current {
+		if label != desired {
+			plan.Remove = append(plan.Remove, label)
+		}
+	}
+	if !containsExact(plan.Current, desired) {
+		plan.Add = append(plan.Add, desired)
+	}
+	return plan, nil
+}
+
+func HasExactTarget(labels []string, nodeName string) bool {
+	if err := ValidateNodeName(nodeName); err != nil {
+		return false
+	}
+	return containsExact(CollectTargetLabels(labels), TargetLabelForNode(nodeName))
+}
+
+func containsExact(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func ValidateNodeName(value string) error {
@@ -142,6 +239,9 @@ func ValidateNodeName(value string) error {
 	}
 	if trimmed != value {
 		return fmt.Errorf("node name %q must not include leading or trailing whitespace", value)
+	}
+	if strings.Contains(trimmed, ":") {
+		return fmt.Errorf("node name %q must not contain ':'", value)
 	}
 	if !nodeNamePattern.MatchString(trimmed) {
 		return fmt.Errorf("node name %q must match %s", value, nodeNamePattern.String())

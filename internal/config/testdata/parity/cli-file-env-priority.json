@@ -103,6 +103,12 @@
         "mode": "gh-forward",
         "publicBaseUrl": ""
       },
+      "network": {
+        "enrolled": false,
+        "githubLogin": "",
+        "loopernetBaseUrl": "",
+        "nodeName": ""
+      },
       "agent": {
         "vendor": "opencode",
         "params": {
@@ -174,9 +180,11 @@
         },
         "worktreeCleanup": {
           "enabled": false,
-          "dryRun": false,
-          "intervalSeconds": 3600,
-          "maxPerTick": 10
+          "interval": "24h",
+          "retentionDays": 7,
+          "maxPerTick": 10,
+          "includeOrphans": false,
+          "dryRun": true
         }
       },
       "package": {
@@ -214,6 +222,10 @@
             "enabled": false,
             "apiTimeoutSeconds": 10,
             "apiRetryAttempts": 3
+          },
+          "mergeWatch": {
+            "maxIndeterminateDuration": "15m",
+            "transientRetries": 3
           },
           "dispatch": {
             "mode": "human-gated",
@@ -411,6 +423,9 @@
         {
           "id": "demo",
           "name": "Demo",
+          "network": {
+            "mode": "off"
+          },
           "repoPath": "__TMP__/repo",
           "webhook": {}
         }

@@ -76,6 +76,65 @@ func TestFakeGHPRViewSupportsCreatedAtAndClosedAt(t *testing.T) {
 	}
 }
 
+func TestFakeGHMergeClosesLinkedIssueRouteForEnterpriseRepo(t *testing.T) {
+	bins := MustBinaries(t)
+	gh := NewFakeGH(t, bins, GHSchema{JSONFieldAllowlist: map[string][]string{}})
+	gh.WriteState(t, GHState{
+		Routes: map[string]any{
+			"repos/acme/looper/issues/1": json.RawMessage(`{"number":1,"state":"open","state_reason":""}`),
+		},
+		PullRequests: map[string]GHPullRequest{
+			"github.example.com/acme/looper#42": {
+				Number:      42,
+				Repo:        "github.example.com/acme/looper",
+				Body:        "Implements feature.\n\nCloses #1",
+				State:       "OPEN",
+				HeadSHA:     "abc123",
+				BaseSHA:     "base123",
+				HeadRefName: "feature/worker-pr",
+				BaseRefName: "main",
+			},
+		},
+	})
+	cmd := exec.Command(gh.Path, "pr", "merge", "42", "--repo", "github.example.com/acme/looper", "--squash")
+	cmd.Env = append(os.Environ(), flattenEnv(gh.EnvMap())...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run fake gh merge: %v\n%s", err, string(output))
+	}
+	payload, err := os.ReadFile(gh.StatePath)
+	if err != nil {
+		t.Fatalf("read fake gh state: %v", err)
+	}
+	var state GHState
+	if err := json.Unmarshal(payload, &state); err != nil {
+		t.Fatalf("decode fake gh state: %v", err)
+	}
+	route, ok := state.Routes["repos/acme/looper/issues/1"]
+	if !ok {
+		t.Fatal("missing normalized issue route after merge")
+	}
+	routeJSON, err := json.Marshal(route)
+	if err != nil {
+		t.Fatalf("marshal issue route: %v", err)
+	}
+	if !strings.Contains(string(routeJSON), `"state":"closed"`) {
+		t.Fatalf("issue route = %s, want closed state", string(routeJSON))
+	}
+	if !strings.Contains(string(routeJSON), `"state_reason":"completed"`) {
+		t.Fatalf("issue route = %s, want completed state_reason", string(routeJSON))
+	}
+	pr := state.PullRequests["github.example.com/acme/looper#42"]
+	if pr.State != "MERGED" {
+		t.Fatalf("pull request state = %q, want MERGED", pr.State)
+	}
+	if pr.MergedAt == "" {
+		t.Fatal("pull request mergedAt is empty, want merge timestamp")
+	}
+	if pr.ClosedAt == "" {
+		t.Fatal("pull request closedAt is empty, want close timestamp")
+	}
+}
+
 func flattenEnv(env map[string]string) []string {
 	items := make([]string, 0, len(env))
 	for key, value := range env {

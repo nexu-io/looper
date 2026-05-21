@@ -233,6 +233,10 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		mergeWebhookConfig(&config.Webhook, *partial.Webhook)
 	}
 
+	if partial.Network != nil {
+		mergeNetworkConfig(&config.Network, *partial.Network)
+	}
+
 	if partial.Agent != nil {
 		mergeAgentConfig(&config.Agent, *partial.Agent)
 	}
@@ -359,6 +363,24 @@ func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
 
 	if partial.FallbackPollIntervalSeconds != nil {
 		config.FallbackPollIntervalSeconds = *partial.FallbackPollIntervalSeconds
+	}
+}
+
+func mergeNetworkConfig(config *NetworkConfig, partial PartialNetworkConfig) {
+	if partial.Enrolled != nil {
+		config.Enrolled = *partial.Enrolled
+	}
+	if partial.LoopernetBaseURL != nil {
+		config.LoopernetBaseURL = *partial.LoopernetBaseURL
+	}
+	if partial.NodeName != nil {
+		config.NodeName = *partial.NodeName
+	}
+	if partial.GitHubLogin != nil {
+		config.GitHubLogin = *partial.GitHubLogin
+	}
+	if partial.GitHubUserID != nil {
+		config.GitHubUserID = *partial.GitHubUserID
 	}
 }
 
@@ -570,14 +592,20 @@ func mergeWorktreeCleanupConfig(config *WorktreeCleanupConfig, partial PartialWo
 	if partial.Enabled != nil {
 		config.Enabled = *partial.Enabled
 	}
-	if partial.DryRun != nil {
-		config.DryRun = *partial.DryRun
+	if partial.Interval != nil {
+		config.Interval = *partial.Interval
 	}
-	if partial.IntervalSeconds != nil {
-		config.IntervalSeconds = *partial.IntervalSeconds
+	if partial.RetentionDays != nil {
+		config.RetentionDays = *partial.RetentionDays
 	}
 	if partial.MaxPerTick != nil {
 		config.MaxPerTick = *partial.MaxPerTick
+	}
+	if partial.IncludeOrphans != nil {
+		config.IncludeOrphans = *partial.IncludeOrphans
+	}
+	if partial.DryRun != nil {
+		config.DryRun = *partial.DryRun
 	}
 }
 
@@ -790,6 +818,9 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	if partial.Dependencies != nil {
 		mergeCoordinatorDependenciesConfig(&config.Dependencies, *partial.Dependencies)
 	}
+	if partial.MergeWatch != nil {
+		mergeCoordinatorMergeWatchConfig(&config.MergeWatch, *partial.MergeWatch)
+	}
 }
 
 func mergeCoordinatorTriageConfig(config *CoordinatorTriageConfig, partial PartialCoordinatorTriageConfig) {
@@ -861,6 +892,15 @@ func mergeCoordinatorDependenciesConfig(config *CoordinatorDependenciesConfig, p
 	}
 	if partial.APIRetryAttempts != nil {
 		config.APIRetryAttempts = *partial.APIRetryAttempts
+	}
+}
+
+func mergeCoordinatorMergeWatchConfig(config *CoordinatorMergeWatchConfig, partial PartialCoordinatorMergeWatchConfig) {
+	if partial.TransientRetries != nil {
+		config.TransientRetries = *partial.TransientRetries
+	}
+	if partial.MaxIndeterminateDuration != nil {
+		config.MaxIndeterminateDuration = *partial.MaxIndeterminateDuration
 	}
 }
 
@@ -1261,6 +1301,10 @@ func cloneStrings(values []string) []string {
 
 func clonePartialConfig(partial PartialConfig) PartialConfig {
 	cloned := partial
+	if partial.Network != nil {
+		network := *partial.Network
+		cloned.Network = &network
+	}
 	if partial.Defaults != nil {
 		defaults := *partial.Defaults
 		cloned.Defaults = &defaults
@@ -1291,13 +1335,21 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Path:         project.Path,
 			BaseBranch:   cloneStringPtr(project.BaseBranch),
 			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
-			Network:      cloneProjectNetworkConfig(project.Network),
+			Network:      clonePartialProjectNetworkConfig(project.Network),
 			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
 		}
 	}
 	return cloned
+}
+
+func clonePartialProjectNetworkConfig(config *PartialProjectNetworkConfig) *PartialProjectNetworkConfig {
+	if config == nil {
+		return nil
+	}
+	cloned := *config
+	return &cloned
 }
 
 func clonePartialProjectWebhookConfig(config *PartialProjectWebhookConfig) *PartialProjectWebhookConfig {
@@ -1347,10 +1399,11 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 			Name:     project.Name,
 			RepoPath: repoPath,
 			Path:     project.Path,
+			Network:  ProjectNetworkConfig{Mode: NetworkModeOff},
 			Roles:    roles,
 		}
-		if project.Network != nil && project.Network.Mode != "" {
-			cloned[index].Network = cloneProjectNetworkConfig(project.Network)
+		if project.Network != nil && project.Network.Mode != nil {
+			cloned[index].Network.Mode = *project.Network.Mode
 		}
 		if project.Webhook != nil && project.Webhook.Mode != nil {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode

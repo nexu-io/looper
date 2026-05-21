@@ -94,7 +94,7 @@
           },
           "worktreeCleanup": {
             "enabled": false,
-            "dryRun": false,
+            "dryRun": true,
             "lastStatus": "idle",
             "scanned": 0,
             "candidates": 0,
@@ -270,9 +270,11 @@
             "environment": {},
             "worktreeCleanup": {
               "enabled": false,
-              "dryRun": false,
-              "intervalSeconds": 3600,
-              "maxPerTick": 10
+              "interval": "24h",
+              "retentionDays": 7,
+              "maxPerTick": 10,
+              "includeOrphans": false,
+              "dryRun": true
             }
           },
           "package": {
@@ -310,6 +312,10 @@
                 "enabled": false,
                 "apiTimeoutSeconds": 10,
                 "apiRetryAttempts": 3
+              },
+              "mergeWatch": {
+                "maxIndeterminateDuration": "15m",
+                "transientRetries": 3
               },
               "dispatch": {
                 "mode": "human-gated",

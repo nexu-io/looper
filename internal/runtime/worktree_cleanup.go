@@ -53,8 +53,8 @@ func (r *Runtime) startWorktreeCleanupLoop() {
 	if initialDelay == 0 {
 		initialDelay = time.Minute
 	}
-	interval := time.Duration(r.config.Daemon.WorktreeCleanup.IntervalSeconds) * time.Second
-	if interval <= 0 {
+	interval, err := time.ParseDuration(r.config.Daemon.WorktreeCleanup.Interval)
+	if err != nil || interval <= 0 {
 		interval = time.Hour
 	}
 

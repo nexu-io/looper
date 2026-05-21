@@ -191,6 +191,7 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Daemon.WorktreeCleanup.Enabled = true
+	cfg.Daemon.WorktreeCleanup.DryRun = false
 	cfg.Daemon.WorktreeCleanup.MaxPerTick = 10
 	worktreeRoot := filepath.Join(root, "worktrees")
 	repoPath := filepath.Join(root, "repo")

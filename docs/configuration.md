@@ -16,6 +16,28 @@ The daemon lookup order used by the CLI is `~/.looper/bin/looperd`, then `$PATH`
 
 Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The webhook forwarder lock uses OS file locking and is not designed for NFS-style shared filesystems. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
 
+## Network mode summary
+
+Looper has two project-level network modes:
+
+- `projects[].network.mode = "off"` — local-only operation. `looper:target:*` labels are ignored and the classic single-Node assignee/review-request behavior stays unchanged.
+- `projects[].network.mode = "routed"` — multi-Node operation coordinated through `loopernet`.
+
+Authority stays split on purpose:
+
+- GitHub work intent stays on GitHub: `looper:worker-ready` for Worker and GitHub review requests for Reviewer.
+- exactly one `looper:target:<node_name>` label is the exact-Node authority in Routed mode.
+- the `loopernet` lease is a mutation fence for Coordinator only; it does not become the source of truth for work intent.
+
+Operational notes:
+
+- `loopernet` centralizes webhook ingress and Node wakeups, but it must not mutate GitHub on its own.
+- Coordinator writes coarse GitHub authority first, then writes the exact target label last.
+- polling remains enabled as fallback and drift recovery when webhook delivery or SSE wakeups are missed.
+- if you use `looper network join` without `--no-enroll-projects`, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
+
+The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
+
 ## Webhook delivery modes
 
 `webhook.enabled=true` supports two delivery modes:
@@ -293,6 +315,22 @@ reReviewPromptOnHeadChange = false
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
 
+### Reviewer auto-merge settings
+
+Reviewer auto-merge lives under `roles.reviewer.autoMerge.*`:
+
+| Path | Purpose | Default | Valid values | Validation |
+| --- | --- | --- | --- | --- |
+| `roles.reviewer.autoMerge.enabled` | Enables Reviewer's auto-merge opt-in flow for in-scope code PRs | `false` | `true`, `false` | When `true`, project startup fails fast unless the repo allows auto-merge, the configured merge strategy is enabled in repo settings, the repo is known, and GitHub validation is configured |
+| `roles.reviewer.autoMerge.strategy` | Merge strategy passed to `gh pr merge --auto` | `"squash"` | `"squash"`, `"merge"`, `"rebase"` | Config validation rejects any other value; when `enabled=true`, startup also fails fast if the repo disallows the chosen strategy |
+| `roles.reviewer.autoMerge.requireBranchProtection` | Requires base-branch protection with required checks before Reviewer opts in | `true` | `true`, `false` | When `true` and `enabled=true`, startup fails fast unless the default/base branch is known and GitHub reports branch protection with required checks |
+| `roles.reviewer.autoMerge.transientRetries` | Retry budget for transient merge-watch failures | `3` | positive integers | Config validation rejects values less than `1` |
+| `roles.reviewer.autoMerge.scope` | v1 scope guard for which PRs Looper may opt into auto-merge | `"looper-only"` | `"looper-only"` | Config validation rejects any other value; startup validation also rejects unsupported scopes |
+
+Project-level overrides use the same shape under `projects[].roles.reviewer.autoMerge.*`.
+
+When `roles.reviewer.autoMerge.enabled = true`, Looper performs a repo-aware startup validation pass: the project must have a known GitHub repo, GitHub auto-merge must be enabled for that repo, the configured strategy must be allowed, and — if `requireBranchProtection=true` — the effective base branch must exist with required checks enabled.
+
 ## Project override rules
 
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.
@@ -498,6 +536,13 @@ blocking = "REQUEST_CHANGES"
 [roles.reviewer.behavior.nativeResume]
 onHeadChange = false
 reReviewPromptOnHeadChange = false
+
+[roles.reviewer.autoMerge]
+enabled = false
+strategy = "squash"
+requireBranchProtection = true
+transientRetries = 3
+scope = "looper-only"
 
 [roles.fixer.discovery]
 autoDiscovery = true
