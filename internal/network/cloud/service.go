@@ -393,15 +393,15 @@ func (s *Service) NodeStatus(ctx context.Context, nodeToken string) (protocol.No
 	if err != nil {
 		return protocol.NodeStatusResponse{}, err
 	}
+	members, err := s.memberships(ctx)
+	if err != nil {
+		return protocol.NodeStatusResponse{}, err
+	}
 	networkID, err := s.NetworkID(ctx)
 	if err != nil {
 		return protocol.NodeStatusResponse{}, err
 	}
 	lease, err := s.currentLease(ctx)
-	if err != nil {
-		return protocol.NodeStatusResponse{}, err
-	}
-	members, err := s.memberships(ctx)
 	if err != nil {
 		return protocol.NodeStatusResponse{}, err
 	}

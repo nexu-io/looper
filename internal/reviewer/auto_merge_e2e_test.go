@@ -21,6 +21,7 @@ func TestReviewerAutoMergeWaitsForMergeBeforeUnblockingDependentDispatchWithFake
 	bins := harness.MustBinaries(t)
 	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{
 		"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"},
+		"pr list":    {"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"},
 		"pr view":    {"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"},
 	}})
 	for key, value := range fakeGH.EnvMap() {

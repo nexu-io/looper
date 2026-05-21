@@ -203,3 +203,17 @@ func TestManagerAcquiresAndRenewsCoordinatorLeaseForEligibleNode(t *testing.T) {
 	}
 	t.Fatalf("manager status = %#v, want acquired coordinator lease", manager.Status())
 }
+
+func TestReviewerProjectCapabilitiesPreserveRequireReviewRequest(t *testing.T) {
+	t.Parallel()
+	caps := reviewerProjectCapabilities(config.Config{
+		Projects: []config.ProjectRefConfig{{ID: "demo", Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}},
+		Roles:    config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Discovery: config.ReviewerRoleDiscoveryConfig{AutoDiscovery: true, Triggers: config.ReviewerRoleTriggersConfig{RequireReviewRequest: true}}}},
+	})
+	if len(caps) != 1 {
+		t.Fatalf("len(caps) = %d, want 1", len(caps))
+	}
+	if caps[0].RequireReviewRequest == nil || !*caps[0].RequireReviewRequest {
+		t.Fatalf("caps[0].RequireReviewRequest = %v, want true pointer", caps[0].RequireReviewRequest)
+	}
+}

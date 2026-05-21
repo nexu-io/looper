@@ -31,6 +31,24 @@ func TestFromMapNormalizesAgentLifecycleState(t *testing.T) {
 	}
 }
 
+func TestFromMapAcceptsNestedActionSources(t *testing.T) {
+	state, err := FromMap(map[string]any{
+		"branch":    "looper/test",
+		"pr_number": float64(84),
+		"actions": map[string]any{
+			"commit": map[string]any{"source": "agent"},
+			"push":   map[string]any{"source": "fallback"},
+			"pr":     map[string]any{"source": "none"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("FromMap() error = %v", err)
+	}
+	if state.Actions.Commit != ActionSourceAgent || state.Actions.Push != ActionSourceFallback || state.Actions.PR != ActionSourceNone {
+		t.Fatalf("state.Actions = %#v, want nested action sources normalized", state.Actions)
+	}
+}
+
 func TestMergeAgentPreservesFallbackMetadata(t *testing.T) {
 	state := NewState(AgentManagedWithFallbackPolicy("worker", true), "looper/test", "main")
 	state.Actions.PR = ActionSourceFallback
@@ -62,7 +80,7 @@ func TestStateSetActiveBranchMarksAgentMigration(t *testing.T) {
 
 func TestPromptInstructionDocumentsLifecycleContract(t *testing.T) {
 	prompt := PromptInstruction("worker", "looper/test", "main", true, true, config.DefaultDisclosureConfig(), "opencode", "")
-	for _, want := range []string{PolicyAgentManagedWithFallback, "git_pr_lifecycle", "commitShas", "actions {commit,push,pr}", "fallbackAllowed=true"} {
+	for _, want := range []string{PolicyAgentManagedWithFallback, "git_pr_lifecycle", "commitShas", "actions {commit,push,pr}", "plain string source", "fallbackAllowed=true"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("PromptInstruction missing %q in:\n%s", want, prompt)
 		}

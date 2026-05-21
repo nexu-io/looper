@@ -16,9 +16,17 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func coordinatorFakeGHSchema() harness.GHSchema {
+	return harness.GHSchema{JSONFieldAllowlist: map[string][]string{
+		"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"},
+		"pr list":    {"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"},
+		"pr view":    {"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"},
+	}}
+}
+
 func TestCoordinatorHappyPathWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -78,7 +86,7 @@ func TestCoordinatorHappyPathWithFakeGH(t *testing.T) {
 
 func TestCoordinatorHumanDispatchWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -117,7 +125,7 @@ func TestCoordinatorHumanDispatchWithFakeGH(t *testing.T) {
 
 func TestCoordinatorHumanDispatchBlockedByDependencyWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -158,7 +166,7 @@ func TestCoordinatorHumanDispatchBlockedByDependencyWithFakeGH(t *testing.T) {
 
 func TestCoordinatorAutonomousDispatchWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -197,7 +205,7 @@ func TestCoordinatorAutonomousDispatchWithFakeGH(t *testing.T) {
 
 func TestCoordinatorAutonomousDispatchWaitsForBlockedByCompletionWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -258,7 +266,7 @@ func TestCoordinatorAutonomousDispatchWaitsForBlockedByCompletionWithFakeGH(t *t
 
 func TestCoordinatorCycleHandlingWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -302,7 +310,7 @@ func TestCoordinatorCycleHandlingWithFakeGH(t *testing.T) {
 
 func TestCoordinatorNotPlannedRetriageWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
@@ -338,7 +346,7 @@ func TestCoordinatorNotPlannedRetriageWithFakeGH(t *testing.T) {
 
 func TestCoordinatorTieBreakWithFakeGH(t *testing.T) {
 	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{"issue list": {"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}}})
+	fakeGH := harness.NewFakeGH(t, bins, coordinatorFakeGHSchema())
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}

@@ -465,10 +465,10 @@ func TestRunnerRoutedImplementAdmissionAssignsReadyThenExactTargetLast(t *testin
 	}
 
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:worker-bot", "add:looper:worker-ready", "add:looper:target:worker-1"})
-	if len(fixture.network.revalidateCalls) != 2 {
-		t.Fatalf("revalidateCalls = %d, want 2", len(fixture.network.revalidateCalls))
+	if len(fixture.network.revalidateRequests) != 2 {
+		t.Fatalf("revalidateRequests = %d, want 2", len(fixture.network.revalidateRequests))
 	}
-	for _, call := range fixture.network.revalidateCalls {
+	for _, call := range fixture.network.revalidateRequests {
 		if call.Method != "GET" || call.URL != "https://github.com/" || call.FencingToken != 44 {
 			t.Fatalf("revalidate call = %#v, want GET repo host root with token 44", call)
 		}
@@ -1152,30 +1152,6 @@ func newCoordinatorFixture(t *testing.T) coordinatorFixture {
 	return coordinatorFixture{runner: runner, github: github, network: network, cfg: &cfg, projectID: projectID, now: now, coord: coord}
 }
 
-type stubCoordinatorNetwork struct {
-	status          protocol.NodeStatusResponse
-	statusErr       error
-	revalidateErrs  []error
-	revalidateCalls []protocol.CoordinatorLeaseRevalidateRequest
-}
-
-func (s *stubCoordinatorNetwork) Status(context.Context) (protocol.NodeStatusResponse, error) {
-	if s.statusErr != nil {
-		return protocol.NodeStatusResponse{}, s.statusErr
-	}
-	return s.status, nil
-}
-
-func (s *stubCoordinatorNetwork) RevalidateLease(_ context.Context, req protocol.CoordinatorLeaseRevalidateRequest) error {
-	s.revalidateCalls = append(s.revalidateCalls, req)
-	if len(s.revalidateErrs) == 0 {
-		return nil
-	}
-	err := s.revalidateErrs[0]
-	s.revalidateErrs = s.revalidateErrs[1:]
-	return err
-}
-
 func timePtr(value time.Time) *time.Time { return &value }
 
 type stubCoordinatorLLM struct{}
@@ -1225,11 +1201,20 @@ type stubCoordinatorGitHub struct {
 	branchProtection     map[string]githubinfra.BranchProtection
 	failBranchProtection map[string]error
 	addedPRLabels        []githubinfra.PullRequestLabelsInput
+	removedPRLabels      []githubinfra.PullRequestLabelsInput
+	addedReviewers       []githubinfra.PullRequestReviewersInput
 	currentLogin         string
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
 	return append([]githubinfra.IssueSummary(nil), s.issues...), nil
+}
+func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
+	result := make([]githubinfra.PullRequestSummary, 0, len(s.pullRequests))
+	for _, detail := range s.pullRequests {
+		result = append(result, githubinfra.PullRequestSummary{Number: detail.Number, State: detail.State, Labels: append([]string(nil), detail.Labels...), Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), ReviewRequestUsers: append([]githubinfra.GitHubUser(nil), detail.ReviewRequestUsers...), IsDraft: detail.IsDraft})
+	}
+	return result, nil
 }
 func (s *stubCoordinatorGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	return s.details[input.IssueNumber], nil
@@ -1353,9 +1338,19 @@ func (s *stubCoordinatorGitHub) DeleteIssueComment(_ context.Context, input gith
 	s.ops = append(s.ops, "delete-comment")
 	return nil
 }
+func (s *stubCoordinatorGitHub) AddPullRequestReviewers(_ context.Context, input githubinfra.PullRequestReviewersInput) error {
+	s.ops = append(s.ops, "add-reviewers:"+joinLabels(input.Reviewers))
+	s.addedReviewers = append(s.addedReviewers, input)
+	return nil
+}
 func (s *stubCoordinatorGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
 	s.ops = append(s.ops, "add-pr:"+joinLabels(input.Labels))
 	s.addedPRLabels = append(s.addedPRLabels, input)
+	return nil
+}
+func (s *stubCoordinatorGitHub) RemovePullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	s.ops = append(s.ops, "remove-pr:"+joinLabels(input.Labels))
+	s.removedPRLabels = append(s.removedPRLabels, input)
 	return nil
 }
 func (s *stubCoordinatorGitHub) ViewPullRequestMergeWatch(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
@@ -1388,6 +1383,27 @@ func (s *stubCoordinatorGitHub) GetBranchProtection(_ context.Context, input git
 		return githubinfra.BranchProtection{}, nil
 	}
 	return s.branchProtection[input.Branch], nil
+}
+
+type stubCoordinatorNetwork struct {
+	status             protocol.NodeStatusResponse
+	statusErr          error
+	revalidateErrs     []error
+	revalidateRequests []protocol.CoordinatorLeaseRevalidateRequest
+}
+
+func (s *stubCoordinatorNetwork) Status(context.Context) (protocol.NodeStatusResponse, error) {
+	return s.status, s.statusErr
+}
+
+func (s *stubCoordinatorNetwork) RevalidateLease(_ context.Context, req protocol.CoordinatorLeaseRevalidateRequest) error {
+	s.revalidateRequests = append(s.revalidateRequests, req)
+	if len(s.revalidateErrs) == 0 {
+		return nil
+	}
+	err := s.revalidateErrs[0]
+	s.revalidateErrs = s.revalidateErrs[1:]
+	return err
 }
 
 func TestRunnerHumanDispatchBlockedByPostsFailureComment(t *testing.T) {
@@ -1647,6 +1663,281 @@ func TestRunnerMergeWatchBranchProtectionTransientErrorConsumesRetryBudget(t *te
 	}
 	if len(fixture.github.addedPRLabels) != 0 {
 		t.Fatalf("addedPRLabels = %v, want no fixer routing on transient error", fixture.github.addedPRLabels)
+	}
+}
+
+func TestRunnerAssignsReviewerInLocalOnlyMode(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.currentLogin = "reviewer"
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 1 || len(fixture.github.addedReviewers[0].Reviewers) != 1 || fixture.github.addedReviewers[0].Reviewers[0] != "reviewer" {
+		t.Fatalf("addedReviewers = %#v, want local reviewer request", fixture.github.addedReviewers)
+	}
+	if len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("addedPRLabels = %#v, want no routed target label", fixture.github.addedPRLabels)
+	}
+}
+
+func TestRunnerSkipsLocalReviewerAssignmentWithoutReviewRequestWhenRequired(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.github.currentLogin = "reviewer"
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = true
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 0 {
+		t.Fatalf("addedReviewers = %#v, want no reviewer request without explicit review request", fixture.github.addedReviewers)
+	}
+}
+
+func TestRunnerAssignsReviewerAndTargetInRoutedMode(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"add-reviewers:reviewer", "add-pr:looper:target:blue"})
+	if len(fixture.network.revalidateRequests) != 2 {
+		t.Fatalf("revalidateRequests = %#v, want review + label lease checks", fixture.network.revalidateRequests)
+	}
+}
+
+func TestRunnerAssignsReviewerAndTargetInRoutedModeWhenLocalAutoDiscoveryDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Reviewer.Discovery.AutoDiscovery = false
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"add-reviewers:reviewer", "add-pr:looper:target:blue"})
+}
+
+func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership: protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{
+			{NodeID: "node-red", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+			{NodeID: "node-blue", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+		},
+		Lease: protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedPRLabels) != 1 || fixture.github.addedPRLabels[0].Labels[0] != "looper:target:blue" {
+		t.Fatalf("addedPRLabels = %#v, want deterministic blue target", fixture.github.addedPRLabels)
+	}
+}
+
+func TestRunnerExcludesSelfReviewCandidatesDuringRoutedAssignment(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership: protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{
+			{NodeID: "node-self", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "octo", NumericID: 11}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+			{NodeID: "node-other", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}},
+		},
+		Lease: protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 1 || fixture.github.addedReviewers[0].Reviewers[0] != "reviewer" {
+		t.Fatalf("addedReviewers = %#v, want non-self reviewer", fixture.github.addedReviewers)
+	}
+}
+
+func TestRunnerStopsBeforeTargetLabelWhenLeaseRevalidationFails(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.network.revalidateErrs = []error{nil, errors.New("lost lease")}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err == nil || !strings.Contains(err.Error(), "lost lease") {
+		t.Fatalf("DiscoverIssues() error = %v, want lost lease", err)
+	}
+	if len(fixture.github.addedReviewers) != 1 {
+		t.Fatalf("addedReviewers = %#v, want first coarse review mutation applied", fixture.github.addedReviewers)
+	}
+	if len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("addedPRLabels = %#v, want target label withheld after lease loss", fixture.github.addedPRLabels)
+	}
+}
+
+func TestLeaseProbeURLPreservesSingleLabelHost(t *testing.T) {
+	t.Parallel()
+	if got := leaseProbeURL("ghe/owner/repo", 91); got != "https://ghe/owner/repo/pull/91" {
+		t.Fatalf("leaseProbeURL() = %q, want single-label host preserved", got)
+	}
+}
+
+func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestWhenRequired(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(true)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 0 || len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("mutations = reviewers:%#v labels:%#v, want no routed assignment without explicit review request", fixture.github.addedReviewers, fixture.github.addedPRLabels)
+	}
+	if len(fixture.network.revalidateRequests) != 0 {
+		t.Fatalf("revalidateRequests = %#v, want no lease revalidation when assignment authority is absent", fixture.network.revalidateRequests)
+	}
+	if len(fixture.github.ops) != 0 {
+		t.Fatalf("ops = %#v, want no GitHub mutations", fixture.github.ops)
+	}
+}
+
+func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestForLegacyCapabilityPayload(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 0 || len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("mutations = reviewers:%#v labels:%#v, want legacy payloads to fail closed without explicit review request authority", fixture.github.addedReviewers, fixture.github.addedPRLabels)
+	}
+}
+
+func TestRunnerSkipsRoutedAssignmentWhenNoEligibleReviewerNodeExists(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+	fixture.runner.config.Projects = []config.ProjectRefConfig{{ID: fixture.projectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-self", NodeName: "red", GitHub: protocol.GitHubIdentity{Login: "octo", NumericID: 11}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"looper:review"}}
+	fixture.runner.config.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.addedReviewers) != 0 || len(fixture.github.addedPRLabels) != 0 {
+		t.Fatalf("mutations = reviewers:%#v labels:%#v, want no assignment", fixture.github.addedReviewers, fixture.github.addedPRLabels)
+	}
+	events, err := fixture.coord.DB().QueryContext(context.Background(), `SELECT payload_json FROM event_logs WHERE event_type = 'pr.review.assignment'`)
+	if err != nil {
+		t.Fatalf("QueryContext() error = %v", err)
+	}
+	defer events.Close()
+	count := 0
+	for events.Next() {
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("pr.review.assignment events = %d, want 1 no-eligible-node record", count)
 	}
 }
 

@@ -38,6 +38,53 @@ type Actions struct {
 	PR     string `json:"pr,omitempty"`
 }
 
+type actionSourceShape struct {
+	Source string `json:"source,omitempty"`
+}
+
+func (a *Actions) UnmarshalJSON(data []byte) error {
+	type rawActions struct {
+		Commit json.RawMessage `json:"commit,omitempty"`
+		Push   json.RawMessage `json:"push,omitempty"`
+		PR     json.RawMessage `json:"pr,omitempty"`
+	}
+	var raw rawActions
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	commit, err := parseActionSource(raw.Commit)
+	if err != nil {
+		return err
+	}
+	push, err := parseActionSource(raw.Push)
+	if err != nil {
+		return err
+	}
+	pr, err := parseActionSource(raw.PR)
+	if err != nil {
+		return err
+	}
+	a.Commit = commit
+	a.Push = push
+	a.PR = pr
+	return nil
+}
+
+func parseActionSource(data json.RawMessage) (string, error) {
+	if len(data) == 0 || string(data) == "null" {
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err == nil {
+		return value, nil
+	}
+	var shape actionSourceShape
+	if err := json.Unmarshal(data, &shape); err == nil {
+		return shape.Source, nil
+	}
+	return "", fmt.Errorf("invalid lifecycle action source: %s", string(data))
+}
+
 type State struct {
 	Policy            string   `json:"policy,omitempty"`
 	PolicyVersion     int      `json:"policy_version,omitempty"`
@@ -333,7 +380,7 @@ func PromptInstruction(runner, branch, baseBranch string, expectPush, expectPR b
 		"Before finishing: inspect git status, staged and unstaged diffs, untracked files, and recent commit style; " + gitStep + "; " + prStep + ".",
 		disclosurePromptInstruction(runner, disclosureCfg, agentRuntime, agentModel),
 		"If a branch PR already exists, reuse it and preserve human-edited title/body while adding only missing labels, reviewers, or closing references requested by the run.",
-		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; use action source \"agent\" for actions you completed and \"none\" for actions still missing.",
+		"Include a git_pr_lifecycle object in the final " + "__LOOPER_RESULT__" + " JSON with branch, baseBranch, commitShas, pushed, prNumber, prUrl, prAdopted, and actions {commit,push,pr}; set each action to a plain string source like \"agent\" or \"none\", not a nested object.",
 		fmt.Sprintf("Expected lifecycle branch=%q baseBranch=%q expectPush=%t expectPR=%t fallbackAllowed=%t.", branch, baseBranch, expectPush, policy.ExpectPR, policy.AllowFallback),
 	}, "\n")
 }
