@@ -11,6 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreecleanup"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
@@ -175,7 +176,11 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		"startedAt":  startedAt,
 	})
 
-	candidates, err := repos.Worktrees.ListCleanupCandidates(ctx, worktreeCleanupMaxPerTick(cfg))
+	plan, err := (&worktreecleanup.Service{
+		Repos:  repos,
+		Config: cfg.Daemon.WorktreeCleanup,
+		Now:    r.now,
+	}).Plan(ctx)
 	if err != nil {
 		summary.Failed = 1
 		summary.LastStatus = "failed"
@@ -185,15 +190,20 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{"status": summary.LastStatus, "failed": summary.Failed, "lastError": summary.LastError})
 		return summary
 	}
-	summary.Scanned = len(candidates)
+	summary.Scanned = plan.Summary.Scanned
+	summary.Candidates = plan.Summary.Candidates
 
-	for _, candidate := range candidates {
+	for _, decision := range plan.Decisions {
 		if ctx.Err() != nil {
 			summary.LastError = ctx.Err().Error()
 			break
 		}
-		summary.Candidates++
-		result := r.cleanupWorktreeCandidate(ctx, repos, gitGateway, cfg, candidate)
+		if decision.Action != worktreecleanup.ActionWouldClean {
+			r.recordWorktreeCleanupPlanSkip(ctx, repos, decision.Worktree, decision.Reason)
+			summary.Skipped++
+			continue
+		}
+		result := r.cleanupWorktreeCandidate(ctx, repos, gitGateway, cfg, decision.Worktree)
 		switch result.status {
 		case "cleaned":
 			summary.Cleaned++
@@ -286,6 +296,10 @@ func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.R
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dirty_git_status")
 	}
 	return r.cleanWorktreeCandidate(ctx, repos, gitGateway, cfg, *project, candidate, worktreeRoot, "clean")
+}
+
+func (r *Runtime) recordWorktreeCleanupPlanSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) {
+	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.skipped", &candidate, map[string]any{"reason": reason})
 }
 
 func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, project storage.ProjectRecord, candidate storage.WorktreeRecord, worktreeRoot, reason string) worktreeCleanupCandidateResult {

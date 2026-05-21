@@ -108,13 +108,13 @@ func TestWorktreeCleanupPassDoesNotStarveNewerCandidateAfterSkip(t *testing.T) {
 	}
 
 	first := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
-	if first.LastStatus != "completed" || first.Skipped != 1 || first.Cleaned != 0 {
-		t.Fatalf("first summary = %#v, want skipped old dirty worktree", first)
+	if first.LastStatus != "completed" || first.Skipped != 2 || first.Cleaned != 0 {
+		t.Fatalf("first summary = %#v, want dirty worktree plus maxPerTick skip", first)
 	}
 
 	second := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
-	if second.LastStatus != "completed" || second.Cleaned != 1 || second.Skipped != 0 {
-		t.Fatalf("second summary = %#v, want newer clean worktree cleaned", second)
+	if second.LastStatus != "completed" || second.Cleaned != 1 || second.Skipped != 1 {
+		t.Fatalf("second summary = %#v, want newer clean worktree cleaned and remaining dirty skipped by maxPerTick", second)
 	}
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("cleanupCalls = %#v, want one clean candidate cleanup", git.cleanupCalls)
@@ -132,6 +132,72 @@ func TestWorktreeCleanupPassDoesNotStarveNewerCandidateAfterSkip(t *testing.T) {
 	}
 	if storedClean == nil || storedClean.Status != "cleaned" {
 		t.Fatalf("stored clean worktree = %#v, want cleaned", storedClean)
+	}
+}
+
+func TestWorktreeCleanupPassRespectsRetentionAndOrphanPolicy(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	fixture.config.Daemon.WorktreeCleanup.RetentionDays = 7
+	fixture.config.Daemon.WorktreeCleanup.IncludeOrphans = false
+	old := fixture.now.Add(-10 * 24 * time.Hour)
+	recent := fixture.seedWorktreeAt(t, "wt_recent", "feature/recent", true, fixture.now)
+	oldOrphan := fixture.seedWorktreeAt(t, "wt_old_orphan", "feature/old-orphan", true, old)
+	oldReferenced := fixture.seedWorktreeAt(t, "wt_old_referenced", "feature/old-referenced", true, old)
+	fixture.seedLoopForWorktree(t, "loop_recent", recent, "completed", fixture.now)
+	fixture.seedLoopForWorktree(t, "loop_old_referenced", oldReferenced, "completed", old)
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
+			{Path: recent.WorktreePath, Branch: recent.Branch},
+			{Path: oldOrphan.WorktreePath, Branch: oldOrphan.Branch},
+			{Path: oldReferenced.WorktreePath, Branch: oldReferenced.Branch},
+		}},
+		clean: map[string]bool{
+			recent.WorktreePath:        true,
+			oldOrphan.WorktreePath:     true,
+			oldReferenced.WorktreePath: true,
+		},
+		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
+			updated, err := fixture.repos.Worktrees.GetByID(context.Background(), worktreeIDForPath(map[string]storage.WorktreeRecord{
+				recent.WorktreePath:        recent,
+				oldOrphan.WorktreePath:     oldOrphan,
+				oldReferenced.WorktreePath: oldReferenced,
+			}, input.WorktreePath))
+			if err != nil {
+				return err
+			}
+			nowISO := formatJavaScriptISOString(fixture.now)
+			updated.Status = "cleaned"
+			updated.CleanedAt = &nowISO
+			updated.UpdatedAt = nowISO
+			return fixture.repos.Worktrees.Upsert(context.Background(), *updated)
+		},
+	}
+
+	first := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+	if first.LastStatus != "completed" || first.Cleaned != 1 || first.Skipped != 2 || len(git.cleanupCalls) != 1 {
+		t.Fatalf("first summary = %#v cleanupCalls=%#v, want old referenced cleaned and policy skips", first, git.cleanupCalls)
+	}
+	if git.cleanupCalls[0].WorktreePath != oldReferenced.WorktreePath {
+		t.Fatalf("first cleanup path = %q, want old referenced path %q", git.cleanupCalls[0].WorktreePath, oldReferenced.WorktreePath)
+	}
+	events := fixture.events(t)
+	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.skipped", "within retention window") {
+		t.Fatalf("events = %#v, want retention skip", events)
+	}
+	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.skipped", "orphan worktree and includeOrphans=false") {
+		t.Fatalf("events = %#v, want orphan policy skip", events)
+	}
+
+	fixture.config.Daemon.WorktreeCleanup.RetentionDays = 0
+	fixture.config.Daemon.WorktreeCleanup.IncludeOrphans = true
+	second := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+	if second.LastStatus != "completed" || second.Cleaned != 2 || second.Skipped != 0 {
+		t.Fatalf("second summary = %#v, want recent and orphan cleaned once config allows them", second)
+	}
+	if len(git.cleanupCalls) != 3 {
+		t.Fatalf("cleanupCalls = %#v, want all allowed worktrees cleaned", git.cleanupCalls)
 	}
 }
 
@@ -181,6 +247,7 @@ type worktreeCleanupFixture struct {
 	project storage.ProjectRecord
 	root    string
 	now     time.Time
+	seq     int64
 }
 
 func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
@@ -193,6 +260,8 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	cfg.Daemon.WorktreeCleanup.Enabled = true
 	cfg.Daemon.WorktreeCleanup.DryRun = false
 	cfg.Daemon.WorktreeCleanup.MaxPerTick = 10
+	cfg.Daemon.WorktreeCleanup.RetentionDays = 0
+	cfg.Daemon.WorktreeCleanup.IncludeOrphans = true
 	worktreeRoot := filepath.Join(root, "worktrees")
 	repoPath := filepath.Join(root, "repo")
 	if err := os.MkdirAll(repoPath, 0o755); err != nil {
@@ -247,6 +316,16 @@ func (f worktreeCleanupFixture) seedWorktreeAt(t *testing.T, id, branch string, 
 	return record
 }
 
+func (f *worktreeCleanupFixture) seedLoopForWorktree(t *testing.T, id string, worktree storage.WorktreeRecord, status string, updatedAt time.Time) {
+	t.Helper()
+	f.seq++
+	metadata := `{"worktreeId":"` + worktree.ID + `","branch":"` + worktree.Branch + `","worktreePath":"` + worktree.WorktreePath + `"}`
+	record := storage.LoopRecord{ID: id, Seq: f.seq, ProjectID: worktree.ProjectID, Type: "worker", TargetType: "project", Status: status, MetadataJSON: &metadata, CreatedAt: formatJavaScriptISOString(updatedAt), UpdatedAt: formatJavaScriptISOString(updatedAt)}
+	if err := f.repos.Loops.Upsert(context.Background(), record); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+}
+
 func (f worktreeCleanupFixture) events(t *testing.T) []storage.EventLogRecord {
 	t.Helper()
 	events, err := f.repos.Events.List(context.Background(), 20)
@@ -295,4 +374,11 @@ func containsWorktreeCleanupEventPayload(events []storage.EventLogRecord, eventT
 		}
 	}
 	return false
+}
+
+func worktreeIDForPath(worktrees map[string]storage.WorktreeRecord, path string) string {
+	if worktree, ok := worktrees[path]; ok {
+		return worktree.ID
+	}
+	return ""
 }
