@@ -237,7 +237,11 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		if branchExists {
 			args = append(args, worktreePath, input.Branch)
 		} else {
-			args = append(args, "-b", input.Branch, worktreePath, input.BaseBranch)
+			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.BaseBranch)
+			if err != nil {
+				return storage.WorktreeRecord{}, err
+			}
+			args = append(args, "-b", input.Branch, worktreePath, startPoint)
 		}
 		if err := g.runGit(ctx, input.RepoPath, nil, args...); err != nil {
 			return storage.WorktreeRecord{}, err
@@ -477,12 +481,16 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	return nil
 }
 
-func (g *Gateway) IsWorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
-	status, err := g.readStatus(ctx, worktreePath)
+func (g *Gateway) WorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
+	entries, err := g.readStatus(ctx, worktreePath)
 	if err != nil {
 		return false, err
 	}
-	return len(status) == 0, nil
+	return len(entries) == 0, nil
+}
+
+func (g *Gateway) IsWorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
+	return g.WorktreeClean(ctx, worktreePath)
 }
 
 func (g *Gateway) Push(ctx context.Context, input PushInput) error {
@@ -719,6 +727,21 @@ func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWor
 	return "", fmt.Errorf("resolve detached start point: no local or remote ref found for branch %q or base branch %q", input.Branch, input.BaseBranch)
 }
 
+func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, baseBranch string) (string, error) {
+	startPoint, ok, err := g.resolveDetachedStartPointRef(ctx, repoPath, baseBranch)
+	if err != nil {
+		branchExists, branchErr := g.branchExists(ctx, repoPath, baseBranch)
+		if branchErr == nil && branchExists {
+			return baseBranch, nil
+		}
+		return "", err
+	}
+	if ok {
+		return startPoint, nil
+	}
+	return "", fmt.Errorf("resolve attached start point: no local or remote ref found for base branch %q", baseBranch)
+}
+
 func (g *Gateway) resolveDetachedStartPointRef(ctx context.Context, repoPath, branch string) (string, bool, error) {
 	remote := "origin"
 	hasRemote, err := g.hasRemote(ctx, repoPath, remote)
@@ -908,7 +931,7 @@ type statusEntry struct {
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all")
+	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
 	if err != nil {
 		return nil, err
 	}
@@ -920,6 +943,9 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 			continue
 		}
 		if len(line) < 3 {
+			continue
+		}
+		if line[:2] == "!!" {
 			continue
 		}
 		entries = append(entries, statusEntry{Code: line[:2], Path: strings.TrimSpace(line[3:])})

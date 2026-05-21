@@ -732,15 +732,16 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 }
 
 type statusResponse struct {
-	Service       statusService       `json:"service"`
-	Storage       statusStorage       `json:"storage"`
-	Scheduler     statusScheduler     `json:"scheduler"`
-	Webhook       statusWebhook       `json:"webhook"`
-	Loops         statusLoops         `json:"loops"`
-	Network       any                 `json:"network,omitempty"`
-	Safety        statusSafety        `json:"safety"`
-	Notifications statusNotifications `json:"notifications"`
-	Tools         statusTools         `json:"tools"`
+	Service         statusService       `json:"service"`
+	Storage         statusStorage       `json:"storage"`
+	Scheduler       statusScheduler     `json:"scheduler"`
+	WorktreeCleanup any                 `json:"worktreeCleanup"`
+	Webhook         statusWebhook       `json:"webhook"`
+	Loops           statusLoops         `json:"loops"`
+	Network         any                 `json:"network,omitempty"`
+	Safety          statusSafety        `json:"safety"`
+	Notifications   statusNotifications `json:"notifications"`
+	Tools           statusTools         `json:"tools"`
 }
 
 type statusService struct {
@@ -875,13 +876,14 @@ type configServerResponse struct {
 }
 
 type configDaemonResponse struct {
-	Mode                   config.DaemonMode          `json:"mode"`
-	RestartPolicy          config.DaemonRestartPolicy `json:"restartPolicy"`
-	RestartThrottleSeconds int                        `json:"restartThrottleSeconds"`
-	PlistPath              *string                    `json:"plistPath,omitempty"`
-	LogDir                 string                     `json:"logDir"`
-	WorkingDirectory       string                     `json:"workingDirectory"`
-	Environment            map[string]string          `json:"environment"`
+	Mode                   config.DaemonMode            `json:"mode"`
+	RestartPolicy          config.DaemonRestartPolicy   `json:"restartPolicy"`
+	RestartThrottleSeconds int                          `json:"restartThrottleSeconds"`
+	PlistPath              *string                      `json:"plistPath,omitempty"`
+	LogDir                 string                       `json:"logDir"`
+	WorkingDirectory       string                       `json:"workingDirectory"`
+	Environment            map[string]string            `json:"environment"`
+	WorktreeCleanup        config.WorktreeCleanupConfig `json:"worktreeCleanup"`
 }
 
 func (h *Handler) buildConfigResponse() configResponse {
@@ -910,6 +912,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			LogDir:                 cfg.Daemon.LogDir,
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
 			Environment:            cfg.Daemon.Environment,
+			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
 		},
 		Package:  cfg.Package,
 		Defaults: cfg.Defaults,
@@ -1025,9 +1028,10 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			TotalRuns:      len(runs),
 			ActiveRuns:     runCounts["running"],
 		},
-		Webhook: summarizeWebhookStatus(h.buildWebhookStatusResponse()),
-		Loops:   loopCounts,
-		Network: h.buildNetworkStatusResponse(),
+		WorktreeCleanup: h.buildWorktreeCleanupStatusResponse(),
+		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),
+		Loops:           loopCounts,
+		Network:         h.buildNetworkStatusResponse(),
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
 			AllowAutoPush:      h.context.Config.Defaults.AllowAutoPush,
@@ -1046,6 +1050,19 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Osascript: hasValue(h.context.Config.Tools.OsascriptPath),
 		},
 	}, nil
+}
+
+func (h *Handler) buildWorktreeCleanupStatusResponse() any {
+	if runtimeWithCleanup, ok := any(h.context.Runtime).(interface {
+		WorktreeCleanupStatus() looperdruntime.WorktreeCleanupStatus
+	}); ok {
+		return runtimeWithCleanup.WorktreeCleanupStatus()
+	}
+	return looperdruntime.WorktreeCleanupStatus{
+		Enabled:    h.context.Config.Daemon.WorktreeCleanup.Enabled,
+		DryRun:     h.context.Config.Daemon.WorktreeCleanup.DryRun,
+		LastStatus: "idle",
+	}
 }
 
 func (h *Handler) buildNetworkStatusResponse() any {

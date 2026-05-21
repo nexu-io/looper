@@ -183,6 +183,46 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	}
 }
 
+func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/ignore",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".gitignore"), "*.log\n")
+	runGit(t, worktree.WorktreePath, "add", ".gitignore")
+	runGit(t, worktree.WorktreePath, "commit", "-m", "ignore logs")
+	runGit(t, worktree.WorktreePath, "config", "status.showIgnored", "matching")
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "debug.log"), "ignored\n")
+	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil {
+		t.Fatalf("WorktreeClean(ignored file) error = %v", err)
+	}
+	if !clean {
+		t.Fatal("WorktreeClean(ignored file) = false, want true")
+	}
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "note.txt"), "untracked\n")
+	clean, err = gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil {
+		t.Fatalf("WorktreeClean(untracked file) error = %v", err)
+	}
+	if clean {
+		t.Fatal("WorktreeClean(untracked file) = true, want false")
+	}
+}
+
 func TestGatewayKeepsPrimaryCheckoutCleanForDetachedFixerWorktree(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -255,6 +295,64 @@ func TestGatewayDetachedWorktreeFallsBackToRemoteOnlyBaseBranch(t *testing.T) {
 	worktreeHeadSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
 	if worktreeHeadSHA != remoteBaseSHA {
 		t.Fatalf("detached HEAD = %q, want %q", worktreeHeadSHA, remoteBaseSHA)
+	}
+}
+
+func TestGatewayAttachedWorktreeFallsBackToRemoteOnlyBaseBranch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	fixture.createUnfetchedRemoteBranch(t, "release/base")
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "worker/release-base-sync",
+		BaseBranch:   "release/base",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "branch", "--show-current")); got != "worker/release-base-sync" {
+		t.Fatalf("attached branch name = %q, want worker/release-base-sync", got)
+	}
+
+	remoteBaseSHA := stringsTrimSpace(runGit(t, fixture.remotePath, "rev-parse", "refs/heads/release/base"))
+	worktreeHeadSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+	if worktreeHeadSHA != remoteBaseSHA {
+		t.Fatalf("attached HEAD = %q, want %q", worktreeHeadSHA, remoteBaseSHA)
+	}
+}
+
+func TestGatewayAttachedWorktreeFallsBackToLocalBaseBranchWhenRemoteProbeFails(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	runGit(t, fixture.repoPath, "remote", "set-url", "origin", filepath.Join(fixture.rootDir, "missing-remote.git"))
+	gateway := fixture.gateway()
+
+	localBaseSHA := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "main"))
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "worker/offline-main-fallback",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	if got := stringsTrimSpace(runGit(t, worktree.WorktreePath, "branch", "--show-current")); got != "worker/offline-main-fallback" {
+		t.Fatalf("attached branch name = %q, want worker/offline-main-fallback", got)
+	}
+
+	worktreeHeadSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+	if worktreeHeadSHA != localBaseSHA {
+		t.Fatalf("attached HEAD = %q, want %q", worktreeHeadSHA, localBaseSHA)
 	}
 }
 

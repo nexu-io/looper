@@ -1954,6 +1954,25 @@ func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID strin
 	return scanWorktrees(rows)
 }
 
+func (r *WorktreesRepository) ListCleanupCandidates(ctx context.Context, limit int) ([]WorktreeRecord, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT *
+		FROM worktrees
+		WHERE status != 'cleaned'
+		ORDER BY updated_at ASC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list worktree cleanup candidates: %w", err)
+	}
+	defer rows.Close()
+
+	return scanWorktrees(rows)
+}
+
 func (r *WorktreesRepository) ListActive(ctx context.Context) ([]WorktreeRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE cleaned_at IS NULL ORDER BY updated_at ASC, created_at ASC`)
 	if err != nil {
@@ -1962,6 +1981,19 @@ func (r *WorktreesRepository) ListActive(ctx context.Context) ([]WorktreeRecord,
 	defer rows.Close()
 
 	return scanWorktrees(rows)
+}
+
+func (r *WorktreesRepository) TouchCleanupAttempt(ctx context.Context, id, updatedAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE worktrees
+		SET updated_at = ?
+		WHERE id = ? AND status != 'cleaned'
+	`, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("touch worktree cleanup attempt: %w", err)
+	}
+
+	return nil
 }
 
 func boolToInt(value bool) int {

@@ -179,6 +179,41 @@ func TestDiscoverIssuesDedupesWorkerReadyIssue(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesSkipsIssueWhenExistingWorkerLoopAlreadyLinkedPR(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
+	nowISO := fixture.nowISO()
+	metadataJSON := `{"worker":{"title":"Implement worker-ready","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr","issueNumber":46,"issueUrl":"https://github.com/acme/looper/issues/46","autoDiscovered":true}}`
+	prTargetID := "pr:acme/looper:101"
+	prNumber := int64(101)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr_linked", Seq: 99, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &metadataJSON, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want existing PR-linked worker loop to suppress rediscovery", result)
+	}
+	loopsList, err := fixture.repos.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	count := 0
+	for _, loop := range loopsList {
+		if workerLoopTracksIssue(loop, "project_1", "acme/looper", 46) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("worker loop count for issue 46 = %d, want 1", count)
+	}
+}
+
 func TestDiscoverIssuesUsesSingleServerSideLabelFilterWhenConfiguredWithMultipleLabels(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

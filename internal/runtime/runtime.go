@@ -27,7 +27,6 @@ import (
 	"github.com/nexu-io/looper/internal/runs"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
-	"github.com/nexu-io/looper/internal/worktreecleanup"
 )
 
 type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error)
@@ -57,16 +56,17 @@ type RecoveryOrphanAgentCleanup struct {
 }
 
 type Options struct {
-	Config                 config.Config
-	Logger                 bootstrap.Logger
-	Now                    func() time.Time
-	ShutdownTimeout        time.Duration
-	OpenSQLiteCoordinator  OpenSQLiteCoordinatorFunc
-	SyncConfiguredProjects SyncConfiguredProjectsFunc
-	RunSchedulerTick       RunSchedulerTickFunc
-	ReadProcessCommand     ReadProcessCommandFunc
-	SignalProcess          SignalProcessFunc
-	DeferRecovery          bool
+	Config                      config.Config
+	Logger                      bootstrap.Logger
+	Now                         func() time.Time
+	ShutdownTimeout             time.Duration
+	WorktreeCleanupInitialDelay time.Duration
+	OpenSQLiteCoordinator       OpenSQLiteCoordinatorFunc
+	SyncConfiguredProjects      SyncConfiguredProjectsFunc
+	RunSchedulerTick            RunSchedulerTickFunc
+	ReadProcessCommand          ReadProcessCommandFunc
+	SignalProcess               SignalProcessFunc
+	DeferRecovery               bool
 }
 
 type Services struct {
@@ -100,34 +100,39 @@ type Runtime struct {
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
 
-	mu                  sync.RWMutex
-	startedAt           *time.Time
-	recovery            RecoverySummary
-	stopped             bool
-	services            Services
-	startErr            error
-	startOnce           sync.Once
-	shutdownOnce        sync.Once
-	shutdownCh          chan struct{}
-	schedulerStop       chan struct{}
-	schedulerDone       chan struct{}
-	schedulerWake       chan struct{}
-	schedulerClaimWake  chan struct{}
-	schedulerCancel     context.CancelFunc
-	schedulerTasks      *schedulerTaskTracker
-	recoveryCancel      context.CancelFunc
-	recoveryDone        chan struct{}
-	activeExecutions    *ActiveExecutionRegistry
-	githubGateway       *githubinfra.Gateway
-	webhook             *webhookRuntime
-	webhookDaemonLock   *daemonLock
-	webhookForwarder    WebhookForwarder
-	networkManager      *networkclient.Manager
-	schedulerDisabled   bool
-	startupReadyOnce    sync.Once
-	startupReadyErr     error
-	ownershipAcquired   bool
-	lastWorktreeCleanup *time.Time
+	mu                          sync.RWMutex
+	startedAt                   *time.Time
+	recovery                    RecoverySummary
+	stopped                     bool
+	services                    Services
+	startErr                    error
+	startOnce                   sync.Once
+	shutdownOnce                sync.Once
+	shutdownCh                  chan struct{}
+	schedulerStop               chan struct{}
+	schedulerDone               chan struct{}
+	schedulerWake               chan struct{}
+	schedulerClaimWake          chan struct{}
+	schedulerCancel             context.CancelFunc
+	schedulerTasks              *schedulerTaskTracker
+	worktreeCleanupStop         chan struct{}
+	worktreeCleanupDone         chan struct{}
+	worktreeCleanupCancel       context.CancelFunc
+	worktreeCleanupRunning      bool
+	worktreeCleanupInitialDelay time.Duration
+	worktreeCleanupStatus       WorktreeCleanupStatus
+	recoveryCancel              context.CancelFunc
+	recoveryDone                chan struct{}
+	activeExecutions            *ActiveExecutionRegistry
+	githubGateway               *githubinfra.Gateway
+	webhook                     *webhookRuntime
+	webhookDaemonLock           *daemonLock
+	webhookForwarder            WebhookForwarder
+	networkManager              *networkclient.Manager
+	schedulerDisabled           bool
+	startupReadyOnce            sync.Once
+	startupReadyErr             error
+	ownershipAcquired           bool
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -170,21 +175,22 @@ func New(options Options) *Runtime {
 	}
 
 	rt := &Runtime{
-		config:                 options.Config,
-		logger:                 options.Logger,
-		now:                    now,
-		openSQLiteCoordinator:  openSQLiteCoordinator,
-		syncConfiguredProjects: syncConfiguredProjects,
-		runSchedulerTick:       runSchedulerTick,
-		customSchedulerTick:    customSchedulerTick,
-		readProcessCommand:     readProcessCommand,
-		signalProcess:          signalProcess,
-		shutdownTimeout:        shutdownTimeout,
-		deferRecovery:          options.DeferRecovery,
-		recovery:               createEmptyRecoverySummary(),
-		shutdownCh:             make(chan struct{}),
-		activeExecutions:       NewActiveExecutionRegistry(),
-		webhook:                newWebhookRuntime(options.Config, options.Logger, now),
+		config:                      options.Config,
+		logger:                      options.Logger,
+		now:                         now,
+		openSQLiteCoordinator:       openSQLiteCoordinator,
+		syncConfiguredProjects:      syncConfiguredProjects,
+		runSchedulerTick:            runSchedulerTick,
+		customSchedulerTick:         customSchedulerTick,
+		readProcessCommand:          readProcessCommand,
+		signalProcess:               signalProcess,
+		shutdownTimeout:             shutdownTimeout,
+		worktreeCleanupInitialDelay: options.WorktreeCleanupInitialDelay,
+		deferRecovery:               options.DeferRecovery,
+		recovery:                    createEmptyRecoverySummary(),
+		shutdownCh:                  make(chan struct{}),
+		activeExecutions:            NewActiveExecutionRegistry(),
+		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 	}
 	if rt.webhook != nil {
 		rt.webhook.forwarder = rt.WebhookForwarder
@@ -222,6 +228,7 @@ func (r *Runtime) Stop(reason string) {
 		}
 
 		r.stopDeferredReviewerRecovery()
+		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
 
@@ -666,6 +673,9 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		if !schedulerDisabled {
 			r.startSchedulerLoop()
 		}
+		if r.config.Daemon.WorktreeCleanup.Enabled {
+			r.startWorktreeCleanupLoop()
+		}
 		r.startDeferredReviewerRecovery(githubGateway)
 
 		if r.logger != nil {
@@ -993,50 +1003,6 @@ func (r *Runtime) executeSchedulerTick(ctx context.Context) {
 	if err := tick(ctx, services); err != nil && r.logger != nil {
 		r.logger.Warn("looperd scheduler tick failed", map[string]any{"error": err.Error()})
 	}
-	if err := r.maybeRunWorktreeCleanup(ctx, services); err != nil && r.logger != nil {
-		r.logger.Warn("looperd worktree cleanup failed", map[string]any{"error": err.Error()})
-	}
-}
-
-func (r *Runtime) maybeRunWorktreeCleanup(ctx context.Context, services Services) error {
-	cfg := r.config.Daemon.WorktreeCleanup
-	if !cfg.Enabled || services.Repositories == nil {
-		return nil
-	}
-	interval, err := time.ParseDuration(strings.TrimSpace(cfg.Interval))
-	if err != nil {
-		return err
-	}
-	nowFunc := r.now
-	if nowFunc == nil {
-		nowFunc = time.Now
-	}
-	now := nowFunc()
-	r.mu.Lock()
-	if r.lastWorktreeCleanup != nil && interval > 0 && now.Sub(*r.lastWorktreeCleanup) < interval {
-		r.mu.Unlock()
-		return nil
-	}
-	r.mu.Unlock()
-
-	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: services.Repositories, Now: r.now})
-	result, err := worktreecleanup.Run(ctx, worktreecleanup.Options{
-		Config: r.config,
-		Repos:  services.Repositories,
-		Git:    gitGateway,
-		DryRun: cfg.DryRun,
-		Now:    r.now,
-	})
-	if err != nil {
-		return err
-	}
-	r.mu.Lock()
-	r.lastWorktreeCleanup = &now
-	r.mu.Unlock()
-	if r.logger != nil && result.Summary.Inspected > 0 {
-		r.logger.Info("looperd worktree cleanup completed", map[string]any{"dryRun": result.DryRun, "summary": result.Summary})
-	}
-	return nil
 }
 
 func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Services) error {

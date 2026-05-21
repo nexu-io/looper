@@ -92,6 +92,16 @@
             "totalRuns": 1,
             "activeRuns": 1
           },
+          "worktreeCleanup": {
+            "enabled": false,
+            "dryRun": true,
+            "lastStatus": "idle",
+            "scanned": 0,
+            "candidates": 0,
+            "cleaned": 0,
+            "skipped": 0,
+            "failed": 0
+          },
           "webhook": {
             "enabled": false,
             "endpointUrl": "http://127.0.0.1:17310/webhook/forward",
@@ -257,7 +267,15 @@
             "restartThrottleSeconds": 10,
             "logDir": "<tmp-root>/logs",
             "workingDirectory": "<tmp-root>",
-            "environment": {}
+            "environment": {},
+            "worktreeCleanup": {
+              "enabled": false,
+              "interval": "24h",
+              "retentionDays": 7,
+              "maxPerTick": 10,
+              "includeOrphans": false,
+              "dryRun": true
+            }
           },
           "package": {
             "distribution": "github-release",
