@@ -179,9 +179,12 @@
           "FROM_FILE": "1"
         },
         "worktreeCleanup": {
-          "enabled": true,
-          "dryRun": false,
-          "intervalSeconds": 3600
+          "enabled": false,
+          "interval": "24h",
+          "retentionDays": 7,
+          "maxPerTick": 10,
+          "includeOrphans": false,
+          "dryRun": true
         }
       },
       "package": {

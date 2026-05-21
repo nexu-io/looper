@@ -592,11 +592,20 @@ func mergeWorktreeCleanupConfig(config *WorktreeCleanupConfig, partial PartialWo
 	if partial.Enabled != nil {
 		config.Enabled = *partial.Enabled
 	}
+	if partial.Interval != nil {
+		config.Interval = *partial.Interval
+	}
+	if partial.RetentionDays != nil {
+		config.RetentionDays = *partial.RetentionDays
+	}
+	if partial.MaxPerTick != nil {
+		config.MaxPerTick = *partial.MaxPerTick
+	}
+	if partial.IncludeOrphans != nil {
+		config.IncludeOrphans = *partial.IncludeOrphans
+	}
 	if partial.DryRun != nil {
 		config.DryRun = *partial.DryRun
-	}
-	if partial.IntervalSeconds != nil {
-		config.IntervalSeconds = *partial.IntervalSeconds
 	}
 }
 

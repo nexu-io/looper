@@ -133,6 +133,23 @@ Each role runs in its own worktree, coordinated by `looperd` and gated by labels
 
 Looper is poll-driven, not webhook-driven: keep `looperd` running and `gh` authenticated for the loop to fire. Everything runs locally — no hosted control plane required.
 
+## Networked operation
+
+Looper supports two project modes:
+
+- `network.mode=off` — local-only behavior. Worker still claims `looper:worker-ready` Issues assigned to the local GitHub user, Reviewer still claims review requests for the local GitHub user, and any `looper:target:*` labels are ignored.
+- `network.mode=routed` — multi-Node behavior. `loopernet` centralizes webhook ingress and event fan-out, but GitHub remains the authority for work intent.
+
+In Routed mode:
+
+- Coordinator, not `loopernet`, mutates GitHub for Issue admission and PR review assignment.
+- `looper:worker-ready` and GitHub review requests express work intent.
+- exactly one `looper:target:<node_name>` label is the exact-Node authority, and Coordinator writes it last.
+- the `loopernet` Coordinator lease is only a fencing gate for mutation rights; if the lease is stale, Coordinator must stop mutating GitHub.
+- polling stays enabled as drift recovery if webhook ingress or SSE wakeups are missed; it is not the primary wakeup path.
+
+For setup, identity strategy, and recovery steps, see **[docs/users-guide.md](docs/users-guide.md)** and **[docs/configuration.md](docs/configuration.md)**. The formal authority rules live in ADRs **[0007](docs/adr/0007-coordinator-admission-assignment-authority.md)** through **[0011](docs/adr/0011-coordinator-control-plane-for-routed-projects-v1.md)**.
+
 ## Command cheatsheet
 
 **Setup & health**

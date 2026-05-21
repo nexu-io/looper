@@ -4248,6 +4248,7 @@ func TestNetworkJoinRemovesLocalStateWhenProjectEnrollmentRollbackFails(t *testi
 	}
 	configPayload := map[string]any{
 		"tools":    map[string]any{"ghPath": ghPath},
+		"roles":    map[string]any{"planner": map[string]any{"autoDiscovery": false}, "fixer": map[string]any{"autoDiscovery": false}},
 		"projects": []map[string]any{{"id": "project-1", "name": "Repo", "path": t.TempDir()}},
 	}
 	raw, err := json.Marshal(configPayload)
@@ -4325,6 +4326,145 @@ func TestNetworkJoinRemovesLocalStateWhenProjectEnrollmentRollbackFails(t *testi
 	}
 }
 
+func TestNetworkJoinRejectsAutoEnrollmentWhenPlannerOrFixerAutoDiscoveryIsEnabled(t *testing.T) {
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.toml")
+	projectPath := t.TempDir()
+	raw, err := config.MarshalConfigFile(configPath, config.PartialConfig{
+		Roles: &config.PartialRoleConfigs{
+			Planner: &config.PartialPlannerRoleConfig{AutoDiscovery: boolPtr(true)},
+			Fixer:   &config.PartialFixerRoleConfig{AutoDiscovery: boolPtr(true)},
+		},
+		Projects: &[]config.PartialProjectRefConfig{{ID: "project-1", Name: "Repo", Path: projectPath}},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	joinCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		joinCalls++
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"networkId":"net-1","nodeId":"node-1","nodeToken":"node-token"}`))
+	}))
+	defer server.Close()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: homeDir, Getwd: func() (string, error) { return configDir, nil }}), []string{"--config", configPath})
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.Flags().String("key", "", "")
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().Bool("no-enroll-projects", false, "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("key", "join-1"); err != nil {
+		t.Fatalf("set key flag: %v", err)
+	}
+	if err := cmd.Flags().Set("name", "worker-1"); err != nil {
+		t.Fatalf("set name flag: %v", err)
+	}
+
+	err = runtime.networkJoin(cmd, []string{server.URL})
+	if err == nil {
+		t.Fatal("networkJoin() error = nil, want auto-enrollment validation failure")
+	}
+	if !strings.Contains(err.Error(), "cannot auto-enroll projects in network.mode=routed") || !strings.Contains(err.Error(), "--no-enroll-projects") {
+		t.Fatalf("error = %q, want actionable routed enrollment remediation", err)
+	}
+	if joinCalls != 0 {
+		t.Fatalf("join calls = %d, want no remote join attempt", joinCalls)
+	}
+	if _, err := os.Stat(filepath.Join(homeDir, ".looper", "network.json")); !os.IsNotExist(err) {
+		t.Fatalf("network state file present after validation failure: %v", err)
+	}
+}
+
+func TestNetworkJoinWithNoEnrollProjectsSkipsRoutedEnrollmentValidation(t *testing.T) {
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.toml")
+	ghPath := filepath.Join(t.TempDir(), "gh")
+	projectPath := t.TempDir()
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"user\" ]; then\n  printf '{\"login\":\"worker-1\",\"id\":101}'\n  exit 0\nfi\nprintf 'unexpected gh invocation: %s\\n' \"$*\" >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	raw, err := config.MarshalConfigFile(configPath, config.PartialConfig{
+		Tools: &config.PartialToolPathsConfig{GHPath: stringPtr(ghPath)},
+		Roles: &config.PartialRoleConfigs{
+			Planner: &config.PartialPlannerRoleConfig{AutoDiscovery: boolPtr(true)},
+			Fixer:   &config.PartialFixerRoleConfig{AutoDiscovery: boolPtr(true)},
+		},
+		Projects: &[]config.PartialProjectRefConfig{{ID: "project-1", Name: "Repo", Path: projectPath}},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	joinCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/join" {
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		joinCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"networkId":"net-1","nodeId":"node-1","nodeToken":"node-token"}`))
+	}))
+	defer server.Close()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: homeDir, Getwd: func() (string, error) { return configDir, nil }}), []string{"--config", configPath})
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.Flags().String("key", "", "")
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().Bool("no-enroll-projects", false, "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("key", "join-1"); err != nil {
+		t.Fatalf("set key flag: %v", err)
+	}
+	if err := cmd.Flags().Set("name", "worker-1"); err != nil {
+		t.Fatalf("set name flag: %v", err)
+	}
+	if err := cmd.Flags().Set("no-enroll-projects", "true"); err != nil {
+		t.Fatalf("set no-enroll-projects flag: %v", err)
+	}
+
+	if err := runtime.networkJoin(cmd, []string{server.URL}); err != nil {
+		t.Fatalf("networkJoin() error = %v", err)
+	}
+	if joinCalls != 1 {
+		t.Fatalf("join calls = %d, want 1", joinCalls)
+	}
+	state, err := client.LoadState(filepath.Join(homeDir, ".looper", "network.json"))
+	if err != nil {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+	if state.URL != server.URL || state.NodeName != "worker-1" {
+		t.Fatalf("state = %#v, want saved routed membership", state)
+	}
+	updated, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(updated), "network") {
+		t.Fatalf("config = %s, want project network mode unchanged when --no-enroll-projects is used", string(updated))
+	}
+}
+
 func TestNetworkJoinPreservesLocalStateWhenProjectEnrollmentRollbackLeaveFails(t *testing.T) {
 	homeDir := t.TempDir()
 	configDir := t.TempDir()
@@ -4335,6 +4475,7 @@ func TestNetworkJoinPreservesLocalStateWhenProjectEnrollmentRollbackLeaveFails(t
 	}
 	configPayload := map[string]any{
 		"tools":    map[string]any{"ghPath": ghPath},
+		"roles":    map[string]any{"planner": map[string]any{"autoDiscovery": false}, "fixer": map[string]any{"autoDiscovery": false}},
 		"projects": []map[string]any{{"id": "project-1", "name": "Repo", "path": t.TempDir()}},
 	}
 	raw, err := json.Marshal(configPayload)

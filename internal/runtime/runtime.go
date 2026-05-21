@@ -1003,7 +1003,10 @@ func (r *Runtime) maybeRunWorktreeCleanup(ctx context.Context, services Services
 	if !cfg.Enabled || services.Repositories == nil {
 		return nil
 	}
-	interval := time.Duration(cfg.IntervalSeconds) * time.Second
+	interval, err := time.ParseDuration(strings.TrimSpace(cfg.Interval))
+	if err != nil {
+		return err
+	}
 	nowFunc := r.now
 	if nowFunc == nil {
 		nowFunc = time.Now

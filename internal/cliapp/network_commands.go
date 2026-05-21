@@ -40,6 +40,7 @@ func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
 	url := strings.TrimSpace(args[0])
 	joinKey := strings.TrimSpace(getStringFlag(cmd, "key"))
 	nodeName := strings.TrimSpace(getStringFlag(cmd, "name"))
+	autoEnrollProjects := !getBoolFlag(cmd, "no-enroll-projects")
 	if joinKey == "" {
 		return fmt.Errorf("network join requires --key <key>")
 	}
@@ -48,6 +49,11 @@ func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
 	}
 	if err := protocol.ValidateNodeName(nodeName); err != nil {
 		return err
+	}
+	if autoEnrollProjects {
+		if err := r.validateRoutedAutoEnrollment(); err != nil {
+			return err
+		}
 	}
 	homeDir, err := r.homeDir()
 	if err != nil {
@@ -73,7 +79,7 @@ func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
 	if err := client.SaveState(client.DefaultStatePath(homeDir), state); err != nil {
 		return err
 	}
-	if !getBoolFlag(cmd, "no-enroll-projects") {
+	if autoEnrollProjects {
 		if err := r.updateAllProjectNetworkModes(config.ProjectNetworkModeRouted); err != nil {
 			if leaveErr := client.New(state.URL, state.NodeToken, r.httpClient()).Leave(cmd.Context()); leaveErr != nil {
 				return errors.Join(err, leaveErr)
@@ -82,13 +88,43 @@ func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
-	output := map[string]any{"networkId": joinResp.NetworkID, "nodeId": joinResp.NodeID, "nodeName": nodeName, "github": identity, "warnings": joinResp.Warnings, "enrolledProjects": !getBoolFlag(cmd, "no-enroll-projects")}
+	output := map[string]any{"networkId": joinResp.NetworkID, "nodeId": joinResp.NodeID, "nodeName": nodeName, "github": identity, "warnings": joinResp.Warnings, "enrolledProjects": autoEnrollProjects}
 	if getBoolFlag(cmd, "json") {
 		return writeJSON(cmd.OutOrStdout(), output)
 	}
-	printSection(cmd.OutOrStdout(), "Network joined", [][2]any{{"networkId", joinResp.NetworkID}, {"nodeId", joinResp.NodeID}, {"nodeName", nodeName}, {"githubLogin", identity.Login}, {"githubNumericId", identity.NumericID}, {"enrolledProjects", !getBoolFlag(cmd, "no-enroll-projects")}, {"warnings", joinOrNone(joinResp.Warnings)}})
+	printSection(cmd.OutOrStdout(), "Network joined", [][2]any{{"networkId", joinResp.NetworkID}, {"nodeId", joinResp.NodeID}, {"nodeName", nodeName}, {"githubLogin", identity.Login}, {"githubNumericId", identity.NumericID}, {"enrolledProjects", autoEnrollProjects}, {"warnings", joinOrNone(joinResp.Warnings)}})
 	return nil
 
+}
+
+func (r *commandRuntime) validateRoutedAutoEnrollment() error {
+	cwd, err := r.getwd()
+	if err != nil {
+		return err
+	}
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: r.argv})
+	if err != nil {
+		return err
+	}
+	var affected []string
+	for _, project := range loaded.Config.Projects {
+		roles := config.ProjectRoleConfigs(loaded.Config, project.ID)
+		var unsupported []string
+		if roles.Planner.AutoDiscovery {
+			unsupported = append(unsupported, "roles.planner.autoDiscovery")
+		}
+		if roles.Fixer.AutoDiscovery {
+			unsupported = append(unsupported, "roles.fixer.autoDiscovery")
+		}
+		if len(unsupported) == 0 {
+			continue
+		}
+		affected = append(affected, fmt.Sprintf("%s (%s)", networkProjectDisplayName(project), strings.Join(unsupported, ", ")))
+	}
+	if len(affected) == 0 {
+		return nil
+	}
+	return fmt.Errorf("cannot auto-enroll projects in network.mode=routed while planner/fixer auto-discovery is enabled: %s; disable those settings globally or per-project, or rerun network join with --no-enroll-projects and opt projects into routed mode manually", strings.Join(affected, "; "))
 }
 
 func (r *commandRuntime) networkLeave(cmd *cobra.Command, args []string) error {
@@ -272,6 +308,19 @@ func (r *commandRuntime) updateAllProjectNetworkModes(mode config.ProjectNetwork
 		return err
 	}
 	return renameFile(tmp, loaded.Metadata.ConfigPath)
+}
+
+func networkProjectDisplayName(project config.ProjectRefConfig) string {
+	if trimmed := strings.TrimSpace(project.ID); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(project.Name); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(project.RepoPath); trimmed != "" {
+		return trimmed
+	}
+	return "<unnamed project>"
 }
 
 func githubIdentityDrift(expected, current protocol.GitHubIdentity) (bool, string) {

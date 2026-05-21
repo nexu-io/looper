@@ -269,9 +269,12 @@ type DaemonConfig struct {
 }
 
 type WorktreeCleanupConfig struct {
-	Enabled         bool `json:"enabled"`
-	DryRun          bool `json:"dryRun"`
-	IntervalSeconds int  `json:"intervalSeconds"`
+	Enabled        bool   `json:"enabled"`
+	Interval       string `json:"interval"`
+	RetentionDays  int    `json:"retentionDays"`
+	MaxPerTick     int    `json:"maxPerTick"`
+	IncludeOrphans bool   `json:"includeOrphans"`
+	DryRun         bool   `json:"dryRun"`
 }
 
 type PackageConfig struct {
@@ -749,9 +752,12 @@ type PartialDaemonConfig struct {
 }
 
 type PartialWorktreeCleanupConfig struct {
-	Enabled         *bool `json:"enabled,omitempty"`
-	DryRun          *bool `json:"dryRun,omitempty"`
-	IntervalSeconds *int  `json:"intervalSeconds,omitempty"`
+	Enabled        *bool   `json:"enabled,omitempty"`
+	Interval       *string `json:"interval,omitempty"`
+	RetentionDays  *int    `json:"retentionDays,omitempty"`
+	MaxPerTick     *int    `json:"maxPerTick,omitempty"`
+	IncludeOrphans *bool   `json:"includeOrphans,omitempty"`
+	DryRun         *bool   `json:"dryRun,omitempty"`
 }
 
 type PartialPackageConfig struct {

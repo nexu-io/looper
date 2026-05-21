@@ -1582,7 +1582,7 @@ func TestRuntimeWorktreeCleanupFailureDoesNotAdvanceIntervalGate(t *testing.T) {
 	}
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
 	cfg.Daemon.WorktreeCleanup.Enabled = true
-	cfg.Daemon.WorktreeCleanup.IntervalSeconds = 3600
+	cfg.Daemon.WorktreeCleanup.Interval = "1h"
 	cfg.Projects = []config.ProjectRefConfig{{
 		ID:       "project_1",
 		Name:     "Looper",
