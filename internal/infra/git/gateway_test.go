@@ -321,6 +321,38 @@ func TestGatewayCreatesAttachedWorktreeFromRemoteOnlyBranch(t *testing.T) {
 	}
 }
 
+func TestGatewayCreatesAttachedWorktreeAfterRemoteBranchForcePush(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	branch := "looper/force-pushed-worker-branch"
+	fixture.createUnfetchedRemoteBranch(t, branch)
+	runGit(t, fixture.repoPath, "fetch", "origin", fmt.Sprintf("refs/heads/%s:refs/remotes/origin/%s", branch, branch))
+	fixture.forcePushRemoteBranch(t, branch, sanitizeBranchName(branch)+"-force.txt", "force-pushed remote change\n")
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       branch,
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	remoteHeadSHA := stringsTrimSpace(runGit(t, fixture.remotePath, "rev-parse", "refs/heads/"+branch))
+	worktreeHeadSHA := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "HEAD"))
+	if worktreeHeadSHA != remoteHeadSHA {
+		t.Fatalf("worktree HEAD = %q, want force-pushed remote branch head %q", worktreeHeadSHA, remoteHeadSHA)
+	}
+	trackingSHA := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "refs/remotes/origin/"+branch))
+	if trackingSHA != remoteHeadSHA {
+		t.Fatalf("remote tracking HEAD = %q, want %q", trackingSHA, remoteHeadSHA)
+	}
+}
+
 func TestGatewayCreatesSeparateDetachedWorktreeForAttachedBranch(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
@@ -950,6 +982,19 @@ func (f *fixture) advanceRemoteBranch(t *testing.T, branch, fileName, contents s
 	runGit(t, clonePath, "add", fileName)
 	runGit(t, clonePath, "commit", "-m", "remote update")
 	runGit(t, clonePath, "push", "origin", branch)
+}
+
+func (f *fixture) forcePushRemoteBranch(t *testing.T, branch, fileName, contents string) {
+	t.Helper()
+	clonePath := filepath.Join(f.rootDir, "remote-force-clone-"+sanitizeBranchName(branch))
+	runGit(t, f.rootDir, "clone", f.remotePath, clonePath)
+	configureRepo(t, clonePath)
+	runGit(t, clonePath, "checkout", branch)
+	runGit(t, clonePath, "reset", "--hard", "origin/main")
+	writeFile(t, filepath.Join(clonePath, fileName), contents)
+	runGit(t, clonePath, "add", fileName)
+	runGit(t, clonePath, "commit", "-m", "remote force update")
+	runGit(t, clonePath, "push", "--force", "origin", branch)
 }
 
 func configureRepo(t *testing.T, repoPath string) {

@@ -305,7 +305,7 @@ func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branc
 		return baseBranch, nil
 	}
 	remoteRef := "refs/remotes/origin/" + branch
-	if err := g.runGit(ctx, repoPath, nil, "fetch", "origin", fmt.Sprintf("refs/heads/%s:%s", branch, remoteRef)); err != nil {
+	if err := g.runGit(ctx, repoPath, nil, "fetch", "origin", fmt.Sprintf("+refs/heads/%s:%s", branch, remoteRef)); err != nil {
 		return "", err
 	}
 	return "origin/" + branch, nil
