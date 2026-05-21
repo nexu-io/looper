@@ -1954,6 +1954,16 @@ func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID strin
 	return scanWorktrees(rows)
 }
 
+func (r *WorktreesRepository) ListActive(ctx context.Context) ([]WorktreeRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE cleaned_at IS NULL ORDER BY updated_at ASC, created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list active worktrees: %w", err)
+	}
+	defer rows.Close()
+
+	return scanWorktrees(rows)
+}
+
 func boolToInt(value bool) int {
 	if value {
 		return 1

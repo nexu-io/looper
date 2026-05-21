@@ -3069,6 +3069,25 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Daemon.WorkingDirectory = %q, want %q", config.Daemon.WorkingDirectory, "/tmp/looper-cwd")
 	}
 
+	if config.Daemon.WorktreeCleanup.Enabled {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.Enabled = true, want false")
+	}
+	if config.Daemon.WorktreeCleanup.Interval != "24h" {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "24h")
+	}
+	if config.Daemon.WorktreeCleanup.RetentionDays != 7 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.RetentionDays = %d, want 7", config.Daemon.WorktreeCleanup.RetentionDays)
+	}
+	if config.Daemon.WorktreeCleanup.MaxPerTick != 10 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 10", config.Daemon.WorktreeCleanup.MaxPerTick)
+	}
+	if config.Daemon.WorktreeCleanup.IncludeOrphans {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = true, want false")
+	}
+	if !config.Daemon.WorktreeCleanup.DryRun {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = false, want true")
+	}
+
 	if config.Defaults.OpenPRStrategy != OpenPRStrategyAllDone {
 		t.Fatalf("DefaultConfig().Defaults.OpenPRStrategy = %q, want %q", config.Defaults.OpenPRStrategy, OpenPRStrategyAllDone)
 	}
@@ -3091,6 +3110,48 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if len(config.Projects) != 0 {
 		t.Fatalf("DefaultConfig().Projects len = %d, want 0", len(config.Projects))
 	}
+}
+
+func TestNormalizeMergesPartialWorktreeCleanupConfig(t *testing.T) {
+	enabled := true
+	retentionDays := 14
+	cfg, err := Normalize(t.TempDir(), PartialConfig{Daemon: &PartialDaemonConfig{WorktreeCleanup: &PartialWorktreeCleanupConfig{Enabled: &enabled, RetentionDays: &retentionDays}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if !cfg.Daemon.WorktreeCleanup.Enabled {
+		t.Fatal("Normalize().Daemon.WorktreeCleanup.Enabled = false, want true")
+	}
+	if cfg.Daemon.WorktreeCleanup.RetentionDays != 14 {
+		t.Fatalf("Normalize().Daemon.WorktreeCleanup.RetentionDays = %d, want 14", cfg.Daemon.WorktreeCleanup.RetentionDays)
+	}
+	if cfg.Daemon.WorktreeCleanup.Interval != "24h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 10 || !cfg.Daemon.WorktreeCleanup.DryRun {
+		t.Fatalf("Normalize().Daemon.WorktreeCleanup = %#v, want unspecified defaults preserved", cfg.Daemon.WorktreeCleanup)
+	}
+}
+
+func TestValidateWorktreeCleanupConfig(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Daemon.LogDir = t.TempDir()
+	cfg.Daemon.WorkingDirectory = t.TempDir()
+	cfg.Daemon.WorktreeCleanup.Interval = "not-a-duration"
+	cfg.Daemon.WorktreeCleanup.RetentionDays = -1
+	cfg.Daemon.WorktreeCleanup.MaxPerTick = 0
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want validation error")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("ValidateWithOptions() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.interval", "must be a positive duration")
+	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.retentionDays", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.maxPerTick", "must be a positive integer")
 }
 
 func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {

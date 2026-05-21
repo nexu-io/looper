@@ -151,6 +151,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Daemon.WorkingDirectory == "" {
 		issues = append(issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
+	validateWorktreeCleanupConfig(config.Daemon.WorktreeCleanup, "daemon.worktreeCleanup", &issues)
 
 	if strings.TrimSpace(config.Package.Distribution) == "" {
 		issues = append(issues, ValidationIssue{Path: "package.distribution", Message: "must be a non-empty string"})
@@ -376,6 +377,20 @@ func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]Va
 	parsed, err := url.Parse(config.PublicBaseURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		*issues = append(*issues, ValidationIssue{Path: path + ".publicBaseUrl", Message: "must be a valid https URL with a host when webhook mode is tunnel"})
+	}
+}
+
+func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, issues *[]ValidationIssue) {
+	if strings.TrimSpace(config.Interval) == "" {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a non-empty duration string"})
+	} else if duration, err := time.ParseDuration(config.Interval); err != nil || duration <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a positive duration"})
+	}
+	if config.RetentionDays < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must be an integer >= 0"})
+	}
+	if config.MaxPerTick < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
 	}
 }
 

@@ -288,29 +288,6 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 
 }
 
-func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branch, baseBranch string) (string, error) {
-	hasRemote, err := g.hasRemote(ctx, repoPath, "origin")
-	if err != nil {
-		return "", err
-	}
-	if !hasRemote {
-		return baseBranch, nil
-	}
-
-	remoteBranchExists, err := g.remoteBranchExists(ctx, repoPath, "origin", branch)
-	if err != nil {
-		return "", err
-	}
-	if !remoteBranchExists {
-		return baseBranch, nil
-	}
-	remoteRef := "refs/remotes/origin/" + branch
-	if err := g.runGit(ctx, repoPath, nil, "fetch", "origin", fmt.Sprintf("+refs/heads/%s:%s", branch, remoteRef)); err != nil {
-		return "", err
-	}
-	return "origin/" + branch, nil
-}
-
 func (g *Gateway) ListWorktrees(ctx context.Context, repoPath string) ([]WorktreeListEntry, error) {
 	result, err := g.runGitResult(ctx, repoPath, nil, "worktree", "list", "--porcelain")
 	if err != nil {
@@ -738,6 +715,26 @@ func (g *Gateway) resolveDetachedStartPoint(ctx context.Context, input CreateWor
 	return "", fmt.Errorf("resolve detached start point: no local or remote ref found for branch %q or base branch %q", input.Branch, input.BaseBranch)
 }
 
+func (g *Gateway) resolveAttachedStartPoint(ctx context.Context, repoPath, branch, baseBranch string) (string, error) {
+	startPoint, ok, err := g.resolveDetachedStartPointRef(ctx, repoPath, branch)
+	if err == nil && ok {
+		return startPoint, nil
+	}
+
+	startPoint, ok, err = g.resolveDetachedStartPointRef(ctx, repoPath, baseBranch)
+	if err != nil {
+		branchExists, branchErr := g.branchExists(ctx, repoPath, baseBranch)
+		if branchErr == nil && branchExists {
+			return baseBranch, nil
+		}
+		return "", err
+	}
+	if ok {
+		return startPoint, nil
+	}
+	return "", fmt.Errorf("resolve attached start point: no local or remote ref found for base branch %q", baseBranch)
+}
+
 func (g *Gateway) resolveDetachedStartPointRef(ctx context.Context, repoPath, branch string) (string, bool, error) {
 	remote := "origin"
 	hasRemote, err := g.hasRemote(ctx, repoPath, remote)
@@ -750,7 +747,8 @@ func (g *Gateway) resolveDetachedStartPointRef(ctx context.Context, repoPath, br
 			return "", false, err
 		}
 		if remoteHeadSHA != "" {
-			if err := g.runGit(ctx, repoPath, nil, "fetch", remote, branch); err != nil {
+			remoteRef := fmt.Sprintf("refs/remotes/%s/%s", remote, branch)
+			if err := g.runGit(ctx, repoPath, nil, "fetch", remote, fmt.Sprintf("+refs/heads/%s:%s", branch, remoteRef)); err != nil {
 				return "", false, err
 			}
 
