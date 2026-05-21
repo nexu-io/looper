@@ -1025,6 +1025,7 @@ func (r *Runtime) maybeRunWorktreeCleanup(ctx context.Context, services Services
 		Repos:  services.Repositories,
 		Git:    gitGateway,
 		DryRun: cfg.DryRun,
+		Now:    r.now,
 	})
 	if err != nil {
 		return err

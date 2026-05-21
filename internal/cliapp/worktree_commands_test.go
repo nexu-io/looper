@@ -136,7 +136,7 @@ func TestWorktreeCleanupSkipsActiveLoopWorktree(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run(worktree cleanup --confirm) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if !strings.Contains(stdout, "skip\tactive_loop") {
+	if !strings.Contains(stdout, "skip\treferenced by running run") {
 		t.Fatalf("stdout = %q, want active loop skip", stdout)
 	}
 	requirePathExists(t, record.WorktreePath)
@@ -160,6 +160,13 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	cfg := map[string]any{
 		"storage": map[string]any{"dbPath": dbPath},
 		"tools":   map[string]any{"gitPath": "git"},
+		"daemon": map[string]any{
+			"worktreeCleanup": map[string]any{
+				"retentionDays":  0,
+				"maxPerTick":     10,
+				"includeOrphans": true,
+			},
+		},
 		"projects": []map[string]any{{
 			"id":           "project_1",
 			"name":         "Test Project",

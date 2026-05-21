@@ -2,13 +2,11 @@ package worktreecleanup
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
@@ -26,6 +24,7 @@ type Options struct {
 	Repos  *storage.Repositories
 	Git    GitGateway
 	DryRun bool
+	Now    func() time.Time
 }
 
 type Summary struct {
@@ -61,66 +60,101 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, fmt.Errorf("git gateway is required")
 	}
 
-	activeRefs, err := collectActiveReferences(ctx, options.Repos)
+	plan, err := (&Service{
+		Repos:  options.Repos,
+		Config: options.Config.Daemon.WorktreeCleanup,
+		Now:    options.Now,
+	}).Plan(ctx)
 	if err != nil {
 		return Result{}, err
 	}
 
-	result := Result{DryRun: options.DryRun}
+	projects := make(map[string]config.ProjectRefConfig, len(options.Config.Projects))
 	for _, project := range options.Config.Projects {
-		worktreeRoot := strings.TrimSpace(derefString(project.WorktreeRoot))
-		if worktreeRoot == "" {
-			worktreeRoot, err = config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
-			if err != nil {
-				return Result{}, err
-			}
-		}
+		projects[project.ID] = project
+	}
 
-		records, err := options.Repos.Worktrees.ListByProject(ctx, project.ID)
+	result := Result{DryRun: options.DryRun}
+	for _, decision := range plan.Decisions {
+		project, ok := projects[decision.Worktree.ProjectID]
+		if !ok {
+			result.Summary.Inspected++
+			result.Summary.Skipped++
+			result.Candidates = append(result.Candidates, Candidate{
+				ID:           decision.Worktree.ID,
+				ProjectID:    decision.Worktree.ProjectID,
+				RepoPath:     decision.Worktree.RepoPath,
+				WorktreePath: decision.Worktree.WorktreePath,
+				Branch:       decision.Worktree.Branch,
+				Action:       "skip",
+				Reason:       "project_not_configured",
+			})
+			continue
+		}
+		worktreeRoot, err := worktreeRootForProject(project)
 		if err != nil {
 			return Result{}, err
 		}
-		sort.Slice(records, func(i, j int) bool {
-			if records[i].ProjectID != records[j].ProjectID {
-				return records[i].ProjectID < records[j].ProjectID
-			}
-			return records[i].WorktreePath < records[j].WorktreePath
-		})
-		for _, record := range records {
-			candidate := inspectCandidate(ctx, options.Git, record, worktreeRoot, activeRefs)
-			result.Summary.Inspected++
-			if candidate.Action == "clean" {
-				result.Summary.Eligible++
-				if !options.DryRun {
-					if err := options.Git.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{
-						ProjectID:         record.ProjectID,
-						RepoPath:          record.RepoPath,
-						WorktreeRoot:      worktreeRoot,
-						WorktreePath:      record.WorktreePath,
-						Branch:            record.Branch,
-						ProtectedBranches: protectedBranches(project),
-					}); err != nil {
-						candidate.Action = "error"
-						candidate.Reason = "cleanup_failed"
-						candidate.Error = err.Error()
-						result.Summary.Errors++
-					} else {
-						result.Summary.Cleaned++
-					}
-				}
-			} else if candidate.Action == "error" {
-				result.Summary.Errors++
-			} else {
-				result.Summary.Skipped++
-			}
+		candidate := candidateFromDecision(decision)
+		result.Summary.Inspected++
+		if decision.Action != ActionWouldClean {
+			result.Summary.Skipped++
 			result.Candidates = append(result.Candidates, candidate)
+			continue
 		}
+
+		candidate = inspectCandidate(ctx, options.Git, decision.Worktree, worktreeRoot)
+		if candidate.Action == "clean" {
+			result.Summary.Eligible++
+			if !options.DryRun {
+				if err := options.Git.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{
+					ProjectID:         decision.Worktree.ProjectID,
+					RepoPath:          decision.Worktree.RepoPath,
+					WorktreeRoot:      worktreeRoot,
+					WorktreePath:      decision.Worktree.WorktreePath,
+					Branch:            decision.Worktree.Branch,
+					ProtectedBranches: protectedBranches(project),
+				}); err != nil {
+					candidate.Action = "error"
+					candidate.Reason = "cleanup_failed"
+					candidate.Error = err.Error()
+					result.Summary.Errors++
+				} else {
+					result.Summary.Cleaned++
+				}
+			}
+		} else if candidate.Action == "error" {
+			result.Summary.Errors++
+		} else {
+			result.Summary.Skipped++
+		}
+		result.Candidates = append(result.Candidates, candidate)
 	}
 
 	return result, nil
 }
 
-func inspectCandidate(ctx context.Context, git GitGateway, record storage.WorktreeRecord, worktreeRoot string, activeRefs activeReferences) Candidate {
+func candidateFromDecision(decision Decision) Candidate {
+	return Candidate{
+		ID:           decision.Worktree.ID,
+		ProjectID:    decision.Worktree.ProjectID,
+		RepoPath:     decision.Worktree.RepoPath,
+		WorktreePath: decision.Worktree.WorktreePath,
+		Branch:       decision.Worktree.Branch,
+		Action:       "skip",
+		Reason:       decision.Reason,
+	}
+}
+
+func worktreeRootForProject(project config.ProjectRefConfig) (string, error) {
+	worktreeRoot := strings.TrimSpace(derefString(project.WorktreeRoot))
+	if worktreeRoot != "" {
+		return worktreeRoot, nil
+	}
+	return config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+}
+
+func inspectCandidate(ctx context.Context, git GitGateway, record storage.WorktreeRecord, worktreeRoot string) Candidate {
 	candidate := Candidate{
 		ID:           record.ID,
 		ProjectID:    record.ProjectID,
@@ -131,10 +165,6 @@ func inspectCandidate(ctx context.Context, git GitGateway, record storage.Worktr
 	}
 	if record.Status == "cleaned" || record.CleanedAt != nil {
 		candidate.Reason = "already_cleaned"
-		return candidate
-	}
-	if activeRefs.references(record) {
-		candidate.Reason = "active_loop"
 		return candidate
 	}
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: record.WorktreePath, RepoPath: record.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
@@ -168,100 +198,12 @@ func inspectCandidate(ctx context.Context, git GitGateway, record storage.Worktr
 	return candidate
 }
 
-type activeReferences struct {
-	ids   map[string]struct{}
-	paths map[string]struct{}
-}
-
-func collectActiveReferences(ctx context.Context, repos *storage.Repositories) (activeReferences, error) {
-	refs := activeReferences{ids: map[string]struct{}{}, paths: map[string]struct{}{}}
-	if repos.Loops == nil || repos.Runs == nil {
-		return refs, nil
-	}
-	loops, err := repos.Loops.List(ctx)
-	if err != nil {
-		return refs, err
-	}
-	for _, loop := range loops {
-		latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
-		if err != nil {
-			return refs, err
-		}
-		if isTerminalLoop(loop.Status) && (latestRun == nil || latestRun.Status != "running") {
-			continue
-		}
-		collectJSONStringRefs(loop.MetadataJSON, refs)
-		if latestRun != nil {
-			collectJSONStringRefs(latestRun.CheckpointJSON, refs)
-		}
-	}
-	return refs, nil
-}
-
-func collectJSONStringRefs(raw *string, refs activeReferences) {
-	if raw == nil || strings.TrimSpace(*raw) == "" {
-		return
-	}
-	var decoded any
-	if err := json.Unmarshal([]byte(*raw), &decoded); err != nil {
-		return
-	}
-	walkJSON(decoded, "", refs)
-}
-
-func walkJSON(value any, key string, refs activeReferences) {
-	switch typed := value.(type) {
-	case map[string]any:
-		for childKey, child := range typed {
-			walkJSON(child, childKey, refs)
-		}
-	case []any:
-		for _, child := range typed {
-			walkJSON(child, key, refs)
-		}
-	case string:
-		switch key {
-		case "id":
-			if strings.HasPrefix(typed, "worktree") {
-				refs.ids[typed] = struct{}{}
-			}
-		case "path", "worktreePath":
-			refs.paths[normalizePath(typed)] = struct{}{}
-		}
-	}
-}
-
-func (r activeReferences) references(record storage.WorktreeRecord) bool {
-	if _, ok := r.ids[record.ID]; ok {
-		return true
-	}
-	_, ok := r.paths[normalizePath(record.WorktreePath)]
-	return ok
-}
-
-func isTerminalLoop(status string) bool {
-	switch status {
-	case "completed", "failed", "interrupted", "terminated", "stopped":
-		return true
-	default:
-		return false
-	}
-}
-
 func protectedBranches(project config.ProjectRefConfig) []string {
 	branches := []string{}
 	if base := strings.TrimSpace(derefString(project.BaseBranch)); base != "" {
 		branches = append(branches, base)
 	}
 	return branches
-}
-
-func normalizePath(path string) string {
-	cleaned := filepath.Clean(strings.TrimSpace(path))
-	if abs, err := filepath.Abs(cleaned); err == nil {
-		return abs
-	}
-	return cleaned
 }
 
 func derefString(value *string) string {
