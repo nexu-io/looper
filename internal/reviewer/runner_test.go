@@ -127,6 +127,35 @@ func TestDiscoverPullRequestRoutedModeRequiresMatchingTargetLabel(t *testing.T) 
 	}
 }
 
+func TestDiscoverPullRequestsRoutedModeSelfReviewLoginRefreshFailureSkipsWithoutError(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	autoDiscovery := true
+	enableSelfReview := true
+	requireReviewRequest := false
+	github := &fakeGitHubGateway{author: "new-user", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{"looper:target:red"}, reviewRequests: []string{}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "stale-user", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:      "project_1",
+			Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+			Roles:   &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery, Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 2 {
+		t.Fatalf("result = %#v, want self-review bypass refresh failure skipped without loop", result)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
+	}
+}
+
 func TestRunFilterStepSkipsRoutedPullRequestWhenReviewRequestRemoved(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -161,6 +190,33 @@ func TestRunFilterStepAllowsRoutedSelfReviewWithoutReviewRequest(t *testing.T) {
 	}
 	if checkpoint.SkipKind != "" || checkpoint.SkipReason != "" {
 		t.Fatalf("checkpoint = %#v, want routed self-review allowed without skip", checkpoint)
+	}
+}
+
+func TestRunFilterStepSkipsRoutedSelfReviewWhenLoginRefreshFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	enableSelfReview := true
+	requireReviewRequest := false
+	github := &fakeGitHubGateway{currentLoginErr: fmt.Errorf("gh auth failed")}
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:      "project_1",
+			Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+			Roles:   &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", Author: "reviewer", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "routed_claim_ineligible" || !strings.Contains(checkpoint.SkipReason, "local GitHub identity is not requested for review") {
+		t.Fatalf("checkpoint = %#v, want routed denial preserved on login refresh failure", checkpoint)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
 	}
 }
 

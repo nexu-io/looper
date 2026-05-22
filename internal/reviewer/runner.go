@@ -1160,7 +1160,7 @@ func (r *Runner) routedReviewerClaimDecisionWithCurrentLogin(ctx context.Context
 		}
 		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, cwd)
 		if err != nil {
-			return networkpolicy.ClaimDecision{}, currentLogin, err
+			return decision, currentLogin, nil
 		}
 		currentLogin = normalizeLogin(lookupLogin)
 	}
