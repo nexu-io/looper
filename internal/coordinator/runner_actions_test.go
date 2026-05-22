@@ -338,6 +338,22 @@ func TestRunnerHumanDispatchOrdersAssignLabelReact(t *testing.T) {
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:looper:plan", "react:+1:11"})
 }
 
+func TestRunnerHumanDispatchAllowsCurrentAuthenticatedBotAuthor(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.runner.config.Roles.Coordinator.Enabled = true
+	fixture.runner.config.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+	fixture.github.currentLogin = "looper-sandbox-e2e[bot]"
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged", "dispatch/plan"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339), Labels: []string{"triaged", "dispatch/plan"}, Comments: []githubinfra.CommentInfo{{ID: 11, Author: "looper-sandbox-e2e[bot]", AuthorAssociation: "NONE", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.comments[1] = [][]githubinfra.CommentInfo{{{ID: 11, Author: "looper-sandbox-e2e[bot]", AuthorAssociation: "NONE", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339)}}}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Add(-time.Hour).Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:looper:plan", "react:+1:11"})
+}
+
 func TestRunnerDispatchFailureDedupesMarkedComment(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)
