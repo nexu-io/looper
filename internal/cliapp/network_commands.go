@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -266,7 +268,10 @@ func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMemb
 	}
 	remote, err := client.New(state.URL, state.NodeToken, r.httpClient()).Status(ctx)
 	if err != nil {
-		return networkMembersOutput{}, fmt.Errorf("network members requires a reachable loopernet status endpoint")
+		if isNetworkStatusReachabilityError(err) {
+			return networkMembersOutput{}, fmt.Errorf("network members requires a reachable loopernet status endpoint: %w", err)
+		}
+		return networkMembersOutput{}, err
 	}
 	leaseHolder := findMembershipByNodeID(remote.Memberships, remote.Lease.HolderNodeID)
 	output := networkMembersOutput{
@@ -305,6 +310,18 @@ func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMemb
 		output.NetworkID = state.NetworkID
 	}
 	return output, nil
+}
+
+func isNetworkStatusReachabilityError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func (r *commandRuntime) loadNetworkState() (client.LocalState, string, error) {

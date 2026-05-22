@@ -224,8 +224,43 @@ func TestNetworkMembersRequiresReachableStatusEndpoint(t *testing.T) {
 	if stdout != "" {
 		t.Fatalf("stdout = %q, want empty", stdout)
 	}
-	if got := stderr; got == "" || !strings.Contains(got, "network members requires a reachable loopernet status endpoint") {
-		t.Fatalf("stderr = %q, want reachable-endpoint error", got)
+	if got := stderr; got == "" || !strings.Contains(got, "network members requires a reachable loopernet status endpoint") || !strings.Contains(got, "connection refused") {
+		t.Fatalf("stderr = %q, want reachable-endpoint error with underlying cause", got)
+	}
+}
+
+func TestNetworkMembersPreservesStatusEndpointAuthErrors(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"node token revoked"}`))
+	}))
+	defer server.Close()
+
+	if err := client.SaveState(filepath.Join(homeDir, ".looper", "network.json"), client.LocalState{
+		URL:       server.URL,
+		NetworkID: "net-1",
+		NodeID:    "node-1",
+		NodeName:  "worker-1",
+		NodeToken: "node-token",
+		GitHub:    protocol.GitHubIdentity{Login: "mrcfps", NumericID: 23410977},
+	}); err != nil {
+		t.Fatalf("SaveState() error = %v", err)
+	}
+
+	app := New(Deps{HomeDir: homeDir})
+	exitCode, stdout, stderr := runAppWithDeps(t, app, []string{"network", "members"})
+	if exitCode == 0 {
+		t.Fatalf("Run(network members) exit code = 0, want non-zero")
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if got := stderr; got == "" || !strings.Contains(got, "node token revoked") || strings.Contains(got, "requires a reachable loopernet status endpoint") {
+		t.Fatalf("stderr = %q, want preserved auth error without reachability wrapper", got)
 	}
 }
 
