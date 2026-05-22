@@ -4988,6 +4988,11 @@ func newTestFixture(t *testing.T) testFixture {
 	t.Helper()
 
 	rootDir := t.TempDir()
+	homeDir := t.TempDir()
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", homeDir, err)
+	}
+	t.Setenv("HOME", homeDir)
 	cfg, err := config.DefaultConfig(rootDir)
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -5407,22 +5412,6 @@ func normalizeResponseValue(value any, rootDir string) any {
 		normalized := make(map[string]any, len(typed))
 		for key, item := range typed {
 			normalized[key] = normalizeResponseValue(item, rootDir)
-		}
-		if _, hasConfigured := normalized["configured"]; hasConfigured {
-			_, hasIdentityDrift := normalized["identityDrift"]
-			_, hasRoutedProjects := normalized["routedProjects"]
-			_, hasLocalProjects := normalized["localProjects"]
-			_, hasGitHub := normalized["github"]
-			_, hasCurrentGitHub := normalized["currentGithub"]
-			_, hasLease := normalized["lease"]
-			if cloudReachable, ok := normalized["cloudReachable"].(bool); ok && !cloudReachable && hasIdentityDrift && hasRoutedProjects && hasLocalProjects && hasGitHub && hasCurrentGitHub && hasLease {
-				normalized["configured"] = false
-				normalized["github"] = map[string]any{"numericId": float64(0)}
-				normalized["currentGithub"] = map[string]any{"numericId": float64(0)}
-				delete(normalized, "networkId")
-				delete(normalized, "nodeId")
-				delete(normalized, "nodeName")
-			}
 		}
 		return normalized
 	case []any:
