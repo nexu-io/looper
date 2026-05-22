@@ -375,6 +375,26 @@ func TestRunnerCommentHasWriteAccessUsesCacheBeforeCurrentUserLookup(t *testing.
 	}
 }
 
+func TestRunnerCommentHasWriteAccessFallsBackToRepositoryPermissionWhenCurrentUserLookupFails(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.github.currentLoginErr = errors.New("boom")
+
+	allowed, err := fixture.runner.commentHasWriteAccess(context.Background(), "acme/looper", "", "octo", map[string]bool{}, dispatch.Config{})
+	if err != nil {
+		t.Fatalf("commentHasWriteAccess() error = %v", err)
+	}
+	if !allowed {
+		t.Fatal("commentHasWriteAccess() allowed = false, want true")
+	}
+	if fixture.github.currentLoginForRepoCalls != 1 {
+		t.Fatalf("GetCurrentUserLoginForRepo calls = %d, want 1", fixture.github.currentLoginForRepoCalls)
+	}
+	if fixture.github.permissionCalls != 1 {
+		t.Fatalf("GetRepositoryPermission calls = %d, want 1", fixture.github.permissionCalls)
+	}
+}
+
 func TestRunnerDispatchFailureDedupesMarkedComment(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t)

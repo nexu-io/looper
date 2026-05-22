@@ -1746,10 +1746,7 @@ func (r *Runner) commentHasWriteAccess(ctx context.Context, repo, cwd, author st
 		return allowed, nil
 	}
 	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
-	if err != nil {
-		return false, err
-	}
-	if strings.EqualFold(strings.TrimSpace(currentLogin), author) {
+	if err == nil && strings.EqualFold(strings.TrimSpace(currentLogin), author) {
 		cache[strings.ToLower(author)] = true
 		return true, nil
 	}
