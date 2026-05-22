@@ -257,27 +257,29 @@ func (r *commandRuntime) resolveNetworkStatus(ctx context.Context) (networkStatu
 }
 
 func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMembersOutput, error) {
-	status, err := r.resolveNetworkStatus(ctx)
+	state, _, err := r.loadNetworkState()
 	if err != nil {
+		if isNotExist(err) {
+			return networkMembersOutput{}, fmt.Errorf("network members requires a joined network")
+		}
 		return networkMembersOutput{}, err
 	}
-	if !status.Configured || status.Membership == nil {
-		return networkMembersOutput{}, fmt.Errorf("network members requires a joined network")
-	}
-	if !status.CloudReachable {
+	remote, err := client.New(state.URL, state.NodeToken, r.httpClient()).Status(ctx)
+	if err != nil {
 		return networkMembersOutput{}, fmt.Errorf("network members requires a reachable loopernet status endpoint")
 	}
+	leaseHolder := findMembershipByNodeID(remote.Memberships, remote.Lease.HolderNodeID)
 	output := networkMembersOutput{
-		NetworkID:       status.NetworkID,
-		CurrentNodeID:   status.Membership.NodeID,
-		CurrentNodeName: status.Membership.NodeName,
-		Warnings:        append([]string{}, status.Warnings...),
+		NetworkID:       remote.NetworkID,
+		CurrentNodeID:   remote.Membership.NodeID,
+		CurrentNodeName: remote.Membership.NodeName,
+		Warnings:        append([]string{}, remote.Warnings...),
 	}
-	if status.LeaseHolder != nil {
-		output.LeaseHolderNodeID = status.LeaseHolder.NodeID
-		output.LeaseHolderName = status.LeaseHolder.NodeName
+	if leaseHolder != nil {
+		output.LeaseHolderNodeID = leaseHolder.NodeID
+		output.LeaseHolderName = leaseHolder.NodeName
 	}
-	for _, member := range status.Memberships {
+	for _, member := range remote.Memberships {
 		summary := networkMemberSummary{
 			NodeID:                   member.NodeID,
 			NodeName:                 member.NodeName,
@@ -285,8 +287,8 @@ func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMemb
 			Roles:                    append([]string{}, member.Capabilities.Roles...),
 			RoutedProjects:           member.Capabilities.RoutedProjects,
 			LocalProjects:            member.Capabilities.LocalProjects,
-			Current:                  member.NodeID == status.Membership.NodeID,
-			LeaseHolder:              status.LeaseHolder != nil && member.NodeID == status.LeaseHolder.NodeID,
+			Current:                  member.NodeID == remote.Membership.NodeID,
+			LeaseHolder:              leaseHolder != nil && member.NodeID == leaseHolder.NodeID,
 			TargetLabels:             append([]string{}, member.TargetLabels...),
 			CoordinatorEligible:      member.Capabilities.CoordinatorEligible,
 			DynamicLoad:              member.Capabilities.DynamicLoad,
@@ -300,7 +302,7 @@ func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMemb
 		output.Members = append(output.Members, summary)
 	}
 	if strings.TrimSpace(output.NetworkID) == "" {
-		output.NetworkID = status.NetworkID
+		output.NetworkID = state.NetworkID
 	}
 	return output, nil
 }
