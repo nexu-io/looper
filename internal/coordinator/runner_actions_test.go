@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/coordinator/dispatch"
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -352,6 +353,26 @@ func TestRunnerHumanDispatchAllowsCurrentAuthenticatedBotAuthor(t *testing.T) {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
 	assertOrderedOps(t, fixture.github.ops, []string{"assign:octocat", "add:looper:plan", "react:+1:11"})
+}
+
+func TestRunnerCommentHasWriteAccessUsesCacheBeforeCurrentUserLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t)
+	fixture.github.currentLoginErr = errors.New("boom")
+
+	allowed, err := fixture.runner.commentHasWriteAccess(context.Background(), "acme/looper", "", "octo", map[string]bool{"octo": true}, dispatch.Config{})
+	if err != nil {
+		t.Fatalf("commentHasWriteAccess() error = %v", err)
+	}
+	if !allowed {
+		t.Fatal("commentHasWriteAccess() allowed = false, want true")
+	}
+	if fixture.github.currentLoginForRepoCalls != 0 {
+		t.Fatalf("GetCurrentUserLoginForRepo calls = %d, want 0", fixture.github.currentLoginForRepoCalls)
+	}
+	if fixture.github.permissionCalls != 0 {
+		t.Fatalf("GetRepositoryPermission calls = %d, want 0", fixture.github.permissionCalls)
+	}
 }
 
 func TestRunnerDispatchFailureDedupesMarkedComment(t *testing.T) {
@@ -1189,37 +1210,40 @@ func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (
 }
 
 type stubCoordinatorGitHub struct {
-	issues               []githubinfra.IssueSummary
-	details              map[int64]githubinfra.IssueDetail
-	comments             map[int64][][]githubinfra.CommentInfo
-	timeline             map[int64][]map[string]any
-	blockedBy            map[int64][]githubinfra.DependencyIssue
-	subIssues            map[int64][]githubinfra.DependencyIssue
-	linkedPullRequests   map[int64][]githubinfra.LinkedPullRequest
-	pullRequests         map[int64]githubinfra.PullRequestDetail
-	subIssueErr          map[int64]error
-	blockedByReads       int
-	blockedByIssueReads  int
-	permissionErr        error
-	ops                  []string
-	createdBodies        []string
-	updatedBodies        []string
-	commentReads         map[int64]int
-	failAddLabels        map[string]error
-	failBlockedByIssues  map[int64][]error
-	addedLabels          []githubinfra.IssueLabelsInput
-	removedLabels        []githubinfra.IssueLabelsInput
-	assigned             []githubinfra.IssueAssigneesInput
-	prDetails            map[int64]githubinfra.PullRequestDetail
-	failPRDetails        map[int64][]error
-	prCheckRuns          map[string]githubinfra.PullRequestCheckRuns
-	failPRCheckRuns      map[string]error
-	branchProtection     map[string]githubinfra.BranchProtection
-	failBranchProtection map[string]error
-	addedPRLabels        []githubinfra.PullRequestLabelsInput
-	removedPRLabels      []githubinfra.PullRequestLabelsInput
-	addedReviewers       []githubinfra.PullRequestReviewersInput
-	currentLogin         string
+	issues                   []githubinfra.IssueSummary
+	details                  map[int64]githubinfra.IssueDetail
+	comments                 map[int64][][]githubinfra.CommentInfo
+	timeline                 map[int64][]map[string]any
+	blockedBy                map[int64][]githubinfra.DependencyIssue
+	subIssues                map[int64][]githubinfra.DependencyIssue
+	linkedPullRequests       map[int64][]githubinfra.LinkedPullRequest
+	pullRequests             map[int64]githubinfra.PullRequestDetail
+	subIssueErr              map[int64]error
+	blockedByReads           int
+	blockedByIssueReads      int
+	permissionCalls          int
+	permissionErr            error
+	ops                      []string
+	createdBodies            []string
+	updatedBodies            []string
+	commentReads             map[int64]int
+	failAddLabels            map[string]error
+	failBlockedByIssues      map[int64][]error
+	addedLabels              []githubinfra.IssueLabelsInput
+	removedLabels            []githubinfra.IssueLabelsInput
+	assigned                 []githubinfra.IssueAssigneesInput
+	prDetails                map[int64]githubinfra.PullRequestDetail
+	failPRDetails            map[int64][]error
+	prCheckRuns              map[string]githubinfra.PullRequestCheckRuns
+	failPRCheckRuns          map[string]error
+	branchProtection         map[string]githubinfra.BranchProtection
+	failBranchProtection     map[string]error
+	addedPRLabels            []githubinfra.PullRequestLabelsInput
+	removedPRLabels          []githubinfra.PullRequestLabelsInput
+	addedReviewers           []githubinfra.PullRequestReviewersInput
+	currentLogin             string
+	currentLoginErr          error
+	currentLoginForRepoCalls int
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -1281,6 +1305,10 @@ func (s *stubCoordinatorGitHub) GetCurrentUserLogin(context.Context, string) (st
 	return "looper", nil
 }
 func (s *stubCoordinatorGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
+	s.currentLoginForRepoCalls++
+	if s.currentLoginErr != nil {
+		return "", s.currentLoginErr
+	}
 	if s.currentLogin != "" {
 		return s.currentLogin, nil
 	}
@@ -1290,6 +1318,7 @@ func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githu
 	return s.timeline[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input githubinfra.RepositoryPermissionInput) (string, error) {
+	s.permissionCalls++
 	if s.permissionErr != nil {
 		return "", s.permissionErr
 	}
