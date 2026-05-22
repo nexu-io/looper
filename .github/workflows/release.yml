@@ -669,22 +669,25 @@ jobs:
               assert len(sha) == 64 and all(c in "0123456789abcdef" for c in sha), f"artifact sha mismatch for {name}: {sha}"
           PY
 
-      - name: Publish GitHub release with assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare-go-release.outputs.release-tag }}
-          name: Looper ${{ needs.prepare-go-release.outputs.release-tag }}
-          draft: false
-          prerelease: ${{ needs.prepare-go-release.outputs.release-prerelease }}
-          body_path: release-notes-preface.md
-          generate_release_notes: true
-          files: |
-            release-assets/looper-darwin-arm64
-            release-assets/looper-darwin-arm64.sha256
-            release-assets/looper-darwin-arm64.tar.gz
-            release-assets/looper-darwin-arm64.tar.gz.sha256
-            release-assets/looperd-darwin-arm64
-            release-assets/looperd-darwin-arm64.sha256
-            release-assets/looperd-darwin-arm64.tar.gz
-            release-assets/looperd-darwin-arm64.tar.gz.sha256
-            release-assets/manifest.json
+      - name: Upload release assets to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            release-assets/looper-darwin-arm64 \
+            release-assets/looper-darwin-arm64.sha256 \
+            release-assets/looper-darwin-arm64.tar.gz \
+            release-assets/looper-darwin-arm64.tar.gz.sha256 \
+            release-assets/looperd-darwin-arm64 \
+            release-assets/looperd-darwin-arm64.sha256 \
+            release-assets/looperd-darwin-arm64.tar.gz \
+            release-assets/looperd-darwin-arm64.tar.gz.sha256 \
+            release-assets/manifest.json \
+            --clobber
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
