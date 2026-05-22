@@ -1,6 +1,7 @@
 package cliapp
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -322,6 +323,25 @@ func TestNetworkMembersIncludesLeaseHolderNodeIDWithoutActiveMembership(t *testi
 	}
 	if payload.LeaseHolderName != nil {
 		t.Fatalf("payload.LeaseHolderName = %q, want nil", *payload.LeaseHolderName)
+	}
+}
+
+func TestIsNetworkStatusReachabilityErrorIgnoresContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "canceled", err: context.Canceled},
+		{name: "deadline exceeded", err: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if isNetworkStatusReachabilityError(tc.err) {
+				t.Fatalf("isNetworkStatusReachabilityError(%v) = true, want false", tc.err)
+			}
+		})
 	}
 }
 

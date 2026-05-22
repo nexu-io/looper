@@ -314,7 +314,7 @@ func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMemb
 
 func isNetworkStatusReachabilityError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
+		return false
 	}
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
