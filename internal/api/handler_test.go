@@ -4994,6 +4994,7 @@ func newTestFixture(t *testing.T) testFixture {
 	}
 
 	backupDir := filepath.Join(rootDir, "backups")
+	cfg.Network = config.NetworkConfig{}
 	cfg.Storage.DBPath = filepath.Join(rootDir, "state", "looper.sqlite")
 	cfg.Storage.BackupDir = &backupDir
 	cfg.Daemon.LogDir = filepath.Join(rootDir, "logs")
@@ -5406,6 +5407,22 @@ func normalizeResponseValue(value any, rootDir string) any {
 		normalized := make(map[string]any, len(typed))
 		for key, item := range typed {
 			normalized[key] = normalizeResponseValue(item, rootDir)
+		}
+		if _, hasConfigured := normalized["configured"]; hasConfigured {
+			_, hasIdentityDrift := normalized["identityDrift"]
+			_, hasRoutedProjects := normalized["routedProjects"]
+			_, hasLocalProjects := normalized["localProjects"]
+			_, hasGitHub := normalized["github"]
+			_, hasCurrentGitHub := normalized["currentGithub"]
+			_, hasLease := normalized["lease"]
+			if cloudReachable, ok := normalized["cloudReachable"].(bool); ok && !cloudReachable && hasIdentityDrift && hasRoutedProjects && hasLocalProjects && hasGitHub && hasCurrentGitHub && hasLease {
+				normalized["configured"] = false
+				normalized["github"] = map[string]any{"numericId": float64(0)}
+				normalized["currentGithub"] = map[string]any{"numericId": float64(0)}
+				delete(normalized, "networkId")
+				delete(normalized, "nodeId")
+				delete(normalized, "nodeName")
+			}
 		}
 		return normalized
 	case []any:

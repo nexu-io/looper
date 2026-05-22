@@ -4465,6 +4465,79 @@ func TestNetworkJoinWithNoEnrollProjectsSkipsRoutedEnrollmentValidation(t *testi
 	}
 }
 
+func TestNetworkJoinIgnoresCLIOnlyFlagsWhenLoadingConfig(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.toml")
+	ghPath := filepath.Join(t.TempDir(), "gh")
+	projectPath := t.TempDir()
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"user\" ]; then\n  printf '{\"login\":\"worker-1\",\"id\":101}'\n  exit 0\nfi\nprintf 'unexpected gh invocation: %s\\n' \"$*\" >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	raw, err := config.MarshalConfigFile(configPath, config.PartialConfig{
+		Tools: &config.PartialToolPathsConfig{GHPath: stringPtr(ghPath)},
+		Roles: &config.PartialRoleConfigs{
+			Planner: &config.PartialPlannerRoleConfig{AutoDiscovery: boolPtr(false)},
+			Fixer:   &config.PartialFixerRoleConfig{AutoDiscovery: boolPtr(false)},
+		},
+		Projects: &[]config.PartialProjectRefConfig{{ID: "project-1", Name: "Repo", Path: projectPath}},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/join" {
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"networkId":"net-1","nodeId":"node-1","nodeToken":"node-token"}`))
+	}))
+	defer server.Close()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: homeDir, Getwd: func() (string, error) { return configDir, nil }}), []string{"network", "join", server.URL, "--key", "join-1", "--name", "worker-1", "--json", "--config", configPath})
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.Flags().String("key", "", "")
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().Bool("no-enroll-projects", false, "")
+	cmd.Flags().Bool("json", false, "")
+	if err := cmd.Flags().Set("key", "join-1"); err != nil {
+		t.Fatalf("set key flag: %v", err)
+	}
+	if err := cmd.Flags().Set("name", "worker-1"); err != nil {
+		t.Fatalf("set name flag: %v", err)
+	}
+	if err := cmd.Flags().Set("json", "true"); err != nil {
+		t.Fatalf("set json flag: %v", err)
+	}
+
+	if err := runtime.networkJoin(cmd, []string{server.URL}); err != nil {
+		t.Fatalf("networkJoin() error = %v", err)
+	}
+	assertJSONContains(t, stdout.String(), "networkId", "net-1")
+	updated, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !strings.Contains(string(updated), "mode = 'routed'") {
+		t.Fatalf("config = %s, want routed project mode written", string(updated))
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
 func TestNetworkJoinPreservesLocalStateWhenProjectEnrollmentRollbackLeaveFails(t *testing.T) {
 	homeDir := t.TempDir()
 	configDir := t.TempDir()
@@ -4632,6 +4705,44 @@ func TestNetworkLeaveRemovesLocalStateWhenProjectModeUpdateFails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(homeDir, ".looper", "network.json")); !os.IsNotExist(err) {
 		t.Fatalf("network state file still present: %v", err)
+	}
+}
+
+func TestResolveNetworkStatusIgnoresCLIOnlyFlagsWhenLoadingConfig(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.toml")
+	ghPath := filepath.Join(t.TempDir(), "gh")
+	projectPath := t.TempDir()
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"user\" ]; then\n  printf '{\"login\":\"worker-1\",\"id\":101}'\n  exit 0\nfi\nprintf 'unexpected gh invocation: %s\\n' \"$*\" >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	raw, err := config.MarshalConfigFile(configPath, config.PartialConfig{
+		Tools:    &config.PartialToolPathsConfig{GHPath: stringPtr(ghPath)},
+		Projects: &[]config.PartialProjectRefConfig{{ID: "project-1", Name: "Repo", Path: projectPath}},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{HomeDir: homeDir, Getwd: func() (string, error) { return configDir, nil }}), []string{"network", "status", "--verbose", "--json", "--config", configPath})
+	status, err := runtime.resolveNetworkStatus(context.Background())
+	if err != nil {
+		t.Fatalf("resolveNetworkStatus() error = %v", err)
+	}
+	if status.Configured {
+		t.Fatalf("status.Configured = true, want false without saved network state")
+	}
+	if status.CurrentGitHub.Login != "worker-1" || status.CurrentGitHub.NumericID != 101 {
+		t.Fatalf("status.CurrentGitHub = %#v, want fake gh identity", status.CurrentGitHub)
+	}
+	if status.LocalProjects != 1 || status.RoutedProjects != 0 {
+		t.Fatalf("project counts = (%d, %d), want (1, 0)", status.LocalProjects, status.RoutedProjects)
 	}
 }
 

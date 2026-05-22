@@ -102,7 +102,7 @@ func (r *commandRuntime) validateRoutedAutoEnrollment() error {
 	if err != nil {
 		return err
 	}
-	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: r.argv})
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: ExtractConfigArgs(r.argv)})
 	if err != nil {
 		return err
 	}
@@ -225,7 +225,7 @@ func (r *commandRuntime) currentGitHubIdentity(ctx context.Context) (protocol.Gi
 	if err != nil {
 		return protocol.GitHubIdentity{}, err
 	}
-	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: r.argv})
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: ExtractConfigArgs(r.argv)})
 	if err != nil {
 		return protocol.GitHubIdentity{}, err
 	}
@@ -242,7 +242,7 @@ func (r *commandRuntime) localProjectCountsAndIdentity(ctx context.Context) (loc
 	if cwdErr != nil {
 		return 0, 0, protocol.GitHubIdentity{}, cwdErr
 	}
-	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: r.argv})
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: ExtractConfigArgs(r.argv)})
 	if err != nil {
 		return 0, 0, protocol.GitHubIdentity{}, err
 	}
@@ -262,7 +262,7 @@ func (r *commandRuntime) updateAllProjectNetworkModes(mode config.ProjectNetwork
 	if err != nil {
 		return err
 	}
-	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: r.argv})
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: ExtractConfigArgs(r.argv)})
 	if err != nil {
 		return err
 	}

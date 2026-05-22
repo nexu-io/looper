@@ -774,6 +774,17 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range openPRs {
 		pr = resolveAuthor(pr)
+		if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
+			result.Skipped++
+			continue
+		}
+		if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+			_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+			currentLogin = resolvedLogin
+		}
 		if !prEligibleForDiscovery(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -784,6 +795,17 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range specPRs {
 		pr = resolveAuthor(pr)
+		if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
+			result.Skipped++
+			continue
+		}
+		if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+			_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+			currentLogin = resolvedLogin
+		}
 		if !prEligibleForDiscovery(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -869,6 +891,17 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 			}
 		}
 		return result, nil
+	}
+	if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
+		result.Skipped++
+		return result, nil
+	}
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentLogin = resolvedLogin
 	}
 	if !prEligibleForDiscovery(pr, currentLogin, policy) {
 		result.Skipped++
@@ -1042,6 +1075,19 @@ func (r *Runner) prEligibleForDiscovery(pr PullRequestSummary, currentLogin stri
 }
 
 func prEligibleForDiscovery(pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
+	if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
+		return false
+	}
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		decision := routedReviewerClaimDecision(policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+		if !decision.Allowed {
+			return false
+		}
+	}
+	return true
+}
+
+func prEligibleForDiscoveryPreclaim(pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
 	if !policy.IncludeDrafts && pr.IsDraft {
 		return false
 	}
@@ -1056,12 +1102,6 @@ func prEligibleForDiscovery(pr PullRequestSummary, currentLogin string, policy D
 	}
 	if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 		return false
-	}
-	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, pr.Labels, pr.ReviewRequestUsers)
-		if !decision.Allowed {
-			return false
-		}
 	}
 	return true
 }
@@ -1087,6 +1127,44 @@ func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy
 		return false
 	}
 	return normalizeLogin(author) != "" && normalizeLogin(author) == normalizeLogin(currentLogin)
+}
+
+func routedReviewerClaimDecision(policy DiscoveryPolicy, currentLogin string, author string, labels []string, reviewRequests []networkpolicy.GitHubUser) networkpolicy.ClaimDecision {
+	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, labels, reviewRequests)
+	if decision.Allowed {
+		return decision
+	}
+	if !policy.EnableSelfReview {
+		return decision
+	}
+	if decision.Reason != "local GitHub identity is not requested for review" {
+		return decision
+	}
+	if normalizeLogin(currentLogin) == "" {
+		return decision
+	}
+	if normalizeLogin(author) == "" || normalizeLogin(author) != normalizeLogin(currentLogin) {
+		return decision
+	}
+	return networkpolicy.ClaimDecision{Allowed: true, Reason: "", MatchMode: decision.MatchMode, TargetLabel: decision.TargetLabel}
+}
+
+func (r *Runner) routedReviewerClaimDecisionWithCurrentLogin(ctx context.Context, cwd string, policy DiscoveryPolicy, currentLogin string, author string, labels []string, reviewRequests []networkpolicy.GitHubUser) (networkpolicy.ClaimDecision, string, error) {
+	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, labels, reviewRequests)
+	if decision.Allowed || !policy.EnableSelfReview || decision.Reason != "local GitHub identity is not requested for review" {
+		return decision, currentLogin, nil
+	}
+	if normalizeLogin(currentLogin) == "" {
+		if r.github == nil {
+			return decision, currentLogin, nil
+		}
+		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, cwd)
+		if err != nil {
+			return networkpolicy.ClaimDecision{}, currentLogin, err
+		}
+		currentLogin = normalizeLogin(lookupLogin)
+	}
+	return routedReviewerClaimDecision(policy, currentLogin, author, labels, reviewRequests), currentLogin, nil
 }
 
 func prQueryLabels(labels []string) []string {
@@ -1424,7 +1502,10 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	if err != nil {
 		return err
 	}
-	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, detail.Labels, detail.ReviewRequestUsers)
+	decision, _, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
+	if err != nil {
+		return err
+	}
 	if !decision.Allowed {
 		return &loopError{message: fmt.Sprintf("Skipped routed pull request %s#%d: %s", *queueItem.Repo, *queueItem.PRNumber, decision.Reason), kind: FailureManualIntervention}
 	}
@@ -1556,8 +1637,17 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	currentLogin := ""
-	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		currentLogin = normalizeLogin(policy.RoutedClaimPolicy.GitHubLogin)
+	ensureCurrentLogin := func() error {
+		if currentLogin != "" {
+			return nil
+		}
+		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return err
+		}
+		currentLogin = normalizeLogin(lookupLogin)
+		checkpoint.Detail.CurrentLogin = currentLogin
+		return nil
 	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
@@ -1576,13 +1666,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && !policy.EnableSelfReview {
-		if currentLogin == "" && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
-			}
-			currentLogin = normalizeLogin(lookupLogin)
-			checkpoint.Detail.CurrentLogin = currentLogin
+		if err := ensureCurrentLogin(); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
 		if isSelfAuthoredPR(checkpoint.Detail.Author, currentLogin, policy) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped self-authored pull request %s#%d for reviewer %s", input.Repo, input.PRNumber, currentLogin)
@@ -1592,13 +1677,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && r.loopConfig.StopOnApproved {
-		if currentLogin == "" && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
-			}
-			currentLogin = normalizeLogin(lookupLogin)
-			checkpoint.Detail.CurrentLogin = currentLogin
+		if err := ensureCurrentLogin(); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
 		if r.loopConfig.StopOnApproved && hasApprovedReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
 			checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
@@ -1610,13 +1690,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
-		if currentLogin == "" && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
-			}
-			currentLogin = normalizeLogin(lookupLogin)
-			checkpoint.Detail.CurrentLogin = currentLogin
+		if err := ensureCurrentLogin(); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
 		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
@@ -1633,7 +1708,12 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Detail.HeadSHA)
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
+		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		currentLogin = resolvedLogin
+		checkpoint.Detail.CurrentLogin = currentLogin
 		if !decision.Allowed {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped routed pull request %s#%d: %s", input.Repo, input.PRNumber, decision.Reason)
 			checkpoint.SkipKind = "routed_claim_ineligible"
@@ -1642,13 +1722,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.RoutedClaimMatchMode = string(decision.MatchMode)
 	}
 	if requireReviewRequest && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		if currentLogin == "" {
-			lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
-			}
-			currentLogin = normalizeLogin(lookupLogin)
-			checkpoint.Detail.CurrentLogin = currentLogin
+		if err := ensureCurrentLogin(); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
 		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
 			if r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {

@@ -131,13 +131,108 @@ func TestRunFilterStepSkipsRoutedPullRequestWhenReviewRequestRemoved(t *testing.
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "reviewer"}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
 	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
 	if checkpoint.SkipKind != "routed_claim_ineligible" {
 		t.Fatalf("checkpoint = %#v, want routed_claim_ineligible skip", checkpoint)
+	}
+}
+
+func TestRunFilterStepAllowsRoutedSelfReviewWithoutReviewRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	enableSelfReview := true
+	requireReviewRequest := false
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:      "project_1",
+			Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+			Roles:   &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "reviewer"}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", Author: "reviewer", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "" || checkpoint.SkipReason != "" {
+		t.Fatalf("checkpoint = %#v, want routed self-review allowed without skip", checkpoint)
+	}
+}
+
+func TestRunFilterStepStillSkipsRoutedSelfReviewWithoutTargetLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	enableSelfReview := true
+	requireReviewRequest := false
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:      "project_1",
+			Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+			Roles:   &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", Author: "reviewer", HeadSHA: "abc123", Labels: []string{}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "routed_claim_ineligible" || !strings.Contains(checkpoint.SkipReason, "missing looper:target:<node_name> label") {
+		t.Fatalf("checkpoint = %#v, want routed target-label skip", checkpoint)
+	}
+}
+
+func TestRevalidateRoutedReviewerClaimAllowsSelfReviewWithoutReviewRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	enableSelfReview := true
+	requireReviewRequest := false
+	github := &fakeGitHubGateway{author: "reviewer", currentLogin: "reviewer", labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:       "project_1",
+			Name:     "Demo",
+			RepoPath: "/tmp/repo",
+			Network:  config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+			Roles:    &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{Repo: &repo, PRNumber: &prNumber}); err != nil {
+		t.Fatalf("revalidateRoutedReviewerClaim() error = %v", err)
+	}
+}
+
+func TestRevalidateRoutedReviewerClaimRequiresCurrentIdentityForSelfReviewBypass(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	enableSelfReview := true
+	requireReviewRequest := false
+	github := &fakeGitHubGateway{author: "reviewer", currentLogin: "someone-else", labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:       "project_1",
+			Name:     "Demo",
+			RepoPath: "/tmp/repo",
+			Network:  config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+			Roles:    &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{Repo: &repo, PRNumber: &prNumber})
+	if err == nil || !strings.Contains(err.Error(), "local GitHub identity is not requested for review") {
+		t.Fatalf("revalidateRoutedReviewerClaim() error = %v, want current-identity review-request failure", err)
 	}
 }
 
@@ -554,6 +649,35 @@ func TestDiscoverPullRequestsAllowsSelfAuthoredPullRequestsWhenEnableSelfReviewT
 	}
 	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 42 {
 		t.Fatalf("QueueItems = %#v, want self-authored PR queued when enableSelfReview=true", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsAllowsRoutedSelfAuthoredPullRequestsWhenEnableSelfReviewTrue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	enableSelfReview := true
+	requireReviewRequest := false
+	github := &fakeGitHubGateway{currentLogin: "octocat", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "octocat", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}}}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Network = config.NetworkConfig{NodeName: "red", GitHubLogin: "octocat", GitHubUserID: 42}
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID:       "project_1",
+		Name:     "Demo",
+		RepoPath: t.TempDir(),
+		Network:  config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+		Roles:    &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 42 {
+		t.Fatalf("QueueItems = %#v, want routed self-authored PR queued when self-review is enabled", result.QueueItems)
 	}
 }
 
@@ -1436,6 +1560,32 @@ func TestRunFilterStepSkipsSelfAuthoredPullRequestByDefault(t *testing.T) {
 	}
 }
 
+func TestRunFilterStepRoutedModeRefreshesCurrentLoginBeforeSelfAuthoredCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "new-user"}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Network = config.NetworkConfig{NodeName: "red", GitHubLogin: "stale-user", GitHubUserID: 42}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	repo := "acme/looper"
+	prNumber := int64(42)
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "new-user", Labels: []string{"looper:target:red"}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "new-user", ID: 42}}}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "self_authored" {
+		t.Fatalf("SkipKind = %q, want self_authored", checkpoint.SkipKind)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
+	}
+}
+
 func TestRunFilterStepRefreshesCurrentLoginBeforeAlreadyReviewedCheck(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1489,6 +1639,33 @@ func TestRunFilterStepSkipsApprovedCurrentHeadWithoutTerminating(t *testing.T) {
 	}
 	if updated.Status == "terminated" {
 		t.Fatalf("loop status = %q, want not terminated", updated.Status)
+	}
+}
+
+func TestRunFilterStepRoutedModeSkipsAlreadyReviewedHeadByCurrentUser(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "reviewer"}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Network = config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	reviews := []map[string]any{{"author": map[string]any{"login": "reviewer"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
+
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "octocat", Labels: []string{"looper:target:red"}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "reviewer", ID: 42}}, Reviews: reviews}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "already_reviewed_by_current_user" {
+		t.Fatalf("SkipKind = %q, want already_reviewed_by_current_user", checkpoint.SkipKind)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
 	}
 }
 

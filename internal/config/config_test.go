@@ -162,6 +162,52 @@ func TestReadConfigFileMatchesTopLevelKeysCaseInsensitively(t *testing.T) {
 	}
 }
 
+func TestLoadFileDecodesTopLevelNetworkSectionForRoutedProjects(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"network": {
+			"enrolled": true,
+			"loopernetBaseUrl": "https://loopernet.example.test",
+			"nodeName": "worker-1",
+			"githubLogin": "mrcfps",
+			"githubUserId": 23410977
+		},
+		"projects": [
+			{
+				"id": "sandbox",
+				"name": "sandbox",
+				"repoPath": "/tmp/sandbox",
+				"network": {"mode": "routed"},
+				"roles": {
+					"planner": {"autoDiscovery": false},
+					"fixer": {"autoDiscovery": false}
+				}
+			}
+		]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if !loaded.Config.Network.Enrolled {
+		t.Fatal("LoadFile().Config.Network.Enrolled = false, want true")
+	}
+	if got := loaded.Config.Network.LoopernetBaseURL; got != "https://loopernet.example.test" {
+		t.Fatalf("LoadFile().Config.Network.LoopernetBaseURL = %q, want %q", got, "https://loopernet.example.test")
+	}
+	if got := loaded.Config.Network.NodeName; got != "worker-1" {
+		t.Fatalf("LoadFile().Config.Network.NodeName = %q, want %q", got, "worker-1")
+	}
+	if loaded.Partial.Network == nil || loaded.Partial.Network.GitHubLogin == nil || *loaded.Partial.Network.GitHubLogin != "mrcfps" {
+		t.Fatalf("LoadFile().Partial.Network = %#v, want githubLogin mrcfps", loaded.Partial.Network)
+	}
+}
+
 func TestReadConfigFileMergesDuplicateTopLevelSectionsInEncounterOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	contents := `{"SERVER":{"host":"0.0.0.0"},"Server":{"port":8123}}`

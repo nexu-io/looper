@@ -356,6 +356,9 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 		{key: "webhook", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "webhook", &partialConfig.Webhook)
 		}},
+		{key: "network", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "network", &partialConfig.Network)
+		}},
 		{key: "agent", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "agent", &partialConfig.Agent)
 		}},
