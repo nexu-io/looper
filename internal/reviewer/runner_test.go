@@ -3,6 +3,7 @@ package reviewer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -289,6 +290,35 @@ func TestRevalidateRoutedReviewerClaimRequiresCurrentIdentityForSelfReviewBypass
 	err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{Repo: &repo, PRNumber: &prNumber})
 	if err == nil || !strings.Contains(err.Error(), "local GitHub identity is not requested for review") {
 		t.Fatalf("revalidateRoutedReviewerClaim() error = %v, want current-identity review-request failure", err)
+	}
+}
+
+func TestRevalidateRoutedReviewerClaimTreatsLoginRefreshFailureAsTransient(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	enableSelfReview := true
+	requireReviewRequest := false
+	github := &fakeGitHubGateway{author: "reviewer", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:       "project_1",
+			Name:     "Demo",
+			RepoPath: "/tmp/repo",
+			Network:  config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+			Roles:    &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{Repo: &repo, PRNumber: &prNumber})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient || !strings.Contains(loopErr.message, "gh auth failed") {
+		t.Fatalf("revalidateRoutedReviewerClaim() error = %v, want transient login refresh failure", err)
+	}
+	if github.currentLoginCalls != 1 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
 	}
 }
 

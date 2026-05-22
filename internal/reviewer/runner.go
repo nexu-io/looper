@@ -1502,9 +1502,13 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	if err != nil {
 		return err
 	}
-	decision, _, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
-	if err != nil {
-		return err
+	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, detail.Labels, detail.ReviewRequestUsers)
+	if !decision.Allowed && policy.EnableSelfReview && decision.Reason == "local GitHub identity is not requested for review" {
+		currentLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if lookupErr != nil {
+			return &loopError{message: lookupErr.Error(), kind: FailureRetryableTransient}
+		}
+		decision = routedReviewerClaimDecision(policy, currentLogin, detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	}
 	if !decision.Allowed {
 		return &loopError{message: fmt.Sprintf("Skipped routed pull request %s#%d: %s", *queueItem.Repo, *queueItem.PRNumber, decision.Reason), kind: FailureManualIntervention}
