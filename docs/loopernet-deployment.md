@@ -90,7 +90,7 @@ docker run -d \
 
 ## Docker Compose example
 
-The repository also includes a ready-to-edit example at [`../docker-compose.loopernet.yml`](../docker-compose.loopernet.yml).
+The repository also includes ready-to-edit deploy assets at [`../deploy/loopernet/`](../deploy/loopernet/) including [`docker-compose.yml`](../deploy/loopernet/docker-compose.yml).
 
 ```yaml
 services:

@@ -497,7 +497,7 @@ jobs:
           ref: ${{ needs.prepare-go-release.outputs.release-commit }}
 
       - name: Verify loopernet Dockerfile exists
-        run: test -f Dockerfile.loopernet
+        run: test -f deploy/loopernet/Dockerfile
 
       - name: Derive image coordinates
         id: image
@@ -536,7 +536,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.loopernet
+          file: ./deploy/loopernet/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
