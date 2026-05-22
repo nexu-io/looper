@@ -270,13 +270,13 @@ func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMemb
 	}
 	leaseHolder := findMembershipByNodeID(remote.Memberships, remote.Lease.HolderNodeID)
 	output := networkMembersOutput{
-		NetworkID:       remote.NetworkID,
-		CurrentNodeID:   remote.Membership.NodeID,
-		CurrentNodeName: remote.Membership.NodeName,
-		Warnings:        append([]string{}, remote.Warnings...),
+		NetworkID:         remote.NetworkID,
+		CurrentNodeID:     remote.Membership.NodeID,
+		CurrentNodeName:   remote.Membership.NodeName,
+		LeaseHolderNodeID: remote.Lease.HolderNodeID,
+		Warnings:          append([]string{}, remote.Warnings...),
 	}
 	if leaseHolder != nil {
-		output.LeaseHolderNodeID = leaseHolder.NodeID
 		output.LeaseHolderName = leaseHolder.NodeName
 	}
 	for _, member := range remote.Memberships {

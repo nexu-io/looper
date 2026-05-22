@@ -229,6 +229,67 @@ func TestNetworkMembersRequiresReachableStatusEndpoint(t *testing.T) {
 	}
 }
 
+func TestNetworkMembersIncludesLeaseHolderNodeIDWithoutActiveMembership(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response := protocol.NodeStatusResponse{
+			NetworkID: "net-1",
+			Membership: protocol.Membership{
+				NodeID:   "node-1",
+				NodeName: "worker-1",
+				GitHub:   protocol.GitHubIdentity{Login: "mrcfps", NumericID: 23410977},
+			},
+			Memberships: []protocol.Membership{{
+				NodeID:   "node-1",
+				NodeName: "worker-1",
+				GitHub:   protocol.GitHubIdentity{Login: "mrcfps", NumericID: 23410977},
+			}},
+			Lease: protocol.CoordinatorLease{HolderNodeID: "node-2"},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	if err := client.SaveState(filepath.Join(homeDir, ".looper", "network.json"), client.LocalState{
+		URL:       server.URL,
+		NetworkID: "net-1",
+		NodeID:    "node-1",
+		NodeName:  "worker-1",
+		NodeToken: "node-token",
+		GitHub:    protocol.GitHubIdentity{Login: "mrcfps", NumericID: 23410977},
+	}); err != nil {
+		t.Fatalf("SaveState() error = %v", err)
+	}
+
+	app := New(Deps{HomeDir: homeDir})
+	exitCode, stdout, stderr := runAppWithDeps(t, app, []string{"network", "members", "--json"})
+	if exitCode != 0 {
+		t.Fatalf("Run(network members --json) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+
+	var payload struct {
+		LeaseHolderNodeID string  `json:"leaseHolderNodeId"`
+		LeaseHolderName   *string `json:"leaseHolderName"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("Unmarshal(stdout) error = %v\nstdout=%q", err, stdout)
+	}
+	if payload.LeaseHolderNodeID != "node-2" {
+		t.Fatalf("payload.LeaseHolderNodeID = %q, want %q", payload.LeaseHolderNodeID, "node-2")
+	}
+	if payload.LeaseHolderName != nil {
+		t.Fatalf("payload.LeaseHolderName = %q, want nil", *payload.LeaseHolderName)
+	}
+}
+
 func ptrTime(value time.Time) *time.Time {
 	return &value
 }
