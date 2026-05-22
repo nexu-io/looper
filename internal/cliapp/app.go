@@ -114,12 +114,13 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "network",
 				short:           "Network membership commands",
-				helpSubcommands: []helpSubcommand{{name: "join", description: "Join a loopernet network"}, {name: "leave", description: "Leave the current network"}, {name: "status", description: "Show network membership status"}},
+				helpSubcommands: []helpSubcommand{{name: "join", description: "Join a loopernet network"}, {name: "leave", description: "Leave the current network"}, {name: "status", description: "Show network membership status"}, {name: "members", description: "List joined network nodes"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "join <url>", short: "Join a loopernet network", args: cobra.ExactArgs(1), runE: runtime.networkJoin, localFlags: []flagSpec{stringFlag("key", "key", "One-time join key"), stringFlag("name", "name", "Node name"), boolFlag("no-enroll-projects", "Skip setting all local projects to network.mode=routed")}}),
 					newCommand(commandSpec{use: "leave", short: "Leave the current network", runE: runtime.networkLeave}),
 					newCommand(commandSpec{use: "status", short: "Show network membership status", runE: runtime.networkStatus, localFlags: []flagSpec{boolFlag("verbose", "Show extended membership details")}}),
+					newCommand(commandSpec{use: "members", short: "List joined network nodes", runE: runtime.networkMembers, localFlags: []flagSpec{boolFlag("verbose", "Show extended membership details")}}),
 				},
 			}),
 			newCommand(commandSpec{

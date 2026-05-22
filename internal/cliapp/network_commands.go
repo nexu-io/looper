@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -19,8 +20,10 @@ import (
 
 type networkStatusOutput struct {
 	Configured       bool                       `json:"configured"`
+	NetworkID        string                     `json:"networkId,omitempty"`
 	Membership       *protocol.Membership       `json:"membership,omitempty"`
 	LeaseHolder      *protocol.Membership       `json:"leaseHolder,omitempty"`
+	Memberships      []protocol.Membership      `json:"memberships,omitempty"`
 	NodeName         string                     `json:"nodeName,omitempty"`
 	GitHub           protocol.GitHubIdentity    `json:"github"`
 	CurrentGitHub    protocol.GitHubIdentity    `json:"currentGithub"`
@@ -34,6 +37,33 @@ type networkStatusOutput struct {
 	LeaseAction      string                     `json:"leaseAction,omitempty"`
 	LeaseError       string                     `json:"leaseError,omitempty"`
 	DriftReason      string                     `json:"driftReason,omitempty"`
+}
+
+type networkMembersOutput struct {
+	NetworkID         string                 `json:"networkId"`
+	CurrentNodeID     string                 `json:"currentNodeId,omitempty"`
+	CurrentNodeName   string                 `json:"currentNodeName,omitempty"`
+	LeaseHolderNodeID string                 `json:"leaseHolderNodeId,omitempty"`
+	LeaseHolderName   string                 `json:"leaseHolderNodeName,omitempty"`
+	Members           []networkMemberSummary `json:"members"`
+	Warnings          []string               `json:"warnings,omitempty"`
+}
+
+type networkMemberSummary struct {
+	NodeID                   string                  `json:"nodeId"`
+	NodeName                 string                  `json:"nodeName"`
+	GitHub                   protocol.GitHubIdentity `json:"github"`
+	Roles                    []string                `json:"roles,omitempty"`
+	RoutedProjects           int                     `json:"routedProjects"`
+	LocalProjects            int                     `json:"localProjects"`
+	LastHeartbeatAt          *string                 `json:"lastHeartbeatAt,omitempty"`
+	Current                  bool                    `json:"current,omitempty"`
+	LeaseHolder              bool                    `json:"leaseHolder,omitempty"`
+	TargetLabels             []string                `json:"targetLabels,omitempty"`
+	CoordinatorEligible      bool                    `json:"coordinatorEligible,omitempty"`
+	DynamicLoad              int                     `json:"dynamicLoad,omitempty"`
+	JoinedAt                 string                  `json:"joinedAt,omitempty"`
+	DuplicateIdentityWarning bool                    `json:"duplicateGithubIdentityWarning,omitempty"`
 }
 
 func (r *commandRuntime) networkJoin(cmd *cobra.Command, args []string) error {
@@ -168,6 +198,18 @@ func (r *commandRuntime) networkStatus(cmd *cobra.Command, args []string) error 
 	return writeHumanNetworkStatus(cmd.OutOrStdout(), status, getBoolFlag(cmd, "verbose"))
 }
 
+func (r *commandRuntime) networkMembers(cmd *cobra.Command, args []string) error {
+	_ = args
+	members, err := r.resolveNetworkMembers(cmd.Context())
+	if err != nil {
+		return err
+	}
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), members)
+	}
+	return writeHumanNetworkMembers(cmd.OutOrStdout(), members, getBoolFlag(cmd, "verbose"))
+}
+
 func (r *commandRuntime) resolveNetworkStatus(ctx context.Context) (networkStatusOutput, error) {
 	state, _, err := r.loadNetworkState()
 	if err != nil {
@@ -188,7 +230,7 @@ func (r *commandRuntime) resolveNetworkStatus(ctx context.Context) (networkStatu
 	if err != nil {
 		return networkStatusOutput{}, err
 	}
-	status := networkStatusOutput{Configured: true, NodeName: state.NodeName, GitHub: state.GitHub, CurrentGitHub: current, LocalProjects: local, RoutedProjects: routed}
+	status := networkStatusOutput{Configured: true, NetworkID: state.NetworkID, NodeName: state.NodeName, GitHub: state.GitHub, CurrentGitHub: current, LocalProjects: local, RoutedProjects: routed}
 	status.IdentityFallback = current.Login != "" && current.NumericID == 0
 	if drift, reason := githubIdentityDrift(state.GitHub, current); drift {
 		status.IdentityDrift = true
@@ -197,9 +239,13 @@ func (r *commandRuntime) resolveNetworkStatus(ctx context.Context) (networkStatu
 	remote, remoteErr := client.New(state.URL, state.NodeToken, r.httpClient()).Status(ctx)
 	if remoteErr == nil {
 		status.CloudReachable = true
+		if strings.TrimSpace(remote.NetworkID) != "" {
+			status.NetworkID = remote.NetworkID
+		}
 		status.Lease = &remote.Lease
 		membership := remote.Membership
 		status.Membership = &membership
+		status.Memberships = append([]protocol.Membership{}, remote.Memberships...)
 		status.LeaseHolder = findMembershipByNodeID(remote.Memberships, remote.Lease.HolderNodeID)
 		status.Warnings = append([]string{}, remote.Warnings...)
 		if remote.IdentityDrift {
@@ -208,6 +254,55 @@ func (r *commandRuntime) resolveNetworkStatus(ctx context.Context) (networkStatu
 		}
 	}
 	return status, nil
+}
+
+func (r *commandRuntime) resolveNetworkMembers(ctx context.Context) (networkMembersOutput, error) {
+	status, err := r.resolveNetworkStatus(ctx)
+	if err != nil {
+		return networkMembersOutput{}, err
+	}
+	if !status.Configured || status.Membership == nil {
+		return networkMembersOutput{}, fmt.Errorf("network members requires a joined network")
+	}
+	if !status.CloudReachable {
+		return networkMembersOutput{}, fmt.Errorf("network members requires a reachable loopernet status endpoint")
+	}
+	output := networkMembersOutput{
+		NetworkID:       status.NetworkID,
+		CurrentNodeID:   status.Membership.NodeID,
+		CurrentNodeName: status.Membership.NodeName,
+		Warnings:        append([]string{}, status.Warnings...),
+	}
+	if status.LeaseHolder != nil {
+		output.LeaseHolderNodeID = status.LeaseHolder.NodeID
+		output.LeaseHolderName = status.LeaseHolder.NodeName
+	}
+	for _, member := range status.Memberships {
+		summary := networkMemberSummary{
+			NodeID:                   member.NodeID,
+			NodeName:                 member.NodeName,
+			GitHub:                   member.GitHub,
+			Roles:                    append([]string{}, member.Capabilities.Roles...),
+			RoutedProjects:           member.Capabilities.RoutedProjects,
+			LocalProjects:            member.Capabilities.LocalProjects,
+			Current:                  member.NodeID == status.Membership.NodeID,
+			LeaseHolder:              status.LeaseHolder != nil && member.NodeID == status.LeaseHolder.NodeID,
+			TargetLabels:             append([]string{}, member.TargetLabels...),
+			CoordinatorEligible:      member.Capabilities.CoordinatorEligible,
+			DynamicLoad:              member.Capabilities.DynamicLoad,
+			JoinedAt:                 member.JoinedAt.Format(time.RFC3339),
+			DuplicateIdentityWarning: member.DuplicateWarning,
+		}
+		if member.LastHeartbeatAt != nil {
+			value := member.LastHeartbeatAt.Format(time.RFC3339)
+			summary.LastHeartbeatAt = &value
+		}
+		output.Members = append(output.Members, summary)
+	}
+	if strings.TrimSpace(output.NetworkID) == "" {
+		output.NetworkID = status.NetworkID
+	}
+	return output, nil
 }
 
 func (r *commandRuntime) loadNetworkState() (client.LocalState, string, error) {
@@ -334,7 +429,7 @@ func githubIdentityDrift(expected, current protocol.GitHubIdentity) (bool, strin
 }
 
 func writeHumanNetworkStatus(w io.Writer, status networkStatusOutput, verbose bool) error {
-	printSection(w, "Network", [][2]any{{"configured", status.Configured}, {"cloudReachable", status.CloudReachable}, {"nodeName", status.NodeName}, {"githubLogin", status.GitHub.Login}, {"githubNumericId", status.GitHub.NumericID}, {"currentGithubLogin", status.CurrentGitHub.Login}, {"currentGithubNumericId", status.CurrentGitHub.NumericID}, {"identityDrift", status.IdentityDrift}, {"routedProjects", status.RoutedProjects}, {"localProjects", status.LocalProjects}})
+	printSection(w, "Network", [][2]any{{"configured", status.Configured}, {"networkId", status.NetworkID}, {"cloudReachable", status.CloudReachable}, {"nodeName", status.NodeName}, {"githubLogin", status.GitHub.Login}, {"githubNumericId", status.GitHub.NumericID}, {"currentGithubLogin", status.CurrentGitHub.Login}, {"currentGithubNumericId", status.CurrentGitHub.NumericID}, {"identityDrift", status.IdentityDrift}, {"routedProjects", status.RoutedProjects}, {"localProjects", status.LocalProjects}})
 	if status.IdentityFallback {
 		fmt.Fprintln(w)
 		printSection(w, "Identity fallback", [][2]any{{"warning", "current GitHub identity is using login fallback because no numeric ID is available"}})
@@ -364,6 +459,51 @@ func writeHumanNetworkStatus(w io.Writer, status networkStatusOutput, verbose bo
 		printSection(w, "Warnings", entries)
 	}
 	return nil
+}
+
+func writeHumanNetworkMembers(w io.Writer, output networkMembersOutput, verbose bool) error {
+	printSection(w, "Network members", [][2]any{{"networkId", output.NetworkID}, {"currentNodeId", output.CurrentNodeID}, {"currentNodeName", output.CurrentNodeName}, {"leaseHolderNodeId", output.LeaseHolderNodeID}, {"leaseHolderNodeName", output.LeaseHolderName}, {"count", len(output.Members)}})
+	if len(output.Members) > 0 {
+		fmt.Fprintln(w)
+		rows := make([]tableRow, 0, len(output.Members))
+		for _, member := range output.Members {
+			rows = append(rows, tableRow{
+				"nodeId":        member.NodeID,
+				"node":          member.NodeName,
+				"github":        member.GitHub.Login,
+				"roles":         joinOrNone(member.Roles),
+				"routed":        member.RoutedProjects,
+				"local":         member.LocalProjects,
+				"lastHeartbeat": valueOrNone(member.LastHeartbeatAt),
+				"current":       member.Current,
+				"lease":         member.LeaseHolder,
+			})
+		}
+		printTable(w, []string{"nodeId", "node", "github", "roles", "routed", "local", "lastHeartbeat", "current", "lease"}, rows)
+	}
+	if verbose {
+		for index, member := range output.Members {
+			fmt.Fprintln(w)
+			rows := [][2]any{{"nodeId", member.NodeID}, {"nodeName", member.NodeName}, {"githubLogin", member.GitHub.Login}, {"githubNumericId", member.GitHub.NumericID}, {"current", member.Current}, {"leaseHolder", member.LeaseHolder}, {"roles", joinOrNone(member.Roles)}, {"routedProjects", member.RoutedProjects}, {"localProjects", member.LocalProjects}, {"lastHeartbeatAt", valueOrNone(member.LastHeartbeatAt)}, {"targetLabels", joinOrNone(member.TargetLabels)}, {"coordinatorEligible", member.CoordinatorEligible}, {"dynamicLoad", member.DynamicLoad}, {"joinedAt", member.JoinedAt}, {"duplicateGithubIdentityWarning", member.DuplicateIdentityWarning}}
+			printSection(w, fmt.Sprintf("Member %d", index+1), rows)
+		}
+	}
+	if len(output.Warnings) > 0 {
+		fmt.Fprintln(w)
+		entries := make([][2]any, 0, len(output.Warnings))
+		for index, warning := range output.Warnings {
+			entries = append(entries, [2]any{fmt.Sprintf("warning[%d]", index), warning})
+		}
+		printSection(w, "Warnings", entries)
+	}
+	return nil
+}
+
+func valueOrNone(value *string) string {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return "none"
+	}
+	return *value
 }
 
 func networkStringValue(value *string) string {
