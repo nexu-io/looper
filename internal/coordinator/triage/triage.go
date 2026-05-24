@@ -13,6 +13,7 @@ import (
 const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
 
 var tokenPattern = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_./-]{2,}`)
+var fencedJSONPattern = regexp.MustCompile("(?s)^```(?:json)?\\s*(.*?)\\s*```$")
 
 type Disposition string
 
@@ -175,7 +176,19 @@ func BuildPrompt(input Input) string {
 	b.WriteString(strings.Join(AllowedDispatches(), ", "))
 	b.WriteString("\nOutput schema:\n")
 	b.WriteString(`{"disposition":"valid|out-of-scope|unclear","comment":"string","labels":{"kind":["kind/..."],"area":["area/..."],"complexity":["complexity/..."],"dispatch":["dispatch/..."]}}`)
+	b.WriteString("\n\nComment style:\n")
+	b.WriteString("- Write the comment in a warm maintainer voice.\n")
+	b.WriteString("- Briefly acknowledge the reporter and reference concrete details from the issue.\n")
+	b.WriteString("- For valid issues, name the selected label/status path and give one clear next step.\n")
+	b.WriteString("- For unclear issues, ask for the smallest missing detail needed to proceed.\n")
+	b.WriteString("- For out-of-scope issues, explain the boundary respectfully.\n")
+	b.WriteString("- Do not write generic bot boilerplate or repeat the entire issue.")
 	b.WriteString("\n\nIssue:\n")
+	if author := strings.TrimSpace(input.Issue.Author); author != "" {
+		b.WriteString("Reporter: @")
+		b.WriteString(strings.TrimPrefix(author, "@"))
+		b.WriteString("\n")
+	}
 	b.WriteString(input.Issue.Title)
 	b.WriteString("\n\n")
 	b.WriteString(strings.TrimSpace(input.Issue.Body))
@@ -230,7 +243,7 @@ func AllowedDispatches() []string {
 
 func parseDecision(raw string, cfg Config) (Decision, error) {
 	var output llmOutput
-	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &output); err != nil {
+	if err := json.Unmarshal([]byte(extractJSON(raw)), &output); err != nil {
 		return Decision{}, err
 	}
 	comment := strings.TrimSpace(output.Comment)
@@ -240,36 +253,76 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 	clear := []string{"kind/*", "area/*", "complexity/*", "dispatch/*", cfg.OutOfScopeLabel, cfg.UnclearLabel}
 	switch Disposition(strings.TrimSpace(output.Disposition)) {
 	case DispositionValid:
-		kind, err := requireExactlyOne(output.Labels.Kind, AllowedKinds())
+		if len(output.Labels.Kind) == 0 && len(output.Labels.Area) == 0 && len(output.Labels.Complexity) == 0 {
+			return Decision{}, fmt.Errorf("valid disposition requires at least one classification label")
+		}
+		kind, err := requireAllowedOrDefault(output.Labels.Kind, AllowedKinds(), "kind/feature")
 		if err != nil {
 			return Decision{}, err
 		}
-		area, err := requireExactlyOne(output.Labels.Area, AllowedAreas())
+		area, err := requireAllowedOrDefault(output.Labels.Area, AllowedAreas(), defaultAreaForKind(kind))
 		if err != nil {
 			return Decision{}, err
 		}
-		complexity, err := requireExactlyOne(output.Labels.Complexity, AllowedComplexities())
+		complexity, err := requireAllowedOrDefault(output.Labels.Complexity, AllowedComplexities(), "complexity/m")
 		if err != nil {
 			return Decision{}, err
 		}
-		dispatch, err := requireExactlyOne(output.Labels.Dispatch, AllowedDispatches())
+		dispatch, err := requireAllowedOrDefault(output.Labels.Dispatch, AllowedDispatches(), "dispatch/plan")
 		if err != nil {
 			return Decision{}, err
 		}
 		return Decision{Disposition: DispositionValid, ClearLabelPatterns: clear, ApplyLabels: []string{kind, area, complexity, dispatch, cfg.TriagedLabel}, CommentBody: comment, MarkTriaged: true}, nil
 	case DispositionOutOfScope:
-		if hasAnyLabels(output.Labels) {
-			return Decision{}, fmt.Errorf("unexpected labels for out-of-scope disposition")
-		}
 		return Decision{Disposition: DispositionOutOfScope, ClearLabelPatterns: clear, ApplyLabels: []string{cfg.OutOfScopeLabel, cfg.TriagedLabel}, CommentBody: comment, MarkTriaged: true}, nil
 	case DispositionUnclear:
-		if hasAnyLabels(output.Labels) {
-			return Decision{}, fmt.Errorf("unexpected labels for unclear disposition")
-		}
 		return Decision{Disposition: DispositionUnclear, ClearLabelPatterns: clear, ApplyLabels: []string{cfg.UnclearLabel, cfg.TriagedLabel}, CommentBody: comment, MarkTriaged: true}, nil
 	default:
 		return Decision{}, fmt.Errorf("unknown disposition")
 	}
+}
+
+func requireAllowedOrDefault(values []string, allowed []string, fallback string) (string, error) {
+	if len(values) == 0 {
+		values = []string{fallback}
+	}
+	allowedSet := map[string]struct{}{}
+	for _, item := range allowed {
+		allowedSet[item] = struct{}{}
+	}
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if _, ok := allowedSet[value]; ok {
+			return value, nil
+		}
+	}
+	return "", fmt.Errorf("no allowed value")
+}
+
+func defaultAreaForKind(kind string) string {
+	switch strings.TrimSpace(kind) {
+	case "kind/docs":
+		return "area/docs"
+	case "kind/feature":
+		return "area/planner"
+	case "kind/bug":
+		return "area/runtime"
+	default:
+		return "area/runtime"
+	}
+}
+
+func extractJSON(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if matches := fencedJSONPattern.FindStringSubmatch(trimmed); len(matches) == 2 {
+		trimmed = strings.TrimSpace(matches[1])
+	}
+	start := strings.Index(trimmed, "{")
+	end := strings.LastIndex(trimmed, "}")
+	if start >= 0 && end > start {
+		return strings.TrimSpace(trimmed[start : end+1])
+	}
+	return trimmed
 }
 
 func requireExactlyOne(values []string, allowed []string) (string, error) {
@@ -285,15 +338,6 @@ func requireExactlyOne(values []string, allowed []string) (string, error) {
 		return "", fmt.Errorf("unknown value %q", value)
 	}
 	return value, nil
-}
-
-func hasAnyLabels(labels struct {
-	Kind       []string `json:"kind"`
-	Area       []string `json:"area"`
-	Complexity []string `json:"complexity"`
-	Dispatch   []string `json:"dispatch"`
-}) bool {
-	return len(labels.Kind) > 0 || len(labels.Area) > 0 || len(labels.Complexity) > 0 || len(labels.Dispatch) > 0
 }
 
 func needsInfoAppliedAt(issue Issue, unclearLabel string) (time.Time, bool) {
