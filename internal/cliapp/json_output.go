@@ -447,6 +447,12 @@ func (r *commandRuntime) runList(cmd *cobra.Command, args []string) error {
 	}, writeHumanRunList)
 }
 
+func (r *commandRuntime) runReconcileStale(cmd *cobra.Command, args []string) error {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		return r.postJSON(ctx, "/api/v1/runs/reconcile-stale", nil)
+	}, writeHumanRunReconcileStale)
+}
+
 func (r *commandRuntime) workCreate(cmd *cobra.Command, args []string) error {
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
 		issueNumberValue := strings.TrimSpace(getStringFlag(cmd, "issue"))

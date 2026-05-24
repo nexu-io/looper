@@ -466,6 +466,61 @@ func TestIndependentClaimPassClaimsQueuedWorkWhileDiscoveryIsBlocked(t *testing.
 	}
 }
 
+func TestRunDefaultSchedulerTickReconcilesLiveStaleRunsWhenCapacityIsFull(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-live-reconcile.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+	projectID := "looper"
+	staleLoopID := "loop_reconcile_stale"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: staleLoopID, Seq: 2, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:42"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(42), Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert(stale) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_reconcile_stale", LoopID: staleLoopID, Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert(stale) error = %v", err)
+	}
+	queuedLoopID := "loop_worker_queued"
+	loopTarget := "project:project_1"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: queuedLoopID, Seq: 3, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &loopTarget, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(queued) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_after_reconcile", ProjectID: &projectID, LoopID: &queuedLoopID, Type: "worker", TargetType: "project", TargetID: loopTarget, DedupeKey: "worker:loop_worker_queued", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	workerRunner := &stubWorkerScheduler{}
+	reconcileCalls := 0
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		MaxConcurrentRuns: 1,
+		AsyncRunner:       immediateSchedulerRunner{},
+		ReconcileStaleRuns: func(context.Context) (StaleRunReconcileSummary, error) {
+			reconcileCalls++
+			if err := interruptRecoveryRun(context.Background(), repos, storage.RunRecord{ID: "run_reconcile_stale", LoopID: staleLoopID}, storage.LoopRecord{ID: staleLoopID, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: "running"}, nowISO, "Interrupted stale running run during stale-run reconciliation"); err != nil {
+				return StaleRunReconcileSummary{}, err
+			}
+			return StaleRunReconcileSummary{Mode: "live", CandidateRuns: 1, InterruptedRuns: 1, LoopsRequeued: 1, RunIDs: []string{"run_reconcile_stale"}, LoopIDs: []string{staleLoopID}}, nil
+		},
+		Worker: workerRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if reconcileCalls == 0 {
+		t.Fatal("reconcile calls = 0, want at least one live reconcile attempt")
+	}
+	waitForSchedulerCondition(t, func() bool { return workerRunner.processItemCount() == 1 })
+	if workerRunner.processItemCount() != 1 || workerRunner.processedItems[0] != "queue_worker_after_reconcile" {
+		t.Fatalf("worker processed items = %#v, want queued item claimed after live reconcile", workerRunner.processedItems)
+	}
+}
+
 func TestRunDefaultSchedulerTickLogsClaimPhasesAndSlowLanes(t *testing.T) {
 	t.Parallel()
 

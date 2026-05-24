@@ -71,7 +71,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 		{args: []string{"labels", "--help"}, subcommands: []string{"init  Initialize standard Looper GitHub labels"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
-		{args: []string{"run", "--help"}, subcommands: []string{"list   List runs", "stats  Show recent run stats"}},
+		{args: []string{"run", "--help"}, subcommands: []string{"list             List runs", "stats            Show recent run stats", "reconcile-stale  Reconcile stale running runs"}},
 	}
 
 	for _, testCase := range tests {
@@ -190,6 +190,65 @@ func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout, want)
 		}
+	}
+}
+
+func TestRunReconcileStaleOutputsHumanAndJSON(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/reconcile-stale"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("request method = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_reconcile", map[string]any{
+			"mode":                 "manual",
+			"candidateRuns":        2,
+			"interruptedRuns":      1,
+			"loopsRequeued":        1,
+			"queueItemsRequeued":   1,
+			"queueItemsCancelled":  0,
+			"cleanedExecutions":    1,
+			"skippedUncertainRuns": 0,
+			"runIds":               []string{"run_1"},
+			"loopIds":              []string{"loop_1"},
+			"executionIds":         []string{"exec_1"},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "run", "reconcile-stale", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([run reconcile-stale]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([run reconcile-stale]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Stale runs reconciled", "mode", "manual", "interruptedRuns", "run_1", "exec_1"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+
+	exitCode, stdout, stderr = runApp(t, "run", "reconcile-stale", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([run reconcile-stale --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([run reconcile-stale --json]) stderr = %q, want empty string", stderr)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(stdout) error = %v", err)
+	}
+	if got := payload["mode"]; got != "manual" {
+		t.Fatalf("payload.mode = %#v, want manual", got)
+	}
+	if got := payload["loopsRequeued"]; got != float64(1) {
+		t.Fatalf("payload.loopsRequeued = %#v, want 1", got)
 	}
 }
 

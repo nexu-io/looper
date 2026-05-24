@@ -534,6 +534,58 @@ func TestHandlerRouteAndMethodErrors(t *testing.T) {
 	}
 }
 
+func TestHandlerReconcileStaleRunsRoute(t *testing.T) {
+	fixture := newTestFixture(t)
+	triggered := 0
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: fixture.runtime,
+		ReconcileStaleRuns: func(context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
+			return looperdruntime.StaleRunReconcileSummary{Mode: "manual", CandidateRuns: 2, InterruptedRuns: 1, LoopsRequeued: 1, RunIDs: []string{"run_1"}, LoopIDs: []string{"loop_1"}}, nil
+		},
+		TriggerSchedulerTick: func() { triggered++ },
+	})
+
+	t.Run("success", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/reconcile-stale", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		assertEqual(t, data["mode"], "manual")
+		assertEqual(t, data["candidateRuns"], float64(2))
+		assertEqual(t, data["interruptedRuns"], float64(1))
+		assertEqual(t, data["loopsRequeued"], float64(1))
+		assertEqual(t, triggered, 1)
+	})
+
+	t.Run("method not allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/reconcile-stale", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want 405", recorder.Code)
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		assertEqual(t, body["error"].(map[string]any)["code"], "METHOD_NOT_ALLOWED")
+	})
+
+	t.Run("runtime control unavailable", func(t *testing.T) {
+		unavailable := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/reconcile-stale", nil)
+		recorder := httptest.NewRecorder()
+		unavailable.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusNotImplemented {
+			t.Fatalf("status = %d, want 501", recorder.Code)
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		assertEqual(t, body["error"].(map[string]any)["code"], "RUNTIME_CONTROL_UNAVAILABLE")
+	})
+}
+
 func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testing.T) {
 	fixture := newTestFixture(t)
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
@@ -865,7 +917,7 @@ func TestHandlerEventAndPullRequestRouteErrorsMatchArtifactCases(t *testing.T) {
 		{caseID: "pr-not-found", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/999"},
 	}
 
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
 	for _, tt := range tests {
 		t.Run(tt.caseID, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, nil)
@@ -1283,7 +1335,7 @@ func TestHandlerProjectsRouteErrorsMatchArtifactCases(t *testing.T) {
 
 func TestHandlerProjectsCreateRouteMapsProjectIDConflict(t *testing.T) {
 	fixture := newTestFixture(t)
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","id":"looper"}`)))
 
 	_, err := h.buildCreateProjectResponse(req, fakeProjectService{
@@ -3307,7 +3359,7 @@ func TestIsPlannerPullRequestOpenReadsStructMarshaledStateKey(t *testing.T) {
 		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
 	}
 
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
 	if !h.isPlannerPullRequestOpen(context.Background(), "project_1", "acme/looper", 42) {
 		t.Fatal("isPlannerPullRequestOpen() = false, want true")
 	}
@@ -4274,9 +4326,7 @@ func TestHandlerActiveRunsSupportFiltersAgentsAndWorktrees(t *testing.T) {
 	assertEqual(t, first["type"], "worker")
 	target := first["target"].(map[string]any)
 	assertEqual(t, target["label"], "Looper")
-	agent := first["agent"].(map[string]any)
-	assertEqual(t, agent["executionId"], "agent_exec_worker_new")
-	assertEqual(t, agent["activeCount"], float64(2))
+	assertEqual(t, first["agent"], nil)
 
 	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active/1", nil)
 	detailRecorder := httptest.NewRecorder()
@@ -4510,7 +4560,7 @@ func TestActiveRunsDefaultExcludesOlderRunningRunWhenLatestCompleted(t *testing.
 	assertEqual(t, item["status"], "completed")
 }
 
-func TestActiveRunsDefaultFallsBackToRunningLoopWhenRunIsStale(t *testing.T) {
+func TestActiveRunsDefaultHidesRunningLoopFallbackWhenRunIsStale(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	oldHeartbeat := fixture.now.Add(-2 * time.Hour).UTC().Format(javaScriptISOString)
@@ -4534,13 +4584,9 @@ func TestActiveRunsDefaultFallsBackToRunningLoopWhenRunIsStale(t *testing.T) {
 	}
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	items := body["data"].(map[string]any)["items"].([]any)
-	if len(items) != 1 {
-		t.Fatalf("len(items) = %d, want 1: %#v", len(items), items)
+	if len(items) != 0 {
+		t.Fatalf("len(items) = %d, want 0: %#v", len(items), items)
 	}
-	item := items[0].(map[string]any)
-	assertEqual(t, item["loopId"], "loop_stale_no_activity")
-	assertEqual(t, item["runId"], nil)
-	assertEqual(t, item["status"], "running")
 }
 
 func TestActiveRunsDefaultExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
@@ -4641,7 +4687,7 @@ func TestActiveRunsDedupesQueuedLoopWhenRunIsRunning(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
@@ -4734,11 +4780,9 @@ func TestActiveRunsStatusAndTypeFiltersIncludeInactiveCompletedWorkerLoops(t *te
 	}
 	defaultBody := parseJSONMap(t, defaultRecorder.Body.Bytes())
 	defaultItems := defaultBody["data"].(map[string]any)["items"].([]any)
-	if len(defaultItems) != 1 {
-		t.Fatalf("len(default items) = %d, want 1", len(defaultItems))
+	if len(defaultItems) != 0 {
+		t.Fatalf("len(default items) = %d, want 0", len(defaultItems))
 	}
-	defaultItem := defaultItems[0].(map[string]any)
-	assertEqual(t, defaultItem["loopId"], "loop_worker_running")
 
 	filteredReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active?status=completed&type=worker", nil)
 	filteredRecorder := httptest.NewRecorder()
@@ -4923,7 +4967,7 @@ func TestActiveRunDetailIncludesRunningLoopWithoutRun(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active/loop_reviewer_running_only", nil)
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)

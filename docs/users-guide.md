@@ -440,6 +440,7 @@ looper ps
 looper logs 12 --follow
 looper jump 12
 looper stop 12
+looper run reconcile-stale
 ```
 
 Typical usage:
@@ -449,6 +450,7 @@ Typical usage:
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
 - `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
 - `looper stop <id>`: stop an active loop
+- `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
 
 ## 13. Minimal end-to-end example
 

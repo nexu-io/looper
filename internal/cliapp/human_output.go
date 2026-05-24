@@ -197,6 +197,20 @@ type runsListOutput struct {
 	Items []runOutput `json:"items"`
 }
 
+type runReconcileStaleOutput struct {
+	Mode                 string   `json:"mode"`
+	CandidateRuns        int64    `json:"candidateRuns"`
+	InterruptedRuns      int64    `json:"interruptedRuns"`
+	LoopsRequeued        int64    `json:"loopsRequeued"`
+	QueueItemsRequeued   int64    `json:"queueItemsRequeued"`
+	QueueItemsCancelled  int64    `json:"queueItemsCancelled"`
+	CleanedExecutions    int64    `json:"cleanedExecutions"`
+	SkippedUncertainRuns int64    `json:"skippedUncertainRuns"`
+	RunIDs               []string `json:"runIds"`
+	LoopIDs              []string `json:"loopIds"`
+	ExecutionIDs         []string `json:"executionIds"`
+}
+
 type runOutput struct {
 	ID          string  `json:"id"`
 	LoopID      string  `json:"loopId"`
@@ -371,6 +385,15 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": item.Status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))})
 	}
 	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age"}, rows)
+	return nil
+}
+
+func writeHumanRunReconcileStale(w io.Writer, payload json.RawMessage) error {
+	var data runReconcileStaleOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode reconcile stale response: %w", err)
+	}
+	printSection(w, "Stale runs reconciled", [][2]any{{"mode", data.Mode}, {"candidates", data.CandidateRuns}, {"interruptedRuns", data.InterruptedRuns}, {"loopsRequeued", data.LoopsRequeued}, {"queueItemsRequeued", data.QueueItemsRequeued}, {"queueItemsCancelled", data.QueueItemsCancelled}, {"cleanedExecutions", data.CleanedExecutions}, {"skippedUncertainRuns", data.SkippedUncertainRuns}, {"runIds", joinOrNone(data.RunIDs)}, {"loopIds", joinOrNone(data.LoopIDs)}, {"executionIds", joinOrNone(data.ExecutionIDs)}})
 	return nil
 }
 

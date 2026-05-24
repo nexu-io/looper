@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -1418,6 +1419,24 @@ func (r *QueueRepository) CountByStatus(ctx context.Context, status string) (int
 	return count, nil
 }
 
+func (r *QueueRepository) CountActiveByLoopID(ctx context.Context, loopID string) (int64, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_items WHERE loop_id = ? AND status IN ('queued', 'running')`, loopID)
+	var count int64
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count active queue items by loop: %w", err)
+	}
+	return count, nil
+}
+
+func (r *QueueRepository) CountByLoopIDAndStatus(ctx context.Context, loopID, status string) (int64, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_items WHERE loop_id = ? AND status = ?`, loopID, status)
+	var count int64
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count queue items by loop and status: %w", err)
+	}
+	return count, nil
+}
+
 func (r *QueueRepository) FindActiveByDedupe(ctx context.Context, dedupeKey string) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
 		SELECT * FROM queue_items
@@ -1892,6 +1911,28 @@ func (r *QueueRepository) CancelByLoop(ctx context.Context, loopID, finishedAt s
 		return 0, fmt.Errorf("read cancel queue items rows affected: %w", err)
 	}
 
+	return affected, nil
+}
+
+func (r *QueueRepository) CancelActiveByLoopExcept(ctx context.Context, loopID, keepID, finishedAt string, reason *string) (int64, error) {
+	if strings.TrimSpace(loopID) == "" || strings.TrimSpace(keepID) == "" {
+		return 0, nil
+	}
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'cancelled',
+			finished_at = ?,
+			last_error = COALESCE(?, last_error),
+			updated_at = ?
+		WHERE loop_id = ? AND status IN ('queued', 'running') AND id != ?
+	`, finishedAt, reason, finishedAt, loopID, keepID)
+	if err != nil {
+		return 0, fmt.Errorf("cancel active queue items by loop except %s: %w", keepID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read cancel active queue items rows affected: %w", err)
+	}
 	return affected, nil
 }
 

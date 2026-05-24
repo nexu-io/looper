@@ -188,6 +188,7 @@ looper ps                   # list active loops
 looper logs <id> --follow   # stream logs
 looper jump <id>            # jump into a loop's worktree
 looper stop <id>
+looper run reconcile-stale  # recover stale running loops after sleep/wake
 ```
 
 **Daemon control**
@@ -195,6 +196,8 @@ looper stop <id>
 ```bash
 looper daemon install|start|stop|restart|status
 ```
+
+If `looper ps` shows stale `running` work with no live agent after sleep/wake, run `looper run reconcile-stale` first. `looper daemon restart` remains a reasonable fallback when you want a full daemon restart.
 
 ## Configuration
 

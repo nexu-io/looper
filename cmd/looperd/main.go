@@ -113,6 +113,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 	handler := looperdapi.NewHandler(looperdapi.Context{
 		Config:  deps.Config,
 		Runtime: rt,
+		ReconcileStaleRuns: func(ctx context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
+			return rt.ReconcileStaleRunningRuns(ctx)
+		},
 		StopLoop: func(ctx context.Context, loopID, reason string) (any, error) {
 			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},

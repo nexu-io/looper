@@ -49,6 +49,31 @@ type RecoverySummary struct {
 	EventsWritten         int64                      `json:"eventsWritten"`
 }
 
+type StaleRunReconcileSummary struct {
+	Mode                 string   `json:"mode"`
+	StartedAt            string   `json:"startedAt,omitempty"`
+	CompletedAt          string   `json:"completedAt,omitempty"`
+	CandidateRuns        int64    `json:"candidateRuns"`
+	InterruptedRuns      int64    `json:"interruptedRuns"`
+	LoopsRequeued        int64    `json:"loopsRequeued"`
+	QueueItemsRequeued   int64    `json:"queueItemsRequeued"`
+	QueueItemsCancelled  int64    `json:"queueItemsCancelled"`
+	CleanedExecutions    int64    `json:"cleanedExecutions"`
+	SkippedUncertainRuns int64    `json:"skippedUncertainRuns"`
+	EventsWritten        int64    `json:"eventsWritten"`
+	RunIDs               []string `json:"runIds,omitempty"`
+	LoopIDs              []string `json:"loopIds,omitempty"`
+	ExecutionIDs         []string `json:"executionIds,omitempty"`
+}
+
+type staleRunReconcileMode string
+
+const (
+	staleRunReconcileModeStartup staleRunReconcileMode = "startup"
+	staleRunReconcileModeLive    staleRunReconcileMode = "live"
+	staleRunReconcileModeManual  staleRunReconcileMode = "manual"
+)
+
 type RecoveryOrphanAgentCleanup struct {
 	Attempted    bool   `json:"attempted"`
 	CleanedCount int64  `json:"cleanedCount"`
@@ -587,7 +612,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
@@ -1053,37 +1078,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.OrphanAgentCleanup.Attempted = true
 	uncertainAgentRunIDs := make(map[string]struct{})
 	uncertainExecutionIDs := make(map[string]struct{})
-	recordUncertainExecution := func(execution storage.AgentExecutionRecord, pid int, scope string) error {
-		if _, ok := uncertainExecutionIDs[execution.ID]; ok {
-			return nil
-		}
-		uncertainExecutionIDs[execution.ID] = struct{}{}
-		if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
-			uncertainAgentRunIDs[*execution.RunID] = struct{}{}
-		}
-		if r.logger != nil {
-			r.logger.Warn("recovery skipped due to uncertain process identity", map[string]any{"executionId": execution.ID, "pid": pid, "scope": scope})
-		}
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-			ID:         newRuntimeEventID(),
-			EventType:  "looperd.recovery.process_identity_uncertain",
-			ProjectID:  execution.ProjectID,
-			LoopID:     execution.LoopID,
-			RunID:      execution.RunID,
-			EntityType: stringPtr("agent_execution"),
-			EntityID:   stringPtr(execution.ID),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"pid":    pid,
-				"reason": "command_mismatch",
-				"scope":  scope,
-			}),
-			CreatedAt: nowISO,
-		}); err != nil {
-			return err
-		}
-		eventsWritten += 1
-		return nil
-	}
 	if repositories.AgentExecutions != nil {
 		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 		if err != nil {
@@ -1102,9 +1096,16 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				continue
 			}
 			if running && !matches {
-				if err := recordUncertainExecution(execution, pid, "orphan_cleanup"); err != nil {
+				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+					uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+				}
+				if _, ok := uncertainExecutionIDs[execution.ID]; !ok {
+					uncertainExecutionIDs[execution.ID] = struct{}{}
+				}
+				if err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, "orphan_cleanup", nowISO); err != nil {
 					return RecoverySummary{}, err
 				}
+				eventsWritten += 1
 				continue
 			}
 			if running {
@@ -1127,43 +1128,10 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 					}(pid)
 				}
 			}
-
-			cleaned := execution
-			cleaned.Status = "killed"
-			if cleaned.ErrorMessage == nil {
-				cleaned.ErrorMessage = stringPtr("Killed during looperd recovery")
-			}
-			if r.config.Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
-				cleaned.NativeResumeMode = stringPtr("native_resume")
-				cleaned.NativeResumeStatus = stringPtr("pending")
-				if r.logger != nil {
-					r.logger.Info("agent execution eligible for native resume", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
-				}
-			} else if r.logger != nil {
-				r.logger.Info("agent execution will restart from checkpoint", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
-			}
-			cleaned.EndedAt = stringPtr(nowISO)
-			cleaned.UpdatedAt = nowISO
-			if err := repositories.AgentExecutions.Upsert(ctx, cleaned); err != nil {
+			if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, pid, nowISO, "Killed during looperd recovery"); err != nil {
 				return RecoverySummary{}, err
 			}
 			summary.OrphanAgentCleanup.CleanedCount += 1
-			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-				ID:         newRuntimeEventID(),
-				EventType:  "agent.killed",
-				ProjectID:  execution.ProjectID,
-				LoopID:     execution.LoopID,
-				RunID:      execution.RunID,
-				EntityType: stringPtr("agent_execution"),
-				EntityID:   stringPtr(execution.ID),
-				PayloadJSON: mustMarshalJSON(map[string]any{
-					"pid":         pid,
-					"recoveredAt": nowISO,
-				}),
-				CreatedAt: nowISO,
-			}); err != nil {
-				return RecoverySummary{}, err
-			}
 			eventsWritten += 1
 		}
 	}
@@ -1194,6 +1162,14 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		eventsWritten += 1
 	}
 
+	staleSummary, err := r.reconcileStaleRunningRunsWithMode(ctx, repositories, now, staleRunReconcileModeStartup)
+	if err != nil {
+		return RecoverySummary{}, err
+	}
+	summary.InterruptedRunsMarked += staleSummary.InterruptedRuns
+	summary.LoopsRequeued += staleSummary.LoopsRequeued
+	eventsWritten += staleSummary.EventsWritten
+
 	loops, err := repositories.Loops.List(ctx)
 	if err != nil {
 		return RecoverySummary{}, err
@@ -1202,64 +1178,43 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	for _, loop := range loops {
 		loopsByID[loop.ID] = loop
 	}
+	requeuedLoopIDs := make(map[string]struct{})
+	if staleSummary.LoopsRequeued > 0 {
+		for _, loopID := range staleSummary.LoopIDs {
+			loop, ok := loopsByID[loopID]
+			if ok && loop.Status == "queued" {
+				requeuedLoopIDs[loopID] = struct{}{}
+			}
+		}
+	}
 	activeAgentRunIDs := make(map[string]struct{})
-	if repositories.Runs != nil {
-		runningRuns, err := repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+	if repositories.AgentExecutions != nil {
+		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		if repositories.AgentExecutions != nil {
-			activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
-			if err != nil {
-				return RecoverySummary{}, err
-			}
-			activeAgentRunIDs = make(map[string]struct{}, len(activeExecutions))
-			for _, execution := range activeExecutions {
-				if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" || execution.PID == nil || *execution.PID <= 0 {
-					continue
-				}
-				pid := int(*execution.PID)
-				matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
-				if err != nil {
-					if r.logger != nil {
-						r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
-					}
-					continue
-				}
-				if running && !matches {
-					if err := recordUncertainExecution(execution, pid, "active_run_detection"); err != nil {
-						return RecoverySummary{}, err
-					}
-					continue
-				}
-				if running && matches {
-					activeAgentRunIDs[*execution.RunID] = struct{}{}
-				}
-			}
-		}
-		for _, run := range runningRuns {
-			loop, ok := loopsByID[run.LoopID]
-			if !ok {
+		activeAgentRunIDs = make(map[string]struct{}, len(activeExecutions))
+		for _, execution := range activeExecutions {
+			if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" || execution.PID == nil || *execution.PID <= 0 {
 				continue
 			}
-			latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, run.LoopID)
+			pid := int(*execution.PID)
+			matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
 			if err != nil {
-				return RecoverySummary{}, err
-			}
-			_, hasActiveAgent := activeAgentRunIDs[run.ID]
-			_, hasUncertainAgent := uncertainAgentRunIDs[run.ID]
-			if !shouldInterruptStaleRunningRun(run, latestRun, hasActiveAgent, hasUncertainAgent) {
+				if r.logger != nil {
+					r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error()})
+				}
 				continue
 			}
-			if err := interruptRecoveryRun(ctx, repositories, run, loop, nowISO, "Interrupted stale/orphaned running run during looperd recovery"); err != nil {
-				return RecoverySummary{}, err
+			if running && matches {
+				activeAgentRunIDs[*execution.RunID] = struct{}{}
 			}
-			summary.InterruptedRunsMarked += 1
-			eventsWritten += 1
 		}
 	}
-	requeuedLoopIDs := make(map[string]struct{})
 	for _, loop := range loops {
+		if _, wasRequeued := requeuedLoopIDs[loop.ID]; wasRequeued {
+			continue
+		}
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return RecoverySummary{}, err
@@ -1374,9 +1329,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 
 	for _, loop := range loops {
 		if loop.Status != "queued" {
-			continue
-		}
-		if _, wasRequeued := requeuedLoopIDs[loop.ID]; wasRequeued {
 			continue
 		}
 		if _, exists := queuedLoopIDs[loop.ID]; exists {
@@ -1562,6 +1514,138 @@ func (r *Runtime) ExecutionMatchesProcess(ctx context.Context, execution storage
 	return r.executionMatchesProcess(ctx, execution, pid)
 }
 
+func (r *Runtime) ReconcileStaleRunningRuns(ctx context.Context) (StaleRunReconcileSummary, error) {
+	r.mu.RLock()
+	repositories := r.services.Repositories
+	now := r.now
+	r.mu.RUnlock()
+	if repositories == nil {
+		return StaleRunReconcileSummary{}, fmt.Errorf("storage is not configured")
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return r.reconcileStaleRunningRunsWithMode(ctx, repositories, now().UTC(), staleRunReconcileModeManual)
+}
+
+func (r *Runtime) reconcileLiveStaleRunningRuns(ctx context.Context) (StaleRunReconcileSummary, error) {
+	r.mu.RLock()
+	repositories := r.services.Repositories
+	now := r.now
+	r.mu.RUnlock()
+	if repositories == nil {
+		return StaleRunReconcileSummary{}, fmt.Errorf("storage is not configured")
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return r.reconcileStaleRunningRunsWithMode(ctx, repositories, now().UTC(), staleRunReconcileModeLive)
+}
+
+func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, repositories *storage.Repositories, now time.Time, mode staleRunReconcileMode) (StaleRunReconcileSummary, error) {
+	summary := StaleRunReconcileSummary{Mode: string(mode), StartedAt: formatJavaScriptISOString(now)}
+	if repositories == nil || repositories.Runs == nil || repositories.Loops == nil {
+		return summary, nil
+	}
+	nowISO := summary.StartedAt
+	runningRuns, err := repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+	if err != nil {
+		return StaleRunReconcileSummary{}, err
+	}
+	activeExecutionsByRunID := make(map[string][]storage.AgentExecutionRecord)
+	if repositories.AgentExecutions != nil {
+		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		for _, execution := range activeExecutions {
+			if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" {
+				continue
+			}
+			activeExecutionsByRunID[*execution.RunID] = append(activeExecutionsByRunID[*execution.RunID], execution)
+		}
+	}
+	for _, run := range runningRuns {
+		if err := ctx.Err(); err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		loop, err := repositories.Loops.GetByID(ctx, run.LoopID)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		if loop == nil {
+			continue
+		}
+		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, run.LoopID)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		decision, err := r.evaluateStaleRunCandidate(ctx, repositories, run, *loop, latestRun, activeExecutionsByRunID[run.ID], now, mode)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		if !decision.Candidate {
+			continue
+		}
+		summary.CandidateRuns += 1
+		if decision.Uncertain {
+			summary.SkippedUncertainRuns += 1
+			summary.EventsWritten += decision.EventsWritten
+			continue
+		}
+		if !decision.Interrupt {
+			continue
+		}
+		if err := interruptRecoveryRun(ctx, repositories, run, *loop, nowISO, decision.Message); err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		summary.InterruptedRuns += 1
+		summary.EventsWritten += 1
+		summary.RunIDs = append(summary.RunIDs, run.ID)
+		summary.LoopIDs = append(summary.LoopIDs, run.LoopID)
+
+		for _, execution := range decision.CleanupExecutions {
+			pid := 0
+			if execution.PID != nil && *execution.PID > 0 {
+				pid = int(*execution.PID)
+			}
+			if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, pid, nowISO, decision.ExecutionMessage); err != nil {
+				return StaleRunReconcileSummary{}, err
+			}
+			summary.CleanedExecutions += 1
+			summary.EventsWritten += 1
+			summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
+		}
+
+		queueRepair, err := r.repairStaleRunQueueState(ctx, repositories, *loop, latestRun, nowISO)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		summary.LoopsRequeued += queueRepair.LoopsRequeued
+		summary.QueueItemsRequeued += queueRepair.QueueItemsRequeued
+		summary.QueueItemsCancelled += queueRepair.QueueItemsCancelled
+		summary.EventsWritten += queueRepair.EventsWritten
+	}
+	if repositories.Queue != nil {
+		loops, err := repositories.Loops.List(ctx)
+		if err != nil {
+			return StaleRunReconcileSummary{}, err
+		}
+		for _, loop := range loops {
+			queueRepair, err := r.repairInterruptedLoopQueueIfNeeded(ctx, repositories, loop, nowISO)
+			if err != nil {
+				return StaleRunReconcileSummary{}, err
+			}
+			summary.LoopsRequeued += queueRepair.LoopsRequeued
+			summary.QueueItemsRequeued += queueRepair.QueueItemsRequeued
+			summary.QueueItemsCancelled += queueRepair.QueueItemsCancelled
+			summary.EventsWritten += queueRepair.EventsWritten
+		}
+	}
+	summary.CompletedAt = nowISO
+	return summary, nil
+}
+
 func (r *Runtime) appendStoppedEvent(ctx context.Context, repositories *storage.Repositories, reason string) error {
 	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
 		ID:         newRuntimeEventID(),
@@ -1580,6 +1664,331 @@ func defaultSyncConfiguredProjects(ctx context.Context, service *projects.Servic
 		return fmt.Errorf("projects service is not configured")
 	}
 	return service.SyncConfigured(ctx, cfg, now)
+}
+
+type staleRunCandidateDecision struct {
+	Candidate         bool
+	Interrupt         bool
+	Uncertain         bool
+	Message           string
+	ExecutionMessage  string
+	CleanupExecutions []storage.AgentExecutionRecord
+	EventsWritten     int64
+}
+
+type staleRunQueueRepairSummary struct {
+	LoopsRequeued       int64
+	QueueItemsRequeued  int64
+	QueueItemsCancelled int64
+	EventsWritten       int64
+}
+
+func (r *Runtime) evaluateStaleRunCandidate(ctx context.Context, repositories *storage.Repositories, run storage.RunRecord, loop storage.LoopRecord, latestRun *storage.RunRecord, activeExecutions []storage.AgentExecutionRecord, now time.Time, mode staleRunReconcileMode) (staleRunCandidateDecision, error) {
+	decision := staleRunCandidateDecision{}
+	if run.Status != string(domain.RunStatusRunning) {
+		return decision, nil
+	}
+	if mode == staleRunReconcileModeStartup {
+		decision.Candidate = true
+		if latestRun != nil && latestRun.ID == run.ID && len(activeExecutions) > 0 {
+			verification, err := r.verifyRunExecutionLiveness(ctx, repositories, activeExecutions, now, "startup_stale_run")
+			if err != nil {
+				return staleRunCandidateDecision{}, err
+			}
+			decision.EventsWritten += verification.EventsWritten
+			if verification.Uncertain {
+				decision.Uncertain = true
+				return decision, nil
+			}
+			if verification.Live {
+				return staleRunCandidateDecision{}, nil
+			}
+		}
+		decision.Interrupt = latestRun == nil || latestRun.ID != run.ID || len(activeExecutions) == 0
+		if latestRun != nil && latestRun.ID == run.ID && len(activeExecutions) > 0 {
+			decision.Interrupt = true
+			decision.CleanupExecutions = append(decision.CleanupExecutions, activeExecutions...)
+			decision.ExecutionMessage = "Killed during stale-run recovery"
+		}
+		decision.Message = "Interrupted stale/orphaned running run during looperd recovery"
+		return decision, nil
+	}
+
+	if latestRun == nil {
+		return decision, nil
+	}
+	if runHeartbeatIsRecent(run, now, 30*time.Minute) {
+		return decision, nil
+	}
+	if len(activeExecutions) == 0 && latestRun.ID == run.ID && !isAgentBackedRunStep(loop, run) {
+		return decision, nil
+	}
+	decision.Candidate = true
+	if len(activeExecutions) > 0 {
+		verification, err := r.verifyRunExecutionLiveness(ctx, repositories, activeExecutions, now, string(mode)+"_stale_run")
+		if err != nil {
+			return staleRunCandidateDecision{}, err
+		}
+		decision.EventsWritten += verification.EventsWritten
+		if verification.Uncertain {
+			decision.Uncertain = true
+			return decision, nil
+		}
+		if verification.Live {
+			return staleRunCandidateDecision{}, nil
+		}
+		decision.CleanupExecutions = append(decision.CleanupExecutions, verification.DeadExecutions...)
+		decision.ExecutionMessage = "Killed during stale-run reconciliation"
+	}
+	decision.Interrupt = true
+	if latestRun.ID != run.ID {
+		decision.Message = "Interrupted superseded stale running run during stale-run reconciliation"
+	} else {
+		decision.Message = "Interrupted stale running run during stale-run reconciliation"
+	}
+	return decision, nil
+}
+
+type executionLivenessResult struct {
+	Live           bool
+	Uncertain      bool
+	DeadExecutions []storage.AgentExecutionRecord
+	EventsWritten  int64
+}
+
+func (r *Runtime) verifyRunExecutionLiveness(ctx context.Context, repositories *storage.Repositories, executions []storage.AgentExecutionRecord, now time.Time, scope string) (executionLivenessResult, error) {
+	result := executionLivenessResult{}
+	for _, execution := range executions {
+		if execution.PID == nil || *execution.PID <= 0 {
+			result.DeadExecutions = append(result.DeadExecutions, execution)
+			continue
+		}
+		pid := int(*execution.PID)
+		matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
+		if err != nil {
+			if r.logger != nil {
+				r.logger.Warn("failed to verify active agent execution identity", map[string]any{"executionId": execution.ID, "pid": *execution.PID, "error": err.Error(), "scope": scope})
+			}
+			nowISO := formatJavaScriptISOString(now)
+			if appendErr := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope, nowISO); appendErr != nil {
+				return executionLivenessResult{}, appendErr
+			}
+			result.Uncertain = true
+			result.EventsWritten += 1
+			continue
+		}
+		if running && !matches {
+			nowISO := formatJavaScriptISOString(now)
+			if err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope, nowISO); err != nil {
+				return executionLivenessResult{}, err
+			}
+			result.Uncertain = true
+			result.EventsWritten += 1
+			continue
+		}
+		if running && matches {
+			result.Live = true
+			continue
+		}
+		result.DeadExecutions = append(result.DeadExecutions, execution)
+	}
+	return result, nil
+}
+
+func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, latestRun *storage.RunRecord, nowISO string) (staleRunQueueRepairSummary, error) {
+	summary := staleRunQueueRepairSummary{}
+	if repositories == nil || repositories.Queue == nil {
+		return summary, nil
+	}
+	if shouldRequeueLoop(loop, latestRun, false) {
+		requeuedLoop := loop
+		requeuedLoop.Status = "queued"
+		requeuedLoop.NextRunAt = stringPtr(nowISO)
+		if latestRun != nil {
+			requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+		}
+		requeuedLoop.UpdatedAt = nowISO
+		if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+			return staleRunQueueRepairSummary{}, err
+		}
+		activeQueue, err := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
+		if err != nil {
+			return staleRunQueueRepairSummary{}, err
+		}
+		keepQueueID := ""
+		if activeQueue != nil {
+			keepQueueID = activeQueue.ID
+		}
+		requeuedCount, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO)
+		if err != nil {
+			return staleRunQueueRepairSummary{}, err
+		}
+		createdQueue := int64(0)
+		if requeuedCount == 0 {
+			if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.config.Scheduler.RetryMaxAttempts)); err != nil {
+				return staleRunQueueRepairSummary{}, err
+			}
+			activeQueue, err = repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
+			if err != nil {
+				return staleRunQueueRepairSummary{}, err
+			}
+			if activeQueue != nil {
+				keepQueueID = activeQueue.ID
+				createdQueue = 1
+			}
+		}
+		if keepQueueID != "" {
+			duplicateReason := "Cancelled duplicate active queue items during stale-run reconciliation"
+			cancelledDuplicates, err := repositories.Queue.CancelActiveByLoopExcept(ctx, loop.ID, keepQueueID, nowISO, &duplicateReason)
+			if err != nil {
+				return staleRunQueueRepairSummary{}, err
+			}
+			summary.QueueItemsCancelled += cancelledDuplicates
+		}
+		summary.LoopsRequeued = 1
+		summary.QueueItemsRequeued = requeuedCount + createdQueue
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.loop_requeued",
+			LoopID:     stringPtr(loop.ID),
+			EntityType: stringPtr("loop"),
+			EntityID:   stringPtr(loop.ID),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"previousStatus":      loop.Status,
+				"nextRunAt":           nowISO,
+				"recoveredQueueItems": requeuedCount + createdQueue,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return staleRunQueueRepairSummary{}, err
+		}
+		summary.EventsWritten = 1
+		return summary, nil
+	}
+	reason := "Cancelled stale queue items during stale-run reconciliation"
+	cancelledCount, err := repositories.Queue.CancelByLoop(ctx, loop.ID, nowISO, &reason)
+	if err != nil {
+		return staleRunQueueRepairSummary{}, err
+	}
+	summary.QueueItemsCancelled = cancelledCount
+	return summary, nil
+}
+
+func (r *Runtime) repairInterruptedLoopQueueIfNeeded(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string) (staleRunQueueRepairSummary, error) {
+	if repositories == nil || repositories.Runs == nil || repositories.Queue == nil {
+		return staleRunQueueRepairSummary{}, nil
+	}
+	latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || latestRun == nil || latestRun.Status != string(domain.RunStatusInterrupted) {
+		return staleRunQueueRepairSummary{}, err
+	}
+	activeCount, err := repositories.Queue.CountActiveByLoopID(ctx, loop.ID)
+	if err != nil {
+		return staleRunQueueRepairSummary{}, err
+	}
+	runningCount, err := repositories.Queue.CountByLoopIDAndStatus(ctx, loop.ID, "running")
+	if err != nil {
+		return staleRunQueueRepairSummary{}, err
+	}
+	if loop.Status == "queued" && runningCount == 0 && activeCount == 1 {
+		return staleRunQueueRepairSummary{}, nil
+	}
+	if activeCount == 0 && !shouldRequeueLoop(loop, latestRun, false) {
+		return staleRunQueueRepairSummary{}, nil
+	}
+	return r.repairStaleRunQueueState(ctx, repositories, loop, latestRun, nowISO)
+}
+
+func isAgentBackedRunStep(loop storage.LoopRecord, run storage.RunRecord) bool {
+	if run.CurrentStep == nil {
+		return false
+	}
+	step := strings.TrimSpace(*run.CurrentStep)
+	switch loop.Type {
+	case "planner":
+		return step == "write-spec"
+	case "reviewer":
+		return step == "thread_resolution" || step == "review"
+	case "fixer":
+		return step == "repair"
+	case "worker":
+		return step == "execute"
+	default:
+		return false
+	}
+}
+
+func runHeartbeatIsRecent(run storage.RunRecord, now time.Time, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return true
+	}
+	heartbeatAt := firstNonEmpty(stringOrEmpty(run.LastHeartbeatAt), run.UpdatedAt, run.StartedAt)
+	if heartbeatAt == "" {
+		return false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(heartbeatAt))
+	if err != nil {
+		return false
+	}
+	return !parsed.UTC().Before(now.UTC().Add(-ttl))
+}
+
+func (r *Runtime) appendUncertainProcessIdentityEvent(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, pid int, scope string, nowISO string) error {
+	if r.logger != nil {
+		r.logger.Warn("recovery skipped due to uncertain process identity", map[string]any{"executionId": execution.ID, "pid": pid, "scope": scope})
+	}
+	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  "looperd.recovery.process_identity_uncertain",
+		ProjectID:  execution.ProjectID,
+		LoopID:     execution.LoopID,
+		RunID:      execution.RunID,
+		EntityType: stringPtr("agent_execution"),
+		EntityID:   stringPtr(execution.ID),
+		PayloadJSON: mustMarshalJSON(map[string]any{
+			"pid":    pid,
+			"reason": "command_mismatch",
+			"scope":  scope,
+		}),
+		CreatedAt: nowISO,
+	})
+}
+
+func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, pid int, nowISO string, message string) error {
+	cleaned := execution
+	cleaned.Status = "killed"
+	if cleaned.ErrorMessage == nil {
+		cleaned.ErrorMessage = stringPtr(message)
+	}
+	if r.config.Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
+		cleaned.NativeResumeMode = stringPtr("native_resume")
+		cleaned.NativeResumeStatus = stringPtr("pending")
+		if r.logger != nil {
+			r.logger.Info("agent execution eligible for native resume", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
+		}
+	} else if r.logger != nil {
+		r.logger.Info("agent execution will restart from checkpoint", map[string]any{"executionId": execution.ID, "runId": execution.RunID, "vendor": execution.Vendor})
+	}
+	cleaned.EndedAt = stringPtr(nowISO)
+	cleaned.UpdatedAt = nowISO
+	if err := repositories.AgentExecutions.Upsert(ctx, cleaned); err != nil {
+		return err
+	}
+	payload := map[string]any{"recoveredAt": nowISO}
+	if pid > 0 {
+		payload["pid"] = pid
+	}
+	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:          newRuntimeEventID(),
+		EventType:   "agent.killed",
+		ProjectID:   execution.ProjectID,
+		LoopID:      execution.LoopID,
+		RunID:       execution.RunID,
+		EntityType:  stringPtr("agent_execution"),
+		EntityID:    stringPtr(execution.ID),
+		PayloadJSON: mustMarshalJSON(payload),
+		CreatedAt:   nowISO,
+	})
 }
 
 func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string, maxAttempts int64) error {
@@ -2344,6 +2753,13 @@ func coalesceString(values ...*string) *string {
 		}
 	}
 	return nil
+}
+
+func stringOrEmpty(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func newRuntimeEventID() string {

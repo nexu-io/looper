@@ -92,6 +92,7 @@ type defaultSchedulerTickInput struct {
 	Now                      func() time.Time
 	MaxConcurrentRuns        int
 	ClaimMu                  *sync.Mutex
+	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
 	Planner                  plannerScheduler
@@ -888,7 +889,7 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -1167,6 +1168,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			Now:                      now,
 			MaxConcurrentRuns:        cfg.Scheduler.MaxConcurrentRuns,
 			ClaimMu:                  claimMu,
+			ReconcileStaleRuns:       reconcileStaleRuns,
 			AsyncRunner:              runner,
 			RequestSchedulerWake:     requestWake,
 			Planner:                  plannerRunner,
@@ -1511,6 +1513,17 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	if err != nil {
 		logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 		return 0, 0, err
+	}
+	if availableSlots == 0 && input.ReconcileStaleRuns != nil {
+		if _, err := input.ReconcileStaleRuns(ctx); err != nil {
+			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
+			return 0, 0, err
+		}
+		availableSlots, err = schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
+		if err != nil {
+			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
+			return 0, 0, err
+		}
 	}
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {

@@ -53,6 +53,10 @@ type RuntimeState interface {
 	StartedAt() (time.Time, bool)
 }
 
+type activeRunExecutionVerifier interface {
+	ExecutionMatchesProcess(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
+}
+
 type sweeperCaseView struct {
 	ID                     string  `json:"id"`
 	ProjectID              string  `json:"projectId"`
@@ -130,6 +134,7 @@ type Context struct {
 	ProjectsService      projectService
 	Now                  func() time.Time
 	RecoverySummary      func() any
+	ReconcileStaleRuns   func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
 	StopLoop             func(context.Context, string, string) (any, error)
 	StopAll              func(context.Context, string) (any, error)
 	TriggerSchedulerTick func()
@@ -328,6 +333,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case apiBasePath + "/runs":
 		payload, err := h.buildRunsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/runs/reconcile-stale":
+		payload, err := h.buildReconcileStaleRunsResponse(r)
 		if err != nil {
 			var typed apiError
 			if !asAPIError(err, &typed) {
@@ -1626,6 +1644,23 @@ func (h *Handler) buildRunsRouteResponse(r *http.Request) (runsListResponse, err
 	return runsListResponse{Items: items}, nil
 }
 
+func (h *Handler) buildReconcileStaleRunsResponse(r *http.Request) (looperdruntime.StaleRunReconcileSummary, error) {
+	if r.Method != http.MethodPost {
+		return looperdruntime.StaleRunReconcileSummary{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/runs/reconcile-stale")}
+	}
+	if h.context.ReconcileStaleRuns == nil {
+		return looperdruntime.StaleRunReconcileSummary{}, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
+	}
+	summary, err := h.context.ReconcileStaleRuns(r.Context())
+	if err != nil {
+		return looperdruntime.StaleRunReconcileSummary{}, err
+	}
+	if h.context.TriggerSchedulerTick != nil && summary.LoopsRequeued > 0 {
+		h.context.TriggerSchedulerTick()
+	}
+	return summary, nil
+}
+
 func (h *Handler) buildEventsRouteResponse(r *http.Request) (eventsListResponse, error) {
 	services := h.context.Runtime.Services()
 	if services.Repositories == nil || services.Repositories.Events == nil {
@@ -2470,11 +2505,9 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	}
 
 	queuedLoopIDs := make(map[string]struct{})
-	activeQueueByLoopID := make(map[string]struct{})
 	for _, item := range queueItems {
 		if item.LoopID != nil && (item.Status == "queued" || item.Status == "running") {
 			queuedLoopIDs[*item.LoopID] = struct{}{}
-			activeQueueByLoopID[*item.LoopID] = struct{}{}
 		}
 	}
 
@@ -2487,7 +2520,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		}
 	}
 
-	activeAgentByRunID := buildActiveAgentByRunID(activeExecutions)
+	activeAgentByRunID := buildVerifiedActiveAgentByRunID(ctx, h.context.Runtime, activeExecutions)
 	plausiblyLiveRunningLoopIDs := make(map[string]struct{}, len(activeRuns))
 	runningViews := make([]activeRunView, 0, len(activeRuns))
 	for _, run := range activeRuns {
@@ -2499,9 +2532,8 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if err != nil {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
-		_, hasActiveQueue := activeQueueByLoopID[run.LoopID]
 		hasActiveAgent := activeAgentByRunID[run.ID] != nil
-		if !isPlausiblyLiveActiveRun(run, loop, latestRun, hasActiveQueue, hasActiveAgent, h.now().UTC()) {
+		if !isPlausiblyLiveActiveRun(run, loop, latestRun, hasActiveAgent, h.now().UTC()) {
 			continue
 		}
 		plausiblyLiveRunningLoopIDs[run.LoopID] = struct{}{}
@@ -2535,6 +2567,9 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 				continue
 			}
 			if _, ok := plausiblyLiveRunningLoopIDs[loop.ID]; ok {
+				continue
+			}
+			if !includeInactiveLoops && !runningLoopWithoutRunIsFresh(loop, h.now().UTC(), activeRunHeartbeatTTL) {
 				continue
 			}
 			runningLoopsWithoutRuns = append(runningLoopsWithoutRuns, loop)
@@ -2677,10 +2712,21 @@ func excludeActiveRunViewsByLoopID(items []activeRunView, excluded []activeRunVi
 	return filtered
 }
 
-func buildActiveAgentByRunID(executions []storage.AgentExecutionRecord) map[string]*activeRunAgent {
+func buildVerifiedActiveAgentByRunID(ctx context.Context, runtime RuntimeState, executions []storage.AgentExecutionRecord) map[string]*activeRunAgent {
+	verifier, _ := runtime.(activeRunExecutionVerifier)
+	if verifier == nil {
+		return map[string]*activeRunAgent{}
+	}
 	grouped := make(map[string][]storage.AgentExecutionRecord)
 	for _, execution := range executions {
 		if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" {
+			continue
+		}
+		if execution.PID == nil || *execution.PID <= 0 {
+			continue
+		}
+		matches, running, err := verifier.ExecutionMatchesProcess(ctx, execution, int(*execution.PID))
+		if err != nil || !running || !matches {
 			continue
 		}
 		runID := *execution.RunID
@@ -2712,14 +2758,14 @@ func buildActiveAgentByRunID(executions []storage.AgentExecutionRecord) map[stri
 	return result
 }
 
-func isPlausiblyLiveActiveRun(run storage.RunRecord, loop storage.LoopRecord, latestRun *storage.RunRecord, hasActiveQueue bool, hasActiveAgent bool, now time.Time) bool {
+func isPlausiblyLiveActiveRun(run storage.RunRecord, loop storage.LoopRecord, latestRun *storage.RunRecord, hasActiveAgent bool, now time.Time) bool {
 	if latestRun == nil || latestRun.ID != run.ID {
 		return false
 	}
 	if !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
 		return false
 	}
-	if hasActiveQueue || hasActiveAgent {
+	if hasActiveAgent {
 		return true
 	}
 	return runHeartbeatIsRecent(run, now, activeRunHeartbeatTTL)
@@ -2734,6 +2780,21 @@ func runHeartbeatIsRecent(run storage.RunRecord, now time.Time, ttl time.Duratio
 		return false
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*heartbeatAt))
+	if err != nil {
+		return false
+	}
+	return !parsed.UTC().Before(now.UTC().Add(-ttl))
+}
+
+func runningLoopWithoutRunIsFresh(loop storage.LoopRecord, now time.Time, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return true
+	}
+	activityAt := firstNonEmptyString(loop.LastRunAt, loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
+	if activityAt == nil || strings.TrimSpace(*activityAt) == "" {
+		return false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*activityAt))
 	if err != nil {
 		return false
 	}
