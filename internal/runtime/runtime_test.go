@@ -1671,6 +1671,67 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 	}
 }
 
+func TestRepairStaleRunQueueStateDoesNotRequeueLoopWhileNewerRunIsLive(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer rt.Stop("test cleanup")
+	repos := rt.Services().Repositories
+	repo := "nexu-io/looper"
+	prNumber := int64(195)
+	targetID := "pr:nexu-io/looper:195"
+	loopID := "loop_superseded_latest_live"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runningQueue := storage.QueueItemRecord{ID: "queue_superseded_running", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_superseded_latest_live:nexu-io/looper:195", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: oldISO, StartedAt: stringPtr(oldISO), MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}
+	if err := repos.Queue.Upsert(context.Background(), runningQueue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	latestRun := &storage.RunRecord{ID: "run_superseded_latest_live", LoopID: loopID, Status: "running", CurrentStep: stringPtr("review"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
+
+	summary, err := rt.repairStaleRunQueueState(context.Background(), repos, loop, latestRun, true, nowISO)
+	if err != nil {
+		t.Fatalf("repairStaleRunQueueState() error = %v", err)
+	}
+	if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 || summary.QueueItemsCancelled != 1 {
+		t.Fatalf("summary = %#v, want no requeue and one stale queue cancellation", summary)
+	}
+	repairedLoop, err := repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if repairedLoop == nil || repairedLoop.Status != "running" {
+		t.Fatalf("loop = %#v, want loop to stay running under newer live run", repairedLoop)
+	}
+	repairedQueue, err := repos.Queue.GetByID(context.Background(), runningQueue.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if repairedQueue == nil || repairedQueue.Status != "cancelled" {
+		t.Fatalf("queue = %#v, want stale running queue item cancelled", repairedQueue)
+	}
+}
+
 func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing.T) {
 	t.Parallel()
 
@@ -1907,6 +1968,75 @@ func TestRuntimeReconcileStaleRunningRunsIsIdempotent(t *testing.T) {
 				t.Fatalf("second summary = %#v, want idempotent no-op", second)
 			}
 		})
+	}
+}
+
+func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+	ambiguousPID := int64(5651)
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "python unrelated.py", nil }})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer rt.Stop("test cleanup")
+	repos := rt.Services().Repositories
+	repo := "nexu-io/looper"
+	prNumber := int64(196)
+	targetID := "pr:nexu-io/looper:196"
+	loopID := "loop_uncertain_event_dedupe"
+	runID := "run_uncertain_event_dedupe"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_uncertain_event_dedupe", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: "codex", Status: "running", PID: &ambiguousPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	first, err := rt.reconcileLiveStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("first reconcile error = %v", err)
+	}
+	second, err := rt.reconcileLiveStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("second reconcile error = %v", err)
+	}
+	if first.SkippedUncertainRuns != 1 || first.EventsWritten != 1 {
+		t.Fatalf("first summary = %#v, want one uncertain event written", first)
+	}
+	if second.SkippedUncertainRuns != 1 || second.EventsWritten != 0 {
+		t.Fatalf("second summary = %#v, want deduped uncertain event without new writes", second)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "exec_uncertain_event_dedupe")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.EventType == "looperd.recovery.process_identity_uncertain" {
+			count += 1
+		}
+	}
+	if count != 1 {
+		t.Fatalf("uncertain event count = %d, want 1; events = %#v", count, events)
 	}
 }
 
