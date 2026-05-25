@@ -86,7 +86,7 @@ func TestRootPreRunSkipsAutoUpgradeForUnsupportedInstallSource(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("Run([version]) stderr = %q, want empty string", stderr.String())
 	}
-	if got, want := stdout.String(), "0.0.0-dev\n"; got != want {
+	if got, want := stdout.String(), "CLI version: 0.0.0-dev\nlooperd server version: unavailable\n"; got != want {
 		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
 	}
 }

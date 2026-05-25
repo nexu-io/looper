@@ -121,7 +121,7 @@ func TestRunUsesDefaultCLIAppFactory(t *testing.T) {
 	}
 }
 
-func TestRunWithDepsVersionShortCircuitsBeforeAppConstruction(t *testing.T) {
+func TestRunWithDepsMapsVersionFlagToVersionCommand(t *testing.T) {
 	t.Parallel()
 
 	stdout := &bytes.Buffer{}
@@ -131,18 +131,23 @@ func TestRunWithDepsVersionShortCircuitsBeforeAppConstruction(t *testing.T) {
 	exitCode := runWithDeps([]string{"--version"}, stdout, stderr, runDeps{
 		newApp: func(cliapp.Deps) appRunner {
 			called = true
-			return fakeApp{run: func(context.Context, []string) int { return 99 }}
+			return fakeApp{run: func(_ context.Context, args []string) int {
+				if got, want := args, []string{"version"}; len(got) != len(want) || got[0] != want[0] {
+					t.Fatalf("args = %v, want %v", got, want)
+				}
+				return 0
+			}}
 		},
 	})
 
 	if exitCode != 0 {
 		t.Fatalf("runWithDeps([--version]) exit code = %d, want 0", exitCode)
 	}
-	if called {
-		t.Fatal("newApp was called for --version")
+	if !called {
+		t.Fatal("newApp was not called for --version")
 	}
-	if got, want := stdout.String(), version.Value+"\n"; got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty string", got)
 	}
 	if got := stderr.String(); got != "" {
 		t.Fatalf("stderr = %q, want empty string", got)
@@ -155,7 +160,12 @@ func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 
-	exitCode := run([]string{"version"}, stdout, stderr)
+	exitCode := runWithDeps([]string{"version"}, stdout, stderr, runDeps{
+		newApp: func(deps cliapp.Deps) appRunner {
+			deps.HomeDir = t.TempDir()
+			return cliapp.New(deps)
+		},
+	})
 
 	if exitCode != 0 {
 		t.Fatalf("run([version]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
@@ -163,7 +173,7 @@ func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
 	if got := stderr.String(); got != "" {
 		t.Fatalf("run([version]) stderr = %q, want empty string", got)
 	}
-	if got, want := stdout.String(), version.Value+"\n"; got != want {
+	if got, want := stdout.String(), "CLI version: "+version.Value+"\nlooperd server version: unavailable\n"; got != want {
 		t.Fatalf("run([version]) stdout = %q, want %q", got, want)
 	}
 }

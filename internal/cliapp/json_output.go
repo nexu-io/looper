@@ -49,11 +49,48 @@ func (r *commandRuntime) configShow(cmd *cobra.Command, args []string) error {
 func (r *commandRuntime) version(cmd *cobra.Command, args []string) error {
 	_ = args
 	info := version.Current()
-	if getBoolFlag(cmd, "json") {
-		return writeJSON(cmd.OutOrStdout(), info)
+	output := versionOutput{CLI: info}
+	if daemon := r.bestEffortDaemonVersion(cmd.Context()); daemon != nil {
+		output.Server = daemon
 	}
-	_, err := fmt.Fprintln(cmd.OutOrStdout(), info.Version)
+	if getBoolFlag(cmd, "json") {
+		return writeJSON(cmd.OutOrStdout(), output)
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "CLI version: %s\n", info.Version); err != nil {
+		return err
+	}
+	serverVersion := "unavailable"
+	if output.Server != nil && strings.TrimSpace(output.Server.Version) != "" {
+		serverVersion = output.Server.Version
+	}
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "looperd server version: %s\n", serverVersion)
 	return err
+}
+
+type versionOutput struct {
+	CLI    version.Info          `json:"cli"`
+	Server *daemonVersionPayload `json:"server,omitempty"`
+}
+
+type daemonVersionPayload struct {
+	Version    string  `json:"version"`
+	Source     string  `json:"source,omitempty"`
+	BinaryPath *string `json:"binaryPath,omitempty"`
+}
+
+func (r *commandRuntime) bestEffortDaemonVersion(ctx context.Context) *daemonVersionPayload {
+	state, err := r.readManagedDaemonVersion(ctx)
+	if err != nil || state == nil || strings.TrimSpace(state.Version) == "" {
+		state, err = r.readPathDaemonVersion(ctx)
+	}
+	if err != nil || state == nil || strings.TrimSpace(state.Version) == "" {
+		return nil
+	}
+	return &daemonVersionPayload{
+		Version:    state.Version,
+		Source:     state.Source,
+		BinaryPath: state.BinaryPath,
+	}
 }
 
 func (r *commandRuntime) projectList(cmd *cobra.Command, args []string) error {

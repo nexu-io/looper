@@ -580,14 +580,50 @@ func TestFeedbackCommandRequiresMessage(t *testing.T) {
 func TestVersionCommandPrintsCurrentVersion(t *testing.T) {
 	t.Parallel()
 
-	exitCode, stdout, stderr := runApp(t, "version")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: t.TempDir()})
+	exitCode := app.Run(context.Background(), []string{"version"})
 	if exitCode != 0 {
 		t.Fatalf("Run([version]) exit code = %d, want 0", exitCode)
 	}
-	if stderr != "" {
-		t.Fatalf("Run([version]) stderr = %q, want empty string", stderr)
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([version]) stderr = %q, want empty string", got)
 	}
-	if got, want := stdout, version.Current().Version+"\n"; got != want {
+	if got, want := stdout.String(), "CLI version: "+version.Current().Version+"\nlooperd server version: unavailable\n"; got != want {
+		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestVersionCommandPrintsCLIAndServerVersionSeparately(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.6.0\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version"})
+	if exitCode != 0 {
+		t.Fatalf("Run([version]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([version]) stderr = %q, want empty string", got)
+	}
+	if got, want := stdout.String(), "CLI version: "+version.Current().Version+"\nlooperd server version: 0.6.0\n"; got != want {
 		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
 	}
 }
@@ -595,22 +631,81 @@ func TestVersionCommandPrintsCurrentVersion(t *testing.T) {
 func TestVersionCommandJSONPrintsBuildMetadata(t *testing.T) {
 	t.Parallel()
 
-	exitCode, stdout, stderr := runApp(t, "version", "--json")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: t.TempDir()})
+	exitCode := app.Run(context.Background(), []string{"version", "--json"})
 	if exitCode != 0 {
 		t.Fatalf("Run([version --json]) exit code = %d, want 0", exitCode)
 	}
-	if stderr != "" {
-		t.Fatalf("Run([version --json]) stderr = %q, want empty string", stderr)
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([version --json]) stderr = %q, want empty string", got)
 	}
-	assertJSONContains(t, stdout, "version", version.Current().Version)
-	assertJSONContains(t, stdout, "metadata", map[string]any{
-		"versionSource":   version.Current().Metadata.VersionSource,
-		"channel":         version.Current().Metadata.Channel,
-		"apiVersion":      version.Current().Metadata.APIVersion,
-		"minCliForDaemon": nil,
-		"minDaemonForCli": nil,
-		"gitCommitSha":    nil,
-		"buildTimestamp":  nil,
+	assertJSONContains(t, stdout.String(), "cli", map[string]any{
+		"version": version.Current().Version,
+		"metadata": map[string]any{
+			"versionSource":   version.Current().Metadata.VersionSource,
+			"channel":         version.Current().Metadata.Channel,
+			"apiVersion":      version.Current().Metadata.APIVersion,
+			"minCliForDaemon": nil,
+			"minDaemonForCli": nil,
+			"gitCommitSha":    nil,
+			"buildTimestamp":  nil,
+		},
+	})
+	var decoded map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("unmarshal stdout JSON: %v\nraw=%q", err, stdout.String())
+	}
+	if _, ok := decoded["server"]; ok {
+		t.Fatalf("stdout JSON unexpectedly included server payload: %#v", decoded)
+	}
+}
+
+func TestVersionCommandJSONPrintsServerVersionSeparately(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.6.0\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version", "--json"})
+	if exitCode != 0 {
+		t.Fatalf("Run([version --json]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([version --json]) stderr = %q, want empty string", got)
+	}
+	assertJSONContains(t, stdout.String(), "cli", map[string]any{
+		"version": version.Current().Version,
+		"metadata": map[string]any{
+			"versionSource":   version.Current().Metadata.VersionSource,
+			"channel":         version.Current().Metadata.Channel,
+			"apiVersion":      version.Current().Metadata.APIVersion,
+			"minCliForDaemon": nil,
+			"minDaemonForCli": nil,
+			"gitCommitSha":    nil,
+			"buildTimestamp":  nil,
+		},
+	})
+	assertJSONContains(t, stdout.String(), "server", map[string]any{
+		"version":    "0.6.0",
+		"source":     "binary",
+		"binaryPath": managedPath,
 	})
 }
 
