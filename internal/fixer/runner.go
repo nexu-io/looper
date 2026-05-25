@@ -1101,24 +1101,29 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
 	policy := r.discoveryPolicyForProject(project.ID)
-	if !policy.AutoDiscovery {
-		return DiscoveryResult{Skipped: 1}, nil
-	}
 	currentUser := ""
-	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	recoveredQueueItems, err := r.recoverLegacyNoopFollowupLoops(ctx, *project, input.Repo, policy, currentUser)
-	if err != nil {
-		return DiscoveryResult{}, err
+	recoveredQueueItems := []storage.QueueItemRecord{}
+	openPRs := []PullRequestSummary{}
+	if policy.AutoDiscovery {
+		recoveredQueueItems, err = r.recoverLegacyNoopFollowupLoops(ctx, *project, input.Repo, policy, currentUser)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		openPRs, err = r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy, "")
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
 	}
-	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, currentUser, policy, "")
-	if err != nil {
-		return DiscoveryResult{}, err
+	openPRs = appendManualFixerFollowupCandidates(ctx, r, input.ProjectID, input.Repo, openPRs)
+	if !policy.AutoDiscovery && len(openPRs) == 0 {
+		return DiscoveryResult{Skipped: 1}, nil
 	}
 	result := DiscoveryResult{}
 	for _, item := range recoveredQueueItems {
@@ -1133,6 +1138,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		if normalizePRState(detail.State) != "open" {
+			result.Skipped++
+			continue
 		}
 		if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
 			return DiscoveryResult{}, err
@@ -1158,10 +1167,16 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	policy := r.discoveryPolicyForProject(project.ID)
 	if !policy.AutoDiscovery {
-		return DiscoveryResult{Skipped: 1}, nil
+		manualFollowupLoop, err := r.findManualFixerFollowupLoopByPR(ctx, input.ProjectID, input.Repo, input.PRNumber)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		if manualFollowupLoop == nil {
+			return DiscoveryResult{Skipped: 1}, nil
+		}
 	}
 	currentUser := ""
-	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
@@ -1171,6 +1186,9 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: project.RepoPath})
 	if err != nil {
 		return DiscoveryResult{}, err
+	}
+	if normalizePRState(detail.State) != "open" {
+		return DiscoveryResult{Skipped: 1}, nil
 	}
 	pr := PullRequestSummary{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, Author: detail.Author}
 	result := DiscoveryResult{}
@@ -1206,20 +1224,24 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
 	policy := r.discoveryPolicyForProject(project.ID)
-	if !policy.AutoDiscovery {
-		return DiscoveryResult{Skipped: 1}, nil
-	}
 	currentUser := ""
-	if policy.AuthorFilter != config.FixerAuthorFilterAny {
+	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
 		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		currentUser = strings.TrimSpace(currentUser)
 	}
-	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, 0, currentUser, policy, baseRefName)
-	if err != nil {
-		return DiscoveryResult{}, err
+	openPRs := []PullRequestSummary{}
+	if policy.AutoDiscovery {
+		openPRs, err = r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, 0, currentUser, policy, baseRefName)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+	}
+	openPRs = appendManualFixerFollowupCandidates(ctx, r, input.ProjectID, input.Repo, openPRs)
+	if !policy.AutoDiscovery && len(openPRs) == 0 {
+		return DiscoveryResult{Skipped: 1}, nil
 	}
 	result := DiscoveryResult{}
 	for _, pr := range openPRs {
@@ -1230,6 +1252,10 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return DiscoveryResult{}, err
+		}
+		if normalizePRState(detail.State) != "open" || !strings.EqualFold(strings.TrimSpace(detail.BaseRefName), baseRefName) {
+			result.Skipped++
+			continue
 		}
 		if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
 			return DiscoveryResult{}, err
@@ -1305,7 +1331,11 @@ func defaultDiscoveryLimit(limit int) int {
 }
 
 func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID string, pr PullRequestSummary, repo, currentUser string, policy DiscoveryPolicy) bool {
-	if (!policy.IncludeDrafts && pr.IsDraft) || normalizePRState(pr.State) != "open" {
+	manualFollowupLoop, _ := r.findManualFixerFollowupLoopByPR(ctx, projectID, repo, pr.Number)
+	if normalizePRState(pr.State) != "open" {
+		return false
+	}
+	if manualFollowupLoop == nil && !policy.IncludeDrafts && pr.IsDraft {
 		return false
 	}
 	if r.hasActivePRLock(ctx, repo, pr.Number) {
@@ -1318,6 +1348,9 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 			return false
 		}
 	}
+	if manualFollowupLoop != nil {
+		return true
+	}
 	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
 		return false
 	}
@@ -1328,6 +1361,14 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 }
 
 func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, result *DiscoveryResult) error {
+	loop, err := r.findFixerLoopByPR(ctx, project.ID, repo, detail.Number)
+	if err != nil {
+		return err
+	}
+	if loop != nil && isManualFixerLoop(*loop) && !fixerFollowUpdatesEnabled(*loop) {
+		result.Skipped++
+		return nil
+	}
 	allFixItems := collectFixItems(detail)
 	if len(allFixItems) == 0 {
 		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
@@ -1812,6 +1853,12 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if current == nil {
 		return false, nil
 	}
+	if !fixerFollowUpdatesEnabled(*current) {
+		if _, err := r.clearPendingFixerRediscovery(ctx, *current); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
 	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(current.MetadataJSON))
 	if !ok {
 		return false, nil
@@ -1859,6 +1906,9 @@ func (r *Runner) scheduleFollowupRetryAfterSuccess(ctx context.Context, loop sto
 		return false, err
 	}
 	if current == nil {
+		return false, nil
+	}
+	if !fixerFollowUpdatesEnabled(*current) {
 		return false, nil
 	}
 	followup, ok := parseFixerFollowupState(parseJSONObject(current.MetadataJSON))
@@ -3708,6 +3758,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	}
 	for _, existing := range existingLoops {
 		if existing.Type == "fixer" && existing.ProjectID == project.ID && derefString(existing.Repo) == repo && derefInt64(existing.PRNumber) == prNumber {
+			if isManualFixerLoop(existing) && !isManualFixerFollowupCandidate(existing) {
+				continue
+			}
 			if existing.Status == "paused" {
 				if resumed, updated, err := r.resumePausedZeroProgressLoop(ctx, existing, headSHA, fixItemsStateHash); err != nil {
 					return loopUpsertResult{}, err
@@ -3930,10 +3983,18 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 		if loop.Status == "paused" || loop.Status == "running" {
 			continue
 		}
+		if isManualFixerLoop(loop) && !isManualFixerFollowupCandidate(loop) {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
 		if r.hasActivePRLock(ctx, repo, *loop.PRNumber) {
 			continue
 		}
 		metadata := parseJSONObject(loop.MetadataJSON)
+		if isManualFixerLoop(loop) && !fixerFollowUpdatesEnabled(loop) {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
 		if _, ok := parseFixerFollowupState(metadata); ok {
 			continue
 		}
@@ -4210,13 +4271,91 @@ func (r *Runner) findFixerLoopByPR(ctx context.Context, projectID, repo string, 
 	if err != nil {
 		return nil, err
 	}
+	var firstMatch *storage.LoopRecord
+	var firstAutomatic *storage.LoopRecord
+	var manualFollowup *storage.LoopRecord
 	for _, loop := range loops {
 		if loop.Type == "fixer" && loop.ProjectID == projectID && derefString(loop.Repo) == repo && derefInt64(loop.PRNumber) == prNumber {
+			matched := loop
+			if manualFollowup == nil && isManualFixerFollowupCandidate(matched) {
+				manualFollowup = &matched
+			}
+			if firstAutomatic == nil && !isManualFixerLoop(matched) {
+				firstAutomatic = &matched
+			}
+			if firstMatch == nil && (!isManualFixerLoop(matched) || isManualFixerFollowupCandidate(matched)) {
+				firstMatch = &matched
+			}
+		}
+	}
+	if manualFollowup != nil {
+		return manualFollowup, nil
+	}
+	if firstAutomatic != nil {
+		return firstAutomatic, nil
+	}
+	return firstMatch, nil
+}
+
+func (r *Runner) findManualFixerFollowupLoopByPR(ctx context.Context, projectID, repo string, prNumber int64) (*storage.LoopRecord, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, loop := range loops {
+		if loop.Type != "fixer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		if isManualFixerFollowupCandidate(loop) {
 			matched := loop
 			return &matched, nil
 		}
 	}
 	return nil, nil
+}
+
+func appendManualFixerFollowupCandidates(ctx context.Context, runner *Runner, projectID, repo string, prs []PullRequestSummary) []PullRequestSummary {
+	if runner == nil || runner.repos == nil || runner.repos.Loops == nil {
+		return prs
+	}
+	loops, err := runner.repos.Loops.List(ctx)
+	if err != nil {
+		return prs
+	}
+	seen := make(map[int64]struct{}, len(prs))
+	for _, pr := range prs {
+		seen[pr.Number] = struct{}{}
+	}
+	for _, loop := range loops {
+		if loop.Type != "fixer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil {
+			continue
+		}
+		if !isManualFixerFollowupCandidate(loop) {
+			continue
+		}
+		if _, ok := seen[*loop.PRNumber]; ok {
+			continue
+		}
+		prs = append(prs, PullRequestSummary{Number: *loop.PRNumber, State: "OPEN"})
+		seen[*loop.PRNumber] = struct{}{}
+	}
+	return prs
+}
+
+func fixerFollowUpdatesEnabled(loop storage.LoopRecord) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
+	if enabled, ok := meta["followUpdates"].(bool); ok {
+		return enabled
+	}
+	return !isManualFixerLoop(loop)
+}
+
+func isManualFixerFollowupCandidate(loop storage.LoopRecord) bool {
+	if !isManualFixerLoop(loop) || !fixerFollowUpdatesEnabled(loop) {
+		return false
+	}
+	status := strings.TrimSpace(loop.Status)
+	return status != "stopped" && status != "terminated"
 }
 
 func loopMetadataForPR(ctx context.Context, runner *Runner, projectID, repo string, prNumber int64) *string {

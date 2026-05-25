@@ -387,10 +387,13 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				runE:  runtime.fixCreate,
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
+					boolFlag("loop", "Keep fixing when new PR comments arrive"),
+					boolFlag("no-loop", "Run only one fixer pass"),
 				},
 				exampleLines: []string{
 					"$ looper fix 42",
 					"$ looper fix acme/looper#42",
+					"$ looper fix acme/looper#42 --loop",
 				},
 			}),
 			newCommand(commandSpec{

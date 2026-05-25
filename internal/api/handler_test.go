@@ -2893,6 +2893,10 @@ func TestHandlerCreateLoopFixerEnqueuesSchedulableManualLoop(t *testing.T) {
 	}
 	metadata := parseJSONObject(loop.MetadataJSON)
 	assertEqual(t, metadata["manual"], true)
+	assertEqual(t, metadata["followUpdates"], false)
+	loopMeta := metadata["loop"].(map[string]any)
+	assertEqual(t, loopMeta["enabled"], false)
+	assertEqual(t, loopMeta["startTime"], fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString))
 
 	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
 	if err != nil {
@@ -2914,6 +2918,33 @@ func TestHandlerCreateLoopFixerEnqueuesSchedulableManualLoop(t *testing.T) {
 	assertEqual(t, queue.TargetID, "pr:acme/looper:99")
 	assertEqual(t, queue.DedupeKey, "fixer:"+loopID)
 	assertEqual(t, triggered, 1)
+}
+
+func TestHandlerCreateLoopFixerPersistsFollowUpdatesWhenLoopEnabled(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"fixer","targetType":"pull_request","repo":"acme/looper","prNumber":99,"metadata":{"followUpdates":true}}`)))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	loopID := data["id"].(string)
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	assertEqual(t, metadata["manual"], true)
+	assertEqual(t, metadata["followUpdates"], true)
+	loopMeta := metadata["loop"].(map[string]any)
+	assertEqual(t, loopMeta["enabled"], true)
+	assertEqual(t, loopMeta["startTime"], fixture.now.UTC().Format(javaScriptISOString))
 }
 
 func TestHandlerCreateLoopWorkerEnqueuesSchedulableManualLoop(t *testing.T) {

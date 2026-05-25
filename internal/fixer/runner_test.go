@@ -1969,7 +1969,7 @@ func TestDiscoverPullRequestsRecoversManualForeignLegacyNoopLoop(t *testing.T) {
 	legacyAt := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -1988,6 +1988,165 @@ func TestDiscoverPullRequestsRecoversManualForeignLegacyNoopLoop(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestSkipsManualLoopWhenFollowUpdatesDisabled(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"manual":true,"followUpdates":false}`
+	loop := storage.LoopRecord{ID: "loop_manual_single_shot", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	github := &fakeGitHubGateway{currentUser: "looper-bot", viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequest() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want no follow-up queue item for disabled manual fixer loop", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestAllowsManualLoopWhenFollowUpdatesEnabled(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"manual":true,"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_followup", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	github := &fakeGitHubGateway{currentUser: "looper-bot", viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequest() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one manual follow-up queue item", result.QueueItems)
+	}
+	if result.QueueItems[0].LoopID == nil || *result.QueueItems[0].LoopID != loop.ID {
+		t.Fatalf("queue item = %#v, want manual follow-up loop %q", result.QueueItems[0], loop.ID)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsClosedManualFollowUpCandidate(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"manual":true,"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_followup_closed", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{currentUser: "looper-bot", viewResponses: []PullRequestDetail{{Number: prNumber, State: "CLOSED", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want no queue items for closed manual follow-up candidate", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsStoppedManualFollowUpCandidate(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"manual":true,"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_followup_stopped", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "stopped", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	github := &fakeGitHubGateway{currentUser: "looper-bot", viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want no queue items for stopped manual follow-up loop", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsForBaseBranchUpdateSkipsManualFollowUpOnDifferentBase(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"manual":true,"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_followup_other_base", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	github := &fakeGitHubGateway{currentUser: "looper-bot", viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "release", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequestsForBaseBranchUpdate(context.Background(), BaseBranchDiscoveryInput{ProjectID: "project_1", Repo: repo, BaseRefName: "main"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequestsForBaseBranchUpdate() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want no queue items for manual follow-up loop on another base branch", result.QueueItems)
+	}
+}
+
+func TestSchedulePendingRediscoveryAfterRunSkipsDisabledManualLoop(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(84)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	projectID := "project_1"
+	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": false, "pendingFixerRediscovery": map[string]any{"headSha": "head-84", "fixItemsStateHash": "state-84", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO}})
+	loop := storage.LoopRecord{ID: "loop_manual_pending_disabled", Seq: 98, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), loop, repo, prNumber)
+	if err != nil {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
+	}
+	if scheduled {
+		t.Fatal("schedulePendingRediscoveryAfterRun() = true, want disabled manual loop to stay single-shot")
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if _, ok := parsePendingFixerRediscoveryState(parseJSONObject(persisted.MetadataJSON)); ok {
+		t.Fatalf("pending rediscovery still present in %#v", parseJSONObject(persisted.MetadataJSON))
+	}
+}
+
 func TestDiscoverPullRequestsRecoversManualLegacyNoopLoopDespiteLabelMismatch(t *testing.T) {
 	t.Parallel()
 
@@ -1998,7 +2157,7 @@ func TestDiscoverPullRequestsRecoversManualLegacyNoopLoopDespiteLabelMismatch(t 
 	legacyAt := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy_labels", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2024,7 +2183,7 @@ func TestDiscoverPullRequestsRecoversManualLegacyNoopDraftLoopDespiteDraftPolicy
 	legacyAt := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", IsDraft: true, HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy_draft", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}

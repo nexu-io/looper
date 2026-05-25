@@ -138,6 +138,9 @@ func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 			if got, want := metadata["manual"], true; got != want {
 				t.Fatalf("body.metadata.manual = %#v, want %#v", got, want)
 			}
+			if got, want := metadata["followUpdates"], false; got != want {
+				t.Fatalf("body.metadata.followUpdates = %#v, want %#v", got, want)
+			}
 			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_fix_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "queued"}))
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)
@@ -165,6 +168,48 @@ func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 	}
 	if got := stdout.String(); !strings.Contains(got, "Fixer started") || !strings.Contains(got, "acme/looper#123") {
 		t.Fatalf("Run([fix 123]) stdout = %q, want fixer summary for %q", got, "acme/looper#123")
+	}
+}
+
+func TestFixCreateAcceptsLoopFlag(t *testing.T) {
+	t.Parallel()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			metadata, ok := body["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("body.metadata = %#v, want object", body["metadata"])
+			}
+			if got, want := metadata["followUpdates"], true; got != want {
+				t.Fatalf("body.metadata.followUpdates = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_fix_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "queued"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, Getwd: func() (string, error) { return repoPath, nil }})
+
+	exitCode := app.Run(context.Background(), []string{"fix", "123", "--loop", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([fix 123 --loop]) exit code = %d, want 0", exitCode)
 	}
 }
 

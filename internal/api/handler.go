@@ -3324,14 +3324,14 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return loopResponse{}, err
 		}
 	}
+	now := h.now().UTC()
+	nowISO := eventlog.FormatJavaScriptISOString(now)
 	if domain.LoopType(loopType) == domain.LoopTypeFixer {
-		metadataJSON, err = manualFixerMetadataJSON(metadataJSON)
+		metadataJSON, err = manualFixerMetadataJSON(metadataJSON, nowISO)
 		if err != nil {
 			return loopResponse{}, err
 		}
 	}
-	now := h.now().UTC()
-	nowISO := eventlog.FormatJavaScriptISOString(now)
 	if domain.LoopType(loopType) == domain.LoopTypeReviewer {
 		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Roles.Reviewer.Behavior, target, nowISO)
 		if err != nil {
@@ -4495,7 +4495,7 @@ func manualPlannerMetadataJSON(existing *string, issueNumber int64) (*string, er
 	return &text, nil
 }
 
-func manualFixerMetadataJSON(existing *string) (*string, error) {
+func manualFixerMetadataJSON(existing *string, nowISO string) (*string, error) {
 	metadata := map[string]any{}
 	if existing != nil && strings.TrimSpace(*existing) != "" {
 		if err := json.Unmarshal([]byte(*existing), &metadata); err != nil {
@@ -4503,6 +4503,20 @@ func manualFixerMetadataJSON(existing *string) (*string, error) {
 		}
 	}
 	metadata["manual"] = true
+	followUpdates, _ := metadata["followUpdates"].(bool)
+	loopMeta, _ := metadata["loop"].(map[string]any)
+	if loopMeta == nil {
+		loopMeta = map[string]any{}
+	}
+	metadata["followUpdates"] = followUpdates
+	loopMeta["enabled"] = followUpdates
+	if _, ok := loopMeta["status"].(string); !ok {
+		loopMeta["status"] = "active"
+	}
+	if _, ok := loopMeta["startTime"].(string); !ok && strings.TrimSpace(nowISO) != "" {
+		loopMeta["startTime"] = nowISO
+	}
+	metadata["loop"] = loopMeta
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
