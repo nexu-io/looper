@@ -747,6 +747,49 @@ func TestVersionCommandJSONPrintsServerVersionSeparately(t *testing.T) {
 	})
 }
 
+func TestVersionCommandUsesConfiguredBaseURLForServerVersionLookup(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"server": map[string]any{
+			"host":     "127.0.0.1",
+			"port":     1,
+			"baseUrl":  "https://daemon.example.test/base",
+			"authMode": "none",
+		},
+	})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{
+		Stdout: stdout,
+		Stderr: stderr,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			if got, want := req.URL.String(), "https://daemon.example.test/base/api/v1/status"; got != want {
+				t.Fatalf("status URL = %q, want %q", got, want)
+			}
+			return jsonResponse(t, http.StatusOK, `{"ok":true,"data":{"service":{"version":"0.8.0"}}}`), nil
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = args
+			_ = timeout
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([version --config]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([version --config]) stderr = %q, want empty string", got)
+	}
+	if got, want := stdout.String(), "CLI version: "+version.Current().Version+"\nlooperd server version: 0.8.0\n"; got != want {
+		t.Fatalf("Run([version --config]) stdout = %q, want %q", got, want)
+	}
+}
+
 func TestNestedCommandParsingReachesLeafCommands(t *testing.T) {
 	t.Parallel()
 

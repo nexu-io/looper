@@ -80,7 +80,7 @@ type daemonVersionPayload struct {
 
 func (r *commandRuntime) bestEffortDaemonVersion(ctx context.Context) *daemonVersionPayload {
 	if loaded, err := r.loadConfig(); err == nil {
-		client := r.localAPIClientFromLoaded(loaded)
+		client := r.apiClientFromLoaded(loaded)
 		if payload, err := r.getJSONWithClient(ctx, client, "/api/v1/status"); err == nil {
 			if state, err := r.detectDaemonVersionState(ctx, payload); err == nil && state != nil && strings.TrimSpace(state.Version) != "" {
 				return &daemonVersionPayload{
