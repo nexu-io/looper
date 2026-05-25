@@ -2025,6 +2025,75 @@ func TestRunRecoveryPipelineAutoRecoversFailedReviewerGuardrailLoop(t *testing.T
 	}
 }
 
+func TestRunRecoveryPipelineUsesProjectReviewerRetryOverride(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	enhanced := true
+	recoverExisting := true
+	patterns := []string{"project-only transient transport"}
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID:       "project_1",
+		Name:     "Looper",
+		RepoPath: filepath.Join(workingDir, "repo"),
+		Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Behavior: &config.PartialReviewerConfig{Retry: &config.PartialReviewerRetryConfig{
+			EnhancedTransientClassification: &enhanced,
+			RecoverExistingMatchedFailures:  &recoverExisting,
+			ExtraTransientErrorPatterns:     &patterns,
+		}}}},
+	}}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	defer coordinator.Close()
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-17T12:00:00.000Z"
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	loopID := "loop_project_retry_recover"
+	queueID := "queue_project_retry_recover"
+	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"enabled": true, "failureCount": 1, "consecutiveFailures": 1, "lastFailure": "project-only transient transport failure"}})
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 166, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := `{"resumePolicy":"replay_step","detail":{"state":"OPEN","reviewDecision":"","labels":[]}}`
+	errorMessage := "project-only transient transport failure"
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_project_retry_recover", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("snapshot"), CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queueKind := "non_retryable"
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_project_retry_recover:acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, FinishedAt: &nowISO, LastError: &errorMessage, LastErrorKind: &queueKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now)
+	if err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	if summary.LoopsRequeued != 1 {
+		t.Fatalf("LoopsRequeued = %d, want 1", summary.LoopsRequeued)
+	}
+	loop, _ := repositories.Loops.GetByID(context.Background(), loopID)
+	queue, _ := repositories.Queue.GetByID(context.Background(), queueID)
+	if loop == nil || loop.Status != "queued" || queue == nil || queue.Status != "queued" || queue.Attempts != 1 {
+		t.Fatalf("loop=%#v queue=%#v, want recovered queued loop and preserved attempts", loop, queue)
+	}
+}
+
 func TestRecoveryInterruptsOlderRunningRunWhenLatestCompleted(t *testing.T) {
 	t.Parallel()
 

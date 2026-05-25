@@ -298,6 +298,49 @@ func TestReviewerFailedLoopRecoveryEnhancedTransientIsOptIn(t *testing.T) {
 	})
 }
 
+func TestReviewerFailedLoopRecoveryUsesProjectRetryOverride(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	message := "project-only transient transport failure"
+	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	enhanced := true
+	recoverExisting := true
+	patterns := []string{"project-only transient transport"}
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID: "project_1",
+		Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Behavior: &config.PartialReviewerConfig{Retry: &config.PartialReviewerRetryConfig{
+			EnhancedTransientClassification: &enhanced,
+			RecoverExistingMatchedFailures:  &recoverExisting,
+			ExtraTransientErrorPatterns:     &patterns,
+		}}}},
+	}}
+	runner := New(Options{
+		DB:                 fixture.coordinator.DB(),
+		Repos:              fixture.repos,
+		GitHub:             &fakeGitHubGateway{},
+		Git:                &fakeGitGateway{},
+		AgentExecutor:      &fakeAgentExecutor{},
+		Logger:             fixture.logger,
+		Now:                fixture.now,
+		LoopConfig:         config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+		RetryPolicy:        cfg.Roles.Reviewer.Behavior.Retry,
+		CustomInstructions: &cfg,
+	})
+	loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN"})
+	if err != nil {
+		t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+	}
+	if !eligible || reason != "enhanced_transient_match_attempts_remaining" {
+		t.Fatalf("eligible=%v reason=%q, want project retry override recovery", eligible, reason)
+	}
+}
+
 func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

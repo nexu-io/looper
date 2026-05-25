@@ -1268,12 +1268,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if err != nil {
 			return RecoverySummary{}, err
 		}
-		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
-			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
-			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
-			retry:            config.NormalizeReviewerRetryConfig(r.config.Roles.Reviewer.Behavior.Retry),
-		}
+		policy := r.reviewerRecoveryPolicyForProject(loop.ProjectID)
 		if reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
 		}
@@ -1473,12 +1468,7 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		if err != nil {
 			return requeued, err
 		}
-		policy := runtimeReviewerRecoveryPolicy{
-			includeDrafts:    r.config.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
-			stopOnApproved:   r.config.Roles.Reviewer.Behavior.Loop.StopOnApproved,
-			stopOnReadyLabel: r.config.Roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
-			retry:            config.NormalizeReviewerRetryConfig(r.config.Roles.Reviewer.Behavior.Retry),
-		}
+		policy := r.reviewerRecoveryPolicyForProject(loop.ProjectID)
 		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
 			continue
 		}
@@ -2015,6 +2005,16 @@ type runtimeReviewerRecoveryPolicy struct {
 	stopOnReadyLabel bool
 	currentLogin     string
 	retry            config.ReviewerRetryConfig
+}
+
+func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeReviewerRecoveryPolicy {
+	roles := config.ProjectRoleConfigs(r.config, projectID)
+	return runtimeReviewerRecoveryPolicy{
+		includeDrafts:    roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+		stopOnApproved:   roles.Reviewer.Behavior.Loop.StopOnApproved,
+		stopOnReadyLabel: roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
+		retry:            config.NormalizeReviewerRetryConfig(roles.Reviewer.Behavior.Retry),
+	}
 }
 
 func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway, loop storage.LoopRecord, latestRun *storage.RunRecord, policy runtimeReviewerRecoveryPolicy) (string, bool) {

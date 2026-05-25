@@ -1090,6 +1090,55 @@ func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.Revi
 	return roles.Reviewer.AutoMerge
 }
 
+func (r *Runner) retryPolicyForProject(projectID string) config.ReviewerRetryConfig {
+	policy := config.NormalizeReviewerRetryConfig(r.retryPolicy)
+	if r.projectRoleConfig == nil {
+		return policy
+	}
+	projectID = strings.TrimSpace(projectID)
+	for _, project := range r.projectRoleConfig.Projects {
+		if strings.TrimSpace(project.ID) != projectID {
+			continue
+		}
+		if project.Roles == nil || project.Roles.Reviewer == nil || project.Roles.Reviewer.Behavior == nil || project.Roles.Reviewer.Behavior.Retry == nil {
+			return policy
+		}
+		return mergeProjectReviewerRetryPolicy(policy, *project.Roles.Reviewer.Behavior.Retry)
+	}
+	return policy
+}
+
+func mergeProjectReviewerRetryPolicy(policy config.ReviewerRetryConfig, partial config.PartialReviewerRetryConfig) config.ReviewerRetryConfig {
+	if partial.EnhancedTransientClassification != nil {
+		policy.EnhancedTransientClassification = *partial.EnhancedTransientClassification
+	}
+	if partial.ExtraTransientErrorPatterns != nil {
+		policy.ExtraTransientErrorPatterns = append([]string(nil), (*partial.ExtraTransientErrorPatterns)...)
+	}
+	if partial.RecoverExistingMatchedFailures != nil {
+		policy.RecoverExistingMatchedFailures = *partial.RecoverExistingMatchedFailures
+	}
+	if partial.AutoRecoveryMaxAttempts != nil {
+		policy.AutoRecoveryMaxAttempts = *partial.AutoRecoveryMaxAttempts
+	}
+	if partial.MaxDelayMS != nil {
+		policy.MaxDelayMS = *partial.MaxDelayMS
+	}
+	return config.NormalizeReviewerRetryConfig(policy)
+}
+
+func (r *Runner) retryMaxDelayForProject(projectID string) time.Duration {
+	if r.projectRoleConfig == nil && r.retryMaxDelay > 0 {
+		return r.retryMaxDelay
+	}
+	policy := r.retryPolicyForProject(projectID)
+	delay := time.Duration(policy.MaxDelayMS) * time.Millisecond
+	if delay <= 0 {
+		return maxRetryDelay
+	}
+	return delay
+}
+
 func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy) bool {
 	if policy.EnableSelfReview {
 		return false
@@ -1161,7 +1210,7 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 }
 
 func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storage.QueueItemRecord, cause error) error {
-	failure := r.classifyFailure(cause)
+	failure := r.classifyFailureForProject(derefString(queueItem.ProjectID), cause)
 	failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
 	if err != nil {
 		return err
@@ -1287,7 +1336,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
 			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
-			failure := r.classifyFailure(err)
+			failure := r.classifyFailureForProject(project.ID, err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			if checkpoint.ResumePolicy == "rerun_review" || hasPendingReviewMarkerMiss(checkpoint) {
 				latest = checkpoint
@@ -1489,6 +1538,7 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 	if maxAttempts <= 0 {
 		maxAttempts = defaultRetryMax
 	}
+	retryMaxDelay := r.retryMaxDelayForProject(input.Project.ID)
 	checkpoint := input.Checkpoint
 	var err error
 	for attempt := int64(1); attempt <= maxAttempts; attempt++ {
@@ -1500,10 +1550,10 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 			}
 			return checkpoint, nil
 		}
-		if attempt >= maxAttempts || !r.isTransientExternalFailure(err) {
+		if attempt >= maxAttempts || !r.isTransientExternalFailureForProject(input.Project.ID, err) {
 			break
 		}
-		delay := retryDelay(r.retryBaseDelay, attempt, err, r.retryMaxDelay)
+		delay := retryDelay(r.retryBaseDelay, attempt, err, retryMaxDelay)
 		if r.shouldSkipTransientRetryDelayForNativeResume(ctx, input.Loop.ID, err) {
 			delay = 0
 		}
@@ -3811,6 +3861,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if loop.Type != "reviewer" || loop.Status != "failed" || isManualReviewerLoop(loop) {
 		return false, "", "not_failed_reviewer_loop", nil
 	}
+	retryPolicy := r.retryPolicyForProject(loop.ProjectID)
 	if normalizePRState(pr.State) != "open" {
 		return false, "", "pr_not_open", nil
 	}
@@ -3828,7 +3879,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if reason, _ := stringFromAny(loopMeta["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
 		return false, "", reason, nil
 	}
-	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= r.retryPolicy.AutoRecoveryMaxAttempts {
+	if intFromAny(loopMeta["autoRecoveryAttempts"]) >= retryPolicy.AutoRecoveryMaxAttempts {
 		return false, "", "auto_recovery_attempt_cap", nil
 	}
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
@@ -3889,7 +3940,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if latestMessage == "" {
 		latestMessage = derefString(latestQueue.LastError)
 	}
-	if r.retryPolicy.RecoverExistingMatchedFailures && queueHasRemainingAttempts(*latestQueue) && r.isEnhancedTransientMessage(latestMessage) {
+	if retryPolicy.RecoverExistingMatchedFailures && queueHasRemainingAttempts(*latestQueue) && r.isEnhancedTransientMessageForPolicy(retryPolicy, latestMessage) {
 		approved, err := approvedByCurrentUser()
 		if err != nil {
 			return false, "", "", err
@@ -4111,7 +4162,8 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
 	if isRetryableFailure(kind) && nextAttempts < queueItem.MaxAttempts {
-		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, nextAttempts, r.retryMaxDelay)))
+		delay := backoffDelay(r.retryBaseDelay, nextAttempts, r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
+		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
 		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
@@ -4145,6 +4197,10 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {
+	return r.classifyFailureForProject("", err)
+}
+
+func (r *Runner) classifyFailureForProject(projectID string, err error) *loopError {
 	var typed *loopError
 	if errors.As(err, &typed) {
 		return typed
@@ -4163,38 +4219,51 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	if isTransientModelProviderError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
-	if r.isEnhancedTransientFailure(err) {
+	if r.isEnhancedTransientFailureForPolicy(r.retryPolicyForProject(projectID), err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
 	return &loopError{message: err.Error(), kind: FailureNonRetryable}
 }
 
 func (r *Runner) isTransientExternalFailure(err error) bool {
+	return r.isTransientExternalFailureForProject("", err)
+}
+
+func (r *Runner) isTransientExternalFailureForProject(projectID string, err error) bool {
 	if err == nil {
 		return false
 	}
+	retryPolicy := r.retryPolicyForProject(projectID)
 	if githubinfra.IsTransientError(err) || isTransientModelProviderError(err) {
 		return true
 	}
-	if r.isEnhancedTransientFailure(err) {
+	if r.isEnhancedTransientFailureForPolicy(retryPolicy, err) {
 		return true
 	}
 	var loopErr *loopError
 	if errors.As(err, &loopErr) {
-		return loopErr.kind == FailureRetryableTransient && (isTransientModelProviderMessage(loopErr.message) || r.isEnhancedTransientMessage(loopErr.message))
+		return loopErr.kind == FailureRetryableTransient && (isTransientModelProviderMessage(loopErr.message) || r.isEnhancedTransientMessageForPolicy(retryPolicy, loopErr.message))
 	}
 	return false
 }
 
 func (r *Runner) isEnhancedTransientFailure(err error) bool {
+	return r.isEnhancedTransientFailureForPolicy(r.retryPolicyForProject(""), err)
+}
+
+func (r *Runner) isEnhancedTransientFailureForPolicy(policy config.ReviewerRetryConfig, err error) bool {
 	if err == nil {
 		return false
 	}
-	return r.isEnhancedTransientMessage(err.Error()) || config.ReviewerRetryMessageMatches(r.retryPolicy, githubinfra.ErrorMessage(err))
+	return r.isEnhancedTransientMessageForPolicy(policy, err.Error()) || config.ReviewerRetryMessageMatches(policy, githubinfra.ErrorMessage(err))
 }
 
 func (r *Runner) isEnhancedTransientMessage(message string) bool {
-	return config.ReviewerRetryMessageMatches(r.retryPolicy, message)
+	return r.isEnhancedTransientMessageForPolicy(r.retryPolicyForProject(""), message)
+}
+
+func (r *Runner) isEnhancedTransientMessageForPolicy(policy config.ReviewerRetryConfig, message string) bool {
+	return config.ReviewerRetryMessageMatches(policy, message)
 }
 
 func (r *Runner) markAgentExecutionNativeResumePendingForTransientProvider(ctx context.Context, executionID string, message string) bool {
