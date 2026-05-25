@@ -121,7 +121,7 @@ func TestRunUsesDefaultCLIAppFactory(t *testing.T) {
 	}
 }
 
-func TestRunWithDepsMapsVersionFlagToVersionCommand(t *testing.T) {
+func TestRunWithDepsVersionShortCircuitsBeforeAppConstruction(t *testing.T) {
 	t.Parallel()
 
 	stdout := &bytes.Buffer{}
@@ -131,30 +131,25 @@ func TestRunWithDepsMapsVersionFlagToVersionCommand(t *testing.T) {
 	exitCode := runWithDeps([]string{"--version"}, stdout, stderr, runDeps{
 		newApp: func(cliapp.Deps) appRunner {
 			called = true
-			return fakeApp{run: func(_ context.Context, args []string) int {
-				if got, want := args, []string{"version"}; len(got) != len(want) || got[0] != want[0] {
-					t.Fatalf("args = %v, want %v", got, want)
-				}
-				return 0
-			}}
+			return fakeApp{run: func(context.Context, []string) int { return 99 }}
 		},
 	})
 
 	if exitCode != 0 {
 		t.Fatalf("runWithDeps([--version]) exit code = %d, want 0", exitCode)
 	}
-	if !called {
-		t.Fatal("newApp was not called for --version")
+	if called {
+		t.Fatal("newApp was called for --version")
 	}
-	if got := stdout.String(); got != "" {
-		t.Fatalf("stdout = %q, want empty string", got)
+	if got, want := stdout.String(), version.Value+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 	if got := stderr.String(); got != "" {
 		t.Fatalf("stderr = %q, want empty string", got)
 	}
 }
 
-func TestRunWithDepsMapsVersionFlagBeforeTrailingFlags(t *testing.T) {
+func TestRunWithDepsVersionShortCircuitsBeforeTrailingFlags(t *testing.T) {
 	t.Parallel()
 
 	stdout := &bytes.Buffer{}
@@ -164,30 +159,25 @@ func TestRunWithDepsMapsVersionFlagBeforeTrailingFlags(t *testing.T) {
 	exitCode := runWithDeps([]string{"--version", "--json"}, stdout, stderr, runDeps{
 		newApp: func(cliapp.Deps) appRunner {
 			called = true
-			return fakeApp{run: func(_ context.Context, args []string) int {
-				if got, want := args, []string{"version", "--json"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-					t.Fatalf("args = %v, want %v", got, want)
-				}
-				return 0
-			}}
+			return fakeApp{run: func(context.Context, []string) int { return 99 }}
 		},
 	})
 
 	if exitCode != 0 {
 		t.Fatalf("runWithDeps([--version --json]) exit code = %d, want 0", exitCode)
 	}
-	if !called {
-		t.Fatal("newApp was not called for --version with trailing flags")
+	if called {
+		t.Fatal("newApp was called for --version with trailing flags")
 	}
-	if got := stdout.String(); got != "" {
-		t.Fatalf("stdout = %q, want empty string", got)
+	if got, want := stdout.String(), version.Value+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 	if got := stderr.String(); got != "" {
 		t.Fatalf("stderr = %q, want empty string", got)
 	}
 }
 
-func TestRunWithDepsMapsVersionFlagAfterLeadingGlobalFlags(t *testing.T) {
+func TestRunWithDepsVersionShortCircuitsAfterLeadingGlobalFlags(t *testing.T) {
 	t.Parallel()
 
 	stdout := &bytes.Buffer{}
@@ -197,24 +187,18 @@ func TestRunWithDepsMapsVersionFlagAfterLeadingGlobalFlags(t *testing.T) {
 	exitCode := runWithDeps([]string{"--json", "--config", "/tmp/looper.json", "--version"}, stdout, stderr, runDeps{
 		newApp: func(cliapp.Deps) appRunner {
 			called = true
-			return fakeApp{run: func(_ context.Context, args []string) int {
-				want := []string{"version", "--json", "--config", "/tmp/looper.json"}
-				if got := args; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
-					t.Fatalf("args = %v, want %v", got, want)
-				}
-				return 0
-			}}
+			return fakeApp{run: func(context.Context, []string) int { return 99 }}
 		},
 	})
 
 	if exitCode != 0 {
 		t.Fatalf("runWithDeps([--json --config /tmp/looper.json --version]) exit code = %d, want 0", exitCode)
 	}
-	if !called {
-		t.Fatal("newApp was not called for --version after global flags")
+	if called {
+		t.Fatal("newApp was called for --version after global flags")
 	}
-	if got := stdout.String(); got != "" {
-		t.Fatalf("stdout = %q, want empty string", got)
+	if got, want := stdout.String(), version.Value+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
 	}
 	if got := stderr.String(); got != "" {
 		t.Fatalf("stderr = %q, want empty string", got)

@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/nexu-io/looper/internal/cliapp"
+	"github.com/nexu-io/looper/internal/version"
 )
 
 func main() {
@@ -28,8 +30,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
-	if versionFlagIndex := indexOf(args, "--version"); versionFlagIndex >= 0 {
-		args = append([]string{"version"}, append(args[:versionFlagIndex], args[versionFlagIndex+1:]...)...)
+	if indexOf(args, "--version") >= 0 {
+		_, _ = fmt.Fprintln(stdout, version.Value)
+		return 0
 	}
 
 	ctx := deps.ctx
