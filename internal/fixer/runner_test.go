@@ -1872,6 +1872,68 @@ func TestDiscoverPullRequestsLeavesPendingRediscoveryUnchangedForDuplicateSignal
 	}
 }
 
+func TestDiscoverPullRequestsPreservesPendingRediscoveryForRunningAutomaticLoopWithManualFollowup(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(85)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	projectID := "project_1"
+	automaticLoopID := "loop_fixer_midrun_automatic"
+	automaticLoop := storage.LoopRecord{ID: automaticLoopID, Seq: 99, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), automaticLoop); err != nil {
+		t.Fatalf("Loops.Upsert() automatic error = %v", err)
+	}
+	manualMetadata := `{"manual":true,"followUpdates":true}`
+	manualLoop := storage.LoopRecord{ID: "loop_manual_followup_completed", Seq: 100, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &manualMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), manualLoop); err != nil {
+		t.Fatalf("Loops.Upsert() manual error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_automatic", LoopID: automaticLoopID, Status: "running", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	if acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: automaticLoopID, ExpiresAt: eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute).UTC()), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	} else if !acquired {
+		t.Fatal("Locks.Acquire() = false, want active fixer PR lock")
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_midrun_automatic", ProjectID: &projectID, LoopID: &automaticLoopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:midrun-automatic:active", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-85", HeadRefName: "feature/fix-85", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: projectID, Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want no parallel queue item while automatic run continues", result.QueueItems)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), automaticLoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(persisted.MetadataJSON))
+	if !ok {
+		t.Fatalf("parsePendingFixerRediscoveryState() = false, want pending rediscovery metadata on automatic loop")
+	}
+	if pending.HeadSHA != detail.HeadSHA || pending.FixItemsStateHash == "" || !sameStringSlices(pending.UnresolvedThreadIDs, []string{"t1"}) {
+		t.Fatalf("pending = %#v, want persisted pending rediscovery state on automatic loop", pending)
+	}
+	manualPersisted, err := fixture.repos.Loops.GetByID(context.Background(), manualLoop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() manual error = %v", err)
+	}
+	if _, ok := parsePendingFixerRediscoveryState(parseJSONObject(manualPersisted.MetadataJSON)); ok {
+		t.Fatalf("manual pending rediscovery present in %#v, want automatic loop to own rediscovery state", parseJSONObject(manualPersisted.MetadataJSON))
+	}
+}
+
 func TestDiscoverPullRequestsRecoversLegacyNoopLoopWithoutOpenPRListing(t *testing.T) {
 	t.Parallel()
 
