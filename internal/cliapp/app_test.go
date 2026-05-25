@@ -131,6 +131,13 @@ func TestFixCreateAcceptsNumericPRRefFromCurrentProject(t *testing.T) {
 			if got, want := body["prNumber"], float64(123); got != want {
 				t.Fatalf("body.prNumber = %#v, want %#v", got, want)
 			}
+			metadata, ok := body["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("body.metadata = %#v, want object", body["metadata"])
+			}
+			if got, want := metadata["manual"], true; got != want {
+				t.Fatalf("body.metadata.manual = %#v, want %#v", got, want)
+			}
 			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_fix_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "queued"}))
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)

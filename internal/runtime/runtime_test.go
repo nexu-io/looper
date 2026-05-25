@@ -548,6 +548,36 @@ func TestBuildRecoveryQueueItemDoesNotRestoreManualPlannerPayloadFromLoopMetadat
 	}
 }
 
+func TestBuildRecoveryQueueItemKeepsManualFixerRecoveryQueuePayloadEmpty(t *testing.T) {
+	t.Parallel()
+
+	loop := storage.LoopRecord{
+		ID:           "loop_fixer_manual",
+		ProjectID:    "project_1",
+		Type:         "fixer",
+		TargetType:   "pull_request",
+		TargetID:     stringPtr("pr:acme/looper:82"),
+		Repo:         stringPtr("acme/looper"),
+		PRNumber:     int64Ptr(82),
+		Status:       "failed",
+		MetadataJSON: stringPtr(`{"manual":true}`),
+	}
+
+	record, ok, err := buildRecoveryQueueItem(loop, "2026-04-17T12:34:56.000Z", 3)
+	if err != nil {
+		t.Fatalf("buildRecoveryQueueItem() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("buildRecoveryQueueItem() ok = false, want true")
+	}
+	if record.PayloadJSON != nil {
+		t.Fatalf("record.PayloadJSON = %#v, want nil for manual fixer recovery queue", record.PayloadJSON)
+	}
+	if record.DedupeKey != "fixer:loop_fixer_manual" {
+		t.Fatalf("record.DedupeKey = %q, want loop-scoped fixer dedupe key", record.DedupeKey)
+	}
+}
+
 func TestRuntimeStartConfiguresDefaultSchedulerTickAtStartup(t *testing.T) {
 	t.Parallel()
 

@@ -3324,6 +3324,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return loopResponse{}, err
 		}
 	}
+	if domain.LoopType(loopType) == domain.LoopTypeFixer {
+		metadataJSON, err = manualFixerMetadataJSON(metadataJSON)
+		if err != nil {
+			return loopResponse{}, err
+		}
+	}
 	now := h.now().UTC()
 	nowISO := eventlog.FormatJavaScriptISOString(now)
 	if domain.LoopType(loopType) == domain.LoopTypeReviewer {
@@ -4480,6 +4486,22 @@ func manualPlannerMetadataJSON(existing *string, issueNumber int64) (*string, er
 		}
 	}
 	metadata["issueNumber"] = issueNumber
+	metadata["manual"] = true
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	text := string(encoded)
+	return &text, nil
+}
+
+func manualFixerMetadataJSON(existing *string) (*string, error) {
+	metadata := map[string]any{}
+	if existing != nil && strings.TrimSpace(*existing) != "" {
+		if err := json.Unmarshal([]byte(*existing), &metadata); err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "metadata must be a JSON object"}
+		}
+	}
 	metadata["manual"] = true
 	encoded, err := json.Marshal(metadata)
 	if err != nil {

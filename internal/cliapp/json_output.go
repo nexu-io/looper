@@ -359,6 +359,9 @@ func (r *commandRuntime) fixCreate(cmd *cobra.Command, args []string) error {
 			"repo":       repo,
 			"prNumber":   prNumber,
 			"status":     "running",
+			"metadata": map[string]any{
+				"manual": true,
+			},
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)

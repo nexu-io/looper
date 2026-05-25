@@ -1605,7 +1605,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, fmt.Errorf("run not found after start checkpoint: %s", resumedRun.Run.ID)
 	}
 	run = *persistedRun
-	if reason, err := r.pullRequestOwnershipSkipReason(ctx, project.ID, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+	if reason, err := r.pullRequestOwnershipSkipReason(ctx, *loop, project.ID, project.RepoPath, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if reason != "" {
 		checkpoint.SkipReason = reason
@@ -1923,7 +1923,16 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 	return checkpoint, nil
 }
 
-func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, projectID, cwd, repo string, prNumber int64) (string, error) {
+func isManualFixerLoop(loop storage.LoopRecord) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
+	manual, _ := meta["manual"].(bool)
+	return manual
+}
+
+func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storage.LoopRecord, projectID, cwd, repo string, prNumber int64) (string, error) {
+	if isManualFixerLoop(loop) {
+		return "", nil
+	}
 	if r.discoveryPolicyForProject(projectID).AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
@@ -3954,15 +3963,15 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 			}
 			continue
 		}
-		if (!policy.IncludeDrafts && detail.IsDraft) || normalizePRState(detail.State) != "open" {
+		if (!isManualFixerLoop(loop) && !policy.IncludeDrafts && detail.IsDraft) || normalizePRState(detail.State) != "open" {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(detail.Author, currentUser) {
+		if !isManualFixerLoop(loop) && policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(detail.Author, currentUser) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		if !isManualFixerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}

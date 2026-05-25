@@ -2884,6 +2884,15 @@ func TestHandlerCreateLoopFixerEnqueuesSchedulableManualLoop(t *testing.T) {
 	data := resp["data"].(map[string]any)
 	loopID := data["id"].(string)
 	assertEqual(t, data["status"], "queued")
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil {
+		t.Fatalf("loop = %#v, want stored manual metadata", loop)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	assertEqual(t, metadata["manual"], true)
 
 	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
 	if err != nil {
