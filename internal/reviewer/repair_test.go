@@ -6,6 +6,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -167,6 +168,53 @@ func TestRepairDoesNotClearPublishedHeadWhenCurrentHeadWasReviewed(t *testing.T)
 	}
 }
 
+func TestRepairKeepsReadyLabelSkipWhileLabelPresent(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	seedReviewerRepairLoop(t, fixture, string(domain.LoopStatusWaiting), readyLabelFilterSkipMetadata())
+	repairer := newTestRepairer(fixture, &fakeGitHubGateway{
+		currentLogin:   "octocat",
+		reviewRequests: []string{"octocat"},
+		viewHeadSHA:    "abc123",
+		labels:         []string{specpr.ReadyLabel},
+	})
+
+	result, err := repairer.Repair(context.Background(), RepairInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("Repair() error = %v", err)
+	}
+	if repairHasDiagnosis(result, "stale_filter_skip") {
+		t.Fatalf("Repair() diagnoses = %#v, did not expect stale_filter_skip", result.Diagnoses)
+	}
+	if repairHasAction(result, "clear_filter_skip") {
+		t.Fatalf("Repair() actions = %#v, did not expect clear_filter_skip", result.Actions)
+	}
+}
+
+func TestRepairClearsReadyLabelSkipWhenLabelRemoved(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	seedReviewerRepairLoop(t, fixture, string(domain.LoopStatusWaiting), readyLabelFilterSkipMetadata())
+	repairer := newTestRepairer(fixture, &fakeGitHubGateway{
+		currentLogin:   "octocat",
+		reviewRequests: []string{"octocat"},
+		viewHeadSHA:    "abc123",
+	})
+
+	result, err := repairer.Repair(context.Background(), RepairInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("Repair() error = %v", err)
+	}
+	if !repairHasDiagnosis(result, "stale_filter_skip") {
+		t.Fatalf("Repair() diagnoses = %#v, want stale_filter_skip", result.Diagnoses)
+	}
+	if !repairHasAction(result, "clear_filter_skip") {
+		t.Fatalf("Repair() actions = %#v, want clear_filter_skip", result.Actions)
+	}
+}
+
 func TestRepairApplyReactivatesFailedRequestedLoop(t *testing.T) {
 	t.Parallel()
 
@@ -275,6 +323,18 @@ func terminatedStaleRepairMetadata() string {
 		},
 		"reviewEvents": map[string]any{"clean": "COMMENT", "blocking": "COMMENT"},
 		"loop":         map[string]any{"status": "terminated", "terminationReason": "manual_stop", "lastReviewedHeadSha": "abc123", "lastOutputFingerprint": "fingerprint-1"},
+	})
+}
+
+func readyLabelFilterSkipMetadata() string {
+	return mustMarshalJSON(map[string]any{
+		"lastFilterSkip": map[string]any{
+			"kind":          "ready_label",
+			"reason":        "PR has ready label",
+			"headSha":       "abc123",
+			"requiredLabel": specpr.ReadyLabel,
+			"recordedAt":    "2026-05-17T06:00:00.000Z",
+		},
 	})
 }
 

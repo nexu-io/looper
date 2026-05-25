@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -364,7 +365,11 @@ func staleFilterSkip(skip map[string]any, detail PullRequestDetail, currentLogin
 	case "self_authored":
 		return !strings.EqualFold(normalizeLogin(detail.Author), normalizeLogin(currentLogin))
 	case "ready_label":
-		return true
+		label, _ := stringFromAny(skip["requiredLabel"])
+		if label == "" {
+			return false
+		}
+		return !specpr.HasLabel(detail.Labels, label)
 	default:
 		return false
 	}
