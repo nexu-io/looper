@@ -28,8 +28,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
-	if len(args) == 1 && args[0] == "--version" {
-		args = []string{"version"}
+	if len(args) > 0 && args[0] == "--version" {
+		args = append([]string{"version"}, args[1:]...)
 	}
 
 	ctx := deps.ctx

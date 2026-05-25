@@ -154,6 +154,39 @@ func TestRunWithDepsMapsVersionFlagToVersionCommand(t *testing.T) {
 	}
 }
 
+func TestRunWithDepsMapsVersionFlagBeforeTrailingFlags(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	called := false
+
+	exitCode := runWithDeps([]string{"--version", "--json"}, stdout, stderr, runDeps{
+		newApp: func(cliapp.Deps) appRunner {
+			called = true
+			return fakeApp{run: func(_ context.Context, args []string) int {
+				if got, want := args, []string{"version", "--json"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+					t.Fatalf("args = %v, want %v", got, want)
+				}
+				return 0
+			}}
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("runWithDeps([--version --json]) exit code = %d, want 0", exitCode)
+	}
+	if !called {
+		t.Fatal("newApp was not called for --version with trailing flags")
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty string", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
+	}
+}
+
 func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
 	t.Parallel()
 
