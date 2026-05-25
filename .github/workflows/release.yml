@@ -258,31 +258,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Build release notes preface
-        env:
-          OWNER: ${{ github.repository_owner }}
-          RELEASE_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
-          RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
-          RELEASE_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
-        run: |
-          owner_lower="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
-          {
-            echo '## Container image'
-            echo
-            echo '```bash'
-            echo "docker pull ghcr.io/${owner_lower}/loopernet:${RELEASE_VERSION}"
-            echo "docker pull ghcr.io/${owner_lower}/loopernet:${RELEASE_TAG}"
-            echo '```'
-            if [ "$RELEASE_CHANNEL" = "stable" ]; then
-              echo
-              echo 'Stable releases also publish:'
-              echo
-              echo '```bash'
-              echo "docker pull ghcr.io/${owner_lower}/loopernet:latest"
-              echo '```'
-            fi
-          } > release-notes-preface.md
-
       - name: Check for existing GitHub release
         id: existing-release
         env:
@@ -319,7 +294,6 @@ jobs:
           name: Looper ${{ needs.prepare-go-release.outputs.release-tag }}
           draft: true
           prerelease: ${{ needs.prepare-go-release.outputs.release-prerelease }}
-          body_path: release-notes-preface.md
           generate_release_notes: true
 
   build-looper:
@@ -562,31 +536,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare-go-release.outputs.release-commit }}
-
-      - name: Build release notes preface
-        env:
-          OWNER: ${{ github.repository_owner }}
-          RELEASE_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
-          RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
-          RELEASE_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
-        run: |
-          owner_lower="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
-          {
-            echo '## Container image'
-            echo
-            echo '```bash'
-            echo "docker pull ghcr.io/${owner_lower}/loopernet:${RELEASE_VERSION}"
-            echo "docker pull ghcr.io/${owner_lower}/loopernet:${RELEASE_TAG}"
-            echo '```'
-            if [ "$RELEASE_CHANNEL" = "stable" ]; then
-              echo
-              echo 'Stable releases also publish:'
-              echo
-              echo '```bash'
-              echo "docker pull ghcr.io/${owner_lower}/loopernet:latest"
-              echo '```'
-            fi
-          } > release-notes-preface.md
 
       - name: Set up Go
         uses: actions/setup-go@v5
