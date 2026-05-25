@@ -298,6 +298,69 @@ func TestReviewerFailedLoopRecoveryEnhancedTransientIsOptIn(t *testing.T) {
 	})
 }
 
+func TestReviewerEnhancedTransientPersistsExtractedShellStderr(t *testing.T) {
+	t.Parallel()
+
+	// Wrapped shell error whose generic exit-code Message hides the EOF text
+	// living in Stderr — exactly the shape `gh api ...` produces on a flaky
+	// network. Pre-fix, classifyFailureForProject persisted err.Error() ("Command
+	// exited with code 1") and failedReviewerLoopRecoveryEligibility could no
+	// longer match the persisted message against the enhanced-transient pattern.
+	cause := &shell.CommandExecutionError{
+		Message: "Command exited with code 1",
+		Result: shell.Result{
+			ExitCode: 1,
+			Stderr:   `Post "https://api.github.com/graphql": EOF`,
+		},
+	}
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{
+		DB:            fixture.coordinator.DB(),
+		Repos:         fixture.repos,
+		GitHub:        &fakeGitHubGateway{},
+		Git:           &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{},
+		Logger:        fixture.logger,
+		Now:           fixture.now,
+		LoopConfig:    config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+		RetryPolicy: config.ReviewerRetryConfig{
+			EnhancedTransientClassification: true,
+			RecoverExistingMatchedFailures:  true,
+		},
+	})
+
+	classified := runner.classifyFailureForProject("", cause)
+	if classified == nil || classified.kind != FailureRetryableTransient {
+		t.Fatalf("classifyFailureForProject() = %#v, want retryable transient", classified)
+	}
+	if !strings.Contains(classified.message, "EOF") || !strings.Contains(classified.message, "/graphql") {
+		t.Fatalf("classified.message = %q, want extracted stderr containing graphql EOF", classified.message)
+	}
+	if !runner.isEnhancedTransientMessageForPolicy(runner.retryPolicyForProject(""), classified.message) {
+		t.Fatalf("persisted message %q should re-match enhanced transient pattern", classified.message)
+	}
+
+	loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{
+		ResumePolicy:     "replay_step",
+		QueueErrorKind:   string(FailureNonRetryable),
+		ErrorMessage:     classified.message,
+		QueueAttempts:    1,
+		QueueMaxAttempts: 5,
+	})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	eligible, recoveredQueueID, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN"})
+	if err != nil {
+		t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+	}
+	if !eligible || reason != "enhanced_transient_match_attempts_remaining" || recoveredQueueID != queueID {
+		t.Fatalf("eligible=%v queueID=%q reason=%q, want enhanced transient recovery on queue %q", eligible, recoveredQueueID, reason, queueID)
+	}
+}
+
 func TestReviewerFailedLoopRecoveryUsesProjectRetryOverride(t *testing.T) {
 	t.Parallel()
 

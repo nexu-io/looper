@@ -4220,7 +4220,7 @@ func (r *Runner) classifyFailureForProject(projectID string, err error) *loopErr
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
 	if r.isEnhancedTransientFailureForPolicy(r.retryPolicyForProject(projectID), err) {
-		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return &loopError{message: githubinfra.ErrorMessage(err), kind: FailureRetryableTransient}
 	}
 	return &loopError{message: err.Error(), kind: FailureNonRetryable}
 }
