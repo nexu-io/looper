@@ -582,7 +582,19 @@ func TestVersionCommandPrintsCurrentVersion(t *testing.T) {
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	app := New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: t.TempDir()})
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: t.TempDir(),
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return nil, os.ErrNotExist
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
 	exitCode := app.Run(context.Background(), []string{"version"})
 	if exitCode != 0 {
 		t.Fatalf("Run([version]) exit code = %d, want 0", exitCode)
@@ -600,12 +612,19 @@ func TestVersionCommandPrintsCLIAndServerVersionSeparately(t *testing.T) {
 
 	homeDir := t.TempDir()
 	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	runningPath := filepath.Join(homeDir, "running", "looperd")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{
 		Stdout:  stdout,
 		Stderr:  stderr,
 		HomeDir: homeDir,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/api/v1/status" {
+				t.Fatalf("unexpected request path %q", req.URL.Path)
+			}
+			return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"data":{"service":{"version":"0.7.0","binary":{"name":"looperd","path":%q}}}}`, runningPath)), nil
+		}),
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			_ = ctx
 			_ = timeout
@@ -623,7 +642,7 @@ func TestVersionCommandPrintsCLIAndServerVersionSeparately(t *testing.T) {
 	if got := stderr.String(); got != "" {
 		t.Fatalf("Run([version]) stderr = %q, want empty string", got)
 	}
-	if got, want := stdout.String(), "CLI version: "+version.Current().Version+"\nlooperd server version: 0.6.0\n"; got != want {
+	if got, want := stdout.String(), "CLI version: "+version.Current().Version+"\nlooperd server version: 0.7.0\n"; got != want {
 		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
 	}
 }
@@ -633,7 +652,19 @@ func TestVersionCommandJSONPrintsBuildMetadata(t *testing.T) {
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	app := New(Deps{Stdout: stdout, Stderr: stderr, HomeDir: t.TempDir()})
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: t.TempDir(),
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return nil, os.ErrNotExist
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
 	exitCode := app.Run(context.Background(), []string{"version", "--json"})
 	if exitCode != 0 {
 		t.Fatalf("Run([version --json]) exit code = %d, want 0", exitCode)
@@ -667,12 +698,19 @@ func TestVersionCommandJSONPrintsServerVersionSeparately(t *testing.T) {
 
 	homeDir := t.TempDir()
 	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	runningPath := filepath.Join(homeDir, "running", "looperd")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := New(Deps{
 		Stdout:  stdout,
 		Stderr:  stderr,
 		HomeDir: homeDir,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/api/v1/status" {
+				t.Fatalf("unexpected request path %q", req.URL.Path)
+			}
+			return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"data":{"service":{"version":"0.7.0","binary":{"name":"looperd","path":%q}}}}`, runningPath)), nil
+		}),
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			_ = ctx
 			_ = timeout
@@ -703,9 +741,9 @@ func TestVersionCommandJSONPrintsServerVersionSeparately(t *testing.T) {
 		},
 	})
 	assertJSONContains(t, stdout.String(), "server", map[string]any{
-		"version":    "0.6.0",
-		"source":     "binary",
-		"binaryPath": managedPath,
+		"version":    "0.7.0",
+		"source":     "api",
+		"binaryPath": runningPath,
 	})
 }
 

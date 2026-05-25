@@ -16,6 +16,25 @@ import (
 	"time"
 )
 
+func allowVersionStatusProbeOnly(t *testing.T) *http.Client {
+	t.Helper()
+	return newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/api/v1/status" {
+			return nil, os.ErrNotExist
+		}
+		t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
+		return nil, nil
+	})
+}
+
+func missingDaemonVersionCommand(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+	_ = ctx
+	_ = command
+	_ = args
+	_ = timeout
+	return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+}
+
 func TestResolveLooperTarget(t *testing.T) {
 	t.Parallel()
 
@@ -73,10 +92,8 @@ func TestRootPreRunSkipsAutoUpgradeForUnsupportedInstallSource(t *testing.T) {
 		HomeDir:        t.TempDir(),
 		ExecutablePath: "/opt/homebrew/Cellar/looper/0.2.1/bin/looper",
 		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
-			return nil, nil
-		}),
+		HTTPClient:     allowVersionStatusProbeOnly(t),
+		RunCommand:     missingDaemonVersionCommand,
 	})
 
 	exitCode := app.Run(context.Background(), []string{"version"})
@@ -103,10 +120,8 @@ func TestRootPreRunSkipsAutoUpgradeForBareRootHelp(t *testing.T) {
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
 		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
-			return nil, nil
-		}),
+		HTTPClient:     allowVersionStatusProbeOnly(t),
+		RunCommand:     missingDaemonVersionCommand,
 	})
 
 	exitCode := app.Run(context.Background(), nil)
@@ -133,10 +148,8 @@ func TestRootPreRunSkipsAutoUpgradeForHelpOnlySubcommand(t *testing.T) {
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
 		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
-			return nil, nil
-		}),
+		HTTPClient:     allowVersionStatusProbeOnly(t),
+		RunCommand:     missingDaemonVersionCommand,
 	})
 
 	exitCode := app.Run(context.Background(), []string{"daemon"})
@@ -164,10 +177,8 @@ func TestVersionNoAutoUpgradeFlagDisablesAutoUpgrade(t *testing.T) {
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
 		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
-			return nil, nil
-		}),
+		HTTPClient:     allowVersionStatusProbeOnly(t),
+		RunCommand:     missingDaemonVersionCommand,
 	})
 
 	exitCode := app.Run(context.Background(), []string{"version", "--no-auto-upgrade", "--config", configPath})
@@ -191,10 +202,8 @@ func TestEnvDisablesAutoUpgrade(t *testing.T) {
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
 		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
-			return nil, nil
-		}),
+		HTTPClient:     allowVersionStatusProbeOnly(t),
+		RunCommand:     missingDaemonVersionCommand,
 	})
 
 	exitCode := app.Run(context.Background(), []string{"version", "--config", configPath})
@@ -223,10 +232,7 @@ func TestAutoUpgradeStartsBackgroundWorkerAndCachesInFlightState(t *testing.T) {
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
 		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
-			return nil, nil
-		}),
+		HTTPClient:     allowVersionStatusProbeOnly(t),
 		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
 			_ = command
 			_ = cwd
@@ -808,6 +814,9 @@ func TestAutoUpgradeReadyNoticePrintsRestartCommand(t *testing.T) {
 			case "http://127.0.0.1:4321/api/v1/status":
 				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":"0.2.0","binary":{"name":"looperd","path":%q}}}}`, managedPath)), nil
 			default:
+				if req.URL.Path == "/api/v1/status" {
+					return nil, os.ErrNotExist
+				}
 				t.Fatalf("unexpected request URL %q", req.URL.String())
 				return nil, nil
 			}
@@ -857,10 +866,8 @@ func TestCorruptAutoUpgradeStateSkipsNetworkAndPreservesFile(t *testing.T) {
 		HomeDir:        homeDir,
 		ExecutablePath: filepath.Join(homeDir, ".looper", "bin", "looper"),
 		CLIChannel:     cliInstallChannelStable,
-		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
-			return nil, nil
-		}),
+		HTTPClient:     allowVersionStatusProbeOnly(t),
+		RunCommand:     missingDaemonVersionCommand,
 	})
 
 	exitCode := app.Run(context.Background(), []string{"version", "--config", configPath})

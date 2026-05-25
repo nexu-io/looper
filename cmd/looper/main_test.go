@@ -3,11 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"os"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/cliapp"
 	"github.com/nexu-io/looper/internal/version"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
 
 type contextKey struct{}
 
@@ -206,7 +214,7 @@ func TestRunWithDepsVersionShortCircuitsAfterLeadingGlobalFlags(t *testing.T) {
 }
 
 func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
-	t.Parallel()
+	t.Setenv("PATH", "")
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
@@ -214,6 +222,9 @@ func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
 	exitCode := runWithDeps([]string{"version"}, stdout, stderr, runDeps{
 		newApp: func(deps cliapp.Deps) appRunner {
 			deps.HomeDir = t.TempDir()
+			deps.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return nil, os.ErrNotExist
+			})}
 			return cliapp.New(deps)
 		},
 	})
