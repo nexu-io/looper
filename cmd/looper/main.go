@@ -28,8 +28,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
-	if len(args) > 0 && args[0] == "--version" {
-		args = append([]string{"version"}, args[1:]...)
+	if versionFlagIndex := indexOf(args, "--version"); versionFlagIndex >= 0 {
+		args = append([]string{"version"}, append(args[:versionFlagIndex], args[versionFlagIndex+1:]...)...)
 	}
 
 	ctx := deps.ctx
@@ -48,4 +48,13 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 
 	app := newApp(cliapp.Deps{Stdout: stdout, Stderr: stderr})
 	return app.Run(ctx, args)
+}
+
+func indexOf(args []string, target string) int {
+	for i, arg := range args {
+		if arg == target {
+			return i
+		}
+	}
+	return -1
 }

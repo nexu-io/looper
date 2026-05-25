@@ -187,6 +187,40 @@ func TestRunWithDepsMapsVersionFlagBeforeTrailingFlags(t *testing.T) {
 	}
 }
 
+func TestRunWithDepsMapsVersionFlagAfterLeadingGlobalFlags(t *testing.T) {
+	t.Parallel()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	called := false
+
+	exitCode := runWithDeps([]string{"--json", "--config", "/tmp/looper.json", "--version"}, stdout, stderr, runDeps{
+		newApp: func(cliapp.Deps) appRunner {
+			called = true
+			return fakeApp{run: func(_ context.Context, args []string) int {
+				want := []string{"version", "--json", "--config", "/tmp/looper.json"}
+				if got := args; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
+					t.Fatalf("args = %v, want %v", got, want)
+				}
+				return 0
+			}}
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("runWithDeps([--json --config /tmp/looper.json --version]) exit code = %d, want 0", exitCode)
+	}
+	if !called {
+		t.Fatal("newApp was not called for --version after global flags")
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("stdout = %q, want empty string", got)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("stderr = %q, want empty string", got)
+	}
+}
+
 func TestRunUsesDefaultCLIAppFactoryForVersionCommand(t *testing.T) {
 	t.Parallel()
 
