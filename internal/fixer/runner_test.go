@@ -1934,6 +1934,55 @@ func TestDiscoverPullRequestsPreservesPendingRediscoveryForRunningAutomaticLoopW
 	}
 }
 
+func TestDiscoverPullRequestsSkipsAutoQueueWhileManualSingleShotRunHoldsLock(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(86)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	projectID := "project_1"
+	metadata := `{"manual":true,"followUpdates":false}`
+	manualLoopID := "loop_manual_single_shot_running"
+	manualLoop := storage.LoopRecord{ID: manualLoopID, Seq: 101, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), manualLoop); err != nil {
+		t.Fatalf("Loops.Upsert() manual error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_single_shot_running", LoopID: manualLoopID, Status: "running", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	if acquired, err := fixture.repos.Locks.Acquire(context.Background(), storage.LockRecord{Key: lockKey, Owner: manualLoopID, ExpiresAt: eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute).UTC()), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Locks.Acquire() error = %v", err)
+	} else if !acquired {
+		t.Fatal("Locks.Acquire() = false, want active fixer PR lock")
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_manual_single_shot_running", ProjectID: &projectID, LoopID: &manualLoopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:manual-single-shot:active", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-86"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: projectID, Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want active manual single-shot run to suppress auto rediscovery", result)
+	}
+	if github.viewIndex != 0 {
+		t.Fatalf("viewIndex = %d, want discovery to stop before opening PR detail", github.viewIndex)
+	}
+	queueItems, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queueItems) != 1 || queueItems[0].ID != "queue_manual_single_shot_running" {
+		t.Fatalf("queueItems = %#v, want only the active manual queue item", queueItems)
+	}
+}
+
 func TestDiscoverPullRequestsRecoversLegacyNoopLoopWithoutOpenPRListing(t *testing.T) {
 	t.Parallel()
 
@@ -2047,6 +2096,39 @@ func TestDiscoverPullRequestsRecoversManualForeignLegacyNoopLoop(t *testing.T) {
 	}
 	if result.QueueItems[0].TargetID != loopTarget {
 		t.Fatalf("queue item = %#v, want recovered manual foreign PR target", result.QueueItems[0])
+	}
+}
+
+func TestDiscoverPullRequestsRecoversAutomaticLegacyNoopLoopAfterManualSingleShotHistory(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	manualMetadata := `{"manual":true,"followUpdates":false}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_manual_single_shot_history", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &manualMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() manual error = %v", err)
+	}
+	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
+	automaticMetadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_after_manual", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &automaticMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() automatic error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want recovered automatic legacy queue item", result.QueueItems)
+	}
+	if result.QueueItems[0].LoopID == nil || *result.QueueItems[0].LoopID != "loop_fixer_legacy_after_manual" {
+		t.Fatalf("queue item = %#v, want automatic legacy loop to be recovered", result.QueueItems[0])
 	}
 }
 
