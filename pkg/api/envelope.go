@@ -18,6 +18,7 @@ const (
 	ErrorCodePullRequestNotFound        ErrorCode = "PULL_REQUEST_NOT_FOUND"
 	ErrorCodePullRequestProjectMismatch ErrorCode = "PULL_REQUEST_PROJECT_MISMATCH"
 	ErrorCodeRouteNotFound              ErrorCode = "ROUTE_NOT_FOUND"
+	ErrorCodeRunNotFound                ErrorCode = "RUN_NOT_FOUND"
 	ErrorCodeRuntimeControlUnavailable  ErrorCode = "RUNTIME_CONTROL_UNAVAILABLE"
 	ErrorCodeUnauthorized               ErrorCode = "UNAUTHORIZED"
 	ErrorCodeValidationFailed           ErrorCode = "VALIDATION_FAILED"
@@ -88,6 +89,8 @@ func (c ErrorCode) Status() int {
 		return 409
 	case ErrorCodeRouteNotFound:
 		return 404
+	case ErrorCodeRunNotFound:
+		return 404
 	case ErrorCodeRuntimeControlUnavailable:
 		return 501
 	case ErrorCodeUnauthorized:
@@ -116,6 +119,7 @@ func AllErrorCodes() []ErrorCode {
 		ErrorCodePullRequestNotFound,
 		ErrorCodePullRequestProjectMismatch,
 		ErrorCodeRouteNotFound,
+		ErrorCodeRunNotFound,
 		ErrorCodeRuntimeControlUnavailable,
 		ErrorCodeUnauthorized,
 		ErrorCodeValidationFailed,

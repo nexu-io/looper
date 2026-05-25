@@ -244,6 +244,14 @@
       "routeSpecificStatuses": []
     },
     {
+      "id": "run.logs",
+      "method": "GET",
+      "path": "/api/v1/runs/run_1/logs",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [404]
+    },
+    {
       "id": "runs.active.list",
       "method": "GET",
       "path": "/api/v1/runs/active",

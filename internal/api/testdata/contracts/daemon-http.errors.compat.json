@@ -94,6 +94,10 @@
       "status": 404
     },
     {
+      "code": "RUN_NOT_FOUND",
+      "status": 404
+    },
+    {
       "code": "RUNTIME_CONTROL_UNAVAILABLE",
       "status": 501
     },

@@ -3556,6 +3556,7 @@ func TestHandlerRunRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 		setup   func(testFixture) Context
 	}{
 		{routeID: "runs.list", method: http.MethodGet, path: "/api/v1/runs?loopId=loop_1"},
+		{routeID: "run.logs", method: http.MethodGet, path: "/api/v1/runs/run_1/logs"},
 		{routeID: "runs.active.list", method: http.MethodGet, path: "/api/v1/runs/active"},
 		{routeID: "runs.active.detail", method: http.MethodGet, path: "/api/v1/runs/active/1"},
 		{routeID: "runs.active.stop", method: http.MethodPost, path: "/api/v1/runs/active/1/stop", setup: func(fixture testFixture) Context {
@@ -3776,6 +3777,73 @@ func TestHandlerLoopLogsReturnsPersistedHistoricalAgentOutput(t *testing.T) {
 	agent := data["agent"].(map[string]any)
 	assertEqual(t, agent["stdout"], fullStdout)
 	assertEqual(t, agent["stderr"], fullStderr)
+}
+
+func TestHandlerRunLogsUsesSelectedRunInsteadOfLatest(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	oldStartedAt := fixture.now.Add(-time.Hour).UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:          "run_old",
+		LoopID:      "loop_1",
+		Status:      "failed",
+		CurrentStep: stringPtr("snapshot"),
+		StartedAt:   oldStartedAt,
+		EndedAt:     stringPtr(oldStartedAt),
+		CreatedAt:   oldStartedAt,
+		UpdatedAt:   oldStartedAt,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_old) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:         "agent_old",
+		ProjectID:  stringPtr("project_1"),
+		LoopID:     stringPtr("loop_1"),
+		RunID:      stringPtr("run_old"),
+		Vendor:     "opencode",
+		Status:     "failed",
+		StartedAt:  oldStartedAt,
+		EndedAt:    stringPtr(oldStartedAt),
+		OutputJSON: stringPtr(`{"stdout":"old run output","stderr":"old run stderr"}`),
+		CreatedAt:  oldStartedAt,
+		UpdatedAt:  oldStartedAt,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(agent_old) error = %v", err)
+	}
+
+	latestStartedAt := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:         "agent_latest",
+		ProjectID:  stringPtr("project_1"),
+		LoopID:     stringPtr("loop_1"),
+		RunID:      stringPtr("run_1"),
+		Vendor:     "opencode",
+		Status:     "running",
+		StartedAt:  latestStartedAt,
+		OutputJSON: stringPtr(`{"stdout":"latest run output","stderr":"latest run stderr"}`),
+		CreatedAt:  latestStartedAt,
+		UpdatedAt:  latestStartedAt,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(agent_latest) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/run_old/logs", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	run := data["run"].(map[string]any)
+	agent := data["agent"].(map[string]any)
+	assertEqual(t, run["runId"], "run_old")
+	assertEqual(t, run["status"], "failed")
+	assertEqual(t, agent["executionId"], "agent_old")
+	assertEqual(t, agent["stdout"], "old run output")
+	assertEqual(t, agent["stderr"], "old run stderr")
 }
 
 func TestHandlerLoopLogsFollowDefaultsToStderrWhenStdoutEmpty(t *testing.T) {

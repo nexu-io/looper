@@ -477,6 +477,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasPrefix(path, apiBasePath+"/runs/") {
+		payload, err := h.buildRunRouteResponse(r, path)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
 	h.writeError(w, requestID, apiError{
 		code:    pkgapi.ErrorCodeRouteNotFound,
 		status:  http.StatusNotFound,
@@ -2428,6 +2443,22 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 	}
 }
 
+func (h *Handler) buildRunRouteResponse(r *http.Request, path string) (any, error) {
+	parts := strings.Split(strings.TrimPrefix(path, apiBasePath+"/runs/"), "/")
+	runID, err := urlPathSegment(parts, 0)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "run id is required"}
+	}
+	if len(parts) != 2 || strings.TrimSpace(parts[1]) != "logs" {
+		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
+	}
+	if r.Method != http.MethodGet {
+		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+	}
+
+	return h.buildRunLogsResponse(r.Context(), runID)
+}
+
 func (h *Handler) buildActiveRunDetailResponse(ctx context.Context, loopID string) (activeRunView, error) {
 	items, err := h.buildActiveRunViews(ctx, true, false)
 	if err != nil {
@@ -4220,20 +4251,46 @@ func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRe
 		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 
+	return h.buildLogsResponseForRun(ctx, loop, latestRun)
+}
+
+func (h *Handler) buildRunLogsResponse(ctx context.Context, runID string) (loopLogsResponse, error) {
+	services := h.context.Runtime.Services()
+	run, err := services.Repositories.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if run == nil {
+		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeRunNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Run not found: %s", runID)}
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(ctx, run.LoopID)
+	if err != nil {
+		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if loop == nil {
+		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found for run: %s", runID)}
+	}
+
+	return h.buildLogsResponseForRun(ctx, *loop, run)
+}
+
+func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord) (loopLogsResponse, error) {
+	services := h.context.Runtime.Services()
 	var runPayload *loopLogsRunResponse
 	var agentPayload *loopLogsAgentPayload
-	if latestRun != nil {
+	if run != nil {
 		runPayload = &loopLogsRunResponse{
-			RunID:        latestRun.ID,
-			Status:       latestRun.Status,
-			CurrentStep:  latestRun.CurrentStep,
-			StartedAt:    latestRun.StartedAt,
-			EndedAt:      latestRun.EndedAt,
-			Summary:      latestRun.Summary,
-			ErrorMessage: latestRun.ErrorMessage,
+			RunID:        run.ID,
+			Status:       run.Status,
+			CurrentStep:  run.CurrentStep,
+			StartedAt:    run.StartedAt,
+			EndedAt:      run.EndedAt,
+			Summary:      run.Summary,
+			ErrorMessage: run.ErrorMessage,
 		}
 
-		latestAgent, agentErr := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
+		latestAgent, agentErr := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, run.ID)
 		if agentErr != nil {
 			return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: agentErr.Error()}
 		}

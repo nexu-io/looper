@@ -948,6 +948,30 @@
       }
     },
     {
+      "id": "run.logs",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "seq": 1,
+          "loopId": "loop_1",
+          "loopType": "reviewer",
+          "loopStatus": "running",
+          "run": {
+            "runId": "run_1",
+            "status": "running",
+            "currentStep": "review",
+            "startedAt": "2026-04-11T12:00:00.000Z",
+            "endedAt": null,
+            "summary": null,
+            "errorMessage": null
+          },
+          "agent": null
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
       "id": "runs.active.list",
       "status": 200,
       "body": {

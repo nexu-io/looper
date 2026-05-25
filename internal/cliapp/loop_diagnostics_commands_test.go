@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/storage"
@@ -92,13 +93,12 @@ func TestLogsAcceptsRunIDFromPSOutput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestedPath = r.URL.Path
 		writeEnvelope(t, w, pkgapi.Success("req_logs", map[string]any{
-			"seq":    7,
-			"loopId": "loop_failed",
-			"runId":  "run_reviewer_failed",
-			"type":   "reviewer",
-			"status": "failed",
-			"stdout": "review output",
-			"stderr": "",
+			"seq":        7,
+			"loopId":     "loop_failed",
+			"loopType":   "reviewer",
+			"loopStatus": "failed",
+			"run":        map[string]any{"runId": "run_reviewer_failed", "status": "failed", "currentStep": "snapshot"},
+			"agent":      map[string]any{"executionId": "agent_failed", "vendor": "claude-code", "status": "failed", "stdout": "review output", "stderr": ""},
 		}))
 	}))
 	defer server.Close()
@@ -108,11 +108,26 @@ func TestLogsAcceptsRunIDFromPSOutput(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([logs run_reviewer_failed]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if requestedPath != "/api/v1/loops/loop_failed/logs" {
-		t.Fatalf("requested path = %q, want loop logs path resolved from run id", requestedPath)
+	if requestedPath != "/api/v1/runs/run_reviewer_failed/logs" {
+		t.Fatalf("requested path = %q, want run-scoped logs path", requestedPath)
 	}
-	if stdout == "" {
-		t.Fatal("stdout is empty, want logs output")
+	for _, want := range []string{"Loop #7 · reviewer · failed", "Run run_reviewer_failed · step: snapshot", "review output"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestLogsRejectsRunIDFollow(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeLoopDiagnosticsFixture(t, "")
+	exitCode, _, stderr := runApp(t, "logs", "run_reviewer_failed", "--follow", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatal("Run([logs run_reviewer_failed --follow]) exit code = 0, want non-zero")
+	}
+	if !strings.Contains(stderr, "run-scoped logs cannot be followed") {
+		t.Fatalf("stderr = %q, want run-scoped follow error", stderr)
 	}
 }
 
