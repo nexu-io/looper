@@ -1632,7 +1632,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
-	if reason, err := r.pullRequestLabelAuthoritySkipReason(ctx, project.ID, project.RepoPath, queueItem, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+	if reason, err := r.pullRequestLabelAuthoritySkipReason(ctx, *loop, project.ID, project.RepoPath, queueItem, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if reason != "" {
 		checkpoint.SkipReason = reason
@@ -1950,7 +1950,10 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storag
 	return fmt.Sprintf("Skipped fixer run for %s#%d because PR author %q does not match fixer owner %q", repo, prNumber, strings.TrimSpace(author), strings.TrimSpace(currentUser)), nil
 }
 
-func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, projectID, cwd string, queueItem storage.QueueItemRecord, repo string, prNumber int64) (string, error) {
+func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, loop storage.LoopRecord, projectID, cwd string, queueItem storage.QueueItemRecord, repo string, prNumber int64) (string, error) {
+	if isManualFixerLoop(loop) {
+		return "", nil
+	}
 	policy := r.discoveryPolicyForProject(projectID)
 	if !queueItemRequiresLabelAuthority(queueItem) {
 		return "", nil
