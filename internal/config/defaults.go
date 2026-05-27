@@ -135,12 +135,12 @@ func DefaultConfig(cwd string) (Config, error) {
 			WorkingDirectory:       cwd,
 			Environment:            map[string]string{},
 			WorktreeCleanup: WorktreeCleanupConfig{
-				Enabled:        false,
+				Enabled:        true,
 				Interval:       "24h",
 				RetentionDays:  7,
 				MaxPerTick:     10,
 				IncludeOrphans: false,
-				DryRun:         true,
+				DryRun:         false,
 			},
 		},
 		Package: PackageConfig{

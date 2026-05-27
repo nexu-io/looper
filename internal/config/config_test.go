@@ -3183,8 +3183,8 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 		t.Fatalf("DefaultConfig().Daemon.WorkingDirectory = %q, want %q", config.Daemon.WorkingDirectory, "/tmp/looper-cwd")
 	}
 
-	if config.Daemon.WorktreeCleanup.Enabled {
-		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.Enabled = true, want false")
+	if !config.Daemon.WorktreeCleanup.Enabled {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.Enabled = false, want true")
 	}
 	if config.Daemon.WorktreeCleanup.Interval != "24h" {
 		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "24h")
@@ -3198,8 +3198,8 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if config.Daemon.WorktreeCleanup.IncludeOrphans {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = true, want false")
 	}
-	if !config.Daemon.WorktreeCleanup.DryRun {
-		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = false, want true")
+	if config.Daemon.WorktreeCleanup.DryRun {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = true, want false")
 	}
 
 	if config.Defaults.OpenPRStrategy != OpenPRStrategyAllDone {
@@ -3239,7 +3239,7 @@ func TestNormalizeMergesPartialWorktreeCleanupConfig(t *testing.T) {
 	if cfg.Daemon.WorktreeCleanup.RetentionDays != 14 {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup.RetentionDays = %d, want 14", cfg.Daemon.WorktreeCleanup.RetentionDays)
 	}
-	if cfg.Daemon.WorktreeCleanup.Interval != "24h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 10 || !cfg.Daemon.WorktreeCleanup.DryRun {
+	if cfg.Daemon.WorktreeCleanup.Interval != "24h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 10 || cfg.Daemon.WorktreeCleanup.DryRun {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup = %#v, want unspecified defaults preserved", cfg.Daemon.WorktreeCleanup)
 	}
 }

@@ -142,8 +142,40 @@ func TestWorktreeCleanupSkipsActiveLoopWorktree(t *testing.T) {
 	requirePathExists(t, record.WorktreePath)
 }
 
+func TestWorktreeCleanupExplainsUnconfiguredProjectSkips(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	record := fixture.createWorktree(t, "looper/test-unconfigured")
+	fixture.writeConfig(t, map[string]any{
+		"storage": map[string]any{"dbPath": fixture.dbPath},
+		"tools":   map[string]any{"gitPath": "git"},
+		"daemon": map[string]any{
+			"worktreeCleanup": map[string]any{
+				"retentionDays":  0,
+				"maxPerTick":     10,
+				"includeOrphans": true,
+			},
+		},
+		"projects": []map[string]any{},
+	})
+
+	exitCode, stdout, stderr := fixture.run("worktree", "cleanup")
+	if exitCode != 0 {
+		t.Fatalf("Run(worktree cleanup) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, record.WorktreePath) || !strings.Contains(stdout, "skip\tproject_not_configured") {
+		t.Fatalf("stdout = %q, want project_not_configured skip", stdout)
+	}
+	if !strings.Contains(stdout, "note\tproject_not_configured\t1 candidate(s) belong to project(s) missing from the current config: [project_1]") {
+		t.Fatalf("stdout = %q, want actionable unconfigured-project note", stdout)
+	}
+	requirePathExists(t, record.WorktreePath)
+}
+
 type worktreeCleanupFixture struct {
 	configPath string
+	dbPath     string
 	repoPath   string
 	root       string
 	repos      *storage.Repositories
@@ -195,7 +227,7 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Test Project", RepoPath: repoPath, BaseBranch: &baseBranch, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	return worktreeCleanupFixture{configPath: configPath, repoPath: repoPath, root: root, repos: repos}
+	return worktreeCleanupFixture{configPath: configPath, dbPath: dbPath, repoPath: repoPath, root: root, repos: repos}
 }
 
 func (f worktreeCleanupFixture) createWorktree(t *testing.T, branch string) storage.WorktreeRecord {
@@ -216,6 +248,17 @@ func (f worktreeCleanupFixture) run(args ...string) (int, string, string) {
 	fullArgs = append(fullArgs, "--config", f.configPath)
 	exitCode := app.Run(context.Background(), fullArgs)
 	return exitCode, stdout.String(), stderr.String()
+}
+
+func (f worktreeCleanupFixture) writeConfig(t *testing.T, cfg map[string]any) {
+	t.Helper()
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(f.configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 }
 
 func jsonString(value string) string {

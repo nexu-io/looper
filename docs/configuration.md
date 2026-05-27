@@ -914,12 +914,12 @@ Looper records worktrees it creates for planner, reviewer, fixer, and worker loo
 
 Defaults:
 
-- `daemon.worktreeCleanup.enabled = false`
+- `daemon.worktreeCleanup.enabled = true`
 - `daemon.worktreeCleanup.interval = "24h"`
 - `daemon.worktreeCleanup.retentionDays = 7`
 - `daemon.worktreeCleanup.maxPerTick = 10`
 - `daemon.worktreeCleanup.includeOrphans = false`
-- `daemon.worktreeCleanup.dryRun = true`
+- `daemon.worktreeCleanup.dryRun = false`
 
 To disable automatic cleanup:
 

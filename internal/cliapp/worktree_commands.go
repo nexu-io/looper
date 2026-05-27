@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
@@ -63,10 +64,12 @@ func writeHumanWorktreeCleanup(w io.Writer, result worktreecleanup.Result) error
 	if !result.DryRun {
 		mode = "confirmed"
 	}
+	reasonCounts := map[string]int{}
 	if _, err := fmt.Fprintf(w, "Worktree cleanup (%s): inspected=%d eligible=%d cleaned=%d skipped=%d errors=%d\n", mode, result.Summary.Inspected, result.Summary.Eligible, result.Summary.Cleaned, result.Summary.Skipped, result.Summary.Errors); err != nil {
 		return err
 	}
 	for _, candidate := range result.Candidates {
+		reasonCounts[candidate.Reason]++
 		if candidate.Error != "" {
 			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", candidate.Action, candidate.Reason, candidate.ProjectID, candidate.Branch, candidate.Error); err != nil {
 				return err
@@ -77,5 +80,30 @@ func writeHumanWorktreeCleanup(w io.Writer, result worktreecleanup.Result) error
 			return err
 		}
 	}
+	if reasonCounts["project_not_configured"] > 0 {
+		projectIDs := unconfiguredProjectIDs(result.Candidates)
+		if _, err := fmt.Fprintf(w, "note\tproject_not_configured\t%d candidate(s) belong to project(s) missing from the current config: %s\n", reasonCounts["project_not_configured"], projectIDs); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func unconfiguredProjectIDs(candidates []worktreecleanup.Candidate) string {
+	set := map[string]struct{}{}
+	for _, candidate := range candidates {
+		if candidate.Reason != "project_not_configured" || candidate.ProjectID == "" {
+			continue
+		}
+		set[candidate.ProjectID] = struct{}{}
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%v", ids)
 }
