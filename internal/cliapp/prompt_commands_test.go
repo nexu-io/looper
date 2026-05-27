@@ -91,6 +91,15 @@ func TestPromptPreviewFixerLifecycleMatchesRuntimeBranchFields(t *testing.T) {
 			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
 		}
 	}
+	for _, want := range []string{
+		"For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round.",
+		"Do not mechanically reuse the PR title or a previous fixer subject",
+		"unless a runner-specific instruction tells you to write a new subject",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("prompt preview = %q, want to contain %q", stdout, want)
+		}
+	}
 	for _, notWant := range []string{"branch=\"<branch>\"", "baseBranch=\"main\""} {
 		if strings.Contains(stdout, notWant) {
 			t.Fatalf("fixer prompt preview used lifecycle fields that runtime fixer prompt does not use %q:\n%s", notWant, stdout)

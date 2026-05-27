@@ -5503,6 +5503,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		parts = append(parts, "Do not push the branch or update remote pull request state; leave repository publishing for Looper/manual follow-up after your edits.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
 	}
+	parts = append(parts, "For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.")
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
 

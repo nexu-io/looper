@@ -403,7 +403,7 @@ func disclosurePromptInstruction(runner string, cfg config.DisclosureConfig, age
 
 	parts := []string{"Disclose looper-generated external content only for the disclosure channels enabled by configuration."}
 	if cfg.Channels.GitCommit {
-		parts = append(parts, "For commits, keep commit subjects unchanged and add a commit body trailer like `"+commitTrailer+"`.")
+		parts = append(parts, "For commits, keep commit subjects unchanged unless a runner-specific instruction tells you to write a new subject, and add a commit body trailer like `"+commitTrailer+"`.")
 	} else {
 		parts = append(parts, "Do not add looper Generated-By trailers to commit messages.")
 	}

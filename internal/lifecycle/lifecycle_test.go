@@ -142,6 +142,9 @@ func TestPromptInstructionRespectsDisclosureChannelOptOuts(t *testing.T) {
 
 func TestPromptInstructionLeavesPRDisclosureStampingToLooper(t *testing.T) {
 	prompt := PromptInstruction("worker", "looper/test", "main", true, true, config.DefaultDisclosureConfig(), "opencode", "")
+	if !strings.Contains(prompt, "unless a runner-specific instruction tells you to write a new subject") {
+		t.Fatalf("PromptInstruction missing softened commit-subject guidance:\n%s", prompt)
+	}
 	if !strings.Contains(prompt, "For PR bodies, do not add looper Markdown disclosure footers yourself; Looper will append or normalize the PR disclosure footer during PR creation or update.") {
 		t.Fatalf("PromptInstruction missing PR stamping guidance:\n%s", prompt)
 	}

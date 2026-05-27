@@ -104,6 +104,24 @@ func TestBuildFixerPromptCommentReplyInstructionRequiresVerificationWithoutRemot
 	}
 }
 
+func TestBuildFixerPromptPrefersRoundSpecificCommitSubject(t *testing.T) {
+	t.Parallel()
+
+	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	for _, want := range []string{
+		"For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round.",
+		"Do not mechanically reuse the PR title or a previous fixer subject",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "For commits, keep commit subjects unchanged and add a commit body trailer") {
+		t.Fatalf("prompt still contains old conflicting commit-subject guidance:\n%s", prompt)
+	}
+}
+
 func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

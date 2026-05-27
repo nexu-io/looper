@@ -97,15 +97,26 @@ func previewLifecycleSafety(role string, project config.ProjectRefConfig, cfg co
 		branch = ""
 		baseBranch = ""
 		if !allowRemote {
-			return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, agentRuntime, agentModel)
+			return previewFixerLifecycleSafety(allowRemote, cfg.Disclosure, agentRuntime, agentModel)
 		}
-		return "Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it.\n\n" + lifecycle.PromptInstruction(role, branch, baseBranch, true, false, cfg.Disclosure, agentRuntime, agentModel)
+		return previewFixerLifecycleSafety(allowRemote, cfg.Disclosure, agentRuntime, agentModel)
 	default:
 		if !allowRemote {
 			return previewNoRemoteLifecyclePromptInstruction(role, branch, baseBranch, cfg.Disclosure, agentRuntime, agentModel)
 		}
 		return lifecycle.PromptInstruction(role, branch, baseBranch, true, true, cfg.Disclosure, agentRuntime, agentModel)
 	}
+}
+
+func previewFixerLifecycleSafety(allowRemote bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
+	parts := []string{"Only repair Looper-provided fix items; do not change remote pull request state unless lifecycle policy allows it."}
+	if !allowRemote {
+		parts = append(parts, previewNoRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
+	} else {
+		parts = append(parts, lifecycle.PromptInstruction("fixer", "", "", true, false, disclosureCfg, agentRuntime, agentModel))
+	}
+	parts = append(parts, "For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.")
+	return strings.Join(parts, "\n\n")
 }
 
 func promptAgentRuntime(cfg config.Config) string {
