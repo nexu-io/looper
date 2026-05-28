@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
@@ -972,7 +973,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, err
 	}
 	if err := validateWorkerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
-		failure := r.classifyFailure(err)
+		failure := r.classifyFailureWithBoundary(err, failureclass.BoundaryCheckpoint)
 		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 		if latest.ResumePolicy == "" {
 			latest.ResumePolicy = "replay_step"
@@ -1016,7 +1017,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
 		if err != nil {
-			failure := r.classifyFailure(err)
+			failure := r.classifyFailureWithBoundary(err, workerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
@@ -2680,6 +2681,10 @@ func (r *Runner) githubCLIAutoPROpeningAvailable(ctx context.Context, repo, cwd 
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {
+	return r.classifyFailureWithBoundary(err, failureclass.BoundaryUnknown)
+}
+
+func (r *Runner) classifyFailureWithBoundary(err error, boundary failureclass.Boundary) *loopError {
 	var typed *loopError
 	if errors.As(err, &typed) {
 		return typed
@@ -2690,7 +2695,35 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	if githubinfra.IsTransientError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
-	return &loopError{message: err.Error(), kind: FailureNonRetryable}
+	return &loopError{message: err.Error(), kind: workerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerWorker, Boundary: boundary}))}
+}
+
+func workerFailureBoundaryForStep(step WorkerStep) failureclass.Boundary {
+	switch step {
+	case stepPrepareWork, stepOpenPR:
+		return failureclass.BoundaryGitHubAPI
+	case stepPrepareWorktree:
+		return failureclass.BoundaryGitRemote
+	case stepPlan, stepExecute:
+		return failureclass.BoundaryModelProvider
+	case stepValidate:
+		return failureclass.BoundaryAgentProcess
+	default:
+		return failureclass.BoundaryUnknown
+	}
+}
+
+func workerFailureKind(kind failureclass.Kind) QueueFailureKind {
+	switch kind {
+	case failureclass.RetryableTransient:
+		return FailureRetryableTransient
+	case failureclass.RetryableAfterResume:
+		return FailureRetryableAfterResume
+	case failureclass.ManualIntervention:
+		return FailureManualIntervention
+	default:
+		return FailureNonRetryable
+	}
 }
 
 func (r *Runner) nowISO() string { return eventlog.FormatJavaScriptISOString(r.now()) }

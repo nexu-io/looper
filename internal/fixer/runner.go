@@ -27,6 +27,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -1749,7 +1750,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.logInfo("fixer step started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(step)})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
-			failure := r.classifyFailure(err)
+			failure := r.classifyFailureWithBoundary(err, fixerFailureBoundaryForStep(step))
 			latest := checkpoint
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
@@ -4893,6 +4894,10 @@ func hasProgressed(checkpoint fixerCheckpoint) bool {
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {
+	return r.classifyFailureWithBoundary(err, failureclass.BoundaryUnknown)
+}
+
+func (r *Runner) classifyFailureWithBoundary(err error, boundary failureclass.Boundary) *loopError {
 	var typed *loopError
 	if errors.As(err, &typed) {
 		return typed
@@ -4901,10 +4906,41 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	if strings.Contains(strings.ToLower(message), "remote head changed") {
 		return &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &loopError{message: message, kind: FailureRetryableTransient}
+	}
 	if githubinfra.IsTransientError(err) {
 		return &loopError{message: message, kind: FailureRetryableTransient}
 	}
-	return &loopError{message: message, kind: FailureNonRetryable}
+	return &loopError{message: message, kind: fixerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: boundary}))}
+}
+
+func fixerFailureBoundaryForStep(step FixerStep) failureclass.Boundary {
+	switch step {
+	case stepDiscoverPR, stepClaimPR, stepCollectFixes, stepResolveComments, stepRecheck:
+		return failureclass.BoundaryGitHubAPI
+	case stepPrepareWorktree, stepPush:
+		return failureclass.BoundaryGitRemote
+	case stepRepair:
+		return failureclass.BoundaryModelProvider
+	case stepValidate, stepReconcileCommits:
+		return failureclass.BoundaryAgentProcess
+	default:
+		return failureclass.BoundaryUnknown
+	}
+}
+
+func fixerFailureKind(kind failureclass.Kind) QueueFailureKind {
+	switch kind {
+	case failureclass.RetryableTransient:
+		return FailureRetryableTransient
+	case failureclass.RetryableAfterResume:
+		return FailureRetryableAfterResume
+	case failureclass.ManualIntervention:
+		return FailureManualIntervention
+	default:
+		return FailureNonRetryable
+	}
 }
 
 func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRecord, checkpoint fixerCheckpoint, commitMessage string) (fixerCheckpoint, error) {

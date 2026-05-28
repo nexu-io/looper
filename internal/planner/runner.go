@@ -21,6 +21,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -698,7 +699,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
 		if err != nil {
-			failure := r.classifyFailure(err)
+			failure := r.classifyFailureWithBoundary(err, plannerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
@@ -1543,6 +1544,10 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {
+	return r.classifyFailureWithBoundary(err, failureclass.BoundaryUnknown)
+}
+
+func (r *Runner) classifyFailureWithBoundary(err error, boundary failureclass.Boundary) *loopError {
 	var typed *loopError
 	if errors.As(err, &typed) {
 		return typed
@@ -1557,7 +1562,33 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	if githubinfra.IsTransientError(err) {
 		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
-	return &loopError{message: err.Error(), kind: FailureNonRetryable}
+	return &loopError{message: err.Error(), kind: plannerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerPlanner, Boundary: boundary}))}
+}
+
+func plannerFailureBoundaryForStep(step PlannerStep) failureclass.Boundary {
+	switch step {
+	case stepDiscoverIssues, stepPublish, stepNotify:
+		return failureclass.BoundaryGitHubAPI
+	case stepPrepareWorktree:
+		return failureclass.BoundaryGitRemote
+	case stepWriteSpec:
+		return failureclass.BoundaryModelProvider
+	default:
+		return failureclass.BoundaryUnknown
+	}
+}
+
+func plannerFailureKind(kind failureclass.Kind) QueueFailureKind {
+	switch kind {
+	case failureclass.RetryableTransient:
+		return FailureRetryableTransient
+	case failureclass.RetryableAfterResume:
+		return FailureRetryableAfterResume
+	case failureclass.ManualIntervention:
+		return FailureManualIntervention
+	default:
+		return FailureNonRetryable
+	}
 }
 
 func (r *Runner) nowISO() string { return eventlog.FormatJavaScriptISOString(r.now()) }

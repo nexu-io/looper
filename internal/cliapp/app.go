@@ -321,7 +321,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "loop",
 				short:           "Loop commands",
-				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "inspect", description: "Inspect loop diagnostics"}, {name: "failures", description: "List failed loop diagnostics"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}},
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "inspect", description: "Inspect loop diagnostics"}, {name: "failures", description: "List failed loop diagnostics"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}, {name: "retry", description: "Retry a failed or paused loop"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
 					"$ looper loop list",
@@ -335,8 +335,10 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "failures", short: "List failed loop diagnostics", runE: runtime.loopFailures, localFlags: []flagSpec{stringFlag("type", "type", "Filter by loop type"), stringFlag("project", "projectId", "Filter by project id"), stringFlag("limit", "count", "Maximum number of failed loops to list")}}),
 					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("type", "type", "Loop type"), stringFlag("pr", "repo#number", "Pull request reference"), stringFlag("project", "projectId", "Project id")}}),
 					newCommand(commandSpec{use: "pause [id]", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause, localFlags: []flagSpec{stringFlag("id", "id", "Loop id")}}),
+					newCommand(commandSpec{use: "retry <seq|loopId>", short: "Retry a loop", args: cobra.ExactArgs(1), runE: runtime.loopRetry, localFlags: []flagSpec{stringFlag("mode", "auto|resume|rediscover", "Retry mode"), boolFlag("discard-worktree-changes", "Discard dirty worktree changes before retrying"), boolFlag("confirm", "Confirm destructive retry action")}}),
 				},
 			}),
+			newCommand(commandSpec{use: "retry <seq|loopId>", short: "Retry a loop", args: cobra.ExactArgs(1), runE: runtime.loopRetry, localFlags: []flagSpec{stringFlag("mode", "auto|resume|rediscover", "Retry mode"), boolFlag("discard-worktree-changes", "Discard dirty worktree changes before retrying"), boolFlag("confirm", "Confirm destructive retry action")}}),
 			newCommand(commandSpec{
 				use:   "work",
 				short: "Create a worker run",

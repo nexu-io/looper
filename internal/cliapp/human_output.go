@@ -88,6 +88,7 @@ type loopsListOutput struct {
 
 type loopOutput struct {
 	ID         string  `json:"id"`
+	Seq        int64   `json:"seq"`
 	ProjectID  string  `json:"projectId"`
 	Type       string  `json:"type"`
 	TargetType string  `json:"targetType"`
@@ -95,6 +96,13 @@ type loopOutput struct {
 	Repo       *string `json:"repo"`
 	PRNumber   *int64  `json:"prNumber"`
 	Status     string  `json:"status"`
+}
+
+type loopRetryOutput struct {
+	Loop          loopOutput `json:"loop"`
+	QueueItemID   *string    `json:"queueItemId"`
+	Mode          string     `json:"mode"`
+	ResetAttempts bool       `json:"resetAttempts"`
 }
 
 type reviewRepairOutput struct {
@@ -197,13 +205,17 @@ type stopAllOutput struct {
 }
 
 type activeRunOutput struct {
-	Seq         int64   `json:"seq"`
-	Type        string  `json:"type"`
-	Status      string  `json:"status"`
-	CurrentStep *string `json:"currentStep"`
-	StartedAt   *string `json:"startedAt"`
-	EndedAt     *string `json:"endedAt"`
-	Target      struct {
+	Seq               int64   `json:"seq"`
+	Type              string  `json:"type"`
+	Status            string  `json:"status"`
+	LoopStatus        string  `json:"loopStatus"`
+	DisplayStatus     string  `json:"displayStatus"`
+	LastFailureKind   *string `json:"lastFailureKind"`
+	LastFailureReason *string `json:"lastFailureReason"`
+	CurrentStep       *string `json:"currentStep"`
+	StartedAt         *string `json:"startedAt"`
+	EndedAt           *string `json:"endedAt"`
+	Target            struct {
 		Label string `json:"label"`
 	} `json:"target"`
 	Agent *struct {
@@ -360,6 +372,15 @@ func writeHumanLoopUnpaused(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
+func writeHumanLoopRetried(w io.Writer, payload json.RawMessage) error {
+	var data loopRetryOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode loop retry response: %w", err)
+	}
+	printSection(w, "Loop retry queued", [][2]any{{"id", data.Loop.ID}, {"seq", data.Loop.Seq}, {"status", data.Loop.Status}, {"mode", data.Mode}, {"queueItem", formatScalar(data.QueueItemID)}})
+	return nil
+}
+
 func writeHumanPullRequestList(w io.Writer, payload json.RawMessage) error {
 	var data pullRequestsListOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
@@ -458,7 +479,11 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": item.Status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))})
+		status := item.Status
+		if strings.TrimSpace(item.DisplayStatus) != "" {
+			status = item.DisplayStatus
+		}
+		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))})
 	}
 	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age"}, rows)
 	return nil

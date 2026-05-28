@@ -992,6 +992,8 @@
               "projectId": "project_1",
               "type": "reviewer",
               "status": "running",
+              "loopStatus": "running",
+              "displayStatus": "running",
               "currentStep": "review",
               "startedAt": "2026-04-11T12:00:00.000Z",
               "target": {
@@ -1010,6 +1012,8 @@
               "projectId": "project_1",
               "type": "worker",
               "status": "queued",
+              "loopStatus": "queued",
+              "displayStatus": "queued",
               "currentStep": null,
               "startedAt": "<generated-timestamp>",
               "target": {
@@ -1037,6 +1041,8 @@
           "projectId": "project_1",
           "type": "reviewer",
           "status": "running",
+          "loopStatus": "running",
+          "displayStatus": "running",
           "currentStep": "review",
           "startedAt": "2026-04-11T12:00:00.000Z",
           "target": {

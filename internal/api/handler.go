@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -1475,18 +1476,35 @@ type activeRunsQuery struct {
 }
 
 type activeRunView struct {
-	Seq         int64              `json:"seq"`
-	RunID       *string            `json:"runId"`
-	LoopID      string             `json:"loopId"`
-	ProjectID   string             `json:"projectId"`
-	Type        string             `json:"type"`
-	Status      string             `json:"status"`
-	CurrentStep *string            `json:"currentStep"`
-	StartedAt   *string            `json:"startedAt"`
-	EndedAt     *string            `json:"endedAt,omitempty"`
-	Target      activeRunTarget    `json:"target"`
-	Agent       *activeRunAgent    `json:"agent"`
-	Worktree    *activeRunWorktree `json:"worktree"`
+	Seq               int64              `json:"seq"`
+	RunID             *string            `json:"runId"`
+	LoopID            string             `json:"loopId"`
+	ProjectID         string             `json:"projectId"`
+	Type              string             `json:"type"`
+	Status            string             `json:"status"`
+	LoopStatus        string             `json:"loopStatus"`
+	DisplayStatus     string             `json:"displayStatus"`
+	LastFailureKind   *string            `json:"lastFailureKind,omitempty"`
+	LastFailureReason *string            `json:"lastFailureReason,omitempty"`
+	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
+	CurrentStep       *string            `json:"currentStep"`
+	StartedAt         *string            `json:"startedAt"`
+	EndedAt           *string            `json:"endedAt,omitempty"`
+	Target            activeRunTarget    `json:"target"`
+	Agent             *activeRunAgent    `json:"agent"`
+	Worktree          *activeRunWorktree `json:"worktree"`
+}
+
+type retryLoopRequest struct {
+	Mode          string `json:"mode"`
+	ResetAttempts *bool  `json:"resetAttempts"`
+}
+
+type retryLoopResponse struct {
+	Loop          loopResponse `json:"loop"`
+	QueueItemID   *string      `json:"queueItemId,omitempty"`
+	Mode          string       `json:"mode"`
+	ResetAttempts bool         `json:"resetAttempts"`
 }
 
 type activeRunTarget struct {
@@ -2550,6 +2568,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	}
 
 	queuedLoopIDs := make(map[string]struct{})
+	latestQueueByLoopID := latestQueueItemByLoopID(queueItems)
 	for _, item := range queueItems {
 		if item.LoopID != nil && (item.Status == "queued" || item.Status == "running") {
 			queuedLoopIDs[*item.LoopID] = struct{}{}
@@ -2590,19 +2609,22 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			continue
 		}
 		runID := run.ID
-		runningViews = append(runningViews, activeRunView{
+		view := activeRunView{
 			Seq:         loop.Seq,
 			RunID:       &runID,
 			LoopID:      run.LoopID,
 			ProjectID:   loop.ProjectID,
 			Type:        loop.Type,
 			Status:      run.Status,
+			LoopStatus:  loop.Status,
 			CurrentStep: run.CurrentStep,
 			StartedAt:   stringPtrOrNil(run.StartedAt),
 			Target:      target,
 			Agent:       activeAgentByRunID[run.ID],
 			Worktree:    buildWorktreeSummary(loop, run),
-		})
+		}
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRun)
+		runningViews = append(runningViews, view)
 	}
 
 	runningLoopsWithoutRuns := make([]storage.LoopRecord, 0)
@@ -2631,19 +2653,22 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			continue
 		}
 		startedAt := firstNonEmptyString(loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
-		queuedViews = append(queuedViews, activeRunView{
+		view := activeRunView{
 			Seq:         loop.Seq,
 			RunID:       nil,
 			LoopID:      loop.ID,
 			ProjectID:   loop.ProjectID,
 			Type:        loop.Type,
 			Status:      loop.Status,
+			LoopStatus:  loop.Status,
 			CurrentStep: nil,
 			StartedAt:   startedAt,
 			Target:      target,
 			Agent:       nil,
 			Worktree:    nil,
-		})
+		}
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], nil)
+		queuedViews = append(queuedViews, view)
 	}
 
 	runningLoopViews := make([]activeRunView, 0, len(runningLoopsWithoutRuns))
@@ -2656,19 +2681,22 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			continue
 		}
 		startedAt := firstNonEmptyString(loop.LastRunAt, loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
-		runningLoopViews = append(runningLoopViews, activeRunView{
+		view := activeRunView{
 			Seq:         loop.Seq,
 			RunID:       nil,
 			LoopID:      loop.ID,
 			ProjectID:   loop.ProjectID,
 			Type:        loop.Type,
 			Status:      loop.Status,
+			LoopStatus:  loop.Status,
 			CurrentStep: nil,
 			StartedAt:   startedAt,
 			Target:      target,
 			Agent:       nil,
 			Worktree:    nil,
-		})
+		}
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], nil)
+		runningLoopViews = append(runningLoopViews, view)
 	}
 
 	includedLoopIDs := make(map[string]struct{}, len(runningViews)+len(runningLoopViews)+len(queuedViews))
@@ -2683,50 +2711,64 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	}
 
 	inactiveLoopViews := make([]activeRunView, 0)
-	if includeInactiveLoops {
-		for _, loop := range loopsList {
-			if _, ok := includedLoopIDs[loop.ID]; ok {
+	for _, loop := range loopsList {
+		if _, ok := includedLoopIDs[loop.ID]; ok {
+			continue
+		}
+		latestQueue := latestQueueByLoopID[loop.ID]
+		var latestRun *storage.RunRecord
+		if !includeInactiveLoops {
+			var runErr error
+			latestRun, runErr = services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+			if runErr != nil {
+				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: runErr.Error()}
+			}
+			if !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
 				continue
 			}
-			target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				continue
-			}
-			var (
-				latestRun *storage.RunRecord
-				runID     *string
-				worktree  *activeRunWorktree
-			)
+		}
+		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		var (
+			runID    *string
+			worktree *activeRunWorktree
+		)
+		if latestRun == nil {
 			latestRun, err = services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 			if err != nil {
 				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 			}
-			startedAt := firstNonEmptyString(loop.LastRunAt, loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
-			var endedAt *string
-			if latestRun != nil {
-				runID = &latestRun.ID
-				startedAt = stringPtrOrNil(latestRun.StartedAt)
-				endedAt = latestRun.EndedAt
-				worktree = buildWorktreeSummary(loop, *latestRun)
-			}
-			inactiveLoopViews = append(inactiveLoopViews, activeRunView{
-				Seq:         loop.Seq,
-				RunID:       runID,
-				LoopID:      loop.ID,
-				ProjectID:   loop.ProjectID,
-				Type:        loop.Type,
-				Status:      loop.Status,
-				CurrentStep: nil,
-				StartedAt:   startedAt,
-				EndedAt:     endedAt,
-				Target:      target,
-				Agent:       nil,
-				Worktree:    worktree,
-			})
 		}
+		startedAt := firstNonEmptyString(loop.LastRunAt, loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
+		var endedAt *string
+		if latestRun != nil {
+			runID = &latestRun.ID
+			startedAt = stringPtrOrNil(latestRun.StartedAt)
+			endedAt = latestRun.EndedAt
+			worktree = buildWorktreeSummary(loop, *latestRun)
+		}
+		view := activeRunView{
+			Seq:         loop.Seq,
+			RunID:       runID,
+			LoopID:      loop.ID,
+			ProjectID:   loop.ProjectID,
+			Type:        loop.Type,
+			Status:      loop.Status,
+			LoopStatus:  loop.Status,
+			CurrentStep: nil,
+			StartedAt:   startedAt,
+			EndedAt:     endedAt,
+			Target:      target,
+			Agent:       nil,
+			Worktree:    worktree,
+		}
+		decorateActiveRunView(&view, loop, latestQueue, latestRun)
+		inactiveLoopViews = append(inactiveLoopViews, view)
 	}
 
 	items := append(runningViews, runningLoopViews...)
@@ -2755,6 +2797,60 @@ func excludeActiveRunViewsByLoopID(items []activeRunView, excluded []activeRunVi
 		filtered = append(filtered, item)
 	}
 	return filtered
+}
+
+func latestQueueItemByLoopID(items []storage.QueueItemRecord) map[string]*storage.QueueItemRecord {
+	latest := make(map[string]*storage.QueueItemRecord)
+	for i := range items {
+		item := &items[i]
+		if item.LoopID == nil || strings.TrimSpace(*item.LoopID) == "" {
+			continue
+		}
+		loopID := *item.LoopID
+		current := latest[loopID]
+		if current == nil || item.UpdatedAt > current.UpdatedAt || (item.UpdatedAt == current.UpdatedAt && item.ID > current.ID) {
+			latest[loopID] = item
+		}
+	}
+	return latest
+}
+
+func isManualInterventionQueue(item *storage.QueueItemRecord) bool {
+	return item != nil && item.LastErrorKind != nil && *item.LastErrorKind == "manual_intervention"
+}
+
+func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
+	policy := resumePolicyFromRun(run)
+	return policy != nil && *policy == loops.ResumePolicyManualIntervention
+}
+
+func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
+	if view.LoopStatus == "" {
+		view.LoopStatus = loop.Status
+	}
+	view.DisplayStatus = view.Status
+	if latestQueue != nil {
+		view.LastFailureKind = latestQueue.LastErrorKind
+		view.LastFailureReason = latestQueue.LastError
+	}
+	view.ResumePolicy = resumePolicyFromRun(latestRun)
+	if isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention) {
+		view.DisplayStatus = "manual_intervention"
+	}
+	if view.DisplayStatus == "" {
+		view.DisplayStatus = view.Status
+	}
+}
+
+func resumePolicyFromRun(run *storage.RunRecord) *string {
+	if run == nil || run.CheckpointJSON == nil {
+		return nil
+	}
+	policy := readStringMap(parseJSONObject(run.CheckpointJSON), "resumePolicy")
+	if policy == nil || strings.TrimSpace(*policy) == "" {
+		return nil
+	}
+	return policy
 }
 
 func buildVerifiedActiveAgentByRunID(ctx context.Context, runtime RuntimeState, executions []storage.AgentExecutionRecord) map[string]*activeRunAgent {
@@ -2918,7 +3014,7 @@ func parsePositiveInt64(value, fieldName string) (int64, error) {
 }
 
 func matchesActiveRunQuery(item activeRunView, query activeRunsQuery) bool {
-	if query.Status != "" && item.Status != query.Status {
+	if query.Status != "" && item.Status != query.Status && item.DisplayStatus != query.Status && item.LoopStatus != query.Status {
 		return false
 	}
 	if query.Type != "" && item.Type != query.Type {
@@ -3043,6 +3139,11 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
 		return h.mutateLoopStatus(r.Context(), loop.ID, domain.LoopStatusPaused)
+	case "retry":
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.retryLoop(r.Context(), r, loop.ID)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
@@ -4319,6 +4420,161 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	return serializeLoop(updated), nil
 }
 
+func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {
+	var body retryLoopRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+		}
+	}
+	mode := strings.TrimSpace(body.Mode)
+	if mode == "" {
+		mode = "auto"
+	}
+	if mode != "auto" && mode != "resume" && mode != "rediscover" {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Unsupported retry mode: %s", mode)}
+	}
+	if mode != "auto" {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusNotImplemented, message: fmt.Sprintf("Retry mode %s is not implemented safely yet; use mode auto", mode)}
+	}
+	resetAttempts := true
+	if body.ResetAttempts != nil {
+		resetAttempts = *body.ResetAttempts
+	}
+	if !resetAttempts {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
+	}
+
+	services := h.context.Runtime.Services()
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	type retryResult struct {
+		loop        storage.LoopRecord
+		queueItemID *string
+	}
+	result, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (retryResult, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return retryResult{}, err
+		}
+		if loop == nil {
+			return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
+			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
+		}
+		if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
+			return retryResult{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
+		}
+		runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+		if err != nil {
+			return retryResult{}, err
+		}
+		for _, run := range runningRuns {
+			if run.LoopID == loop.ID {
+				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", loop.ID)}
+			}
+		}
+		activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+		if err != nil {
+			return retryResult{}, err
+		}
+		if activeQueue != nil {
+			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", loop.ID, activeQueue.ID)}
+		}
+
+		target, targetErr := loopTargetFromRecordCompat(*loop)
+		if targetErr != nil {
+			return retryResult{}, targetErr
+		}
+		existing, err := repos.Loops.List(ctx)
+		if err != nil {
+			return retryResult{}, err
+		}
+		if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusQueued); uniqueErr != nil {
+			return retryResult{}, uniqueErr
+		}
+		latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return retryResult{}, err
+		}
+
+		queueLoop := *loop
+		queueLoop.Status = string(domain.LoopStatusQueued)
+		queueLoop.NextRunAt = &nowISO
+		queueLoop.UpdatedAt = nowISO
+		if queueLoop.Type == string(domain.LoopTypeReviewer) {
+			metadataJSON, metadataErr := resetReviewerLoopRetryMetadata(queueLoop.MetadataJSON)
+			if metadataErr != nil {
+				return retryResult{}, metadataErr
+			}
+			queueLoop.MetadataJSON = metadataJSON
+		}
+		var queueRecord storage.QueueItemRecord
+		var ok bool
+		if latestQueue != nil {
+			queueRecord = *latestQueue
+			queueRecord.ID = generateRequestID()
+			queueRecord.Status = "queued"
+			queueRecord.AvailableAt = nowISO
+			if resetAttempts {
+				queueRecord.Attempts = 0
+			}
+			queueRecord.ClaimedBy = nil
+			queueRecord.ClaimedAt = nil
+			queueRecord.StartedAt = nil
+			queueRecord.FinishedAt = nil
+			queueRecord.LastError = nil
+			queueRecord.LastErrorKind = nil
+			queueRecord.CreatedAt = nowISO
+			queueRecord.UpdatedAt = nowISO
+			ok = true
+		} else {
+			built, builtOK, queueErr := buildQueuedLoopQueueRecordCompat(queueLoop, target, nowISO, queueLoop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+			if queueErr != nil {
+				return retryResult{}, queueErr
+			}
+			queueRecord = built
+			ok = builtOK
+		}
+		if !ok {
+			return retryResult{loop: *loop}, nil
+		}
+		if queueRecord.DedupeKey != "" {
+			activeDedupe, err := repos.Queue.FindActiveByDedupe(ctx, queueRecord.DedupeKey)
+			if err != nil {
+				return retryResult{}, err
+			}
+			if activeDedupe != nil {
+				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while dedupe queue item %s is active", loop.ID, activeDedupe.ID)}
+			}
+		}
+
+		updated := queueLoop
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return retryResult{}, err
+		}
+		persisted, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)
+		if err != nil {
+			return retryResult{}, err
+		}
+		return retryResult{loop: updated, queueItemID: &persisted.ID}, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return retryLoopResponse{}, typed
+		}
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
+	}
+	return retryLoopResponse{Loop: serializeLoop(result.loop), QueueItemID: result.queueItemID, Mode: mode, ResetAttempts: resetAttempts}, nil
+}
+
 func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRecord) (loopLogsResponse, error) {
 	services := h.context.Runtime.Services()
 	if latestLoop, err := services.Repositories.Loops.GetByID(ctx, loop.ID); err != nil {
@@ -4666,6 +4922,25 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	status, _ := loopMeta["status"].(string)
 	return status == "terminated" || status == "stopped" || status == "failed"
+}
+
+func resetReviewerLoopRetryMetadata(current *string) (*string, error) {
+	if current == nil || strings.TrimSpace(*current) == "" {
+		return current, nil
+	}
+	metadata := parseJSONObject(current)
+	loopMeta, ok := metadata["loop"].(map[string]any)
+	if !ok || loopMeta == nil {
+		return current, nil
+	}
+	loopMeta["status"] = "queued"
+	metadata["loop"] = loopMeta
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	value := string(encoded)
+	return &value, nil
 }
 
 func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.LoopTarget, nowISO string, metadataJSON *string, maxAttempts int64) (storage.QueueItemRecord, bool, error) {

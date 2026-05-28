@@ -250,6 +250,27 @@ func (r *commandRuntime) unpauseLoopBySeq(cmd *cobra.Command, args []string) err
 	}, writeHumanLoopUnpaused)
 }
 
+func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		selector := strings.TrimSpace(args[0])
+		if selector == "" {
+			return nil, fmt.Errorf("loop retry requires <seq|loopId>")
+		}
+		if getBoolFlag(cmd, "discard-worktree-changes") && !getBoolFlag(cmd, "confirm") {
+			return nil, fmt.Errorf("--discard-worktree-changes requires --confirm")
+		}
+		if getBoolFlag(cmd, "discard-worktree-changes") {
+			return nil, fmt.Errorf("--discard-worktree-changes is not supported yet; fix or reset the worktree manually, then retry without this flag")
+		}
+		mode := strings.TrimSpace(getStringFlag(cmd, "mode"))
+		if mode == "" {
+			mode = "auto"
+		}
+		body := map[string]any{"mode": mode, "resetAttempts": true}
+		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
+	}, writeHumanLoopRetried)
+}
+
 func loopSeqSelector(value string) (string, error) {
 	seq := strings.TrimSpace(value)
 	if seq == "" {

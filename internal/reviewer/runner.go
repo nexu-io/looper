@@ -29,6 +29,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
@@ -1414,7 +1415,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
 			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
-			failure := r.classifyFailureForProject(project.ID, err)
+			failure := r.classifyFailureForProjectAndBoundary(project.ID, err, reviewerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			if checkpoint.ResumePolicy == "rerun_review" || hasPendingReviewMarkerMiss(checkpoint) {
 				latest = checkpoint
@@ -4280,6 +4281,10 @@ func (r *Runner) classifyFailure(err error) *loopError {
 }
 
 func (r *Runner) classifyFailureForProject(projectID string, err error) *loopError {
+	return r.classifyFailureForProjectAndBoundary(projectID, err, failureclass.BoundaryUnknown)
+}
+
+func (r *Runner) classifyFailureForProjectAndBoundary(projectID string, err error, boundary failureclass.Boundary) *loopError {
 	var typed *loopError
 	if errors.As(err, &typed) {
 		return typed
@@ -4301,7 +4306,33 @@ func (r *Runner) classifyFailureForProject(projectID string, err error) *loopErr
 	if r.isEnhancedTransientFailureForPolicy(r.retryPolicyForProject(projectID), err) {
 		return &loopError{message: githubinfra.ErrorMessage(err), kind: FailureRetryableTransient}
 	}
-	return &loopError{message: err.Error(), kind: FailureNonRetryable}
+	return &loopError{message: err.Error(), kind: reviewerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerReviewer, Boundary: boundary}))}
+}
+
+func reviewerFailureBoundaryForStep(step ReviewerStep) failureclass.Boundary {
+	switch step {
+	case stepDiscover, stepFilter, stepClaim, stepSnapshot, stepThreadResolution, stepPublish:
+		return failureclass.BoundaryGitHubAPI
+	case stepWorktree:
+		return failureclass.BoundaryGitRemote
+	case stepReview:
+		return failureclass.BoundaryModelProvider
+	default:
+		return failureclass.BoundaryUnknown
+	}
+}
+
+func reviewerFailureKind(kind failureclass.Kind) QueueFailureKind {
+	switch kind {
+	case failureclass.RetryableTransient:
+		return FailureRetryableTransient
+	case failureclass.RetryableAfterResume:
+		return FailureRetryableAfterResume
+	case failureclass.ManualIntervention:
+		return FailureManualIntervention
+	default:
+		return FailureNonRetryable
+	}
 }
 
 func (r *Runner) isTransientExternalFailure(err error) bool {

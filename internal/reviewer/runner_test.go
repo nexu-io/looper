@@ -17,6 +17,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
@@ -5937,7 +5938,7 @@ func TestIsTransientExternalFailureDetectsWrappedGitHubStatus(t *testing.T) {
 	}
 }
 
-func TestEnhancedTransientClassificationIsOptIn(t *testing.T) {
+func TestUnknownBoundaryDoesNotRetryExternalLookingCommandError(t *testing.T) {
 	err := &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: `Post "https://api.github.com/graphql": EOF`}}
 
 	defaultRunner := New(Options{})
@@ -5946,6 +5947,11 @@ func TestEnhancedTransientClassificationIsOptIn(t *testing.T) {
 	}
 	if defaultRunner.isTransientExternalFailure(err) {
 		t.Fatal("default isTransientExternalFailure() = true, want false")
+	}
+
+	boundaryErr := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+	if got := defaultRunner.classifyFailure(boundaryErr); got.kind != FailureRetryableTransient {
+		t.Fatalf("boundary classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
 
 	enabledRunner := New(Options{RetryPolicy: config.ReviewerRetryConfig{EnhancedTransientClassification: true}})
