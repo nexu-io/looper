@@ -89,6 +89,9 @@ func Classify(err error, ctx Context) Kind {
 	if isManualWorktreeMessage(message) || ctx.Boundary == BoundaryLocalWorktree {
 		return ManualIntervention
 	}
+	if ctx.Boundary == BoundaryGitHubAPI && isRetryableGitHubGraphQLUnauthorized(message) {
+		return RetryableTransient
+	}
 	if isDeterministicDenial(message) || isInternalDeterministicBoundary(ctx.Boundary) {
 		return NonRetryable
 	}
@@ -156,4 +159,23 @@ func isDeterministicDenial(message string) bool {
 		}
 	}
 	return false
+}
+
+func isRetryableGitHubGraphQLUnauthorized(message string) bool {
+	if !(strings.Contains(message, "graphql") && strings.Contains(message, "401")) {
+		return false
+	}
+	for _, fragment := range []string{
+		"bad credentials",
+		"authentication failed",
+		"permission denied",
+		"not authorized",
+		"invalid token",
+		"token expired",
+	} {
+		if strings.Contains(message, fragment) {
+			return false
+		}
+	}
+	return true
 }

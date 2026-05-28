@@ -39,6 +39,20 @@ func TestClassifyUsesWrappedBoundaryAuthority(t *testing.T) {
 	}
 }
 
+func TestClassifyRetriesGitHubGraphQLUnauthorizedAtGitHubBoundary(t *testing.T) {
+	got := Classify(errors.New(`Post "https://api.github.com/graphql": HTTP 401 Unauthorized`), Context{Runner: RunnerReviewer, Boundary: BoundaryGitHubAPI})
+	if got != RetryableTransient {
+		t.Fatalf("Classify() = %s, want %s", got, RetryableTransient)
+	}
+}
+
+func TestClassifyDoesNotRetryCredentialFailures(t *testing.T) {
+	got := Classify(errors.New("GitHub API failed: HTTP 401 Unauthorized: bad credentials"), Context{Runner: RunnerReviewer, Boundary: BoundaryGitHubAPI})
+	if got != NonRetryable {
+		t.Fatalf("Classify() = %s, want %s", got, NonRetryable)
+	}
+}
+
 func TestClassifyDeterministicFailuresDoNotBecomeTransient(t *testing.T) {
 	tests := []struct {
 		name     string
