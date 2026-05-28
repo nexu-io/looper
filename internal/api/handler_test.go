@@ -152,6 +152,105 @@ func TestHandlerLoopRetryAllowsFailedReviewerLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryRejectsTerminalReviewerMetadata(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_reviewer_terminal_metadata"
+	loopID := "loop_retry_reviewer_terminal_metadata"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	metadata := `{"loop":{"status":"terminated","terminationReason":"manual_stop","failureCount":3}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 45, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lastErrorKind := "non_retryable"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_retry_reviewer_terminal_metadata", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:retry_reviewer_terminal_metadata", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 5, MaxAttempts: 5, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/45/retry", strings.NewReader(`{"mode":"auto"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "Cannot retry terminal reviewer metadata terminated loop") {
+		t.Fatalf("body = %s, want terminal reviewer metadata error", recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "failed" {
+		t.Fatalf("loop.Status = %q, want failed", loop.Status)
+	}
+	if loop.MetadataJSON == nil || *loop.MetadataJSON != metadata {
+		t.Fatalf("loop.MetadataJSON = %#v, want %q", loop.MetadataJSON, metadata)
+	}
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue items len = %d, want 1", len(items))
+	}
+}
+
+func TestHandlerLoopRetryClearsDeprecatedReviewerBudgetMetadata(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_reviewer_budget_metadata"
+	loopID := "loop_retry_reviewer_budget_metadata"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	metadata := `{"loop":{"status":"terminated","terminationReason":"max_wall_clock","failureCount":3,"maxIterationsPerPR":2,"maxWallClockSeconds":60}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 46, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lastErrorKind := "non_retryable"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_retry_reviewer_budget_metadata", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:retry_reviewer_budget_metadata", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 5, MaxAttempts: 5, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/46/retry", strings.NewReader(`{"mode":"auto"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	loopMeta := parseJSONObject(loop.MetadataJSON)["loop"].(map[string]any)
+	if loopMeta["status"] != "queued" {
+		t.Fatalf("metadata loop.status = %#v, want queued", loopMeta["status"])
+	}
+	if _, ok := loopMeta["terminationReason"]; ok {
+		t.Fatalf("metadata terminationReason still present: %#v", loopMeta)
+	}
+	if _, ok := loopMeta["maxIterationsPerPR"]; ok {
+		t.Fatalf("metadata maxIterationsPerPR still present: %#v", loopMeta)
+	}
+	if _, ok := loopMeta["maxWallClockSeconds"]; ok {
+		t.Fatalf("metadata maxWallClockSeconds still present: %#v", loopMeta)
+	}
+}
+
 func TestHandlerLoopRetryRejectsConflictingActiveLoop(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

@@ -4465,6 +4465,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
 		}
+		if loop.Type == string(domain.LoopTypeReviewer) {
+			if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(*loop); terminalMetadataStatus != "" {
+				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
+			}
+		}
 		if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
 		}
@@ -4924,6 +4929,23 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	return status == "terminated" || status == "stopped" || status == "failed"
 }
 
+func terminalReviewerRetryMetadataStatus(loop storage.LoopRecord) string {
+	if loop.MetadataJSON == nil || strings.TrimSpace(*loop.MetadataJSON) == "" {
+		return ""
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	loopMeta, _ := metadata["loop"].(map[string]any)
+	if loopMeta == nil {
+		return ""
+	}
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
+	status, _ := loopMeta["status"].(string)
+	if status == "terminated" || status == "stopped" {
+		return status
+	}
+	return ""
+}
+
 func resetReviewerLoopRetryMetadata(current *string) (*string, error) {
 	if current == nil || strings.TrimSpace(*current) == "" {
 		return current, nil
@@ -4933,6 +4955,7 @@ func resetReviewerLoopRetryMetadata(current *string) (*string, error) {
 	if !ok || loopMeta == nil {
 		return current, nil
 	}
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	loopMeta["status"] = "queued"
 	metadata["loop"] = loopMeta
 	encoded, err := json.Marshal(metadata)
