@@ -6,7 +6,7 @@ This document contains the detailed install, upgrade, uninstall, and source-buil
 
 For the default supported install path:
 
-- macOS (`darwin-arm64`)
+- macOS (`darwin-arm64`) or Linux (`linux-amd64`)
 - `git`
 - `gh`
 
@@ -34,13 +34,13 @@ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode
 
 ### Install the CLI manually
 
-1. Download the matching `looper` release artifact for your macOS architecture from GitHub Releases.
+1. Download the matching `looper` release artifact for your platform from GitHub Releases.
 2. Rename it to `looper` if needed.
 3. Place it on your `PATH`, for example `/usr/local/bin/looper` or `~/.local/bin/looper`.
 
-GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64`.
+GitHub Releases publish standalone Go binaries for both `looper` and `looperd` on `darwin-arm64` and `linux-amd64`.
 
-Linux is not currently supported for the managed daemon flow.
+On Linux (`linux-amd64`) the daemon runs in `foreground` (detached) mode, which is the default. Supervised lifecycle management via `systemd` is planned but not yet implemented; `--daemon-mode launchd` remains macOS-only.
 
 ### Install the daemon manually
 
@@ -54,7 +54,7 @@ looper status
 
 This flow:
 
-- detects the current macOS architecture
+- detects the current platform architecture
 - downloads the matching GitHub Release artifact
 - installs it to `~/.looper/bin/looperd`
 
