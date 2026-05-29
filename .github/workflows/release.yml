@@ -310,6 +310,11 @@ jobs:
             goos: darwin
             goarch: arm64
             artifact-name: looper-darwin-arm64
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact-name: looper-linux-amd64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -388,12 +393,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Phase 1 intentionally publishes macOS artifacts only.
           - target: darwin-arm64
             runner: macos-14
             goos: darwin
             goarch: arm64
             artifact-name: looperd-darwin-arm64
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact-name: looperd-linux-amd64
     runs-on: ${{ matrix.runner }}
 
     steps:
