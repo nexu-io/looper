@@ -2859,7 +2859,7 @@ func buildVerifiedActiveAgentByRunID(ctx context.Context, runtime RuntimeState, 
 	if verifier == nil {
 		return map[string]*activeRunAgent{}
 	}
-	grouped := groupActiveExecutionsByRunID(executions, func(execution storage.AgentExecutionRecord) bool {
+	grouped := groupActiveExecutionsByRunID(executions, true, func(execution storage.AgentExecutionRecord) bool {
 		matches, running, err := verifier.ExecutionMatchesProcess(ctx, execution, int(*execution.PID))
 		return err == nil && running && matches
 	})
@@ -2867,18 +2867,18 @@ func buildVerifiedActiveAgentByRunID(ctx context.Context, runtime RuntimeState, 
 }
 
 func buildActiveAgentByRunID(executions []storage.AgentExecutionRecord) map[string]*activeRunAgent {
-	return buildActiveRunAgents(groupActiveExecutionsByRunID(executions, func(storage.AgentExecutionRecord) bool {
+	return buildActiveRunAgents(groupActiveExecutionsByRunID(executions, false, func(storage.AgentExecutionRecord) bool {
 		return true
 	}))
 }
 
-func groupActiveExecutionsByRunID(executions []storage.AgentExecutionRecord, include func(storage.AgentExecutionRecord) bool) map[string][]storage.AgentExecutionRecord {
+func groupActiveExecutionsByRunID(executions []storage.AgentExecutionRecord, requirePID bool, include func(storage.AgentExecutionRecord) bool) map[string][]storage.AgentExecutionRecord {
 	grouped := make(map[string][]storage.AgentExecutionRecord)
 	for _, execution := range executions {
 		if execution.RunID == nil || strings.TrimSpace(*execution.RunID) == "" {
 			continue
 		}
-		if execution.PID == nil || *execution.PID <= 0 {
+		if requirePID && (execution.PID == nil || *execution.PID <= 0) {
 			continue
 		}
 		if !include(execution) {

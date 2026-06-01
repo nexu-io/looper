@@ -5118,6 +5118,43 @@ func TestActiveRunsDefaultExcludesStaleRunningRunWithUnverifiedAgent(t *testing.
 	}
 }
 
+func TestActiveRunsFallbackIncludesAgentWithoutPID(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fallback_nil_pid", Seq: 22, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:186"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(186), Status: "running", LastRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fallback_nil_pid", LoopID: "loop_fallback_nil_pid", Status: "running", CurrentStep: stringPtr("review"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_exec_nil_pid", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_fallback_nil_pid"), RunID: stringPtr("run_fallback_nil_pid"), Vendor: "opencode", Status: "running", StartedAt: fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString), LastHeartbeatAt: stringPtr(nowISO), CreatedAt: fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString), UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	agent := items[0].(map[string]any)["agent"].(map[string]any)
+	assertEqual(t, agent["executionId"], "agent_exec_nil_pid")
+	assertEqual(t, agent["vendor"], "opencode")
+	assertEqual(t, agent["pid"], nil)
+	assertEqual(t, agent["activeCount"], float64(1))
+	assertEqual(t, agent["status"], "running")
+}
+
 func TestActiveRunsPrefersVerifiedAgentOverNewerFallback(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
