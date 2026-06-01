@@ -4777,7 +4777,12 @@ func TestHandlerActiveRunsSupportFiltersAgentsAndWorktrees(t *testing.T) {
 	assertEqual(t, first["type"], "worker")
 	target := first["target"].(map[string]any)
 	assertEqual(t, target["label"], "Looper")
-	assertEqual(t, first["agent"], nil)
+	agent := first["agent"].(map[string]any)
+	assertEqual(t, agent["executionId"], "agent_exec_worker_new")
+	assertEqual(t, agent["vendor"], "opencode")
+	assertEqual(t, agent["pid"], float64(22222))
+	assertEqual(t, agent["activeCount"], float64(2))
+	assertEqual(t, agent["status"], "running")
 
 	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active/1", nil)
 	detailRecorder := httptest.NewRecorder()
@@ -4790,6 +4795,18 @@ func TestHandlerActiveRunsSupportFiltersAgentsAndWorktrees(t *testing.T) {
 	worktree := detail["worktree"].(map[string]any)
 	assertEqual(t, worktree["path"], "/tmp/worktrees/loop-1")
 	assertEqual(t, worktree["branch"], "feature/loop-1")
+
+	workerDetailReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active/5", nil)
+	workerDetailRecorder := httptest.NewRecorder()
+	h.ServeHTTP(workerDetailRecorder, workerDetailReq)
+	if workerDetailRecorder.Code != http.StatusOK {
+		t.Fatalf("worker detail status = %d, want 200", workerDetailRecorder.Code)
+	}
+	workerDetailBody := parseJSONMap(t, workerDetailRecorder.Body.Bytes())
+	workerDetail := workerDetailBody["data"].(map[string]any)
+	detailAgent := workerDetail["agent"].(map[string]any)
+	assertEqual(t, detailAgent["executionId"], "agent_exec_worker_new")
+	assertEqual(t, detailAgent["pid"], float64(22222))
 
 	validationReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active?repo=acme/looper", nil)
 	validationRecorder := httptest.NewRecorder()
@@ -5067,6 +5084,82 @@ func TestActiveRunsDefaultExcludesPausedLoopWithStaleRunningRun(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatalf("len(items) = %d, want 0: %#v", len(items), items)
 	}
+}
+
+func TestActiveRunsDefaultExcludesStaleRunningRunWithUnverifiedAgent(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	oldHeartbeat := fixture.now.Add(-2 * time.Hour).UTC().Format(javaScriptISOString)
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stale_unverified_agent", Seq: 21, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:185"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(185), Status: "running", LastRunAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stale_unverified_agent", LoopID: "loop_stale_unverified_agent", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_exec_stale_unverified", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_stale_unverified_agent"), RunID: stringPtr("run_stale_unverified_agent"), Vendor: "opencode", Status: "running", PID: int64Ptr(54321), StartedAt: oldHeartbeat, LastHeartbeatAt: stringPtr(oldHeartbeat), CreatedAt: oldHeartbeat, UpdatedAt: oldHeartbeat}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 0 {
+		t.Fatalf("len(items) = %d, want 0: %#v", len(items), items)
+	}
+}
+
+func TestActiveRunsPrefersVerifiedAgentOverNewerFallback(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	runtimeWithVerifier := executionVerifierRuntime{
+		Runtime: fixture.runtime,
+		matchProcess: func(_ context.Context, execution storage.AgentExecutionRecord, _ int) (bool, bool, error) {
+			return execution.ID == "agent_exec_verified", true, nil
+		},
+	}
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_verified_preferred", Seq: 22, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:nexu-io/looper:186"), Repo: stringPtr("nexu-io/looper"), PRNumber: int64Ptr(186), Status: "running", LastRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_verified_preferred", LoopID: "loop_verified_preferred", Status: "running", CurrentStep: stringPtr("review"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_exec_verified", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_verified_preferred"), RunID: stringPtr("run_verified_preferred"), Vendor: "opencode", Status: "running", PID: int64Ptr(12345), StartedAt: fixture.now.Add(-time.Minute).UTC().Format(javaScriptISOString), LastHeartbeatAt: stringPtr(nowISO), CreatedAt: fixture.now.Add(-time.Minute).UTC().Format(javaScriptISOString), UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(verified) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "agent_exec_unverified_newer", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_verified_preferred"), RunID: stringPtr("run_verified_preferred"), Vendor: "opencode", Status: "running", PID: int64Ptr(67890), StartedAt: fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString), LastHeartbeatAt: stringPtr(nowISO), CreatedAt: fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString), UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(unverified) error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtimeWithVerifier, Now: func() time.Time { return fixture.now }})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	agent := items[0].(map[string]any)["agent"].(map[string]any)
+	assertEqual(t, agent["executionId"], "agent_exec_verified")
+	assertEqual(t, agent["pid"], float64(12345))
+	assertEqual(t, agent["activeCount"], float64(1))
 }
 
 func TestActiveRunsDedupesQueuedLoopWhenRunIsRunning(t *testing.T) {
@@ -5464,6 +5557,11 @@ type webhookForwardRuntime struct {
 	record func(string, string)
 }
 
+type executionVerifierRuntime struct {
+	*looperdruntime.Runtime
+	matchProcess func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
+}
+
 func (r webhookForwardRuntime) WebhookStatus() looperdruntime.WebhookStatus {
 	if r.status != nil {
 		return r.status()
@@ -5477,6 +5575,13 @@ func (r webhookForwardRuntime) RecordWebhookDelivery(eventType, deliveryID strin
 		return
 	}
 	r.Runtime.RecordWebhookDelivery(eventType, deliveryID)
+}
+
+func (r executionVerifierRuntime) ExecutionMatchesProcess(ctx context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
+	if r.matchProcess != nil {
+		return r.matchProcess(ctx, execution, pid)
+	}
+	return r.Runtime.ExecutionMatchesProcess(ctx, execution, pid)
 }
 
 func newTestFixture(t *testing.T) testFixture {
