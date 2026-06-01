@@ -15,6 +15,19 @@ Scheduler
   queuedItems  : 2
   runningItems : 1
 
+Agent
+  vendor                     : opencode
+  model                      : gpt-5.4
+  nativeResumeEnabled        : yes
+  plannerIdleTimeoutSeconds  : 600
+  plannerMaxRuntimeSeconds   : 3600
+  workerIdleTimeoutSeconds   : 900
+  workerMaxRuntimeSeconds    : 10800
+  reviewerIdleTimeoutSeconds : 600
+  reviewerMaxRuntimeSeconds  : 5400
+  fixerIdleTimeoutSeconds    : 600
+  fixerMaxRuntimeSeconds     : 7200
+
 Webhook
   enabled                     : no
   endpointUrl                 : -

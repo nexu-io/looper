@@ -783,6 +783,7 @@ type statusResponse struct {
 	Service         statusService       `json:"service"`
 	Storage         statusStorage       `json:"storage"`
 	Scheduler       statusScheduler     `json:"scheduler"`
+	Agent           statusAgent         `json:"agent"`
 	WorktreeCleanup any                 `json:"worktreeCleanup"`
 	Webhook         statusWebhook       `json:"webhook"`
 	Loops           statusLoops         `json:"loops"`
@@ -850,6 +851,25 @@ type statusScheduler struct {
 	FailedItems    int  `json:"failedItems"`
 	TotalRuns      int  `json:"totalRuns"`
 	ActiveRuns     int  `json:"activeRuns"`
+}
+
+type statusAgent struct {
+	Vendor              *config.AgentVendor `json:"vendor,omitempty"`
+	Model               *string             `json:"model,omitempty"`
+	NativeResumeEnabled bool                `json:"nativeResumeEnabled"`
+	Timeouts            statusAgentTimeouts `json:"timeouts"`
+}
+
+type statusAgentTimeouts struct {
+	Planner  statusAgentRoleTimeouts `json:"planner"`
+	Worker   statusAgentRoleTimeouts `json:"worker"`
+	Reviewer statusAgentRoleTimeouts `json:"reviewer"`
+	Fixer    statusAgentRoleTimeouts `json:"fixer"`
+}
+
+type statusAgentRoleTimeouts struct {
+	IdleTimeoutSeconds int `json:"idleTimeoutSeconds"`
+	MaxRuntimeSeconds  int `json:"maxRuntimeSeconds"`
 }
 
 type statusWebhook struct {
@@ -1075,6 +1095,17 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			FailedItems:    queueCounts["failed"],
 			TotalRuns:      len(runs),
 			ActiveRuns:     runCounts["running"],
+		},
+		Agent: statusAgent{
+			Vendor:              h.context.Config.Agent.Vendor,
+			Model:               h.context.Config.Agent.Model,
+			NativeResumeEnabled: h.context.Config.Agent.NativeResume.Enabled,
+			Timeouts: statusAgentTimeouts{
+				Planner:  statusAgentRoleTimeouts{IdleTimeoutSeconds: h.context.Config.Agent.Timeouts.PlannerIdleTimeoutSeconds, MaxRuntimeSeconds: h.context.Config.Agent.Timeouts.PlannerMaxRuntimeSeconds},
+				Worker:   statusAgentRoleTimeouts{IdleTimeoutSeconds: h.context.Config.Agent.Timeouts.WorkerIdleTimeoutSeconds, MaxRuntimeSeconds: h.context.Config.Agent.Timeouts.WorkerMaxRuntimeSeconds},
+				Reviewer: statusAgentRoleTimeouts{IdleTimeoutSeconds: h.context.Config.Agent.Timeouts.ReviewerIdleTimeoutSeconds, MaxRuntimeSeconds: h.context.Config.Agent.Timeouts.ReviewerMaxRuntimeSeconds},
+				Fixer:    statusAgentRoleTimeouts{IdleTimeoutSeconds: h.context.Config.Agent.Timeouts.FixerIdleTimeoutSeconds, MaxRuntimeSeconds: h.context.Config.Agent.Timeouts.FixerMaxRuntimeSeconds},
+			},
 		},
 		WorktreeCleanup: h.buildWorktreeCleanupStatusResponse(),
 		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),

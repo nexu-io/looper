@@ -58,6 +58,7 @@ func TestCLIGoldenOutputs(t *testing.T) {
 						"service":   map[string]any{"healthy": true, "version": "1.2.3", "daemonMode": "full", "startedAt": "2026-04-20T10:00:00.000Z"},
 						"storage":   map[string]any{"dbPath": "/tmp/looper.sqlite", "schemaVersion": "12", "healthy": true, "pendingMigrations": []string{}},
 						"scheduler": map[string]any{"healthy": true, "queuedItems": 2, "runningItems": 1},
+						"agent":     map[string]any{"vendor": "opencode", "model": "gpt-5.4", "nativeResumeEnabled": true, "timeouts": map[string]any{"planner": map[string]any{"idleTimeoutSeconds": 600, "maxRuntimeSeconds": 3600}, "worker": map[string]any{"idleTimeoutSeconds": 900, "maxRuntimeSeconds": 10800}, "reviewer": map[string]any{"idleTimeoutSeconds": 600, "maxRuntimeSeconds": 5400}, "fixer": map[string]any{"idleTimeoutSeconds": 600, "maxRuntimeSeconds": 7200}}},
 						"loops": map[string]any{
 							"planner":  map[string]any{"queued": 0, "running": 0, "waiting": 0, "paused": 1, "failed": 0, "terminated": 0, "stopped": 0},
 							"reviewer": map[string]any{"queued": 1, "running": 1, "waiting": 1, "paused": 0, "failed": 0, "terminated": 0, "stopped": 0},

@@ -92,6 +92,28 @@
             "totalRuns": 1,
             "activeRuns": 1
           },
+          "agent": {
+            "vendor": "opencode",
+            "nativeResumeEnabled": true,
+            "timeouts": {
+              "planner": {
+                "idleTimeoutSeconds": 600,
+                "maxRuntimeSeconds": 3600
+              },
+              "worker": {
+                "idleTimeoutSeconds": 900,
+                "maxRuntimeSeconds": 10800
+              },
+              "reviewer": {
+                "idleTimeoutSeconds": 600,
+                "maxRuntimeSeconds": 5400
+              },
+              "fixer": {
+                "idleTimeoutSeconds": 600,
+                "maxRuntimeSeconds": 7200
+              }
+            }
+          },
           "worktreeCleanup": {
             "enabled": true,
             "dryRun": false,

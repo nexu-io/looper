@@ -416,6 +416,10 @@ func TestIsTerminalReviewerLoopRecordTreatsFailedAsTerminal(t *testing.T) {
 
 func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
+	vendor := config.AgentVendorOpenCode
+	model := "gpt-5.4"
+	cfg.Agent.Vendor = &vendor
+	cfg.Agent.Model = &model
 	seedStatusData(t, rt)
 	seedStatusLoopCounts(t, rt)
 
@@ -437,6 +441,7 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	binaryInfo := service["binary"].(map[string]any)
 	storageInfo := data["storage"].(map[string]any)
 	scheduler := data["scheduler"].(map[string]any)
+	agentInfo := data["agent"].(map[string]any)
 	loops := data["loops"].(map[string]any)
 
 	assertEqual(t, service["healthy"], true)
@@ -446,6 +451,12 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 		t.Fatalf("service.binary.path missing/invalid: %#v", binaryInfo["path"])
 	}
 	assertEqual(t, storageInfo["healthy"], true)
+	assertEqual(t, agentInfo["vendor"], string(vendor))
+	assertEqual(t, agentInfo["model"], model)
+	assertEqual(t, agentInfo["nativeResumeEnabled"], true)
+	plannerTimeouts := agentInfo["timeouts"].(map[string]any)["planner"].(map[string]any)
+	assertEqual(t, plannerTimeouts["idleTimeoutSeconds"], float64(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds))
+	assertEqual(t, plannerTimeouts["maxRuntimeSeconds"], float64(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds))
 	queuedItems, queuedOK := scheduler["queuedItems"].(float64)
 	runningItems, runningOK := scheduler["runningItems"].(float64)
 	if !queuedOK || !runningOK {
