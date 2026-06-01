@@ -1368,6 +1368,47 @@ func TestStatusWithoutJSONPrintsHumanReadableSections(t *testing.T) {
 	}
 }
 
+func TestStatusWithoutJSONOmitsAgentSectionWhenStatusPayloadHasNoAgent(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/status" {
+			t.Fatalf("request path = %q, want %q", r.URL.Path, "/api/v1/status")
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_status", map[string]any{
+			"service":   map[string]any{"healthy": true, "version": "1.2.3", "daemonMode": "full", "startedAt": "2026-04-20T10:00:00.000Z"},
+			"storage":   map[string]any{"dbPath": "/tmp/looper.sqlite", "schemaVersion": "12", "healthy": true, "pendingMigrations": []string{}},
+			"scheduler": map[string]any{"healthy": true, "queuedItems": 2, "runningItems": 1},
+			"loops": map[string]any{
+				"planner":  map[string]any{"running": 0, "paused": 1, "failed": 0},
+				"reviewer": map[string]any{"running": 1, "paused": 0, "failed": 0},
+				"worker":   map[string]any{"running": 2, "paused": 0, "failed": 1},
+				"fixer":    map[string]any{"running": 0, "paused": 0, "failed": 0},
+			},
+			"tools":         map[string]any{"git": true, "gh": false, "osascript": true},
+			"notifications": map[string]any{"inAppEnabled": true, "osascriptEnabled": false},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "status", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([status]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([status]) stderr = %q, want empty string", stderr)
+	}
+	if strings.Contains(stdout, "Agent\n") {
+		t.Fatalf("Run([status]) stdout = %q, want Agent section omitted", stdout)
+	}
+	for _, want := range []string{"Service", "Storage", "Scheduler", "Webhook", "Tools", "Notifications"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([status]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestConfigShowWithoutJSONPrintsJSON(t *testing.T) {
 	t.Parallel()
 

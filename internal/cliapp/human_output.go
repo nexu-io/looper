@@ -28,17 +28,7 @@ type statusOutput struct {
 		QueuedItems  int  `json:"queuedItems"`
 		RunningItems int  `json:"runningItems"`
 	} `json:"scheduler"`
-	Agent struct {
-		Vendor              *string `json:"vendor"`
-		Model               *string `json:"model"`
-		NativeResumeEnabled bool    `json:"nativeResumeEnabled"`
-		Timeouts            struct {
-			Planner  statusAgentRoleTimeoutOutput `json:"planner"`
-			Worker   statusAgentRoleTimeoutOutput `json:"worker"`
-			Reviewer statusAgentRoleTimeoutOutput `json:"reviewer"`
-			Fixer    statusAgentRoleTimeoutOutput `json:"fixer"`
-		} `json:"timeouts"`
-	} `json:"agent"`
+	Agent   *statusAgentOutput `json:"agent"`
 	Webhook struct {
 		Enabled                     bool     `json:"enabled"`
 		EndpointURL                 string   `json:"endpointUrl"`
@@ -63,6 +53,18 @@ type statusOutput struct {
 		GH        bool `json:"gh"`
 		Osascript bool `json:"osascript"`
 	} `json:"tools"`
+}
+
+type statusAgentOutput struct {
+	Vendor              *string `json:"vendor"`
+	Model               *string `json:"model"`
+	NativeResumeEnabled bool    `json:"nativeResumeEnabled"`
+	Timeouts            struct {
+		Planner  statusAgentRoleTimeoutOutput `json:"planner"`
+		Worker   statusAgentRoleTimeoutOutput `json:"worker"`
+		Reviewer statusAgentRoleTimeoutOutput `json:"reviewer"`
+		Fixer    statusAgentRoleTimeoutOutput `json:"fixer"`
+	} `json:"timeouts"`
 }
 
 type statusLoopSummary struct {
@@ -299,8 +301,10 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	printSection(w, "Storage", [][2]any{{"dbPath", data.Storage.DBPath}, {"schemaVersion", data.Storage.SchemaVersion}, {"healthy", data.Storage.Healthy}, {"pendingMigrations", joinOrNone(data.Storage.PendingMigrations)}})
 	fmt.Fprintln(w)
 	printSection(w, "Scheduler", [][2]any{{"healthy", data.Scheduler.Healthy}, {"queuedItems", data.Scheduler.QueuedItems}, {"runningItems", data.Scheduler.RunningItems}})
-	fmt.Fprintln(w)
-	printSection(w, "Agent", [][2]any{{"vendor", data.Agent.Vendor}, {"model", data.Agent.Model}, {"nativeResumeEnabled", data.Agent.NativeResumeEnabled}, {"plannerIdleTimeoutSeconds", data.Agent.Timeouts.Planner.IdleTimeoutSeconds}, {"plannerMaxRuntimeSeconds", data.Agent.Timeouts.Planner.MaxRuntimeSeconds}, {"workerIdleTimeoutSeconds", data.Agent.Timeouts.Worker.IdleTimeoutSeconds}, {"workerMaxRuntimeSeconds", data.Agent.Timeouts.Worker.MaxRuntimeSeconds}, {"reviewerIdleTimeoutSeconds", data.Agent.Timeouts.Reviewer.IdleTimeoutSeconds}, {"reviewerMaxRuntimeSeconds", data.Agent.Timeouts.Reviewer.MaxRuntimeSeconds}, {"fixerIdleTimeoutSeconds", data.Agent.Timeouts.Fixer.IdleTimeoutSeconds}, {"fixerMaxRuntimeSeconds", data.Agent.Timeouts.Fixer.MaxRuntimeSeconds}})
+	if data.Agent != nil {
+		fmt.Fprintln(w)
+		printSection(w, "Agent", [][2]any{{"vendor", data.Agent.Vendor}, {"model", data.Agent.Model}, {"nativeResumeEnabled", data.Agent.NativeResumeEnabled}, {"plannerIdleTimeoutSeconds", data.Agent.Timeouts.Planner.IdleTimeoutSeconds}, {"plannerMaxRuntimeSeconds", data.Agent.Timeouts.Planner.MaxRuntimeSeconds}, {"workerIdleTimeoutSeconds", data.Agent.Timeouts.Worker.IdleTimeoutSeconds}, {"workerMaxRuntimeSeconds", data.Agent.Timeouts.Worker.MaxRuntimeSeconds}, {"reviewerIdleTimeoutSeconds", data.Agent.Timeouts.Reviewer.IdleTimeoutSeconds}, {"reviewerMaxRuntimeSeconds", data.Agent.Timeouts.Reviewer.MaxRuntimeSeconds}, {"fixerIdleTimeoutSeconds", data.Agent.Timeouts.Fixer.IdleTimeoutSeconds}, {"fixerMaxRuntimeSeconds", data.Agent.Timeouts.Fixer.MaxRuntimeSeconds}})
+	}
 	fmt.Fprintln(w)
 	printSection(w, "Webhook", [][2]any{{"enabled", data.Webhook.Enabled}, {"endpointUrl", data.Webhook.EndpointURL}, {"fallbackPollIntervalSeconds", data.Webhook.FallbackPollIntervalSeconds}, {"degraded", data.Webhook.Degraded}, {"configuredForwarders", data.Webhook.ConfiguredForwarders}, {"runningForwarders", data.Webhook.RunningForwarders}, {"degradedReasons", joinOrNone(data.Webhook.DegradedReasons)}})
 	fmt.Fprintln(w)
