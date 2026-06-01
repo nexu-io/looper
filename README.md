@@ -52,7 +52,7 @@ It contains a one-shot, step-by-step flow (preflight → install → bootstrap �
 
 ### For humans
 
-Fast path (macOS, `darwin-arm64`):
+Fast path (macOS `darwin-arm64` or Linux `linux-amd64`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nexu-io/looper/main/scripts/install.sh | sh

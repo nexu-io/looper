@@ -310,6 +310,11 @@ jobs:
             goos: darwin
             goarch: arm64
             artifact-name: looper-darwin-arm64
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact-name: looper-linux-amd64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -388,12 +393,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Phase 1 intentionally publishes macOS artifacts only.
           - target: darwin-arm64
             runner: macos-14
             goos: darwin
             goarch: arm64
             artifact-name: looperd-darwin-arm64
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact-name: looperd-linux-amd64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -555,17 +564,18 @@ jobs:
           test -f release-assets/looper-darwin-arm64.sha256
           test -f release-assets/looper-darwin-arm64.tar.gz
           test -f release-assets/looper-darwin-arm64.tar.gz.sha256
+          test -f release-assets/looper-linux-amd64
+          test -f release-assets/looper-linux-amd64.sha256
+          test -f release-assets/looper-linux-amd64.tar.gz
+          test -f release-assets/looper-linux-amd64.tar.gz.sha256
           test -f release-assets/looperd-darwin-arm64
           test -f release-assets/looperd-darwin-arm64.sha256
           test -f release-assets/looperd-darwin-arm64.tar.gz
           test -f release-assets/looperd-darwin-arm64.tar.gz.sha256
-
-      - name: Verify Linux artifacts are not published in Phase 1
-        run: |
-          if find release-assets -maxdepth 1 \( -name '*linux*' -o -name '*.AppImage' \) | grep -q .; then
-            echo "Phase 1 release workflow must not publish Linux artifacts." >&2
-            exit 1
-          fi
+          test -f release-assets/looperd-linux-amd64
+          test -f release-assets/looperd-linux-amd64.sha256
+          test -f release-assets/looperd-linux-amd64.tar.gz
+          test -f release-assets/looperd-linux-amd64.tar.gz.sha256
 
       - name: Generate release manifest
         run: |
@@ -578,7 +588,7 @@ jobs:
             -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
             -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
-            -required-assets "looper-darwin-arm64,looper-darwin-arm64.tar.gz,looperd-darwin-arm64,looperd-darwin-arm64.tar.gz" \
+            -required-assets "looper-darwin-arm64,looper-darwin-arm64.tar.gz,looper-linux-amd64,looper-linux-amd64.tar.gz,looperd-darwin-arm64,looperd-darwin-arm64.tar.gz,looperd-linux-amd64,looperd-linux-amd64.tar.gz" \
             -output release-assets/manifest.json
 
       - name: Validate release manifest fields
@@ -607,8 +617,12 @@ jobs:
           required = {
               "looper-darwin-arm64",
               "looper-darwin-arm64.tar.gz",
+              "looper-linux-amd64",
+              "looper-linux-amd64.tar.gz",
               "looperd-darwin-arm64",
               "looperd-darwin-arm64.tar.gz",
+              "looperd-linux-amd64",
+              "looperd-linux-amd64.tar.gz",
           }
           assert required.issubset(set(m["artifacts"].keys())), "manifest missing artifacts"
           for name in required:
@@ -628,10 +642,18 @@ jobs:
             release-assets/looper-darwin-arm64.sha256 \
             release-assets/looper-darwin-arm64.tar.gz \
             release-assets/looper-darwin-arm64.tar.gz.sha256 \
+            release-assets/looper-linux-amd64 \
+            release-assets/looper-linux-amd64.sha256 \
+            release-assets/looper-linux-amd64.tar.gz \
+            release-assets/looper-linux-amd64.tar.gz.sha256 \
             release-assets/looperd-darwin-arm64 \
             release-assets/looperd-darwin-arm64.sha256 \
             release-assets/looperd-darwin-arm64.tar.gz \
             release-assets/looperd-darwin-arm64.tar.gz.sha256 \
+            release-assets/looperd-linux-amd64 \
+            release-assets/looperd-linux-amd64.sha256 \
+            release-assets/looperd-linux-amd64.tar.gz \
+            release-assets/looperd-linux-amd64.tar.gz.sha256 \
             release-assets/manifest.json \
             --clobber
 

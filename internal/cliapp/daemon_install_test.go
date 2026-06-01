@@ -25,9 +25,12 @@ func TestResolveLooperdTarget(t *testing.T) {
 		t.Fatalf("resolveLooperdTarget(darwin, arm64) = %q, want %q", target, "darwin-arm64")
 	}
 
-	_, err = resolveLooperdTarget("linux", "amd64")
-	if err == nil || err.Error() != "Unsupported platform/arch for looperd install: linux-amd64. Supported targets: darwin-arm64" {
+	target, err = resolveLooperdTarget("linux", "amd64")
+	if err != nil {
 		t.Fatalf("resolveLooperdTarget(linux, amd64) error = %v", err)
+	}
+	if target != "linux-amd64" {
+		t.Fatalf("resolveLooperdTarget(linux, amd64) = %q, want %q", target, "linux-amd64")
 	}
 
 	for _, arch := range []string{"amd64", "x64"} {

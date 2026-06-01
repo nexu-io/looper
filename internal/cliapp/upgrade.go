@@ -1401,11 +1401,14 @@ func detectCLIInstallSourceForChannel(execPath, channel string) cliInstallSource
 	if strings.HasSuffix(path, "/.local/bin/looper") || strings.HasSuffix(path, "/usr/local/bin/looper") || strings.HasSuffix(path, "/.looper/bin/looper") {
 		return cliInstallSourceRelease
 	}
-	if strings.Contains(path, "/go/bin/") || strings.Contains(path, "/go-build/") || strings.Contains(path, "/tmp/") {
+	if strings.Contains(path, "/go/bin/") || strings.Contains(path, "/go-build/") {
 		return cliInstallSourceDev
 	}
 	if isInstallerSelectedUserBinPath(execPath) {
 		return cliInstallSourceRelease
+	}
+	if strings.Contains(path, "/tmp/") {
+		return cliInstallSourceDev
 	}
 	return cliInstallSourceUnknown
 }
@@ -1501,7 +1504,10 @@ func resolveLooperTarget(platform string, arch string) (string, error) {
 	if platform == "darwin" && arch == "arm64" {
 		return "darwin-arm64", nil
 	}
-	return "", fmt.Errorf("unsupported platform/arch for looper upgrade: %s-%s. Supported targets: darwin-arm64", platform, arch)
+	if platform == "linux" && arch == "amd64" {
+		return "linux-amd64", nil
+	}
+	return "", fmt.Errorf("unsupported platform/arch for looper upgrade: %s-%s. Supported targets: darwin-arm64, linux-amd64", platform, arch)
 }
 
 func replaceBinaryAtomically(installPath string, binaryBytes []byte) error {

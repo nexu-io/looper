@@ -23,11 +23,20 @@ detect_target() {
   os="$(uname -s)"
   arch="$(uname -m)"
 
-  [ "$os" = "Darwin" ] || fail "unsupported platform: $os (supported: macOS)"
-
-  case "$arch" in
-    arm64|aarch64) printf 'darwin-arm64\n' ;;
-    *) fail "unsupported architecture: $arch (supported: arm64)" ;;
+  case "$os" in
+    Darwin)
+      case "$arch" in
+        arm64|aarch64) printf 'darwin-arm64\n' ;;
+        *) fail "unsupported architecture for macOS: $arch (supported: arm64)" ;;
+      esac
+      ;;
+    Linux)
+      case "$arch" in
+        x86_64|amd64) printf 'linux-amd64\n' ;;
+        *) fail "unsupported architecture for Linux: $arch (supported: x86_64)" ;;
+      esac
+      ;;
+    *) fail "unsupported platform: $os (supported: macOS, Linux)" ;;
   esac
 }
 

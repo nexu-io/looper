@@ -272,8 +272,11 @@ func resolveLooperdTarget(platform string, arch string) (string, error) {
 	if platform == "darwin" && arch == "arm64" {
 		return "darwin-arm64", nil
 	}
+	if platform == "linux" && arch == "amd64" {
+		return "linux-amd64", nil
+	}
 
-	return "", fmt.Errorf("Unsupported platform/arch for looperd install: %s-%s. Supported targets: darwin-arm64", platform, arch)
+	return "", fmt.Errorf("Unsupported platform/arch for looperd install: %s-%s. Supported targets: darwin-arm64, linux-amd64", platform, arch)
 }
 
 func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
