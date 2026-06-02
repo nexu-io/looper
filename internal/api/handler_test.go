@@ -5488,6 +5488,67 @@ func TestActiveRunsStatusAndTypeFiltersIncludeInactiveCompletedWorkerLoops(t *te
 	assertEqual(t, filteredItem["agent"], nil)
 }
 
+func TestActiveRunsIgnoresStaleManualInterventionQueueHistory(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	manualAt := fixture.now.Add(-2 * time.Minute).UTC().Format(javaScriptISOString)
+	completedAt := fixture.now.Add(-time.Minute).UTC().Format(javaScriptISOString)
+	projectID := "project_1"
+	loopID := "loop_worker_completed_after_manual"
+	targetID := "issue:acme/looper:45"
+	manualReason := "needs manual intervention"
+	manualKind := "manual_intervention"
+
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:        projectID,
+		Name:      "Looper",
+		RepoPath:  "/tmp/repos/looper",
+		Archived:  false,
+		CreatedAt: nowISO,
+		UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         loopID,
+		Seq:        15,
+		ProjectID:  projectID,
+		Type:       "worker",
+		TargetType: "issue",
+		TargetID:   stringPtr(targetID),
+		Repo:       stringPtr("acme/looper"),
+		Status:     "completed",
+		LastRunAt:  stringPtr(completedAt),
+		CreatedAt:  nowISO,
+		UpdatedAt:  completedAt,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "queue_manual", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:manual", Priority: storage.QueuePriorityWorker, Status: "manual_intervention", AvailableAt: manualAt, Attempts: 1, MaxAttempts: 3, LastError: &manualReason, LastErrorKind: &manualKind, CreatedAt: manualAt, UpdatedAt: manualAt},
+		{ID: "queue_completed", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:completed", Priority: storage.QueuePriorityWorker, Status: "completed", AvailableAt: completedAt, Attempts: 1, MaxAttempts: 3, FinishedAt: &completedAt, CreatedAt: completedAt, UpdatedAt: completedAt},
+	} {
+		if err := fixture.runtime.Services().Repositories.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 0 {
+		t.Fatalf("len(items) = %d, want 0", len(items))
+	}
+}
+
 func TestActiveRunsAllIncludesInactiveCompletedLoopWithLatestRunFields(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

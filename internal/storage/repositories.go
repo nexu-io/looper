@@ -1613,6 +1613,41 @@ func (r *QueueRepository) ListByStatuses(ctx context.Context, statuses []string)
 	return scanQueueItems(rows)
 }
 
+func (r *QueueRepository) ListLatestByLoopStatuses(ctx context.Context, statuses []string) ([]QueueItemRecord, error) {
+	if len(statuses) == 0 {
+		return []QueueItemRecord{}, nil
+	}
+	args := make([]any, 0, len(statuses))
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT
+			id, project_id, loop_id, type, target_type, target_id, repo, pr_number, dedupe_key,
+			priority, status, available_at, attempts, max_attempts, claimed_by, claimed_at,
+			started_at, finished_at, lock_key, payload_json, last_error, last_error_kind,
+			created_at, updated_at
+		FROM (
+			SELECT
+				queue_items.*,
+				ROW_NUMBER() OVER (
+					PARTITION BY loop_id
+					ORDER BY updated_at DESC, created_at DESC, id DESC
+				) AS row_num
+			FROM queue_items
+			WHERE loop_id IS NOT NULL AND TRIM(loop_id) != ''
+		)
+		WHERE row_num = 1 AND status IN (`+sqlPlaceholders(len(statuses))+`)
+		ORDER BY created_at DESC, id DESC
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list latest queue items by loop statuses: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
 func (r *QueueRepository) CountByAllStatuses(ctx context.Context) (map[string]int64, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT status, COUNT(*) FROM queue_items GROUP BY status`)
 	if err != nil {

@@ -2621,7 +2621,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	} else {
-		queueItems, err = services.Repositories.Queue.ListByStatuses(ctx, []string{"queued", "running", "manual_intervention"})
+		queueItems, err = services.Repositories.Queue.ListLatestByLoopStatuses(ctx, []string{"queued", "running", "manual_intervention"})
 		if err != nil {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}

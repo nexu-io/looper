@@ -1599,6 +1599,7 @@ func TestTargetedListRepositories(t *testing.T) {
 	for _, item := range []QueueItemRecord{
 		{ID: "queue_queued", ProjectID: &projectID, LoopID: &loopQueued, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "queued", Priority: QueuePriorityWorker, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
 		{ID: "queue_manual", ProjectID: &projectID, LoopID: &loopManual, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "manual", Priority: QueuePriorityWorker, Status: "manual_intervention", AvailableAt: now, Attempts: 1, MaxAttempts: 3, LastErrorKind: &manualKind, CreatedAt: later, UpdatedAt: later},
+		{ID: "queue_done_manual_old", ProjectID: &projectID, LoopID: &loopDone, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "done_manual_old", Priority: QueuePriorityWorker, Status: "manual_intervention", AvailableAt: now, Attempts: 1, MaxAttempts: 3, LastErrorKind: &manualKind, CreatedAt: now, UpdatedAt: now},
 		{ID: "queue_done", ProjectID: &projectID, LoopID: &loopDone, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "done", Priority: QueuePriorityWorker, Status: "completed", AvailableAt: now, Attempts: 1, MaxAttempts: 3, CreatedAt: later, UpdatedAt: later},
 	} {
 		if err := repos.Queue.Upsert(ctx, item); err != nil {
@@ -1627,8 +1628,21 @@ func TestTargetedListRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.ListByStatuses() error = %v", err)
 	}
-	if len(queueByStatus) != 2 {
-		t.Fatalf("len(Queue.ListByStatuses()) = %d, want 2", len(queueByStatus))
+	if len(queueByStatus) != 3 {
+		t.Fatalf("len(Queue.ListByStatuses()) = %d, want 3", len(queueByStatus))
+	}
+
+	latestQueueByStatus, err := repos.Queue.ListLatestByLoopStatuses(ctx, []string{"queued", "manual_intervention"})
+	if err != nil {
+		t.Fatalf("Queue.ListLatestByLoopStatuses() error = %v", err)
+	}
+	if len(latestQueueByStatus) != 2 {
+		t.Fatalf("len(Queue.ListLatestByLoopStatuses()) = %d, want 2", len(latestQueueByStatus))
+	}
+	latestQueueIDs := []string{latestQueueByStatus[0].ID, latestQueueByStatus[1].ID}
+	sort.Strings(latestQueueIDs)
+	if want := []string{"queue_manual", "queue_queued"}; !reflect.DeepEqual(latestQueueIDs, want) {
+		t.Fatalf("Queue.ListLatestByLoopStatuses() ids = %#v, want %#v", latestQueueIDs, want)
 	}
 
 	latestRuns, err := repos.Runs.ListLatestByLoopIDs(ctx, []string{loopManual, loopDone})
