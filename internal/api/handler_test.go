@@ -1201,6 +1201,18 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 	}
 }
 
+func TestLooperdArtifactNameSupportsLinuxAMD64(t *testing.T) {
+	t.Parallel()
+
+	got := looperdArtifactName("linux-amd64")
+	if got == nil {
+		t.Fatal("looperdArtifactName(linux-amd64) = nil, want non-nil")
+	}
+	if *got != "looperd-linux-amd64" {
+		t.Fatalf("looperdArtifactName(linux-amd64) = %q, want %q", *got, "looperd-linux-amd64")
+	}
+}
+
 func TestHandlerEventAndPullRequestRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 	fixture := newTestFixture(t)
