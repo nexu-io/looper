@@ -11,11 +11,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
 )
+
+const daemonVersionProbeTimeout = 250 * time.Millisecond
 
 type commandRuntime struct {
 	app                *App
@@ -81,7 +84,19 @@ type daemonVersionPayload struct {
 func (r *commandRuntime) bestEffortDaemonVersion(ctx context.Context) *daemonVersionPayload {
 	if loaded, err := r.loadConfig(); err == nil {
 		client := r.apiClientFromLoaded(loaded)
-		if payload, err := r.getJSONWithClient(ctx, client, "/api/v1/status"); err == nil {
+		if payload, err := r.getJSONWithClient(ctx, client, "/api/v1/version"); err == nil {
+			if state := extractDaemonVersionEndpointState(payload); state != nil && strings.TrimSpace(state.Version) != "" {
+				return &daemonVersionPayload{
+					Version:    state.Version,
+					Source:     state.Source,
+					BinaryPath: state.BinaryPath,
+				}
+			}
+		}
+
+		statusProbeCtx, cancel := context.WithTimeout(ctx, daemonVersionProbeTimeout)
+		if payload, err := r.getJSONWithClient(statusProbeCtx, client, "/api/v1/status"); err == nil {
+			cancel()
 			if state, err := r.detectDaemonVersionState(ctx, payload); err == nil && state != nil && strings.TrimSpace(state.Version) != "" {
 				return &daemonVersionPayload{
 					Version:    state.Version,
@@ -90,6 +105,7 @@ func (r *commandRuntime) bestEffortDaemonVersion(ctx context.Context) *daemonVer
 				}
 			}
 		}
+		cancel()
 	}
 
 	state, err := r.readManagedDaemonVersion(ctx)
@@ -104,6 +120,33 @@ func (r *commandRuntime) bestEffortDaemonVersion(ctx context.Context) *daemonVer
 		Source:     state.Source,
 		BinaryPath: state.BinaryPath,
 	}
+}
+func extractDaemonVersionEndpointState(payload json.RawMessage) *daemonVersionState {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	var decoded struct {
+		Version string `json:"version"`
+		Binary  struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		} `json:"binary"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return nil
+	}
+
+	versionText := strings.TrimSpace(decoded.Version)
+	if versionText == "" {
+		return nil
+	}
+
+	state := &daemonVersionState{Version: versionText, Source: "api"}
+	if path := strings.TrimSpace(decoded.Binary.Path); path != "" {
+		state.BinaryPath = stringPtr(path)
+	}
+	return state
 }
 
 func (r *commandRuntime) projectList(cmd *cobra.Command, args []string) error {

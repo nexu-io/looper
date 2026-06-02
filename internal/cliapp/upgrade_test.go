@@ -14,12 +14,14 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/version"
 )
 
 func allowVersionStatusProbeOnly(t *testing.T) *http.Client {
 	t.Helper()
 	return newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path == "/api/v1/status" {
+		if req.URL.Path == "/api/v1/status" || req.URL.Path == "/api/v1/version" {
 			return nil, os.ErrNotExist
 		}
 		t.Fatalf("unexpected auto-upgrade request to %q", req.URL.String())
@@ -819,10 +821,12 @@ func TestAutoUpgradeReadyNoticePrintsRestartCommand(t *testing.T) {
 		CLIChannel:     cliInstallChannelStable,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
+			case "http://127.0.0.1:4321/api/v1/version":
+				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_version","data":{"version":"0.2.0","build":{"apiVersion":%q},"binary":{"name":"looperd","path":%q}}}`, version.Current().Metadata.APIVersion, managedPath)), nil
 			case "http://127.0.0.1:4321/api/v1/status":
 				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"requestId":"req_status","data":{"service":{"version":"0.2.0","binary":{"name":"looperd","path":%q}}}}`, managedPath)), nil
 			default:
-				if req.URL.Path == "/api/v1/status" {
+				if req.URL.Path == "/api/v1/status" || req.URL.Path == "/api/v1/version" {
 					return nil, os.ErrNotExist
 				}
 				t.Fatalf("unexpected request URL %q", req.URL.String())

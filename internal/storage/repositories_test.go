@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -297,6 +299,95 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 	if worktree.BaseBranch == nil || *worktree.BaseBranch != mainBranch {
 		t.Fatalf("Worktrees.GetByBranch().BaseBranch = %#v, want %q", worktree.BaseBranch, mainBranch)
+	}
+}
+
+func TestRepositoriesStatusAggregates(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", Archived: false, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	for _, loop := range []LoopRecord{
+		{ID: "loop_reviewer_running", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Status: "running", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_reviewer_waiting", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Status: "waiting", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_worker_failed", Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "project", Status: "failed", CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	largeCheckpoint := make([]byte, 64*1024)
+	for i := range largeCheckpoint {
+		largeCheckpoint[i] = 'x'
+	}
+	checkpointJSON := string(largeCheckpoint)
+	for _, run := range []RunRecord{
+		{ID: "run_running", LoopID: "loop_reviewer_running", Status: "running", CheckpointJSON: &checkpointJSON, StartedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "run_failed", LoopID: "loop_worker_failed", Status: "failed", CheckpointJSON: &checkpointJSON, StartedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "run_completed", LoopID: "loop_reviewer_waiting", Status: "completed", CheckpointJSON: &checkpointJSON, StartedAt: now, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+
+	for _, item := range []QueueItemRecord{
+		{ID: "queue_queued", Type: "reviewer", TargetType: "pull_request", TargetID: "pr:1", DedupeKey: "reviewer:1", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_running", Type: "worker", TargetType: "project", TargetID: "project:1", DedupeKey: "worker:1", Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_failed", Type: "fixer", TargetType: "project", TargetID: "project:2", DedupeKey: "fixer:2", Priority: 1, Status: "failed", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	loopCounts, err := repos.Loops.CountByTypeAndStatus(ctx)
+	if err != nil {
+		t.Fatalf("Loops.CountByTypeAndStatus() error = %v", err)
+	}
+	if got := loopCounts["reviewer"]["running"]; got != 1 {
+		t.Fatalf("reviewer/running loop count = %d, want 1", got)
+	}
+	if got := loopCounts["reviewer"]["waiting"]; got != 1 {
+		t.Fatalf("reviewer/waiting loop count = %d, want 1", got)
+	}
+	if got := loopCounts["worker"]["failed"]; got != 1 {
+		t.Fatalf("worker/failed loop count = %d, want 1", got)
+	}
+
+	runCounts, err := repos.Runs.CountByStatus(ctx)
+	if err != nil {
+		t.Fatalf("Runs.CountByStatus() error = %v", err)
+	}
+	if got := runCounts["running"]; got != 1 {
+		t.Fatalf("running run count = %d, want 1", got)
+	}
+	if got := runCounts["failed"]; got != 1 {
+		t.Fatalf("failed run count = %d, want 1", got)
+	}
+	if got := runCounts["completed"]; got != 1 {
+		t.Fatalf("completed run count = %d, want 1", got)
+	}
+
+	queueCounts, err := repos.Queue.CountByAllStatuses(ctx)
+	if err != nil {
+		t.Fatalf("Queue.CountByAllStatuses() error = %v", err)
+	}
+	if got := queueCounts["queued"]; got != 1 {
+		t.Fatalf("queued queue count = %d, want 1", got)
+	}
+	if got := queueCounts["running"]; got != 1 {
+		t.Fatalf("running queue count = %d, want 1", got)
+	}
+	if got := queueCounts["failed"]; got != 1 {
+		t.Fatalf("failed queue count = %d, want 1", got)
 	}
 }
 
@@ -1475,6 +1566,121 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	}
 	if gotFailed == nil || gotFailed.Status != "manual_intervention" || gotFailed.LastError == nil || *gotFailed.LastError != failReason || gotFailed.Attempts != 4 {
 		t.Fatalf("Queue.GetByID(qi_fail) after fail = %#v, want manual_intervention", gotFailed)
+	}
+}
+
+func TestTargetedListRepositories(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	later := "2026-04-11T12:10:00.000Z"
+	projectID := "project_targeted"
+	loopQueued := "loop_queued"
+	loopManual := "loop_manual"
+	loopDone := "loop_done"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for _, loop := range []LoopRecord{
+		{ID: loopQueued, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now},
+		{ID: loopManual, Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "failed", CreatedAt: now, UpdatedAt: later},
+		{ID: loopDone, Seq: 3, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "completed", CreatedAt: now, UpdatedAt: later},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	manualKind := "manual_intervention"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	for _, item := range []QueueItemRecord{
+		{ID: "queue_queued", ProjectID: &projectID, LoopID: &loopQueued, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "queued", Priority: QueuePriorityWorker, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "queue_manual", ProjectID: &projectID, LoopID: &loopManual, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "manual", Priority: QueuePriorityWorker, Status: "manual_intervention", AvailableAt: now, Attempts: 1, MaxAttempts: 3, LastErrorKind: &manualKind, CreatedAt: later, UpdatedAt: later},
+		{ID: "queue_done", ProjectID: &projectID, LoopID: &loopDone, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "done", Priority: QueuePriorityWorker, Status: "completed", AvailableAt: now, Attempts: 1, MaxAttempts: 3, CreatedAt: later, UpdatedAt: later},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+	for _, run := range []RunRecord{
+		{ID: "run_manual_old", LoopID: loopManual, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now},
+		{ID: "run_manual_latest", LoopID: loopManual, Status: "failed", CheckpointJSON: &checkpoint, StartedAt: later, CreatedAt: later, UpdatedAt: later},
+		{ID: "run_done", LoopID: loopDone, Status: "completed", StartedAt: later, CreatedAt: later, UpdatedAt: later},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+
+	loopsByStatus, err := repos.Loops.ListByStatuses(ctx, []string{"queued", "running"})
+	if err != nil {
+		t.Fatalf("Loops.ListByStatuses() error = %v", err)
+	}
+	if len(loopsByStatus) != 1 || loopsByStatus[0].ID != loopQueued {
+		t.Fatalf("Loops.ListByStatuses() = %#v, want queued loop only", loopsByStatus)
+	}
+
+	queueByStatus, err := repos.Queue.ListByStatuses(ctx, []string{"queued", "manual_intervention"})
+	if err != nil {
+		t.Fatalf("Queue.ListByStatuses() error = %v", err)
+	}
+	if len(queueByStatus) != 2 {
+		t.Fatalf("len(Queue.ListByStatuses()) = %d, want 2", len(queueByStatus))
+	}
+
+	latestRuns, err := repos.Runs.ListLatestByLoopIDs(ctx, []string{loopManual, loopDone})
+	if err != nil {
+		t.Fatalf("Runs.ListLatestByLoopIDs() error = %v", err)
+	}
+	gotRunIDs := []string{latestRuns[0].ID, latestRuns[1].ID}
+	sort.Strings(gotRunIDs)
+	if want := []string{"run_done", "run_manual_latest"}; !reflect.DeepEqual(gotRunIDs, want) {
+		t.Fatalf("Runs.ListLatestByLoopIDs() ids = %#v, want %#v", gotRunIDs, want)
+	}
+
+}
+
+func TestRepositoriesListByIDHelpersChunkLargeInput(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_chunk", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	loopIDs := make([]string, 0, sqliteMaxVariables+5)
+	for i := 0; i < sqliteMaxVariables+5; i++ {
+		loopID := fmt.Sprintf("loop_chunk_%04d", i)
+		loopIDs = append(loopIDs, loopID)
+		if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: int64(i + 1), ProjectID: "project_chunk", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+		}
+		runID := fmt.Sprintf("run_chunk_%04d", i)
+		if err := repos.Runs.Upsert(ctx, RunRecord{ID: runID, LoopID: loopID, Status: "failed", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", runID, err)
+		}
+	}
+
+	loopsList, err := repos.Loops.ListByIDs(ctx, loopIDs)
+	if err != nil {
+		t.Fatalf("Loops.ListByIDs() error = %v", err)
+	}
+	if got := len(loopsList); got != len(loopIDs) {
+		t.Fatalf("len(Loops.ListByIDs()) = %d, want %d", got, len(loopIDs))
+	}
+
+	latestRuns, err := repos.Runs.ListLatestByLoopIDs(ctx, loopIDs)
+	if err != nil {
+		t.Fatalf("Runs.ListLatestByLoopIDs() error = %v", err)
+	}
+	if got := len(latestRuns); got != len(loopIDs) {
+		t.Fatalf("len(Runs.ListLatestByLoopIDs()) = %d, want %d", got, len(loopIDs))
 	}
 }
 

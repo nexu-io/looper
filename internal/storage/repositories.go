@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -591,6 +592,87 @@ func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
 	return scanLoops(rows)
 }
 
+func (r *LoopsRepository) ListByStatuses(ctx context.Context, statuses []string) ([]LoopRecord, error) {
+	if len(statuses) == 0 {
+		return []LoopRecord{}, nil
+	}
+	args := make([]any, 0, len(statuses))
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops WHERE status IN (`+sqlPlaceholders(len(statuses))+`) ORDER BY updated_at DESC, seq DESC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list loops by statuses: %w", err)
+	}
+	defer rows.Close()
+
+	return scanLoops(rows)
+}
+
+func (r *LoopsRepository) ListByIDs(ctx context.Context, ids []string) ([]LoopRecord, error) {
+	if len(ids) == 0 {
+		return []LoopRecord{}, nil
+	}
+	chunks := chunkStrings(ids, sqliteMaxVariables)
+	items := make([]LoopRecord, 0, len(ids))
+	for _, chunk := range chunks {
+		args := make([]any, 0, len(chunk))
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops WHERE id IN (`+sqlPlaceholders(len(chunk))+`) ORDER BY updated_at DESC, seq DESC`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list loops by ids: %w", err)
+		}
+		chunkItems, scanErr := scanLoops(rows)
+		closeErr := rows.Close()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close list loops by ids rows: %w", closeErr)
+		}
+		items = append(items, chunkItems...)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].UpdatedAt != items[j].UpdatedAt {
+			return items[i].UpdatedAt > items[j].UpdatedAt
+		}
+		if items[i].Seq != items[j].Seq {
+			return items[i].Seq > items[j].Seq
+		}
+		return items[i].ID > items[j].ID
+	})
+	return items, nil
+}
+
+func (r *LoopsRepository) CountByTypeAndStatus(ctx context.Context) (map[string]map[string]int64, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT type, status, COUNT(*) FROM loops GROUP BY type, status`)
+	if err != nil {
+		return nil, fmt.Errorf("count loops by type and status: %w", err)
+	}
+	defer rows.Close()
+
+	counts := map[string]map[string]int64{}
+	for rows.Next() {
+		var loopType string
+		var status string
+		var count int64
+		if err := rows.Scan(&loopType, &status, &count); err != nil {
+			return nil, fmt.Errorf("scan loop counts by type and status: %w", err)
+		}
+		if counts[loopType] == nil {
+			counts[loopType] = map[string]int64{}
+		}
+		counts[loopType][status] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate loop counts by type and status: %w", err)
+	}
+
+	return counts, nil
+}
+
 type RunsRepository struct{ q sqliteQuerier }
 
 type AgentExecutionsRepository struct{ q sqliteQuerier }
@@ -650,6 +732,107 @@ func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (
 	return &record, nil
 }
 
+func (r *RunsRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []string) ([]RunRecord, error) {
+	if len(loopIDs) == 0 {
+		return []RunRecord{}, nil
+	}
+	chunks := chunkStrings(loopIDs, sqliteMaxVariables/2)
+	items := make([]RunRecord, 0, len(loopIDs))
+	for _, chunk := range chunks {
+		args := make([]any, 0, len(chunk)*2)
+		for _, loopID := range chunk {
+			args = append(args, loopID)
+		}
+		for _, loopID := range chunk {
+			args = append(args, loopID)
+		}
+		rows, err := r.q.QueryContext(ctx, `
+			SELECT r.*
+			FROM runs r
+			JOIN (
+				SELECT loop_id, MAX(started_at) AS started_at
+				FROM runs
+				WHERE loop_id IN (`+sqlPlaceholders(len(chunk))+`)
+				GROUP BY loop_id
+			) latest ON latest.loop_id = r.loop_id AND latest.started_at = r.started_at
+			WHERE r.loop_id IN (`+sqlPlaceholders(len(chunk))+`)
+			AND r.id = (
+				SELECT id FROM runs latest_id
+				WHERE latest_id.loop_id = r.loop_id AND latest_id.started_at = r.started_at
+				ORDER BY latest_id.created_at DESC, latest_id.id DESC
+				LIMIT 1
+			)
+			ORDER BY r.started_at DESC, r.created_at DESC, r.id DESC
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list latest runs by loop ids: %w", err)
+		}
+		chunkItems, scanErr := scanRuns(rows)
+		closeErr := rows.Close()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close list latest runs by loop ids rows: %w", closeErr)
+		}
+		items = append(items, chunkItems...)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].StartedAt != items[j].StartedAt {
+			return items[i].StartedAt > items[j].StartedAt
+		}
+		if items[i].CreatedAt != items[j].CreatedAt {
+			return items[i].CreatedAt > items[j].CreatedAt
+		}
+		return items[i].ID > items[j].ID
+	})
+	return items, nil
+}
+
+func (r *RunsRepository) ListLatestByLoopStatusesAndResumePolicy(ctx context.Context, statuses []string, resumePolicy string) ([]RunRecord, error) {
+	if len(statuses) == 0 || strings.TrimSpace(resumePolicy) == "" {
+		return []RunRecord{}, nil
+	}
+	args := make([]any, 0, len(statuses)+1)
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	args = append(args, resumePolicy)
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT r.*
+		FROM loops l
+		JOIN (
+			SELECT latest_runs.*
+			FROM runs latest_runs
+			JOIN (
+				SELECT runs.loop_id, MAX(runs.started_at) AS started_at
+				FROM runs
+				JOIN loops candidate_loops ON candidate_loops.id = runs.loop_id
+				WHERE candidate_loops.status IN (`+sqlPlaceholders(len(statuses))+`)
+				GROUP BY runs.loop_id
+			) latest ON latest.loop_id = latest_runs.loop_id AND latest.started_at = latest_runs.started_at
+			WHERE latest_runs.id = (
+				SELECT id FROM runs latest_id
+				WHERE latest_id.loop_id = latest_runs.loop_id AND latest_id.started_at = latest_runs.started_at
+				ORDER BY latest_id.created_at DESC, latest_id.id DESC
+				LIMIT 1
+			)
+		) r ON r.loop_id = l.id
+		WHERE l.status IN (`+sqlPlaceholders(len(statuses))+`)
+		AND json_extract(r.checkpoint_json, '$.resumePolicy') = ?
+		ORDER BY r.started_at DESC, r.created_at DESC, r.id DESC
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list latest runs by loop statuses and resume policy: %w", err)
+	}
+	defer rows.Close()
+
+	return scanRuns(rows)
+}
+
 func (r *RunsRepository) HasRunningByLoopID(ctx context.Context, loopID string) (bool, error) {
 	var count int64
 	if err := r.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE loop_id = ? AND status = 'running'`, loopID).Scan(&count); err != nil {
@@ -667,6 +850,29 @@ func (r *RunsRepository) List(ctx context.Context) ([]RunRecord, error) {
 	defer rows.Close()
 
 	return scanRuns(rows)
+}
+
+func (r *RunsRepository) CountByStatus(ctx context.Context) (map[string]int64, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT status, COUNT(*) FROM runs GROUP BY status`)
+	if err != nil {
+		return nil, fmt.Errorf("count runs by status: %w", err)
+	}
+	defer rows.Close()
+
+	counts := map[string]int64{}
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, fmt.Errorf("scan run counts by status: %w", err)
+		}
+		counts[status] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate run counts by status: %w", err)
+	}
+
+	return counts, nil
 }
 
 func (r *RunsRepository) ListSince(ctx context.Context, sinceISO string) ([]RunRecord, error) {
@@ -1390,6 +1596,46 @@ func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	return scanQueueItems(rows)
 }
 
+func (r *QueueRepository) ListByStatuses(ctx context.Context, statuses []string) ([]QueueItemRecord, error) {
+	if len(statuses) == 0 {
+		return []QueueItemRecord{}, nil
+	}
+	args := make([]any, 0, len(statuses))
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM queue_items WHERE status IN (`+sqlPlaceholders(len(statuses))+`) ORDER BY created_at DESC, id DESC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list queue items by statuses: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
+}
+
+func (r *QueueRepository) CountByAllStatuses(ctx context.Context) (map[string]int64, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT status, COUNT(*) FROM queue_items GROUP BY status`)
+	if err != nil {
+		return nil, fmt.Errorf("count queue items by all statuses: %w", err)
+	}
+	defer rows.Close()
+
+	counts := map[string]int64{}
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, fmt.Errorf("scan queue item counts by all statuses: %w", err)
+		}
+		counts[status] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate queue item counts by all statuses: %w", err)
+	}
+
+	return counts, nil
+}
+
 func (r *QueueRepository) ListQueued(ctx context.Context, limit int64) ([]QueueItemRecord, error) {
 	if limit <= 0 {
 		limit = 100
@@ -2061,6 +2307,33 @@ func nullableInt64(value sql.NullInt64) *int64 {
 
 	intValue := value.Int64
 	return &intValue
+}
+
+func sqlPlaceholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
+}
+
+const sqliteMaxVariables = 900
+
+func chunkStrings(values []string, chunkSize int) [][]string {
+	if len(values) == 0 {
+		return nil
+	}
+	if chunkSize <= 0 {
+		chunkSize = len(values)
+	}
+	chunks := make([][]string, 0, (len(values)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(values); start += chunkSize {
+		end := start + chunkSize
+		if end > len(values) {
+			end = len(values)
+		}
+		chunks = append(chunks, values[start:end])
+	}
+	return chunks
 }
 
 const scheduledQueueBaseQuery = `

@@ -667,15 +667,17 @@ func TestVersionCommandPrintsCLIAndServerVersionSeparately(t *testing.T) {
 	runningPath := filepath.Join(homeDir, "running", "looperd")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
+	requestPaths := []string{}
 	app := New(Deps{
 		Stdout:  stdout,
 		Stderr:  stderr,
 		HomeDir: homeDir,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/api/v1/status" {
+			requestPaths = append(requestPaths, req.URL.Path)
+			if req.URL.Path != "/api/v1/version" {
 				t.Fatalf("unexpected request path %q", req.URL.Path)
 			}
-			return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"data":{"service":{"version":"0.7.0","binary":{"name":"looperd","path":%q}}}}`, runningPath)), nil
+			return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"data":{"version":"0.7.0","build":{"apiVersion":%q},"binary":{"name":"looperd","path":%q}}}`, version.Current().Metadata.APIVersion, runningPath)), nil
 		}),
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			_ = ctx
@@ -696,6 +698,9 @@ func TestVersionCommandPrintsCLIAndServerVersionSeparately(t *testing.T) {
 	}
 	if got, want := stdout.String(), "CLI version: "+version.Current().Version+"\nlooperd server version: 0.7.0\n"; got != want {
 		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(requestPaths, []string{"/api/v1/version"}) {
+		t.Fatalf("request paths = %#v, want only /api/v1/version", requestPaths)
 	}
 }
 
@@ -753,15 +758,17 @@ func TestVersionCommandJSONPrintsServerVersionSeparately(t *testing.T) {
 	runningPath := filepath.Join(homeDir, "running", "looperd")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
+	requestPaths := []string{}
 	app := New(Deps{
 		Stdout:  stdout,
 		Stderr:  stderr,
 		HomeDir: homeDir,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/api/v1/status" {
+			requestPaths = append(requestPaths, req.URL.Path)
+			if req.URL.Path != "/api/v1/version" {
 				t.Fatalf("unexpected request path %q", req.URL.Path)
 			}
-			return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"data":{"service":{"version":"0.7.0","binary":{"name":"looperd","path":%q}}}}`, runningPath)), nil
+			return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"data":{"version":"0.7.0","build":{"apiVersion":%q},"binary":{"name":"looperd","path":%q}}}`, version.Current().Metadata.APIVersion, runningPath)), nil
 		}),
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			_ = ctx
@@ -797,6 +804,9 @@ func TestVersionCommandJSONPrintsServerVersionSeparately(t *testing.T) {
 		"source":     "api",
 		"binaryPath": runningPath,
 	})
+	if !reflect.DeepEqual(requestPaths, []string{"/api/v1/version"}) {
+		t.Fatalf("request paths = %#v, want only /api/v1/version", requestPaths)
+	}
 }
 
 func TestVersionCommandUsesConfiguredBaseURLForServerVersionLookup(t *testing.T) {
@@ -816,10 +826,10 @@ func TestVersionCommandUsesConfiguredBaseURLForServerVersionLookup(t *testing.T)
 		Stdout: stdout,
 		Stderr: stderr,
 		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
-			if got, want := req.URL.String(), "https://daemon.example.test/base/api/v1/status"; got != want {
-				t.Fatalf("status URL = %q, want %q", got, want)
+			if got, want := req.URL.String(), "https://daemon.example.test/base/api/v1/version"; got != want {
+				t.Fatalf("version URL = %q, want %q", got, want)
 			}
-			return jsonResponse(t, http.StatusOK, `{"ok":true,"data":{"service":{"version":"0.8.0"}}}`), nil
+			return jsonResponse(t, http.StatusOK, `{"ok":true,"data":{"version":"0.8.0","build":{"apiVersion":"v1"},"binary":{"name":"looperd"}}}`), nil
 		}),
 		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
 			_ = ctx
@@ -839,6 +849,112 @@ func TestVersionCommandUsesConfiguredBaseURLForServerVersionLookup(t *testing.T)
 	}
 	if got, want := stdout.String(), "CLI version: "+version.Current().Version+"\nlooperd server version: 0.8.0\n"; got != want {
 		t.Fatalf("Run([version --config]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestVersionCommandFallsBackToStatusForOlderDaemon(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	runningPath := filepath.Join(homeDir, "running", "looperd")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	requestPaths := []string{}
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			requestPaths = append(requestPaths, req.URL.Path)
+			switch req.URL.Path {
+			case "/api/v1/version":
+				return jsonResponse(t, http.StatusNotFound, `{"ok":false,"error":{"code":"NOT_FOUND","message":"not found"}}`), nil
+			case "/api/v1/status":
+				return jsonResponse(t, http.StatusOK, fmt.Sprintf(`{"ok":true,"data":{"service":{"version":"0.7.0","binary":{"name":"looperd","path":%q}}}}`, runningPath)), nil
+			default:
+				t.Fatalf("unexpected request path %q", req.URL.Path)
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = command
+			_ = args
+			_ = timeout
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	exitCode := app.Run(context.Background(), []string{"version", "--json"})
+	if exitCode != 0 {
+		t.Fatalf("Run([version --json]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([version --json]) stderr = %q, want empty string", got)
+	}
+	assertJSONContains(t, stdout.String(), "server", map[string]any{
+		"version":    "0.7.0",
+		"source":     "api",
+		"binaryPath": runningPath,
+	})
+	if !reflect.DeepEqual(requestPaths, []string{"/api/v1/version", "/api/v1/status"}) {
+		t.Fatalf("request paths = %#v, want version then status", requestPaths)
+	}
+}
+
+func TestVersionCommandSlowStatusFallbackUsesBinaryVersion(t *testing.T) {
+	t.Parallel()
+
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	requestPaths := []string{}
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			requestPaths = append(requestPaths, req.URL.Path)
+			switch req.URL.Path {
+			case "/api/v1/version":
+				return jsonResponse(t, http.StatusNotFound, `{"ok":false,"error":{"code":"NOT_FOUND","message":"not found"}}`), nil
+			case "/api/v1/status":
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			default:
+				t.Fatalf("unexpected request path %q", req.URL.Path)
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{Stdout: "0.6.0\n", ExitCode: 0}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+	})
+
+	startedAt := time.Now()
+	exitCode := app.Run(context.Background(), []string{"version", "--json"})
+	if exitCode != 0 {
+		t.Fatalf("Run([version --json]) exit code = %d, want 0", exitCode)
+	}
+	if got := stderr.String(); got != "" {
+		t.Fatalf("Run([version --json]) stderr = %q, want empty string", got)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("Run([version --json]) took %v, want quick fallback", elapsed)
+	}
+	assertJSONContains(t, stdout.String(), "server", map[string]any{
+		"version":    "0.6.0",
+		"source":     "binary",
+		"binaryPath": managedPath,
+	})
+	if !reflect.DeepEqual(requestPaths, []string{"/api/v1/version", "/api/v1/status"}) {
+		t.Fatalf("request paths = %#v, want version then status", requestPaths)
 	}
 }
 

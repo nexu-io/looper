@@ -242,6 +242,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
+	case apiBasePath + "/version":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+
+		h.writeSuccess(w, requestID, h.buildVersionResponse())
+		return
 	case apiBasePath + "/config":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
 			return
@@ -812,6 +819,17 @@ type statusBinary struct {
 	SupportedTargets []string `json:"supportedTargets"`
 }
 
+type versionResponse struct {
+	Version string                `json:"version"`
+	Build   version.BuildMetadata `json:"build"`
+	Binary  versionBinaryResponse `json:"binary"`
+}
+
+type versionBinaryResponse struct {
+	Name string `json:"name"`
+	Path string `json:"path,omitempty"`
+}
+
 func daemonExecutablePath() string {
 	executablePath, err := os.Executable()
 	if err != nil {
@@ -1033,6 +1051,17 @@ func serverBaseURL(cfg config.ServerConfig) string {
 	return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
 }
 
+func (h *Handler) buildVersionResponse() versionResponse {
+	return versionResponse{
+		Version: version.Current().Version,
+		Build:   version.Current().Metadata,
+		Binary: versionBinaryResponse{
+			Name: "looperd",
+			Path: daemonExecutablePath(),
+		},
+	}
+}
+
 func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, error) {
 	storageState, err := h.loadStorageState(ctx)
 	if err != nil {
@@ -1040,24 +1069,22 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	}
 
 	services := h.context.Runtime.Services()
-	loops, err := services.Repositories.Loops.List(ctx)
+	loopCountsByType, err := services.Repositories.Loops.CountByTypeAndStatus(ctx)
 	if err != nil {
 		return statusResponse{}, err
 	}
 
-	runs, err := services.Repositories.Runs.List(ctx)
+	runCounts, err := services.Repositories.Runs.CountByStatus(ctx)
 	if err != nil {
 		return statusResponse{}, err
 	}
 
-	queueItems, err := services.Repositories.Queue.List(ctx)
+	queueCounts, err := services.Repositories.Queue.CountByAllStatuses(ctx)
 	if err != nil {
 		return statusResponse{}, err
 	}
 
-	loopCounts := countLoops(loops)
-	queueCounts := countQueueByStatus(queueItems)
-	runCounts := countRunsByStatus(runs)
+	loopCounts := countLoops(loopCountsByType)
 
 	currentTarget := currentLooperdTarget()
 	installDir := filepath.Join(homeDirOrEmpty(), ".looper", "bin")
@@ -1089,12 +1116,12 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 		},
 		Scheduler: statusScheduler{
 			Healthy:        true,
-			QueuedItems:    queueCounts["queued"],
-			RunningItems:   queueCounts["running"],
-			CompletedItems: queueCounts["completed"],
-			FailedItems:    queueCounts["failed"],
-			TotalRuns:      len(runs),
-			ActiveRuns:     runCounts["running"],
+			QueuedItems:    int(queueCounts["queued"]),
+			RunningItems:   int(queueCounts["running"]),
+			CompletedItems: int(queueCounts["completed"]),
+			FailedItems:    int(queueCounts["failed"]),
+			TotalRuns:      sumStatusCounts(runCounts),
+			ActiveRuns:     int(runCounts["running"]),
 		},
 		Agent: statusAgent{
 			Vendor:              h.context.Config.Agent.Vendor,
@@ -1199,11 +1226,11 @@ func (s storageState) schemaVersion() string {
 	return s.LatestAppliedID
 }
 
-func countLoops(loops []storage.LoopRecord) statusLoops {
+func countLoops(countsByType map[string]map[string]int64) statusLoops {
 	counts := statusLoops{}
-	for _, loop := range loops {
+	for loopType, statuses := range countsByType {
 		var target *statusLoopType
-		switch loop.Type {
+		switch loopType {
 		case "planner":
 			target = &counts.Planner
 		case "reviewer":
@@ -1216,43 +1243,35 @@ func countLoops(loops []storage.LoopRecord) statusLoops {
 			continue
 		}
 
-		switch loop.Status {
-		case "queued":
-			target.Queued++
-		case "running":
-			target.Running++
-		case "waiting":
-			target.Waiting++
-		case "paused":
-			target.Paused++
-		case "failed":
-			target.Failed++
-		case "terminated":
-			target.Terminated++
-		case "stopped":
-			target.Stopped++
+		for status, count := range statuses {
+			switch status {
+			case "queued":
+				target.Queued = int(count)
+			case "running":
+				target.Running = int(count)
+			case "waiting":
+				target.Waiting = int(count)
+			case "paused":
+				target.Paused = int(count)
+			case "failed":
+				target.Failed = int(count)
+			case "terminated":
+				target.Terminated = int(count)
+			case "stopped":
+				target.Stopped = int(count)
+			}
 		}
 	}
 
 	return counts
 }
 
-func countQueueByStatus(items []storage.QueueItemRecord) map[string]int {
-	counts := map[string]int{}
-	for _, item := range items {
-		counts[item.Status]++
+func sumStatusCounts(counts map[string]int64) int {
+	total := 0
+	for _, count := range counts {
+		total += int(count)
 	}
-
-	return counts
-}
-
-func countRunsByStatus(items []storage.RunRecord) map[string]int {
-	counts := map[string]int{}
-	for _, item := range items {
-		counts[item.Status]++
-	}
-
-	return counts
+	return total
 }
 
 func generateRequestID() string {
@@ -2580,17 +2599,44 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
-	queueItems, err := services.Repositories.Queue.List(ctx)
-	if err != nil {
-		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	loopsList, err := services.Repositories.Loops.List(ctx)
-	if err != nil {
-		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
 	activeExecutions, err := services.Repositories.AgentExecutions.ListActive(ctx)
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	queueItems := make([]storage.QueueItemRecord, 0)
+	loopsList := make([]storage.LoopRecord, 0)
+	latestRunsByLoopID := map[string]*storage.RunRecord{}
+	if includeInactiveLoops {
+		queueItems, err = services.Repositories.Queue.List(ctx)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		loopsList, err = services.Repositories.Loops.List(ctx)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		latestRunsByLoopID, err = h.latestRunsByLoopID(ctx, services.Repositories.Runs, loopIDsFromLoops(loopsList))
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+	} else {
+		queueItems, err = services.Repositories.Queue.ListByStatuses(ctx, []string{"queued", "running", "manual_intervention"})
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		manualResumeRuns, err := services.Repositories.Runs.ListLatestByLoopStatusesAndResumePolicy(ctx, manualResumeCandidateLoopStatuses(), string(loops.ResumePolicyManualIntervention))
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		loopsList, err = h.listDefaultActiveRunLoops(ctx, services.Repositories, activeRuns, queueItems, manualResumeRuns, includeRunningLoopsWithoutRuns)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		latestRunsByLoopID, err = h.latestRunsForDefaultActiveRuns(ctx, services.Repositories, activeRuns, queueItems, manualResumeRuns, loopsList)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
 	}
 
 	loopsByID := make(map[string]storage.LoopRecord, len(loopsList))
@@ -2624,10 +2670,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if !ok {
 			continue
 		}
-		latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, run.LoopID)
-		if err != nil {
-			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-		}
+		latestRun := latestRunsByLoopID[run.LoopID]
 		hasActiveAgent := verifiedActiveAgentByRunID[run.ID] != nil
 		if !isPlausiblyLiveActiveRun(run, loop, latestRun, hasActiveAgent, h.now().UTC()) {
 			continue
@@ -2699,7 +2742,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			Agent:       nil,
 			Worktree:    nil,
 		}
-		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], nil)
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRunsByLoopID[loop.ID])
 		queuedViews = append(queuedViews, view)
 	}
 
@@ -2727,7 +2770,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			Agent:       nil,
 			Worktree:    nil,
 		}
-		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], nil)
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRunsByLoopID[loop.ID])
 		runningLoopViews = append(runningLoopViews, view)
 	}
 
@@ -2748,16 +2791,9 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			continue
 		}
 		latestQueue := latestQueueByLoopID[loop.ID]
-		var latestRun *storage.RunRecord
-		if !includeInactiveLoops {
-			var runErr error
-			latestRun, runErr = services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
-			if runErr != nil {
-				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: runErr.Error()}
-			}
-			if !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
-				continue
-			}
+		latestRun := latestRunsByLoopID[loop.ID]
+		if !includeInactiveLoops && !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
+			continue
 		}
 		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
 		if err != nil {
@@ -2770,12 +2806,6 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			runID    *string
 			worktree *activeRunWorktree
 		)
-		if latestRun == nil {
-			latestRun, err = services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
-			if err != nil {
-				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-			}
-		}
 		startedAt := firstNonEmptyString(loop.LastRunAt, loop.NextRunAt, stringPtrOrNil(loop.UpdatedAt), stringPtrOrNil(loop.CreatedAt))
 		var endedAt *string
 		if latestRun != nil {
@@ -2829,6 +2859,91 @@ func excludeActiveRunViewsByLoopID(items []activeRunView, excluded []activeRunVi
 		filtered = append(filtered, item)
 	}
 	return filtered
+}
+
+func (h *Handler) listDefaultActiveRunLoops(ctx context.Context, repos *storage.Repositories, activeRuns []storage.RunRecord, queueItems []storage.QueueItemRecord, manualResumeRuns []storage.RunRecord, includeRunningLoopsWithoutRuns bool) ([]storage.LoopRecord, error) {
+	loopIDs := make(map[string]struct{}, len(activeRuns)+len(queueItems)+len(manualResumeRuns))
+	for _, run := range activeRuns {
+		loopIDs[run.LoopID] = struct{}{}
+	}
+	for _, item := range queueItems {
+		if item.LoopID != nil && strings.TrimSpace(*item.LoopID) != "" {
+			loopIDs[*item.LoopID] = struct{}{}
+		}
+	}
+	for _, run := range manualResumeRuns {
+		loopIDs[run.LoopID] = struct{}{}
+	}
+	if includeRunningLoopsWithoutRuns {
+		runningAndQueued, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusRunning), string(domain.LoopStatusQueued)})
+		if err != nil {
+			return nil, err
+		}
+		for _, loop := range runningAndQueued {
+			loopIDs[loop.ID] = struct{}{}
+		}
+	}
+	return repos.Loops.ListByIDs(ctx, mapKeys(loopIDs))
+}
+
+func (h *Handler) latestRunsForDefaultActiveRuns(ctx context.Context, repos *storage.Repositories, activeRuns []storage.RunRecord, queueItems []storage.QueueItemRecord, manualResumeRuns []storage.RunRecord, loopsList []storage.LoopRecord) (map[string]*storage.RunRecord, error) {
+	loopIDs := make(map[string]struct{}, len(activeRuns)+len(queueItems)+len(manualResumeRuns)+len(loopsList))
+	for _, run := range activeRuns {
+		loopIDs[run.LoopID] = struct{}{}
+	}
+	for _, item := range queueItems {
+		if item.LoopID != nil && strings.TrimSpace(*item.LoopID) != "" {
+			loopIDs[*item.LoopID] = struct{}{}
+		}
+	}
+	for _, loop := range loopsList {
+		loopIDs[loop.ID] = struct{}{}
+	}
+	latestRunsByLoopID, err := h.latestRunsByLoopID(ctx, repos.Runs, mapKeys(loopIDs))
+	if err != nil {
+		return nil, err
+	}
+	for i := range manualResumeRuns {
+		latestRunsByLoopID[manualResumeRuns[i].LoopID] = &manualResumeRuns[i]
+	}
+	return latestRunsByLoopID, nil
+}
+
+func manualResumeCandidateLoopStatuses() []string {
+	return []string{
+		string(domain.LoopStatusPaused),
+		string(domain.LoopStatusWaiting),
+		string(domain.LoopStatusFailed),
+		string(domain.LoopStatusInterrupted),
+	}
+}
+
+func (h *Handler) latestRunsByLoopID(ctx context.Context, runs *storage.RunsRepository, loopIDs []string) (map[string]*storage.RunRecord, error) {
+	latestRuns, err := runs.ListLatestByLoopIDs(ctx, loopIDs)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]*storage.RunRecord, len(latestRuns))
+	for i := range latestRuns {
+		result[latestRuns[i].LoopID] = &latestRuns[i]
+	}
+	return result, nil
+}
+
+func loopIDsFromLoops(loopsList []storage.LoopRecord) []string {
+	ids := make([]string, 0, len(loopsList))
+	for _, loop := range loopsList {
+		ids = append(ids, loop.ID)
+	}
+	return ids
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func latestQueueItemByLoopID(items []storage.QueueItemRecord) map[string]*storage.QueueItemRecord {
