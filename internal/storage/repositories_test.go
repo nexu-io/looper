@@ -1657,6 +1657,51 @@ func TestTargetedListRepositories(t *testing.T) {
 
 }
 
+func TestRunsListLatestByLoopStatusesAndResumePolicySkipsMalformedCheckpointJSON(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	later := "2026-04-11T12:10:00.000Z"
+	projectID := "project_resume_policy"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	malformedCheckpoint := `{"resumePolicy":`
+
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	for _, loop := range []LoopRecord{
+		{ID: "loop_valid", Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "failed", CreatedAt: now, UpdatedAt: now},
+		{ID: "loop_malformed", Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "failed", CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	for _, run := range []RunRecord{
+		{ID: "run_valid", LoopID: "loop_valid", Status: "failed", CheckpointJSON: &checkpoint, StartedAt: later, CreatedAt: later, UpdatedAt: later},
+		{ID: "run_malformed", LoopID: "loop_malformed", Status: "failed", CheckpointJSON: &malformedCheckpoint, StartedAt: later, CreatedAt: later, UpdatedAt: later},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+
+	runs, err := repos.Runs.ListLatestByLoopStatusesAndResumePolicy(ctx, []string{"failed"}, "manual_intervention")
+	if err != nil {
+		t.Fatalf("Runs.ListLatestByLoopStatusesAndResumePolicy() error = %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("len(Runs.ListLatestByLoopStatusesAndResumePolicy()) = %d, want 1", len(runs))
+	}
+	if runs[0].ID != "run_valid" {
+		t.Fatalf("Runs.ListLatestByLoopStatusesAndResumePolicy()[0].ID = %q, want run_valid", runs[0].ID)
+	}
+}
+
 func TestRepositoriesListByIDHelpersChunkLargeInput(t *testing.T) {
 	t.Parallel()
 

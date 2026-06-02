@@ -822,6 +822,7 @@ func (r *RunsRepository) ListLatestByLoopStatusesAndResumePolicy(ctx context.Con
 			)
 		) r ON r.loop_id = l.id
 		WHERE l.status IN (`+sqlPlaceholders(len(statuses))+`)
+		AND json_valid(r.checkpoint_json)
 		AND json_extract(r.checkpoint_json, '$.resumePolicy') = ?
 		ORDER BY r.started_at DESC, r.created_at DESC, r.id DESC
 	`, args...)
