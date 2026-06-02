@@ -299,6 +299,101 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	}
 }
 
+func TestGatewayListOpenPullRequestsFallsBackWhenReviewRequestReviewerIsInaccessible(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if strings.HasPrefix(args, "pr list") && strings.Contains(args, "reviewRequests") {
+			result := shell.Result{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by personal access token (repository.pullRequests.nodes.3.reviewRequests.nodes.0.requestedReviewer)"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		}
+		if strings.HasPrefix(args, "pr list") {
+			if strings.Contains(args, "reviewRequests") {
+				t.Fatalf("fallback gh args = %q, want reviewRequests omitted", args)
+			}
+			return shell.Result{Stdout: `[{"number":42,"title":"Review me","url":"https://example.test/pull/42","state":"OPEN","updatedAt":"2026-05-01T12:00:00Z","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":[{"name":"ready"}],"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviews":[{"state":"COMMENTED"}]}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListOpenPullRequests(context.Background(), ListOpenPullRequestsInput{Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].Title != "Review me" {
+		t.Fatalf("ListOpenPullRequests() = %#v, want fallback PR metadata", prs)
+	}
+	if len(prs[0].ReviewRequests) != 0 || len(prs[0].ReviewRequestUsers) != 0 {
+		t.Fatalf("fallback review requests = %#v/%#v, want empty best-effort metadata", prs[0].ReviewRequests, prs[0].ReviewRequestUsers)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("gh calls = %#v, want primary and fallback list calls", runner.calls)
+	}
+}
+
+func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if strings.HasPrefix(args, "pr view") && strings.Contains(args, "reviewRequests") {
+			result := shell.Result{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by personal access token (repository.pullRequest.reviewRequests.nodes.0.requestedReviewer)"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		}
+		if strings.HasPrefix(args, "pr view") {
+			if strings.Contains(args, "reviewRequests") {
+				t.Fatalf("fallback gh args = %q, want reviewRequests omitted", args)
+			}
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","createdAt":"2026-05-03T12:00:00Z","updatedAt":"2026-05-04T12:00:00Z","closedAt":"","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":[{"name":"ready"}],"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
+		}
+		if strings.Contains(args, "reviewThreads") {
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ViewPullRequest() error = %v", err)
+	}
+	if detail.Number != 42 || detail.Title != "Review me" || detail.Author != "octocat" {
+		t.Fatalf("ViewPullRequest() = %#v, want fallback PR metadata", detail)
+	}
+	if len(detail.ReviewRequests) != 0 || len(detail.ReviewRequestUsers) != 0 {
+		t.Fatalf("fallback review requests = %#v/%#v, want empty best-effort metadata", detail.ReviewRequests, detail.ReviewRequestUsers)
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("gh calls = %#v, want primary view, fallback view, and review thread fetch", runner.calls)
+	}
+}
+
+func TestGatewayListOpenPullRequestsDoesNotFallbackForUnrelatedAccessError(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if strings.HasPrefix(args, "pr list") {
+			result := shell.Result{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by personal access token (repository.pullRequests.nodes.0.author)"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ListOpenPullRequests(context.Background(), ListOpenPullRequestsInput{Repo: "acme/looper"}); err == nil {
+		t.Fatal("ListOpenPullRequests() error = nil, want unrelated access error")
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("gh calls = %#v, want no fallback for unrelated access error", runner.calls)
+	}
+}
+
 func TestGetPullRequestHeadSHA(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

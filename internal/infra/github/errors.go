@@ -83,6 +83,16 @@ func IsNotFoundError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "404")
 }
 
+func IsInaccessibleReviewRequestReviewerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(ErrorMessage(err))
+	return strings.Contains(message, "resource not accessible") &&
+		strings.Contains(message, "reviewrequests") &&
+		strings.Contains(message, "requestedreviewer")
+}
+
 func nonEmptyStrings(values ...string) []string {
 	out := make([]string, 0, len(values))
 	for _, value := range values {

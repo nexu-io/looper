@@ -28,6 +28,11 @@ const (
 	prDiffGhCommandTimeout  = 180 * time.Second
 )
 
+var (
+	prListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
+	prViewJSONFields = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}
+)
+
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 
 var ErrDiffTooLarge = errors.New("github pull request diff is too large")
@@ -640,28 +645,10 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 }
 
 func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-	args := []string{"pr", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
-	labels := prListLabels(input)
-	for _, label := range labels {
-		args = append(args, "--label", label)
+	rows, err := g.listOpenPullRequestRows(ctx, input, prListJSONFields)
+	if err != nil && IsInaccessibleReviewRequestReviewerError(err) {
+		rows, err = g.listOpenPullRequestRows(ctx, input, withoutJSONField(prListJSONFields, "reviewRequests"))
 	}
-	if strings.TrimSpace(input.Author) != "" {
-		args = append(args, "--author", strings.TrimSpace(input.Author))
-	}
-	if strings.TrimSpace(input.BaseRefName) != "" {
-		args = append(args, "--base", strings.TrimSpace(input.BaseRefName))
-	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
-
-	timeout := input.Timeout
-	if timeout <= 0 {
-		timeout = defaultGhCommandTimeout
-	}
-	result, err := g.runGhWithTimeout(ctx, input.CWD, "", timeout, args...)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := decodeJSONArray(result.Stdout)
 	if err != nil {
 		return nil, err
 	}
@@ -689,6 +676,31 @@ func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPul
 		})
 	}
 	return out, nil
+}
+
+func (g *Gateway) listOpenPullRequestRows(ctx context.Context, input ListOpenPullRequestsInput, fields []string) ([]map[string]any, error) {
+	args := []string{"pr", "list", "--repo", input.Repo, "--state", "open", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit))}
+	labels := prListLabels(input)
+	for _, label := range labels {
+		args = append(args, "--label", label)
+	}
+	if strings.TrimSpace(input.Author) != "" {
+		args = append(args, "--author", strings.TrimSpace(input.Author))
+	}
+	if strings.TrimSpace(input.BaseRefName) != "" {
+		args = append(args, "--base", strings.TrimSpace(input.BaseRefName))
+	}
+	args = append(args, "--json", strings.Join(fields, ","))
+
+	timeout := input.Timeout
+	if timeout <= 0 {
+		timeout = defaultGhCommandTimeout
+	}
+	result, err := g.runGhWithTimeout(ctx, input.CWD, "", timeout, args...)
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSONArray(result.Stdout)
 }
 
 func prListLabels(input ListOpenPullRequestsInput) []string {
@@ -1251,11 +1263,10 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 }
 
 func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
-	if err != nil {
-		return PullRequestDetail{}, err
+	row, err := g.viewPullRequestRow(ctx, input, prViewJSONFields)
+	if err != nil && IsInaccessibleReviewRequestReviewerError(err) {
+		row, err = g.viewPullRequestRow(ctx, input, withoutJSONField(prViewJSONFields, "reviewRequests"))
 	}
-	row, err := decodeJSONObject(result.Stdout)
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -1294,6 +1305,14 @@ func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestI
 		MergedAt:           asString(row["merged_at"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}, nil
+}
+
+func (g *Gateway) viewPullRequestRow(ctx context.Context, input ViewPullRequestInput, fields []string) (map[string]any, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join(fields, ","))
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSONObject(result.Stdout)
 }
 
 func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
@@ -2807,6 +2826,16 @@ func defaultLimit(limit int) int {
 		return 30
 	}
 	return limit
+}
+
+func withoutJSONField(fields []string, field string) []string {
+	out := make([]string, 0, len(fields))
+	for _, candidate := range fields {
+		if candidate != field {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 func parseRepo(repo string) (string, string, error) {
