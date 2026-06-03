@@ -1129,7 +1129,11 @@ func TestDiscoverPullRequestsRequeuesFollowUpOnNewHeadWithoutFreshReviewRequest(
 		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
 	}
 	if result.QueueItems[0].PayloadJSON == nil || !contains(*result.QueueItems[0].PayloadJSON, `"headSha":"new-head"`) {
-		t.Fatalf("queue payload = %#v, want new head recorded", result.QueueItems[0].PayloadJSON)
+		payload := ""
+		if result.QueueItems[0].PayloadJSON != nil {
+			payload = *result.QueueItems[0].PayloadJSON
+		}
+		t.Fatalf("queue payload = %q, want new head recorded", payload)
 	}
 	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil {
@@ -2387,6 +2391,42 @@ func TestProcessClaimedItemSkipsQueuedAutomaticLoopWhenCurrentUserIsNotRequested
 	}
 	if got := intFromAny(loopMeta["iterationCount"]); got != 0 {
 		t.Fatalf("iterationCount = %d, want 0 for filter-only skip", got)
+	}
+}
+
+func TestProcessClaimedItemAllowsQueuedAutomaticLoopWhenReviewRequestsUnknown(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequestsUnknown: true, currentLogin: "bob", reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_unknown_review_requests", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want reviewer work to run when review request state is unknown", len(agent.starts))
 	}
 }
 
@@ -7797,6 +7837,7 @@ type fakeGitHubGateway struct {
 	reviewDecisionAfterFirstView    string
 	commentsAfterFirstView          []map[string]any
 	reviewRequests                  []string
+	reviewRequestsUnknown           bool
 	currentLogin                    string
 	currentLoginErr                 error
 	currentLoginCalls               int
@@ -7898,7 +7939,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	}
 	reviewRequests := g.effectiveReviewRequests()
 	if g.removeReviewRequestOnSecondView && g.viewCalls >= 2 {
-		reviewRequests = nil
+		reviewRequests = []string{}
 	}
 	reviewDecision := g.reviewDecision
 	comments := g.comments
@@ -7985,8 +8026,13 @@ func cloneCommentMaps(comments []map[string]any) []map[string]any {
 }
 
 func (g *fakeGitHubGateway) effectiveReviewRequests() []string {
+	if g.reviewRequestsUnknown {
+		return nil
+	}
 	if g.reviewRequests != nil {
-		return append([]string(nil), g.reviewRequests...)
+		reviewRequests := make([]string, len(g.reviewRequests))
+		copy(reviewRequests, g.reviewRequests)
+		return reviewRequests
 	}
 	return []string{"octocat"}
 }

@@ -1005,7 +1005,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		return nil
 	}
 	requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
-	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, *currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin) {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin) {
 		result.Skipped++
 		return nil
 	}
@@ -1106,7 +1106,7 @@ func prEligibleForDiscoveryPreclaim(pr PullRequestSummary, currentLogin string, 
 	if isSelfAuthoredPR(pr.Author, currentLogin, policy) {
 		return false
 	}
-	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireReviewRequest && !isCurrentUserRequested(pr.ReviewRequests, currentLogin) {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireReviewRequest && reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 		return false
 	}
 	if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
@@ -1788,7 +1788,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		if err := ensureCurrentLogin(); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
-		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
+		if reviewRequestsKnownAbsent(checkpoint.Detail.ReviewRequests, currentLogin) {
 			if r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {
 				checkpoint.ThreadResolutionFollowUpOnly = true
 				return checkpoint, nil
@@ -2234,7 +2234,7 @@ func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input ste
 	if normalizePRState(detail.State) != "open" || detail.HeadSHA != headSHA {
 		return nil, PullRequestDetail{}, &loopError{message: "PR changed during thread reconciliation", kind: FailureRetryableAfterResume}
 	}
-	if policy.RequireCurrentReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+	if policy.RequireCurrentReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, currentLogin) {
 		return nil, detail, nil
 	}
 	latest, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: limit})
@@ -2694,7 +2694,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
-			if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+			if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 				return checkpoint, nil
 			}
@@ -2775,7 +2775,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+		if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
 			return checkpoint, nil
 		}
@@ -4682,7 +4682,7 @@ func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput,
 	if err != nil {
 		return "", false
 	}
-	if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+	if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 		return "review request removed before publish", true
 	}
 	return "", false
@@ -5386,6 +5386,10 @@ func isCurrentUserRequested(requested []string, currentLogin string) bool {
 	return false
 }
 
+func reviewRequestsKnownAbsent(requested []string, currentLogin string) bool {
+	return requested != nil && !isCurrentUserRequested(requested, currentLogin)
+}
+
 func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 	if item.Repo == nil || item.PRNumber == nil {
 		return ""
@@ -5892,14 +5896,18 @@ func cloneStrings(values []string) []string {
 	if values == nil {
 		return nil
 	}
-	return append([]string(nil), values...)
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
 }
 
 func cloneGitHubUsers(values []networkpolicy.GitHubUser) []networkpolicy.GitHubUser {
 	if values == nil {
 		return nil
 	}
-	return append([]networkpolicy.GitHubUser(nil), values...)
+	cloned := make([]networkpolicy.GitHubUser, len(values))
+	copy(cloned, values)
+	return cloned
 }
 
 func cloneObjectSlice(values []map[string]any) []map[string]any {

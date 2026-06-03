@@ -326,8 +326,8 @@ func TestGatewayListOpenPullRequestsFallsBackWhenReviewRequestReviewerIsInaccess
 	if len(prs) != 1 || prs[0].Number != 42 || prs[0].Title != "Review me" {
 		t.Fatalf("ListOpenPullRequests() = %#v, want fallback PR metadata", prs)
 	}
-	if len(prs[0].ReviewRequests) != 0 || len(prs[0].ReviewRequestUsers) != 0 {
-		t.Fatalf("fallback review requests = %#v/%#v, want empty best-effort metadata", prs[0].ReviewRequests, prs[0].ReviewRequestUsers)
+	if prs[0].ReviewRequests != nil || prs[0].ReviewRequestUsers != nil {
+		t.Fatalf("fallback review requests = %#v/%#v, want unknown metadata", prs[0].ReviewRequests, prs[0].ReviewRequestUsers)
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("gh calls = %#v, want primary and fallback list calls", runner.calls)
@@ -364,8 +364,8 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 	if detail.Number != 42 || detail.Title != "Review me" || detail.Author != "octocat" {
 		t.Fatalf("ViewPullRequest() = %#v, want fallback PR metadata", detail)
 	}
-	if len(detail.ReviewRequests) != 0 || len(detail.ReviewRequestUsers) != 0 {
-		t.Fatalf("fallback review requests = %#v/%#v, want empty best-effort metadata", detail.ReviewRequests, detail.ReviewRequestUsers)
+	if detail.ReviewRequests != nil || detail.ReviewRequestUsers != nil {
+		t.Fatalf("fallback review requests = %#v/%#v, want unknown metadata", detail.ReviewRequests, detail.ReviewRequestUsers)
 	}
 	if len(runner.calls) != 3 {
 		t.Fatalf("gh calls = %#v, want primary view, fallback view, and review thread fetch", runner.calls)

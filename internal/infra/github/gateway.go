@@ -3287,6 +3287,9 @@ func extractOID(value any) string {
 
 func extractReviewRequestLogins(value any) []string {
 	users := extractReviewRequestUsers(value)
+	if users == nil {
+		return nil
+	}
 	out := make([]string, 0, len(users))
 	for _, user := range users {
 		if user.Login != "" {
@@ -3299,7 +3302,7 @@ func extractReviewRequestLogins(value any) []string {
 func extractReviewRequestUsers(value any) []GitHubUser {
 	items, ok := value.([]any)
 	if !ok {
-		return []GitHubUser{}
+		return nil
 	}
 	out := make([]GitHubUser, 0, len(items))
 	for _, item := range items {
