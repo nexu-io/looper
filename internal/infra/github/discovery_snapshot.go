@@ -392,11 +392,38 @@ func cloneObjectMaps(items []map[string]any) []map[string]any {
 		}
 		cloned := make(map[string]any, len(item))
 		for key, value := range item {
-			cloned[key] = value
+			cloned[key] = cloneJSONLikeValue(value)
 		}
 		out[i] = cloned
 	}
 	return out
+}
+
+func cloneJSONLikeValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			cloned[key] = cloneJSONLikeValue(nested)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, nested := range typed {
+			cloned[i] = cloneJSONLikeValue(nested)
+		}
+		return cloned
+	case []map[string]any:
+		cloned := make([]map[string]any, len(typed))
+		for i, nested := range typed {
+			if nestedMap, ok := cloneJSONLikeValue(nested).(map[string]any); ok {
+				cloned[i] = nestedMap
+			}
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 func snapshotPullRequestDetailKey(input ViewPullRequestInput) string {

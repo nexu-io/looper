@@ -170,7 +170,7 @@ func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) 
 			if strings.Contains(cmd, "pr list") {
 				prListCalls++
 				return shell.Result{Stdout: `[
-					{"number":1,"title":"PR 1","state":"OPEN","labels":[{"name":"bug"}],"baseRefName":"main","headRefOid":"sha-1","author":{"login":"octo"}}
+					{"number":1,"title":"PR 1","state":"OPEN","labels":[{"name":"bug"}],"baseRefName":"main","headRefOid":"sha-1","author":{"login":"octo"},"reviews":[{"state":"APPROVED","author":{"login":"reviewer"},"commit":{"oid":"sha-1"},"comments":[{"body":"ok"}]}]}
 				]`}, nil
 			}
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
@@ -183,6 +183,25 @@ func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) 
 		t.Fatalf("ListOpenPullRequests(first) error = %v", err)
 	}
 	first[0].Labels[0] = "mutated"
+	firstReviewAuthor, ok := first[0].Reviews[0]["author"].(map[string]any)
+	if !ok {
+		t.Fatalf("review author = %#v, want object", first[0].Reviews[0]["author"])
+	}
+	firstReviewAuthor["login"] = "mutated"
+	firstReviewCommit, ok := first[0].Reviews[0]["commit"].(map[string]any)
+	if !ok {
+		t.Fatalf("review commit = %#v, want object", first[0].Reviews[0]["commit"])
+	}
+	firstReviewCommit["oid"] = "mutated"
+	firstReviewComments, ok := first[0].Reviews[0]["comments"].([]any)
+	if !ok {
+		t.Fatalf("review comments = %#v, want array", first[0].Reviews[0]["comments"])
+	}
+	firstReviewComment, ok := firstReviewComments[0].(map[string]any)
+	if !ok {
+		t.Fatalf("review comment = %#v, want object", firstReviewComments[0])
+	}
+	firstReviewComment["body"] = "mutated"
 
 	now = now.Add(10 * time.Second)
 	secondCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
@@ -195,6 +214,31 @@ func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) 
 	}
 	if got := second[0].Labels[0]; got != "bug" {
 		t.Fatalf("cached label = %q, want cache to be isolated from caller mutation", got)
+	}
+	secondReviewAuthor, ok := second[0].Reviews[0]["author"].(map[string]any)
+	if !ok {
+		t.Fatalf("cached review author = %#v, want object", second[0].Reviews[0]["author"])
+	}
+	if got := secondReviewAuthor["login"]; got != "reviewer" {
+		t.Fatalf("cached review author login = %q, want cache to be isolated from caller mutation", got)
+	}
+	secondReviewCommit, ok := second[0].Reviews[0]["commit"].(map[string]any)
+	if !ok {
+		t.Fatalf("cached review commit = %#v, want object", second[0].Reviews[0]["commit"])
+	}
+	if got := secondReviewCommit["oid"]; got != "sha-1" {
+		t.Fatalf("cached review commit oid = %q, want cache to be isolated from caller mutation", got)
+	}
+	secondReviewComments, ok := second[0].Reviews[0]["comments"].([]any)
+	if !ok {
+		t.Fatalf("cached review comments = %#v, want array", second[0].Reviews[0]["comments"])
+	}
+	secondReviewComment, ok := secondReviewComments[0].(map[string]any)
+	if !ok {
+		t.Fatalf("cached review comment = %#v, want object", secondReviewComments[0])
+	}
+	if got := secondReviewComment["body"]; got != "ok" {
+		t.Fatalf("cached review comment body = %q, want cache to be isolated from caller mutation", got)
 	}
 
 	now = now.Add(31 * time.Second)
