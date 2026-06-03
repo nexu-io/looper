@@ -90,12 +90,12 @@ func (s *DiscoverySnapshot) ensureOpenPullRequests(ctx context.Context, input Li
 		return nil
 	}
 	requiredLimit := s.prLimit
-	prs, err := s.gateway.listOpenPullRequestsRaw(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: requiredLimit, Timeout: input.Timeout})
+	prs, err := s.gateway.listOpenPullRequestsForDiscovery(ctx, ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: requiredLimit, Timeout: input.Timeout})
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	s.openPRs = prs
+	s.openPRs = clonePullRequestSummaries(prs)
 	s.openPRsFetched = true
 	s.openPRsFetchRepo = input.Repo
 	s.openPRsFetchCWD = input.CWD
@@ -123,12 +123,12 @@ func (s *DiscoverySnapshot) ensureOpenIssues(ctx context.Context, input ListOpen
 		return nil
 	}
 	requiredLimit := s.issueLimit
-	issues, err := s.gateway.listOpenIssuesRaw(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: requiredLimit})
+	issues, err := s.gateway.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: requiredLimit})
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	s.openIssues = issues
+	s.openIssues = cloneIssueSummaries(issues)
 	s.openIssuesFetched = true
 	s.openIssuesFetchRepo = input.Repo
 	s.openIssuesFetchCWD = input.CWD
@@ -157,16 +157,66 @@ func (s *DiscoverySnapshot) viewPullRequest(ctx context.Context, input ViewPullR
 
 func (s *DiscoverySnapshot) filteredPullRequests(input ListOpenPullRequestsInput) []PullRequestSummary {
 	s.mu.Lock()
-	prs := append([]PullRequestSummary(nil), s.openPRs...)
+	prs := clonePullRequestSummaries(s.openPRs)
 	s.mu.Unlock()
 	return filterPullRequests(prs, input)
 }
 
 func (s *DiscoverySnapshot) filteredIssues(input ListOpenIssuesInput) []IssueSummary {
 	s.mu.Lock()
-	issues := append([]IssueSummary(nil), s.openIssues...)
+	issues := cloneIssueSummaries(s.openIssues)
 	s.mu.Unlock()
 	return filterIssues(issues, input)
+}
+
+func (g *Gateway) listOpenPullRequestsForDiscovery(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	if g.discoveryCacheTTL <= 0 {
+		return g.listOpenPullRequestsRaw(ctx, input)
+	}
+	key := discoveryPullRequestListCacheKey(input)
+	now := g.now().UTC()
+	g.discoveryCacheMu.Lock()
+	if entry, ok := g.discoveryPRCache[key]; ok && now.Before(entry.expiresAt) {
+		items := clonePullRequestSummaries(entry.items)
+		g.discoveryCacheMu.Unlock()
+		return items, nil
+	}
+	g.discoveryCacheMu.Unlock()
+
+	prs, err := g.listOpenPullRequestsRaw(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := g.now().UTC().Add(g.discoveryCacheTTL)
+	g.discoveryCacheMu.Lock()
+	g.discoveryPRCache[key] = discoveryPullRequestListCacheEntry{expiresAt: expiresAt, items: clonePullRequestSummaries(prs)}
+	g.discoveryCacheMu.Unlock()
+	return clonePullRequestSummaries(prs), nil
+}
+
+func (g *Gateway) listOpenIssuesForDiscovery(ctx context.Context, input ListOpenIssuesInput) ([]IssueSummary, error) {
+	if g.discoveryCacheTTL <= 0 {
+		return g.listOpenIssuesRaw(ctx, input)
+	}
+	key := discoveryIssueListCacheKey(input)
+	now := g.now().UTC()
+	g.discoveryCacheMu.Lock()
+	if entry, ok := g.discoveryIssueCache[key]; ok && now.Before(entry.expiresAt) {
+		items := cloneIssueSummaries(entry.items)
+		g.discoveryCacheMu.Unlock()
+		return items, nil
+	}
+	g.discoveryCacheMu.Unlock()
+
+	issues, err := g.listOpenIssuesRaw(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := g.now().UTC().Add(g.discoveryCacheTTL)
+	g.discoveryCacheMu.Lock()
+	g.discoveryIssueCache[key] = discoveryIssueListCacheEntry{expiresAt: expiresAt, items: cloneIssueSummaries(issues)}
+	g.discoveryCacheMu.Unlock()
+	return cloneIssueSummaries(issues), nil
 }
 
 func (s *DiscoverySnapshot) shouldFallbackToFilteredPullRequestQuery(input ListOpenPullRequestsInput, filteredCount int) bool {
@@ -292,6 +342,61 @@ func limitIssues(issues []IssueSummary, limit int) []IssueSummary {
 		return issues
 	}
 	return issues[:effective]
+}
+
+func discoveryPullRequestListCacheKey(input ListOpenPullRequestsInput) string {
+	return fmt.Sprintf("pr|%s|%s|%d", strings.TrimSpace(input.Repo), strings.TrimSpace(input.CWD), defaultLimit(input.Limit))
+}
+
+func discoveryIssueListCacheKey(input ListOpenIssuesInput) string {
+	return fmt.Sprintf("issue|%s|%s|%d", strings.TrimSpace(input.Repo), strings.TrimSpace(input.CWD), defaultLimit(input.Limit))
+}
+
+func clonePullRequestSummaries(prs []PullRequestSummary) []PullRequestSummary {
+	if len(prs) == 0 {
+		return nil
+	}
+	out := make([]PullRequestSummary, len(prs))
+	for i, pr := range prs {
+		out[i] = pr
+		out[i].Labels = append([]string(nil), pr.Labels...)
+		out[i].ReviewRequests = append([]string(nil), pr.ReviewRequests...)
+		out[i].ReviewRequestUsers = append([]GitHubUser(nil), pr.ReviewRequestUsers...)
+		out[i].Reviews = cloneObjectMaps(pr.Reviews)
+	}
+	return out
+}
+
+func cloneIssueSummaries(issues []IssueSummary) []IssueSummary {
+	if len(issues) == 0 {
+		return nil
+	}
+	out := make([]IssueSummary, len(issues))
+	for i, issue := range issues {
+		out[i] = issue
+		out[i].Assignees = append([]string(nil), issue.Assignees...)
+		out[i].AssigneeUsers = append([]GitHubUser(nil), issue.AssigneeUsers...)
+		out[i].Labels = append([]string(nil), issue.Labels...)
+	}
+	return out
+}
+
+func cloneObjectMaps(items []map[string]any) []map[string]any {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, len(items))
+	for i, item := range items {
+		if item == nil {
+			continue
+		}
+		cloned := make(map[string]any, len(item))
+		for key, value := range item {
+			cloned[key] = value
+		}
+		out[i] = cloned
+	}
+	return out
 }
 
 func snapshotPullRequestDetailKey(input ViewPullRequestInput) string {

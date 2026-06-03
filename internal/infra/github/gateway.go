@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -41,6 +42,7 @@ type Options struct {
 	GHPath                 string
 	CWD                    string
 	Now                    func() time.Time
+	DiscoveryCacheTTL      time.Duration
 	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
 	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
@@ -49,8 +51,22 @@ type Gateway struct {
 	ghPath                 string
 	cwd                    string
 	now                    func() time.Time
+	discoveryCacheTTL      time.Duration
+	discoveryCacheMu       sync.Mutex
+	discoveryPRCache       map[string]discoveryPullRequestListCacheEntry
+	discoveryIssueCache    map[string]discoveryIssueListCacheEntry
 	ghRun                  func(context.Context, shell.Options) (shell.Result, error)
 	reviewSubmitDiagnostic func(event string, fields map[string]any)
+}
+
+type discoveryPullRequestListCacheEntry struct {
+	expiresAt time.Time
+	items     []PullRequestSummary
+}
+
+type discoveryIssueListCacheEntry struct {
+	expiresAt time.Time
+	items     []IssueSummary
 }
 
 type PullRequestSummary struct {
@@ -634,7 +650,7 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
+	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {

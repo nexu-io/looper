@@ -74,11 +74,12 @@ func DefaultConfig(cwd string) (Config, error) {
 			BackupDir: stringPtr(backupDir),
 		},
 		Scheduler: SchedulerConfig{
-			PollIntervalSeconds:     30,
-			MaxConcurrentRuns:       3,
-			RetryMaxAttempts:        5,
-			RetryBaseDelayMS:        5000,
-			SlowLaneWarnThresholdMS: 5000,
+			PollIntervalSeconds:      30,
+			MaxConcurrentRuns:        3,
+			RetryMaxAttempts:         5,
+			RetryBaseDelayMS:         5000,
+			SlowLaneWarnThresholdMS:  5000,
+			DiscoveryCacheTTLSeconds: 30,
 		},
 		Webhook: WebhookConfig{
 			Enabled:                     false,

@@ -149,11 +149,12 @@ type StorageConfig struct {
 }
 
 type SchedulerConfig struct {
-	PollIntervalSeconds     int `json:"pollIntervalSeconds"`
-	MaxConcurrentRuns       int `json:"maxConcurrentRuns"`
-	RetryMaxAttempts        int `json:"retryMaxAttempts"`
-	RetryBaseDelayMS        int `json:"retryBaseDelayMs"`
-	SlowLaneWarnThresholdMS int `json:"slowLaneWarnThresholdMs"`
+	PollIntervalSeconds      int `json:"pollIntervalSeconds"`
+	MaxConcurrentRuns        int `json:"maxConcurrentRuns"`
+	RetryMaxAttempts         int `json:"retryMaxAttempts"`
+	RetryBaseDelayMS         int `json:"retryBaseDelayMs"`
+	SlowLaneWarnThresholdMS  int `json:"slowLaneWarnThresholdMs"`
+	DiscoveryCacheTTLSeconds int `json:"discoveryCacheTtlSeconds"`
 }
 
 type WebhookConfig struct {
@@ -665,11 +666,12 @@ type PartialStorageConfig struct {
 }
 
 type PartialSchedulerConfig struct {
-	PollIntervalSeconds     *int `json:"pollIntervalSeconds,omitempty"`
-	MaxConcurrentRuns       *int `json:"maxConcurrentRuns,omitempty"`
-	RetryMaxAttempts        *int `json:"retryMaxAttempts,omitempty"`
-	RetryBaseDelayMS        *int `json:"retryBaseDelayMs,omitempty"`
-	SlowLaneWarnThresholdMS *int `json:"slowLaneWarnThresholdMs,omitempty"`
+	PollIntervalSeconds      *int `json:"pollIntervalSeconds,omitempty"`
+	MaxConcurrentRuns        *int `json:"maxConcurrentRuns,omitempty"`
+	RetryMaxAttempts         *int `json:"retryMaxAttempts,omitempty"`
+	RetryBaseDelayMS         *int `json:"retryBaseDelayMs,omitempty"`
+	SlowLaneWarnThresholdMS  *int `json:"slowLaneWarnThresholdMs,omitempty"`
+	DiscoveryCacheTTLSeconds *int `json:"discoveryCacheTtlSeconds,omitempty"`
 }
 
 type PartialWebhookConfig struct {

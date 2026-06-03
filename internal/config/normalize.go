@@ -345,6 +345,10 @@ func mergeSchedulerConfig(config *SchedulerConfig, partial PartialSchedulerConfi
 	if partial.SlowLaneWarnThresholdMS != nil {
 		config.SlowLaneWarnThresholdMS = *partial.SlowLaneWarnThresholdMS
 	}
+
+	if partial.DiscoveryCacheTTLSeconds != nil {
+		config.DiscoveryCacheTTLSeconds = *partial.DiscoveryCacheTTLSeconds
+	}
 }
 
 func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {

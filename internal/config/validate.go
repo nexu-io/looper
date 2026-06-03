@@ -91,6 +91,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.slowLaneWarnThresholdMs", Message: "must be a positive integer"})
 	}
 
+	if config.Scheduler.DiscoveryCacheTTLSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "scheduler.discoveryCacheTtlSeconds", Message: "must be an integer >= 0"})
+	}
+
 	if config.Webhook.FallbackPollIntervalSeconds < 60 {
 		issues = append(issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
 	}

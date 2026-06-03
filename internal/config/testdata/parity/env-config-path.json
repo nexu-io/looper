@@ -21,7 +21,8 @@
           "maxConcurrentRuns": 4,
           "retryMaxAttempts": 7,
           "retryBaseDelayMs": 1500,
-          "slowLaneWarnThresholdMs": 5000
+          "slowLaneWarnThresholdMs": 5000,
+          "discoveryCacheTtlSeconds": 30
         },
         "agent": {
           "vendor": "codex",
@@ -112,7 +113,8 @@
         "maxConcurrentRuns": 4,
         "retryMaxAttempts": 7,
         "retryBaseDelayMs": 1500,
-        "slowLaneWarnThresholdMs": 5000
+        "slowLaneWarnThresholdMs": 5000,
+        "discoveryCacheTtlSeconds": 30
       },
       "webhook": {
         "enabled": false,

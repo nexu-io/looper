@@ -541,7 +541,7 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
-	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now})
+	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	projectService := &projects.Service{
 		DB:     coordinator.DB(),
 		Repos:  repositories,

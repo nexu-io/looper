@@ -2871,7 +2871,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	contents := `{
 		"server": {"port": 0, "authMode": "local-token"},
 		"storage": {"mode": "memory"},
-		"scheduler": {"pollIntervalSeconds": 2},
+		"scheduler": {"pollIntervalSeconds": 2, "discoveryCacheTtlSeconds": -1},
 		"logging": {"level": "verbose", "maxFiles": 0},
 		"daemon": {"mode": "invalid", "shutdownTimeoutMs": 0},
 		"defaults": {"openPrStrategy": "unsupported"},
@@ -2897,6 +2897,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "server.localToken", "is required when authMode is local-token")
 	assertValidationIssue(t, validationErr, "storage.mode", "must be sqlite")
 	assertValidationIssue(t, validationErr, "scheduler.pollIntervalSeconds", "must be an integer >= 10")
+	assertValidationIssue(t, validationErr, "scheduler.discoveryCacheTtlSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "logging.level", "must be one of: debug, info, warn, error")
 	assertValidationIssue(t, validationErr, "logging.maxFiles", "must be a positive integer")
 	assertValidationIssue(t, validationErr, "daemon.mode", "must be one of: foreground, launchd")
