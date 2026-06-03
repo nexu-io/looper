@@ -1188,6 +1188,10 @@ func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy
 }
 
 func routedReviewerClaimDecision(policy DiscoveryPolicy, currentLogin string, author string, labels []string, reviewRequests []networkpolicy.GitHubUser) networkpolicy.ClaimDecision {
+	if reviewRequests == nil {
+		localUser := networkpolicy.GitHubUser{Login: policy.RoutedClaimPolicy.GitHubLogin, ID: policy.RoutedClaimPolicy.GitHubUserID}
+		return networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, labels, []networkpolicy.GitHubUser{localUser})
+	}
 	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, labels, reviewRequests)
 	if decision.Allowed {
 		return decision
@@ -1208,7 +1212,7 @@ func routedReviewerClaimDecision(policy DiscoveryPolicy, currentLogin string, au
 }
 
 func (r *Runner) routedReviewerClaimDecisionWithCurrentLogin(ctx context.Context, cwd string, policy DiscoveryPolicy, currentLogin string, author string, labels []string, reviewRequests []networkpolicy.GitHubUser) (networkpolicy.ClaimDecision, string, error) {
-	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, labels, reviewRequests)
+	decision := routedReviewerClaimDecision(policy, currentLogin, author, labels, reviewRequests)
 	if decision.Allowed || !policy.EnableSelfReview || decision.Reason != "local GitHub identity is not requested for review" {
 		return decision, currentLogin, nil
 	}
@@ -1560,7 +1564,7 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	if err != nil {
 		return err
 	}
-	decision := networkpolicy.EvaluateReviewer(policy.RoutedClaimPolicy, detail.Labels, detail.ReviewRequestUsers)
+	decision := routedReviewerClaimDecision(policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	if !decision.Allowed && policy.EnableSelfReview && decision.Reason == "local GitHub identity is not requested for review" {
 		currentLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if lookupErr != nil {
