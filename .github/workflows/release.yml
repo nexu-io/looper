@@ -609,6 +609,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
         run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          raw_assets = [
+              "looper-darwin-arm64",
+              "looper-darwin-arm64.sha256",
+              "looper-linux-amd64",
+              "looper-linux-amd64.sha256",
+              "looperd-darwin-arm64",
+              "looperd-darwin-arm64.sha256",
+              "looperd-linux-amd64",
+              "looperd-linux-amd64.sha256",
+          ]
+          release = json.loads(
+              subprocess.run(
+                  ["gh", "release", "view", os.environ["RELEASE_TAG"], "--json", "assets"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+          )
+          assets = {asset["name"] for asset in release["assets"]}
+          for asset in raw_assets:
+              if asset in assets:
+                  subprocess.run(
+                      ["gh", "release", "delete-asset", os.environ["RELEASE_TAG"], asset, "--yes"],
+                      check=True,
+                  )
+          PY
+
           gh release upload "$RELEASE_TAG" \
             release-assets/looper-darwin-arm64.tar.gz \
             release-assets/looper-darwin-arm64.tar.gz.sha256 \
