@@ -198,14 +198,20 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 
 	reasonCopy := reason
-	if terminal {
+	complete := func() (any, error) {
+		if !terminal {
+			return result, nil
+		}
 		terminated, err := services.Loops.Terminate(ctx, loopID, &reasonCopy)
 		if err != nil {
 			return nil, err
 		}
 		result.Stopped = true
 		result.LoopID = terminated.Loop.ID
-	} else {
+		return result, nil
+	}
+
+	if !terminal {
 		paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
 		if err != nil {
 			return nil, err
@@ -215,28 +221,34 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 
 	if services.Repositories == nil || services.Repositories.Runs == nil {
-		return result, nil
+		return complete()
 	}
 
 	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
-	if err != nil || latestRun == nil || latestRun.Status != "running" {
-		return result, err
+	if err != nil {
+		return nil, err
+	}
+	if latestRun == nil || latestRun.Status != "running" {
+		return complete()
 	}
 	result.RunID = latestRun.ID
 
 	if services.Repositories.AgentExecutions == nil {
-		return result, nil
+		return complete()
 	}
 
 	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
-	if err != nil || latestExecution == nil {
-		return result, err
+	if err != nil {
+		return nil, err
+	}
+	if latestExecution == nil {
+		return complete()
 	}
 
 	result.ExecutionID = latestExecution.ID
 	result.Vendor = latestExecution.Vendor
 	if !isStoppableExecutionStatus(latestExecution.Status) {
-		return result, nil
+		return complete()
 	}
 	if services.ActiveExecutions != nil {
 		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
@@ -247,11 +259,11 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 				return nil, err
 			}
-			return result, nil
+			return complete()
 		}
 	}
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
-		return result, nil
+		return complete()
 	}
 
 	pid := int(*latestExecution.PID)
@@ -261,7 +273,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			return nil, err
 		}
 		if !running || !matches {
-			return result, nil
+			return complete()
 		}
 	}
 	result.PID = *latestExecution.PID
@@ -275,7 +287,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return nil, err
 	}
 
-	return result, nil
+	return complete()
 }
 
 type stopAllResult string
