@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,8 +26,8 @@ func TestOpenSQLiteCoordinatorCreatesParentDirAndAppliesPragmas(t *testing.T) {
 		}
 	})
 
-	if got := coordinator.DB().Stats().MaxOpenConnections; got != 1 {
-		t.Fatalf("db.Stats().MaxOpenConnections = %d, want 1", got)
+	if got := coordinator.DB().Stats().MaxOpenConnections; got != sqliteMaxOpenConnections {
+		t.Fatalf("db.Stats().MaxOpenConnections = %d, want %d", got, sqliteMaxOpenConnections)
 	}
 
 	if got := readStringPragmaForTest(t, coordinator.DB(), `PRAGMA journal_mode;`); got != "wal" {
@@ -39,6 +40,113 @@ func TestOpenSQLiteCoordinatorCreatesParentDirAndAppliesPragmas(t *testing.T) {
 
 	if got := readForeignKeysPragmaForTest(t, coordinator.DB()); !got {
 		t.Fatal("PRAGMA foreign_keys = false, want true")
+	}
+}
+
+func TestOpenSQLiteDBAppliesPragmasToMultipleConnections(t *testing.T) {
+	t.Parallel()
+
+	db, err := OpenSQLiteDB(context.Background(), filepath.Join(t.TempDir(), "looper.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close() error = %v", err)
+		}
+	})
+
+	ctx := context.Background()
+	conns := make([]*sql.Conn, 0, sqliteMaxOpenConnections)
+	for i := 0; i < sqliteMaxOpenConnections; i++ {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("db.Conn() #%d error = %v", i, err)
+		}
+		conns = append(conns, conn)
+	}
+	t.Cleanup(func() {
+		for _, conn := range conns {
+			if err := conn.Close(); err != nil {
+				t.Fatalf("conn.Close() error = %v", err)
+			}
+		}
+	})
+
+	for i, conn := range conns {
+		if got := readIntPragmaFromConnForTest(t, conn, `PRAGMA foreign_keys;`); got != 1 {
+			t.Fatalf("conn %d PRAGMA foreign_keys = %d, want 1", i, got)
+		}
+		if got := readIntPragmaFromConnForTest(t, conn, `PRAGMA busy_timeout;`); got != sqliteBusyTimeoutMilliseconds {
+			t.Fatalf("conn %d PRAGMA busy_timeout = %d, want %d", i, got, sqliteBusyTimeoutMilliseconds)
+		}
+		if got := readStringPragmaFromConnForTest(t, conn, `PRAGMA journal_mode;`); got != "wal" {
+			t.Fatalf("conn %d PRAGMA journal_mode = %q, want %q", i, got, "wal")
+		}
+	}
+}
+
+func TestOpenSQLiteDBAllowsReadDuringWriteTransaction(t *testing.T) {
+	t.Parallel()
+
+	db, err := OpenSQLiteDB(context.Background(), filepath.Join(t.TempDir(), "looper.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close() error = %v", err)
+		}
+	})
+
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`); err != nil {
+		t.Fatalf("db.ExecContext(CREATE TABLE) error = %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO widgets (id, name) VALUES (1, 'alpha')`); err != nil {
+		t.Fatalf("db.ExecContext(INSERT) error = %v", err)
+	}
+
+	writerConn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn(writer) error = %v", err)
+	}
+	defer writerConn.Close()
+
+	tx, err := writerConn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("writerConn.BeginTx() error = %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `UPDATE widgets SET name = 'beta' WHERE id = 1`); err != nil {
+		t.Fatalf("tx.ExecContext(UPDATE) error = %v", err)
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	resultCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		var name string
+		err := db.QueryRowContext(readCtx, `SELECT name FROM widgets WHERE id = 1`).Scan(&name)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- name
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("read during write returned error = %v", err)
+	case name := <-resultCh:
+		if name != "alpha" {
+			t.Fatalf("read during write name = %q, want %q", name, "alpha")
+		}
+	case <-readCtx.Done():
+		t.Fatalf("read during write timed out: %v", readCtx.Err())
 	}
 }
 
@@ -324,12 +432,34 @@ func readStringPragmaForTest(t *testing.T, db *sql.DB, query string) string {
 	return value
 }
 
+func readStringPragmaFromConnForTest(t *testing.T, conn *sql.Conn, query string) string {
+	t.Helper()
+
+	var value string
+	if err := conn.QueryRowContext(context.Background(), query).Scan(&value); err != nil {
+		t.Fatalf("conn.QueryRowContext(%q).Scan() error = %v", query, err)
+	}
+
+	return strings.ToLower(value)
+}
+
 func readIntPragmaForTest(t *testing.T, db *sql.DB, query string) int {
 	t.Helper()
 
 	var value int
 	if err := db.QueryRow(query).Scan(&value); err != nil {
 		t.Fatalf("db.QueryRow(%q).Scan() error = %v", query, err)
+	}
+
+	return value
+}
+
+func readIntPragmaFromConnForTest(t *testing.T, conn *sql.Conn, query string) int {
+	t.Helper()
+
+	var value int
+	if err := conn.QueryRowContext(context.Background(), query).Scan(&value); err != nil {
+		t.Fatalf("conn.QueryRowContext(%q).Scan() error = %v", query, err)
 	}
 
 	return value

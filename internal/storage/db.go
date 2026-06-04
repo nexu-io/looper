@@ -4,13 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-const sqliteBusyTimeoutMilliseconds = 5000
+const (
+	sqliteBusyTimeoutMilliseconds = 5000
+	sqliteMaxOpenConnections      = 4
+)
 
 type SQLiteCoordinatorOptions struct {
 	Migrations []EmbeddedMigration
@@ -50,13 +54,17 @@ func OpenSQLiteDB(ctx context.Context, dbPath string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open(DriverName, dbPath)
+	db, err := sql.Open(DriverName, sqliteDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	maxConns := sqliteMaxOpenConnections
+	if dbPath == ":memory:" {
+		maxConns = 1
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
@@ -162,6 +170,42 @@ func ensureSQLiteParentDir(dbPath string) error {
 	}
 
 	return nil
+}
+
+func sqliteDSN(dbPath string) string {
+	params := map[string]string{
+		"_foreign_keys": "on",
+		"_busy_timeout": fmt.Sprintf("%d", sqliteBusyTimeoutMilliseconds),
+		"_journal_mode": "WAL",
+	}
+	if dbPath == ":memory:" {
+		values := url.Values{}
+		values.Set("mode", "memory")
+		for key, value := range params {
+			values.Set(key, value)
+		}
+		return "file::memory:?" + values.Encode()
+	}
+
+	if strings.HasPrefix(dbPath, "file:") {
+		parsed, err := url.Parse(dbPath)
+		if err != nil {
+			return dbPath
+		}
+
+		query := parsed.Query()
+		for key, value := range params {
+			query.Set(key, value)
+		}
+		parsed.RawQuery = query.Encode()
+		return parsed.String()
+	}
+
+	values := url.Values{}
+	for key, value := range params {
+		values.Set(key, value)
+	}
+	return dbPath + "?" + values.Encode()
 }
 
 func applySQLitePragmas(ctx context.Context, db *sql.DB) error {

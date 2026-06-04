@@ -5730,6 +5730,26 @@ func TestActiveRunDetailIncludesRunningLoopWithoutRun(t *testing.T) {
 	assertEqual(t, target["label"], "acme/looper#43")
 }
 
+func TestProjectNamesByIDPreservesEmptyAndTrimmedNames(t *testing.T) {
+	projectsList := []storage.ProjectRecord{
+		{ID: "project_1", Name: "  Looper  "},
+		{ID: "project_2", Name: ""},
+		{ID: "project_3", Name: "   "},
+	}
+
+	got := projectNamesByID(projectsList)
+
+	assertEqual(t, got["project_1"], "Looper")
+	assertEqual(t, got["project_2"], "")
+	assertEqual(t, got["project_3"], "")
+	if _, ok := got["missing"]; ok {
+		t.Fatalf("unexpected entry for missing project: %#v", got)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(got) = %d, want 3", len(got))
+	}
+}
+
 type testFixture struct {
 	rootDir string
 	now     time.Time

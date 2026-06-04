@@ -2643,6 +2643,10 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 	for _, loop := range loopsList {
 		loopsByID[loop.ID] = loop
 	}
+	projectNamesByID, err := loadProjectNamesByIDForActiveRunTargets(ctx, services.Repositories.Projects, loopsList)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
 
 	queuedLoopIDs := make(map[string]struct{})
 	latestQueueByLoopID := latestQueueItemByLoopID(queueItems)
@@ -2676,7 +2680,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			continue
 		}
 		plausiblyLiveRunningLoopIDs[run.LoopID] = struct{}{}
-		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
+		target, ok, err := h.tryBuildActiveRunTarget(loop, projectNamesByID)
 		if err != nil {
 			return nil, err
 		}
@@ -2720,7 +2724,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 
 	queuedViews := make([]activeRunView, 0, len(queuedLoops))
 	for _, loop := range queuedLoops {
-		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
+		target, ok, err := h.tryBuildActiveRunTarget(loop, projectNamesByID)
 		if err != nil {
 			return nil, err
 		}
@@ -2748,7 +2752,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 
 	runningLoopViews := make([]activeRunView, 0, len(runningLoopsWithoutRuns))
 	for _, loop := range runningLoopsWithoutRuns {
-		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
+		target, ok, err := h.tryBuildActiveRunTarget(loop, projectNamesByID)
 		if err != nil {
 			return nil, err
 		}
@@ -2795,7 +2799,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		if !includeInactiveLoops && !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
 			continue
 		}
-		target, ok, err := h.tryBuildActiveRunTarget(ctx, loop)
+		target, ok, err := h.tryBuildActiveRunTarget(loop, projectNamesByID)
 		if err != nil {
 			return nil, err
 		}
@@ -3112,7 +3116,35 @@ func runningLoopWithoutRunIsFresh(loop storage.LoopRecord, now time.Time, ttl ti
 	return !parsed.UTC().Before(now.UTC().Add(-ttl))
 }
 
-func (h *Handler) tryBuildActiveRunTarget(ctx context.Context, loop storage.LoopRecord) (activeRunTarget, bool, error) {
+func loadProjectNamesByIDForActiveRunTargets(ctx context.Context, repo *storage.ProjectsRepository, loopsList []storage.LoopRecord) (map[string]string, error) {
+	if !hasProjectActiveRunTarget(loopsList) {
+		return map[string]string{}, nil
+	}
+	projectsList, err := repo.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return projectNamesByID(projectsList), nil
+}
+
+func hasProjectActiveRunTarget(loopsList []storage.LoopRecord) bool {
+	for _, loop := range loopsList {
+		if loop.TargetType == string(domain.LoopTargetTypeProject) {
+			return true
+		}
+	}
+	return false
+}
+
+func projectNamesByID(projectsList []storage.ProjectRecord) map[string]string {
+	result := make(map[string]string, len(projectsList))
+	for _, project := range projectsList {
+		result[project.ID] = strings.TrimSpace(project.Name)
+	}
+	return result
+}
+
+func (h *Handler) tryBuildActiveRunTarget(loop storage.LoopRecord, projectNamesByID map[string]string) (activeRunTarget, bool, error) {
 	switch loop.TargetType {
 	case string(domain.LoopTargetTypeProject):
 		projectID := ""
@@ -3126,12 +3158,8 @@ func (h *Handler) tryBuildActiveRunTarget(ctx context.Context, loop storage.Loop
 			return activeRunTarget{}, false, nil
 		}
 		label := projectID
-		project, err := h.context.Runtime.Services().Repositories.Projects.GetByID(ctx, projectID)
-		if err != nil {
-			return activeRunTarget{}, false, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-		}
-		if project != nil && strings.TrimSpace(project.Name) != "" {
-			label = project.Name
+		if name := strings.TrimSpace(projectNamesByID[projectID]); name != "" {
+			label = name
 		}
 		return activeRunTarget{Type: string(domain.LoopTargetTypeProject), ProjectID: &projectID, Label: label}, true, nil
 	case string(domain.LoopTargetTypeIssue):
