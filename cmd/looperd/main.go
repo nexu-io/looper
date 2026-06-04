@@ -119,6 +119,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		StopLoop: func(ctx context.Context, loopID, reason string) (any, error) {
 			return stopLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
+		CloseLoop: func(ctx context.Context, loopID, reason string) (any, error) {
+			return closeLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+		},
 		StopAll: func(ctx context.Context, reason string) (any, error) {
 			return stopAllLoops(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
@@ -181,18 +184,35 @@ func (d *daemonRuntime) WaitForShutdown() {
 }
 
 func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (any, error) {
+	return haltLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess, false)
+}
+
+func closeLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (any, error) {
+	return haltLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess, true)
+}
+
+func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
 	result := stopLoopResult{Stopped: false, LoopID: loopID}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
 	}
 
 	reasonCopy := reason
-	paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
-	if err != nil {
-		return nil, err
+	if terminal {
+		terminated, err := services.Loops.Terminate(ctx, loopID, &reasonCopy)
+		if err != nil {
+			return nil, err
+		}
+		result.Stopped = true
+		result.LoopID = terminated.Loop.ID
+	} else {
+		paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
+		if err != nil {
+			return nil, err
+		}
+		result.Stopped = true
+		result.LoopID = paused.Loop.ID
 	}
-	result.Stopped = true
-	result.LoopID = paused.Loop.ID
 
 	if services.Repositories == nil || services.Repositories.Runs == nil {
 		return result, nil

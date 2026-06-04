@@ -88,10 +88,10 @@ var terminalRunStatuses = map[RunStatus]struct{}{
 }
 
 var loopStatusTransitions = map[LoopStatus][]LoopStatus{
-	LoopStatusIdle:        {LoopStatusQueued, LoopStatusPaused},
-	LoopStatusQueued:      {LoopStatusRunning, LoopStatusPaused},
+	LoopStatusIdle:        {LoopStatusQueued, LoopStatusPaused, LoopStatusTerminated},
+	LoopStatusQueued:      {LoopStatusRunning, LoopStatusPaused, LoopStatusTerminated},
 	LoopStatusRunning:     {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusTerminated},
-	LoopStatusPaused:      {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped},
+	LoopStatusPaused:      {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusWaiting:     {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusStopped:     {},
 	LoopStatusTerminated:  {},

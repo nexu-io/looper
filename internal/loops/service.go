@@ -38,6 +38,11 @@ type PauseResult struct {
 	CancelledQueueItems int64
 }
 
+type TerminateResult struct {
+	Loop                storage.LoopRecord
+	CancelledQueueItems int64
+}
+
 func (s *Service) Create(ctx context.Context, input CreateInput) (storage.LoopRecord, error) {
 	if s.DB == nil || s.Repos == nil || s.Repos.Loops == nil {
 		return storage.LoopRecord{}, fmt.Errorf("loops service is not configured")
@@ -216,6 +221,45 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 	})
 	if err != nil {
 		return PauseResult{}, err
+	}
+	return result, nil
+}
+
+func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) (TerminateResult, error) {
+	if s.DB == nil || s.Repos == nil || s.Repos.Queue == nil {
+		return TerminateResult{}, fmt.Errorf("loops service is not configured")
+	}
+	now := s.currentTime()
+	result, err := storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (TerminateResult, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return TerminateResult{}, err
+		}
+		if loop == nil {
+			return TerminateResult{}, fmt.Errorf("loop not found: %s", loopID)
+		}
+		currentStatus := domain.LoopStatus(loop.Status)
+		if currentStatus != domain.LoopStatusTerminated {
+			if err := domain.AssertLoopStatusTransition(currentStatus, domain.LoopStatusTerminated); err != nil {
+				return TerminateResult{}, err
+			}
+		}
+		updated := *loop
+		updated.Status = string(domain.LoopStatusTerminated)
+		updated.NextRunAt = nil
+		updated.UpdatedAt = eventlog.FormatJavaScriptISOString(now)
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return TerminateResult{}, err
+		}
+		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)
+		if err != nil {
+			return TerminateResult{}, err
+		}
+		return TerminateResult{Loop: updated, CancelledQueueItems: cancelled}, nil
+	})
+	if err != nil {
+		return TerminateResult{}, err
 	}
 	return result, nil
 }

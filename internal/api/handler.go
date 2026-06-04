@@ -138,6 +138,7 @@ type Context struct {
 	RecoverySummary      func() any
 	ReconcileStaleRuns   func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
 	StopLoop             func(context.Context, string, string) (any, error)
+	CloseLoop            func(context.Context, string, string) (any, error)
 	StopAll              func(context.Context, string) (any, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
@@ -2555,6 +2556,18 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 			return nil, err
 		}
 		return h.context.StopLoop(r.Context(), loop.ID, fmt.Sprintf("Stopped by user via selector %s", selector))
+	case "close":
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		if h.context.CloseLoop == nil {
+			return nil, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
+		}
+		loop, err := h.resolveLoop(r.Context(), selector)
+		if err != nil {
+			return nil, err
+		}
+		return h.context.CloseLoop(r.Context(), loop.ID, fmt.Sprintf("Closed by user via selector %s", selector))
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}

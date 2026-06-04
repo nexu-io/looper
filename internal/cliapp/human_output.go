@@ -704,6 +704,18 @@ func writeHumanStopLoop(w io.Writer, payload json.RawMessage) error {
 	return nil
 }
 
+func writeHumanCloseLoop(w io.Writer, payload json.RawMessage) error {
+	var data pullRequestOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode close response: %w", err)
+	}
+	printSection(w, "Loop closed", [][2]any{{"loopId", data.LoopID}, {"runId", data.RunID}, {"executionId", data.ExecutionID}, {"vendor", data.Vendor}, {"pid", data.PID}, {"closed", data.Stopped}})
+	if !data.Stopped {
+		return fmt.Errorf("Loop %s could not be closed", data.LoopID)
+	}
+	return nil
+}
+
 func writeHumanStopAll(w io.Writer, payload json.RawMessage) error {
 	var data stopAllOutput
 	if err := json.Unmarshal(payload, &data); err != nil {

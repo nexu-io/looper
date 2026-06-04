@@ -575,6 +575,16 @@ func (r *commandRuntime) stopLoop(cmd *cobra.Command, args []string) error {
 	}, writeHumanStopLoop)
 }
 
+func (r *commandRuntime) closeLoop(cmd *cobra.Command, args []string) error {
+	selector := strings.TrimSpace(args[0])
+	if selector == "all" {
+		return fmt.Errorf("close all is not supported; close individual loops explicitly")
+	}
+	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
+		return r.postJSON(ctx, "/api/v1/runs/active/"+url.PathEscape(selector)+"/close", nil)
+	}, writeHumanCloseLoop)
+}
+
 func stopAllFailedCount(payload json.RawMessage) (int, error) {
 	var data struct {
 		Summary struct {

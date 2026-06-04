@@ -414,6 +414,69 @@ func TestSignalAgentProcessGroupDoesNotEscalateAfterESRCH(t *testing.T) {
 	}
 }
 
+func TestCloseLoopTerminatesLoopAndCancelsActiveQueue(t *testing.T) {
+	ctx := context.Background()
+	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = coordinator.Close()
+	})
+
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-21T12:00:00.000Z"
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_queued", Seq: 31, ProjectID: project.ID, Type: "worker", TargetType: "project", Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queueID := "queue_queued"
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: &project.ID, LoopID: &loop.ID, Type: "worker", TargetType: "project", TargetID: project.ID, DedupeKey: "worker:queued", Priority: 1, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	services := looperdruntime.Services{
+		Coordinator:  coordinator,
+		Repositories: repos,
+		Loops:        &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }},
+	}
+
+	gotResult, err := closeLoop(ctx, services, loop.ID, "Closed by test", func() time.Time { return now }, nil, nil)
+	if err != nil {
+		t.Fatalf("closeLoop() error = %v", err)
+	}
+	result, ok := gotResult.(stopLoopResult)
+	if !ok {
+		t.Fatalf("closeLoop() result type = %T, want stopLoopResult", gotResult)
+	}
+	if !result.Stopped || result.LoopID != loop.ID {
+		t.Fatalf("closeLoop() result = %#v", result)
+	}
+
+	storedLoop, err := repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if storedLoop == nil || storedLoop.Status != "terminated" || storedLoop.NextRunAt != nil {
+		t.Fatalf("Loops.GetByID() = %#v, want terminated loop without next run", storedLoop)
+	}
+	storedQueue, err := repos.Queue.GetByID(ctx, queueID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if storedQueue == nil || storedQueue.Status != "cancelled" || storedQueue.LastError == nil || *storedQueue.LastError != "Closed by test" {
+		t.Fatalf("Queue.GetByID() = %#v, want cancelled queue item with close reason", storedQueue)
+	}
+}
+
 func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})

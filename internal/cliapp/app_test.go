@@ -3384,6 +3384,35 @@ func TestStopAllWithoutJSONUsesStopAllRoute(t *testing.T) {
 	}
 }
 
+func TestCloseWithoutJSONUsesCloseRoute(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/runs/active/12/close"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_close", map[string]any{"stopped": true, "loopId": "loop_12"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "close", "12", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([close 12]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([close 12]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop closed", "loop_12", "closed"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([close 12]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestStopAllWithoutJSONPrintsNoRunningWorkMessage(t *testing.T) {
 	t.Parallel()
 

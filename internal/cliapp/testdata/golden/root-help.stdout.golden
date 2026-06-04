@@ -32,6 +32,7 @@ Subcommands:
   pause      Pause a loop by sequence number
   unpause    Resume a paused loop by sequence number
   stop       Stop an active loop
+  close      Terminally close a loop
   run        Run commands
 
 Flags:
