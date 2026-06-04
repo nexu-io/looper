@@ -6327,6 +6327,43 @@ func TestRunPrepareWorktreeStepPersistsCreatedWorktreeBeforeManualIntervention(t
 	}
 }
 
+func TestDiscoverPullRequestsUsesReviewRequestedQueryWhenReviewRequestRequired(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentLogin: "OctoCat",
+		reviewRequestedPullRequests: []PullRequestSummary{{
+			Number:             77,
+			Title:              "Window-external review request",
+			State:              "OPEN",
+			HeadSHA:            "head77",
+			BaseSHA:            "base77",
+			Author:             "contributor",
+			ReviewRequests:     []string{"octocat"},
+			ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "octocat"}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", Limit: 10})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(github.listCalls) != 0 {
+		t.Fatalf("generic list calls = %#v, want targeted review-request query only", github.listCalls)
+	}
+	if len(github.listReviewRequestedCalls) != 1 {
+		t.Fatalf("review-requested calls = %#v, want one call", github.listReviewRequestedCalls)
+	}
+	call := github.listReviewRequestedCalls[0]
+	if call.Reviewer != "octocat" || call.Limit != 10 {
+		t.Fatalf("review-requested call = %#v, want normalized reviewer and discovery limit", call)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 77 {
+		t.Fatalf("queue items = %#v, want PR 77 queued", result.QueueItems)
+	}
+}
+
 func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -7941,6 +7978,8 @@ type fakeGitHubGateway struct {
 	addLabelCalls                   []PullRequestLabelsInput
 	removeLabelCalls                []PullRequestLabelsInput
 	listCalls                       []ListOpenPullRequestsInput
+	listReviewRequestedCalls        []ListReviewRequestedPullRequestsInput
+	reviewRequestedPullRequests     []PullRequestSummary
 	listOpenByLabel                 map[string][]PullRequestSummary
 }
 
@@ -7948,6 +7987,30 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 	g.listCalls = append(g.listCalls, input)
 	if g.listOpenByLabel != nil {
 		return append([]PullRequestSummary(nil), g.listOpenByLabel[input.Label]...), nil
+	}
+	reviewRequests := g.effectiveReviewRequests()
+	headSHA := g.listHeadSHA
+	if headSHA == "" {
+		headSHA = "abc123"
+	}
+	author := g.effectiveAuthor()
+	users := append([]networkpolicy.GitHubUser(nil), g.reviewRequestUsers...)
+	if len(users) == 0 && reviewRequests != nil {
+		users = make([]networkpolicy.GitHubUser, 0, len(reviewRequests))
+		for _, login := range reviewRequests {
+			users = append(users, networkpolicy.GitHubUser{Login: login})
+		}
+	}
+	return []PullRequestSummary{{Number: 42, Title: "Review me", State: "OPEN", ReviewDecision: g.reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HasConflicts: g.hasConflicts, Author: author, ReviewRequests: reviewRequests, ReviewRequestUsers: users, Reviews: cloneCommentMaps(g.reviews)}, {Number: 99, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", BaseSHA: "base123", Author: author, ReviewRequests: reviewRequests, ReviewRequestUsers: users}}, nil
+}
+
+func (g *fakeGitHubGateway) ListReviewRequestedPullRequests(_ context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
+	g.listReviewRequestedCalls = append(g.listReviewRequestedCalls, input)
+	if g.reviewRequestedPullRequests != nil {
+		return append([]PullRequestSummary(nil), g.reviewRequestedPullRequests...), nil
+	}
+	if g.listOpenByLabel != nil {
+		return append([]PullRequestSummary(nil), g.listOpenByLabel[""]...), nil
 	}
 	reviewRequests := g.effectiveReviewRequests()
 	headSHA := g.listHeadSHA

@@ -791,6 +791,8 @@ Common fields:
 
 Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
 
+When reviewer `triggers.requireReviewRequest=true` and no reviewer label filter is configured, discovery queries GitHub directly for PRs review-requested from the current GitHub user. This avoids missing requested reviews that fall outside the generic open-PR discovery window. Reviewer label filters keep using the labeled open-PR query path and are still applied before queuing.
+
 Sweeper terminology used in config, logs, and future operator surfaces:
 
 - **case**: the mutable lifecycle record for one issue or pull request

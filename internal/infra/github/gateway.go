@@ -501,6 +501,14 @@ type ListOpenPullRequestsInput struct {
 	Timeout     time.Duration
 }
 
+type ListReviewRequestedPullRequestsInput struct {
+	Repo     string
+	CWD      string
+	Limit    int
+	Reviewer string
+	Timeout  time.Duration
+}
+
 type ListOpenIssuesInput struct {
 	Repo     string
 	CWD      string
@@ -658,6 +666,85 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 		return snapshot.listOpenPullRequests(ctx, input)
 	}
 	return g.listOpenPullRequestsRaw(ctx, input)
+}
+
+func (g *Gateway) ListReviewRequestedPullRequests(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
+	reviewer := normalizeGitHubLogin(input.Reviewer)
+	if reviewer == "" {
+		return nil, fmt.Errorf("review requester login is required")
+	}
+	query := `
+query($searchQuery: String!, $first: Int!) {
+  search(type: ISSUE, query: $searchQuery, first: $first) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        state
+        updatedAt
+        isDraft
+        reviewDecision
+        labels(first: 20) { nodes { name } }
+        headRefName
+        baseRefName
+        headRefOid
+        baseRefOid
+        mergeStateStatus
+        author { login }
+        reviews(last: 20) {
+          nodes {
+            state
+            author { login }
+            submittedAt
+            updatedAt
+          }
+        }
+      }
+    }
+  }
+}`
+	searchQuery := fmt.Sprintf("repo:%s is:pr is:open review-requested:%s", input.Repo, reviewer)
+	timeout := input.Timeout
+	if timeout <= 0 {
+		timeout = defaultGhCommandTimeout
+	}
+	result, err := g.runGhWithTimeout(ctx, input.CWD, "", timeout, "api", "graphql", "-f", "query="+query, "-F", "searchQuery="+searchQuery, "-F", fmt.Sprintf("first=%d", defaultLimit(input.Limit)))
+	if err != nil {
+		return nil, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	nodes := digNodes(row, "data", "search")
+	out := make([]PullRequestSummary, 0, len(nodes))
+	for _, node := range nodes {
+		number := asInt64(node["number"])
+		if number <= 0 {
+			continue
+		}
+		out = append(out, PullRequestSummary{
+			Number:             number,
+			Title:              asString(node["title"]),
+			URL:                asString(node["url"]),
+			State:              asString(node["state"]),
+			UpdatedAt:          asString(node["updatedAt"]),
+			IsDraft:            asBool(node["isDraft"]),
+			ReviewDecision:     asString(node["reviewDecision"]),
+			Labels:             extractLabelNamesFromConnection(node["labels"]),
+			HeadRefName:        asString(node["headRefName"]),
+			BaseRefName:        asString(node["baseRefName"]),
+			HeadSHA:            asString(node["headRefOid"]),
+			BaseSHA:            asString(node["baseRefOid"]),
+			HasConflicts:       asString(node["mergeStateStatus"]) == "DIRTY",
+			Author:             extractAuthor(node["author"]),
+			ReviewRequests:     []string{reviewer},
+			ReviewRequestUsers: []GitHubUser{{Login: reviewer}},
+			Reviews:            extractReviewNodesFromConnection(node["reviews"]),
+		})
+	}
+	return out, nil
 }
 
 func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -3394,6 +3481,26 @@ func extractLabelNames(value any) []string {
 		}
 	}
 	return out
+}
+
+func extractLabelNamesFromConnection(value any) []string {
+	row, _ := value.(map[string]any)
+	if row == nil {
+		return []string{}
+	}
+	return extractLabelNames(row["nodes"])
+}
+
+func extractReviewNodesFromConnection(value any) []map[string]any {
+	row, _ := value.(map[string]any)
+	if row == nil {
+		return []map[string]any{}
+	}
+	return toObjectSlice(row["nodes"])
+}
+
+func normalizeGitHubLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(login))
 }
 
 func firstNonEmpty(values ...string) string {

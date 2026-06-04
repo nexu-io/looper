@@ -176,6 +176,18 @@ func (a reviewerIntegrationGatewayAdapter) ListOpenPullRequests(ctx context.Cont
 	return out, nil
 }
 
+func (a reviewerIntegrationGatewayAdapter) ListReviewRequestedPullRequests(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
+	prs, err := a.Gateway.ListReviewRequestedPullRequests(ctx, githubinfra.ListReviewRequestedPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Reviewer: input.Reviewer})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestSummary, 0, len(prs))
+	for _, pr := range prs {
+		out = append(out, PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: append([]string(nil), pr.Labels...), HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: append([]string(nil), pr.ReviewRequests...), Reviews: pr.Reviews})
+	}
+	return out, nil
+}
+
 func (a reviewerIntegrationGatewayAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	return a.Gateway.GetCurrentUserLogin(ctx, cwd)
 }

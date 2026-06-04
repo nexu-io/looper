@@ -339,6 +339,18 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 	return result, nil
 }
 
+func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Context, input reviewer.ListReviewRequestedPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
+	pullRequests, err := a.gateway.ListReviewRequestedPullRequests(ctx, githubinfra.ListReviewRequestedPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Reviewer: input.Reviewer})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
+	for _, pr := range pullRequests {
+		result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: pr.ReviewDecision, Labels: pr.Labels, HeadSHA: pr.HeadSHA, BaseSHA: pr.BaseSHA, HasConflicts: pr.HasConflicts, Author: pr.Author, ReviewRequests: pr.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(pr.ReviewRequestUsers), Reviews: pr.Reviews})
+	}
+	return result, nil
+}
+
 func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	return a.gateway.GetCurrentUserLogin(ctx, cwd)
 }

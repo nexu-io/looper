@@ -238,6 +238,13 @@ type ListOpenPullRequestsInput struct {
 	Labels []string
 }
 
+type ListReviewRequestedPullRequestsInput struct {
+	Repo     string
+	CWD      string
+	Limit    int
+	Reviewer string
+}
+
 type ViewPullRequestInput struct {
 	Repo     string
 	PRNumber int64
@@ -341,6 +348,7 @@ type ResolveReviewThreadInput struct {
 
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
+	ListReviewRequestedPullRequests(context.Context, ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
@@ -731,7 +739,16 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if !policy.AutoDiscovery {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, policy)
+	currentLogin := ""
+	if policy.RequireReviewRequest || !policy.EnableSelfReview {
+		var err error
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		currentLogin = normalizeLogin(currentLogin)
+	}
+	openPRs, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, input.Repo, project.RepoPath, input.Limit, policy, currentLogin)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -742,15 +759,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-	}
-	currentLogin := ""
-	if policy.RequireReviewRequest || !policy.EnableSelfReview {
-		var err error
-		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
-		if err != nil {
-			return DiscoveryResult{}, err
-		}
-		currentLogin = normalizeLogin(currentLogin)
 	}
 	result := DiscoveryResult{}
 	seen := map[string]struct{}{}
@@ -1032,11 +1040,22 @@ func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo stri
 }
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
-	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, r.discoveryPolicy)
+	currentLogin := ""
+	if r.discoveryPolicy.RequireReviewRequest {
+		login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+		if err != nil {
+			return nil, err
+		}
+		currentLogin = normalizeLogin(login)
+	}
+	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, r.discoveryPolicy, currentLogin)
 }
 
-func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, policy DiscoveryPolicy) ([]PullRequestSummary, error) {
+func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, policy DiscoveryPolicy, currentLogin string) ([]PullRequestSummary, error) {
 	labels := prQueryLabels(policy.Labels)
+	if policy.RequireReviewRequest && strings.TrimSpace(currentLogin) != "" && len(labels) == 0 && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		return r.github.ListReviewRequestedPullRequests(ctx, ListReviewRequestedPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Reviewer: currentLogin})
+	}
 	effectiveLimit := defaultDiscoveryLimit(limit)
 	if len(labels) == 0 {
 		return r.github.ListOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit})

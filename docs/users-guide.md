@@ -261,6 +261,8 @@ Reviewer mainly watches two kinds of PRs:
 - open PRs where the current GitHub user was requested as a reviewer
 - manually-started reviewer loops from this machine, including `looper review owner/repo#42 --loop`
 
+For the default review-requested path, Looper asks GitHub for PRs requested from the current user instead of only filtering the first page of open PRs locally.
+
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
 ### What happens after reviewer finishes

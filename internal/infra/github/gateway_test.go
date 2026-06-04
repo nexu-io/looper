@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -2170,6 +2171,40 @@ func TestListOpenIssuesPassesAllLabelsToGH(t *testing.T) {
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	if _, err := gateway.ListOpenIssues(context.Background(), ListOpenIssuesInput{Repo: "acme/looper", Assignee: "reviewer", Labels: []string{"bug", "priority"}}); err != nil {
 		t.Fatalf("ListOpenIssues() error = %v", err)
+	}
+}
+
+func TestGatewayListsReviewRequestedPullRequestsThroughSearch(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if !strings.Contains(args, "api graphql") {
+			t.Fatalf("gh args = %q, want graphql search", args)
+		}
+		if !strings.Contains(args, "repo:acme/looper is:pr is:open review-requested:reviewer") {
+			t.Fatalf("gh args = %q, want review-requested search qualifier", args)
+		}
+		if !strings.Contains(args, "-F first=50") {
+			t.Fatalf("gh args = %q, want caller limit", args)
+		}
+		return shell.Result{Stdout: `{"data":{"search":{"nodes":[{"number":77,"title":"Review me","url":"https://example.test/pull/77","state":"OPEN","updatedAt":"2026-06-04T10:00:00Z","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":{"nodes":[{"name":"ready"}]},"headRefName":"feature","baseRefName":"main","headRefOid":"head77","baseRefOid":"base77","mergeStateStatus":"CLEAN","author":{"login":"contributor"},"reviews":{"nodes":[{"state":"COMMENTED","author":{"login":"reviewer"},"submittedAt":"2026-06-04T10:01:00Z"}]}}]}}}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListReviewRequestedPullRequests(context.Background(), ListReviewRequestedPullRequestsInput{Repo: "acme/looper", Reviewer: "Reviewer", Limit: 50})
+	if err != nil {
+		t.Fatalf("ListReviewRequestedPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 {
+		t.Fatalf("PR count = %d, want 1", len(prs))
+	}
+	pr := prs[0]
+	if pr.Number != 77 || pr.HeadSHA != "head77" || pr.Author != "contributor" || !slices.Contains(pr.Labels, "ready") {
+		t.Fatalf("PR = %#v, want parsed search result", pr)
+	}
+	if !slices.Contains(pr.ReviewRequests, "reviewer") || len(pr.Reviews) != 1 {
+		t.Fatalf("PR review metadata = %#v / %#v, want synthetic reviewer and parsed reviews", pr.ReviewRequests, pr.Reviews)
 	}
 }
 
