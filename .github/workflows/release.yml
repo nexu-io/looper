@@ -358,12 +358,6 @@ jobs:
             exit 1
           fi
 
-      - name: Generate and verify SHA-256 checksum
-        working-directory: dist/release
-        run: |
-          shasum -a 256 "${{ matrix.artifact-name }}" > "${{ matrix.artifact-name }}.sha256"
-          shasum -a 256 -c "${{ matrix.artifact-name }}.sha256"
-
       - name: Create release archive
         working-directory: dist/release
         run: |
@@ -379,8 +373,6 @@ jobs:
         with:
           name: looper-release-assets-${{ matrix.target }}
           path: |
-            dist/release/${{ matrix.artifact-name }}
-            dist/release/${{ matrix.artifact-name }}.sha256
             dist/release/${{ matrix.artifact-name }}.tar.gz
             dist/release/${{ matrix.artifact-name }}.tar.gz.sha256
 
@@ -443,12 +435,6 @@ jobs:
             exit 1
           fi
 
-      - name: Generate and verify SHA-256 checksum
-        working-directory: dist/release
-        run: |
-          shasum -a 256 "${{ matrix.artifact-name }}" > "${{ matrix.artifact-name }}.sha256"
-          shasum -a 256 -c "${{ matrix.artifact-name }}.sha256"
-
       - name: Create release archive
         working-directory: dist/release
         run: |
@@ -461,8 +447,6 @@ jobs:
         with:
           name: looperd-release-assets-${{ matrix.target }}
           path: |
-            dist/release/${{ matrix.artifact-name }}
-            dist/release/${{ matrix.artifact-name }}.sha256
             dist/release/${{ matrix.artifact-name }}.tar.gz
             dist/release/${{ matrix.artifact-name }}.tar.gz.sha256
 
@@ -560,20 +544,12 @@ jobs:
 
       - name: Verify predictable asset names
         run: |
-          test -f release-assets/looper-darwin-arm64
-          test -f release-assets/looper-darwin-arm64.sha256
           test -f release-assets/looper-darwin-arm64.tar.gz
           test -f release-assets/looper-darwin-arm64.tar.gz.sha256
-          test -f release-assets/looper-linux-amd64
-          test -f release-assets/looper-linux-amd64.sha256
           test -f release-assets/looper-linux-amd64.tar.gz
           test -f release-assets/looper-linux-amd64.tar.gz.sha256
-          test -f release-assets/looperd-darwin-arm64
-          test -f release-assets/looperd-darwin-arm64.sha256
           test -f release-assets/looperd-darwin-arm64.tar.gz
           test -f release-assets/looperd-darwin-arm64.tar.gz.sha256
-          test -f release-assets/looperd-linux-amd64
-          test -f release-assets/looperd-linux-amd64.sha256
           test -f release-assets/looperd-linux-amd64.tar.gz
           test -f release-assets/looperd-linux-amd64.tar.gz.sha256
 
@@ -588,7 +564,7 @@ jobs:
             -min-cli-for-daemon "$LOOPER_BUILD_MIN_CLI_FOR_DAEMON" \
             -min-daemon-for-cli "$LOOPER_BUILD_MIN_DAEMON_FOR_CLI" \
             -assets-dir release-assets \
-            -required-assets "looper-darwin-arm64,looper-darwin-arm64.tar.gz,looper-linux-amd64,looper-linux-amd64.tar.gz,looperd-darwin-arm64,looperd-darwin-arm64.tar.gz,looperd-linux-amd64,looperd-linux-amd64.tar.gz" \
+            -required-assets "looper-darwin-arm64.tar.gz,looper-linux-amd64.tar.gz,looperd-darwin-arm64.tar.gz,looperd-linux-amd64.tar.gz" \
             -output release-assets/manifest.json
 
       - name: Validate release manifest fields
@@ -615,13 +591,9 @@ jobs:
           assert m["minCliForDaemon"], "minCliForDaemon missing"
           assert m["minDaemonForCli"], "minDaemonForCli missing"
           required = {
-              "looper-darwin-arm64",
               "looper-darwin-arm64.tar.gz",
-              "looper-linux-amd64",
               "looper-linux-amd64.tar.gz",
-              "looperd-darwin-arm64",
               "looperd-darwin-arm64.tar.gz",
-              "looperd-linux-amd64",
               "looperd-linux-amd64.tar.gz",
           }
           assert required.issubset(set(m["artifacts"].keys())), "manifest missing artifacts"
@@ -638,20 +610,12 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare-go-release.outputs.release-tag }}
         run: |
           gh release upload "$RELEASE_TAG" \
-            release-assets/looper-darwin-arm64 \
-            release-assets/looper-darwin-arm64.sha256 \
             release-assets/looper-darwin-arm64.tar.gz \
             release-assets/looper-darwin-arm64.tar.gz.sha256 \
-            release-assets/looper-linux-amd64 \
-            release-assets/looper-linux-amd64.sha256 \
             release-assets/looper-linux-amd64.tar.gz \
             release-assets/looper-linux-amd64.tar.gz.sha256 \
-            release-assets/looperd-darwin-arm64 \
-            release-assets/looperd-darwin-arm64.sha256 \
             release-assets/looperd-darwin-arm64.tar.gz \
             release-assets/looperd-darwin-arm64.tar.gz.sha256 \
-            release-assets/looperd-linux-amd64 \
-            release-assets/looperd-linux-amd64.sha256 \
             release-assets/looperd-linux-amd64.tar.gz \
             release-assets/looperd-linux-amd64.tar.gz.sha256 \
             release-assets/manifest.json \
