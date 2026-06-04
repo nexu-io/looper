@@ -177,6 +177,7 @@ func sqliteDSN(dbPath string) string {
 		"_foreign_keys": "on",
 		"_busy_timeout": fmt.Sprintf("%d", sqliteBusyTimeoutMilliseconds),
 		"_journal_mode": "WAL",
+		"_txlock":       "immediate",
 	}
 	if dbPath == ":memory:" {
 		values := url.Values{}

@@ -345,6 +345,82 @@ func TestSQLiteCoordinatorSerializesConcurrentTransactionsWithoutDataLoss(t *tes
 	}
 }
 
+func TestSQLiteCoordinatorWithTransactionBeginsImmediateTransactions(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openTestSQLiteCoordinator(t)
+	ctx := context.Background()
+
+	if _, err := coordinator.DB().ExecContext(ctx, `CREATE TABLE counters (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)`); err != nil {
+		t.Fatalf("db.ExecContext(CREATE TABLE counters) error = %v", err)
+	}
+	if _, err := coordinator.DB().ExecContext(ctx, `INSERT INTO counters (id, value) VALUES (1, 0)`); err != nil {
+		t.Fatalf("db.ExecContext(INSERT counters) error = %v", err)
+	}
+
+	firstStarted := make(chan struct{})
+	allowFirstCommit := make(chan struct{})
+	secondStarted := make(chan struct{})
+	errCh := make(chan error, 2)
+
+	go func() {
+		errCh <- coordinator.WithTransaction(ctx, func(tx *sql.Tx) error {
+			var value int
+			if err := tx.QueryRowContext(ctx, `SELECT value FROM counters WHERE id = 1`).Scan(&value); err != nil {
+				return err
+			}
+			close(firstStarted)
+			<-allowFirstCommit
+			_, err := tx.ExecContext(ctx, `UPDATE counters SET value = ? WHERE id = 1`, value+1)
+			return err
+		})
+	}()
+
+	select {
+	case <-firstStarted:
+	case err := <-errCh:
+		t.Fatalf("first transaction returned early: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first transaction did not start")
+	}
+
+	go func() {
+		errCh <- coordinator.WithTransaction(ctx, func(tx *sql.Tx) error {
+			close(secondStarted)
+			var value int
+			if err := tx.QueryRowContext(ctx, `SELECT value FROM counters WHERE id = 1`).Scan(&value); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `UPDATE counters SET value = ? WHERE id = 1`, value+1)
+			return err
+		})
+	}()
+
+	select {
+	case <-secondStarted:
+		t.Fatal("second transaction began before first transaction committed")
+	case err := <-errCh:
+		t.Fatalf("transaction returned early: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(allowFirstCommit)
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("coordinator.WithTransaction() error = %v", err)
+		}
+	}
+
+	var counterValue int
+	if err := coordinator.DB().QueryRowContext(ctx, `SELECT value FROM counters WHERE id = 1`).Scan(&counterValue); err != nil {
+		t.Fatalf("db.QueryRowContext(counter).Scan() error = %v", err)
+	}
+	if counterValue != 2 {
+		t.Fatalf("counter value = %d, want 2", counterValue)
+	}
+}
+
 func TestSQLiteCoordinatorPersistsDataAcrossCloseAndReopenWithEmbeddedMigrations(t *testing.T) {
 	t.Parallel()
 
