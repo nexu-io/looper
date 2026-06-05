@@ -476,6 +476,34 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 	}
 }
 
+func TestReviewerFailedLoopRecoveryEligibilityUsesFreshDetailHeadForApproval(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"})
+	github := &fakeGitHubGateway{
+		viewHeadSHA: "fresh-head",
+		reviews: []map[string]any{{
+			"author": map[string]any{"login": "octocat"},
+			"state":  "APPROVED",
+			"commit": map[string]any{"oid": "fresh-head"},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}})
+	loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+
+	eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", HeadSHA: "stale-head"})
+	if err != nil {
+		t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+	}
+	if eligible || reason != "approved" {
+		t.Fatalf("eligible=%v reason=%q, want approved suppression", eligible, reason)
+	}
+	if github.viewCalls != 1 {
+		t.Fatalf("viewCalls = %d, want 1", github.viewCalls)
+	}
+}
+
 func TestReviewerFailedLoopRecoveryEnhancedTransientIsOptIn(t *testing.T) {
 	t.Parallel()
 	message := `Post "https://api.github.com/graphql": EOF`

@@ -4026,7 +4026,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 					return false, err
 				}
 				reviews = detail.Reviews
-				if headSHA == "" {
+				if detail.HeadSHA != "" {
 					headSHA = detail.HeadSHA
 				}
 			}
