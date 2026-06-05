@@ -663,8 +663,9 @@ func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !strings.Contains(result.Summary, "server_error") {
-		t.Fatalf("result = %#v, want retryable failed result with upstream error", result)
+	wantSummary := "Worker completed without a valid structured result (parse status: missing). See Looper logs for details."
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || result.Summary != wantSummary {
+		t.Fatalf("result = %#v, want retryable failed result with parse-status summary", result)
 	}
 	if validationCalls != 0 {
 		t.Fatalf("validationCalls = %d, want execute failure to stop before validation", validationCalls)
@@ -674,6 +675,12 @@ func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	}
 	if len(completed) != 0 {
 		t.Fatalf("len(completed) = %d, want no completion notification for retryable failure", len(completed))
+	}
+	if len(github.updateIssueCommentCalls) != 1 {
+		t.Fatalf("len(github.updateIssueCommentCalls) = %d, want 1 issue comment refresh", len(github.updateIssueCommentCalls))
+	}
+	if body := github.updateIssueCommentCalls[0].Body; strings.Contains(body, "server_error") {
+		t.Fatalf("issue comment body = %q, want no raw transcript text in public comment", body)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
 	if err != nil {
@@ -755,8 +762,27 @@ func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *tes
 	if loopErr.kind != FailureRetryableTransient {
 		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableTransient)
 	}
-	if !strings.Contains(err.Error(), "server_error") {
-		t.Fatalf("error = %q, want upstream summary", err.Error())
+	want := "Worker completed without a valid structured result (parse status: missing). See Looper logs for details."
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestBuildIssueClaimCommentBodySanitizesTranscriptSummary(t *testing.T) {
+	t.Parallel()
+
+	rawSummary := strings.Repeat("\x1b[31mtool call\x1b[0m\n/path/to/worktree\n$ git status\n", 20)
+	body := buildIssueClaimCommentBody("loop_1", "run_1", workerInput{Repo: "acme/looper", IssueNumber: 27}, issueClaimStatusFailed, nil, rawSummary)
+	if !strings.Contains(body, "Latest status: See Looper logs for details.") {
+		t.Fatalf("body = %q, want sanitized public summary", body)
+	}
+	for _, fragment := range []string{"\x1b[31m", "tool call", "/path/to/worktree", "git status"} {
+		if strings.Contains(body, fragment) {
+			t.Fatalf("body = %q, want fragment %q removed", body, fragment)
+		}
+	}
+	if len(body) >= 600 {
+		t.Fatalf("len(body) = %d, want short sanitized comment", len(body))
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -51,11 +52,17 @@ const (
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
 
-	workerBranchSlugMaxLength = 30
-	workerBranchSlugMaxWords  = 5
-	workerBranchHashLength    = 16
-	workerPRDedupeLookupLimit = 1000
-	issueDiscoveryLabel       = "looper:worker-ready"
+	workerBranchSlugMaxLength        = 30
+	workerBranchSlugMaxWords         = 5
+	workerBranchHashLength           = 16
+	workerPRDedupeLookupLimit        = 1000
+	issueDiscoveryLabel              = "looper:worker-ready"
+	maxPublicIssueClaimSummaryLength = 240
+)
+
+var (
+	workerANSIEscapePattern              = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	workerStructuredResultMessagePattern = regexp.MustCompile(`^Worker completed without a valid structured result \(parse status: ([a-z_]+)\)\. See Looper logs for details\.$`)
 )
 
 var workerStepSequence = []WorkerStep{
@@ -616,9 +623,35 @@ func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error 
 		return nil
 	}
 	return &loopError{
-		message: firstNonEmpty(execution.Summary, fmt.Sprintf("Worker agent completed without valid structured result (parse status: %s)", firstNonEmpty(execution.ParseStatus, "missing"))),
+		message: invalidWorkerStructuredResultMessage(execution.ParseStatus),
 		kind:    FailureRetryableTransient,
 	}
+}
+
+func invalidWorkerStructuredResultMessage(parseStatus string) string {
+	return fmt.Sprintf("Worker completed without a valid structured result (parse status: %s). See Looper logs for details.", firstNonEmpty(parseStatus, "missing"))
+}
+
+func sanitizePublicIssueClaimSummary(summary string) string {
+	cleaned := strings.TrimSpace(disclosure.StripMarkdownStamp(summary))
+	if cleaned == "" {
+		return ""
+	}
+	cleaned = workerANSIEscapePattern.ReplaceAllString(cleaned, "")
+	cleaned = strings.Join(strings.Fields(cleaned), " ")
+	if cleaned == "" {
+		return ""
+	}
+	match := workerStructuredResultMessagePattern.FindStringSubmatch(cleaned)
+	if len(match) != 2 {
+		return "See Looper logs for details."
+	}
+	cleaned = invalidWorkerStructuredResultMessage(match[1])
+	runes := []rune(cleaned)
+	if len(runes) > maxPublicIssueClaimSummaryLength {
+		cleaned = strings.TrimSpace(string(runes[:maxPublicIssueClaimSummaryLength])) + "…"
+	}
+	return cleaned
 }
 
 func checkpointExecutionFromAgentResult(result AgentResult) *checkpointExecution {
@@ -2540,12 +2573,12 @@ func buildIssueClaimCommentBody(loopID, runID string, work workerInput, status s
 		}
 	case issueClaimStatusFailed:
 		lines = append(lines, "Looper stopped work on this issue with a failure.")
-		if summary != "" {
+		if summary = sanitizePublicIssueClaimSummary(summary); summary != "" {
 			lines = append(lines, "", "Latest status: "+summary)
 		}
 	case issueClaimStatusPaused:
 		lines = append(lines, "Looper paused work on this issue.")
-		if summary != "" {
+		if summary = sanitizePublicIssueClaimSummary(summary); summary != "" {
 			lines = append(lines, "", "Latest status: "+summary)
 		}
 	default:
