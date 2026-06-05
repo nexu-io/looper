@@ -4920,6 +4920,17 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 		if draft, ok := raw["isDraft"].(bool); ok && draft != pr.IsDraft {
 			return false
 		}
+	case "not_requested":
+		if !policy.RequireReviewRequest {
+			return false
+		}
+		reviewerLogin, _ := stringFromAny(raw["reviewerLogin"])
+		if normalizeLogin(reviewerLogin) == "" || normalizeLogin(currentLogin) == "" || normalizeLogin(reviewerLogin) != normalizeLogin(currentLogin) {
+			return false
+		}
+		if !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
+			return false
+		}
 	}
 	return true
 }
@@ -4930,7 +4941,7 @@ func reviewerLastSkipNeedsCurrentLogin(meta map[string]any, pr PullRequestSummar
 		return false
 	}
 	kind, _ := stringFromAny(raw["kind"])
-	if kind != "already_reviewed_by_current_user" && kind != "self_authored" {
+	if kind != "already_reviewed_by_current_user" && kind != "self_authored" && kind != "not_requested" {
 		return false
 	}
 	headSHA, _ := stringFromAny(raw["headSha"])
@@ -4939,7 +4950,7 @@ func reviewerLastSkipNeedsCurrentLogin(meta map[string]any, pr PullRequestSummar
 
 func isDiscoverySuppressingSkipKind(kind string) bool {
 	switch kind {
-	case "conflicted", "already_reviewed_by_current_user", "already_published_head", "draft", "approved", "ready_label", "self_authored":
+	case "conflicted", "already_reviewed_by_current_user", "already_published_head", "draft", "approved", "ready_label", "self_authored", "not_requested":
 		return true
 	default:
 		return false
@@ -5228,6 +5239,9 @@ func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[st
 	}
 	if checkpoint.SkipKind == "already_reviewed_by_current_user" && checkpoint.SkipReviewerLogin != "" {
 		metadata["reviewerLogin"] = normalizeLogin(checkpoint.SkipReviewerLogin)
+	}
+	if checkpoint.SkipKind == "not_requested" && checkpoint.Detail.CurrentLogin != "" {
+		metadata["reviewerLogin"] = normalizeLogin(checkpoint.Detail.CurrentLogin)
 	}
 	if checkpoint.SkipKind == "self_authored" {
 		if author := normalizeLogin(checkpoint.Detail.Author); author != "" {

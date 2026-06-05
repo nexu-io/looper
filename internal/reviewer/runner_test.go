@@ -2613,6 +2613,100 @@ func TestDiscoverPullRequestsSuppressesRepeatedConflictSkipUntilHeadChanges(t *t
 	}
 }
 
+func TestDiscoverPullRequestsSuppressesRepeatedNotRequestedSkipUntilRequested(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "bob", reviewRequests: []string{}, listHeadSHA: "new-head", viewHeadSHA: "new-head"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: "loop_not_requested_followup", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if len(first.QueueItems) != 0 {
+		t.Fatalf("first QueueItems = %#v, want suppression for unchanged not_requested head", first.QueueItems)
+	}
+
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if len(second.QueueItems) != 0 {
+		t.Fatalf("second QueueItems = %#v, want no repeated re-enqueue while request remains absent", second.QueueItems)
+	}
+
+	github.reviewRequests = []string{"bob"}
+	third, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("third DiscoverPullRequests() error = %v", err)
+	}
+	if len(third.QueueItems) != 1 {
+		t.Fatalf("third QueueItems = %#v, want re-enqueue when current reviewer is requested", third.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsDoesNotSuppressNotRequestedSkipAfterHeadChange(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "bob", reviewRequests: []string{}, listHeadSHA: "new-head", viewHeadSHA: "new-head"}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: "loop_not_requested_head_change", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if len(first.QueueItems) != 0 {
+		t.Fatalf("first QueueItems = %#v, want suppression for unchanged not_requested head", first.QueueItems)
+	}
+
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if len(second.QueueItems) != 0 {
+		t.Fatalf("second QueueItems = %#v, want no repeated re-enqueue for same head", second.QueueItems)
+	}
+
+	meta := parseJSONObject(loop.MetadataJSON)
+	if reviewerDiscoverySuppressedByLastSkip(meta, PullRequestSummary{Number: 42, HeadSHA: "newer-head", ReviewRequests: []string{}}, "bob", DiscoveryPolicy{RequireReviewRequest: true}) {
+		t.Fatalf("reviewerDiscoverySuppressedByLastSkip() = true, want false after head change")
+	}
+}
+
+func TestFilterSkipMetadataRecordsReviewerForNotRequested(t *testing.T) {
+	t.Parallel()
+	metadata := filterSkipMetadata(reviewerCheckpoint{
+		SkipKind:   "not_requested",
+		SkipReason: "Skipped pull request acme/looper#42 because current user is not requested for review",
+		Detail:     &checkpointDetail{HeadSHA: "abc123", CurrentLogin: "Bob"},
+	}, "2026-05-01T00:00:00Z")
+	if metadata == nil {
+		t.Fatalf("filterSkipMetadata() = nil, want metadata")
+	}
+	if got, _ := stringFromAny(metadata["reviewerLogin"]); got != "bob" {
+		t.Fatalf("metadata.reviewerLogin = %q, want bob", got)
+	}
+	if got, _ := stringFromAny(metadata["headSha"]); got != "abc123" {
+		t.Fatalf("metadata.headSha = %q, want abc123", got)
+	}
+}
+
 func TestDiscoverPullRequestsRequeuesConflictedSkipWhenConflictClears(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
