@@ -4928,6 +4928,10 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 		if normalizeLogin(reviewerLogin) == "" || normalizeLogin(currentLogin) == "" || normalizeLogin(reviewerLogin) != normalizeLogin(currentLogin) {
 			return false
 		}
+		if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+			decision := routedReviewerClaimDecision(policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+			return !decision.Allowed && decision.Reason == "local GitHub identity is not requested for review"
+		}
 		if !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 			return false
 		}

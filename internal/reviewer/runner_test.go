@@ -2689,6 +2689,31 @@ func TestDiscoverPullRequestsDoesNotSuppressNotRequestedSkipAfterHeadChange(t *t
 	}
 }
 
+func TestReviewerDiscoverySuppressedByLastSkipDoesNotUseCurrentReviewRequestsInRoutedMode(t *testing.T) {
+	t.Parallel()
+	meta := map[string]any{"lastFilterSkip": map[string]any{"kind": "not_requested", "headSha": "new-head", "reviewerLogin": "bob"}}
+	pr := PullRequestSummary{
+		Number:             42,
+		HeadSHA:            "new-head",
+		Author:             "alice",
+		Labels:             []string{"looper:target:red"},
+		ReviewRequests:     []string{},
+		ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "bob", ID: 42}},
+	}
+	policy := DiscoveryPolicy{
+		RequireReviewRequest: true,
+		RoutedClaimPolicy: networkpolicy.ProjectPolicy{
+			Mode:         config.NetworkModeRouted,
+			NodeName:     "red",
+			GitHubLogin:  "bob",
+			GitHubUserID: 42,
+		},
+	}
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, "bob", policy) {
+		t.Fatalf("reviewerDiscoverySuppressedByLastSkip() = true, want false when routed claim still allows reviewer")
+	}
+}
+
 func TestFilterSkipMetadataRecordsReviewerForNotRequested(t *testing.T) {
 	t.Parallel()
 	metadata := filterSkipMetadata(reviewerCheckpoint{
