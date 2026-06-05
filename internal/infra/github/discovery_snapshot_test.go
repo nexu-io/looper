@@ -169,12 +169,12 @@ func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) 
 		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
 			cmd := strings.Join(options.Args, " ")
 			if strings.Contains(cmd, "pr list") {
-				if strings.Contains(cmd, "reviews") || strings.Contains(cmd, "mergeStateStatus") {
+				if strings.Contains(cmd, "reviews") || !strings.Contains(cmd, "mergeStateStatus") {
 					t.Fatalf("pr list args = %q, want lightweight discovery fields", cmd)
 				}
 				prListCalls++
 				return shell.Result{Stdout: `[
-					{"number":1,"title":"PR 1","state":"OPEN","labels":[{"name":"bug"}],"baseRefName":"main","headRefOid":"sha-1","author":{"login":"octo"}}
+					{"number":1,"title":"PR 1","state":"OPEN","labels":[{"name":"bug"}],"baseRefName":"main","headRefOid":"sha-1","mergeStateStatus":"DIRTY","author":{"login":"octo"}}
 				]`}, nil
 			}
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
@@ -199,6 +199,9 @@ func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) 
 	}
 	if got := second[0].Labels[0]; got != "bug" {
 		t.Fatalf("cached label = %q, want cache to be isolated from caller mutation", got)
+	}
+	if !second[0].HasConflicts {
+		t.Fatal("cached PR HasConflicts = false, want merge state preserved")
 	}
 
 	now = now.Add(31 * time.Second)

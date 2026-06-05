@@ -31,7 +31,7 @@ const (
 
 var (
 	prListJSONFields          = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
-	prDiscoveryListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests"}
+	prDiscoveryListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewJSONFields          = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}
 )
 
@@ -699,6 +699,7 @@ query($searchQuery: String!, $first: Int!) {
         baseRefName
         headRefOid
         baseRefOid
+        mergeStateStatus
         author { login }
       }
     }
@@ -737,6 +738,7 @@ query($searchQuery: String!, $first: Int!) {
 			BaseRefName:        asString(node["baseRefName"]),
 			HeadSHA:            asString(node["headRefOid"]),
 			BaseSHA:            asString(node["baseRefOid"]),
+			HasConflicts:       asString(node["mergeStateStatus"]) == "DIRTY",
 			Author:             extractAuthor(node["author"]),
 			ReviewRequests:     []string{reviewer},
 			ReviewRequestUsers: []GitHubUser{{Login: reviewer}},

@@ -2189,10 +2189,10 @@ func TestGatewayListsReviewRequestedPullRequestsThroughSearch(t *testing.T) {
 			t.Fatalf("gh args = %q, want caller limit", args)
 		}
 		query := strings.Join(options.Args, " ")
-		if strings.Contains(query, "reviews(") || strings.Contains(query, "mergeStateStatus") {
+		if strings.Contains(query, "reviews(") || !strings.Contains(query, "mergeStateStatus") {
 			t.Fatalf("gh args = %q, want lightweight discovery query", query)
 		}
-		return shell.Result{Stdout: `{"data":{"search":{"nodes":[{"number":77,"title":"Review me","url":"https://example.test/pull/77","state":"OPEN","updatedAt":"2026-06-04T10:00:00Z","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":{"nodes":[{"name":"ready"}]},"headRefName":"feature","baseRefName":"main","headRefOid":"head77","baseRefOid":"base77","author":{"login":"contributor"}}]}}}`}, nil
+		return shell.Result{Stdout: `{"data":{"search":{"nodes":[{"number":77,"title":"Review me","url":"https://example.test/pull/77","state":"OPEN","updatedAt":"2026-06-04T10:00:00Z","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":{"nodes":[{"name":"ready"}]},"headRefName":"feature","baseRefName":"main","headRefOid":"head77","baseRefOid":"base77","mergeStateStatus":"DIRTY","author":{"login":"contributor"}}]}}}`}, nil
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
@@ -2204,7 +2204,7 @@ func TestGatewayListsReviewRequestedPullRequestsThroughSearch(t *testing.T) {
 		t.Fatalf("PR count = %d, want 1", len(prs))
 	}
 	pr := prs[0]
-	if pr.Number != 77 || pr.HeadSHA != "head77" || pr.Author != "contributor" || !slices.Contains(pr.Labels, "ready") {
+	if pr.Number != 77 || pr.HeadSHA != "head77" || pr.Author != "contributor" || !pr.HasConflicts || !slices.Contains(pr.Labels, "ready") {
 		t.Fatalf("PR = %#v, want parsed search result", pr)
 	}
 	if !slices.Contains(pr.ReviewRequests, "reviewer") || len(pr.Reviews) != 0 {

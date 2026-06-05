@@ -6364,6 +6364,48 @@ func TestDiscoverPullRequestsUsesReviewRequestedQueryWhenReviewRequestRequired(t
 	}
 }
 
+func TestDiscoverPullRequestsSuppressesConflictedLastFilterSkipFromReviewRequestedQuery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentLogin: "OctoCat",
+		reviewRequestedPullRequests: []PullRequestSummary{{
+			Number:             77,
+			Title:              "Conflicted review request",
+			State:              "OPEN",
+			HeadSHA:            "head77",
+			BaseSHA:            "base77",
+			HasConflicts:       true,
+			Author:             "contributor",
+			ReviewRequests:     []string{"octocat"},
+			ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "octocat"}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(77)
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"conflicted","reason":"Skipped conflicted pull request acme/looper#77","recordedAt":"2026-06-05T10:00:00Z","headSha":"head77"}}`
+	loop := storage.LoopRecord{ID: "loop_conflicted_review_request", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo, Limit: 10})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(github.listReviewRequestedCalls) != 1 {
+		t.Fatalf("review-requested calls = %#v, want one call", github.listReviewRequestedCalls)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("queue items = %#v, want conflicted lastFilterSkip preserved", result.QueueItems)
+	}
+	if result.Skipped != 1 {
+		t.Fatalf("Skipped = %d, want conflicted lastFilterSkip suppression", result.Skipped)
+	}
+}
+
 func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
