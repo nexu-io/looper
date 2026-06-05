@@ -194,7 +194,7 @@ func (s *DiscoverySnapshot) filteredIssues(input ListOpenIssuesInput) []IssueSum
 
 func (g *Gateway) listOpenPullRequestsForDiscovery(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
 	if g.discoveryCacheTTL <= 0 {
-		return g.listOpenPullRequestsRaw(ctx, input)
+		return g.listOpenPullRequestsWithFields(ctx, input, prDiscoveryListJSONFields)
 	}
 	key := discoveryPullRequestListCacheKey(input)
 	now := g.now().UTC()
@@ -206,7 +206,7 @@ func (g *Gateway) listOpenPullRequestsForDiscovery(ctx context.Context, input Li
 	}
 	g.discoveryCacheMu.Unlock()
 
-	prs, err := g.listOpenPullRequestsRaw(ctx, input)
+	prs, err := g.listOpenPullRequestsWithFields(ctx, input, prDiscoveryListJSONFields)
 	if err != nil {
 		return nil, err
 	}

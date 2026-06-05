@@ -4010,14 +4010,35 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		return false, "", "manual_intervention", nil
 	}
 	approvedByCurrentUser := func() (bool, error) {
-		if !r.loopConfig.StopOnApproved || len(pr.Reviews) == 0 {
+		if !r.loopConfig.StopOnApproved {
+			return false, nil
+		}
+		reviews := pr.Reviews
+		headSHA := pr.HeadSHA
+		if len(reviews) == 0 && loop.Repo != nil && loop.PRNumber != nil && r.github != nil && r.repos != nil && r.repos.Projects != nil {
+			project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if err != nil {
+				return false, err
+			}
+			if project != nil {
+				detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: *loop.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
+				if err != nil {
+					return false, err
+				}
+				reviews = detail.Reviews
+				if headSHA == "" {
+					headSHA = detail.HeadSHA
+				}
+			}
+		}
+		if len(reviews) == 0 {
 			return false, nil
 		}
 		currentLogin, err := r.currentLoginForLoop(ctx, loop)
 		if err != nil {
 			return false, err
 		}
-		return hasApprovedReviewByAuthorForHead(pr.Reviews, currentLogin, pr.HeadSHA), nil
+		return hasApprovedReviewByAuthorForHead(reviews, currentLogin, headSHA), nil
 	}
 	if queueKind == string(FailureRetryableAfterResume) && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == "rerun_review") {
 		approved, err := approvedByCurrentUser()
