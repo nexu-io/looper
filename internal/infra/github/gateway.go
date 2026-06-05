@@ -54,6 +54,7 @@ type Gateway struct {
 	discoveryCacheTTL      time.Duration
 	discoveryCacheMu       sync.Mutex
 	discoveryPRCache       map[string]discoveryPullRequestListCacheEntry
+	discoveryReviewPRCache map[string]discoveryPullRequestListCacheEntry
 	discoveryIssueCache    map[string]discoveryIssueListCacheEntry
 	ghRun                  func(context.Context, shell.Options) (shell.Result, error)
 	reviewSubmitDiagnostic func(event string, fields map[string]any)
@@ -658,7 +659,7 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
+	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -669,6 +670,13 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 }
 
 func (g *Gateway) ListReviewRequestedPullRequests(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.listReviewRequestedPullRequests(ctx, input)
+	}
+	return g.listReviewRequestedPullRequestsRaw(ctx, input)
+}
+
+func (g *Gateway) listReviewRequestedPullRequestsRaw(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
 	reviewer := normalizeGitHubLogin(input.Reviewer)
 	if reviewer == "" {
 		return nil, fmt.Errorf("review requester login is required")

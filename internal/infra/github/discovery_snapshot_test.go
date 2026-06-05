@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -251,6 +252,80 @@ func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) 
 	}
 }
 
+func TestDiscoverySnapshotCachesReviewRequestedPullRequestsPerTickAndTTL(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)
+	graphQLCalls := 0
+	gateway := New(Options{
+		Now:               func() time.Time { return now },
+		DiscoveryCacheTTL: 30 * time.Second,
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			cmd := strings.Join(options.Args, " ")
+			if !strings.Contains(cmd, "api graphql") {
+				return shell.Result{}, errors.New("unexpected command: " + cmd)
+			}
+			if !strings.Contains(cmd, "repo:acme/looper is:pr is:open review-requested:reviewer") {
+				return shell.Result{}, errors.New("missing review-requested search qualifier: " + cmd)
+			}
+			graphQLCalls++
+			switch graphQLCalls {
+			case 1:
+				return shell.Result{Stdout: reviewRequestedSearchResponse(7, "sha-7")}, nil
+			case 2:
+				return shell.Result{Stdout: reviewRequestedSearchResponse(8, "sha-8")}, nil
+			default:
+				return shell.Result{}, errors.New("unexpected extra graphql call: " + cmd)
+			}
+		},
+	})
+
+	firstCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+	first, err := gateway.ListReviewRequestedPullRequests(firstCtx, ListReviewRequestedPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Reviewer: "Reviewer", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReviewRequestedPullRequests(first) error = %v", err)
+	}
+	first[0].Labels[0] = "mutated"
+	first[0].ReviewRequests[0] = "mutated"
+
+	again, err := gateway.ListReviewRequestedPullRequests(firstCtx, ListReviewRequestedPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Reviewer: "reviewer", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReviewRequestedPullRequests(same tick) error = %v", err)
+	}
+	if graphQLCalls != 1 {
+		t.Fatalf("graphql calls in same tick = %d, want 1", graphQLCalls)
+	}
+	if again[0].Number != 7 || again[0].Labels[0] != "ready" || again[0].ReviewRequests[0] != "reviewer" {
+		t.Fatalf("same tick PR = %#v, want stable cloned snapshot for PR 7", again[0])
+	}
+
+	now = now.Add(10 * time.Second)
+	secondCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+	second, err := gateway.ListReviewRequestedPullRequests(secondCtx, ListReviewRequestedPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Reviewer: "reviewer", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReviewRequestedPullRequests(ttl hit) error = %v", err)
+	}
+	if graphQLCalls != 1 {
+		t.Fatalf("graphql calls after ttl hit = %d, want 1", graphQLCalls)
+	}
+	if second[0].Number != 7 || second[0].Labels[0] != "ready" {
+		t.Fatalf("ttl cached PR = %#v, want PR 7 from gateway cache", second[0])
+	}
+
+	now = now.Add(31 * time.Second)
+	thirdCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+	third, err := gateway.ListReviewRequestedPullRequests(thirdCtx, ListReviewRequestedPullRequestsInput{Repo: "acme/looper", CWD: "/repo", Reviewer: "reviewer", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListReviewRequestedPullRequests(ttl expired) error = %v", err)
+	}
+	if graphQLCalls != 2 {
+		t.Fatalf("graphql calls after ttl expiry = %d, want 2", graphQLCalls)
+	}
+	if third[0].Number != 8 {
+		t.Fatalf("ttl expired PR number = %d, want 8", third[0].Number)
+	}
+}
+
 func TestDiscoverySnapshotDiscoveryCacheTTLZeroDisablesGatewayCache(t *testing.T) {
 	t.Parallel()
 
@@ -278,4 +353,8 @@ func TestDiscoverySnapshotDiscoveryCacheTTLZeroDisablesGatewayCache(t *testing.T
 	if prListCalls != 2 {
 		t.Fatalf("pr list calls with ttl disabled = %d, want 2", prListCalls)
 	}
+}
+
+func reviewRequestedSearchResponse(number int, sha string) string {
+	return fmt.Sprintf(`{"data":{"search":{"nodes":[{"number":%d,"title":"Review me","url":"https://example.test/pull/%d","state":"OPEN","updatedAt":"2026-06-05T10:00:00Z","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":{"nodes":[{"name":"ready"}]},"headRefName":"feature","baseRefName":"main","headRefOid":%q,"baseRefOid":"base","mergeStateStatus":"CLEAN","author":{"login":"contributor"},"reviews":{"nodes":[]}}]}}}`, number, number, sha)
 }

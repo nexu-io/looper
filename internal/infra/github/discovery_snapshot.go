@@ -33,6 +33,8 @@ type DiscoverySnapshot struct {
 	openPRsFetchCWD  string
 	openPRsLimit     int
 
+	reviewRequestedPRs map[string]reviewRequestedPullRequestSnapshotEntry
+
 	openIssues          []IssueSummary
 	openIssuesFetched   bool
 	openIssuesFetchRepo string
@@ -53,7 +55,7 @@ func NewDiscoverySnapshot(gateway *Gateway, tick *DiscoveryTickState, options Di
 	if tick == nil {
 		tick = NewDiscoveryTickState()
 	}
-	return &DiscoverySnapshot{gateway: gateway, tick: tick, prLimit: max(defaultLimit(options.PullRequestLimit), 30), issueLimit: max(defaultLimit(options.IssueLimit), 30), prDetails: map[string]PullRequestDetail{}}
+	return &DiscoverySnapshot{gateway: gateway, tick: tick, prLimit: max(defaultLimit(options.PullRequestLimit), 30), issueLimit: max(defaultLimit(options.IssueLimit), 30), reviewRequestedPRs: map[string]reviewRequestedPullRequestSnapshotEntry{}, prDetails: map[string]PullRequestDetail{}}
 }
 
 func ContextWithDiscoverySnapshot(ctx context.Context, snapshot *DiscoverySnapshot) context.Context {
@@ -80,6 +82,27 @@ func (s *DiscoverySnapshot) listOpenPullRequests(ctx context.Context, input List
 		return s.gateway.listOpenPullRequestsRaw(ctx, input)
 	}
 	return limitPullRequests(prs, input.Limit), nil
+}
+
+func (s *DiscoverySnapshot) listReviewRequestedPullRequests(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
+	key := reviewRequestedPullRequestSnapshotKey(input)
+	s.mu.Lock()
+	if entry, ok := s.reviewRequestedPRs[key]; ok {
+		prs := clonePullRequestSummaries(entry.items)
+		s.mu.Unlock()
+		return limitPullRequests(prs, input.Limit), nil
+	}
+	s.mu.Unlock()
+
+	requiredLimit := s.prLimit
+	prs, err := s.gateway.listReviewRequestedPullRequestsForDiscovery(ctx, ListReviewRequestedPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: requiredLimit, Reviewer: input.Reviewer, Timeout: input.Timeout})
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.reviewRequestedPRs[key] = reviewRequestedPullRequestSnapshotEntry{items: clonePullRequestSummaries(prs)}
+	s.mu.Unlock()
+	return limitPullRequests(clonePullRequestSummaries(prs), input.Limit), nil
 }
 
 func (s *DiscoverySnapshot) ensureOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) error {
@@ -190,6 +213,31 @@ func (g *Gateway) listOpenPullRequestsForDiscovery(ctx context.Context, input Li
 	expiresAt := g.now().UTC().Add(g.discoveryCacheTTL)
 	g.discoveryCacheMu.Lock()
 	g.discoveryPRCache[key] = discoveryPullRequestListCacheEntry{expiresAt: expiresAt, items: clonePullRequestSummaries(prs)}
+	g.discoveryCacheMu.Unlock()
+	return clonePullRequestSummaries(prs), nil
+}
+
+func (g *Gateway) listReviewRequestedPullRequestsForDiscovery(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
+	if g.discoveryCacheTTL <= 0 {
+		return g.listReviewRequestedPullRequestsRaw(ctx, input)
+	}
+	key := discoveryReviewRequestedPullRequestListCacheKey(input)
+	now := g.now().UTC()
+	g.discoveryCacheMu.Lock()
+	if entry, ok := g.discoveryReviewPRCache[key]; ok && now.Before(entry.expiresAt) {
+		items := clonePullRequestSummaries(entry.items)
+		g.discoveryCacheMu.Unlock()
+		return items, nil
+	}
+	g.discoveryCacheMu.Unlock()
+
+	prs, err := g.listReviewRequestedPullRequestsRaw(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := g.now().UTC().Add(g.discoveryCacheTTL)
+	g.discoveryCacheMu.Lock()
+	g.discoveryReviewPRCache[key] = discoveryPullRequestListCacheEntry{expiresAt: expiresAt, items: clonePullRequestSummaries(prs)}
 	g.discoveryCacheMu.Unlock()
 	return clonePullRequestSummaries(prs), nil
 }
@@ -348,8 +396,20 @@ func discoveryPullRequestListCacheKey(input ListOpenPullRequestsInput) string {
 	return fmt.Sprintf("pr|%s|%s|%d", strings.TrimSpace(input.Repo), strings.TrimSpace(input.CWD), defaultLimit(input.Limit))
 }
 
+func discoveryReviewRequestedPullRequestListCacheKey(input ListReviewRequestedPullRequestsInput) string {
+	return fmt.Sprintf("review-pr|%s|%s|%s|%d", strings.TrimSpace(input.Repo), strings.TrimSpace(input.CWD), normalizeGitHubLogin(input.Reviewer), defaultLimit(input.Limit))
+}
+
 func discoveryIssueListCacheKey(input ListOpenIssuesInput) string {
 	return fmt.Sprintf("issue|%s|%s|%d", strings.TrimSpace(input.Repo), strings.TrimSpace(input.CWD), defaultLimit(input.Limit))
+}
+
+func reviewRequestedPullRequestSnapshotKey(input ListReviewRequestedPullRequestsInput) string {
+	return fmt.Sprintf("%s|%s|%s", strings.TrimSpace(input.Repo), strings.TrimSpace(input.CWD), normalizeGitHubLogin(input.Reviewer))
+}
+
+type reviewRequestedPullRequestSnapshotEntry struct {
+	items []PullRequestSummary
 }
 
 func clonePullRequestSummaries(prs []PullRequestSummary) []PullRequestSummary {
