@@ -1182,6 +1182,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		loopsByID[loop.ID] = loop
 	}
 	requeuedLoopIDs := make(map[string]struct{})
+	terminalNormalizedLoopIDs := make(map[string]struct{})
 	if staleSummary.LoopsRequeued > 0 {
 		for _, loopID := range staleSummary.LoopIDs {
 			loop, ok := loopsByID[loopID]
@@ -1225,6 +1226,15 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return RecoverySummary{}, err
+		}
+		if handled, wroteEvent, err := normalizeTerminalReviewerLoopForRecovery(ctx, repositories, loop, latestRun, nowISO); err != nil {
+			return RecoverySummary{}, err
+		} else if handled {
+			if wroteEvent {
+				eventsWritten += 1
+			}
+			terminalNormalizedLoopIDs[loop.ID] = struct{}{}
+			continue
 		}
 		policy := r.reviewerRecoveryPolicyForProject(loop.ProjectID)
 		if reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
@@ -1328,10 +1338,14 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	}
 
 	for _, loop := range loops {
-		if loop.Status != "queued" {
+		if _, normalized := terminalNormalizedLoopIDs[loop.ID]; normalized {
 			continue
 		}
 		if _, exists := queuedLoopIDs[loop.ID]; exists {
+			continue
+		}
+
+		if loop.Status != "queued" {
 			continue
 		}
 
@@ -1344,7 +1358,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 
 		normalizedLoop := loop
-		normalizedLoop.Status = normalizeStaleQueuedLoopStatus(*latestRun)
+		normalizedLoop.Status = normalizeStaleQueuedLoopStatus(loop, *latestRun)
 		normalizedLoop.NextRunAt = nil
 		normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 		normalizedLoop.UpdatedAt = nowISO
@@ -1422,6 +1436,11 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
 			return requeued, err
+		}
+		if handled, _, err := normalizeTerminalReviewerLoopForRecovery(ctx, repositories, loop, latestRun, nowISO); err != nil {
+			return requeued, err
+		} else if handled {
+			continue
 		}
 		policy := r.reviewerRecoveryPolicyForProject(loop.ProjectID)
 		if !reviewerRecoveryNeedsFreshLogin(loop, latestRun, policy) {
@@ -2710,6 +2729,14 @@ func removeDeprecatedReviewerLoopBudgetMetadata(loopMeta map[string]any) {
 	for _, key := range deprecatedReviewerLoopBudgetMetadataKeys {
 		delete(loopMeta, key)
 	}
+	reason, _ := runtimeStringFromAny(loopMeta["terminationReason"])
+	if isDeprecatedReviewerLoopBudgetReason(reason) {
+		delete(loopMeta, "terminationReason")
+		status, _ := runtimeStringFromAny(loopMeta["status"])
+		if status == "failed" || status == "terminated" {
+			loopMeta["status"] = "active"
+		}
+	}
 }
 
 var deprecatedReviewerLoopBudgetMetadataKeys = []string{
@@ -2746,6 +2773,9 @@ func firstNonEmpty(values ...string) string {
 }
 
 func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasLiveAgent bool) bool {
+	if terminalReviewerRecoveryMetadataStatus(loop) != "" {
+		return false
+	}
 	if loop.Status == "paused" {
 		return false
 	}
@@ -2769,7 +2799,71 @@ func derefRunID(run *storage.RunRecord) string {
 	return run.ID
 }
 
-func normalizeStaleQueuedLoopStatus(latestRun storage.RunRecord) string {
+func terminalReviewerRecoveryMetadataStatus(loop storage.LoopRecord) string {
+	if loop.Type != string(domain.LoopTypeReviewer) || loop.MetadataJSON == nil || strings.TrimSpace(*loop.MetadataJSON) == "" {
+		return ""
+	}
+	meta := parseRuntimeJSONObject(loop.MetadataJSON)
+	loopMeta := runtimeReviewerLoopMetadata(meta)
+	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
+	status, _ := runtimeStringFromAny(loopMeta["status"])
+	if status == "terminated" || status == "stopped" {
+		return status
+	}
+	return ""
+}
+
+func normalizeTerminalReviewerLoopForRecovery(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, latestRun *storage.RunRecord, nowISO string) (bool, bool, error) {
+	terminalReviewerStatus := terminalReviewerRecoveryMetadataStatus(loop)
+	if terminalReviewerStatus == "" {
+		return false, false, nil
+	}
+	cancelReason := "reviewer terminal metadata recovered during runtime recovery"
+	cancelledQueueItems, err := repositories.Queue.CancelByLoop(ctx, loop.ID, nowISO, &cancelReason)
+	if err != nil {
+		return true, false, err
+	}
+	if loop.Status != terminalReviewerStatus || loop.NextRunAt != nil || cancelledQueueItems > 0 {
+		normalizedLoop := loop
+		normalizedLoop.Status = terminalReviewerStatus
+		normalizedLoop.NextRunAt = nil
+		if latestRun != nil {
+			normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+		}
+		normalizedLoop.UpdatedAt = nowISO
+		if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+			return true, false, err
+		}
+		latestRunStatus := ""
+		if latestRun != nil {
+			latestRunStatus = latestRun.Status
+		}
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.reviewer_terminal_metadata_normalized",
+			LoopID:     stringPtr(loop.ID),
+			EntityType: stringPtr("loop"),
+			EntityID:   stringPtr(loop.ID),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"previousStatus":      loop.Status,
+				"recoveredStatus":     normalizedLoop.Status,
+				"latestRunStatus":     latestRunStatus,
+				"cancelledQueueItems": cancelledQueueItems,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return true, false, err
+		}
+		return true, true, nil
+	}
+	return true, false, nil
+}
+
+func normalizeStaleQueuedLoopStatus(loop storage.LoopRecord, latestRun storage.RunRecord) string {
+	if status := terminalReviewerRecoveryMetadataStatus(loop); status != "" {
+		return status
+	}
+
 	switch latestRun.Status {
 	case "success":
 		return "completed"

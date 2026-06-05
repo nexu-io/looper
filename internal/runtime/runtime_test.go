@@ -910,6 +910,209 @@ func TestRuntimeRecoveryDoesNotRequeueTerminalReviewerLoopWithInterruptedRun(t *
 	}
 }
 
+func TestRunRecoveryPipelineNormalizesQueuedReviewerLoopToTerminalMetadataStatus(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 4, 17, 5, 32, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "nexu-io/vela"
+	prNumber := int64(223)
+	targetID := "pr:nexu-io/vela:223"
+	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "terminated", "terminationReason": "pr_closed_or_merged", "lastStatus": "failed", "failureCount": 5, "lastFailure": "Reviewer review agent timed out (idle)..."}})
+	loopID := "loop_reviewer_terminal_metadata"
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1697, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: stringPtr(nowISO), MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	errorMessage := "Reviewer review agent timed out (idle)..."
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_reviewer_terminal_metadata", LoopID: loopID, Status: "failed", Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queueErrorKind := "retryable_transient"
+	queueError := "loop_terminated"
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_terminal_metadata", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_terminal_metadata:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "cancelled", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, FinishedAt: &nowISO, LastError: &queueError, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	summary, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now)
+	if err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	if summary.EventsWritten == 0 {
+		t.Fatalf("summary = %#v, want recovery event written", summary)
+	}
+	loop, err := repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("Loops.GetByID() = nil, want persisted reviewer loop")
+	}
+	if loop.Status != "terminated" {
+		t.Fatalf("loop.Status = %q, want terminated", loop.Status)
+	}
+	if loop.NextRunAt != nil {
+		t.Fatalf("loop.NextRunAt = %#v, want nil", loop.NextRunAt)
+	}
+	if loop.MetadataJSON == nil || *loop.MetadataJSON != metadata {
+		t.Fatalf("loop.MetadataJSON = %#v, want %q", loop.MetadataJSON, metadata)
+	}
+	events, err := repositories.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	var normalized *storage.EventLogRecord
+	for i := range events {
+		if events[i].EventType == "looperd.recovery.reviewer_terminal_metadata_normalized" {
+			normalized = &events[i]
+			break
+		}
+	}
+	if normalized == nil || strings.TrimSpace(normalized.PayloadJSON) == "" {
+		t.Fatalf("events = %#v, want reviewer terminal normalization event with payload", events)
+	}
+	payload := parseRuntimeJSONObject(&normalized.PayloadJSON)
+	if payload["recoveredStatus"] != "terminated" {
+		t.Fatalf("payload recoveredStatus = %#v, want terminated", payload["recoveredStatus"])
+	}
+	if payload["latestRunStatus"] != "failed" {
+		t.Fatalf("payload latestRunStatus = %#v, want failed", payload["latestRunStatus"])
+	}
+}
+
+func TestRunRecoveryPipelineCancelsActiveQueueForTerminalReviewerMetadata(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 4, 17, 5, 32, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "nexu-io/vela"
+	prNumber := int64(223)
+	targetID := "pr:nexu-io/vela:223"
+	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "terminated", "terminationReason": "pr_closed_or_merged"}})
+	loopID := "loop_reviewer_terminal_metadata_active_queue"
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1699, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: stringPtr(nowISO), MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_reviewer_terminal_metadata_active_queue", LoopID: loopID, Status: "interrupted", StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_terminal_metadata_active_queue", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_terminal_metadata_active_queue:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, StartedAt: stringPtr(nowISO), Attempts: 1, MaxAttempts: 5, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	if _, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now); err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	loop, err := repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "terminated" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want terminated loop with nil nextRunAt", loop)
+	}
+	queue, err := repositories.Queue.GetByID(context.Background(), "queue_reviewer_terminal_metadata_active_queue")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "cancelled" || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want cancelled queue with finishedAt", queue)
+	}
+	events, err := repositories.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if containsEventType(events, "looperd.recovery.loop_requeued") {
+		t.Fatalf("events = %#v, want no loop_requeued event", events)
+	}
+	if !containsEventType(events, "looperd.recovery.reviewer_terminal_metadata_normalized") {
+		t.Fatalf("events = %#v, want reviewer terminal normalization event", events)
+	}
+}
+
+func TestRunRecoveryPipelineRepairsFailedReviewerLoopToTerminalMetadataStatus(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 4, 17, 5, 32, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "nexu-io/vela"
+	prNumber := int64(223)
+	targetID := "pr:nexu-io/vela:223"
+	metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "terminated", "terminationReason": "pr_closed_or_merged", "lastStatus": "failed"}})
+	loopID := "loop_reviewer_failed_terminal_metadata"
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1698, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	errorMessage := "Reviewer review agent timed out (idle)..."
+	step := "publish"
+	checkpoint := `{"resumePolicy":"restart_from_discover","detail":{"state":"OPEN","reviewDecision":"APPROVED","headSha":"abc123","currentLogin":"octocat","reviews":[{"author":{"login":"octocat"},"state":"APPROVED","commit":{"oid":"abc123"}}],"labels":[]}}`
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_reviewer_failed_terminal_metadata", LoopID: loopID, Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queueErrorKind := "retryable_after_resume"
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_failed_terminal_metadata", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_failed_terminal_metadata:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, FinishedAt: &nowISO, LastError: &errorMessage, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	if _, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now); err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	loop, err := repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "terminated" {
+		t.Fatalf("loop = %#v, want status terminated", loop)
+	}
+	events, err := repositories.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if containsEventType(events, "looperd.recovery.reviewer_auto_recovered") || containsEventType(events, "looperd.recovery.loop_requeued") {
+		t.Fatalf("events = %#v, want terminal normalization without recovery requeue", events)
+	}
+	if !containsEventType(events, "looperd.recovery.reviewer_terminal_metadata_normalized") {
+		t.Fatalf("events = %#v, want reviewer terminal normalization event", events)
+	}
+}
+
 func TestRuntimeRecoveryRequeuesRunningQueueItemWithoutRun(t *testing.T) {
 	t.Parallel()
 
@@ -3140,6 +3343,15 @@ func TestShouldAutoRecoverFailedReviewerLoopIgnoresLegacyBudgetTermination(t *te
 		if _, ok := loopMeta[key]; ok {
 			t.Fatalf("loop metadata retained deprecated budget key %q: %#v", key, loopMeta)
 		}
+	}
+}
+
+func TestTerminalReviewerRecoveryMetadataStatusIgnoresLegacyBudgetTermination(t *testing.T) {
+	t.Parallel()
+
+	loop := storage.LoopRecord{Type: "reviewer", MetadataJSON: stringPtr(`{"loop":{"status":"terminated","terminationReason":"max_wall_clock","maxWallClockSeconds":60}}`)}
+	if status := terminalReviewerRecoveryMetadataStatus(loop); status != "" {
+		t.Fatalf("terminalReviewerRecoveryMetadataStatus() = %q, want empty status", status)
 	}
 }
 
