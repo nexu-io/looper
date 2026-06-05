@@ -2740,7 +2740,7 @@ func TestDiscoverPullRequestsChecksNotRequestedThreadResolutionFollowUpOncePerCa
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1}}`
 	loop := storage.LoopRecord{ID: "loop_not_requested_thread_resolution_once", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)

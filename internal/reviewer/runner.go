@@ -770,7 +770,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	enqueue := func(pr PullRequestSummary, existing *storage.LoopRecord) error {
 
-		return r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, existing, &result)
+		return r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, existing, false, &result)
 
 	}
 	seenEnqueue := func(pr PullRequestSummary) error {
@@ -916,14 +916,14 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		result.Skipped++
 		return result, nil
 	}
-	if err := r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, nil, &result); err != nil {
+	if err := r.enqueueReviewerDiscoveryCandidate(ctx, *project, input.Repo, policy, &currentLogin, pr, nil, false, &result); err != nil {
 
 		return DiscoveryResult{}, err
 	}
 	return result, nil
 }
 
-func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, pr PullRequestSummary, existing *storage.LoopRecord, result *DiscoveryResult) error {
+func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, pr PullRequestSummary, existing *storage.LoopRecord, allowThreadResolutionFollowUp bool, result *DiscoveryResult) error {
 	loopResult, loopErr := r.ensureLoopForPullRequest(ctx, project, repo, pr.Number, existing)
 	if loopErr != nil {
 		return loopErr
@@ -957,7 +957,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		}
 		*currentLogin = normalizeLogin(lookupLogin)
 	}
-	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy) {
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp && !r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy) {
 		result.Skipped++
 		return nil
 	}
@@ -1020,15 +1020,19 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		return nil
 	}
 	requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
-	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin) {
-		result.Skipped++
-		return nil
+	allowThreadResolutionFollowUp := false
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) {
+		allowThreadResolutionFollowUp = r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin)
+		if !allowThreadResolutionFollowUp {
+			result.Skipped++
+			return nil
+		}
 	}
 	if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		result.Skipped++
 		return nil
 	}
-	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, result)
+	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, allowThreadResolutionFollowUp, result)
 }
 
 func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
