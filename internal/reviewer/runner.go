@@ -950,7 +950,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		result.Skipped++
 		return nil
 	}
-	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) {
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy) {
 		result.Skipped++
 		return nil
 	}
@@ -961,7 +961,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		}
 		*currentLogin = normalizeLogin(lookupLogin)
 	}
-	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) {
+	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy) {
 		result.Skipped++
 		return nil
 	}
@@ -986,6 +986,25 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 	}
 	result.QueueItems = append(result.QueueItems, queueItem)
 	return nil
+}
+
+func (r *Runner) allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx context.Context, cwd, repo string, pr PullRequestSummary, currentLogin string, meta map[string]any, policy DiscoveryPolicy) bool {
+	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) || !policy.RequireReviewRequest {
+		return false
+	}
+	raw, _ := meta["lastFilterSkip"].(map[string]any)
+	if raw == nil {
+		return false
+	}
+	kind, _ := stringFromAny(raw["kind"])
+	if kind != "not_requested" || !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
+		return false
+	}
+	reviewerLogin, _ := stringFromAny(raw["reviewerLogin"])
+	if normalizeLogin(reviewerLogin) == "" || normalizeLogin(currentLogin) == "" || normalizeLogin(reviewerLogin) != normalizeLogin(currentLogin) {
+		return false
+	}
+	return r.hasThreadResolutionFollowUpCandidate(ctx, cwd, repo, pr.Number, pr.HeadSHA, currentLogin)
 }
 
 func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, loop storage.LoopRecord, detail PullRequestDetail, result *DiscoveryResult) error {
