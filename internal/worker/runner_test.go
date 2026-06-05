@@ -786,6 +786,16 @@ func TestBuildIssueClaimCommentBodySanitizesTranscriptSummary(t *testing.T) {
 	}
 }
 
+func TestBuildIssueClaimCommentBodyPreservesPausedSummary(t *testing.T) {
+	t.Parallel()
+
+	summary := "Worker stopped because acme/looper#27 is no longer an open issue"
+	body := buildIssueClaimCommentBody("loop_1", "run_1", workerInput{Repo: "acme/looper", IssueNumber: 27}, issueClaimStatusPaused, nil, summary)
+	if !strings.Contains(body, "Latest status: "+summary) {
+		t.Fatalf("body = %q, want paused summary preserved", body)
+	}
+}
+
 func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
