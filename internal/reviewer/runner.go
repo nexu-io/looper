@@ -950,10 +950,6 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		result.Skipped++
 		return nil
 	}
-	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy) {
-		result.Skipped++
-		return nil
-	}
 	if reviewerLastSkipNeedsCurrentLogin(meta, pr) && *currentLogin == "" {
 		lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
 		if lookupErr != nil {

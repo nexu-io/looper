@@ -2722,6 +2722,42 @@ func TestDiscoverPullRequestsAllowsThreadResolutionFollowUpAfterNotRequestedSkip
 	}
 }
 
+func TestDiscoverPullRequestsChecksNotRequestedThreadResolutionFollowUpOncePerCandidate(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentLogin:   "bob",
+		reviewRequests: []string{},
+		listHeadSHA:    "new-head",
+		viewHeadSHA:    "new-head",
+		reviewThreads:  []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "bob", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}},
+	}
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	policy.RequireCurrentReviewRequest = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ThreadResolution: policy})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: "loop_not_requested_thread_resolution_once", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
+	}
+	if github.listReviewThreadsCalls != 1 {
+		t.Fatalf("ListReviewThreads calls = %d, want 1", github.listReviewThreadsCalls)
+	}
+}
+
 func TestReviewerDiscoverySuppressedByLastSkipDoesNotUseCurrentReviewRequestsInRoutedMode(t *testing.T) {
 	t.Parallel()
 	meta := map[string]any{"lastFilterSkip": map[string]any{"kind": "not_requested", "headSha": "new-head", "reviewerLogin": "bob"}}
@@ -8078,6 +8114,7 @@ type fakeGitHubGateway struct {
 	issueCommentErr                 error
 	issueCommentResult              IssueCommentResult
 	reviewThreads                   []ReviewThread
+	listReviewThreadsCalls          int
 	viewHeadSHA                     string
 	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
@@ -8399,6 +8436,7 @@ func (g *fakeGitHubGateway) RemoveIssueLabels(_ context.Context, input githubinf
 }
 
 func (g *fakeGitHubGateway) ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error) {
+	g.listReviewThreadsCalls++
 	out := make([]ReviewThread, len(g.reviewThreads))
 	copy(out, g.reviewThreads)
 	return out, nil
