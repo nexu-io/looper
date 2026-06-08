@@ -60,6 +60,25 @@ func TestEmbeddedMigrationsMirrorSourceFiles(t *testing.T) {
 	}
 }
 
+func TestIsMigrationFileNameRejectsIncidentalSQLFiles(t *testing.T) {
+	t.Parallel()
+
+	for _, fileName := range []string{
+		"._0001_init.sql",
+		"0001 init.sql",
+		"README.sql",
+		"0001_init.sql.bak",
+	} {
+		if isMigrationFileName(fileName) {
+			t.Fatalf("isMigrationFileName(%q) = true, want false", fileName)
+		}
+	}
+
+	if !isMigrationFileName("0001_init.sql") {
+		t.Fatal("isMigrationFileName(\"0001_init.sql\") = false, want true")
+	}
+}
+
 func compareStrings(a string, b string) int {
 	if a < b {
 		return -1

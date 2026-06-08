@@ -38,12 +38,17 @@ func mustLoadEmbeddedMigrations() []EmbeddedMigration {
 	migrations := make([]EmbeddedMigration, 0, len(entries))
 
 	for _, entry := range entries {
+		fileName := path.Base(entry)
+		if !isMigrationFileName(fileName) {
+			continue
+		}
+
 		sqlBytes, err := embeddedMigrationFiles.ReadFile(entry)
 		if err != nil {
 			panic("storage: read embedded migration " + entry + ": " + err.Error())
 		}
 
-		migration, err := newEmbeddedMigration(path.Base(entry), string(sqlBytes))
+		migration, err := newEmbeddedMigration(fileName, string(sqlBytes))
 		if err != nil {
 			panic("storage: load embedded migration " + entry + ": " + err.Error())
 		}
@@ -67,7 +72,7 @@ func ReadMigrationsFromDir(migrationsDir string) ([]EmbeddedMigration, error) {
 		}
 
 		fileName := entry.Name()
-		if !migrationFilePattern.MatchString(fileName) {
+		if !isMigrationFileName(fileName) {
 			continue
 		}
 
@@ -94,7 +99,7 @@ func ReadMigrationsFromDir(migrationsDir string) ([]EmbeddedMigration, error) {
 }
 
 func newEmbeddedMigration(fileName string, sql string) (EmbeddedMigration, error) {
-	if !migrationFilePattern.MatchString(fileName) {
+	if !isMigrationFileName(fileName) {
 		return EmbeddedMigration{}, fmt.Errorf("migration file name %q does not match %s", fileName, migrationFilePattern.String())
 	}
 
@@ -103,4 +108,8 @@ func newEmbeddedMigration(fileName string, sql string) (EmbeddedMigration, error
 		FileName: fileName,
 		SQL:      sql,
 	}, nil
+}
+
+func isMigrationFileName(fileName string) bool {
+	return migrationFilePattern.MatchString(fileName)
 }
