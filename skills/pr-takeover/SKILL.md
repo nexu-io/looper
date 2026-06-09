@@ -113,6 +113,17 @@ gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$
 gh api graphql -f query='mutation($id:ID!,$m:String!){dismissPullRequestReview(input:{pullRequestReviewId:$id,message:$m}){pullRequestReview{state}}}' -F id=<reviewNodeId> -F m="Dismissing: <why this change request is wrong/out of scope>."
 ```
 
+### 3b. Re-request the reviewer after pushing a new head
+
+GitHub does **not** auto-re-request a reviewer when you push fixes — their `CHANGES_REQUESTED` stays on the record, the PR keeps showing as blocked even though you addressed everything, and the reviewer gets **no notification** that there's a new head to look at. So after pushing fixes that address a reviewer's change request, re-request them:
+
+```bash
+# for each reviewer whose requested changes this push addresses
+gh pr edit <num> --add-reviewer <login>
+```
+
+This is what flips a stale `CHANGES_REQUESTED` back into an active review request and notifies the reviewer. Skip only if they already re-reviewed the current head.
+
 ### 4. Merge when approved and green
 
 Only when `reviewDecision==APPROVED`, every required check is `SUCCESS` (none pending/failing), `mergeable==MERGEABLE`, and not a draft:
@@ -129,8 +140,6 @@ Then report and stop.
 Poll on an interval instead of spinning. Use your agent's own loop/scheduler if it has one:
 - **Claude Code**: `/loop 5m <this instruction>`, or schedule a wake-up; idle between ticks.
 - **Codex / opencode / Gemini / others**: re-run this instruction on a timer, or iterate with a `sleep 180` between checks.
-
-Re-request review after pushing fixes if needed: `gh pr edit <num> --add-reviewer <login>`.
 
 ---
 
@@ -155,4 +164,4 @@ Works in any agent, with or without this skill installed — it just points the 
 
 If your agent can't fetch URLs, paste this instead:
 
-> Take over this PR until it merges. Loop: read the open review threads (`gh`), fix what they ask and push, reply + resolve each thread, dismiss any change request you can justify as wrong (with a written reason), and merge once it's approved and all required checks are green. Never merge on red/pending checks, never force-push, and stop to ask me if someone says hold or a fix needs a product decision.
+> Take over this PR until it merges. Loop: read the open review threads (`gh`), fix what they ask and push, re-request the reviewer after each push (GitHub won't auto-re-request, so the reviewer won't otherwise know there's a new head), reply + resolve each thread, dismiss any change request you can justify as wrong (with a written reason), and merge once it's approved and all required checks are green. Never merge on red/pending checks, never force-push, and stop to ask me if someone says hold or a fix needs a product decision.
