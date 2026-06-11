@@ -1249,6 +1249,72 @@ func TestRunRecoveryPipelineDoesNotRequeueManualInterventionQueueWhenLoopStillRu
 	}
 }
 
+func TestRunRecoveryPipelineRequeuesClaimedManualInterventionRetry(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 4, 17, 5, 32, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_manual_intervention_claimed_retry"
+	targetID := projectID
+	errorMessage := "dirty worktree"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1702, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "queued", NextRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_intervention_claimed_retry", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queueErrorKind := "manual_intervention"
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_manual_intervention_claimed_retry", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:project_1:loop_manual_intervention_claimed_retry", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastError: &errorMessage, LastErrorKind: &queueErrorKind, ClaimedBy: stringPtr("scheduler"), ClaimedAt: stringPtr(nowISO), StartedAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	if _, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now); err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	loop, err := repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued recovery", loop)
+	}
+	queue, err := repositories.Queue.GetByID(context.Background(), "queue_manual_intervention_claimed_retry")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" {
+		t.Fatalf("queue = %#v, want queued retry", queue)
+	}
+	if queue.ClaimedBy != nil || queue.ClaimedAt != nil || queue.StartedAt != nil {
+		t.Fatalf("queue = %#v, want claimed fields cleared", queue)
+	}
+	events, err := repositories.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if !containsEventType(events, "looperd.recovery.loop_manual_intervention_requeued") {
+		t.Fatalf("events = %#v, want manual intervention recovery event", events)
+	}
+	if containsEventType(events, "looperd.recovery.loop_requeued") {
+		t.Fatalf("events = %#v, want no generic loop_requeued event", events)
+	}
+}
+
 func TestRuntimeRecoveryRequeuesRunningQueueItemWithoutRun(t *testing.T) {
 	t.Parallel()
 

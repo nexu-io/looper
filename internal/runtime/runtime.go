@@ -1295,6 +1295,10 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				if _, err := repositories.Queue.RequeueFailedByIDWithAttempts(ctx, loop.ID, latestQueue.ID, nowISO, latestQueue.Attempts); err != nil {
 					return RecoverySummary{}, err
 				}
+			} else if latestQueue.Status == "running" {
+				if _, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
+					return RecoverySummary{}, err
+				}
 			}
 			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
 				return RecoverySummary{}, err
@@ -1883,6 +1887,10 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 			requeuedLoop.UpdatedAt = nowISO
 			if latestQueue.Status == "manual_intervention" {
 				if _, err := repositories.Queue.RequeueFailedByIDWithAttempts(ctx, loop.ID, latestQueue.ID, nowISO, latestQueue.Attempts); err != nil {
+					return staleRunQueueRepairSummary{}, err
+				}
+			} else if latestQueue.Status == "running" {
+				if _, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
 					return staleRunQueueRepairSummary{}, err
 				}
 			}
