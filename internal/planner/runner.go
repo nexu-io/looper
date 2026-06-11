@@ -751,7 +751,18 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
+	status := "success"
+	if checkpoint.SkipReason != "" {
+		status = "skipped"
+	}
+	prNumber := int64(0)
+	if checkpoint.Publish != nil && checkpoint.Publish.PullRequest != nil {
+		prNumber = checkpoint.Publish.PullRequest.Number
+	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+		if errors.Is(err, storage.ErrQueueItemNotActive) {
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: prNumber}, nil
+		}
 		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -760,14 +771,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
-	}
-	status := "success"
-	if checkpoint.SkipReason != "" {
-		status = "skipped"
-	}
-	prNumber := int64(0)
-	if checkpoint.Publish != nil && checkpoint.Publish.PullRequest != nil {
-		prNumber = checkpoint.Publish.PullRequest.Number
 	}
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: prNumber}, nil
 }
@@ -1525,6 +1528,9 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	}
 	if current == nil {
 		return storage.LoopRecord{}, fmt.Errorf("loop not found: %s", loop.ID)
+	}
+	if current.Status == "terminated" {
+		return *current, nil
 	}
 	updated := *current
 	mutate(&updated)

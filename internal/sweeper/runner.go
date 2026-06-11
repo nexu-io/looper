@@ -3,6 +3,7 @@ package sweeper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -354,6 +355,9 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 		return r.recoverClaimedQueueItem(ctx, queueItem, err)
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+		if errors.Is(err, storage.ErrQueueItemNotActive) {
+			return &ProcessResult{QueueItemID: queueItem.ID, Status: outcomeCancelled, Summary: summary}, nil
+		}
 		return nil, err
 	}
 	return &ProcessResult{QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil

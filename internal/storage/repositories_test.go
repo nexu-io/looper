@@ -1604,8 +1604,8 @@ func TestQueueTerminalWritersDoNotOverwriteCancelledProjectItems(t *testing.T) {
 		t.Fatalf("Queue.CancelByProject() error = %v", err)
 	}
 
-	if err := repos.Queue.Complete(ctx, "qi_cancelled_complete", "2026-04-11T12:02:00.000Z"); err != nil {
-		t.Fatalf("Queue.Complete() error = %v", err)
+	if err := repos.Queue.Complete(ctx, "qi_cancelled_complete", "2026-04-11T12:02:00.000Z"); !errors.Is(err, ErrQueueItemNotActive) {
+		t.Fatalf("Queue.Complete() error = %v, want ErrQueueItemNotActive", err)
 	}
 	failReason := "late failure"
 	if err := repos.Queue.Fail(ctx, QueueFailInput{ID: "qi_cancelled_fail", Attempts: 2, FinishedAt: "2026-04-11T12:02:30.000Z", ErrorMessage: &failReason, ErrorKind: "manual_intervention", UpdatedAt: "2026-04-11T12:02:30.000Z"}); err != nil {

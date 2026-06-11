@@ -1090,7 +1090,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
 	}
+	status := "success"
+	if checkpoint.SkipReason != "" {
+		status = "skipped"
+	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+		if errors.Is(err, storage.ErrQueueItemNotActive) {
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
+		}
 		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -1099,10 +1106,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
-	}
-	status := "success"
-	if checkpoint.SkipReason != "" {
-		status = "skipped"
 	}
 	finalIssueClaimStatus := issueClaimStatusSuccess
 	if checkpoint.SkipReason != "" {
@@ -1210,6 +1213,9 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 			return ProcessResult{}, true, err
 		}
 		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+			if errors.Is(err, storage.ErrQueueItemNotActive) {
+				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, true, nil
+			}
 			return ProcessResult{}, true, err
 		}
 		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
@@ -2442,6 +2448,9 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil {
 		return storage.LoopRecord{}, err
+	}
+	if current != nil && current.Status == "terminated" {
+		return *current, nil
 	}
 	updated := loop
 	if current != nil {

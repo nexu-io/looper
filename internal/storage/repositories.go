@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var ErrQueueItemNotActive = errors.New("queue item not active")
+
 type sqliteQuerier interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -1937,13 +1939,20 @@ func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy
 }
 
 func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) error {
-	_, err := r.q.ExecContext(ctx, `
+	result, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = 'completed', finished_at = ?, updated_at = ?
 		WHERE id = ? AND status IN ('queued', 'running')
 	`, finishedAt, finishedAt, id)
 	if err != nil {
 		return fmt.Errorf("complete queue item: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read complete queue item rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("complete queue item: %w", ErrQueueItemNotActive)
 	}
 
 	return nil

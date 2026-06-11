@@ -1758,6 +1758,9 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}
 	if err := input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC())); err != nil {
+		if errors.Is(err, storage.ErrQueueItemNotActive) {
+			return nil
+		}
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}
 	return nil

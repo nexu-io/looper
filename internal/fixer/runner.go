@@ -1804,6 +1804,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+		if errors.Is(err, storage.ErrQueueItemNotActive) {
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
+		}
 		return ProcessResult{}, err
 	}
 	if hasProgressed(checkpoint) {
@@ -4271,6 +4275,9 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil {
 		return storage.LoopRecord{}, err
+	}
+	if current != nil && current.Status == "terminated" {
+		return *current, nil
 	}
 	updated := loop
 	if current != nil {

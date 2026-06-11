@@ -1353,3 +1353,31 @@ func (*testLogger) Warn(string, map[string]any)  {}
 func (*testLogger) Error(string, map[string]any) {}
 
 func boolPtr(value bool) *bool { return &value }
+
+func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_planner_terminated", Seq: 901, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "terminated", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	runner := &Runner{repos: fixture.repos, now: fixture.now}
+	updated, err := runner.updateLoop(context.Background(), loop, func(current *storage.LoopRecord) {
+		current.Status = "completed"
+	})
+	if err != nil {
+		t.Fatalf("updateLoop() error = %v", err)
+	}
+	if updated.Status != "terminated" {
+		t.Fatalf("updateLoop().Status = %q, want terminated", updated.Status)
+	}
+
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "terminated" {
+		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
+	}
+}
