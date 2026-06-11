@@ -14,6 +14,34 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 )
 
+func TestInvalidJSONErrorIncludesParserDetailsAndPayloadSample(t *testing.T) {
+	t.Parallel()
+	stdout := strings.Repeat("warning: ", 40) + "not json"
+	_, err := decodeJSONObject(stdout)
+	if err == nil {
+		t.Fatal("decodeJSONObject() error = nil, want invalid JSON error")
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		t.Fatalf("decodeJSONObject() error = %T, want CommandExecutionError", err)
+	}
+	if !strings.Contains(commandErr.Error(), "Invalid gh JSON payload:") {
+		t.Fatalf("error = %q, want parser details", commandErr.Error())
+	}
+	if !strings.Contains(commandErr.Error(), "stdoutBytes=") {
+		t.Fatalf("error = %q, want stdoutBytes", commandErr.Error())
+	}
+	if !strings.Contains(commandErr.Error(), "stdoutSample=") {
+		t.Fatalf("error = %q, want stdout sample", commandErr.Error())
+	}
+	if !strings.Contains(commandErr.Error(), "…") {
+		t.Fatalf("error = %q, want truncated sample marker", commandErr.Error())
+	}
+	if commandErr.Result.Stdout != stdout {
+		t.Fatalf("Result.Stdout was not preserved")
+	}
+}
+
 func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

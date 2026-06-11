@@ -3316,7 +3316,30 @@ func decodeJSONArrayOrPages(value string) ([]map[string]any, error) {
 }
 
 func invalidJSONError(stdout string, err error) error {
-	return &shell.CommandExecutionError{Message: "Invalid gh JSON payload", Result: shell.Result{ExitCode: 0, Stdout: stdout, Stderr: err.Error()}}
+	message := "Invalid gh JSON payload"
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+		message += ": " + errText
+	}
+	message += fmt.Sprintf("; stdoutBytes=%d", len(stdout))
+	if sample := summarizeInvalidJSONPayload(stdout); sample != "" {
+		message += "; stdoutSample=" + strconv.Quote(sample)
+	}
+	return &shell.CommandExecutionError{Message: message, Result: shell.Result{ExitCode: 0, Stdout: stdout, Stderr: errText}}
+}
+
+func summarizeInvalidJSONPayload(stdout string) string {
+	stdout = strings.TrimSpace(stdout)
+	if stdout == "" {
+		return ""
+	}
+	stdout = strings.Join(strings.Fields(stdout), " ")
+	const maxSampleBytes = 240
+	if len(stdout) <= maxSampleBytes {
+		return stdout
+	}
+	return strings.TrimSpace(stdout[:maxSampleBytes]) + "…"
 }
 
 func toObjectSlice(value any) []map[string]any {
