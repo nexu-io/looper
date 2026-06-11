@@ -154,7 +154,10 @@ func TestHandlerLoopRetryAllowsFailedReviewerLoop(t *testing.T) {
 }
 
 func TestHandlerLoopRetryRejectsTerminalReviewerMetadata(t *testing.T) {
-	rt, cfg := startTestRuntime(t)
+	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		options.DeferRecovery = true
+	})
+	rt, cfg := fixture.runtime, fixture.config
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
@@ -5806,7 +5809,7 @@ func (r executionVerifierRuntime) ExecutionMatchesProcess(ctx context.Context, e
 	return r.Runtime.ExecutionMatchesProcess(ctx, execution, pid)
 }
 
-func newTestFixture(t *testing.T) testFixture {
+func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) testFixture {
 	t.Helper()
 
 	rootDir := t.TempDir()
@@ -5834,7 +5837,7 @@ func newTestFixture(t *testing.T) testFixture {
 	cfg.Agent.Vendor = &vendor
 
 	now := time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC)
-	rt := looperdruntime.New(looperdruntime.Options{
+	options := looperdruntime.Options{
 		Config: cfg,
 		Logger: noopLogger{},
 		Now: func() time.Time {
@@ -5843,7 +5846,11 @@ func newTestFixture(t *testing.T) testFixture {
 		RunSchedulerTick: func(context.Context, looperdruntime.Services) error {
 			return nil
 		},
-	})
+	}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	rt := looperdruntime.New(options)
 
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Runtime.Start() error = %v", err)
