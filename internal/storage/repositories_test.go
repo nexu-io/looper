@@ -1569,6 +1569,66 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	}
 }
 
+func TestQueueTerminalWritersDoNotOverwriteCancelledProjectItems(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	projectID := "project_archived"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	loopID := "loop_archived"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	claimedBy := "worker-a"
+	claimedAt := "2026-04-11T12:00:10.000Z"
+	for _, item := range []QueueItemRecord{
+		{ID: "qi_cancelled_complete", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "d_cancelled_complete", Priority: 1, Status: "running", AvailableAt: now, Attempts: 1, MaxAttempts: 3, ClaimedBy: &claimedBy, ClaimedAt: &claimedAt, StartedAt: &claimedAt, CreatedAt: now, UpdatedAt: claimedAt},
+		{ID: "qi_cancelled_fail", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "d_cancelled_fail", Priority: 1, Status: "running", AvailableAt: now, Attempts: 1, MaxAttempts: 3, ClaimedBy: &claimedBy, ClaimedAt: &claimedAt, StartedAt: &claimedAt, CreatedAt: now, UpdatedAt: claimedAt},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	archivedAt := "2026-04-11T12:01:00.000Z"
+	reason := "project archived"
+	if _, err := repos.Queue.CancelByProject(ctx, projectID, archivedAt, &reason); err != nil {
+		t.Fatalf("Queue.CancelByProject() error = %v", err)
+	}
+
+	if err := repos.Queue.Complete(ctx, "qi_cancelled_complete", "2026-04-11T12:02:00.000Z"); err != nil {
+		t.Fatalf("Queue.Complete() error = %v", err)
+	}
+	failReason := "late failure"
+	if err := repos.Queue.Fail(ctx, QueueFailInput{ID: "qi_cancelled_fail", Attempts: 2, FinishedAt: "2026-04-11T12:02:30.000Z", ErrorMessage: &failReason, ErrorKind: "manual_intervention", UpdatedAt: "2026-04-11T12:02:30.000Z"}); err != nil {
+		t.Fatalf("Queue.Fail() error = %v", err)
+	}
+
+	for _, id := range []string{"qi_cancelled_complete", "qi_cancelled_fail"} {
+		item, err := repos.Queue.GetByID(ctx, id)
+		if err != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, err)
+		}
+		if item == nil || item.Status != "cancelled" {
+			t.Fatalf("Queue.GetByID(%s) = %#v, want cancelled", id, item)
+		}
+		if item.FinishedAt == nil || *item.FinishedAt != archivedAt {
+			t.Fatalf("Queue.GetByID(%s).FinishedAt = %#v, want %q", id, item.FinishedAt, archivedAt)
+		}
+		if item.LastError == nil || *item.LastError != reason {
+			t.Fatalf("Queue.GetByID(%s).LastError = %#v, want %q", id, item.LastError, reason)
+		}
+	}
+}
+
 func TestTargetedListRepositories(t *testing.T) {
 	t.Parallel()
 

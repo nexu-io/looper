@@ -1940,7 +1940,7 @@ func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) e
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = 'completed', finished_at = ?, updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND status IN ('queued', 'running')
 	`, finishedAt, finishedAt, id)
 	if err != nil {
 		return fmt.Errorf("complete queue item: %w", err)
@@ -1997,7 +1997,7 @@ func (r *QueueRepository) Fail(ctx context.Context, input QueueFailInput) error 
 			last_error = ?,
 			last_error_kind = ?,
 			updated_at = ?
-		WHERE id = ?
+		WHERE id = ? AND status IN ('queued', 'running')
 	`, "manual_intervention", input.Attempts, input.Attempts, input.FinishedAt, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("fail queue item: %w", err)
