@@ -1960,11 +1960,6 @@ func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInp
 }
 
 func (r *QueueRepository) Fail(ctx context.Context, input QueueFailInput) error {
-	terminalStatus := "failed"
-	if input.ErrorKind == "manual_intervention" {
-		terminalStatus = "manual_intervention"
-	}
-
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = ?,
@@ -1974,7 +1969,7 @@ func (r *QueueRepository) Fail(ctx context.Context, input QueueFailInput) error 
 			last_error_kind = ?,
 			updated_at = ?
 		WHERE id = ?
-	`, terminalStatus, input.Attempts, input.Attempts, input.FinishedAt, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
+	`, "manual_intervention", input.Attempts, input.Attempts, input.FinishedAt, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("fail queue item: %w", err)
 	}
@@ -2051,7 +2046,7 @@ func (r *QueueRepository) RequeueLatestCancelledByLoop(ctx context.Context, loop
 }
 
 func (r *QueueRepository) RequeueLatestFailedByLoop(ctx context.Context, loopID, queuedAt string) (int64, error) {
-	queueID, err := r.findLatestQueueIDByLoopStatus(ctx, loopID, "failed")
+	queueID, err := r.findLatestQueueIDByLoopStatuses(ctx, loopID, []string{"manual_intervention", "failed"})
 	if err != nil {
 		return 0, err
 	}
@@ -2079,7 +2074,7 @@ func (r *QueueRepository) RequeueFailedByID(ctx context.Context, loopID, queueID
 			last_error = NULL,
 			last_error_kind = NULL,
 			updated_at = ?
-		WHERE id = ? AND loop_id = ? AND status = 'failed'
+		WHERE id = ? AND loop_id = ? AND status IN ('manual_intervention', 'failed')
 			AND NOT EXISTS (
 				SELECT 1 FROM queue_items
 				WHERE loop_id = ? AND status IN ('queued', 'running') AND id != ?
@@ -2117,7 +2112,7 @@ func (r *QueueRepository) RequeueFailedByIDWithAttempts(ctx context.Context, loo
 			last_error = NULL,
 			last_error_kind = NULL,
 			updated_at = ?
-		WHERE id = ? AND loop_id = ? AND status = 'failed'
+		WHERE id = ? AND loop_id = ? AND status IN ('manual_intervention', 'failed')
 			AND NOT EXISTS (
 				SELECT 1 FROM queue_items
 				WHERE loop_id = ? AND status IN ('queued', 'running') AND id != ?
@@ -2136,18 +2131,31 @@ func (r *QueueRepository) RequeueFailedByIDWithAttempts(ctx context.Context, loo
 }
 
 func (r *QueueRepository) findLatestQueueIDByLoopStatus(ctx context.Context, loopID, status string) (string, error) {
+	return r.findLatestQueueIDByLoopStatuses(ctx, loopID, []string{status})
+}
+
+func (r *QueueRepository) findLatestQueueIDByLoopStatuses(ctx context.Context, loopID string, statuses []string) (string, error) {
+	if len(statuses) == 0 {
+		return "", nil
+	}
+	placeholders := make([]string, 0, len(statuses))
+	args := []any{loopID}
+	for _, status := range statuses {
+		placeholders = append(placeholders, "?")
+		args = append(args, status)
+	}
 	row := r.q.QueryRowContext(ctx, `
 		SELECT id
 		FROM queue_items
-		WHERE loop_id = ? AND status = ?
+		WHERE loop_id = ? AND status IN (`+strings.Join(placeholders, ", ")+`)
 		ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1
-	`, loopID, status)
+	`, args...)
 	var queueID string
 	if err := row.Scan(&queueID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil
 		}
-		return "", fmt.Errorf("get latest %s queue item by loop: %w", status, err)
+		return "", fmt.Errorf("get latest queue item by loop statuses %s: %w", strings.Join(statuses, ","), err)
 	}
 	return queueID, nil
 }

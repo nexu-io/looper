@@ -1354,11 +1354,7 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, "") {
-				updated.Status = "paused"
-			} else {
-				updated.Status = "failed"
-			}
+			updated.Status = "paused"
 			updated.NextRunAt = nil
 		}
 	})
@@ -1501,7 +1497,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if queueErr != nil {
 				return ProcessResult{}, queueErr
 			}
-			terminalFailure := false
 			_, loopErr := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = stringPtr(r.nowISO())
 				if !failure.interrupted {
@@ -1510,9 +1505,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 						updated.MetadataJSON = &metadataJSON
 					}
 				}
-				if !failure.interrupted && terminalReviewerLoopReason(*updated) == "failed" {
-					terminalFailure = true
-					updated.Status = "failed"
+				if failure.interrupted && terminalReviewerLoopReason(*updated) == "failed" {
+					updated.Status = "paused"
 					updated.NextRunAt = nil
 				} else if updated.Status == "paused" {
 					updated.NextRunAt = nil
@@ -1520,24 +1514,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
-						updated.Status = "paused"
-					} else {
-						updated.Status = "failed"
-					}
+					updated.Status = "paused"
 					updated.NextRunAt = nil
 				}
 			})
 			if loopErr != nil {
 				return ProcessResult{}, loopErr
 			}
-			if terminalFailure && failedQueue != nil && failedQueue.Status == "queued" {
-				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, Attempts: failedQueue.Attempts, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
-					return ProcessResult{}, err
-				}
-				failedQueue.Status = "failed"
-			}
-			if failedQueue == nil || failedQueue.Status != "queued" {
+			if queueResultIsTerminalForCleanup(failedQueue) {
 				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
@@ -5850,6 +5834,10 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 		return
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
+}
+
+func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
+	return queue == nil || (queue.Status != "queued" && queue.Status != "manual_intervention")
 }
 
 func requireWorktree(checkpoint reviewerCheckpoint) (*checkpointWorktree, error) {

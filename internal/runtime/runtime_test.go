@@ -685,7 +685,7 @@ func TestRuntimeStartNormalizesStaleQueuedLoops(t *testing.T) {
 
 	services := rt.Services()
 	assertLoopStatus(t, services.Repositories, "loop_success", "completed")
-	assertLoopStatus(t, services.Repositories, "loop_failed", "failed")
+	assertLoopStatus(t, services.Repositories, "loop_failed", "paused")
 	assertLoopStatus(t, services.Repositories, "loop_legit", "queued")
 	assertLoopStatus(t, services.Repositories, "loop_requeued", "queued")
 
@@ -1110,6 +1110,142 @@ func TestRunRecoveryPipelineRepairsFailedReviewerLoopToTerminalMetadataStatus(t 
 	}
 	if !containsEventType(events, "looperd.recovery.reviewer_terminal_metadata_normalized") {
 		t.Fatalf("events = %#v, want reviewer terminal normalization event", events)
+	}
+}
+
+func TestRunRecoveryPipelineKeepsQueuedReviewerLoopPausedWhenLatestRunFailed(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 4, 17, 5, 32, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "nexu-io/vela"
+	prNumber := int64(223)
+	targetID := "pr:nexu-io/vela:223"
+	loopID := "loop_reviewer_queued_failed_run_pauses"
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1700, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	errorMessage := "review failed"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_reviewer_queued_failed_run_pauses", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queueErrorKind := "manual_intervention"
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_queued_failed_run_pauses", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_reviewer_queued_failed_run_pauses:nexu-io/vela:223", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, LastError: &errorMessage, LastErrorKind: &queueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	if _, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now); err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	loop, err := repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused", loop)
+	}
+	queue, err := repositories.Queue.GetByID(context.Background(), "queue_reviewer_queued_failed_run_pauses")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual_intervention hold", queue)
+	}
+	events, err := repositories.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if containsEventType(events, "looperd.recovery.loop_requeued") {
+		t.Fatalf("events = %#v, want no loop_requeued event", events)
+	}
+	if containsEventType(events, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("events = %#v, want no failed normalization event", events)
+	}
+	if containsEventType(events, "looperd.recovery.reviewer_terminal_metadata_normalized") {
+		t.Fatalf("events = %#v, want no terminal metadata normalization", events)
+	}
+	if !containsEventType(events, "looperd.recovery.loop_manual_intervention_held") {
+		t.Fatalf("events = %#v, want manual intervention recovery event", events)
+	}
+}
+
+func TestRunRecoveryPipelineDoesNotRequeueManualInterventionQueueWhenLoopStillRunning(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 4, 17, 5, 32, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_manual_intervention_crash_window"
+	targetID := projectID
+	errorMessage := "dirty worktree"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1701, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_intervention_crash_window", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, Summary: &errorMessage, ErrorMessage: &errorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queueErrorKind := "manual_intervention"
+	if err := repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_manual_intervention_crash_window", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:project_1:loop_manual_intervention_crash_window", Priority: storage.QueuePriorityWorker, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastError: &errorMessage, LastErrorKind: &queueErrorKind, FinishedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	if _, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now); err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+	loop, err := repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused manual hold", loop)
+	}
+	items, err := repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("queue items = %#v, want exactly original manual_intervention item", items)
+	}
+	if items[0].Status != "manual_intervention" || items[0].ID != "queue_manual_intervention_crash_window" {
+		t.Fatalf("queue item = %#v, want original manual_intervention hold", items[0])
+	}
+	events, err := repositories.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if containsEventType(events, "looperd.recovery.loop_requeued") {
+		t.Fatalf("events = %#v, want no loop_requeued event", events)
+	}
+	if containsEventType(events, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("events = %#v, want no queued normalization", events)
 	}
 }
 

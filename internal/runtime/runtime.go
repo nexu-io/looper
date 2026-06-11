@@ -1277,11 +1277,52 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			eventsWritten += 1
+			terminalNormalizedLoopIDs[loop.ID] = struct{}{}
 			continue
 		}
 
 		_, latestRunHasActiveAgent := activeAgentRunIDs[derefRunID(latestRun)]
 		_, latestRunHasUncertainAgent := uncertainAgentRunIDs[derefRunID(latestRun)]
+		if latestQueueIsManualIntervention(latestQueue) && (loop.Status == "running" || loop.Status == "queued") {
+			if latestQueue.Status != "manual_intervention" {
+				attempts := latestQueue.Attempts
+				if attempts <= 0 {
+					attempts = 1
+				}
+				if err := repositories.Queue.Fail(ctx, storage.QueueFailInput{ID: latestQueue.ID, Attempts: attempts, FinishedAt: nowISO, ErrorMessage: latestQueue.LastError, ErrorKind: derefString(latestQueue.LastErrorKind), UpdatedAt: nowISO}); err != nil {
+					return RecoverySummary{}, err
+				}
+			}
+			heldLoop := loop
+			heldLoop.Status = "paused"
+			heldLoop.NextRunAt = nil
+			if latestRun != nil {
+				heldLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+			}
+			heldLoop.UpdatedAt = nowISO
+			if err := repositories.Loops.Upsert(ctx, heldLoop); err != nil {
+				return RecoverySummary{}, err
+			}
+			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				ID:         newRuntimeEventID(),
+				EventType:  "looperd.recovery.loop_manual_intervention_held",
+				LoopID:     stringPtr(loop.ID),
+				EntityType: stringPtr("loop"),
+				EntityID:   stringPtr(loop.ID),
+				PayloadJSON: mustMarshalJSON(map[string]any{
+					"previousStatus":  loop.Status,
+					"recoveredStatus": heldLoop.Status,
+					"queueItemId":     latestQueue.ID,
+					"lastErrorKind":   derefString(latestQueue.LastErrorKind),
+				}),
+				CreatedAt: nowISO,
+			}); err != nil {
+				return RecoverySummary{}, err
+			}
+			eventsWritten += 1
+			terminalNormalizedLoopIDs[loop.ID] = struct{}{}
+			continue
+		}
 		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent || latestRunHasUncertainAgent) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
@@ -1829,6 +1870,35 @@ func (r *Runtime) verifyRunExecutionLiveness(ctx context.Context, repositories *
 func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, latestRun *storage.RunRecord, latestRunHasLiveAgent bool, nowISO string) (staleRunQueueRepairSummary, error) {
 	summary := staleRunQueueRepairSummary{}
 	if repositories == nil || repositories.Queue == nil {
+		return summary, nil
+	}
+	latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return staleRunQueueRepairSummary{}, err
+	}
+	if latestQueueIsManualIntervention(latestQueue) {
+		if latestQueue.Status != "manual_intervention" {
+			attempts := latestQueue.Attempts
+			if attempts <= 0 {
+				attempts = 1
+			}
+			if err := repositories.Queue.Fail(ctx, storage.QueueFailInput{ID: latestQueue.ID, Attempts: attempts, FinishedAt: nowISO, ErrorMessage: latestQueue.LastError, ErrorKind: derefString(latestQueue.LastErrorKind), UpdatedAt: nowISO}); err != nil {
+				return staleRunQueueRepairSummary{}, err
+			}
+		}
+		if loop.Status == "running" || loop.Status == "queued" {
+			heldLoop := loop
+			heldLoop.Status = "paused"
+			heldLoop.NextRunAt = nil
+			if latestRun != nil {
+				heldLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+			}
+			heldLoop.UpdatedAt = nowISO
+			if err := repositories.Loops.Upsert(ctx, heldLoop); err != nil {
+				return staleRunQueueRepairSummary{}, err
+			}
+			summary.LoopsRequeued = 0
+		}
 		return summary, nil
 	}
 	if shouldRequeueLoop(loop, latestRun, latestRunHasLiveAgent) {
@@ -2870,8 +2940,12 @@ func normalizeStaleQueuedLoopStatus(loop storage.LoopRecord, latestRun storage.R
 	case "interrupted", "running":
 		return "interrupted"
 	default:
-		return "failed"
+		return "paused"
 	}
+}
+
+func latestQueueIsManualIntervention(queue *storage.QueueItemRecord) bool {
+	return queue != nil && (queue.Status == "manual_intervention" || (queue.LastErrorKind != nil && *queue.LastErrorKind == "manual_intervention"))
 }
 
 func mustMarshalJSON(value any) string {

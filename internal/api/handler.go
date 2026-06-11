@@ -2715,7 +2715,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			Agent:       preferredActiveRunAgent(verifiedActiveAgentByRunID[run.ID], activeAgentByRunID[run.ID]),
 			Worktree:    buildWorktreeSummary(loop, run),
 		}
-		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRun)
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRun, h.now().UTC())
 		runningViews = append(runningViews, view)
 	}
 
@@ -2759,7 +2759,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			Agent:       nil,
 			Worktree:    nil,
 		}
-		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRunsByLoopID[loop.ID])
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRunsByLoopID[loop.ID], h.now().UTC())
 		queuedViews = append(queuedViews, view)
 	}
 
@@ -2787,7 +2787,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			Agent:       nil,
 			Worktree:    nil,
 		}
-		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRunsByLoopID[loop.ID])
+		decorateActiveRunView(&view, loop, latestQueueByLoopID[loop.ID], latestRunsByLoopID[loop.ID], h.now().UTC())
 		runningLoopViews = append(runningLoopViews, view)
 	}
 
@@ -2846,7 +2846,7 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 			Agent:       nil,
 			Worktree:    worktree,
 		}
-		decorateActiveRunView(&view, loop, latestQueue, latestRun)
+		decorateActiveRunView(&view, loop, latestQueue, latestRun, h.now().UTC())
 		inactiveLoopViews = append(inactiveLoopViews, view)
 	}
 
@@ -2980,7 +2980,7 @@ func latestQueueItemByLoopID(items []storage.QueueItemRecord) map[string]*storag
 }
 
 func isManualInterventionQueue(item *storage.QueueItemRecord) bool {
-	return item != nil && item.LastErrorKind != nil && *item.LastErrorKind == "manual_intervention"
+	return item != nil && (item.Status == "manual_intervention" || (item.LastErrorKind != nil && *item.LastErrorKind == "manual_intervention"))
 }
 
 func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
@@ -2988,7 +2988,7 @@ func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 	return policy != nil && *policy == loops.ResumePolicyManualIntervention
 }
 
-func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
+func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) {
 	if view.LoopStatus == "" {
 		view.LoopStatus = loop.Status
 	}
@@ -3000,10 +3000,32 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
 	if isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention) {
 		view.DisplayStatus = "manual_intervention"
+	} else if isBackingOffQueue(latestQueue, now) {
+		view.DisplayStatus = "backing_off"
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status
 	}
+}
+
+func isBackingOffQueue(item *storage.QueueItemRecord, now time.Time) bool {
+	if item == nil || item.Status != "queued" || item.LastErrorKind == nil {
+		return false
+	}
+	switch strings.TrimSpace(*item.LastErrorKind) {
+	case "retryable_transient", "retryable_after_resume":
+	default:
+		return false
+	}
+	availableAt := strings.TrimSpace(item.AvailableAt)
+	if availableAt == "" {
+		return false
+	}
+	availableTime, err := time.Parse(time.RFC3339Nano, availableAt)
+	if err != nil {
+		return availableAt > eventlog.FormatJavaScriptISOString(now)
+	}
+	return availableTime.After(now)
 }
 
 func resumePolicyFromRun(run *storage.RunRecord) *string {

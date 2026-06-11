@@ -1041,8 +1041,8 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual_intervention", queue)
 	}
 }
 
@@ -1073,15 +1073,15 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual_intervention", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop", loop)
 	}
 }
 

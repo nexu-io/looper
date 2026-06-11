@@ -5145,22 +5145,19 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed terminal queue item", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual_intervention queue item", queue)
 	}
 
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_fixer_resume_parse_status")
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop", loop)
 	}
-	if len(git.cleanupCalls) != 1 {
-		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
-	}
-	if git.cleanupCalls[0].WorktreePath == "" || git.cleanupCalls[0].Branch != "feature/fix-42" {
-		t.Fatalf("cleanup call = %#v, want persisted worktree cleanup", git.cleanupCalls[0])
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want no cleanup for manual intervention", len(git.cleanupCalls))
 	}
 }
 
@@ -5316,8 +5313,8 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual_intervention", queue)
 	}
 }
 
@@ -5348,15 +5345,15 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual_intervention", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop", loop)
 	}
 }
 

@@ -1,10 +1,6 @@
 package loops
 
-import (
-	"strings"
-
-	"github.com/nexu-io/looper/internal/storage"
-)
+import "strings"
 
 const (
 	FailureKindRetryableAfterResume = "retryable_after_resume"
@@ -51,11 +47,4 @@ func ShouldRestartFromDiscover(status, resumePolicy string) bool {
 		return false
 	}
 	return strings.TrimSpace(resumePolicy) == ResumePolicyRestartFromDiscover
-}
-
-func ShouldPauseLoopAfterFailure(failureKind string, failedQueue *storage.QueueItemRecord, resumePolicy string) bool {
-	if failedQueue != nil && failedQueue.Status == "cancelled" {
-		return true
-	}
-	return IsHardHold(failureKind, resumePolicy)
 }

@@ -1,10 +1,6 @@
 package loops
 
-import (
-	"testing"
-
-	"github.com/nexu-io/looper/internal/storage"
-)
+import "testing"
 
 func TestNormalizeResumePolicy(t *testing.T) {
 	t.Parallel()
@@ -42,18 +38,9 @@ func TestShouldRestartFromDiscover(t *testing.T) {
 	}
 }
 
-func TestShouldPauseLoopAfterFailure(t *testing.T) {
+func TestManualHoldPolicy(t *testing.T) {
 	t.Parallel()
 
-	if !ShouldPauseLoopAfterFailure(FailureKindManualIntervention, nil, "") {
-		t.Fatal("ShouldPauseLoopAfterFailure() = false, want true for manual_intervention")
-	}
-	if ShouldPauseLoopAfterFailure(FailureKindRetryableAfterResume, nil, ResumePolicyRestartFromDiscover) {
-		t.Fatal("ShouldPauseLoopAfterFailure() = true, want false for rediscoverable retry")
-	}
-	if !ShouldPauseLoopAfterFailure("retryable_transient", &storage.QueueItemRecord{Status: "cancelled"}, "") {
-		t.Fatal("ShouldPauseLoopAfterFailure() = false, want true for cancelled queue item")
-	}
 	if !SuppressesAutonomousRecovery(FailureKindManualIntervention, "") {
 		t.Fatal("SuppressesAutonomousRecovery() = false, want true for hard hold")
 	}

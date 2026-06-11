@@ -620,12 +620,8 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
-				updated.Status = "paused"
-			} else {
-				updated.Status = "failed"
-				r.stampFailedDiscoveryFingerprint(updated, queueItem)
-			}
+			updated.Status = "paused"
+			r.stampFailedDiscoveryFingerprint(updated, queueItem)
 			updated.NextRunAt = nil
 		}
 	})
@@ -719,12 +715,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
-						updated.Status = "paused"
-					} else {
-						updated.Status = "failed"
-						r.stampFailedDiscoveryFingerprint(updated, queueItem)
-					}
+					updated.Status = "paused"
+					r.stampFailedDiscoveryFingerprint(updated, queueItem)
 					updated.NextRunAt = nil
 				}
 			}); err != nil {
