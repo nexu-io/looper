@@ -611,6 +611,7 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	if queuedItems+runningItems != float64(1) {
 		t.Fatalf("scheduler queued+running = %v, want 1 (queued=%v running=%v)", queuedItems+runningItems, queuedItems, runningItems)
 	}
+	assertEqual(t, scheduler["failedItems"], float64(1))
 	assertEqual(t, scheduler["totalRuns"], float64(1))
 	assertEqual(t, scheduler["activeRuns"], float64(1))
 
@@ -6026,6 +6027,31 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 		UpdatedAt:   nowISO,
 	}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	manualReason := "dirty worker worktree"
+	manualKind := "manual_intervention"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:            "queue_manual_1",
+		ProjectID:     &projectID,
+		LoopID:        &loopID,
+		Type:          "reviewer",
+		TargetType:    "pull_request",
+		TargetID:      "pr:acme/looper:42",
+		Repo:          stringPtr("acme/looper"),
+		PRNumber:      int64Ptr(42),
+		DedupeKey:     "reviewer:acme/looper:42:manual",
+		Priority:      2,
+		Status:        "manual_intervention",
+		AvailableAt:   nowISO,
+		Attempts:      1,
+		MaxAttempts:   3,
+		LastError:     &manualReason,
+		LastErrorKind: &manualKind,
+		CreatedAt:     nowISO,
+		UpdatedAt:     nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_manual_1) error = %v", err)
 	}
 }
 

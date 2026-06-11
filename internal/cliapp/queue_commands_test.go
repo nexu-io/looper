@@ -155,12 +155,28 @@ func TestQueueFailedCommandListsFailedItems(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v\noutput=%q", err, stdout)
 	}
-	if decoded.Count != 1 || len(decoded.Items) != 1 {
-		t.Fatalf("queue failed output = %#v, want one item", decoded)
+	if decoded.Count != 2 || len(decoded.Items) != 2 {
+		t.Fatalf("queue failed output = %#v, want two items", decoded)
 	}
-	item := decoded.Items[0]
-	if item.QueueItem.ID != "qi_failed" || item.QueueItem.Status != "failed" || item.Diagnosis.FailureClass != "github_transient" || item.Diagnosis.Retryable == nil || !*item.Diagnosis.Retryable {
-		t.Fatalf("queue failed item = %#v, want retryable github_transient failed item", item)
+	itemsByID := map[string]struct {
+		status       string
+		failureClass string
+		retryable    *bool
+	}{}
+	for _, item := range decoded.Items {
+		itemsByID[item.QueueItem.ID] = struct {
+			status       string
+			failureClass string
+			retryable    *bool
+		}{status: item.QueueItem.Status, failureClass: item.Diagnosis.FailureClass, retryable: item.Diagnosis.Retryable}
+	}
+	failed := itemsByID["qi_failed"]
+	if failed.status != "failed" || failed.failureClass != "github_transient" || failed.retryable == nil || !*failed.retryable {
+		t.Fatalf("qi_failed = %#v, want retryable github_transient failed item", failed)
+	}
+	manual := itemsByID["qi_manual_intervention"]
+	if manual.status != "manual_intervention" {
+		t.Fatalf("qi_manual_intervention = %#v, want manual_intervention status", manual)
 	}
 }
 
@@ -202,6 +218,11 @@ func writeQueueCommandFixture(t *testing.T) (string, *storage.Repositories) {
 	prNumber := int64(42)
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "qi_failed", ProjectID: &projectID, LoopID: stringPtr("loop_failed"), Type: "reviewer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "failed", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 2, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert(qi_failed) error = %v", err)
+	}
+	manualError := "dirty worktree requires cleanup"
+	manualErrorKind := "manual_intervention"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "qi_manual_intervention", ProjectID: &projectID, LoopID: stringPtr("loop_failed"), Type: "reviewer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "manual", Priority: 1, Status: "manual_intervention", AvailableAt: now, Attempts: 1, MaxAttempts: 3, LastError: &manualError, LastErrorKind: &manualErrorKind, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_manual_intervention) error = %v", err)
 	}
 	configPath := filepath.Join(root, "config.json")
 	raw, err := json.Marshal(map[string]any{"storage": map[string]any{"dbPath": dbPath}})

@@ -169,7 +169,7 @@ func (r *commandRuntime) queueFailed(cmd *cobra.Command, args []string) error {
 		}
 		output := queueFailedOutput{NowISO: eventlog.FormatJavaScriptISOString(time.Now().UTC()), Type: typeFilter, ProjectID: projectFilter, Limit: limit}
 		for _, item := range items {
-			if item.Status != "failed" {
+			if item.Status != "failed" && item.Status != "manual_intervention" {
 				continue
 			}
 			if typeFilter != "" && item.Type != typeFilter {

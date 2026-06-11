@@ -1120,7 +1120,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			QueuedItems:    int(queueCounts["queued"]),
 			RunningItems:   int(queueCounts["running"]),
 			CompletedItems: int(queueCounts["completed"]),
-			FailedItems:    int(queueCounts["failed"]),
+			FailedItems:    int(queueCounts["failed"] + queueCounts["manual_intervention"]),
 			TotalRuns:      sumStatusCounts(runCounts),
 			ActiveRuns:     int(runCounts["running"]),
 		},

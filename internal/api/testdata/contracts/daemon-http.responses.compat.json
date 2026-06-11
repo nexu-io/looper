@@ -89,7 +89,7 @@
             "queuedItems": 1,
             "runningItems": 0,
             "completedItems": 0,
-            "failedItems": 0,
+            "failedItems": 1,
             "totalRuns": 1,
             "activeRuns": 1
           },
