@@ -143,6 +143,8 @@ func isDeterministicDenial(message string) bool {
 		"permission denied",
 		"not authorized",
 		"repository not found",
+		"not a git repository",
+		"not in a git directory",
 		"could not resolve to a repository",
 		"could not resolve to a pullrequest",
 		"protected branch",

@@ -61,6 +61,7 @@ func TestClassifyDeterministicFailuresDoNotBecomeTransient(t *testing.T) {
 		want     Kind
 	}{
 		{name: "github auth", boundary: BoundaryGitHubAPI, message: "GitHub API failed: HTTP 403 Forbidden", want: NonRetryable},
+		{name: "invalid git repository", boundary: BoundaryGitRemote, message: "git worktree list --porcelain: fatal: not a git repository (or any of the parent directories): .git", want: NonRetryable},
 		{name: "config", boundary: BoundaryConfig, message: "config validation failed", want: NonRetryable},
 		{name: "checkpoint", boundary: BoundaryCheckpoint, message: "checkpoint invariant missing", want: NonRetryable},
 		{name: "dirty worktree", boundary: BoundaryLocalWorktree, message: "dirty worktree", want: ManualIntervention},

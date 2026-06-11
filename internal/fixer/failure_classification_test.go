@@ -33,3 +33,11 @@ func TestClassifyFailureRetriesBoundaryExternalTransport(t *testing.T) {
 		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
 }
+
+func TestClassifyFailureDoesNotRetryInvalidProjectRepoPath(t *testing.T) {
+	runner := &Runner{}
+	got := runner.classifyFailureWithBoundary(errors.New("git worktree list --porcelain: fatal: not a git repository (or any of the parent directories): .git"), failureclass.BoundaryGitRemote)
+	if got.kind != FailureNonRetryable {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	}
+}
