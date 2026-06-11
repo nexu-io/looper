@@ -41,3 +41,11 @@ func TestClassifyFailureDoesNotRetryInvalidProjectRepoPath(t *testing.T) {
 		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
 	}
 }
+
+func TestClassifyFailureDoesNotRetryMissingProjectRepoDirectory(t *testing.T) {
+	runner := &Runner{}
+	got := runner.classifyFailureWithBoundary(errors.New("start command: chdir /tmp/missing-repo: no such file or directory"), failureclass.BoundaryGitRemote)
+	if got.kind != FailureNonRetryable {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	}
+}
