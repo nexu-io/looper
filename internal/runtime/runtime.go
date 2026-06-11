@@ -1284,34 +1284,31 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		_, latestRunHasActiveAgent := activeAgentRunIDs[derefRunID(latestRun)]
 		_, latestRunHasUncertainAgent := uncertainAgentRunIDs[derefRunID(latestRun)]
 		if latestQueueIsManualIntervention(latestQueue) && (loop.Status == "running" || loop.Status == "queued") {
-			if latestQueue.Status != "manual_intervention" {
-				attempts := latestQueue.Attempts
-				if attempts <= 0 {
-					attempts = 1
-				}
-				if err := repositories.Queue.Fail(ctx, storage.QueueFailInput{ID: latestQueue.ID, Attempts: attempts, FinishedAt: nowISO, ErrorMessage: latestQueue.LastError, ErrorKind: derefString(latestQueue.LastErrorKind), UpdatedAt: nowISO}); err != nil {
+			requeuedLoop := loop
+			requeuedLoop.Status = "queued"
+			requeuedLoop.NextRunAt = stringPtr(nowISO)
+			if latestRun != nil {
+				requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+			}
+			requeuedLoop.UpdatedAt = nowISO
+			if latestQueue.Status == "manual_intervention" {
+				if _, err := repositories.Queue.RequeueFailedByIDWithAttempts(ctx, loop.ID, latestQueue.ID, nowISO, latestQueue.Attempts); err != nil {
 					return RecoverySummary{}, err
 				}
 			}
-			heldLoop := loop
-			heldLoop.Status = "paused"
-			heldLoop.NextRunAt = nil
-			if latestRun != nil {
-				heldLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
-			}
-			heldLoop.UpdatedAt = nowISO
-			if err := repositories.Loops.Upsert(ctx, heldLoop); err != nil {
+			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
 				return RecoverySummary{}, err
 			}
+			requeuedLoopIDs[loop.ID] = struct{}{}
 			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
 				ID:         newRuntimeEventID(),
-				EventType:  "looperd.recovery.loop_manual_intervention_held",
+				EventType:  "looperd.recovery.loop_manual_intervention_requeued",
 				LoopID:     stringPtr(loop.ID),
 				EntityType: stringPtr("loop"),
 				EntityID:   stringPtr(loop.ID),
 				PayloadJSON: mustMarshalJSON(map[string]any{
 					"previousStatus":  loop.Status,
-					"recoveredStatus": heldLoop.Status,
+					"recoveredStatus": requeuedLoop.Status,
 					"queueItemId":     latestQueue.ID,
 					"lastErrorKind":   derefString(latestQueue.LastErrorKind),
 				}),
@@ -1320,7 +1317,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			eventsWritten += 1
-			terminalNormalizedLoopIDs[loop.ID] = struct{}{}
 			continue
 		}
 		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent || latestRunHasUncertainAgent) {
@@ -1877,27 +1873,24 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 		return staleRunQueueRepairSummary{}, err
 	}
 	if latestQueueIsManualIntervention(latestQueue) {
-		if latestQueue.Status != "manual_intervention" {
-			attempts := latestQueue.Attempts
-			if attempts <= 0 {
-				attempts = 1
-			}
-			if err := repositories.Queue.Fail(ctx, storage.QueueFailInput{ID: latestQueue.ID, Attempts: attempts, FinishedAt: nowISO, ErrorMessage: latestQueue.LastError, ErrorKind: derefString(latestQueue.LastErrorKind), UpdatedAt: nowISO}); err != nil {
-				return staleRunQueueRepairSummary{}, err
-			}
-		}
 		if loop.Status == "running" || loop.Status == "queued" {
-			heldLoop := loop
-			heldLoop.Status = "paused"
-			heldLoop.NextRunAt = nil
+			requeuedLoop := loop
+			requeuedLoop.Status = "queued"
+			requeuedLoop.NextRunAt = stringPtr(nowISO)
 			if latestRun != nil {
-				heldLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+				requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
 			}
-			heldLoop.UpdatedAt = nowISO
-			if err := repositories.Loops.Upsert(ctx, heldLoop); err != nil {
+			requeuedLoop.UpdatedAt = nowISO
+			if latestQueue.Status == "manual_intervention" {
+				if _, err := repositories.Queue.RequeueFailedByIDWithAttempts(ctx, loop.ID, latestQueue.ID, nowISO, latestQueue.Attempts); err != nil {
+					return staleRunQueueRepairSummary{}, err
+				}
+			}
+			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
 				return staleRunQueueRepairSummary{}, err
 			}
-			summary.LoopsRequeued = 0
+			summary.LoopsRequeued = 1
+			summary.QueueItemsRequeued = 1
 		}
 		return summary, nil
 	}

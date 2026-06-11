@@ -4329,22 +4329,26 @@ func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) stri
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
-	if isRetryableFailure(kind) && nextAttempts < queueItem.MaxAttempts {
-		delay := backoffDelay(r.retryBaseDelay, nextAttempts, r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
-		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
-		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
-			return nil, err
-		}
+	delay := backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts), r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
 	}
 	updated, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
 	if err != nil {
 		return nil, err
 	}
 	return updated, nil
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
