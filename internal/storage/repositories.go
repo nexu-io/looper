@@ -683,7 +683,7 @@ func (r *LoopsRepository) TerminateByProject(ctx context.Context, projectID, upd
 		SET status = 'terminated',
 			next_run_at = NULL,
 			updated_at = ?
-		WHERE project_id = ? AND status IN ('idle', 'queued', 'running', 'paused', 'waiting')
+		WHERE project_id = ? AND status IN ('idle', 'queued', 'running', 'paused', 'waiting', 'failed')
 	`, updatedAt, projectID)
 	if err != nil {
 		return 0, fmt.Errorf("terminate loops by project: %w", err)
@@ -2244,7 +2244,7 @@ func (r *QueueRepository) CancelByProject(ctx context.Context, projectID, finish
 			finished_at = ?,
 			last_error = COALESCE(?, last_error),
 			updated_at = ?
-		WHERE project_id = ? AND status IN ('queued', 'running')
+		WHERE project_id = ? AND status IN ('queued', 'running', 'failed', 'manual_intervention')
 	`, finishedAt, reason, finishedAt, projectID)
 	if err != nil {
 		return 0, fmt.Errorf("cancel queue items by project: %w", err)

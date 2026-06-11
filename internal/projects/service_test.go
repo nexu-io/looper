@@ -842,6 +842,79 @@ func TestServiceRemoveProjectTerminatesActiveLoopsBeforeReactivation(t *testing.
 	}
 }
 
+func TestServiceRemoveProjectTerminatesFailedLoopsAndCancelsRecoverableQueueItems(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repoName := "acme/looper"
+	prNumber := int64(42)
+	failedTargetID := "pr:acme/looper:42"
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_failed", Seq: 1, ProjectID: "looper", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &failedTargetID, Repo: &repoName, PRNumber: &prNumber, Status: string(domain.LoopStatusFailed), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_failed) error = %v", err)
+	}
+	manualTargetID := "pr:acme/looper:43"
+	manualPRNumber := int64(43)
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_manual", Seq: 2, ProjectID: "looper", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &manualTargetID, Repo: &repoName, PRNumber: &manualPRNumber, Status: string(domain.LoopStatusPaused), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_manual) error = %v", err)
+	}
+	errorMessage := "review failed"
+	errorKind := "retryable_transient"
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_failed", ProjectID: stringPointer("looper"), LoopID: stringPointer("loop_failed"), Type: "reviewer", TargetType: "pull_request", TargetID: failedTargetID, Repo: &repoName, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_failed:acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, LastError: &errorMessage, LastErrorKind: &errorKind, FinishedAt: stringPointer(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_failed) error = %v", err)
+	}
+	manualErrorKind := "manual_intervention"
+	manualError := "needs manual follow-up"
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_manual", ProjectID: stringPointer("looper"), LoopID: stringPointer("loop_manual"), Type: "reviewer", TargetType: "pull_request", TargetID: manualTargetID, Repo: &repoName, PRNumber: &manualPRNumber, DedupeKey: "reviewer:project_1:loop_manual:acme/looper:43", Priority: storage.QueuePriorityReviewer, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 5, LastError: &manualError, LastErrorKind: &manualErrorKind, FinishedAt: stringPointer(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_manual) error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
+	removed, err := service.RemoveProject(ctx, "looper")
+	if err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+	if !removed.Archived {
+		t.Fatalf("RemoveProject().Archived = %v, want true", removed.Archived)
+	}
+
+	failedLoop, err := repos.Loops.GetByID(ctx, "loop_failed")
+	if err != nil {
+		t.Fatalf("Loops.GetByID(loop_failed) error = %v", err)
+	}
+	if failedLoop == nil || failedLoop.Status != string(domain.LoopStatusTerminated) {
+		t.Fatalf("failed loop = %#v, want terminated", failedLoop)
+	}
+	manualLoop, err := repos.Loops.GetByID(ctx, "loop_manual")
+	if err != nil {
+		t.Fatalf("Loops.GetByID(loop_manual) error = %v", err)
+	}
+	if manualLoop == nil || manualLoop.Status != string(domain.LoopStatusTerminated) {
+		t.Fatalf("manual loop = %#v, want terminated", manualLoop)
+	}
+
+	failedQueue, err := repos.Queue.GetByID(ctx, "queue_failed")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(queue_failed) error = %v", err)
+	}
+	if failedQueue == nil || failedQueue.Status != "cancelled" || failedQueue.FinishedAt == nil || failedQueue.LastError == nil || *failedQueue.LastError != "project archived" {
+		t.Fatalf("failed queue = %#v, want cancelled archived queue item", failedQueue)
+	}
+	manualQueue, err := repos.Queue.GetByID(ctx, "queue_manual")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(queue_manual) error = %v", err)
+	}
+	if manualQueue == nil || manualQueue.Status != "cancelled" || manualQueue.FinishedAt == nil || manualQueue.LastError == nil || *manualQueue.LastError != "project archived" {
+		t.Fatalf("manual queue = %#v, want cancelled archived queue item", manualQueue)
+	}
+}
+
 func TestServiceListSkipsArchivedProjects(t *testing.T) {
 	t.Parallel()
 
