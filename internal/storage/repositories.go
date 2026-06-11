@@ -673,6 +673,30 @@ func (r *LoopsRepository) CountByTypeAndStatus(ctx context.Context) (map[string]
 	return counts, nil
 }
 
+func (r *LoopsRepository) TerminateByProject(ctx context.Context, projectID, updatedAt string) (int64, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return 0, nil
+	}
+
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE loops
+		SET status = 'terminated',
+			next_run_at = NULL,
+			updated_at = ?
+		WHERE project_id = ? AND status IN ('idle', 'queued', 'running', 'paused', 'waiting')
+	`, updatedAt, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("terminate loops by project: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read terminate loops by project rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
 type RunsRepository struct{ q sqliteQuerier }
 
 type AgentExecutionsRepository struct{ q sqliteQuerier }

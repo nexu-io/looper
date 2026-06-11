@@ -309,6 +309,9 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 		if !archived {
 			return false, nil
 		}
+		if _, err := repos.Loops.TerminateByProject(ctx, project.ID, nowISO); err != nil {
+			return false, err
+		}
 		if _, err := repos.Queue.CancelByProject(ctx, project.ID, nowISO, &cancelReason); err != nil {
 			return false, err
 		}
@@ -331,7 +334,10 @@ func (s *Service) resolveActiveProjectForRemoval(ctx context.Context, identifier
 	if err != nil {
 		return nil, err
 	}
-	if project != nil && !project.Archived {
+	if project != nil {
+		if project.Archived {
+			return nil, nil
+		}
 		return project, nil
 	}
 

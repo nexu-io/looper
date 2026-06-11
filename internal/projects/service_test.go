@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -787,6 +789,59 @@ func TestServiceRemoveProjectCancelsActiveProjectQueueItems(t *testing.T) {
 	}
 }
 
+func TestServiceRemoveProjectTerminatesActiveLoopsBeforeReactivation(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	prNumber := int64(42)
+	repoName := "acme/looper"
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "looper", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), Repo: &repoName, PRNumber: &prNumber, Status: string(domain.LoopStatusRunning), CreatedAt: nowISO, UpdatedAt: nowISO, NextRunAt: stringPointer(nowISO)}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
+	removed, err := service.RemoveProject(ctx, "looper")
+	if err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+	if !removed.Archived {
+		t.Fatalf("RemoveProject().Archived = %v, want true", removed.Archived)
+	}
+
+	loop, err := repos.Loops.GetByID(ctx, "loop_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != string(domain.LoopStatusTerminated) || loop.NextRunAt != nil {
+		t.Fatalf("archived loop = %#v, want terminated with cleared next_run_at", loop)
+	}
+
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+
+	loopService := &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(2 * time.Minute) }}
+	created, err := loopService.Create(ctx, loops.CreateInput{
+		ProjectID: "looper",
+		Type:      domain.LoopTypeReviewer,
+		Target:    domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: repoName, PRNumber: prNumber},
+		Status:    domain.LoopStatusQueued,
+	})
+	if err != nil {
+		t.Fatalf("loops.Create() error = %v", err)
+	}
+	if created.ProjectID != "looper" || created.Status != string(domain.LoopStatusQueued) {
+		t.Fatalf("loops.Create() = %#v, want queued loop for reactivated project", created)
+	}
+}
+
 func TestServiceListSkipsArchivedProjects(t *testing.T) {
 	t.Parallel()
 
@@ -838,6 +893,47 @@ func TestServiceRemoveProjectTreatsArchivedProjectAsNotFound(t *testing.T) {
 	}
 	if !errors.As(err, &notFound) {
 		t.Fatalf("RemoveProject(name) error = %T, want ProjectNotFoundError", err)
+	}
+}
+
+func TestServiceRemoveProjectDoesNotFallbackToNameAfterArchivedIDMatch(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "foo", Name: "Archived", RepoPath: "/tmp/archived", Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(foo archived) error = %v", err)
+	}
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "active", Name: "foo", RepoPath: "/tmp/active", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(active) error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
+	_, err := service.RemoveProject(ctx, "foo")
+	if err == nil {
+		t.Fatal("RemoveProject() error = nil, want not found")
+	}
+	var notFound ProjectNotFoundError
+	if !errors.As(err, &notFound) {
+		t.Fatalf("RemoveProject() error = %T, want ProjectNotFoundError", err)
+	}
+
+	active, err := repos.Projects.GetByID(ctx, "active")
+	if err != nil {
+		t.Fatalf("Projects.GetByID(active) error = %v", err)
+	}
+	if active == nil || active.Archived {
+		t.Fatalf("active project = %#v, want still active", active)
+	}
+	archived, err := repos.Projects.GetByID(ctx, "foo")
+	if err != nil {
+		t.Fatalf("Projects.GetByID(foo) error = %v", err)
+	}
+	if archived == nil || !archived.Archived {
+		t.Fatalf("archived project = %#v, want unchanged archived project", archived)
 	}
 }
 
