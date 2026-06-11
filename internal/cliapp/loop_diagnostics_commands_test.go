@@ -86,6 +86,37 @@ func TestLoopFailuresListsFailedLoops(t *testing.T) {
 	}
 }
 
+func TestLoopFailuresIncludesPausedManualInterventionLoops(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeLoopDiagnosticsFixture(t, "")
+	exitCode, stdout, stderr := runApp(t, "loop", "failures", "--type", "worker", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([loop failures]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	var decoded struct {
+		Count int `json:"count"`
+		Items []struct {
+			Loop struct {
+				Seq    int64  `json:"seq"`
+				Status string `json:"status"`
+			} `json:"loop"`
+			LatestQueueItem struct {
+				Status string `json:"status"`
+			} `json:"latestQueueItem"`
+			Diagnosis struct {
+				FailureClass string `json:"failureClass"`
+			} `json:"diagnosis"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v\noutput=%q", err, stdout)
+	}
+	if decoded.Count != 1 || len(decoded.Items) != 1 || decoded.Items[0].Loop.Seq != 8 || decoded.Items[0].Loop.Status != "paused" || decoded.Items[0].LatestQueueItem.Status != "manual_intervention" || decoded.Items[0].Diagnosis.FailureClass != "non_retryable" {
+		t.Fatalf("loop failures output = %#v, want one paused manual-intervention worker loop", decoded)
+	}
+}
+
 func TestLogsAcceptsRunIDFromPSOutput(t *testing.T) {
 	t.Parallel()
 
@@ -162,6 +193,19 @@ func writeLoopDiagnosticsFixture(t *testing.T, serverURL string) string {
 	}
 	lastErrorKind := "retryable_transient"
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_failed", ProjectID: &projectID, LoopID: stringPtr("loop_failed"), Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "reviewer:failed", Priority: 1, Status: "failed", AvailableAt: now, Attempts: 2, MaxAttempts: 5, LastError: &errorMessage, LastErrorKind: &lastErrorKind, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	workerTargetID := "project:acme/looper"
+	workerMetadata := `{"loop":{"lastFailure":"fatal: worktree is locked"}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_action_required", Seq: 8, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &workerTargetID, Repo: stringPtr("acme/looper"), Status: "paused", MetadataJSON: &workerMetadata, LastRunAt: &now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	workerErrorMessage := "fatal: worktree is locked"
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_paused", LoopID: "loop_paused_action_required", Status: "failed", CurrentStep: stringPtr("prepare_work"), ErrorMessage: &workerErrorMessage, StartedAt: now, LastHeartbeatAt: &now, EndedAt: &now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	workerErrorKind := "non_retryable"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_manual_intervention", ProjectID: &projectID, LoopID: stringPtr("loop_paused_action_required"), Type: "worker", TargetType: "project", TargetID: workerTargetID, Repo: stringPtr("acme/looper"), DedupeKey: "worker:manual", Priority: 1, Status: "manual_intervention", AvailableAt: now, Attempts: 3, MaxAttempts: 3, LastError: &workerErrorMessage, LastErrorKind: &workerErrorKind, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	pid := int64(1234)
