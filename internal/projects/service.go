@@ -137,7 +137,7 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if err != nil {
 		return AddResult{}, err
 	}
-	if existing != nil && input.IDSource != "derived" {
+	if existing != nil && !existing.Archived && input.IDSource != "derived" {
 		return AddResult{}, ProjectIDCollisionError{ProjectID: input.ID}
 	}
 	projectID := input.ID
@@ -264,7 +264,17 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return nil, fmt.Errorf("projects repository is not configured")
 	}
-	return s.Repos.Projects.List(ctx)
+	items, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	active := make([]storage.ProjectRecord, 0, len(items))
+	for _, item := range items {
+		if !item.Archived {
+			active = append(active, item)
+		}
+	}
+	return active, nil
 }
 
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
@@ -277,24 +287,9 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 		return storage.ProjectRecord{}, ProjectValidationError{Message: "project identifier is required"}
 	}
 
-	project, err := s.Repos.Projects.GetByID(ctx, trimmed)
+	project, err := s.resolveActiveProjectForRemoval(ctx, trimmed)
 	if err != nil {
 		return storage.ProjectRecord{}, err
-	}
-	if project == nil {
-		items, err := s.Repos.Projects.List(ctx)
-		if err != nil {
-			return storage.ProjectRecord{}, err
-		}
-
-		for index := range items {
-			if strings.EqualFold(strings.TrimSpace(items[index].Name), trimmed) {
-				if project != nil {
-					return storage.ProjectRecord{}, AmbiguousProjectIdentifierError{Identifier: trimmed}
-				}
-				project = &items[index]
-			}
-		}
 	}
 	if project == nil {
 		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: trimmed}
@@ -303,15 +298,45 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 		return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be removed from the CLI", project.ID)}
 	}
 
-	deleted, err := s.Repos.Projects.Delete(ctx, project.ID)
+	nowISO := currentISO(s.Now)
+	archived, err := s.Repos.Projects.Archive(ctx, project.ID, nowISO)
 	if err != nil {
 		return storage.ProjectRecord{}, err
 	}
-	if !deleted {
+	if !archived {
 		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: trimmed}
 	}
+	project.Archived = true
+	project.UpdatedAt = nowISO
 
 	return *project, nil
+}
+
+func (s *Service) resolveActiveProjectForRemoval(ctx context.Context, identifier string) (*storage.ProjectRecord, error) {
+	project, err := s.Repos.Projects.GetByID(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	if project != nil && !project.Archived {
+		return project, nil
+	}
+
+	items, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var matched *storage.ProjectRecord
+	for index := range items {
+		if items[index].Archived || !strings.EqualFold(strings.TrimSpace(items[index].Name), identifier) {
+			continue
+		}
+		if matched != nil {
+			return nil, AmbiguousProjectIdentifierError{Identifier: identifier}
+		}
+		matched = &items[index]
+	}
+	return matched, nil
 }
 
 func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now time.Time) error {

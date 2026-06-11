@@ -3689,12 +3689,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		transactionRepos := storage.NewRepositories(tx)
-		project, err := transactionRepos.Projects.GetByID(r.Context(), projectID)
+		project, err := requireActiveProjectRecord(r.Context(), transactionRepos.Projects, projectID)
 		if err != nil {
 			return storage.LoopRecord{}, err
-		}
-		if project == nil {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", projectID)}
 		}
 		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 			return storage.LoopRecord{}, err
@@ -4187,12 +4184,9 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	if projectID == "" {
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "projectId is required"}
 	}
-	project, err := services.Repositories.Projects.GetByID(r.Context(), projectID)
+	project, err := requireActiveProjectRecord(r.Context(), services.Repositories.Projects, projectID)
 	if err != nil {
-		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	if project == nil {
-		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", projectID)}
+		return plannerCreateResponse{}, err
 	}
 
 	issueNumber := normalizePositiveInt64Ptr(body.IssueNumber)
@@ -4285,12 +4279,9 @@ type resolveWorkerProjectInput struct {
 func (h *Handler) resolveWorkerProject(ctx context.Context, input resolveWorkerProjectInput) (storage.ProjectRecord, error) {
 	services := h.context.Runtime.Services()
 	if input.ProjectID != nil {
-		project, err := services.Repositories.Projects.GetByID(ctx, *input.ProjectID)
+		project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, *input.ProjectID)
 		if err != nil {
-			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-		}
-		if project == nil {
-			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", *input.ProjectID)}
+			return storage.ProjectRecord{}, err
 		}
 		if input.Repo != nil {
 			configuredRepo := strings.TrimSpace(derefString(stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")))
@@ -4313,7 +4304,13 @@ func (h *Handler) resolveWorkerProject(ctx context.Context, input resolveWorkerP
 		matchedProjectIDs := map[string]struct{}{}
 		for _, snapshot := range snapshots {
 			if snapshot.Repo == *input.Repo && snapshot.PRNumber == *input.PRNumber {
-				matchedProjectIDs[snapshot.ProjectID] = struct{}{}
+				project, getErr := services.Repositories.Projects.GetByID(ctx, snapshot.ProjectID)
+				if getErr != nil {
+					return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: getErr.Error()}
+				}
+				if project != nil && !project.Archived {
+					matchedProjectIDs[snapshot.ProjectID] = struct{}{}
+				}
 			}
 		}
 		if len(matchedProjectIDs) > 1 {
@@ -4337,6 +4334,9 @@ func (h *Handler) resolveWorkerProject(ctx context.Context, input resolveWorkerP
 		}
 		matches := make([]storage.ProjectRecord, 0)
 		for _, candidate := range projectsList {
+			if candidate.Archived {
+				continue
+			}
 			candidateRepo := stringMetadataPtr(parseProjectMetadata(candidate.MetadataJSON), "repo")
 			if candidateRepo != nil && *candidateRepo == *input.Repo {
 				matches = append(matches, candidate)
@@ -4361,12 +4361,9 @@ type requirePullRequestTargetInput struct {
 
 func (h *Handler) requirePullRequestTarget(ctx context.Context, input requirePullRequestTargetInput) (int64, error) {
 	services := h.context.Runtime.Services()
-	project, err := services.Repositories.Projects.GetByID(ctx, input.ProjectID)
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, input.ProjectID)
 	if err != nil {
-		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	if project == nil {
-		return 0, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", input.ProjectID)}
+		return 0, err
 	}
 	projectRepo := stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")
 	if projectRepo == nil || *projectRepo != input.Repo {
@@ -5735,6 +5732,17 @@ func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) p
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
+}
+
+func requireActiveProjectRecord(ctx context.Context, repo *storage.ProjectsRepository, projectID string) (*storage.ProjectRecord, error) {
+	project, err := repo.GetByID(ctx, projectID)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if project == nil || project.Archived {
+		return nil, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", projectID)}
+	}
+	return project, nil
 }
 
 func parseProjectMetadata(metadataJSON *string) map[string]any {

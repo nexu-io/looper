@@ -91,6 +91,7 @@ type projectOutput struct {
 	Name                   string   `json:"name"`
 	RepoPath               string   `json:"repoPath"`
 	BaseBranch             string   `json:"baseBranch"`
+	Archived               bool     `json:"archived"`
 	Repo                   *string  `json:"repo"`
 	UpdatedAt              string   `json:"updatedAt"`
 	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
@@ -354,7 +355,7 @@ func writeHumanProjectRemove(w io.Writer, payload json.RawMessage) error {
 		return fmt.Errorf("decode project response: %w", err)
 	}
 
-	printSection(w, "Project removed", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}})
+	printSection(w, "Project archived", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"historyPreserved", true}})
 	return nil
 }
 

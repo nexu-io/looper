@@ -1679,7 +1679,7 @@ func TestHandlerProjectsCreateRouteReturnsSuccessWhenWebhookRefreshFails(t *test
 	}
 }
 
-func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
+func TestHandlerProjectsRemoveRouteArchivesProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -1698,12 +1698,13 @@ func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	data := body["data"].(map[string]any)
 	assertEqual(t, data["id"], "project_1")
 	assertEqual(t, data["name"], "Looper")
+	assertEqual(t, data["archived"], true)
 	project, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "project_1")
 	if err != nil {
 		t.Fatalf("Projects.GetByID() error = %v", err)
 	}
-	if project != nil {
-		t.Fatalf("project after delete = %#v, want nil", project)
+	if project == nil || !project.Archived {
+		t.Fatalf("project after archive = %#v, want archived project", project)
 	}
 }
 
@@ -1728,7 +1729,7 @@ func TestHandlerProjectsRemoveRouteReconcilesWebhookForwarders(t *testing.T) {
 	}
 }
 
-func TestHandlerProjectsRemoveRouteDeletesProjectWithEscapedSlashInName(t *testing.T) {
+func TestHandlerProjectsRemoveRouteArchivesProjectWithEscapedSlashInName(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper/Core", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
@@ -1747,12 +1748,13 @@ func TestHandlerProjectsRemoveRouteDeletesProjectWithEscapedSlashInName(t *testi
 	data := body["data"].(map[string]any)
 	assertEqual(t, data["id"], "project_1")
 	assertEqual(t, data["name"], "Looper/Core")
+	assertEqual(t, data["archived"], true)
 	project, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "project_1")
 	if err != nil {
 		t.Fatalf("Projects.GetByID() error = %v", err)
 	}
-	if project != nil {
-		t.Fatalf("project after delete = %#v, want nil", project)
+	if project == nil || !project.Archived {
+		t.Fatalf("project after archive = %#v, want archived project", project)
 	}
 }
 
@@ -2732,6 +2734,57 @@ func TestHandlerWorkerAndPlannerCreateRejectActiveLoopConflicts(t *testing.T) {
 	plannerBody := parseJSONMap(t, plannerRecorder.Body.Bytes())
 	plannerError := plannerBody["error"].(map[string]any)
 	assertEqual(t, plannerError["code"], "LOOP_CONFLICT")
+}
+
+func TestHandlerWorkerCreateRejectsArchivedProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: true, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","prompt":"Wire runtime","repo":"acme/looper","baseBranch":"main"}`)))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+}
+
+func TestHandlerPlannersCreateRejectsArchivedProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: true, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77}`)))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+}
+
+func TestHandlerLoopsCreateRejectsArchivedProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: true, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`)))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
 }
 
 func TestAssertUniqueActiveLoopCompatAllowsWaitingReviewerRerun(t *testing.T) {

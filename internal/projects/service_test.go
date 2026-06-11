@@ -2,6 +2,7 @@ package projects
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -659,6 +660,228 @@ func TestServiceSyncConfiguredDoesNotDeleteUnlistedProjects(t *testing.T) {
 	}
 	if other == nil || other.Name != "Other" {
 		t.Fatalf("other = %#v, want configured project upserted", other)
+	}
+}
+
+func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	baseBranch := "main"
+	metadata := `{"repo":"nexu-io/looper","source":"api"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "looper", Type: "reviewer", TargetType: "pull_request", Status: "idle", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
+
+	removed, err := service.RemoveProject(ctx, "looper")
+	if err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+	if !removed.Archived {
+		t.Fatalf("RemoveProject().Archived = %v, want true", removed.Archived)
+	}
+
+	stored, err := repos.Projects.GetByID(ctx, "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if stored == nil || !stored.Archived {
+		t.Fatalf("stored project = %#v, want archived project", stored)
+	}
+	wantUpdatedAt := currentISO(func() time.Time { return now.Add(time.Minute) })
+	if stored.UpdatedAt != wantUpdatedAt {
+		t.Fatalf("stored.UpdatedAt = %q, want %q", stored.UpdatedAt, wantUpdatedAt)
+	}
+	loop, err := repos.Loops.GetByID(ctx, "loop_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.ProjectID != "looper" {
+		t.Fatalf("loop = %#v, want preserved loop history", loop)
+	}
+}
+
+func TestServiceListSkipsArchivedProjects(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC).UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "active", Name: "Active", RepoPath: "/tmp/active", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(active) error = %v", err)
+	}
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "archived", Name: "Archived", RepoPath: "/tmp/archived", Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(archived) error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos}
+	items, err := service.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "active" {
+		t.Fatalf("List() = %#v, want only active project", items)
+	}
+}
+
+func TestServiceRemoveProjectTreatsArchivedProjectAsNotFound(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
+	_, err := service.RemoveProject(ctx, "looper")
+	if err == nil {
+		t.Fatal("RemoveProject(id) error = nil, want not found")
+	}
+	var notFound ProjectNotFoundError
+	if !errors.As(err, &notFound) {
+		t.Fatalf("RemoveProject(id) error = %T, want ProjectNotFoundError", err)
+	}
+	_, err = service.RemoveProject(ctx, "Looper")
+	if err == nil {
+		t.Fatal("RemoveProject(name) error = nil, want not found")
+	}
+	if !errors.As(err, &notFound) {
+		t.Fatalf("RemoveProject(name) error = %T, want ProjectNotFoundError", err)
+	}
+}
+
+func TestServiceAddProjectReactivatesArchivedExplicitID(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC).UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Old", RepoPath: "/tmp/old", Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos}
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.Project.Archived {
+		t.Fatalf("AddProject().Project.Archived = %v, want false", result.Project.Archived)
+	}
+}
+
+func TestServiceRemoveProjectRejectsConfigManagedProject(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC).UTC().Format(time.RFC3339Nano)
+	metadata := `{"repo":null,"worktreeRoot":null,"source":"config"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos}
+	_, err := service.RemoveProject(ctx, "looper")
+	if err == nil {
+		t.Fatal("RemoveProject() error = nil, want validation error")
+	}
+	var validationErr ProjectValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("RemoveProject() error = %T, want ProjectValidationError", err)
+	}
+
+	stored, err := repos.Projects.GetByID(ctx, "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Archived {
+		t.Fatalf("stored project = %#v, want non-archived project", stored)
+	}
+}
+
+func TestProjectsRepositoryArchiveMarksArchivedWithoutDeletingRow(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC).UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	archivedAt := time.Date(2026, time.June, 11, 12, 5, 0, 0, time.UTC).UTC().Format(time.RFC3339Nano)
+
+	ok, err := repos.Projects.Archive(ctx, "looper", archivedAt)
+	if err != nil {
+		t.Fatalf("Projects.Archive() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("Projects.Archive() = false, want true")
+	}
+
+	var archived int
+	var updatedAt string
+	row := coordinator.DB().QueryRowContext(ctx, `SELECT archived, updated_at FROM projects WHERE id = ?`, "looper")
+	if err := row.Scan(&archived, &updatedAt); err != nil {
+		t.Fatalf("scan archived project row: %v", err)
+	}
+	if archived != 1 || updatedAt != archivedAt {
+		t.Fatalf("project row = archived:%d updated_at:%q, want 1/%q", archived, updatedAt, archivedAt)
+	}
+	var count int
+	if err := coordinator.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE id = ?`, "looper").Scan(&count); err != nil {
+		t.Fatalf("count archived project row: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("project row count = %d, want 1", count)
+	}
+	if err := coordinator.DB().QueryRowContext(ctx, `SELECT archived FROM projects WHERE id = ?`, "missing").Scan(&archived); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing project query error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestProjectsRepositoryArchiveSkipsArchivedProjectUpdates(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC).UTC().Format(time.RFC3339Nano)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	archivedAt := time.Date(2026, time.June, 11, 12, 5, 0, 0, time.UTC).UTC().Format(time.RFC3339Nano)
+
+	ok, err := repos.Projects.Archive(ctx, "looper", archivedAt)
+	if err != nil {
+		t.Fatalf("Projects.Archive() error = %v", err)
+	}
+	if ok {
+		t.Fatal("Projects.Archive() = true, want false for already archived project")
+	}
+	stored, err := repos.Projects.GetByID(ctx, "looper")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.UpdatedAt != nowISO {
+		t.Fatalf("stored = %#v, want unchanged updatedAt %q", stored, nowISO)
 	}
 }
 

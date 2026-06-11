@@ -1321,7 +1321,7 @@ func TestProjectAddResolvesRelativePathsBeforePosting(t *testing.T) {
 	}
 }
 
-func TestProjectRemoveForceDeletesResolvedProject(t *testing.T) {
+func TestProjectRemoveForceArchivesResolvedProject(t *testing.T) {
 	t.Parallel()
 
 	var seenList atomic.Bool
@@ -1333,7 +1333,7 @@ func TestProjectRemoveForceDeletesResolvedProject(t *testing.T) {
 			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/projects/project_1":
 			seenDelete.Store(true)
-			writeEnvelope(t, w, pkgapi.Success("req_project_remove", map[string]any{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "updatedAt": "2026-04-20T10:00:00.000Z"}))
+			writeEnvelope(t, w, pkgapi.Success("req_project_remove", map[string]any{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "archived": true, "updatedAt": "2026-04-20T10:00:00.000Z"}))
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
@@ -1352,6 +1352,7 @@ func TestProjectRemoveForceDeletesResolvedProject(t *testing.T) {
 		t.Fatalf("requests seen list=%v delete=%v, want both", seenList.Load(), seenDelete.Load())
 	}
 	assertJSONContains(t, stdout, "id", "project_1")
+	assertJSONContains(t, stdout, "archived", true)
 }
 
 func TestProjectRemovePromptsForConfirmation(t *testing.T) {
@@ -1380,8 +1381,11 @@ func TestProjectRemovePromptsForConfirmation(t *testing.T) {
 	if !strings.Contains(stderr.String(), "Type \"project_1\" to confirm") {
 		t.Fatalf("stderr = %q, want confirmation prompt", stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Project removed") {
-		t.Fatalf("stdout = %q, want removal summary", stdout.String())
+	if !strings.Contains(stdout.String(), "Project archived") {
+		t.Fatalf("stdout = %q, want archive summary", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "preserving history") {
+		t.Fatalf("stderr = %q, want archive wording", stderr.String())
 	}
 }
 

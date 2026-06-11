@@ -1069,16 +1069,16 @@ func resolveProjectByIdentifier(projects []projectOutput, identifier projectRemo
 }
 
 func confirmProjectRemoval(cmd *cobra.Command, project projectOutput) error {
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Remove project %s (%s) and associated runtime records? Type %q to confirm: ", project.ID, project.Name, project.ID)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Archive project %s (%s) and unregister it from new work while preserving history? Type %q to confirm: ", project.ID, project.Name, project.ID)
 	scanner := bufio.NewScanner(cmd.InOrStdin())
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
 			return fmt.Errorf("read confirmation: %w", err)
 		}
-		return fmt.Errorf("project removal cancelled")
+		return fmt.Errorf("project archive cancelled")
 	}
 	if strings.TrimSpace(scanner.Text()) != project.ID {
-		return fmt.Errorf("project removal cancelled")
+		return fmt.Errorf("project archive cancelled")
 	}
 	return nil
 }

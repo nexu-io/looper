@@ -479,15 +479,15 @@ func (r *ProjectsRepository) List(ctx context.Context) ([]ProjectRecord, error) 
 	return scanProjects(rows)
 }
 
-func (r *ProjectsRepository) Delete(ctx context.Context, id string) (bool, error) {
-	result, err := r.q.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, id)
+func (r *ProjectsRepository) Archive(ctx context.Context, id string, updatedAt string) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `UPDATE projects SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0`, updatedAt, id)
 	if err != nil {
-		return false, fmt.Errorf("delete project: %w", err)
+		return false, fmt.Errorf("archive project: %w", err)
 	}
 
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("delete project rows affected: %w", err)
+		return false, fmt.Errorf("archive project rows affected: %w", err)
 	}
 
 	return rowsAffected > 0, nil
@@ -2384,8 +2384,10 @@ const scheduledQueueBaseQuery = `
 	SELECT qi.*
 	FROM queue_items qi
 	LEFT JOIN loops l ON l.id = qi.loop_id
+	LEFT JOIN projects p ON p.id = qi.project_id
 	WHERE qi.status = 'queued'
 		AND qi.available_at <= ?
+		AND (qi.project_id IS NULL OR p.archived = 0)
 		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
 		AND (
 			qi.lock_key IS NULL
