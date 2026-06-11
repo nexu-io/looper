@@ -299,7 +299,21 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	}
 
 	nowISO := currentISO(s.Now)
-	archived, err := s.Repos.Projects.Archive(ctx, project.ID, nowISO)
+	cancelReason := "project archived"
+	archived, err := storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (bool, error) {
+		repos := storage.NewRepositories(tx)
+		archived, err := repos.Projects.Archive(ctx, project.ID, nowISO)
+		if err != nil {
+			return false, err
+		}
+		if !archived {
+			return false, nil
+		}
+		if _, err := repos.Queue.CancelByProject(ctx, project.ID, nowISO, &cancelReason); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
 	if err != nil {
 		return storage.ProjectRecord{}, err
 	}

@@ -1951,6 +1951,11 @@ func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInp
 			finished_at = NULL,
 			updated_at = ?
 		WHERE id = ?
+			AND NOT EXISTS (
+				SELECT 1
+				FROM projects p
+				WHERE p.id = queue_items.project_id AND p.archived = 1
+			)
 	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("mark queue item for retry: %w", err)
@@ -2199,6 +2204,31 @@ func (r *QueueRepository) CancelByLoop(ctx context.Context, loopID, finishedAt s
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("read cancel queue items rows affected: %w", err)
+	}
+
+	return affected, nil
+}
+
+func (r *QueueRepository) CancelByProject(ctx context.Context, projectID, finishedAt string, reason *string) (int64, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return 0, nil
+	}
+
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'cancelled',
+			finished_at = ?,
+			last_error = COALESCE(?, last_error),
+			updated_at = ?
+		WHERE project_id = ? AND status IN ('queued', 'running')
+	`, finishedAt, reason, finishedAt, projectID)
+	if err != nil {
+		return 0, fmt.Errorf("cancel queue items by project: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read cancel queue items by project rows affected: %w", err)
 	}
 
 	return affected, nil

@@ -710,6 +710,83 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	}
 }
 
+func TestServiceRemoveProjectCancelsActiveProjectQueueItems(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	repoName := "acme/looper"
+	prNumber := int64(42)
+	runningPRNumber := int64(43)
+	dedupeKey := "sweeper:acme/looper:42"
+	runningDedupeKey := "sweeper:acme/looper:43"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(looper) error = %v", err)
+	}
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "other", Name: "Other", RepoPath: "/tmp/other", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(other) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_looper", ProjectID: stringPointer("looper"), Type: "sweeper", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_looper) error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_running", ProjectID: stringPointer("looper"), Type: "sweeper", TargetType: "pull_request", TargetID: "pr:43", Repo: &repoName, PRNumber: &runningPRNumber, DedupeKey: runningDedupeKey, Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_running) error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
+
+	removed, err := service.RemoveProject(ctx, "looper")
+	if err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+	if !removed.Archived {
+		t.Fatalf("RemoveProject().Archived = %v, want true", removed.Archived)
+	}
+
+	for _, id := range []string{"queue_looper", "queue_running"} {
+		item, err := repos.Queue.GetByID(ctx, id)
+		if err != nil {
+			t.Fatalf("Queue.GetByID(%s) error = %v", id, err)
+		}
+		if item == nil || item.Status != "cancelled" || item.FinishedAt == nil || item.LastError == nil || *item.LastError != "project archived" {
+			t.Fatalf("Queue.GetByID(%s) = %#v, want cancelled item with archive reason", id, item)
+		}
+	}
+
+	if err := repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: "queue_running", AvailableAt: nowISO, Attempts: 2, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.MarkRetry(queue_running) error = %v", err)
+	}
+	retried, err := repos.Queue.GetByID(ctx, "queue_running")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(queue_running after retry) error = %v", err)
+	}
+	if retried == nil || retried.Status != "cancelled" {
+		t.Fatalf("Queue.GetByID(queue_running after retry) = %#v, want cancelled", retried)
+	}
+
+	if active, err := repos.Queue.FindActiveByDedupe(ctx, dedupeKey); err != nil {
+		t.Fatalf("Queue.FindActiveByDedupe() error = %v", err)
+	} else if active != nil {
+		t.Fatalf("Queue.FindActiveByDedupe() = %#v, want nil after archive", active)
+	}
+	if active, err := repos.Queue.FindActiveByDedupe(ctx, runningDedupeKey); err != nil {
+		t.Fatalf("Queue.FindActiveByDedupe(running) error = %v", err)
+	} else if active != nil {
+		t.Fatalf("Queue.FindActiveByDedupe(running) = %#v, want nil after archive", active)
+	}
+
+	created, didCreate, err := repos.Queue.CreateOrGetActiveByDedupe(ctx, storage.QueueItemRecord{ID: "queue_other", ProjectID: stringPointer("other"), Type: "sweeper", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO})
+	if err != nil {
+		t.Fatalf("Queue.CreateOrGetActiveByDedupe() error = %v", err)
+	}
+	if !didCreate || created.ID != "queue_other" {
+		t.Fatalf("Queue.CreateOrGetActiveByDedupe() = (%#v, %v), want created queue_other", created, didCreate)
+	}
+}
+
 func TestServiceListSkipsArchivedProjects(t *testing.T) {
 	t.Parallel()
 
