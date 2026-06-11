@@ -1183,7 +1183,7 @@ func TestRunRecoveryPipelineKeepsQueuedReviewerLoopPausedWhenLatestRunFailed(t *
 	}
 }
 
-func TestRunRecoveryPipelineDoesNotRequeueManualInterventionQueueWhenLoopStillRunning(t *testing.T) {
+func TestRunRecoveryPipelineNormalizesManualInterventionQueueWhenLoopStillRunning(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -1224,18 +1224,15 @@ func TestRunRecoveryPipelineDoesNotRequeueManualInterventionQueueWhenLoopStillRu
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "queued" {
-		t.Fatalf("loop = %#v, want queued recovery", loop)
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused recovery", loop)
 	}
-	items, err := repositories.Queue.List(context.Background())
+	queue, err := repositories.Queue.GetByID(context.Background(), "queue_manual_intervention_crash_window")
 	if err != nil {
-		t.Fatalf("Queue.List() error = %v", err)
+		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if len(items) != 1 {
-		t.Fatalf("queue items = %#v, want exactly original requeued item", items)
-	}
-	if items[0].Status != "queued" || items[0].ID != "queue_manual_intervention_crash_window" {
-		t.Fatalf("queue item = %#v, want original queue item requeued", items[0])
+	if queue == nil || queue.Status != "manual_intervention" || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want parked manual intervention item", queue)
 	}
 	events, err := repositories.Events.ListByEntity(context.Background(), "loop", loopID)
 	if err != nil {
@@ -1244,8 +1241,11 @@ func TestRunRecoveryPipelineDoesNotRequeueManualInterventionQueueWhenLoopStillRu
 	if containsEventType(events, "looperd.recovery.loop_requeued") {
 		t.Fatalf("events = %#v, want no loop_requeued event", events)
 	}
-	if containsEventType(events, "looperd.recovery.loop_queue_normalized") {
-		t.Fatalf("events = %#v, want no queued normalization", events)
+	if !containsEventType(events, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("events = %#v, want queued normalization", events)
+	}
+	if containsEventType(events, "looperd.recovery.loop_manual_intervention_requeued") {
+		t.Fatalf("events = %#v, want no manual intervention requeue event", events)
 	}
 }
 

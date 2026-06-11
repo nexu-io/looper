@@ -929,6 +929,42 @@ func TestProcessSnapshotQueueItemRetriesTransientCompletionFailure(t *testing.T)
 	assertQueueRetryError(t, updated, "database is locked")
 }
 
+func TestProcessSnapshotQueueItemFailsNonRetryableInvalidItem(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-project-missing-fail.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	repo := "nexu-io/looper"
+	prNumber := int64(109)
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_invalid_item", Type: "snapshot", TargetType: "pull_request", TargetID: "nexu-io/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:nexu-io/looper:109", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos:       repos,
+		Now:         func() time.Time { return now },
+		Snapshotter: stubSnapshotScheduler{},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil || updated.Status != "manual_intervention" || updated.FinishedAt == nil {
+		t.Fatalf("queue item = %#v, want parked queue item", updated)
+	}
+	if updated.LastError == nil || *updated.LastError != "invalid snapshot queue item" || updated.LastErrorKind == nil || *updated.LastErrorKind != "non_retryable" {
+		t.Fatalf("queue item error = (%v, %v), want non-retryable invalid-item failure", updated.LastError, updated.LastErrorKind)
+	}
+}
+
 func TestSchedulerAvailableSlotsAccountsForRunningQueueItems(t *testing.T) {
 	t.Parallel()
 

@@ -1770,8 +1770,11 @@ func failSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord, in
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	nextAttempts := item.Attempts + 1
-	retryAt := formatJavaScriptISOString(now().UTC().Add(time.Minute * time.Duration(cappedRetryDelayAttempt(nextAttempts, item.MaxAttempts))))
-	return input.Repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: item.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
+	if kind == "retryable_transient" && nextAttempts < item.MaxAttempts {
+		retryAt := formatJavaScriptISOString(now().UTC().Add(time.Minute * time.Duration(cappedRetryDelayAttempt(nextAttempts, item.MaxAttempts))))
+		return input.Repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: item.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
+	}
+	return input.Repos.Queue.Fail(ctx, storage.QueueFailInput{ID: item.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
 }
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
