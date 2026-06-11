@@ -5039,6 +5039,56 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemPreservesTerminalReviewerFailureMetadata(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+
+	if _, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	agent.onStart = func(AgentRunInput) {
+		loop, err := fixture.repos.Loops.GetByID(ctx, *claim.LoopID)
+		if err != nil || loop == nil {
+			t.Fatalf("Loops.GetByID() = (%#v, %v), want loop during agent start", loop, err)
+		}
+		metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "failed"}})
+		loop.MetadataJSON = &metadata
+		if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+			t.Fatalf("Loops.Upsert() error = %v", err)
+		}
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+		t.Fatalf("result = %#v, want retryable failed marker-miss result", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(ctx, claim.ID)
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
+	}
+	if queue.Status != "manual_intervention" || queue.FinishedAt == nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableAfterResume) {
+		t.Fatalf("queue = %#v, want terminal manual_intervention queue preserving retryable failure", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(ctx, result.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	if loop.Status != "failed" || loop.NextRunAt != nil || terminalReviewerLoopReason(*loop) != "failed" {
+		t.Fatalf("loop = %#v, want failed terminal loop with no next run", loop)
+	}
+}
+
 func TestProcessClaimedItemRerunsReviewAfterRepeatedAgentReviewMarkerMisses(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
