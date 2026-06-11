@@ -1934,9 +1934,9 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 				}
 				summary.LoopsRequeued = 1
 				summary.QueueItemsRequeued = 1
+				return summary, nil
 			}
 		}
-		return summary, nil
 	}
 	if shouldRequeueLoop(loop, latestRun, latestRunHasLiveAgent) {
 		requeuedLoop := loop
