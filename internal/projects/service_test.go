@@ -842,7 +842,7 @@ func TestServiceRemoveProjectTerminatesActiveLoopsBeforeReactivation(t *testing.
 	}
 }
 
-func TestServiceRemoveProjectTerminatesFailedLoopsAndCancelsRecoverableQueueItems(t *testing.T) {
+func TestServiceRemoveProjectTerminatesFailedAndInterruptedLoopsAndCancelsRecoverableQueueItems(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -858,6 +858,11 @@ func TestServiceRemoveProjectTerminatesFailedLoopsAndCancelsRecoverableQueueItem
 	failedTargetID := "pr:acme/looper:42"
 	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_failed", Seq: 1, ProjectID: "looper", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &failedTargetID, Repo: &repoName, PRNumber: &prNumber, Status: string(domain.LoopStatusFailed), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert(loop_failed) error = %v", err)
+	}
+	interruptedTargetID := "pr:acme/looper:44"
+	interruptedPRNumber := int64(44)
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_interrupted", Seq: 3, ProjectID: "looper", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &interruptedTargetID, Repo: &repoName, PRNumber: &interruptedPRNumber, Status: string(domain.LoopStatusInterrupted), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_interrupted) error = %v", err)
 	}
 	manualTargetID := "pr:acme/looper:43"
 	manualPRNumber := int64(43)
@@ -890,6 +895,13 @@ func TestServiceRemoveProjectTerminatesFailedLoopsAndCancelsRecoverableQueueItem
 	}
 	if failedLoop == nil || failedLoop.Status != string(domain.LoopStatusTerminated) {
 		t.Fatalf("failed loop = %#v, want terminated", failedLoop)
+	}
+	interruptedLoop, err := repos.Loops.GetByID(ctx, "loop_interrupted")
+	if err != nil {
+		t.Fatalf("Loops.GetByID(loop_interrupted) error = %v", err)
+	}
+	if interruptedLoop == nil || interruptedLoop.Status != string(domain.LoopStatusTerminated) {
+		t.Fatalf("interrupted loop = %#v, want terminated", interruptedLoop)
 	}
 	manualLoop, err := repos.Loops.GetByID(ctx, "loop_manual")
 	if err != nil {

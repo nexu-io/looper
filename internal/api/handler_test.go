@@ -2961,6 +2961,69 @@ func TestHandlerWorkerCreateUsesProjectScopedPullRequestSnapshot(t *testing.T) {
 	}
 }
 
+func TestHandlerWorkerCreateIgnoresSnapshotForProjectReactivatedToDifferentRepo(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	baseBranch := "main"
+	otherMetadata := `{"repo":"acme/other","worktreeRoot":null,"source":"api"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID:           "project_2",
+		Name:         "Looper Reused",
+		RepoPath:     "/tmp/repos/looper-reused",
+		BaseBranch:   &baseBranch,
+		Archived:     false,
+		MetadataJSON: &otherMetadata,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_project_1_latest",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "head-project-1",
+		CapturedAt: fixture.now.UTC().Format(javaScriptISOString),
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(project_1) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
+		ID:         "prs_project_2_stale",
+		ProjectID:  "project_2",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "head-project-2-stale",
+		CapturedAt: fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString),
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert(project_2) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"repo":"acme/looper","prNumber":42,"baseBranch":"main"}`)))
+	req.Header.Set("x-request-id", "error-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(2 * time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queueItems) != 1 {
+		t.Fatalf("Queue.List() = %#v, want one enqueued worker", queueItems)
+	}
+	if queueItems[0].ProjectID == nil || *queueItems[0].ProjectID != "project_1" {
+		t.Fatalf("queueItems[0].ProjectID = %#v, want project_1", queueItems[0].ProjectID)
+	}
+}
+
 func TestHandlerWorkerCreateRejectsRepoMismatchForExplicitProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

@@ -4297,18 +4297,23 @@ func (h *Handler) resolveWorkerProject(ctx context.Context, input resolveWorkerP
 	}
 
 	if input.Repo != nil && input.PRNumber != nil {
+		requestedRepo := strings.TrimSpace(*input.Repo)
 		snapshots, err := services.Repositories.PullRequestSnapshots.List(ctx)
 		if err != nil {
 			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 		matchedProjectIDs := map[string]struct{}{}
 		for _, snapshot := range snapshots {
-			if snapshot.Repo == *input.Repo && snapshot.PRNumber == *input.PRNumber {
+			if snapshot.Repo == requestedRepo && snapshot.PRNumber == *input.PRNumber {
 				project, getErr := services.Repositories.Projects.GetByID(ctx, snapshot.ProjectID)
 				if getErr != nil {
 					return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: getErr.Error()}
 				}
 				if project != nil && !project.Archived {
+					configuredRepo := strings.TrimSpace(derefString(stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")))
+					if configuredRepo != "" && configuredRepo != requestedRepo {
+						continue
+					}
 					matchedProjectIDs[snapshot.ProjectID] = struct{}{}
 				}
 			}

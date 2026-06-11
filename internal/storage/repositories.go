@@ -683,7 +683,7 @@ func (r *LoopsRepository) TerminateByProject(ctx context.Context, projectID, upd
 		SET status = 'terminated',
 			next_run_at = NULL,
 			updated_at = ?
-		WHERE project_id = ? AND status IN ('idle', 'queued', 'running', 'paused', 'waiting', 'failed')
+		WHERE project_id = ? AND status IN ('idle', 'queued', 'running', 'paused', 'waiting', 'failed', 'interrupted')
 	`, updatedAt, projectID)
 	if err != nil {
 		return 0, fmt.Errorf("terminate loops by project: %w", err)
