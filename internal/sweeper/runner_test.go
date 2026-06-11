@@ -1525,8 +1525,8 @@ func TestProcessWarnFailsQueueItemAfterMaxAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if stored == nil || stored.Status != "queued" || stored.Attempts != 3 || stored.FinishedAt != nil || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" || stored.AvailableAt <= fixture.nowISO {
-		t.Fatalf("stored queue item = %#v, want queued backoff queue item after max attempts", stored)
+	if stored == nil || stored.Status != "manual_intervention" || stored.Attempts != 3 || stored.FinishedAt == nil || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
+		t.Fatalf("stored queue item = %#v, want parked queue item after max attempts", stored)
 	}
 }
 

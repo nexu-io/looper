@@ -363,11 +363,24 @@ func (r *Runner) recoverClaimedQueueItem(ctx context.Context, queueItem storage.
 	failureKind, failureMessage := classifyQueueFailure(err)
 	nowISO := r.nowISO()
 	nextAttempts := queueItem.Attempts + 1
+	if !shouldRetryQueueFailure(failureKind, nextAttempts, queueItem.MaxAttempts) {
+		if failErr := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: stringPtr(failureMessage), ErrorKind: failureKind, UpdatedAt: nowISO}); failErr != nil {
+			return nil, failErr
+		}
+		return &ProcessResult{QueueItemID: queueItem.ID, Status: "failed", Summary: failureMessage}, nil
+	}
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
 	if markErr := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: stringPtr(failureMessage), ErrorKind: failureKind, UpdatedAt: nowISO}); markErr != nil {
 		return nil, markErr
 	}
 	return &ProcessResult{QueueItemID: queueItem.ID, Status: "failed", Summary: failureMessage}, nil
+}
+
+func shouldRetryQueueFailure(kind string, nextAttempts, maxAttempts int64) bool {
+	if kind != "retryable_transient" {
+		return false
+	}
+	return maxAttempts <= 0 || nextAttempts < maxAttempts
 }
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {

@@ -6077,8 +6077,8 @@ func TestProcessClaimedItemDoesNotRetryGitHubSelfApprovalFailure(t *testing.T) {
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt != nil || queue.AvailableAt <= fixture.nowISO() {
-		t.Fatalf("queue = %#v, want queued backoff non_retryable queue item", queue)
+	if queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want parked non_retryable queue item", queue)
 	}
 }
 
@@ -6163,8 +6163,8 @@ func TestProcessClaimedItemPersistsExhaustedTransientDiscoverShellFailureAsRetry
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.LastError == nil || !strings.Contains(*queue.LastError, "unexpected EOF") || queue.FinishedAt != nil {
-		t.Fatalf("queue = %#v, want queued backoff retryable transient item preserving GitHub error", queue)
+	if queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.LastError == nil || !strings.Contains(*queue.LastError, "unexpected EOF") || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want parked retryable transient item preserving GitHub error after exhaustion", queue)
 	}
 }
 
@@ -6652,8 +6652,8 @@ func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 	if getErr != nil {
 		t.Fatalf("Queue.GetByID() error = %v", getErr)
 	}
-	if queue == nil || queue.Status != "queued" || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.AvailableAt <= fixture.nowISO() {
-		t.Fatalf("queue = %#v, want queued backoff queue item with non_retryable error kind", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.FinishedAt == nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
+		t.Fatalf("queue = %#v, want parked queue item with non_retryable error kind", queue)
 	}
 	if queue.LastError == nil || !contains(*queue.LastError, "start run blocked") {
 		t.Fatalf("queue.LastError = %#v, want start run blocked", queue.LastError)
