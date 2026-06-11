@@ -203,6 +203,54 @@ func TestHandlerLoopRetryAllowsManualInterventionQueueItem(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryRejectsArchivedProject(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_archived"
+	loopID := "loop_retry_archived"
+	targetID := projectID
+	finishedAt := "2026-04-11T12:01:00.000Z"
+	lastErrorKind := "manual_intervention"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 49, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_retry_archived", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:retry_archived", Priority: storage.QueuePriorityWorker, Status: "failed", AvailableAt: nowISO, Attempts: 2, MaxAttempts: 3, LastErrorKind: &lastErrorKind, FinishedAt: &finishedAt, CreatedAt: nowISO, UpdatedAt: finishedAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/49/retry", strings.NewReader(`{"mode":"auto"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], "PROJECT_NOT_FOUND")
+	assertEqual(t, errorMap["message"], "Project not found: "+projectID)
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "paused" {
+		t.Fatalf("loop.Status = %q, want paused", loop.Status)
+	}
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 || items[0].Status != "failed" {
+		t.Fatalf("queue items = %#v, want single failed item", items)
+	}
+}
+
 func TestHandlerLoopRetryRejectsTerminalReviewerMetadata(t *testing.T) {
 	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
 		options.DeferRecovery = true
@@ -2200,6 +2248,50 @@ func TestHandlerLoopStartRejectsTerminalReviewerLoop(t *testing.T) {
 		if updated.Status != loop.Status {
 			t.Fatalf("loop %s status = %q, want unchanged %q", loop.ID, updated.Status, loop.Status)
 		}
+	}
+}
+
+func TestHandlerLoopStartRejectsArchivedProject(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_archived_start"
+	loopID := "loop_archived_start"
+	targetID := "project:" + projectID
+	metadata := `{"worker":{"title":"Implement worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", Archived: true, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 12, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "terminated", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/start", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errorMap := body["error"].(map[string]any)
+	assertEqual(t, errorMap["code"], "PROJECT_NOT_FOUND")
+	assertEqual(t, errorMap["message"], "Project not found: "+projectID)
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	if loop.Status != "terminated" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want unchanged terminated loop", loop)
+	}
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("queue items = %#v, want none", items)
 	}
 }
 

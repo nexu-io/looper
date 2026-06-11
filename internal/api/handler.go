@@ -4529,6 +4529,11 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		if loop == nil {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
+		if status == domain.LoopStatusRunning && strings.TrimSpace(loop.ProjectID) != "" {
+			if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+				return storage.LoopRecord{}, err
+			}
+		}
 
 		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
@@ -4691,6 +4696,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		}
 		if loop == nil {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if strings.TrimSpace(loop.ProjectID) != "" {
+			if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+				return retryResult{}, err
+			}
 		}
 		if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
