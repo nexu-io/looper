@@ -4153,8 +4153,7 @@ func isRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bo
 }
 
 func queueHasRemainingAttempts(queue storage.QueueItemRecord) bool {
-	nextAttempts := queue.Attempts + 1
-	return queue.MaxAttempts > 0 && nextAttempts < queue.MaxAttempts
+	return true
 }
 
 func isKnownReviewerRediscoveryGuardrail(message string) bool {
@@ -6064,10 +6063,7 @@ func isRetryableFailure(kind QueueFailureKind) bool {
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if !isRetryableFailure(kind) {
-		return false
-	}
-	return maxAttempts <= 0 || nextAttempts < maxAttempts
+	return isRetryableFailure(kind)
 }
 
 func cloneStrings(values []string) []string {

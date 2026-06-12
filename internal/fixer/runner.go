@@ -6004,10 +6004,7 @@ func isRetryableFailure(kind QueueFailureKind) bool {
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if !isRetryableFailure(kind) {
-		return false
-	}
-	return maxAttempts <= 0 || nextAttempts < maxAttempts
+	return isRetryableFailure(kind)
 }
 
 func normalizePRState(value string) string {

@@ -381,10 +381,7 @@ func (r *Runner) recoverClaimedQueueItem(ctx context.Context, queueItem storage.
 }
 
 func shouldRetryQueueFailure(kind string, nextAttempts, maxAttempts int64) bool {
-	if kind != "retryable_transient" {
-		return false
-	}
-	return maxAttempts <= 0 || nextAttempts < maxAttempts
+	return kind == "retryable_transient"
 }
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {

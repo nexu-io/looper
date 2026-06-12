@@ -1502,7 +1502,7 @@ func TestProcessWarnRecoversAfterCommentPostedButLabelFails(t *testing.T) {
 	}
 }
 
-func TestProcessWarnFailsQueueItemAfterMaxAttempts(t *testing.T) {
+func TestProcessWarnRequeuesRetryableFailureAfterMaxAttempts(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
@@ -1525,8 +1525,8 @@ func TestProcessWarnFailsQueueItemAfterMaxAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if stored == nil || stored.Status != "manual_intervention" || stored.Attempts != 3 || stored.FinishedAt == nil || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
-		t.Fatalf("stored queue item = %#v, want parked queue item after max attempts", stored)
+	if stored == nil || stored.Status != "queued" || stored.Attempts != 3 || stored.FinishedAt != nil || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
+		t.Fatalf("stored queue item = %#v, want requeued queue item after max attempts", stored)
 	}
 }
 

@@ -2703,8 +2703,7 @@ func runtimeRecoverableEnhancedTransient(policy config.ReviewerRetryConfig, queu
 }
 
 func runtimeQueueHasRemainingAttempts(queue storage.QueueItemRecord) bool {
-	nextAttempts := queue.Attempts + 1
-	return queue.MaxAttempts > 0 && nextAttempts < queue.MaxAttempts
+	return true
 }
 
 func autoRecoveredReviewerLoop(loop storage.LoopRecord, nowISO string) storage.LoopRecord {

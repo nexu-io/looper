@@ -3658,8 +3658,8 @@ func TestShouldAutoRecoverFailedReviewerLoopAllowsRetryableTransientWithAttempts
 		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true")
 	}
 	queue.Attempts = 4
-	if shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
-		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = true, want false on final allowed run")
+	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, policy) {
+		t.Fatalf("shouldAutoRecoverFailedReviewerLoop() = false, want true after max attempts")
 	}
 }
 
@@ -3686,8 +3686,8 @@ func TestShouldAutoRecoverFailedReviewerLoopAllowsEnhancedMatchedTransientWhenCo
 		t.Fatal("shouldAutoRecoverFailedReviewerLoop(enabled) = false, want true")
 	}
 	queue.Attempts = 4
-	if shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, enabledPolicy) {
-		t.Fatal("shouldAutoRecoverFailedReviewerLoop(enabled final attempt) = true, want false")
+	if !shouldAutoRecoverFailedReviewerLoop(loop, &run, &queue, enabledPolicy) {
+		t.Fatal("shouldAutoRecoverFailedReviewerLoop(enabled final attempt) = false, want true")
 	}
 }
 

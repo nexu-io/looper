@@ -2668,10 +2668,7 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume {
-		return false
-	}
-	return maxAttempts <= 0 || nextAttempts < maxAttempts
+	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
 }
 
 func issueClaimStatusForFailure(checkpoint workerCheckpoint, failedQueue *storage.QueueItemRecord, kind QueueFailureKind) string {
