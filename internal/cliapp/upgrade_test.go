@@ -1141,11 +1141,17 @@ func TestUpgradeWithoutFlagsContinuesWithDaemonWhenCLISelfUpgradeRefused(t *test
 	if !strings.Contains(stdout.String(), "CLI self-upgrade skipped") {
 		t.Fatalf("stdout = %q, want CLI refusal guidance", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "Proceeding with daemon upgrade") {
-		t.Fatalf("stdout = %q, want daemon continuation note", stdout.String())
-	}
 	if !strings.Contains(stdout.String(), "Installed looperd 0.3.0") {
 		t.Fatalf("stdout = %q, want daemon install message", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "looper daemon restart") {
+		t.Fatalf("stdout = %q, want restart hint", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Proceeding with daemon upgrade") {
+		t.Fatalf("stdout = %q, did not expect duplicate daemon transition note", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Downloaded from ") {
+		t.Fatalf("stdout = %q, did not expect download URL noise", stdout.String())
 	}
 }
 

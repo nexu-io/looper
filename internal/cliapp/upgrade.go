@@ -1043,11 +1043,6 @@ func (r *commandRuntime) finishPreparedDaemonUpgrade(cmd *cobra.Command, prepare
 			return daemonUpgradeOutput{}, err
 		}
 	}
-	if output.DownloadedFrom != nil {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", *output.DownloadedFrom); err != nil {
-			return daemonUpgradeOutput{}, err
-		}
-	}
 	if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Restart the daemon to use the new version:"); err != nil {
 		return daemonUpgradeOutput{}, err
 	}
@@ -1161,7 +1156,12 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 	daemonBuf := &bytes.Buffer{}
 
 	progressMux := newConcurrentProgressMux(cmd.ErrOrStderr())
-	defer progressMux.close()
+	progressClosed := false
+	defer func() {
+		if !progressClosed {
+			progressMux.close()
+		}
+	}()
 
 	cliCmd := mirrorCommandWithIO(cmd, cliBuf, progressMux)
 	daemonCmd := mirrorCommandWithIO(cmd, daemonBuf, progressMux)
@@ -1189,6 +1189,8 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 
 	cliRes := <-cliCh
 	daemonRes := <-daemonCh
+	progressMux.close()
+	progressClosed = true
 
 	// Surface CLI lane output, accepting refusal as a non-fatal outcome since
 	// non-release installs (Homebrew, dev builds, ...) deliberately reject
@@ -1208,12 +1210,6 @@ func (r *commandRuntime) upgradeUnifiedConcurrent(cmd *cobra.Command) error {
 		}
 	} else if !jsonOutput {
 		if _, err := cmd.OutOrStdout().Write(cliBuf.Bytes()); err != nil {
-			return err
-		}
-	}
-
-	if !jsonOutput {
-		if _, err := fmt.Fprintln(cmd.OutOrStdout(), "Proceeding with daemon upgrade..."); err != nil {
 			return err
 		}
 	}
@@ -1360,9 +1356,6 @@ func (r *commandRuntime) upgradeCLIWithOutput(cmd *cobra.Command, emitOutput boo
 		return cliUpgradeOutput{}, err
 	}
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Previous binary kept at %s\n", prevPath); err != nil {
-		return cliUpgradeOutput{}, err
-	}
-	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Downloaded from %s\n", asset.PreferredURL); err != nil {
 		return cliUpgradeOutput{}, err
 	}
 	return result, nil

@@ -359,6 +359,12 @@ func TestUpgradeUnifiedDownloadsCLIAndDaemonConcurrently(t *testing.T) {
 		!strings.Contains(stdout.String(), "looperd 9.9.9") {
 		t.Fatalf("stdout = %q, want daemon install confirmation", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "looper daemon restart") {
+		t.Fatalf("stdout = %q, want restart hint", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Downloaded from ") {
+		t.Fatalf("stdout = %q, did not expect download URL noise", stdout.String())
+	}
 	if got := strings.Count(stderr.String(), "Downloading "); got != 2 {
 		t.Fatalf("stderr start line count = %d, want 2 compact start lines; stderr=%q", got, stderr.String())
 	}
