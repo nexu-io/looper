@@ -45,6 +45,26 @@ func TestProcessNextIgnoresOtherQueueTypes(t *testing.T) {
 	}
 }
 
+func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
+		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
+	}
+	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
+		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
+	}
+}
+
+func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{RetryMaxAttempts: -1})
+	if runner.retryMaxAttempts != -1 {
+		t.Fatalf("retryMaxAttempts = %d, want -1", runner.retryMaxAttempts)
+	}
+}
+
 func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1025,16 +1045,16 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.FinishedAt != nil {
-		t.Fatalf("queue = %#v, want requeued retryable_transient queue item after max attempts", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want manual_intervention retryable_transient queue item after max attempts", queue)
 	}
 
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
-		t.Fatalf("loop = %#v, want queued loop after max attempts", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop after max attempts", loop)
 	}
 }
 

@@ -1621,7 +1621,20 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
 		}
-		item, err := input.Repos.Queue.ClaimNext(ctx, nowISO, "scheduler")
+		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
+		if err != nil {
+			return queueItems, err
+		}
+		if item == nil {
+			break
+		}
+		queueItems = append(queueItems, *item)
+	}
+	for len(queueItems) < availableSlots {
+		if err := ctx.Err(); err != nil {
+			return queueItems, err
+		}
+		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
 			return queueItems, err
 		}
@@ -1773,7 +1786,7 @@ func failSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord, in
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	nextAttempts := item.Attempts + 1
-	if kind == "retryable_transient" {
+	if kind == "retryable_transient" && (item.MaxAttempts < 0 || (item.MaxAttempts > 0 && nextAttempts < item.MaxAttempts)) {
 		retryAt := formatJavaScriptISOString(now().UTC().Add(time.Minute * time.Duration(cappedRetryDelayAttempt(nextAttempts, item.MaxAttempts))))
 		return input.Repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: item.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
 	}

@@ -3023,6 +3023,45 @@ func TestValidateDaemonSupervisionConfig(t *testing.T) {
 	}
 }
 
+func TestValidateSchedulerRetryMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		attempts  int
+		wantError string
+	}{
+		{name: "infinite retries", attempts: -1},
+		{name: "finite retries", attempts: 3},
+		{name: "zero rejected", attempts: 0, wantError: "must be -1 or a positive integer"},
+		{name: "less than negative one rejected", attempts: -2, wantError: "must be -1 or a positive integer"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Scheduler.RetryMaxAttempts = tt.attempts
+			err = Validate(cfg)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			var validationErr *ConfigValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+			}
+			assertValidationIssue(t, validationErr, "scheduler.retryMaxAttempts", tt.wantError)
+		})
+	}
+}
+
 func TestValidateRejectsDuplicateAndIncompleteProjects(t *testing.T) {
 	config, err := DefaultConfig(t.TempDir())
 	if err != nil {
@@ -3151,6 +3190,9 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 
 	if config.Scheduler.MaxConcurrentRuns != 3 {
 		t.Fatalf("DefaultConfig().Scheduler.MaxConcurrentRuns = %d, want %d", config.Scheduler.MaxConcurrentRuns, 3)
+	}
+	if config.Scheduler.RetryMaxAttempts != -1 {
+		t.Fatalf("DefaultConfig().Scheduler.RetryMaxAttempts = %d, want %d", config.Scheduler.RetryMaxAttempts, -1)
 	}
 	if config.Scheduler.SlowLaneWarnThresholdMS != 5000 {
 		t.Fatalf("DefaultConfig().Scheduler.SlowLaneWarnThresholdMS = %d, want %d", config.Scheduler.SlowLaneWarnThresholdMS, 5000)

@@ -830,13 +830,20 @@ func (s *Service) enqueuePullRequestSnapshot(ctx context.Context, project storag
 		Priority:    storage.QueuePrioritySnapshot,
 		Status:      "queued",
 		AvailableAt: nowISO,
-		MaxAttempts: 3,
+		MaxAttempts: s.snapshotRetryMaxAttempts(),
 		PayloadJSON: stringPointer(string(payload)),
 		CreatedAt:   nowISO,
 		UpdatedAt:   nowISO,
 	}
 	_, _, err = s.Repos.Queue.CreateOrGetActiveByDedupe(ctx, record)
 	return true, err
+}
+
+func (s *Service) snapshotRetryMaxAttempts() int64 {
+	if s.Config.Scheduler.RetryMaxAttempts == 0 {
+		return -1
+	}
+	return int64(s.Config.Scheduler.RetryMaxAttempts)
 }
 
 func snapshotModeOrDefault(mode SnapshotMode) SnapshotMode {

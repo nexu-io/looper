@@ -56,6 +56,26 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 }
 
+func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
+		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
+	}
+	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
+		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
+	}
+}
+
+func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{RetryMaxAttempts: -1})
+	if runner.retryMaxAttempts != -1 {
+		t.Fatalf("retryMaxAttempts = %d, want -1", runner.retryMaxAttempts)
+	}
+}
+
 func TestDiscoverPullRequestCreatesLoopAndQueue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -6213,8 +6233,8 @@ func TestProcessClaimedItemRequeuesTransientDiscoverShellFailureAfterMaxAttempts
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.LastError == nil || !strings.Contains(*queue.LastError, "unexpected EOF") || queue.FinishedAt != nil {
-		t.Fatalf("queue = %#v, want requeued retryable transient item preserving GitHub error after max attempts", queue)
+	if queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.LastError == nil || !strings.Contains(*queue.LastError, "unexpected EOF") || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want manual_intervention retryable transient item preserving GitHub error after max attempts", queue)
 	}
 }
 

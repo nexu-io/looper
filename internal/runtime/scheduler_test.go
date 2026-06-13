@@ -730,6 +730,52 @@ func TestClaimAndRunScheduledQueueItemsBackfillsAvailableSlots(t *testing.T) {
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsUsesLongTermRetryOnlyForIdleSlots(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "long-retry-idle.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_retry", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_retry", Seq: 1, ProjectID: "project_retry", Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	loopID := "loop_retry"
+	retryKind := "retryable_transient"
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "fresh_1", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_retry", DedupeKey: "d_fresh_1", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:40:00.000Z", UpdatedAt: nowISO},
+		{ID: "fresh_2", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_retry", DedupeKey: "d_fresh_2", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:41:00.000Z", UpdatedAt: nowISO},
+		{ID: "long_retry", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_retry", DedupeKey: "d_long_retry", Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, Attempts: storage.QueueLongTermRetryAttemptThreshold, MaxAttempts: -1, LastErrorKind: &retryKind, CreatedAt: "2026-04-21T07:00:00.000Z", UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	workerRunner := &stubWorkerScheduler{}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Worker: workerRunner})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 2 || claimed[0].ID != "fresh_1" || claimed[1].ID != "fresh_2" {
+		t.Fatalf("claimed = %#v, want only fresh items when fresh work fills slots", claimed)
+	}
+
+	workerRunner = &stubWorkerScheduler{}
+	claimed, err = claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Worker: workerRunner})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems(second) error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "long_retry" {
+		t.Fatalf("claimed second = %#v, want long retry after ordinary work is claimed", claimed)
+	}
+}
+
 func TestRunScheduledQueueItemsRejectsUnsupportedType(t *testing.T) {
 	t.Parallel()
 
@@ -797,6 +843,42 @@ func TestProcessSnapshotQueueItemRetriesTransientCaptureFailure(t *testing.T) {
 	}
 	if updated.LastError == nil || *updated.LastError != "gh timeout" || updated.LastErrorKind == nil || *updated.LastErrorKind != "retryable_transient" {
 		t.Fatalf("queue item error = (%v, %v), want retryable gh timeout", updated.LastError, updated.LastErrorKind)
+	}
+}
+
+func TestProcessSnapshotQueueItemStopsRetryingAtMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-terminal.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "looper"
+	repo := "nexu-io/looper"
+	prNumber := int64(109)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_terminal_1", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: "nexu-io/looper#109", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:nexu-io/looper:109:terminal", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }, Snapshotter: stubSnapshotScheduler{err: errors.New("gh timeout")}})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	updated, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if updated == nil {
+		t.Fatal("Queue.GetByID() = nil, want failed queue item")
+	}
+	if updated.Status != "manual_intervention" || updated.Attempts != 1 || updated.FinishedAt == nil {
+		t.Fatalf("queue item = %#v, want manual_intervention terminal item with one attempt", updated)
 	}
 }
 

@@ -45,6 +45,26 @@ func TestBuildPlannerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	}
 }
 
+func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
+		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
+	}
+	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
+		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
+	}
+}
+
+func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{RetryMaxAttempts: -1})
+	if runner.retryMaxAttempts != -1 {
+		t.Fatalf("retryMaxAttempts = %d, want -1", runner.retryMaxAttempts)
+	}
+}
+
 func TestDiscoverIssuesEnqueuesEligibleWorkAndCreatesLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

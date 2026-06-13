@@ -1474,6 +1474,55 @@ func TestQueueClaimOrderingAndBlockers(t *testing.T) {
 	}
 }
 
+func TestQueueLongTermRetryClaimsAfterFreshWork(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_retry_order", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "loop_retry_order", Seq: 1, ProjectID: "project_retry_order", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	loopID := "loop_retry_order"
+	retryKind := "retryable_transient"
+	items := []QueueItemRecord{
+		{ID: "long_retry", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_retry_order", DedupeKey: "d_long_retry", Priority: QueuePriorityPlanner, Status: "queued", AvailableAt: now, Attempts: QueueLongTermRetryAttemptThreshold, MaxAttempts: -1, LastErrorKind: &retryKind, CreatedAt: "2026-04-11T11:00:00.000Z", UpdatedAt: now},
+		{ID: "fresh", LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project_retry_order", DedupeKey: "d_fresh", Priority: QueuePriorityWorker, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-11T11:30:00.000Z", UpdatedAt: now},
+	}
+	for _, item := range items {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	scheduled, err := repos.Queue.ListScheduled(ctx, now, 2)
+	if err != nil {
+		t.Fatalf("Queue.ListScheduled() error = %v", err)
+	}
+	if len(scheduled) != 2 || scheduled[0].ID != "fresh" || scheduled[1].ID != "long_retry" {
+		t.Fatalf("Queue.ListScheduled() order = %#v, want fresh before long_retry", scheduled)
+	}
+	claimed, err := repos.Queue.ClaimNext(ctx, now, "worker-a")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNext() error = %v", err)
+	}
+	if claimed == nil || claimed.ID != "fresh" {
+		t.Fatalf("Queue.ClaimNext() = %#v, want fresh", claimed)
+	}
+	claimedLong, err := repos.Queue.ClaimNextLongTermRetry(ctx, now, "worker-b")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextLongTermRetry() error = %v", err)
+	}
+	if claimedLong == nil || claimedLong.ID != "long_retry" {
+		t.Fatalf("Queue.ClaimNextLongTermRetry() = %#v, want long_retry", claimedLong)
+	}
+}
+
 func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	t.Parallel()
 

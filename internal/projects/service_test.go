@@ -170,6 +170,9 @@ func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testi
 	if items[0].Priority != storage.QueuePrioritySnapshot {
 		t.Fatalf("snapshot priority = %d, want %d", items[0].Priority, storage.QueuePrioritySnapshot)
 	}
+	if items[0].MaxAttempts != -1 {
+		t.Fatalf("snapshot max attempts = %d, want -1", items[0].MaxAttempts)
+	}
 }
 
 func TestServiceAddProjectAsyncFallsBackToFullWhenQueueDisabled(t *testing.T) {

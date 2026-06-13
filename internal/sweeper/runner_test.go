@@ -42,6 +42,31 @@ func TestDiscoverIssuesSkipsWhenAutoDiscoveryDisabledForProject(t *testing.T) {
 	}
 }
 
+func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	if !shouldRetryQueueFailure("retryable_transient", 5, -1) {
+		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
+	}
+	if shouldRetryQueueFailure("retryable_transient", 3, 3) {
+		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
+	}
+}
+
+func TestNewUsesSchedulerRetryMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Scheduler.RetryMaxAttempts = -1
+	runner := New(Options{Config: &cfg})
+	if runner.maxTry != -1 {
+		t.Fatalf("maxTry = %d, want -1", runner.maxTry)
+	}
+}
+
 func TestDiscoverIssuesEnqueuesWarnAndCloseCandidates(t *testing.T) {
 	t.Parallel()
 
@@ -1525,8 +1550,8 @@ func TestProcessWarnRequeuesRetryableFailureAfterMaxAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if stored == nil || stored.Status != "queued" || stored.Attempts != 3 || stored.FinishedAt != nil || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
-		t.Fatalf("stored queue item = %#v, want requeued queue item after max attempts", stored)
+	if stored == nil || stored.Status != "manual_intervention" || stored.Attempts != 3 || stored.FinishedAt == nil || stored.LastErrorKind == nil || *stored.LastErrorKind != "retryable_transient" {
+		t.Fatalf("stored queue item = %#v, want manual_intervention queue item after max attempts", stored)
 	}
 }
 

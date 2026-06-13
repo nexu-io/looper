@@ -92,7 +92,7 @@
       "scheduler": {
         "pollIntervalSeconds": 30,
         "maxConcurrentRuns": 3,
-        "retryMaxAttempts": 5,
+        "retryMaxAttempts": -1,
         "retryBaseDelayMs": 5000,
         "slowLaneWarnThresholdMs": 5000,
         "discoveryCacheTtlSeconds": 30

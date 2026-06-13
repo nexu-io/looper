@@ -6,4 +6,6 @@ const (
 	QueuePriorityFixer    int64 = 2
 	QueuePriorityWorker   int64 = 3
 	QueuePrioritySnapshot int64 = 4
+
+	QueueLongTermRetryAttemptThreshold int64 = 5
 )

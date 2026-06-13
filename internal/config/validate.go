@@ -79,8 +79,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "scheduler.maxConcurrentRuns", Message: "must be a positive integer"})
 	}
 
-	if config.Scheduler.RetryMaxAttempts < 1 {
-		issues = append(issues, ValidationIssue{Path: "scheduler.retryMaxAttempts", Message: "must be a positive integer"})
+	if config.Scheduler.RetryMaxAttempts == 0 || config.Scheduler.RetryMaxAttempts < -1 {
+		issues = append(issues, ValidationIssue{Path: "scheduler.retryMaxAttempts", Message: "must be -1 or a positive integer"})
 	}
 
 	if config.Scheduler.RetryBaseDelayMS < 1 {

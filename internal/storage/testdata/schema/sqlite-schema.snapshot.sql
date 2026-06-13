@@ -159,7 +159,7 @@ CREATE TABLE "queue_items" (
   status TEXT NOT NULL,
   available_at TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
-  max_attempts INTEGER NOT NULL DEFAULT 3,
+  max_attempts INTEGER NOT NULL DEFAULT -1,
   claimed_by TEXT,
   claimed_at TEXT,
   started_at TEXT,
@@ -175,7 +175,7 @@ CREATE TABLE "queue_items" (
   CHECK (pr_number IS NULL OR pr_number > 0),
   CHECK (priority > 0),
   CHECK (attempts >= 0),
-  CHECK (max_attempts >= 1),
+  CHECK (max_attempts = -1 OR max_attempts > 0),
   CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'manual_intervention')),
   CHECK (last_error_kind IS NULL OR last_error_kind IN ('retryable_transient', 'retryable_after_resume', 'non_retryable', 'manual_intervention'))
 );

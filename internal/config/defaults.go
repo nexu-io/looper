@@ -76,7 +76,7 @@ func DefaultConfig(cwd string) (Config, error) {
 		Scheduler: SchedulerConfig{
 			PollIntervalSeconds:      30,
 			MaxConcurrentRuns:        3,
-			RetryMaxAttempts:         5,
+			RetryMaxAttempts:         -1,
 			RetryBaseDelayMS:         5000,
 			SlowLaneWarnThresholdMS:  5000,
 			DiscoveryCacheTTLSeconds: 30,

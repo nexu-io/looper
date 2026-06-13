@@ -687,7 +687,7 @@ func New(options Options) *Runner {
 		retryBaseDelay = defaultRetryDelay
 	}
 	retryMaxAttempts := options.RetryMaxAttempts
-	if retryMaxAttempts <= 0 {
+	if retryMaxAttempts == 0 {
 		retryMaxAttempts = defaultRetryMax
 	}
 	githubCLIAvailable := options.GitHub != nil
@@ -2668,7 +2668,13 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
+	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume {
+		return false
+	}
+	if maxAttempts < 0 {
+		return true
+	}
+	return maxAttempts > 0 && nextAttempts < maxAttempts
 }
 
 func issueClaimStatusForFailure(checkpoint workerCheckpoint, failedQueue *storage.QueueItemRecord, kind QueueFailureKind) string {

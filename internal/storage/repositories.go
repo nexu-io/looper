@@ -1881,9 +1881,25 @@ func (r *QueueRepository) CleanupStaleQueued(ctx context.Context, finishedAt str
 }
 
 func (r *QueueRepository) ClaimNext(ctx context.Context, nowISO, claimedBy string) (*QueueItemRecord, error) {
+	return r.claimNextMatching(ctx, nowISO, claimedBy, "", nil)
+}
+
+func (r *QueueRepository) ClaimNextNonLongTermRetry(ctx context.Context, nowISO, claimedBy string) (*QueueItemRecord, error) {
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND NOT (`+longTermRetryPredicateParam+`)
+	`, []any{QueueLongTermRetryAttemptThreshold})
+}
+
+func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, claimedBy string) (*QueueItemRecord, error) {
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND (`+longTermRetryPredicateParam+`)
+	`, []any{QueueLongTermRetryAttemptThreshold})
+}
+
+func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
 		WITH candidate AS (
-			`+scheduledQueueQuery+`
+			`+scheduledQueueBaseQuery+extraPredicate+scheduledQueueOrderBy+`
 			LIMIT 1
 		)
 		UPDATE queue_items
@@ -1895,7 +1911,7 @@ func (r *QueueRepository) ClaimNext(ctx context.Context, nowISO, claimedBy strin
 		WHERE id = (SELECT id FROM candidate)
 			AND status = 'queued'
 		RETURNING *
-	`, nowISO, claimedBy, nowISO, nowISO, nowISO)
+	`, append([]any{nowISO}, append(extraArgs, claimedBy, nowISO, nowISO, nowISO)...)...)
 
 	record, err := scanQueueItem(row)
 	if err != nil {
@@ -2479,8 +2495,12 @@ const scheduledQueueBaseQuery = `
 `
 
 const scheduledQueueOrderBy = `
-	ORDER BY qi.priority ASC, qi.available_at ASC, qi.created_at ASC
+	ORDER BY CASE WHEN ` + longTermRetryPredicateLiteral + ` THEN 1 ELSE 0 END ASC,
+		qi.priority ASC, qi.available_at ASC, qi.created_at ASC
 `
+
+const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND qi.last_error_kind IN ('retryable_transient', 'retryable_after_resume')`
+const longTermRetryPredicateParam = `qi.attempts >= ? AND qi.last_error_kind IN ('retryable_transient', 'retryable_after_resume')`
 
 const scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
 

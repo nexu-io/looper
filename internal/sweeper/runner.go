@@ -25,7 +25,7 @@ const (
 	defaultSkippedSummary  = "sweeper: no action"
 	javaScriptISOStringUTC = "2006-01-02T15:04:05.000Z"
 	defaultRetryDelay      = 5 * time.Second
-	defaultRetryMax        = int64(3)
+	defaultRetryMax        = int64(-1)
 	defaultQueuePriority   = storage.QueuePriorityWorker
 
 	categoryNone          = "none"
@@ -197,7 +197,11 @@ func New(options Options) *Runner {
 	if now == nil {
 		now = time.Now
 	}
-	return &Runner{repos: options.Repos, github: options.GitHub, agent: options.Agent, logger: options.Logger, now: now, config: options.Config, agentRuntime: options.AgentRuntime, agentModel: options.AgentModel, claimer: defaultClaimedBy, maxTry: defaultRetryMax, retryDelay: defaultRetryDelay, onQueueItemEnqueued: options.OnQueueItemEnqueued}
+	maxTry := defaultRetryMax
+	if options.Config != nil && options.Config.Scheduler.RetryMaxAttempts != 0 {
+		maxTry = int64(options.Config.Scheduler.RetryMaxAttempts)
+	}
+	return &Runner{repos: options.Repos, github: options.GitHub, agent: options.Agent, logger: options.Logger, now: now, config: options.Config, agentRuntime: options.AgentRuntime, agentModel: options.AgentModel, claimer: defaultClaimedBy, maxTry: maxTry, retryDelay: defaultRetryDelay, onQueueItemEnqueued: options.OnQueueItemEnqueued}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -381,7 +385,13 @@ func (r *Runner) recoverClaimedQueueItem(ctx context.Context, queueItem storage.
 }
 
 func shouldRetryQueueFailure(kind string, nextAttempts, maxAttempts int64) bool {
-	return kind == "retryable_transient"
+	if kind != "retryable_transient" {
+		return false
+	}
+	if maxAttempts < 0 {
+		return true
+	}
+	return maxAttempts > 0 && nextAttempts < maxAttempts
 }
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
