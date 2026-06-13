@@ -1523,6 +1523,55 @@ func TestQueueLongTermRetryClaimsAfterFreshWork(t *testing.T) {
 	}
 }
 
+func TestQueueRecoveredRetryWithoutErrorKindStaysNonLongTerm(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_retry_recovered", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_retry_recovered"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_retry_recovered", Type: "reviewer", TargetType: "pull_request", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lastError := "reviewer agent timed out"
+	lastErrorKind := "retryable_transient"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "recovered_retry", LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:a", DedupeKey: "reviewer:recovered", Priority: QueuePriorityReviewer, Status: "failed", AvailableAt: now, Attempts: QueueLongTermRetryAttemptThreshold, MaxAttempts: -1, LastError: &lastError, LastErrorKind: &lastErrorKind, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	affected, err := repos.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, "recovered_retry", now, QueueLongTermRetryAttemptThreshold)
+	if err != nil {
+		t.Fatalf("RequeueFailedByIDWithAttempts() error = %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("RequeueFailedByIDWithAttempts() affected = %d, want 1", affected)
+	}
+
+	claimedLong, err := repos.Queue.ClaimNextLongTermRetry(ctx, now, "worker-a")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextLongTermRetry() error = %v", err)
+	}
+	if claimedLong != nil {
+		t.Fatalf("Queue.ClaimNextLongTermRetry() = %#v, want nil", claimedLong)
+	}
+
+	claimed, err := repos.Queue.ClaimNextNonLongTermRetry(ctx, now, "worker-b")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextNonLongTermRetry() error = %v", err)
+	}
+	if claimed == nil || claimed.ID != "recovered_retry" {
+		t.Fatalf("Queue.ClaimNextNonLongTermRetry() = %#v, want recovered_retry", claimed)
+	}
+	if claimed.LastErrorKind != nil {
+		t.Fatalf("claimed.LastErrorKind = %#v, want nil", claimed.LastErrorKind)
+	}
+}
+
 func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	t.Parallel()
 
