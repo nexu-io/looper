@@ -5925,6 +5925,9 @@ func backoffDelay(base time.Duration, attempts int64, maxDelay time.Duration) ti
 	}
 	delay := base
 	for i := int64(1); i < attempts; i++ {
+		if delay >= maxDelay || delay > maxDelay/2 {
+			return maxDelay
+		}
 		delay *= 2
 	}
 	if delay > maxDelay {
