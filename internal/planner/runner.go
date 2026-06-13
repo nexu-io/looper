@@ -39,6 +39,7 @@ const (
 	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
+	maxRetryDelay       = 60 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
 )
@@ -2113,7 +2114,13 @@ func firstNonEmpty(values ...string) string {
 func backoffDelay(base time.Duration, attempts int64) time.Duration {
 	delay := base
 	for i := int64(1); i < attempts; i++ {
+		if delay >= maxRetryDelay || delay > maxRetryDelay/2 {
+			return maxRetryDelay
+		}
 		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
 	}
 	return delay
 }

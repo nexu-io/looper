@@ -79,6 +79,7 @@ const (
 	// longer than a queue claim window without an active agent execution.
 	defaultLegacyMarkerlessRunGrace = 24 * time.Hour
 	defaultRetryDelay               = 5 * time.Second
+	maxRetryDelay                   = 60 * time.Second
 	defaultRetryMax                 = 3
 )
 
@@ -5994,7 +5995,13 @@ func alreadyResolved(items []checkpointResolvedComment, item FixItem) bool {
 func backoffDelay(base time.Duration, attempts int64) time.Duration {
 	delay := base
 	for i := int64(1); i < attempts; i++ {
+		if delay >= maxRetryDelay || delay > maxRetryDelay/2 {
+			return maxRetryDelay
+		}
 		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
 	}
 	return delay
 }
