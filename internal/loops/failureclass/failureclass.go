@@ -128,8 +128,15 @@ func isManualWorktreeMessage(message string) bool {
 
 func isDeterministicDenial(message string) bool {
 	for _, fragment := range []string{
+		"http 400",
+		"http 422",
+		"400 bad request",
+		"422 unprocessable",
 		"could not resolve to a pullrequest",
 		"could not resolve to an issue",
+		"protected branch",
+		"branch protection",
+		"policy denied",
 		"checkpoint invariant",
 	} {
 		if strings.Contains(message, fragment) {

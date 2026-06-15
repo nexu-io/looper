@@ -96,3 +96,24 @@ func TestClassifyTerminalTargetMissingFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyPermanentExternalDenialsStayTerminal(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{name: "protected branch", message: "git push origin HEAD: protected branch update failed"},
+		{name: "branch protection", message: "GraphQL: branch protection blocked this update"},
+		{name: "policy denied", message: "GitHub API failed: policy denied by ruleset"},
+		{name: "http 400", message: "GitHub API failed: HTTP 400 Bad Request"},
+		{name: "http 422", message: "GitHub API failed: HTTP 422 Unprocessable Entity"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Classify(errors.New(tt.message), Context{Runner: RunnerWorker, Boundary: BoundaryGitHubAPI})
+			if got != NonRetryable {
+				t.Fatalf("Classify() = %s, want %s", got, NonRetryable)
+			}
+		})
+	}
+}
