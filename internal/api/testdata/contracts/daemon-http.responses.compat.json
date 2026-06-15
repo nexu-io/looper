@@ -33,8 +33,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0016_queue_infinite_retry_attempts",
-              "latestAppliedId": "0016_queue_infinite_retry_attempts",
+              "latestAvailableId": "0017_remove_sweeper_storage",
+              "latestAppliedId": "0017_remove_sweeper_storage",
               "pendingCount": 0
             }
           }
@@ -80,7 +80,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0016_queue_infinite_retry_attempts",
+            "schemaVersion": "0017_remove_sweeper_storage",
             "pendingMigrations": [],
             "healthy": true
           },
@@ -439,94 +439,6 @@
                 "labels": [],
                 "labelMode": "all",
                 "authorFilter": "current_user"
-              }
-            },
-            "sweeper": {
-              "autoDiscovery": false,
-              "dryRun": true,
-              "triggers": {
-                "includeIssues": true,
-                "includePullRequests": true,
-                "includeDrafts": false,
-                "excludeLabels": [
-                  "pinned",
-                  "security",
-                  "looper:sweep-keep",
-                  "dispatch/*",
-                  "needs-info",
-                  "looper:hold"
-                ],
-                "excludeAuthors": [],
-                "excludeAuthorAssociations": [
-                  "OWNER",
-                  "MEMBER",
-                  "COLLABORATOR"
-                ],
-                "looperInternalLabels": [
-                  "looper:plan",
-                  "looper:worker-ready",
-                  "looper:spec-reviewing",
-                  "looper:swept"
-                ],
-                "reopenCooldownDays": 30,
-                "maxPerTick": 10
-              },
-              "filter": {
-                "mode": "deterministic"
-              },
-              "proposer": {
-                "diagnosticMode": false,
-                "mode": "agent_apply",
-                "timeoutRateDryRunMinSamples": 3,
-                "timeoutRateDryRunThreshold": 0.5,
-                "timeoutSeconds": 180,
-                "schemaVersion": 2
-              },
-              "lifecycle": {
-                "pendingLabel": "looper:sweep-pending",
-                "closedLabel": "looper:swept",
-                "keepLabel": "looper:sweep-keep"
-              },
-              "limits": {
-                "maxWarningsPerRepoPerDay": 25,
-                "maxClosesPerRepoPerDay": 25,
-                "globalKillSwitch": false
-              },
-              "categories": {
-                "stale": {
-                  "enabled": true,
-                  "inactivityDays": 90,
-                  "gracePeriodDays": 7,
-                  "minConfidence": 70
-                },
-                "alreadyFixed": {
-                  "enabled": true,
-                  "gracePeriodDays": 7,
-                  "minConfidence": 80
-                },
-                "unrelated": {
-                  "enabled": false,
-                  "gracePeriodDays": 7,
-                  "minConfidence": 90
-                },
-                "superseded": {
-                  "enabled": true,
-                  "gracePeriodDays": 7,
-                  "minConfidence": 85
-                },
-                "abandonedPR": {
-                  "enabled": true,
-                  "inactivityDays": 30,
-                  "gracePeriodDays": 7,
-                  "minConfidence": 75
-                }
-              },
-              "security": {
-                "quarantineLabel": "looper:sweeper-route-security",
-                "notifyAssignees": []
-              },
-              "reporting": {
-                "durableReportsDir": ""
               }
             },
             "worker": {

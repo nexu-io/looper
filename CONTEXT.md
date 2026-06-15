@@ -6,7 +6,7 @@ Looper is a daemon (`looperd`) plus CLI (`looper`) that runs autonomous agent **
 
 ### Roles
 
-A **Role** is a configured agent that performs one specific job in the issue/PR lifecycle. Roles are either *reactive* (they wait for a matching trigger) or *proactive* (they sweep their own input set on a cadence).
+A **Role** is a configured agent that performs one specific job in the issue/PR lifecycle.
 
 **Planner**:
 A reactive Role that produces a Spec from an Issue.
@@ -23,10 +23,6 @@ _Avoid_: critic, checker.
 **Fixer**:
 A reactive Role that addresses review feedback on a Pull Request.
 _Avoid_: patcher, responder.
-
-**Sweeper**:
-A proactive, rule-based Role that retires stale or low-signal Issues and Pull Requests through warn-then-close lifecycle.
-_Avoid_: janitor, cleaner.
 
 **Coordinator**:
 A proactive, LLM-driven Role that performs Triage on fresh Issues and executes Dispatch. In Network mode, Coordinator is also the control plane for Issue admission, PR review assignment, and exact Node targeting, gated by the Network Lease.
@@ -80,7 +76,7 @@ The `<!-- looper:coordinator:merge-watch retries=N -->` HTML-comment marker Coor
 For any side-effecting action, the named, durable, structured signal that justifies the action. Per `AGENTS.md`: "What is the authority for this action, and why is it not the agent's own structured output?" Coordinator's authority for Dispatch is the durable `dispatch/*` label on the Issue, which is the agent's structured output committed to GitHub.
 
 **Stateless Role**:
-A Role whose memory lives entirely in GitHub (labels, comments with markers, event timeline). It owns no private database tables. Coordinator is stateless. Sweeper is stateless. Worker, Planner, Reviewer, and Fixer are not — they persist runs in the local SQLite database.
+A Role whose memory lives entirely in GitHub (labels, comments with markers, event timeline). It owns no private database tables. Coordinator is stateless. Worker, Planner, Reviewer, and Fixer are not — they persist runs in the local SQLite database.
 
 ### Comment markers
 
@@ -122,8 +118,6 @@ The durable Authority for Network Coordinator control-plane leadership. A row in
 - **Reviewer** opts approved code PRs (carrying **Auto-merge scope**) into GitHub-native auto-merge after verifying each **Acceptance criterion** has satisfying-evidence in the diff
 - **Coordinator**'s per-tick poll classifies **Merge-pending state** PRs into WatchActions, routing mechanical failures (conflict, red CI) to **Fixer** via **Trigger label** and policy failures (branch protection change) to re-Triage by removing the Issue's `triaged` and `dispatch/*` labels
 - The **Watch marker** carries merge-watch retry state on the linked Issue, preserving Coordinator's stateless property
-- A **Sweeper** retires Issues and Pull Requests that have aged past their **Trigger label** or have an `out-of-scope` Disposition
-- **Coordinator** and **Sweeper** are both stateless and compose via shared label semantics, not direct calls
 - A **Veto signal** from a human overrides Coordinator's autonomous Dispatch but does not override **Triage** itself
 - In a **Routed project**, the **Coordinator control plane** applies GitHub-native coarse authority (`looper:worker-ready` plus assignee for Worker, review request for Reviewer) and writes the **Target label** last. The **Lease** gates Coordinator control-plane action; current GitHub issue/PR state remains the claim Authority.
 

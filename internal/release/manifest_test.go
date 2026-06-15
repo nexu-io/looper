@@ -106,7 +106,7 @@ func TestBuildManifestRejectsInvalidChecksum(t *testing.T) {
 }
 
 func TestCurrentSchemaVersionUsesLatestEmbeddedMigration(t *testing.T) {
-	if got, want := CurrentSchemaVersion(), "0016_queue_infinite_retry_attempts"; got != want {
+	if got, want := CurrentSchemaVersion(), "0017_remove_sweeper_storage"; got != want {
 		t.Fatalf("CurrentSchemaVersion() = %q, want %q", got, want)
 	}
 }

@@ -136,16 +136,6 @@ The `triaged` label means Coordinator has formed an opinion about the issue. Bec
 
 If an issue is in the `unclear` state and the original author replies after `needs-info` was applied, Coordinator removes both `needs-info` and `triaged` and immediately re-runs triage in the same poll. That lets the issue move back through triage without requiring the author to know Looper's label vocabulary.
 
-### Cross-role boundary
-
-Coordinator stays out of issues already under Sweeper lifecycle control. It skips issues carrying:
-
-- `roles.sweeper.lifecycle.pendingLabel`
-- `roles.sweeper.lifecycle.closedLabel`
-- `roles.sweeper.security.quarantineLabel`
-
-Sweeper, in turn, exempts active coordinator-managed issues such as `dispatch/*`, `needs-info`, and `looper:hold`.
-
 ### Dispatch after triage
 
 Once an issue is already `triaged` and carries exactly one `dispatch/*` label, Coordinator can hand it off in one of two modes:

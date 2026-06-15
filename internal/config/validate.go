@@ -233,7 +233,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
-	validateSweeperRoleConfig(config.Roles.Sweeper, "roles.sweeper", &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 	} else if config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) {
@@ -287,9 +286,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
-		}
-		if project.Roles != nil && project.Roles.Sweeper != nil {
-			validateSweeperRoleConfig(effectiveProjectRoles.Sweeper, prefix+".roles.sweeper", &issues)
 		}
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
@@ -493,9 +489,6 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 			validateFixerRoleTriggers(partialFixerRoleTriggers(*roles.Fixer.Triggers), prefix+".fixer.triggers", issues)
 		}
 	}
-	if roles.Sweeper != nil {
-		validateProjectRoleInstruction(prefix+".sweeper.instructions", "sweeper", roles.Sweeper.Instructions, maxInstructionBytes, issues)
-	}
 	if roles.Coordinator != nil {
 		if roles.Coordinator.PollInterval != nil && strings.TrimSpace(*roles.Coordinator.PollInterval) == "" {
 			*issues = append(*issues, ValidationIssue{Path: prefix + ".coordinator.pollInterval", Message: "must be a non-empty duration string"})
@@ -549,7 +542,6 @@ func roleInstructions(roles RoleConfigs) []roleInstruction {
 		{role: "worker", text: roles.Worker.Instructions},
 		{role: "reviewer", text: roles.Reviewer.Instructions},
 		{role: "fixer", text: roles.Fixer.Instructions},
-		{role: "sweeper", text: roles.Sweeper.Instructions},
 	}
 }
 
@@ -563,8 +555,6 @@ func roleInstructionText(roles RoleConfigs, role string) string {
 		return roles.Reviewer.Instructions
 	case "fixer":
 		return roles.Fixer.Instructions
-	case "sweeper":
-		return roles.Sweeper.Instructions
 	default:
 		return ""
 	}
@@ -572,7 +562,7 @@ func roleInstructionText(roles RoleConfigs, role string) string {
 
 func validateInstructionText(path, role, text string, maxBytes int, issues *[]ValidationIssue) {
 	if !isValidInstructionRole(role) {
-		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer, sweeper"})
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "role must be one of: planner, worker, reviewer, fixer"})
 	}
 	if maxBytes > 0 && len([]byte(text)) > maxBytes {
 		*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("must be at most %d bytes", maxBytes)})
@@ -594,7 +584,7 @@ func validateAggregateInstructionBytes(path, globalText, projectText string, max
 
 func isValidInstructionRole(role string) bool {
 	switch role {
-	case "planner", "worker", "reviewer", "fixer", "sweeper":
+	case "planner", "worker", "reviewer", "fixer":
 		return true
 	default:
 		return false
@@ -902,104 +892,9 @@ func isNonEmptyTrimmed(value string) bool {
 	return strings.TrimSpace(value) != "" && value == strings.TrimSpace(value)
 }
 
-func validateSweeperRoleConfig(config SweeperRoleConfig, path string, issues *[]ValidationIssue) {
-	validateStringList(config.Triggers.ExcludeLabels, path+".triggers.excludeLabels", issues)
-	validateStringList(config.Triggers.ExcludeAuthors, path+".triggers.excludeAuthors", issues)
-	validateStringList(config.Triggers.LooperInternalLabels, path+".triggers.looperInternalLabels", issues)
-	validateStringList(config.Security.NotifyAssignees, path+".security.notifyAssignees", issues)
-	validateSweeperAssociations(config.Triggers.ExcludeAuthorAssociations, path+".triggers.excludeAuthorAssociations", issues)
-
-	if config.Triggers.MaxPerTick <= 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.maxPerTick", Message: "must be a positive integer"})
-	}
-	if config.Filter.Mode != SweeperFilterModeDeterministic {
-		*issues = append(*issues, ValidationIssue{Path: path + ".filter.mode", Message: fmt.Sprintf("must be %q", SweeperFilterModeDeterministic)})
-	}
-	if config.Proposer.Mode != SweeperProposerModeAgentApply && config.Proposer.Mode != SweeperProposerModeHeuristicFallback {
-		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.mode", Message: fmt.Sprintf("must be one of: %s, %s", SweeperProposerModeAgentApply, SweeperProposerModeHeuristicFallback)})
-	}
-	if config.Proposer.TimeoutSeconds <= 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutSeconds", Message: "must be a positive integer"})
-	}
-	if config.Proposer.TimeoutRateDryRunThreshold < 0 || config.Proposer.TimeoutRateDryRunThreshold > 1 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutRateDryRunThreshold", Message: "must be between 0 and 1"})
-	}
-	if config.Proposer.TimeoutRateDryRunMinSamples < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.timeoutRateDryRunMinSamples", Message: "must be greater than or equal to 0"})
-	}
-	if config.Proposer.SchemaVersion != 1 && config.Proposer.SchemaVersion != 2 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.schemaVersion", Message: "must be 1 or 2"})
-	}
-	if config.Proposer.Model != nil && strings.TrimSpace(*config.Proposer.Model) == "" {
-		*issues = append(*issues, ValidationIssue{Path: path + ".proposer.model", Message: "must be a non-empty string when set"})
-	}
-	if config.Triggers.ReopenCooldownDays <= 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.reopenCooldownDays", Message: "must be a positive integer"})
-	}
-	if config.AutoDiscovery && !config.Triggers.IncludeIssues && !config.Triggers.IncludePullRequests {
-		*issues = append(*issues, ValidationIssue{Path: path + ".triggers.includeIssues", Message: "includeIssues and includePullRequests cannot both be false when sweeper autoDiscovery is enabled"})
-	}
-	if config.Limits.MaxWarningsPerRepoPerDay < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".limits.maxWarningsPerRepoPerDay", Message: "must be greater than or equal to 0"})
-	}
-	if config.Limits.MaxClosesPerRepoPerDay < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".limits.maxClosesPerRepoPerDay", Message: "must be greater than or equal to 0"})
-	}
-
-	validateSweeperLabel(config.Lifecycle.PendingLabel, path+".lifecycle.pendingLabel", issues)
-	validateSweeperLabel(config.Lifecycle.ClosedLabel, path+".lifecycle.closedLabel", issues)
-	validateSweeperLabel(config.Lifecycle.KeepLabel, path+".lifecycle.keepLabel", issues)
-	validateSweeperLabel(config.Security.QuarantineLabel, path+".security.quarantineLabel", issues)
-	validateDistinctLabels([]labelPathValue{
-		{Path: path + ".lifecycle.pendingLabel", Value: config.Lifecycle.PendingLabel},
-		{Path: path + ".lifecycle.closedLabel", Value: config.Lifecycle.ClosedLabel},
-		{Path: path + ".lifecycle.keepLabel", Value: config.Lifecycle.KeepLabel},
-		{Path: path + ".security.quarantineLabel", Value: config.Security.QuarantineLabel},
-	}, issues)
-	validateNoLabelOverlap(
-		[]labelPathValue{
-			{Path: path + ".lifecycle.pendingLabel", Value: config.Lifecycle.PendingLabel},
-			{Path: path + ".lifecycle.closedLabel", Value: config.Lifecycle.ClosedLabel},
-			{Path: path + ".security.quarantineLabel", Value: config.Security.QuarantineLabel},
-		},
-		config.Triggers.ExcludeLabels,
-		path+".triggers.excludeLabels",
-		issues,
-	)
-
-	validateSweeperCategory(config.Categories.Stale, path+".categories.stale", true, issues)
-	validateSweeperCategory(config.Categories.AlreadyFixed, path+".categories.alreadyFixed", false, issues)
-	validateSweeperCategory(config.Categories.Unrelated, path+".categories.unrelated", false, issues)
-	validateSweeperCategory(config.Categories.Superseded, path+".categories.superseded", false, issues)
-	validateSweeperCategory(config.Categories.AbandonedPR, path+".categories.abandonedPR", true, issues)
-}
-
 type labelPathValue struct {
 	Path  string
 	Value string
-}
-
-func validateSweeperCategory(config SweeperCategoryConfig, path string, requiresInactivity bool, issues *[]ValidationIssue) {
-	if requiresInactivity && config.Enabled && config.InactivityDays <= 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".inactivityDays", Message: "must be a positive integer when category is enabled"})
-	}
-	if config.GracePeriodDays <= 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".gracePeriodDays", Message: "must be a positive integer"})
-	}
-	if config.MinConfidence < 0 || config.MinConfidence > 100 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".minConfidence", Message: "must be between 0 and 100"})
-	}
-}
-
-func validateSweeperLabel(value, path string, issues *[]ValidationIssue) {
-	trimmed := strings.TrimSpace(value)
-	if trimmed == "" {
-		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a non-empty string"})
-		return
-	}
-	if value != trimmed {
-		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not contain leading or trailing whitespace"})
-	}
 }
 
 func validateDistinctLabels(labels []labelPathValue, issues *[]ValidationIssue) {
@@ -1014,54 +909,6 @@ func validateDistinctLabels(labels []labelPathValue, issues *[]ValidationIssue) 
 			continue
 		}
 		seen[trimmed] = label.Path
-	}
-}
-
-func validateNoLabelOverlap(labels []labelPathValue, excluded []string, excludePath string, issues *[]ValidationIssue) {
-	excludedSet := map[string]struct{}{}
-	for _, label := range excluded {
-		trimmed := strings.TrimSpace(label)
-		if trimmed == "" {
-			continue
-		}
-		excludedSet[trimmed] = struct{}{}
-	}
-	for _, label := range labels {
-		trimmed := strings.TrimSpace(label.Value)
-		if trimmed == "" {
-			continue
-		}
-		if _, ok := excludedSet[trimmed]; ok {
-			*issues = append(*issues, ValidationIssue{Path: excludePath, Message: fmt.Sprintf("must not contain lifecycle/security label %q configured at %s", trimmed, label.Path)})
-		}
-	}
-}
-
-func validateSweeperAssociations(values []string, path string, issues *[]ValidationIssue) {
-	allowed := map[string]struct{}{
-		"OWNER": {}, "MEMBER": {}, "COLLABORATOR": {}, "CONTRIBUTOR": {},
-		"FIRST_TIME_CONTRIBUTOR": {}, "FIRST_TIMER": {}, "MANNEQUIN": {}, "NONE": {},
-	}
-	seen := map[string]struct{}{}
-	for index, value := range values {
-		trimmed := strings.TrimSpace(value)
-		if trimmed == "" {
-			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must be a non-empty string"})
-			continue
-		}
-		if value != trimmed {
-			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must not contain leading or trailing whitespace"})
-			continue
-		}
-		if _, ok := allowed[value]; !ok {
-			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s[%d]", path, index), Message: "must be one of: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN, NONE"})
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			*issues = append(*issues, ValidationIssue{Path: path, Message: fmt.Sprintf("contains duplicate value: %s", value)})
-			continue
-		}
-		seen[value] = struct{}{}
 	}
 }
 

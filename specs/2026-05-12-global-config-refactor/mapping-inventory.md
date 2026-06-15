@@ -54,7 +54,6 @@ Status meanings:
 | `roles.planner.*` | `roles.planner.*` | unchanged | Current planner role root remains canonical. |
 | `roles.worker.*` | `roles.worker.*` | unchanged | Current worker role root remains canonical. |
 | `roles.fixer.*` | `roles.fixer.*` | unchanged | Current fixer role root remains canonical. |
-| `roles.sweeper.*` | `roles.sweeper.*` | unchanged | Current sweeper role root remains canonical. |
 | `roles.reviewer.behavior.*` | `roles.reviewer.behavior.*` | unchanged | Canonical reviewer behavior target. |
 | `roles.reviewer.instructions` | `roles.reviewer.instructions` | unchanged | Canonical reviewer instruction target. |
 
@@ -70,7 +69,6 @@ Status meanings:
 | `projects[].roles.planner.*` | `projects[].roles.planner.*` | unchanged | Canonical project role override shape. |
 | `projects[].roles.worker.*` | `projects[].roles.worker.*` | unchanged | Canonical project role override shape. |
 | `projects[].roles.fixer.*` | `projects[].roles.fixer.*` | unchanged | Canonical project role override shape. |
-| `projects[].roles.sweeper.*` | `projects[].roles.sweeper.*` | unchanged | Canonical project role override shape. |
 | `projects[].roles.reviewer.instructions` | `projects[].roles.reviewer.instructions` | unchanged | Canonical project reviewer instruction target. |
 | `projects[].roles.reviewer.autoDiscovery` | `projects[].roles.reviewer.discovery.autoDiscovery` | moved | Frozen canonical reviewer discovery home from the spec. |
 | `projects[].roles.reviewer.triggers.*` | `projects[].roles.reviewer.discovery.triggers.*` | moved | Frozen canonical reviewer discovery home from the spec. |
@@ -79,7 +77,6 @@ Status meanings:
 | `projects[].instructions.planner` | `projects[].roles.planner.instructions` | normalized-only | Convenience project instruction map entry. |
 | `projects[].instructions.worker` | `projects[].roles.worker.instructions` | normalized-only | Convenience project instruction map entry. |
 | `projects[].instructions.fixer` | `projects[].roles.fixer.instructions` | normalized-only | Convenience project instruction map entry. |
-| `projects[].instructions.sweeper` | `projects[].roles.sweeper.instructions` | normalized-only | Convenience project instruction map entry. |
 
 ## Environment variables
 

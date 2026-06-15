@@ -217,7 +217,7 @@ func AllowedKinds() []string {
 }
 
 func AllowedAreas() []string {
-	return []string{"area/api", "area/config", "area/coordinator", "area/docs", "area/github", "area/runtime", "area/testing", "area/planner", "area/worker", "area/reviewer", "area/sweeper"}
+	return []string{"area/api", "area/config", "area/coordinator", "area/docs", "area/github", "area/runtime", "area/testing", "area/planner", "area/worker", "area/reviewer"}
 }
 
 func AllowedComplexities() []string {

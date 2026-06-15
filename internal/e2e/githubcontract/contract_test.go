@@ -8,13 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/e2e/harness"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/sweeper"
 )
 
 type fakeGHState struct {
@@ -128,91 +124,6 @@ func TestInvariantGatewayDependencyWrappersUseSupportedRoutes(t *testing.T) {
 	assertInvocationContains(t, invocations, []string{"api", "--paginate", "--slurp", "repos/acme/looper/issues/22/dependencies/blocked_by"})
 	assertInvocationContains(t, invocations, []string{"api", "--paginate", "--slurp", "repos/acme/looper/issues/22/dependencies/blocking"})
 	assertInvocationContains(t, invocations, []string{"api", "--paginate", "--slurp", "repos/acme/looper/issues/22/sub_issues"})
-}
-
-func TestRegressionPR261FallsBackToIssueDetailForPRAuthorAssociation(t *testing.T) {
-	bins := harness.MustBinaries(t)
-	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
-	fakeGH.WriteState(t, harness.GHState{
-		Commands: map[string]any{
-			"pr list": map[string]any{
-				"stdout": []map[string]any{{
-					"number":           42,
-					"title":            "stale pr",
-					"url":              "https://example.test/acme/looper/pull/42",
-					"state":            "OPEN",
-					"updatedAt":        "2026-05-12T00:00:00Z",
-					"isDraft":          false,
-					"reviewDecision":   "",
-					"labels":           []map[string]any{},
-					"headRefName":      "feature/pr-42",
-					"baseRefName":      "main",
-					"headRefOid":       "head-42",
-					"baseRefOid":       "base-42",
-					"author":           map[string]any{"login": "octocat"},
-					"reviewRequests":   []map[string]any{},
-					"reviews":          []map[string]any{},
-					"mergeStateStatus": "CLEAN",
-				}},
-			},
-		},
-		Routes: map[string]any{
-			"repos/acme/looper/issues/42": map[string]any{
-				"number":             42,
-				"title":              "stale pr",
-				"body":               "body",
-				"html_url":           "https://example.test/acme/looper/issues/42",
-				"state":              "open",
-				"updated_at":         "2026-05-12T00:00:00Z",
-				"user":               map[string]any{"login": "octocat"},
-				"author_association": "MEMBER",
-				"labels":             []map[string]any{},
-			},
-			"repos/acme/looper/issues/42/comments": []map[string]any{},
-		},
-	})
-	root := t.TempDir()
-	for key, value := range fakeGH.EnvMap() {
-		t.Setenv(key, value)
-	}
-	t.Setenv("HOME", root)
-	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
-	if err != nil {
-		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
-	}
-	defer coordinator.Close()
-	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
-		t.Fatalf("RunPending() error = %v", err)
-	}
-	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.May, 12, 12, 0, 0, 0, time.UTC)
-	nowISO := now.Format("2006-01-02T15:04:05.000Z")
-	projectRepoPath := filepath.Join(root, "repo")
-	if err := os.MkdirAll(projectRepoPath, 0o755); err != nil {
-		t.Fatalf("mkdir repo path: %v", err)
-	}
-	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Demo", RepoPath: projectRepoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-	cfg, err := config.DefaultConfig(root)
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Roles.Sweeper.AutoDiscovery = true
-	cfg.Roles.Sweeper.Triggers.IncludePullRequests = true
-	cfg.Roles.Sweeper.Triggers.ExcludeAuthorAssociations = []string{"MEMBER"}
-	gateway := githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: root})
-	runner := sweeper.New(sweeper.Options{Repos: repos, GitHub: gateway, Config: &cfg, Now: func() time.Time { return now }})
-	result, err := runner.DiscoverPullRequests(context.Background(), sweeper.DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	if len(result.QueueItems) != 0 || result.Skipped != 1 {
-		t.Fatalf("DiscoverPullRequests() = %#v, want excluded PR skipped after detail fallback", result)
-	}
-	invocations := readInvocationsForContract(t, fakeGH.InvocationLog)
-	assertInvocationMissingJSONField(t, invocations, "pr", "list", "authorAssociation")
-	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/42"})
 }
 
 func TestInvariantGatewaySupportsRepoForms(t *testing.T) {

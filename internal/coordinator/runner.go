@@ -185,7 +185,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if r.repos == nil || r.repos.Projects == nil {
 		return DiscoveryResult{}, fmt.Errorf("coordinator repositories are not configured")
 	}
-	project, roleCfg, sweeperCfg, err := r.projectConfig(ctx, input.ProjectID)
+	project, roleCfg, err := r.projectConfig(ctx, input.ProjectID)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -209,9 +209,6 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	loaded := make([]loadedIssue, 0, len(issues))
 	for _, summary := range issues {
-		if ShouldSkipIssue(IssueSummary{Number: summary.Number, Labels: summary.Labels}, roleCfg, sweeperCfg) {
-			continue
-		}
 		issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
 		if err != nil {
 			return DiscoveryResult{}, err
@@ -416,16 +413,6 @@ func shouldRetryDependencyError(err error) bool {
 
 func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
 	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
-}
-
-// ShouldSkipIssue reserves the structural cross-role boundary with Sweeper.
-// Future triage discovery must skip issues that Sweeper already marked pending,
-// retired, or quarantined so the two roles never fight over authority.
-func ShouldSkipIssue(issue IssueSummary, roleCfg config.CoordinatorRoleConfig, sweeperCfg config.SweeperRoleConfig) bool {
-	_ = roleCfg
-	return hasExactLabel(issue.Labels, sweeperCfg.Lifecycle.PendingLabel) ||
-		hasExactLabel(issue.Labels, sweeperCfg.Lifecycle.ClosedLabel) ||
-		hasExactLabel(issue.Labels, sweeperCfg.Security.QuarantineLabel)
 }
 
 func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
@@ -1759,19 +1746,19 @@ func (r *Runner) commentHasWriteAccess(ctx context.Context, repo, cwd, author st
 	return allowed, nil
 }
 
-func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.ProjectRecord, config.CoordinatorRoleConfig, config.SweeperRoleConfig, error) {
+func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.ProjectRecord, config.CoordinatorRoleConfig, error) {
 	project, err := r.repos.Projects.GetByID(ctx, projectID)
 	if err != nil {
-		return nil, config.CoordinatorRoleConfig{}, config.SweeperRoleConfig{}, err
+		return nil, config.CoordinatorRoleConfig{}, err
 	}
 	if project == nil {
-		return nil, config.CoordinatorRoleConfig{}, config.SweeperRoleConfig{}, fmt.Errorf("project %q not found", projectID)
+		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("project %q not found", projectID)
 	}
 	if r.config == nil {
-		return nil, config.CoordinatorRoleConfig{}, config.SweeperRoleConfig{}, fmt.Errorf("coordinator config is not configured")
+		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("coordinator config is not configured")
 	}
 	roles := config.ProjectRoleConfigs(*r.config, projectID)
-	return project, roles.Coordinator, roles.Sweeper, nil
+	return project, roles.Coordinator, nil
 }
 
 func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode {

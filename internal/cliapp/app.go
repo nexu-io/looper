@@ -222,7 +222,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				helpSubcommands: []helpSubcommand{{name: "preview", description: "Preview assembled prompt order"}},
 				helpWhenNoArgs:  true,
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "preview", short: "Preview assembled prompt order", runE: runtime.promptPreview, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id"), stringFlag("role", "role", "Role: planner, worker, reviewer, fixer, or sweeper")}}),
+					newCommand(commandSpec{use: "preview", short: "Preview assembled prompt order", runE: runtime.promptPreview, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id"), stringFlag("role", "role", "Role: planner, worker, reviewer, or fixer")}}),
 				},
 			}),
 			newCommand(commandSpec{

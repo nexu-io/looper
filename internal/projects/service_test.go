@@ -726,18 +726,18 @@ func TestServiceRemoveProjectCancelsActiveProjectQueueItems(t *testing.T) {
 	repoName := "acme/looper"
 	prNumber := int64(42)
 	runningPRNumber := int64(43)
-	dedupeKey := "sweeper:acme/looper:42"
-	runningDedupeKey := "sweeper:acme/looper:43"
+	dedupeKey := "worker:acme/looper:42"
+	runningDedupeKey := "worker:acme/looper:43"
 	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(looper) error = %v", err)
 	}
 	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "other", Name: "Other", RepoPath: "/tmp/other", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(other) error = %v", err)
 	}
-	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_looper", ProjectID: stringPointer("looper"), Type: "sweeper", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_looper", ProjectID: stringPointer("looper"), Type: "worker", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert(queue_looper) error = %v", err)
 	}
-	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_running", ProjectID: stringPointer("looper"), Type: "sweeper", TargetType: "pull_request", TargetID: "pr:43", Repo: &repoName, PRNumber: &runningPRNumber, DedupeKey: runningDedupeKey, Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_running", ProjectID: stringPointer("looper"), Type: "worker", TargetType: "pull_request", TargetID: "pr:43", Repo: &repoName, PRNumber: &runningPRNumber, DedupeKey: runningDedupeKey, Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert(queue_running) error = %v", err)
 	}
 
@@ -783,7 +783,7 @@ func TestServiceRemoveProjectCancelsActiveProjectQueueItems(t *testing.T) {
 		t.Fatalf("Queue.FindActiveByDedupe(running) = %#v, want nil after archive", active)
 	}
 
-	created, didCreate, err := repos.Queue.CreateOrGetActiveByDedupe(ctx, storage.QueueItemRecord{ID: "queue_other", ProjectID: stringPointer("other"), Type: "sweeper", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO})
+	created, didCreate, err := repos.Queue.CreateOrGetActiveByDedupe(ctx, storage.QueueItemRecord{ID: "queue_other", ProjectID: stringPointer("other"), Type: "worker", TargetType: "pull_request", TargetID: "pr:42", Repo: &repoName, PRNumber: &prNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO})
 	if err != nil {
 		t.Fatalf("Queue.CreateOrGetActiveByDedupe() error = %v", err)
 	}

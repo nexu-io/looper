@@ -286,7 +286,7 @@ Add:
 
 The response should expose counts and IDs where practical, but the product surface should stay simple.
 
-Live/manual cleanup should stay narrow: only executions tied to stale candidate runs should be marked dead or killed. This command should not become a broad orphan-agent sweeper.
+Live/manual cleanup should stay narrow: only executions tied to stale candidate runs should be marked dead or killed. This command should not become a broad orphan-agent cleanup path.
 
 When a dead execution is marked terminal, it should preserve the same native-resume metadata behavior already used by startup recovery.
 

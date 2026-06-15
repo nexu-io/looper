@@ -74,35 +74,3 @@ func TestDiscoverIssuesRespectsTrimmedPollInterval(t *testing.T) {
 		t.Fatalf("second DiscoverIssues() = %#v, want poll interval gate to skip", second)
 	}
 }
-
-func TestShouldSkipIssueForSweeperManagedLabels(t *testing.T) {
-	t.Parallel()
-
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	coordinatorCfg := cfg.Roles.Coordinator
-	sweeperCfg := cfg.Roles.Sweeper
-
-	for _, tc := range []struct {
-		name   string
-		labels []string
-	}{
-		{name: "pending", labels: []string{sweeperCfg.Lifecycle.PendingLabel}},
-		{name: "closed", labels: []string{sweeperCfg.Lifecycle.ClosedLabel}},
-		{name: "quarantine", labels: []string{sweeperCfg.Security.QuarantineLabel}},
-	} {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if !ShouldSkipIssue(IssueSummary{Labels: tc.labels}, coordinatorCfg, sweeperCfg) {
-				t.Fatalf("ShouldSkipIssue(%v) = false, want true", tc.labels)
-			}
-		})
-	}
-
-	if ShouldSkipIssue(IssueSummary{Labels: []string{"dispatch/plan"}}, coordinatorCfg, sweeperCfg) {
-		t.Fatal("ShouldSkipIssue(dispatch/plan) = true, want false for coordinator-owned labels")
-	}
-}

@@ -21,7 +21,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -31,7 +30,6 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/sweeper"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -57,76 +55,6 @@ type RuntimeState interface {
 
 type activeRunExecutionVerifier interface {
 	ExecutionMatchesProcess(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
-}
-
-type sweeperCaseView struct {
-	ID                     string  `json:"id"`
-	ProjectID              string  `json:"projectId"`
-	Repo                   string  `json:"repo"`
-	TargetType             string  `json:"targetType"`
-	TargetNumber           int64   `json:"targetNumber"`
-	Status                 string  `json:"status"`
-	CurrentPhase           string  `json:"currentPhase"`
-	CurrentCategory        *string `json:"currentCategory,omitempty"`
-	CurrentConfidenceScore *int64  `json:"currentConfidenceScore,omitempty"`
-	WarningCommentID       *int64  `json:"warningCommentId,omitempty"`
-	WarningMarkerUUID      *string `json:"warningMarkerUuid,omitempty"`
-	LastProposalID         *string `json:"lastProposalId,omitempty"`
-	LastFingerprintJSON    *string `json:"lastFingerprintJson,omitempty"`
-	LastHumanActivityAt    *string `json:"lastHumanActivityAt,omitempty"`
-	WarnedAt               *string `json:"warnedAt,omitempty"`
-	CloseDueAt             *string `json:"closeDueAt,omitempty"`
-	TerminalOutcome        *string `json:"terminalOutcome,omitempty"`
-	TerminalAt             *string `json:"terminalAt,omitempty"`
-	CreatedAt              string  `json:"createdAt"`
-	UpdatedAt              string  `json:"updatedAt"`
-}
-
-type sweeperProposalView struct {
-	ID               string  `json:"id"`
-	CaseID           string  `json:"caseId"`
-	ProjectID        string  `json:"projectId"`
-	Repo             string  `json:"repo"`
-	TargetType       string  `json:"targetType"`
-	TargetNumber     int64   `json:"targetNumber"`
-	SchemaVersion    int64   `json:"schemaVersion"`
-	ProposerKind     string  `json:"proposerKind"`
-	FactBundleJSON   string  `json:"factBundleJson"`
-	FingerprintJSON  string  `json:"fingerprintJson"`
-	ProposalJSON     string  `json:"proposalJson"`
-	RawResultJSON    *string `json:"rawResultJson,omitempty"`
-	Decision         string  `json:"decision"`
-	Category         string  `json:"category"`
-	ConfidenceScore  int64   `json:"confidenceScore"`
-	Summary          *string `json:"summary,omitempty"`
-	Rationale        *string `json:"rationale,omitempty"`
-	MarkerUUID       *string `json:"markerUuid,omitempty"`
-	ValidationStatus *string `json:"validationStatus,omitempty"`
-	ValidationError  *string `json:"validationError,omitempty"`
-	ApplyStatus      *string `json:"applyStatus,omitempty"`
-	ApplySummary     *string `json:"applySummary,omitempty"`
-	ApplyError       *string `json:"applyError,omitempty"`
-	AppliedAt        *string `json:"appliedAt,omitempty"`
-	CreatedAt        string  `json:"createdAt"`
-}
-
-type sweeperCasesResponse struct {
-	ProjectID string            `json:"projectId"`
-	Repo      string            `json:"repo"`
-	Phase     string            `json:"phase,omitempty"`
-	Status    string            `json:"status,omitempty"`
-	Items     []sweeperCaseView `json:"items"`
-}
-
-type sweeperCaseDetailResponse struct {
-	Case      sweeperCaseView       `json:"case"`
-	Proposals []sweeperProposalView `json:"proposals"`
-}
-
-type sweeperReplayResponse struct {
-	CaseID   string              `json:"caseId"`
-	Proposal sweeperProposalView `json:"proposal"`
-	DryRun   bool                `json:"dryRun"`
 }
 
 type Context struct {
@@ -381,30 +309,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
-	case apiBasePath + "/sweeper/cases":
-		payload, err := h.buildSweeperCasesResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/sweeper/stats":
-		payload, err := h.buildSweeperStatsResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-		h.writeSuccess(w, requestID, payload)
-		return
 	case apiBasePath + "/reviewer/repair":
 		payload, err := h.buildReviewerRepairRouteResponse(r)
 		if err != nil {
@@ -485,20 +389,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		h.writeSuccess(w, requestID, payload)
-		return
-	}
-
-	if strings.HasPrefix(path, apiBasePath+"/sweeper/cases/") {
-		payload, err := h.buildSweeperCaseRouteResponse(r, path)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
 		h.writeSuccess(w, requestID, payload)
 		return
 	}
@@ -1915,218 +1805,6 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 	}
 	return h.serializePullRequestListItem(repo, prNumber, snapshot, loopMatches), nil
 }
-
-func (h *Handler) buildSweeperCasesResponse(r *http.Request) (sweeperCasesResponse, error) {
-	if r.Method != http.MethodGet {
-		return sweeperCasesResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", normalizePath(r.URL.Path))}
-	}
-	services := h.context.Runtime.Services()
-	runner, err := h.newSweeperOperatorRunner(services)
-	if err != nil {
-		return sweeperCasesResponse{}, err
-	}
-	query := r.URL.Query()
-	projectID := strings.TrimSpace(query.Get("projectId"))
-	repo := strings.TrimSpace(query.Get("repo"))
-	if projectID == "" || repo == "" {
-		return sweeperCasesResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "projectId and repo are required"}
-	}
-	limit := 100
-	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
-		parsed, err := parsePositiveInt64(raw, "limit")
-		if err != nil {
-			return sweeperCasesResponse{}, err
-		}
-		limit = int(parsed)
-	}
-	phase := strings.TrimSpace(query.Get("phase"))
-	status := strings.TrimSpace(query.Get("status"))
-	items, err := runner.ListCases(r.Context(), sweeper.CaseQuery{ProjectID: projectID, Repo: repo, Phase: phase, Status: status, Limit: limit})
-	if err != nil {
-		return sweeperCasesResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	return sweeperCasesResponse{ProjectID: projectID, Repo: repo, Phase: phase, Status: status, Items: serializeSweeperCases(items)}, nil
-}
-
-func (h *Handler) buildSweeperStatsResponse(r *http.Request) (sweeper.RepoStats, error) {
-	if r.Method != http.MethodGet {
-		return sweeper.RepoStats{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", normalizePath(r.URL.Path))}
-	}
-	services := h.context.Runtime.Services()
-	runner, err := h.newSweeperOperatorRunner(services)
-	if err != nil {
-		return sweeper.RepoStats{}, err
-	}
-	query := r.URL.Query()
-	projectID := strings.TrimSpace(query.Get("projectId"))
-	repo := strings.TrimSpace(query.Get("repo"))
-	if projectID == "" || repo == "" {
-		return sweeper.RepoStats{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "projectId and repo are required"}
-	}
-	return runner.RepoOperatorStats(r.Context(), projectID, repo, 1000)
-}
-
-func (h *Handler) buildSweeperCaseRouteResponse(r *http.Request, path string) (any, error) {
-	services := h.context.Runtime.Services()
-	runner, err := h.newSweeperOperatorRunner(services)
-	if err != nil {
-		return nil, err
-	}
-	parts := strings.Split(strings.TrimPrefix(path, apiBasePath+"/sweeper/cases/"), "/")
-	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
-		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "caseId is required"}
-	}
-	caseID, err := url.PathUnescape(strings.TrimSpace(parts[0]))
-	if err != nil || strings.TrimSpace(caseID) == "" {
-		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "caseId is required"}
-	}
-	if len(parts) == 1 || strings.TrimSpace(parts[1]) == "" {
-		if r.Method != http.MethodGet {
-			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
-		}
-		inspection, err := runner.InspectCase(r.Context(), caseID)
-		if err != nil {
-			return nil, sweeperOperatorAPIError(err, caseID)
-		}
-		return sweeperCaseDetailResponse{Case: serializeSweeperCase(inspection.Case), Proposals: serializeSweeperProposals(inspection.Proposals)}, nil
-	}
-	if strings.TrimSpace(parts[1]) != "replay" || len(parts) > 2 {
-		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
-	}
-	if r.Method != http.MethodPost {
-		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
-	}
-	proposal, err := runner.ReplayCaseProposalDryRun(r.Context(), caseID)
-	if err != nil {
-		return nil, sweeperOperatorAPIError(err, caseID)
-	}
-	return sweeperReplayResponse{CaseID: caseID, Proposal: serializeSweeperProposal(*proposal), DryRun: true}, nil
-}
-
-func sweeperOperatorAPIError(err error, caseID string) error {
-	if err == nil {
-		return nil
-	}
-	if strings.Contains(err.Error(), "not found") {
-		return apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Sweeper case not found: %s", caseID)}
-	}
-	if strings.Contains(err.Error(), "not configured") {
-		return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusServiceUnavailable, message: err.Error()}
-	}
-	return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-}
-
-func serializeSweeperCases(records []storage.SweeperCaseRecord) []sweeperCaseView {
-	out := make([]sweeperCaseView, 0, len(records))
-	for _, record := range records {
-		out = append(out, serializeSweeperCase(record))
-	}
-	return out
-}
-
-func serializeSweeperCase(record storage.SweeperCaseRecord) sweeperCaseView {
-	return sweeperCaseView{
-		ID:                     record.ID,
-		ProjectID:              record.ProjectID,
-		Repo:                   record.Repo,
-		TargetType:             record.TargetType,
-		TargetNumber:           record.TargetNumber,
-		Status:                 record.Status,
-		CurrentPhase:           record.CurrentPhase,
-		CurrentCategory:        record.CurrentCategory,
-		CurrentConfidenceScore: record.CurrentConfidenceScore,
-		WarningCommentID:       record.WarningCommentID,
-		WarningMarkerUUID:      record.WarningMarkerUUID,
-		LastProposalID:         record.LastProposalID,
-		LastFingerprintJSON:    record.LastFingerprintJSON,
-		LastHumanActivityAt:    record.LastHumanActivityAt,
-		WarnedAt:               record.WarnedAt,
-		CloseDueAt:             record.CloseDueAt,
-		TerminalOutcome:        record.TerminalOutcome,
-		TerminalAt:             record.TerminalAt,
-		CreatedAt:              record.CreatedAt,
-		UpdatedAt:              record.UpdatedAt,
-	}
-}
-
-func serializeSweeperProposals(records []storage.SweeperProposalRecord) []sweeperProposalView {
-	out := make([]sweeperProposalView, 0, len(records))
-	for _, record := range records {
-		out = append(out, serializeSweeperProposal(record))
-	}
-	return out
-}
-
-func serializeSweeperProposal(record storage.SweeperProposalRecord) sweeperProposalView {
-	return sweeperProposalView{
-		ID:               record.ID,
-		CaseID:           record.CaseID,
-		ProjectID:        record.ProjectID,
-		Repo:             record.Repo,
-		TargetType:       record.TargetType,
-		TargetNumber:     record.TargetNumber,
-		SchemaVersion:    record.SchemaVersion,
-		ProposerKind:     record.ProposerKind,
-		FactBundleJSON:   record.FactBundleJSON,
-		FingerprintJSON:  record.FingerprintJSON,
-		ProposalJSON:     record.ProposalJSON,
-		RawResultJSON:    record.RawResultJSON,
-		Decision:         record.Decision,
-		Category:         record.Category,
-		ConfidenceScore:  record.ConfidenceScore,
-		Summary:          record.Summary,
-		Rationale:        record.Rationale,
-		MarkerUUID:       record.MarkerUUID,
-		ValidationStatus: record.ValidationStatus,
-		ValidationError:  record.ValidationError,
-		ApplyStatus:      record.ApplyStatus,
-		ApplySummary:     record.ApplySummary,
-		ApplyError:       record.ApplyError,
-		AppliedAt:        record.AppliedAt,
-		CreatedAt:        record.CreatedAt,
-	}
-}
-
-func (h *Handler) newSweeperOperatorRunner(services looperdruntime.Services) (*sweeper.Runner, error) {
-	if services.Repositories == nil {
-		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "repositories are unavailable"}
-	}
-	var sweeperAgent sweeper.AgentExecutor
-	if h.context.Config.Agent.Vendor != nil {
-		model := h.context.Config.Roles.Sweeper.Proposer.Model
-		if model == nil || strings.TrimSpace(*model) == "" {
-			model = h.context.Config.Agent.Model
-		}
-		configured := agent.New(agent.ExecutorOptions{Config: agent.ExecutorConfig{Vendor: *h.context.Config.Agent.Vendor, Model: model, Params: h.context.Config.Agent.Params, Env: h.context.Config.Agent.Env, NativeResumeEnabled: h.context.Config.Agent.NativeResume.Enabled}, Repos: services.Repositories, LogDir: h.context.Config.Daemon.LogDir, Now: h.now})
-		sweeperAgent = apiSweeperAgentExecutorAdapter{executor: configured}
-	}
-	agentRuntime := ""
-	if h.context.Config.Agent.Vendor != nil {
-		agentRuntime = string(*h.context.Config.Agent.Vendor)
-	}
-	return sweeper.New(sweeper.Options{Repos: services.Repositories, Agent: sweeperAgent, Config: &h.context.Config, AgentRuntime: agentRuntime, AgentModel: h.context.Config.Roles.Sweeper.Proposer.Model}), nil
-}
-
-type apiSweeperAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type apiSweeperAgentExecutionAdapter struct{ execution agent.Execution }
-
-func (a apiSweeperAgentExecutorAdapter) Start(ctx context.Context, input sweeper.AgentRunInput) (sweeper.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
-	if err != nil {
-		return nil, err
-	}
-	return apiSweeperAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a apiSweeperAgentExecutionAdapter) Wait(ctx context.Context) (sweeper.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return sweeper.AgentResult{}, err
-	}
-	return sweeper.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
-}
-
-func (a apiSweeperAgentExecutionAdapter) Kill(reason string) error { return a.execution.Kill(reason) }
 
 func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) (pullRequestStatusResponse, error) {
 	loopMatches, err := h.findPullRequestLoops(ctx, snapshot.Repo, snapshot.PRNumber)

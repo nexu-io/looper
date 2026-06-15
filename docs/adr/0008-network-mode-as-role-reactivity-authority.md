@@ -14,7 +14,7 @@ The Authority for a reactive Role to use Network target-label matching is the pe
 
 - Worker claims only when `looper:worker-ready`, a matching exact target label, and the local Node's GitHub assignee are present.
 - Reviewer claims only when a matching exact target label and the local Node's GitHub review request are present.
-- Coordinator control-plane actions require the Network Lease. Planner, Fixer, and Sweeper keep existing local-only semantics unless given explicit Routed semantics in a later ADR.
+- Coordinator control-plane actions require the Network Lease. Planner and Fixer keep existing local-only semantics unless given explicit Routed semantics in a later ADR.
 
 When a project has `network.mode = off`, `looper:target:*` labels are ignored and legacy single-machine behaviour is preserved.
 

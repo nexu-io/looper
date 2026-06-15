@@ -29,8 +29,6 @@ type Repositories struct {
 	Queue                *QueueRepository
 	Notifications        *NotificationsRepository
 	Worktrees            *WorktreesRepository
-	SweeperCases         *SweeperCasesRepository
-	SweeperProposals     *SweeperProposalsRepository
 	WebhookForwarders    *WebhookForwardersRepository
 	WebhookTunnelHooks   *WebhookTunnelHooksRepository
 }
@@ -47,8 +45,6 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		Queue:                &QueueRepository{q: q},
 		Notifications:        &NotificationsRepository{q: q},
 		Worktrees:            &WorktreesRepository{q: q},
-		SweeperCases:         &SweeperCasesRepository{q: q},
-		SweeperProposals:     &SweeperProposalsRepository{q: q},
 		WebhookForwarders:    &WebhookForwardersRepository{q: q},
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 	}
@@ -197,57 +193,6 @@ type QueueItemRecord struct {
 	LastErrorKind *string
 	CreatedAt     string
 	UpdatedAt     string
-}
-
-type SweeperCaseRecord struct {
-	ID                     string
-	ProjectID              string
-	Repo                   string
-	TargetType             string
-	TargetNumber           int64
-	Status                 string
-	CurrentPhase           string
-	CurrentCategory        *string
-	CurrentConfidenceScore *int64
-	WarningCommentID       *int64
-	WarningMarkerUUID      *string
-	LastProposalID         *string
-	LastFingerprintJSON    *string
-	LastHumanActivityAt    *string
-	WarnedAt               *string
-	CloseDueAt             *string
-	TerminalOutcome        *string
-	TerminalAt             *string
-	CreatedAt              string
-	UpdatedAt              string
-}
-
-type SweeperProposalRecord struct {
-	ID               string
-	CaseID           string
-	ProjectID        string
-	Repo             string
-	TargetType       string
-	TargetNumber     int64
-	SchemaVersion    int64
-	ProposerKind     string
-	FactBundleJSON   string
-	FingerprintJSON  string
-	ProposalJSON     string
-	RawResultJSON    *string
-	Decision         string
-	Category         string
-	ConfidenceScore  int64
-	Summary          *string
-	Rationale        *string
-	MarkerUUID       *string
-	ValidationStatus *string
-	ValidationError  *string
-	ApplyStatus      *string
-	ApplySummary     *string
-	ApplyError       *string
-	AppliedAt        *string
-	CreatedAt        string
 }
 
 type QueueStats struct {
@@ -703,9 +648,12 @@ type RunsRepository struct{ q sqliteQuerier }
 
 type AgentExecutionsRepository struct{ q sqliteQuerier }
 
-type SweeperCasesRepository struct{ q sqliteQuerier }
+type PullRequestSnapshotsRepository struct{ q sqliteQuerier }
 
-type SweeperProposalsRepository struct{ q sqliteQuerier }
+type LocksRepository struct {
+	q   sqliteQuerier
+	now func() time.Time
+}
 
 const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
 
@@ -968,293 +916,6 @@ func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExec
 	return nil
 }
 
-func (r *SweeperCasesRepository) Upsert(ctx context.Context, record SweeperCaseRecord) error {
-	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO sweeper_cases (
-			id, project_id, repo, target_type, target_number, status,
-			current_phase, current_category, current_confidence_score,
-			warning_comment_id, warning_marker_uuid, last_proposal_id,
-			last_fingerprint_json, last_human_activity_at, warned_at,
-			close_due_at, terminal_outcome, terminal_at, created_at, updated_at
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			project_id=excluded.project_id,
-			repo=excluded.repo,
-			target_type=excluded.target_type,
-			target_number=excluded.target_number,
-			status=excluded.status,
-			current_phase=excluded.current_phase,
-			current_category=excluded.current_category,
-			current_confidence_score=excluded.current_confidence_score,
-			warning_comment_id=excluded.warning_comment_id,
-			warning_marker_uuid=excluded.warning_marker_uuid,
-			last_proposal_id=excluded.last_proposal_id,
-			last_fingerprint_json=excluded.last_fingerprint_json,
-			last_human_activity_at=excluded.last_human_activity_at,
-			warned_at=excluded.warned_at,
-			close_due_at=excluded.close_due_at,
-			terminal_outcome=excluded.terminal_outcome,
-			terminal_at=excluded.terminal_at,
-			updated_at=excluded.updated_at
-	`, record.ID, record.ProjectID, record.Repo, record.TargetType, record.TargetNumber, record.Status, record.CurrentPhase, record.CurrentCategory, record.CurrentConfidenceScore, record.WarningCommentID, record.WarningMarkerUUID, record.LastProposalID, record.LastFingerprintJSON, record.LastHumanActivityAt, record.WarnedAt, record.CloseDueAt, record.TerminalOutcome, record.TerminalAt, record.CreatedAt, record.UpdatedAt)
-	if err != nil {
-		return fmt.Errorf("upsert sweeper case: %w", err)
-	}
-
-	return nil
-}
-
-func (r *SweeperCasesRepository) GetByID(ctx context.Context, id string) (*SweeperCaseRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM sweeper_cases WHERE id = ?`, id)
-	record, err := scanSweeperCase(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get sweeper case by id: %w", err)
-	}
-
-	return &record, nil
-}
-
-func (r *SweeperCasesRepository) GetByProjectRepoTarget(ctx context.Context, projectID, repo, targetType string, targetNumber int64) (*SweeperCaseRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
-		SELECT *
-		FROM sweeper_cases
-		WHERE project_id = ? AND repo = ? AND target_type = ? AND target_number = ?
-		LIMIT 1
-	`, projectID, repo, targetType, targetNumber)
-	record, err := scanSweeperCase(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get sweeper case by target: %w", err)
-	}
-
-	return &record, nil
-}
-
-func (r *SweeperCasesRepository) ListByProjectRepoPhase(ctx context.Context, projectID, repo, phase string) ([]SweeperCaseRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT *
-		FROM sweeper_cases
-		WHERE project_id = ? AND repo = ? AND current_phase = ?
-		ORDER BY updated_at DESC, id DESC
-	`, projectID, repo, phase)
-	if err != nil {
-		return nil, fmt.Errorf("list sweeper cases by phase: %w", err)
-	}
-	defer rows.Close()
-
-	return scanSweeperCases(rows)
-}
-
-func (r *SweeperCasesRepository) ListByProjectRepo(ctx context.Context, projectID, repo string, limit int) ([]SweeperCaseRecord, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT *
-		FROM sweeper_cases
-		WHERE project_id = ? AND repo = ?
-		ORDER BY updated_at DESC, id DESC
-		LIMIT ?
-	`, projectID, repo, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list sweeper cases by repo: %w", err)
-	}
-	defer rows.Close()
-
-	return scanSweeperCases(rows)
-}
-
-func (r *SweeperCasesRepository) ListByProjectRepoStatus(ctx context.Context, projectID, repo, status string) ([]SweeperCaseRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT *
-		FROM sweeper_cases
-		WHERE project_id = ? AND repo = ? AND status = ?
-		ORDER BY updated_at DESC, id DESC
-	`, projectID, repo, status)
-	if err != nil {
-		return nil, fmt.Errorf("list sweeper cases by status: %w", err)
-	}
-	defer rows.Close()
-
-	return scanSweeperCases(rows)
-}
-
-func (r *SweeperProposalsRepository) Insert(ctx context.Context, record SweeperProposalRecord) error {
-	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO sweeper_proposals (
-			id, case_id, project_id, repo, target_type, target_number,
-			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
-			proposal_json, raw_result_json, decision, category, confidence_score, summary,
-			rationale, marker_uuid, validation_status, validation_error,
-			apply_status, apply_summary, apply_error, applied_at, created_at
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, record.ID, record.CaseID, record.ProjectID, record.Repo, record.TargetType, record.TargetNumber, record.SchemaVersion, record.ProposerKind, record.FactBundleJSON, record.FingerprintJSON, record.ProposalJSON, record.RawResultJSON, record.Decision, record.Category, record.ConfidenceScore, record.Summary, record.Rationale, record.MarkerUUID, record.ValidationStatus, record.ValidationError, record.ApplyStatus, record.ApplySummary, record.ApplyError, record.AppliedAt, record.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("insert sweeper proposal: %w", err)
-	}
-
-	return nil
-}
-
-func (r *SweeperProposalsRepository) GetByID(ctx context.Context, id string) (*SweeperProposalRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
-		SELECT id, case_id, project_id, repo, target_type, target_number,
-			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
-			proposal_json, raw_result_json, decision, category, confidence_score,
-			summary, rationale, marker_uuid, validation_status, validation_error,
-			apply_status, apply_summary, apply_error, applied_at, created_at
-		FROM sweeper_proposals
-		WHERE id = ?
-	`, id)
-	record, err := scanSweeperProposal(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get sweeper proposal by id: %w", err)
-	}
-
-	return &record, nil
-}
-
-func (r *SweeperProposalsRepository) GetLatestByCaseID(ctx context.Context, caseID string) (*SweeperProposalRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
-		SELECT id, case_id, project_id, repo, target_type, target_number,
-			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
-			proposal_json, raw_result_json, decision, category, confidence_score,
-			summary, rationale, marker_uuid, validation_status, validation_error,
-			apply_status, apply_summary, apply_error, applied_at, created_at
-		FROM sweeper_proposals
-		WHERE case_id = ?
-		ORDER BY created_at DESC, id DESC
-		LIMIT 1
-	`, caseID)
-	record, err := scanSweeperProposal(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get latest sweeper proposal by case: %w", err)
-	}
-
-	return &record, nil
-}
-
-func (r *SweeperProposalsRepository) ListByCaseID(ctx context.Context, caseID string) ([]SweeperProposalRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT id, case_id, project_id, repo, target_type, target_number,
-			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
-			proposal_json, raw_result_json, decision, category, confidence_score,
-			summary, rationale, marker_uuid, validation_status, validation_error,
-			apply_status, apply_summary, apply_error, applied_at, created_at
-		FROM sweeper_proposals
-		WHERE case_id = ?
-		ORDER BY created_at DESC, id DESC
-	`, caseID)
-	if err != nil {
-		return nil, fmt.Errorf("list sweeper proposals by case: %w", err)
-	}
-	defer rows.Close()
-
-	return scanSweeperProposals(rows)
-}
-
-func (r *SweeperProposalsRepository) ListByProjectRepo(ctx context.Context, projectID, repo string, limit int) ([]SweeperProposalRecord, error) {
-	if limit <= 0 {
-		limit = 1000
-	}
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT id, case_id, project_id, repo, target_type, target_number,
-			schema_version, proposer_kind, fact_bundle_json, fingerprint_json,
-			proposal_json, raw_result_json, decision, category, confidence_score,
-			summary, rationale, marker_uuid, validation_status, validation_error,
-			apply_status, apply_summary, apply_error, applied_at, created_at
-		FROM sweeper_proposals
-		WHERE project_id = ? AND repo = ?
-		ORDER BY created_at DESC, id DESC
-		LIMIT ?
-	`, projectID, repo, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list sweeper proposals by repo: %w", err)
-	}
-	defer rows.Close()
-
-	return scanSweeperProposals(rows)
-}
-
-func (r *SweeperProposalsRepository) UpdateApplyReceipt(ctx context.Context, id string, applyStatus string, applySummary *string, applyError *string, appliedAt *string) error {
-	_, err := r.q.ExecContext(ctx, `
-		UPDATE sweeper_proposals
-		SET apply_status = ?,
-			apply_summary = ?,
-			apply_error = ?,
-			applied_at = ?
-		WHERE id = ?
-	`, applyStatus, applySummary, applyError, appliedAt, id)
-	if err != nil {
-		return fmt.Errorf("update sweeper proposal apply receipt: %w", err)
-	}
-
-	return nil
-}
-
-func (r *SweeperProposalsRepository) CountAppliedByRepoAndDecisionSince(ctx context.Context, projectID, repo, decision, sinceISO string) (int64, error) {
-	var count int64
-	err := r.q.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM sweeper_proposals
-		WHERE project_id = ?
-			AND repo = ?
-			AND decision = ?
-			AND applied_at IS NOT NULL
-			AND applied_at >= ?
-			AND apply_status = CASE
-				WHEN ? = 'warn' THEN 'completed_warned'
-				WHEN ? = 'close' THEN 'completed_closed'
-				WHEN ? = 'cancel' THEN 'completed_cancelled'
-				WHEN ? = 'quarantine' THEN 'completed_quarantined'
-				ELSE apply_status
-			END
-	`, projectID, repo, decision, sinceISO, decision, decision, decision, decision).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("count applied sweeper proposals by repo and decision: %w", err)
-	}
-	return count, nil
-}
-
-func (r *SweeperProposalsRepository) CountInflightByRepoAndDecision(ctx context.Context, projectID, repo, decision string) (int64, error) {
-	var count int64
-	err := r.q.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM sweeper_proposals p
-		WHERE p.project_id = ?
-			AND p.repo = ?
-			AND p.decision = ?
-			AND NOT EXISTS (
-				SELECT 1
-				FROM sweeper_proposals newer
-				WHERE newer.case_id = p.case_id
-					AND (newer.created_at > p.created_at OR (newer.created_at = p.created_at AND newer.id > p.id))
-			)
-			AND (p.apply_status IS NULL OR (
-				p.apply_status NOT LIKE 'completed_%'
-				AND p.apply_status NOT LIKE 'skipped_%'
-				AND p.apply_status NOT LIKE 'failed_%'
-			))
-	`, projectID, repo, decision).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("count inflight sweeper proposals by repo and decision: %w", err)
-	}
-	return count, nil
-}
-
 func (r *AgentExecutionsRepository) GetByID(ctx context.Context, id string) (*AgentExecutionRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT `+agentExecutionColumns+` FROM agent_executions WHERE id = ?`, id)
 	record, err := scanAgentExecution(row)
@@ -1337,8 +998,6 @@ func (r *AgentExecutionsRepository) ListSince(ctx context.Context, sinceISO stri
 	return scanAgentExecutions(rows)
 }
 
-type PullRequestSnapshotsRepository struct{ q sqliteQuerier }
-
 func (r *PullRequestSnapshotsRepository) Upsert(ctx context.Context, record PullRequestSnapshotRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO pull_request_snapshots (id, project_id, repo, pr_number, head_sha, base_sha, title, body, author, diff_ref, checks_summary, unresolved_thread_count, review_state, payload_json, captured_at, created_at)
@@ -1400,11 +1059,6 @@ func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context,
 	}
 
 	return &record, nil
-}
-
-type LocksRepository struct {
-	q   sqliteQuerier
-	now func() time.Time
 }
 
 func (r *LocksRepository) SetNow(now func() time.Time) {
@@ -2979,157 +2633,6 @@ func scanQueueItems(rows *sql.Rows) ([]QueueItemRecord, error) {
 	}
 
 	return records, nil
-}
-
-func scanSweeperCases(rows *sql.Rows) ([]SweeperCaseRecord, error) {
-	records := make([]SweeperCaseRecord, 0)
-	for rows.Next() {
-		record, err := scanSweeperCase(rows)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, record)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate sweeper case rows: %w", err)
-	}
-
-	return records, nil
-}
-
-func scanSweeperCase(row interface{ Scan(...any) error }) (SweeperCaseRecord, error) {
-	var (
-		record                 SweeperCaseRecord
-		currentCategory        sql.NullString
-		currentConfidenceScore sql.NullInt64
-		warningCommentID       sql.NullInt64
-		warningMarkerUUID      sql.NullString
-		lastProposalID         sql.NullString
-		lastFingerprintJSON    sql.NullString
-		lastHumanActivityAt    sql.NullString
-		warnedAt               sql.NullString
-		closeDueAt             sql.NullString
-		terminalOutcome        sql.NullString
-		terminalAt             sql.NullString
-	)
-
-	err := row.Scan(
-		&record.ID,
-		&record.ProjectID,
-		&record.Repo,
-		&record.TargetType,
-		&record.TargetNumber,
-		&record.Status,
-		&record.CurrentPhase,
-		&currentCategory,
-		&currentConfidenceScore,
-		&warningCommentID,
-		&warningMarkerUUID,
-		&lastProposalID,
-		&lastFingerprintJSON,
-		&lastHumanActivityAt,
-		&warnedAt,
-		&closeDueAt,
-		&terminalOutcome,
-		&terminalAt,
-		&record.CreatedAt,
-		&record.UpdatedAt,
-	)
-	if err != nil {
-		return SweeperCaseRecord{}, err
-	}
-
-	record.CurrentCategory = nullableString(currentCategory)
-	record.CurrentConfidenceScore = nullableInt64(currentConfidenceScore)
-	record.WarningCommentID = nullableInt64(warningCommentID)
-	record.WarningMarkerUUID = nullableString(warningMarkerUUID)
-	record.LastProposalID = nullableString(lastProposalID)
-	record.LastFingerprintJSON = nullableString(lastFingerprintJSON)
-	record.LastHumanActivityAt = nullableString(lastHumanActivityAt)
-	record.WarnedAt = nullableString(warnedAt)
-	record.CloseDueAt = nullableString(closeDueAt)
-	record.TerminalOutcome = nullableString(terminalOutcome)
-	record.TerminalAt = nullableString(terminalAt)
-
-	return record, nil
-}
-
-func scanSweeperProposals(rows *sql.Rows) ([]SweeperProposalRecord, error) {
-	records := make([]SweeperProposalRecord, 0)
-	for rows.Next() {
-		record, err := scanSweeperProposal(rows)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, record)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate sweeper proposal rows: %w", err)
-	}
-
-	return records, nil
-}
-
-func scanSweeperProposal(row interface{ Scan(...any) error }) (SweeperProposalRecord, error) {
-	var (
-		record           SweeperProposalRecord
-		rawResultJSON    sql.NullString
-		summary          sql.NullString
-		rationale        sql.NullString
-		markerUUID       sql.NullString
-		validationStatus sql.NullString
-		validationError  sql.NullString
-		applyStatus      sql.NullString
-		applySummary     sql.NullString
-		applyError       sql.NullString
-		appliedAt        sql.NullString
-	)
-
-	err := row.Scan(
-		&record.ID,
-		&record.CaseID,
-		&record.ProjectID,
-		&record.Repo,
-		&record.TargetType,
-		&record.TargetNumber,
-		&record.SchemaVersion,
-		&record.ProposerKind,
-		&record.FactBundleJSON,
-		&record.FingerprintJSON,
-		&record.ProposalJSON,
-		&rawResultJSON,
-		&record.Decision,
-		&record.Category,
-		&record.ConfidenceScore,
-		&summary,
-		&rationale,
-		&markerUUID,
-		&validationStatus,
-		&validationError,
-		&applyStatus,
-		&applySummary,
-		&applyError,
-		&appliedAt,
-		&record.CreatedAt,
-	)
-	if err != nil {
-		return SweeperProposalRecord{}, err
-	}
-
-	record.Summary = nullableString(summary)
-	record.Rationale = nullableString(rationale)
-	record.RawResultJSON = nullableString(rawResultJSON)
-	record.MarkerUUID = nullableString(markerUUID)
-	record.ValidationStatus = nullableString(validationStatus)
-	record.ValidationError = nullableString(validationError)
-	record.ApplyStatus = nullableString(applyStatus)
-	record.ApplySummary = nullableString(applySummary)
-	record.ApplyError = nullableString(applyError)
-	record.AppliedAt = nullableString(appliedAt)
-
-	return record, nil
 }
 
 func scanQueueItem(row interface{ Scan(...any) error }) (QueueItemRecord, error) {

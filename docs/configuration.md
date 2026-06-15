@@ -571,37 +571,6 @@ labels = ["looper:worker-ready"]
 labelMode = "all"
 requireAssigneeCurrentUser = true
 
-[roles.sweeper.discovery]
-autoDiscovery = false
-
-[roles.sweeper.behavior]
-dryRun = true
-
-[roles.sweeper.discovery.triggers]
-includeIssues = true
-includePullRequests = true
-includeDrafts = false
-excludeLabels = ["pinned", "security", "looper:sweep-keep"]
-excludeAuthors = []
-excludeAuthorAssociations = ["OWNER", "MEMBER", "COLLABORATOR"]
-looperInternalLabels = ["looper:plan", "looper:worker-ready", "looper:spec-reviewing", "looper:swept"]
-reopenCooldownDays = 30
-maxPerTick = 10
-
-[roles.sweeper.behavior.lifecycle]
-pendingLabel = "looper:sweep-pending"
-closedLabel = "looper:swept"
-keepLabel = "looper:sweep-keep"
-
-[roles.sweeper.behavior.limits]
-maxWarningsPerRepoPerDay = 25
-maxClosesPerRepoPerDay = 25
-globalKillSwitch = false
-
-[roles.sweeper.behavior.security]
-quarantineLabel = "looper:sweeper-route-security"
-notifyAssignees = []
-
 [[projects]]
 id = "looper"
 name = "Looper"
@@ -772,7 +741,7 @@ To restore it by default for all project additions:
 
 ### `roles`
 
-The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, worker, and sweeper. It does not block manual commands, direct processing, retries, or already queued work.
+The `roles` section controls scheduler-driven auto-discovery for planner, reviewer, fixer, and worker. It does not block manual commands, direct processing, retries, or already queued work.
 
 Defaults preserve Looper's historical behavior:
 
@@ -780,7 +749,6 @@ Defaults preserve Looper's historical behavior:
 - worker discovers open issues labeled `looper:worker-ready` assigned to the current GitHub user
 - reviewer discovers open non-draft PRs where the current user is requested for review, skips self-authored PRs by default, and includes the `looper:spec-reviewing` follow-up path
 - fixer discovers open non-draft PRs authored by the current user that have actionable review items
-- sweeper is opt-in (`autoDiscovery=false`) and dry-run by default; its target model is a case/proposal ledger with deterministic prefiltering, immutable proposal artifacts, and idempotent apply receipts
 
 Common fields:
 
@@ -792,48 +760,6 @@ Common fields:
 Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
 
 When reviewer `triggers.requireReviewRequest=true` and no reviewer label filter is configured, discovery queries GitHub directly for PRs review-requested from the current GitHub user. This avoids missing requested reviews that fall outside the generic open-PR discovery window. Reviewer label filters keep using the labeled open-PR query path and are still applied before queuing.
-
-Sweeper terminology used in config, logs, and future operator surfaces:
-
-- **case**: the mutable lifecycle record for one issue or pull request
-- **proposal**: an immutable decision artifact for a case
-- **fact bundle**: normalized target + policy snapshot persisted with each proposal
-- **apply receipt**: the apply-side status written back to a proposal
-- **stale proposal**: a proposal rejected at apply time because live state drifted or its schema version is obsolete
-- **marker UUID**: the stable UUID embedded in warning comment markers for retry-safe idempotency
-
-Sweeper-specific config fields:
-
-- `roles.sweeper.autoDiscovery`: when `false`, scheduler discovery does not enqueue new sweeper cases
-- `roles.sweeper.dryRun`: when `true`, the propose/apply pipeline still writes cases, proposals, and apply receipts, but GitHub mutations are skipped
-- `roles.sweeper.triggers.includeIssues` / `includePullRequests`: enable issue or PR discovery
-- `roles.sweeper.triggers.includeDrafts`: include draft PRs in discovery
-- `roles.sweeper.triggers.excludeLabels`: hard exclusion labels removed during deterministic prefilter
-- `roles.sweeper.triggers.excludeAuthors`: GitHub logins excluded before proposing
-- `roles.sweeper.triggers.excludeAuthorAssociations`: author associations excluded before proposing
-- `roles.sweeper.triggers.looperInternalLabels`: labels treated as Looper-owned/policy-relevant for filtering and fingerprinting
-- `roles.sweeper.triggers.reopenCooldownDays`: skip recently reopened targets for this cooldown window
-- `roles.sweeper.triggers.maxPerTick`: soft per-discovery budget before proposal/apply
-- `roles.sweeper.filter.mode`: deterministic prefilter mode used before any agent review; currently `deterministic`
-- `roles.sweeper.proposer.mode`: `agent_apply` for agent-backed canonical proposals on live categories, or `heuristic_fallback` as a break-glass fallback
-- `roles.sweeper.proposer.model`: optional sweeper-specific agent model override
-- `roles.sweeper.proposer.timeoutSeconds`: proposer agent timeout budget per review attempt
-- `roles.sweeper.proposer.schemaVersion`: normalized proposal schema version expected from the agent; currently `2`
-- `roles.sweeper.proposer.diagnosticMode`: when `true`, persist fresh heuristic shadow proposals alongside agent-backed reviews for offline comparison
-- `roles.sweeper.proposer.timeoutRateDryRunThreshold`: auto-backpressure threshold from `0..1`; when the observed agent timeout rate meets or exceeds it, the scheduler flips that repo to sweeper dry-run
-- `roles.sweeper.proposer.timeoutRateDryRunMinSamples`: minimum agent proposal sample size required before timeout-rate backpressure can auto-flip a repo
-- `roles.sweeper.lifecycle.pendingLabel`: label used while a case is in warned/pending-close state
-- `roles.sweeper.lifecycle.closedLabel`: label added when sweeper completes a close action
-- `roles.sweeper.lifecycle.keepLabel`: label that suppresses sweeper action and can cancel a pending case
-- `roles.sweeper.limits.maxWarningsPerRepoPerDay`: per-repo warning ceiling enforced from successful applies
-- `roles.sweeper.limits.maxClosesPerRepoPerDay`: per-repo close ceiling enforced from successful applies
-- `roles.sweeper.limits.globalKillSwitch`: stops new sweeper side effects globally
-- `roles.sweeper.categories.*`: enablement, inactivity windows, grace periods, and minimum confidence thresholds per category
-- `roles.sweeper.security.quarantineLabel`: deterministic security-routing label for `route_security`
-- `roles.sweeper.security.notifyAssignees`: assignee logins to notify on security-routing outcomes
-- `roles.sweeper.reporting.durableReportsDir`: optional durable report export directory; the canonical audit store remains the sweeper case/proposal ledger
-
-Sweeper categories currently exposed in config are `stale`, `alreadyFixed`, `superseded`, `unrelated`, and `abandonedPR`. `unrelated` remains report-only/dry-run for now, and `route_security` remains deterministic prefilter-only with dry-run apply until maintainers confirm the operating model; canonical live apply stays focused on higher-confidence maintenance categories while `sweeper_cases` and `sweeper_proposals` remain the source of truth.
 
 For reviewer discovery, `triggers.enableSelfReview` defaults to `false`. When omitted or falsy, non-manual reviewer loops skip pull requests whose normalized PR author login matches the current authenticated GitHub login. Set it to `true` to allow those loops to review self-authored PRs.
 

@@ -116,7 +116,6 @@ PR 默认 integration smoke 目标耗时控制在 60 秒左右；更深的 path-
 - `internal/runtime/**`
 - `internal/scheduler/**`
 - `internal/storage/**`
-- `internal/sweeper/**`
 - `internal/worker/**`
 - `internal/worktree*/**`
 - `pkg/**`

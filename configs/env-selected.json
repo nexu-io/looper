@@ -36,7 +36,9 @@
     "inApp": true,
     "osascript": {
       "enabled": true,
-      "soundForLevels": ["failure"],
+      "soundForLevels": [
+        "failure"
+      ],
       "throttleWindowSeconds": 120
     }
   },

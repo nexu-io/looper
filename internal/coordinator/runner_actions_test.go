@@ -295,7 +295,7 @@ func TestRunnerProjectConfigRequiresConfig(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
 	fixture.runner.config = nil
 
-	_, _, _, err := fixture.runner.projectConfig(context.Background(), fixture.projectID)
+	_, _, err := fixture.runner.projectConfig(context.Background(), fixture.projectID)
 	if err == nil || !strings.Contains(err.Error(), "coordinator config is not configured") {
 		t.Fatalf("projectConfig() error = %v, want missing config error", err)
 	}

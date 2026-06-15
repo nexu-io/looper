@@ -22,7 +22,7 @@ func (r *commandRuntime) promptPreview(cmd *cobra.Command, args []string) error 
 		return fmt.Errorf("--role is required")
 	}
 	if !isPreviewInstructionRole(role) {
-		return fmt.Errorf("--role must be one of: planner, worker, reviewer, fixer, sweeper")
+		return fmt.Errorf("--role must be one of: planner, worker, reviewer, fixer")
 	}
 	loaded, err := r.loadConfigForEdit()
 	if err != nil {
@@ -61,7 +61,7 @@ func (r *commandRuntime) promptPreview(cmd *cobra.Command, args []string) error 
 
 func isPreviewInstructionRole(role string) bool {
 	switch role {
-	case "planner", "worker", "reviewer", "fixer", "sweeper":
+	case "planner", "worker", "reviewer", "fixer":
 		return true
 	default:
 		return false
@@ -185,10 +185,8 @@ func previewBaseRole(role string) string {
 		return "Review the target pull request through Looper's trusted review workflow."
 	case "fixer":
 		return "Repair only the Looper-provided review findings."
-	case "sweeper":
-		return "Apply the sweeper policy through deterministic prefiltering, durable proposals, and idempotent apply receipts."
 	default:
-		return "Unknown role; config validation accepts planner, worker, reviewer, fixer, and sweeper."
+		return "Unknown role; config validation accepts planner, worker, reviewer, and fixer."
 	}
 }
 
