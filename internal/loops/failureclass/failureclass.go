@@ -92,7 +92,7 @@ func Classify(err error, ctx Context) Kind {
 	if ctx.Boundary == BoundaryGitHubAPI && isRetryableGitHubGraphQLUnauthorized(message) {
 		return RetryableTransient
 	}
-	if isDeterministicDenial(message) || isInternalDeterministicBoundary(ctx.Boundary) {
+	if isDeterministicDenial(message) || isGitHubAPIDeterministicDenial(message, ctx.Boundary) || isInternalDeterministicBoundary(ctx.Boundary) {
 		return NonRetryable
 	}
 	if isExternalBoundary(ctx.Boundary) {
@@ -128,16 +128,29 @@ func isManualWorktreeMessage(message string) bool {
 
 func isDeterministicDenial(message string) bool {
 	for _, fragment := range []string{
-		"http 400",
-		"http 422",
-		"400 bad request",
-		"422 unprocessable",
 		"could not resolve to a pullrequest",
 		"could not resolve to an issue",
 		"protected branch",
 		"branch protection",
 		"policy denied",
 		"checkpoint invariant",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGitHubAPIDeterministicDenial(message string, boundary Boundary) bool {
+	if boundary != BoundaryGitHubAPI {
+		return false
+	}
+	for _, fragment := range []string{
+		"http 400",
+		"http 422",
+		"400 bad request",
+		"422 unprocessable",
 	} {
 		if strings.Contains(message, fragment) {
 			return true
