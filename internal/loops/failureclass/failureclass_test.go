@@ -86,7 +86,6 @@ func TestClassifyTerminalTargetMissingFailures(t *testing.T) {
 	}{
 		{name: "pull request", message: "GraphQL: Could not resolve to a PullRequest with the number of 71. (repository.pullRequest)"},
 		{name: "issue", message: "GraphQL: Could not resolve to an Issue with the number of 42. (repository.issue)"},
-		{name: "issue rest 404", message: "gh: Not Found (HTTP 404)\n{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/issues/issues#get-an-issue\",\"status\":\"404\"}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -102,6 +101,24 @@ func TestClassifyGenericGitHub404StaysRetryable(t *testing.T) {
 	got := Classify(errors.New("gh: Not Found (HTTP 404)"), Context{Runner: RunnerWorker, Boundary: BoundaryGitHubAPI})
 	if got != RetryableTransient {
 		t.Fatalf("Classify() = %s, want %s", got, RetryableTransient)
+	}
+}
+
+func TestClassifyIssueREST404StaysRetryable(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{name: "docs url", message: "gh: Not Found (HTTP 404)\n{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/issues/issues#get-an-issue\",\"status\":\"404\"}"},
+		{name: "issue path", message: "GET https://api.github.com/repos/acme/looper/issues/42: 404 Not Found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Classify(errors.New(tt.message), Context{Runner: RunnerWorker, Boundary: BoundaryGitHubAPI})
+			if got != RetryableTransient {
+				t.Fatalf("Classify() = %s, want %s", got, RetryableTransient)
+			}
+		})
 	}
 }
 

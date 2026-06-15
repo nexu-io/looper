@@ -143,15 +143,7 @@ func isDeterministicDenial(message string) bool {
 			return true
 		}
 	}
-	return isIssueRESTNotFound(message)
-}
-
-func isIssueRESTNotFound(message string) bool {
-	if !strings.Contains(message, "404") {
-		return false
-	}
-	return strings.Contains(message, "issues#get-an-issue") ||
-		(strings.Contains(message, "repos/") && strings.Contains(message, "/issues/"))
+	return false
 }
 
 func isRetryableGitHubGraphQLUnauthorized(message string) bool {
