@@ -898,6 +898,8 @@ type PartialRoleConfigs struct {
 	Fixer       *PartialFixerRoleConfig       `json:"fixer,omitempty"`
 	Worker      *PartialWorkerRoleConfig      `json:"worker,omitempty"`
 	Coordinator *PartialCoordinatorRoleConfig `json:"coordinator,omitempty"`
+	// Deprecated: sweeper was retired and is ignored when present in older configs.
+	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }
 
 type PartialConfig struct {

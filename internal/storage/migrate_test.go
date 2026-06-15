@@ -701,6 +701,7 @@ func TestMigration0017DeletesRetiredSweeperQueueItems(t *testing.T) {
 	}
 
 	for _, item := range []QueueItemRecord{
+		{ID: "sweeper_bare_queued", ProjectID: &projectID, LoopID: &loopID, Type: "sweeper", TargetType: "project", TargetID: projectID, DedupeKey: "sweeper:" + projectID, Priority: QueuePriorityWorker, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
 		{ID: "sweeper_warn_queued", ProjectID: &projectID, LoopID: &loopID, Type: "sweeper:warn", TargetType: "project", TargetID: projectID, DedupeKey: "sweeper:warn:" + projectID, Priority: QueuePriorityWorker, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
 		{ID: "sweeper_close_running", ProjectID: &projectID, LoopID: &loopID, Type: "sweeper:close", TargetType: "project", TargetID: projectID, DedupeKey: "sweeper:close:" + projectID, Priority: QueuePriorityWorker, Status: "running", AvailableAt: now, Attempts: 1, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
 		{ID: "sweeper_reconcile_completed", ProjectID: &projectID, LoopID: &loopID, Type: "sweeper:reconcile", TargetType: "project", TargetID: projectID, DedupeKey: "sweeper:reconcile:" + projectID, Priority: QueuePriorityWorker, Status: "completed", AvailableAt: now, Attempts: 1, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
@@ -721,7 +722,7 @@ func TestMigration0017DeletesRetiredSweeperQueueItems(t *testing.T) {
 	}
 
 	var retiredCount int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_items WHERE type LIKE 'sweeper:%'`).Scan(&retiredCount); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_items WHERE type = 'sweeper' OR type LIKE 'sweeper:%'`).Scan(&retiredCount); err != nil {
 		t.Fatalf("count retired sweeper queue items error = %v", err)
 	}
 	if retiredCount != 0 {

@@ -857,6 +857,18 @@ func TestMixedSchemaConfigAcceptsDeterministicInputsWithCanonicalWinning(t *test
 			wantWarnings: []string{`deprecated config path "projects[].roles.reviewer.autoDiscovery" is accepted for now; use "projects[].roles.reviewer.discovery.autoDiscovery" instead`},
 		},
 		{
+			name:     "retired sweeper role configs are ignored",
+			fileName: "config.json",
+			contents: `{"roles":{"sweeper":{"enabled":true,"pollInterval":"1m"}},"projects":[{"id":"demo","name":"Demo","repoPath":"/repos/demo","roles":{"sweeper":{"enabled":false}}}]}`,
+			assertConfig: func(t *testing.T, loaded LoadedFileConfig) {
+				t.Helper()
+				if len(loaded.Config.Projects) != 1 {
+					t.Fatalf("projects len = %d, want 1", len(loaded.Config.Projects))
+				}
+			},
+			wantWarnings: []string{},
+		},
+		{
 			name:     "legacy project path alias is preserved when it matches repoPath",
 			fileName: "config.yaml",
 			contents: "projects:\n  - id: demo\n    name: Demo\n    path: /repos/demo\n    repoPath: /repos/demo\n",
