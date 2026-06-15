@@ -110,7 +110,7 @@ func validateLegacyProjectInstructionRoleKeys(partial PartialConfig) []Validatio
 	issues := make([]ValidationIssue, 0)
 	for index, project := range *partial.Projects {
 		for role := range project.Instructions {
-			if isValidInstructionRole(role) {
+			if isValidInstructionRole(role) || role == "sweeper" {
 				continue
 			}
 			issues = append(issues, ValidationIssue{

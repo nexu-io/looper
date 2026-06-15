@@ -1889,6 +1889,24 @@ func TestCanonicalProjectRoleInstructionsBeatLegacyProjectInstructionMap(t *test
 	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
 }
 
+func TestLegacyProjectInstructionsIgnoreRetiredSweeperRole(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.json", `{
+		"instructions": {"enabled": true, "maxBytes": 128},
+		"projects": [{
+			"id": "demo",
+			"name": "Demo",
+			"repoPath": "/repos/demo",
+			"instructions": {"sweeper": "Retired sweeper guidance."}
+		}]
+	}`, nil, nil)
+
+	block := BuildCustomInstructionBlock(loaded.Config, "demo", "worker")
+	if strings.Contains(block.Text, "Retired sweeper guidance.") {
+		t.Fatalf("custom instruction block = %q, want retired sweeper instructions ignored", block.Text)
+	}
+	assertWarningsEqual(t, loaded.Warnings, []string{`deprecated config path "projects[].instructions" is accepted for now; use "projects[].roles.<role>.instructions" instead`})
+}
+
 func TestLoadFileRejectsUnknownLegacyProjectInstructionRole(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
