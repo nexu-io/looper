@@ -56,6 +56,14 @@ func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestBackoffDelayCapsInfiniteRetryOverflow(t *testing.T) {
+	t.Parallel()
+
+	if got := backoffDelay(defaultRetryDelay, 100); got != maxRetryDelay {
+		t.Fatalf("backoffDelay(infinite retry overflow) = %v, want %v", got, maxRetryDelay)
+	}
+}
+
 func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
 	t.Parallel()
 

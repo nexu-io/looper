@@ -49,6 +49,7 @@ const (
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
+	maxRetryDelay       = 300 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
 
@@ -3640,7 +3641,11 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 	if attempts <= 0 {
 		attempts = 1
 	}
-	return time.Duration(attempts) * base
+	delay := time.Duration(attempts) * base
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
 }
 
 func isRetryableFailure(kind QueueFailureKind) bool {

@@ -79,7 +79,7 @@ const (
 	// longer than a queue claim window without an active agent execution.
 	defaultLegacyMarkerlessRunGrace = 24 * time.Hour
 	defaultRetryDelay               = 5 * time.Second
-	maxRetryDelay                   = 60 * time.Second
+	maxRetryDelay                   = 300 * time.Second
 	defaultRetryMax                 = 3
 )
 

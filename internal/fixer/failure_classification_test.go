@@ -34,18 +34,18 @@ func TestClassifyFailureRetriesBoundaryExternalTransport(t *testing.T) {
 	}
 }
 
-func TestClassifyFailureDoesNotRetryInvalidProjectRepoPath(t *testing.T) {
+func TestClassifyFailureRetriesInvalidProjectRepoPath(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailureWithBoundary(errors.New("git worktree list --porcelain: fatal: not a git repository (or any of the parent directories): .git"), failureclass.BoundaryGitRemote)
-	if got.kind != FailureNonRetryable {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	if got.kind != FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
 }
 
-func TestClassifyFailureDoesNotRetryMissingProjectRepoDirectory(t *testing.T) {
+func TestClassifyFailureRetriesMissingProjectRepoDirectory(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailureWithBoundary(errors.New("start command: chdir /tmp/missing-repo: no such file or directory"), failureclass.BoundaryGitRemote)
-	if got.kind != FailureNonRetryable {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	if got.kind != FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
 }

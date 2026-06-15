@@ -127,37 +127,9 @@ func isManualWorktreeMessage(message string) bool {
 }
 
 func isDeterministicDenial(message string) bool {
-	if strings.Contains(message, "start command: chdir") && strings.Contains(message, "no such file or directory") {
-		return true
-	}
-
 	for _, fragment := range []string{
-		"http 400",
-		"http 401",
-		"http 403",
-		"http 404",
-		"http 422",
-		"400 bad request",
-		"401 unauthorized",
-		"403 forbidden",
-		"404 not found",
-		"422 unprocessable",
-		"bad credentials",
-		"authentication failed",
-		"permission denied",
-		"not authorized",
-		"repository not found",
-		"not a git repository",
-		"not in a git directory",
-		"could not resolve to a repository",
 		"could not resolve to a pullrequest",
-		"protected branch",
-		"branch protection",
-		"policy denied",
-		"invalid model",
-		"unsupported model",
-		"config validation",
-		"schema",
+		"could not resolve to an issue",
 		"checkpoint invariant",
 	} {
 		if strings.Contains(message, fragment) {

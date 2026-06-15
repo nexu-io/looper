@@ -302,7 +302,7 @@
               "extraTransientErrorPatterns": [],
               "recoverExistingMatchedFailures": false,
               "autoRecoveryMaxAttempts": 3,
-              "maxDelayMs": 60000
+              "maxDelayMs": 300000
             },
             "scope": "changed_ranges",
             "publishMode": "single_review",

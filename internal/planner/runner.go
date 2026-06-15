@@ -39,7 +39,7 @@ const (
 	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
-	maxRetryDelay       = 60 * time.Second
+	maxRetryDelay       = 300 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
 )

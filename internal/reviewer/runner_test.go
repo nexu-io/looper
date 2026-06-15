@@ -6281,6 +6281,69 @@ func TestProcessClaimedItemSkipsMissingPullRequestInDiscover(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewErrs: []error{&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "GraphQL: Could not resolve to a PullRequest with the number of 42. (repository.pullRequest)"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
+	ctx := context.Background()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	loopID := "loop_publish_pr_not_found"
+	queueID := "queue_publish_pr_not_found"
+	nowISO := fixture.nowISO()
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, repo, prNumber)
+	if err != nil {
+		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 42, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_publish_pr_not_found:acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 2212, MaxAttempts: 5, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(reviewerCheckpoint{
+		ResumePolicy: "advance_from_checkpoint",
+		Detail:       &checkpointDetail{Title: "Deploy vela-web test sha-59e6fd8", State: "OPEN", HeadSHA: "abc123", HeadRefName: "feature", BaseRefName: "main", ReviewRequests: []string{"octocat"}, CurrentLogin: "octocat"},
+		Snapshot:     &checkpointSnapshot{HeadSHA: "abc123"},
+		PendingReview: &pendingReviewCheckpoint{
+			HeadSHA:        "abc123",
+			IdempotencyKey: "reviewer:loop_publish_pr_not_found:abc123",
+			Event:          reviewEventAgentNative,
+			Summary:        "posted review",
+		},
+	})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_publish_pr_not_found_previous", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("publish"), LastCompletedStep: stringPtr("review"), CheckpointJSON: &checkpointJSON, Summary: stringPtr("previous publish failure"), ErrorMessage: stringPtr("previous publish failure"), StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, Status: "running"})
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "Could not resolve to a PullRequest") {
+		t.Fatalf("result = %#v, want skipped missing PR publish resume", result)
+	}
+	loop, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	if terminalReviewerLoopReason(*loop) != "terminated" {
+		t.Fatalf("loop = %#v, want terminal terminated loop", loop)
+	}
+	loopMeta := reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))
+	if loopMeta["terminationReason"] != "pr_not_found" {
+		t.Fatalf("loop metadata = %#v, want pr_not_found termination", loopMeta)
+	}
+	queue, err := fixture.repos.Queue.GetByID(ctx, queueID)
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
+	}
+	if queue.Status == "queued" {
+		t.Fatalf("queue = %#v, want terminal queue state instead of requeue", queue)
+	}
+}
+
 func TestExecuteStepDoesNotRetryNonTransientSnapshotFailure(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{captureSnapshotErrs: []error{fmt.Errorf("GraphQL: Resource not accessible by integration")}}
@@ -6384,10 +6447,13 @@ func TestRetryDelayHonorsRetryAfterAndCapsBackoff(t *testing.T) {
 	if got := retryDelay(time.Second, 1, fmt.Errorf("anthropic overloaded; retry-after: 7"), maxRetryDelay); got != 7*time.Second {
 		t.Fatalf("retryDelay(retry-after) = %v, want 7s", got)
 	}
-	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), maxRetryDelay); got != maxRetryDelay {
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), maxRetryDelay); got != 120*time.Second {
+		t.Fatalf("retryDelay(retry-after below cap) = %v, want 120s", got)
+	}
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 600"), maxRetryDelay); got != maxRetryDelay {
 		t.Fatalf("retryDelay(capped retry-after) = %v, want %v", got, maxRetryDelay)
 	}
-	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded"), maxRetryDelay); got != maxRetryDelay {
+	if got := retryDelay(time.Minute, 4, fmt.Errorf("anthropic overloaded"), maxRetryDelay); got != maxRetryDelay {
 		t.Fatalf("retryDelay(capped exponential) = %v, want %v", got, maxRetryDelay)
 	}
 	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), 10*time.Second); got != 10*time.Second {

@@ -10,7 +10,7 @@ const DefaultServerPort = 17310
 
 const (
 	DefaultReviewerAutoRecoveryMaxAttempts = 3
-	DefaultReviewerRetryMaxDelayMS         = 60000
+	DefaultReviewerRetryMaxDelayMS         = 300000
 )
 
 func DefaultLooperHome() (string, error) {

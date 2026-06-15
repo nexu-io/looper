@@ -95,7 +95,7 @@ const (
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 5
-	maxRetryDelay       = 60 * time.Second
+	maxRetryDelay       = 300 * time.Second
 	retryJitterDivisor  = 4
 
 	defaultHeadChangePollInterval = 15 * time.Second
@@ -1698,15 +1698,8 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		if githubinfra.IsPullRequestNotFoundError(err) {
-			checkpoint := input.Checkpoint
-			checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
-			checkpoint.SkipKind = "pr_not_found"
-			checkpoint.ResumePolicy = ""
-			if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
-				return checkpoint, terminateErr
-			}
-			return checkpoint, nil
+		if checkpoint, skipped, skipErr := r.skipMissingPullRequest(ctx, input, input.Checkpoint, err); skipped || skipErr != nil {
+			return checkpoint, skipErr
 		}
 		return input.Checkpoint, err
 	}
@@ -1714,6 +1707,19 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 	checkpoint.Detail = checkpointDetailFromDetail(detail)
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
+}
+
+func (r *Runner) skipMissingPullRequest(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, err error) (reviewerCheckpoint, bool, error) {
+	if !githubinfra.IsPullRequestNotFoundError(err) {
+		return checkpoint, false, nil
+	}
+	checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
+	checkpoint.SkipKind = "pr_not_found"
+	checkpoint.ResumePolicy = ""
+	if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
+		return checkpoint, true, terminateErr
+	}
+	return checkpoint, true, nil
 }
 
 func checkpointDetailFromDetail(detail PullRequestDetail) *checkpointDetail {
@@ -2719,6 +2725,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if pending.CleanNoop {
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 		if err != nil {
+			if checkpoint, skipped, skipErr := r.skipMissingPullRequest(ctx, input, checkpoint, err); skipped || skipErr != nil {
+				return checkpoint, skipErr
+			}
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
@@ -2784,6 +2793,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	prNumber := input.PRNumber
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: input.Project.RepoPath})
 	if err != nil {
+		if checkpoint, skipped, skipErr := r.skipMissingPullRequest(ctx, input, checkpoint, err); skipped || skipErr != nil {
+			return checkpoint, skipErr
+		}
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
