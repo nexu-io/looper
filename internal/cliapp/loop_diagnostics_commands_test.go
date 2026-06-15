@@ -86,6 +86,18 @@ func TestClassifyDiagnosticMessageSuggestsRepairForRetryableConfigFailures(t *te
 	}
 }
 
+func TestClassifyDiagnosticMessagePreservesTerminalGitHubDenials(t *testing.T) {
+	t.Parallel()
+
+	got := classifyDiagnosticMessage("GitHub API failed: HTTP 403 Forbidden: policy denied by ruleset", "non_retryable")
+	if got.FailureClass != "non_retryable" || got.Retryable == nil || *got.Retryable {
+		t.Fatalf("diagnosis = %#v, want non_retryable terminal denial", got)
+	}
+	if got.RecommendedAction != "inspect before manual recovery" {
+		t.Fatalf("RecommendedAction = %q, want manual recovery hint", got.RecommendedAction)
+	}
+}
+
 func TestLoopFailuresListsFailedLoops(t *testing.T) {
 	t.Parallel()
 

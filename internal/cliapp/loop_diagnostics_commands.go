@@ -574,6 +574,10 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 		retryable := true
 		return loopDiagnosis{FailureClass: "review_marker_missing", Retryable: &retryable, Message: msg, RecommendedAction: "rerun publish verification or re-review after checking GitHub state"}
 	}
+	if kind == "non_retryable" && isTerminalGitHubDenial(lower) {
+		retryable := false
+		return loopDiagnosis{FailureClass: kind, Retryable: &retryable, Message: msg, RecommendedAction: "inspect before manual recovery"}
+	}
 	if strings.Contains(lower, "bad credentials") || strings.Contains(lower, "authentication failed") || strings.Contains(lower, "not authorized") || strings.Contains(lower, "permission denied") || strings.Contains(lower, "http 401") || strings.Contains(lower, "http 403") {
 		retryable := true
 		return loopDiagnosis{FailureClass: "github_auth_or_scope", Retryable: &retryable, Message: msg, RecommendedAction: "fix GitHub auth or token scopes, then allow the queued retry to continue"}
@@ -611,6 +615,25 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 		return loopDiagnosis{FailureClass: kind, Retryable: &retryable, Message: msg, RecommendedAction: "inspect before manual recovery"}
 	}
 	return loopDiagnosis{FailureClass: "unknown", Message: msg, RecommendedAction: "inspect the loop, run, and queue item details"}
+}
+
+func isTerminalGitHubDenial(message string) bool {
+	for _, fragment := range []string{
+		"http 400",
+		"http 403",
+		"http 422",
+		"400 bad request",
+		"403 forbidden",
+		"422 unprocessable",
+		"protected branch",
+		"branch protection",
+		"policy denied",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func recommendedActionForState(state string) string {
