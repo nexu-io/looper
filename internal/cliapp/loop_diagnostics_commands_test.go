@@ -98,6 +98,18 @@ func TestClassifyDiagnosticMessagePreservesTerminalGitHubDenials(t *testing.T) {
 	}
 }
 
+func TestClassifyDiagnosticMessagePreservesTerminalConfigValidationFailures(t *testing.T) {
+	t.Parallel()
+
+	got := classifyDiagnosticMessage("config validation failed: notifications.osascript.enabled requires osascript", "non_retryable")
+	if got.FailureClass != "non_retryable" || got.Retryable == nil || *got.Retryable {
+		t.Fatalf("diagnosis = %#v, want non_retryable terminal config failure", got)
+	}
+	if got.RecommendedAction != "fix the Looper configuration value before manual recovery" {
+		t.Fatalf("RecommendedAction = %q, want config manual recovery hint", got.RecommendedAction)
+	}
+}
+
 func TestLoopFailuresListsFailedLoops(t *testing.T) {
 	t.Parallel()
 

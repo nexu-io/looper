@@ -591,6 +591,10 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 		return loopDiagnosis{FailureClass: "project_repo_path", Retryable: &retryable, Message: msg, RecommendedAction: "fix the project repoPath or restore the local checkout, then allow the queued retry to continue"}
 	}
 	if strings.Contains(lower, "invalid model") || strings.Contains(lower, "unsupported model") || strings.Contains(lower, "config validation") {
+		if kind == "non_retryable" {
+			retryable := false
+			return loopDiagnosis{FailureClass: kind, Retryable: &retryable, Message: msg, RecommendedAction: "fix the Looper configuration value before manual recovery"}
+		}
 		retryable := true
 		return loopDiagnosis{FailureClass: "configuration", Retryable: &retryable, Message: msg, RecommendedAction: "fix the Looper configuration value, then allow the queued retry to continue"}
 	}
