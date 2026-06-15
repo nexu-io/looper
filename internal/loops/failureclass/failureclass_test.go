@@ -86,6 +86,7 @@ func TestClassifyTerminalTargetMissingFailures(t *testing.T) {
 	}{
 		{name: "pull request", message: "GraphQL: Could not resolve to a PullRequest with the number of 71. (repository.pullRequest)"},
 		{name: "issue", message: "GraphQL: Could not resolve to an Issue with the number of 42. (repository.issue)"},
+		{name: "issue rest 404", message: "gh: Not Found (HTTP 404)\n{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/issues/issues#get-an-issue\",\"status\":\"404\"}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -94,6 +95,13 @@ func TestClassifyTerminalTargetMissingFailures(t *testing.T) {
 				t.Fatalf("Classify() = %s, want %s", got, NonRetryable)
 			}
 		})
+	}
+}
+
+func TestClassifyGenericGitHub404StaysRetryable(t *testing.T) {
+	got := Classify(errors.New("gh: Not Found (HTTP 404)"), Context{Runner: RunnerWorker, Boundary: BoundaryGitHubAPI})
+	if got != RetryableTransient {
+		t.Fatalf("Classify() = %s, want %s", got, RetryableTransient)
 	}
 }
 
