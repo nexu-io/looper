@@ -1716,6 +1716,7 @@ func (r *Runner) skipMissingPullRequest(ctx context.Context, input stepInput, ch
 	checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
 	checkpoint.SkipKind = "pr_not_found"
 	checkpoint.ResumePolicy = ""
+	r.cleanupReviewerWorktreeIfTerminal(context.Background(), input.Project, &checkpoint)
 	if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
 		return checkpoint, true, terminateErr
 	}

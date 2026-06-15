@@ -6284,7 +6284,8 @@ func TestProcessClaimedItemSkipsMissingPullRequestInDiscover(t *testing.T) {
 func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{viewErrs: []error{&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "GraphQL: Could not resolve to a PullRequest with the number of 42. (repository.pullRequest)"}}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, RetryBaseDelay: time.Nanosecond})
 	ctx := context.Background()
 	repo := "acme/looper"
 	prNumber := int64(42)
@@ -6292,6 +6293,7 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 	loopID := "loop_publish_pr_not_found"
 	queueID := "queue_publish_pr_not_found"
 	nowISO := fixture.nowISO()
+	worktreePath := filepath.Join(t.TempDir(), "reviewer-worktree")
 	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, repo, prNumber)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
@@ -6306,6 +6308,7 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 		ResumePolicy: "advance_from_checkpoint",
 		Detail:       &checkpointDetail{Title: "Deploy vela-web test sha-59e6fd8", State: "OPEN", HeadSHA: "abc123", HeadRefName: "feature", BaseRefName: "main", ReviewRequests: []string{"octocat"}, CurrentLogin: "octocat"},
 		Snapshot:     &checkpointSnapshot{HeadSHA: "abc123"},
+		Worktree:     &checkpointWorktree{Path: worktreePath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: nowISO},
 		PendingReview: &pendingReviewCheckpoint{
 			HeadSHA:        "abc123",
 			IdempotencyKey: "reviewer:loop_publish_pr_not_found:abc123",
@@ -6341,6 +6344,12 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 	}
 	if queue.Status == "queued" {
 		t.Fatalf("queue = %#v, want terminal queue state instead of requeue", queue)
+	}
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
+	}
+	if git.cleanupCalls[0].WorktreePath != worktreePath {
+		t.Fatalf("CleanupWorktree().WorktreePath = %q, want %q", git.cleanupCalls[0].WorktreePath, worktreePath)
 	}
 }
 
