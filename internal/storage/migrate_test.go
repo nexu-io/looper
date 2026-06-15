@@ -675,6 +675,68 @@ func TestMigration0013CancelsDuplicateActiveQueueItemsBeforeUniqueIndex(t *testi
 	}
 }
 
+func TestMigration0017DeletesRetiredSweeperQueueItems(t *testing.T) {
+	t.Parallel()
+
+	if len(EmbeddedMigrations) < 17 || EmbeddedMigrations[16].ID != "0017_remove_sweeper_storage" {
+		t.Fatalf("EmbeddedMigrations[16] = %#v, want 0017_remove_sweeper_storage", EmbeddedMigrations[16])
+	}
+
+	ctx := context.Background()
+	db := openTestSQLiteDB(t)
+	seedRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:16]})
+	if _, err := seedRunner.RunPending(ctx); err != nil {
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+
+	repos := NewRepositories(db)
+	projectID := "project_migration_0017"
+	loopID := "loop_migration_0017"
+	now := "2026-06-15T17:30:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	for _, item := range []QueueItemRecord{
+		{ID: "sweeper_warn_queued", ProjectID: &projectID, LoopID: &loopID, Type: "sweeper:warn", TargetType: "project", TargetID: projectID, DedupeKey: "sweeper:warn:" + projectID, Priority: QueuePriorityWorker, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "sweeper_close_running", ProjectID: &projectID, LoopID: &loopID, Type: "sweeper:close", TargetType: "project", TargetID: projectID, DedupeKey: "sweeper:close:" + projectID, Priority: QueuePriorityWorker, Status: "running", AvailableAt: now, Attempts: 1, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "sweeper_reconcile_completed", ProjectID: &projectID, LoopID: &loopID, Type: "sweeper:reconcile", TargetType: "project", TargetID: projectID, DedupeKey: "sweeper:reconcile:" + projectID, Priority: QueuePriorityWorker, Status: "completed", AvailableAt: now, Attempts: 1, MaxAttempts: 3, FinishedAt: &now, CreatedAt: now, UpdatedAt: now},
+		{ID: "worker_queued", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:" + projectID, Priority: QueuePriorityWorker, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	migrationRunner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:17]})
+	result, err := migrationRunner.RunPending(ctx)
+	if err != nil {
+		t.Fatalf("RunPending() applying 0017 error = %v", err)
+	}
+	if !reflect.DeepEqual(result.AppliedIDs, []string{"0017_remove_sweeper_storage"}) {
+		t.Fatalf("RunPending().AppliedIDs = %v, want [0017_remove_sweeper_storage]", result.AppliedIDs)
+	}
+
+	var retiredCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_items WHERE type LIKE 'sweeper:%'`).Scan(&retiredCount); err != nil {
+		t.Fatalf("count retired sweeper queue items error = %v", err)
+	}
+	if retiredCount != 0 {
+		t.Fatalf("retired sweeper queue item count = %d, want 0", retiredCount)
+	}
+
+	workerItem, err := repos.Queue.GetByID(ctx, "worker_queued")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(worker_queued) error = %v", err)
+	}
+	if workerItem == nil || workerItem.Status != "queued" {
+		t.Fatalf("worker_queued = %#v, want queued item preserved", workerItem)
+	}
+}
+
 func openTestSQLiteDB(t *testing.T) *sql.DB {
 	t.Helper()
 
