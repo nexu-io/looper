@@ -1248,6 +1248,53 @@ func TestQueueRecoveredRetryWithoutErrorKindStaysNonLongTerm(t *testing.T) {
 	}
 }
 
+func TestQueueBoundedNonRetryableRetryMovesToLongTermLane(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_non_retryable_long_term", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_non_retryable_long_term"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_non_retryable_long_term", Type: "planner", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	nonRetryableKind := "non_retryable"
+	items := []QueueItemRecord{
+		{ID: "fresh_retryable", LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: "issue:1", DedupeKey: "planner:fresh", Priority: QueuePriorityPlanner, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 8, CreatedAt: "2026-04-11T11:30:00.000Z", UpdatedAt: now},
+		{ID: "bounded_non_retryable", LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: "issue:2", DedupeKey: "planner:bounded_non_retryable", Priority: QueuePriorityPlanner, Status: "queued", AvailableAt: now, Attempts: QueueLongTermRetryAttemptThreshold, MaxAttempts: 8, LastErrorKind: &nonRetryableKind, CreatedAt: "2026-04-11T11:00:00.000Z", UpdatedAt: now},
+	}
+	for _, item := range items {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	claimed, err := repos.Queue.ClaimNextNonLongTermRetry(ctx, now, "worker-a")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextNonLongTermRetry() error = %v", err)
+	}
+	if claimed == nil || claimed.ID != "fresh_retryable" {
+		t.Fatalf("Queue.ClaimNextNonLongTermRetry() = %#v, want fresh_retryable", claimed)
+	}
+
+	claimedLong, err := repos.Queue.ClaimNextLongTermRetry(ctx, now, "worker-b")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextLongTermRetry() error = %v", err)
+	}
+	if claimedLong == nil || claimedLong.ID != "bounded_non_retryable" {
+		t.Fatalf("Queue.ClaimNextLongTermRetry() = %#v, want bounded_non_retryable", claimedLong)
+	}
+	if claimedLong.LastErrorKind == nil || *claimedLong.LastErrorKind != nonRetryableKind {
+		t.Fatalf("claimedLong.LastErrorKind = %#v, want %q", claimedLong.LastErrorKind, nonRetryableKind)
+	}
+}
+
 func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	t.Parallel()
 
