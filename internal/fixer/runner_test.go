@@ -56,6 +56,9 @@ func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
 		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
 	}
+	if shouldRetryQueueFailure(FailureNonRetryable, 5, -1) {
+		t.Fatal("shouldRetryQueueFailure() = true, want false for infinite non_retryable retries")
+	}
 	if !shouldRetryQueueFailure(FailureNonRetryable, 1, 3) {
 		t.Fatal("shouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
 	}

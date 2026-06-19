@@ -6083,7 +6083,7 @@ func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts in
 		return false
 	}
 	if maxAttempts < 0 {
-		return true
+		return kind != FailureNonRetryable
 	}
 	return maxAttempts > 0 && nextAttempts < maxAttempts
 }
