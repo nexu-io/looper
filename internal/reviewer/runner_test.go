@@ -62,6 +62,9 @@ func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
 		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
 	}
+	if !shouldRetryQueueFailure(FailureNonRetryable, 1, 3) {
+		t.Fatal("shouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
+	}
 	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
 		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
 	}
@@ -6156,8 +6159,8 @@ func TestProcessClaimedItemDoesNotRetryGitHubSelfApprovalFailure(t *testing.T) {
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt == nil {
-		t.Fatalf("queue = %#v, want parked non_retryable queue item", queue)
+	if queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want requeued non_retryable queue item", queue)
 	}
 }
 
@@ -6806,8 +6809,8 @@ func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 	if getErr != nil {
 		t.Fatalf("Queue.GetByID() error = %v", getErr)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.FinishedAt == nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
-		t.Fatalf("queue = %#v, want parked queue item with non_retryable error kind", queue)
+	if queue == nil || queue.Status != "queued" || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
+		t.Fatalf("queue = %#v, want requeued queue item with non_retryable error kind", queue)
 	}
 	if queue.LastError == nil || !contains(*queue.LastError, "start run blocked") {
 		t.Fatalf("queue.LastError = %#v, want start run blocked", queue.LastError)

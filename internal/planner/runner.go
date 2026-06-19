@@ -2126,7 +2126,7 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 }
 
 func isRetryableFailure(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
+	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {

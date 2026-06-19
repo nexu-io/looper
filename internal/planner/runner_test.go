@@ -51,6 +51,9 @@ func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
 		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
 	}
+	if !shouldRetryQueueFailure(FailureNonRetryable, 1, 3) {
+		t.Fatal("shouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
+	}
 	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
 		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
 	}
@@ -1069,8 +1072,8 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt == nil {
-		t.Fatalf("queue = %#v, want parked non_retryable item", queue)
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want requeued non_retryable item", queue)
 	}
 }
 

@@ -2669,7 +2669,7 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume {
+	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume && kind != FailureNonRetryable {
 		return false
 	}
 	if maxAttempts < 0 {
