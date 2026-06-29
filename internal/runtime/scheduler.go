@@ -682,7 +682,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
 	}
-	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
@@ -926,7 +926,7 @@ func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
-	detail, err := a.gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}

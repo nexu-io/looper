@@ -32,7 +32,9 @@ const (
 var (
 	prListJSONFields          = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
 	prDiscoveryListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
-	prViewJSONFields          = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}
+	prViewMetadataJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
+	prViewFixerJSONFields     = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "statusCheckRollup", "mergeStateStatus"}
+	prViewReviewerJSONFields  = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -1366,21 +1368,47 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.viewPullRequest(ctx, input)
 	}
-	return g.viewPullRequestRaw(ctx, input)
+	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
+}
+
+func (g *Gateway) ViewPullRequestForFixer(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	return g.viewPullRequestWithFields(ctx, input, prViewFixerJSONFields, true, true)
+}
+
+func (g *Gateway) ViewPullRequestForReviewer(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	return g.viewPullRequestWithFields(ctx, input, prViewReviewerJSONFields, true, true)
 }
 
 func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	row, err := g.viewPullRequestRow(ctx, input, prViewJSONFields)
+	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
+}
+
+func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
+	row, err := g.viewPullRequestRow(ctx, input, fields)
 	if err != nil && IsInaccessibleReviewRequestReviewerError(err) {
-		row, err = g.viewPullRequestRow(ctx, input, withoutJSONField(prViewJSONFields, "reviewRequests"))
+		row, err = g.viewPullRequestRow(ctx, input, withoutJSONField(fields, "reviewRequests"))
 	}
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
-	threads, err := g.fetchReviewThreads(ctx, input.Repo, input.PRNumber, input.CWD)
-	if err != nil {
-		return PullRequestDetail{}, err
+	threads := []map[string]any(nil)
+	if includeReviewThreads {
+		threads, err = g.fetchReviewThreads(ctx, input.Repo, input.PRNumber, input.CWD)
+		if err != nil {
+			return PullRequestDetail{}, err
+		}
 	}
+	issueComments := []CommentInfo(nil)
+	if includeIssueComments {
+		issueComments, err = g.ListIssueComments(ctx, ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
+		if err != nil {
+			return PullRequestDetail{}, err
+		}
+	}
+	return pullRequestDetailFromViewRow(row, threads, issueComments), nil
+}
+
+func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, issueComments []CommentInfo) PullRequestDetail {
 	return PullRequestDetail{
 		Number:             asInt64(row["number"]),
 		Title:              asString(row["title"]),
@@ -1399,19 +1427,19 @@ func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestI
 		BaseSHA:            asString(row["baseRefOid"]),
 		Author:             extractAuthor(row["author"]),
 		AuthorAssociation:  asString(row["authorAssociation"]),
-		CommentCount:       len(toObjectSlice(row["comments"])),
+		CommentCount:       len(issueComments),
 		ReviewRequests:     extractReviewRequestLogins(row["reviewRequests"]),
 		ReviewRequestUsers: extractReviewRequestUsers(row["reviewRequests"]),
 		HasConflicts:       asString(row["mergeStateStatus"]) == "DIRTY",
 		Comments:           threads,
-		IssueComments:      extractCommentInfos(toObjectSlice(row["comments"])),
+		IssueComments:      issueComments,
 		Reviews:            toObjectSlice(row["reviews"]),
 		Checks:             toObjectSlice(row["statusCheckRollup"]),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     asString(row["mergeable_state"]),
 		MergedAt:           asString(row["merged_at"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
-	}, nil
+	}
 }
 
 func (g *Gateway) viewPullRequestRow(ctx context.Context, input ViewPullRequestInput, fields []string) (map[string]any, error) {

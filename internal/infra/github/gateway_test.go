@@ -65,6 +65,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `[[{"id":14,"number":14,"title":"sub issue","url":"https://api.example.test/issues/14","html_url":"https://example.test/issues/14","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]]`}, nil
 		case args == "api --paginate --slurp repos/acme/looper/issues/8/comments":
 			return shell.Result{Stdout: `[[{"id":91,"body":"First human follow-up","html_url":"https://example.test/issues/8#issuecomment-91","created_at":"2026-05-03T13:00:00Z","updated_at":"2026-05-03T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]]`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
+			return shell.Result{Stdout: `[[{"id":92,"body":"conversation notice","html_url":"https://example.test/issues/42#issuecomment-92","created_at":"2026-05-04T13:00:00Z","updated_at":"2026-05-04T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]]`}, nil
 		case args == "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started":
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
@@ -192,7 +194,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if err := gateway.UpdatePullRequestBody(context.Background(), UpdatePullRequestBodyInput{Repo: "acme/looper", PRNumber: 42, Body: "Updated body"}); err != nil {
 		t.Fatalf("UpdatePullRequestBody() error = %v", err)
 	}
-	detail, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	detail, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
 	if err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}
@@ -378,6 +380,9 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 			}
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","createdAt":"2026-05-03T12:00:00Z","updatedAt":"2026-05-04T12:00:00Z","closedAt":"","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":[{"name":"ready"}],"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		}
+		if args == "api --paginate --slurp repos/acme/looper/issues/42/comments" {
+			return shell.Result{Stdout: `[[]]`}, nil
+		}
 		if strings.Contains(args, "reviewThreads") {
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
 		}
@@ -386,7 +391,7 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	detail, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	detail, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
 	if err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}
@@ -396,8 +401,48 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 	if detail.ReviewRequests != nil || detail.ReviewRequestUsers != nil {
 		t.Fatalf("fallback review requests = %#v/%#v, want unknown metadata", detail.ReviewRequests, detail.ReviewRequestUsers)
 	}
-	if len(runner.calls) != 3 {
-		t.Fatalf("gh calls = %#v, want primary view, fallback view, and review thread fetch", runner.calls)
+	if len(runner.calls) != 4 {
+		t.Fatalf("gh calls = %#v, want primary view, fallback view, review thread fetch, and issue comments fetch", runner.calls)
+	}
+}
+
+func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			fields := strings.TrimPrefix(args, "pr view 42 --repo acme/looper --json ")
+			if strings.Contains(fields, "comments") || strings.Contains(fields, "reviews") || strings.Contains(fields, "statusCheckRollup") {
+				t.Fatalf("metadata profile fields = %q, want no comments, reviews, or checks", fields)
+			}
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[]}`}, nil
+		case strings.HasPrefix(args, "pr view 43 --repo acme/looper --json "):
+			fields := strings.TrimPrefix(args, "pr view 43 --repo acme/looper --json ")
+			if strings.Contains(fields, "comments") || strings.Contains(fields, "reviews") {
+				t.Fatalf("fixer profile fields = %q, want no comments or reviews", fields)
+			}
+			if !strings.Contains(fields, "statusCheckRollup") {
+				t.Fatalf("fixer profile fields = %q, want checks", fields)
+			}
+			return shell.Result{Stdout: `{"number":43,"title":"Fix me","body":"Body","url":"https://example.test/pull/43","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"statusCheckRollup":[]}`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/43/comments":
+			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.Contains(args, "reviewThreads"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if _, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
+		t.Fatalf("ViewPullRequest() error = %v", err)
+	}
+	if _, err := gateway.ViewPullRequestForFixer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 43}); err != nil {
+		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
 	}
 }
 
@@ -1055,6 +1100,8 @@ func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
 		switch {
 		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
+			return shell.Result{Stdout: `[[]]`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-2","isResolved":true,"comments":{"nodes":[{"id":"comment-2","body":"second page"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && !strings.Contains(args, "-F after="):
@@ -1066,7 +1113,7 @@ func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	detail, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	detail, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
 	if err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}

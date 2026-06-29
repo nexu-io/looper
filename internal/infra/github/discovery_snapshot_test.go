@@ -31,11 +31,9 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {
 				{"number":11,"title":"Issue 11","body":"body","url":"https://example.com/issues/11","state":"OPEN","assignees":[{"login":"octo"}],"labels":[{"name":"ready"}]},
 				{"number":12,"title":"Issue 12","body":"body","url":"https://example.com/issues/12","state":"OPEN","assignees":[{"login":"other"}],"labels":[{"name":"other"}]}
 			]`}, nil
-		case strings.Contains(cmd, "pr view 1") && strings.Contains(cmd, "statusCheckRollup"):
+		case strings.Contains(cmd, "pr view 1") && !strings.Contains(cmd, "statusCheckRollup") && !strings.Contains(cmd, "comments") && !strings.Contains(cmd, "reviews"):
 			counts["pr_view"]++
-			return shell.Result{Stdout: `{"number":1,"title":"PR 1","body":"body","url":"https://example.com/pulls/1","state":"OPEN","labels":[{"name":"bug"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-1","baseRefOid":"base-1","author":{"login":"octo"},"comments":[],"reviewRequests":[],"reviews":[],"statusCheckRollup":[]}`}, nil
-		case strings.Contains(cmd, "api graphql") && strings.Contains(cmd, "reviewThreads"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+			return shell.Result{Stdout: `{"number":1,"title":"PR 1","body":"body","url":"https://example.com/pulls/1","state":"OPEN","labels":[{"name":"bug"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-1","baseRefOid":"base-1","author":{"login":"octo"},"reviewRequests":[]}`}, nil
 		case strings.Contains(cmd, "api user --jq .login"):
 			counts["user_login"]++
 			switch options.CWD {
@@ -133,14 +131,12 @@ func TestDiscoverySnapshotDoesNotCacheFailedPullRequestDetailFetch(t *testing.T)
 	gateway := New(Options{GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
 		cmd := strings.Join(options.Args, " ")
 		switch {
-		case strings.Contains(cmd, "pr view 7") && strings.Contains(cmd, "statusCheckRollup"):
+		case strings.Contains(cmd, "pr view 7") && !strings.Contains(cmd, "statusCheckRollup") && !strings.Contains(cmd, "comments") && !strings.Contains(cmd, "reviews"):
 			viewCalls++
 			if viewCalls == 1 {
 				return shell.Result{}, errors.New("temporary gh failure")
 			}
-			return shell.Result{Stdout: `{"number":7,"title":"PR 7","body":"body","url":"https://example.com/pulls/7","state":"OPEN","labels":[],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-7","baseRefOid":"base-7","author":{"login":"octo"},"comments":[],"reviewRequests":[],"reviews":[],"statusCheckRollup":[]}`}, nil
-		case strings.Contains(cmd, "api graphql") && strings.Contains(cmd, "reviewThreads"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+			return shell.Result{Stdout: `{"number":7,"title":"PR 7","body":"body","url":"https://example.com/pulls/7","state":"OPEN","labels":[],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-7","baseRefOid":"base-7","author":{"login":"octo"},"reviewRequests":[]}`}, nil
 		default:
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
 		}
