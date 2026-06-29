@@ -423,10 +423,10 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 			if strings.Contains(fields, "comments") || strings.Contains(fields, "reviews") {
 				t.Fatalf("fixer profile fields = %q, want no comments or reviews", fields)
 			}
-			if !strings.Contains(fields, "statusCheckRollup") {
-				t.Fatalf("fixer profile fields = %q, want checks", fields)
+			if !strings.Contains(fields, "statusCheckRollup") || !strings.Contains(fields, "reviewRequests") {
+				t.Fatalf("fixer profile fields = %q, want checks and review requests", fields)
 			}
-			return shell.Result{Stdout: `{"number":43,"title":"Fix me","body":"Body","url":"https://example.test/pull/43","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"statusCheckRollup":[]}`}, nil
+			return shell.Result{Stdout: `{"number":43,"title":"Fix me","body":"Body","url":"https://example.test/pull/43","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"login":"reviewer"}}],"statusCheckRollup":[]}`}, nil
 		case args == "api --paginate --slurp repos/acme/looper/issues/43/comments":
 			return shell.Result{Stdout: `[[]]`}, nil
 		case strings.Contains(args, "reviewThreads"):

@@ -32,11 +32,11 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {
 				{"number":12,"title":"Issue 12","body":"body","url":"https://example.com/issues/12","state":"OPEN","assignees":[{"login":"other"}],"labels":[{"name":"other"}]}
 			]`}, nil
 		case strings.Contains(cmd, "pr view 1"):
-			if !strings.Contains(cmd, "statusCheckRollup") || strings.Contains(cmd, "reviews") {
+			if !strings.Contains(cmd, "statusCheckRollup") || !strings.Contains(cmd, "reviewRequests") || strings.Contains(cmd, "reviews") {
 				t.Fatalf("pr view args = %q, want fixer fields", cmd)
 			}
 			counts["pr_view"]++
-			return shell.Result{Stdout: `{"number":1,"title":"PR 1","body":"body","url":"https://example.com/pulls/1","state":"OPEN","labels":[{"name":"bug"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-1","baseRefOid":"base-1","author":{"login":"octo"},"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
+			return shell.Result{Stdout: `{"number":1,"title":"PR 1","body":"body","url":"https://example.com/pulls/1","state":"OPEN","labels":[{"name":"bug"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-1","baseRefOid":"base-1","author":{"login":"octo"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"octo"}}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.Contains(cmd, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case cmd == "api --paginate --slurp repos/acme/looper/issues/1/comments":
@@ -143,10 +143,10 @@ func TestDiscoverySnapshotDoesNotCacheFailedPullRequestDetailFetch(t *testing.T)
 			if viewCalls == 1 {
 				return shell.Result{}, errors.New("temporary gh failure")
 			}
-			if !strings.Contains(cmd, "statusCheckRollup") || strings.Contains(cmd, "reviews") {
+			if !strings.Contains(cmd, "statusCheckRollup") || !strings.Contains(cmd, "reviewRequests") || strings.Contains(cmd, "reviews") {
 				t.Fatalf("pr view args = %q, want fixer fields", cmd)
 			}
-			return shell.Result{Stdout: `{"number":7,"title":"PR 7","body":"body","url":"https://example.com/pulls/7","state":"OPEN","labels":[],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-7","baseRefOid":"base-7","author":{"login":"octo"},"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
+			return shell.Result{Stdout: `{"number":7,"title":"PR 7","body":"body","url":"https://example.com/pulls/7","state":"OPEN","labels":[],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-7","baseRefOid":"base-7","author":{"login":"octo"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.Contains(cmd, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case cmd == "api --paginate --slurp repos/acme/looper/issues/7/comments":
@@ -168,7 +168,7 @@ func TestDiscoverySnapshotDoesNotCacheFailedPullRequestDetailFetch(t *testing.T)
 	}
 }
 
-func TestDiscoverySnapshotPreservesFixerSignalsInPullRequestDetail(t *testing.T) {
+func TestDiscoverySnapshotPreservesPendingWorkSignalsInPullRequestDetail(t *testing.T) {
 	t.Parallel()
 
 	counts := map[string]int{}
@@ -178,10 +178,10 @@ func TestDiscoverySnapshotPreservesFixerSignalsInPullRequestDetail(t *testing.T)
 		case strings.Contains(cmd, "pr view 9"):
 			counts["pr_view"]++
 			fields := strings.TrimPrefix(cmd, "pr view 9 --repo acme/looper --json ")
-			if !strings.Contains(fields, "statusCheckRollup") || strings.Contains(fields, "reviews") || strings.Contains(fields, "reviewRequests") {
-				t.Fatalf("pr view fields = %q, want fixer profile fields", fields)
+			if !strings.Contains(fields, "statusCheckRollup") || !strings.Contains(fields, "reviewRequests") || strings.Contains(fields, "reviews") {
+				t.Fatalf("pr view fields = %q, want pending-work profile fields", fields)
 			}
-			return shell.Result{Stdout: `{"number":9,"title":"PR 9","body":"body","url":"https://example.com/pulls/9","state":"OPEN","labels":[{"name":"looper:fixer"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-9","baseRefOid":"base-9","author":{"login":"octo"},"statusCheckRollup":[{"conclusion":"FAILURE"}]}`}, nil
+			return shell.Result{Stdout: `{"number":9,"title":"PR 9","body":"body","url":"https://example.com/pulls/9","state":"OPEN","labels":[{"name":"looper:fixer"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-9","baseRefOid":"base-9","author":{"login":"octo"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}}],"statusCheckRollup":[{"conclusion":"FAILURE"}]}`}, nil
 		case strings.Contains(cmd, "reviewThreads"):
 			counts["review_threads"]++
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"path":"main.go","line":12,"comments":{"nodes":[{"id":"comment-1","body":"Fix this","updatedAt":"2026-06-29T14:08:40Z","url":"https://example.com/pulls/9#discussion_r1","path":"main.go","line":12,"authorAssociation":"NONE","author":{"login":"reviewer"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
@@ -209,8 +209,11 @@ func TestDiscoverySnapshotPreservesFixerSignalsInPullRequestDetail(t *testing.T)
 	if len(first.Checks) != 1 || !strings.EqualFold(asString(first.Checks[0]["conclusion"]), "FAILURE") {
 		t.Fatalf("Checks = %#v, want failing check preserved", first.Checks)
 	}
-	if len(second.Comments) != 1 || len(second.Checks) != 1 {
-		t.Fatalf("cached detail = %#v, want fixer signals preserved", second)
+	if len(first.ReviewRequests) != 1 || first.ReviewRequests[0] != "reviewer" {
+		t.Fatalf("ReviewRequests = %#v, want pending reviewer preserved", first.ReviewRequests)
+	}
+	if len(second.Comments) != 1 || len(second.Checks) != 1 || len(second.ReviewRequests) != 1 {
+		t.Fatalf("cached detail = %#v, want pending-work signals preserved", second)
 	}
 	if counts["pr_view"] != 1 || counts["review_threads"] != 1 || counts["issue_comments"] != 1 {
 		t.Fatalf("counts = %#v, want each detail source fetched once", counts)
