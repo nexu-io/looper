@@ -168,7 +168,7 @@ func (s *DiscoverySnapshot) viewPullRequest(ctx context.Context, input ViewPullR
 		return detail, nil
 	}
 	s.mu.Unlock()
-	detail, err := s.gateway.viewPullRequestRaw(ctx, input)
+	detail, err := s.gateway.ViewPullRequestForFixer(ctx, input)
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
