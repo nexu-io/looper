@@ -1846,6 +1846,45 @@ func TestGatewayIgnoresMissingLabelDeleteErrors(t *testing.T) {
 	}
 }
 
+func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			fields := strings.TrimPrefix(args, "pr view 42 --repo acme/looper --json ")
+			for _, field := range []string{"reviews", "statusCheckRollup"} {
+				if !strings.Contains(fields, field) {
+					t.Fatalf("snapshot pr view fields = %q, want %s", fields, field)
+				}
+			}
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"FAILURE"}]}`}, nil
+		case strings.Contains(args, "reviewThreads"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"comments":{"nodes":[{"id":"comment-1","body":"Fix this"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
+			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "pr diff"):
+			return shell.Result{Stdout: "diff --git a/a.go b/a.go\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+
+	snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
+	}
+	if snapshot.ChecksSummary == nil || *snapshot.ChecksSummary != "FAILURE" {
+		t.Fatalf("ChecksSummary = %v, want FAILURE", snapshot.ChecksSummary)
+	}
+	if snapshot.UnresolvedThreadCount == nil || *snapshot.UnresolvedThreadCount != 1 {
+		t.Fatalf("UnresolvedThreadCount = %v, want 1", snapshot.UnresolvedThreadCount)
+	}
+}
+
 func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -1856,6 +1895,8 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
+		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
+			return shell.Result{Stdout: `[[]]`}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			result := shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"}
 			return result, &shell.CommandExecutionError{Message: result.Stderr, Result: result}

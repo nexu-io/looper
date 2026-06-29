@@ -103,7 +103,7 @@ type reviewerRepairGitHubAdapter struct {
 }
 
 func (a reviewerRepairGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
-	detail, err := a.gateway.ViewPullRequest(ctx, github.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, github.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}

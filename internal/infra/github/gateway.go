@@ -2590,7 +2590,7 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 }
 
 func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
-	detail, err := g.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	detail, err := g.ViewPullRequestForReviewer(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, err
 	}
