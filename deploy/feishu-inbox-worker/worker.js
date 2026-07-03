@@ -86,6 +86,11 @@ async function handleFeishuCallback(request, env) {
     )
     .run();
 
+  // card.action.trigger expects a card-action response; a toast gives the clicker
+  // immediate feedback. Plain events just get an ack.
+  if (evt.kind === "card_action") {
+    return json({ toast: { type: "success", content: "已收到,继续处理中…" } });
+  }
   return json({ code: 0, msg: "ok" });
 }
 
@@ -112,12 +117,33 @@ function normalizeEvent(body) {
       valueJson: "",
     };
   }
-  // Card action button click (older card callback shape).
-  if (body.action && body.action.value) {
+  // Card action button click, v2 shape (card.action.trigger): everything is nested
+  // under `event` — action.value + context.open_message_id + operator.open_id.
+  if (eventType === "card.action.trigger") {
+    const ev = body.event || {};
+    const action = ev.action || {};
+    if (action.value === undefined || action.value === null) return null;
+    const ctx = ev.context || {};
+    const operator = ev.operator || {};
     return {
       kind: "card_action",
-      chatId: (body.open_chat_id || "").trim(),
-      rootId: (body.open_message_id || "").trim(),
+      chatId: (ctx.open_chat_id || "").trim(),
+      rootId: (ctx.open_message_id || "").trim(),
+      threadId: "",
+      senderOpenId: (operator.open_id || operator.union_id || "").trim(),
+      text: "",
+      valueJson: JSON.stringify(action.value),
+    };
+  }
+  // Card action button click, legacy shape (card.action.trigger_v1): the older one
+  // carries open_chat_id/open_message_id at the top level; some variants nest them
+  // under `context`. Accept both so chat/root metadata survives.
+  if (body.action && body.action.value) {
+    const ctx = body.context || {};
+    return {
+      kind: "card_action",
+      chatId: (body.open_chat_id || ctx.open_chat_id || "").trim(),
+      rootId: (body.open_message_id || ctx.open_message_id || "").trim(),
       threadId: "",
       senderOpenId: (body.open_id || (body.operator && body.operator.open_id) || "").trim(),
       text: "",

@@ -29,6 +29,13 @@ type HITLAsk struct {
 	Transport    string `json:"transport,omitempty"`
 	PRNumber     int64  `json:"prNumber,omitempty"`
 	AskCommentID int64  `json:"askCommentId,omitempty"`
+
+	// The agent's decision brief — research + recommendation surfaced on the ask
+	// card so a human can confirm in seconds instead of researching from scratch.
+	Recommendation    string            `json:"recommendation,omitempty"`
+	RecommendedOption string            `json:"recommendedOption,omitempty"`
+	Consequences      map[string]string `json:"consequences,omitempty"`
+	Confidence        string            `json:"confidence,omitempty"`
 }
 
 // ReadHITLAsk extracts the HITL ask state from a loop's metadata JSON. The

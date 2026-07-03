@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/loops"
@@ -19,11 +20,15 @@ const hitlSentinelRelPath = ".looper/ask.json"
 
 // hitlPromptInstruction is appended to the worker prompt ONLY when hitl.enabled
 // is true. It tells the agent how to pause and ask a human instead of guessing.
-const hitlPromptInstruction = "\n\n---\nHUMAN-IN-THE-LOOP: If you hit a point where you genuinely need a human decision to proceed — an ambiguous product/design choice, a risky or irreversible action, or missing information only a human has — do NOT guess. Instead write a JSON file at `.looper/ask.json` in the repository root with the shape {\"question\": \"<one concise question>\", \"options\": [\"<option 1>\", \"<option 2>\"]}, then STOP immediately without making further changes. A human will answer and you will be resumed in this same session with their decision. Use this only for genuine blockers; when a reasonable default exists, proceed autonomously.\n---"
+const hitlPromptInstruction = "\n\n---\nHUMAN-IN-THE-LOOP: If you hit a point where you genuinely need a human decision to proceed — an ambiguous product/design choice, a risky or irreversible action, or missing information only a human has — do NOT guess. First DO YOUR HOMEWORK: investigate the codebase / context enough to form an opinion, then present it as a decision brief so the human can confirm in seconds rather than research from scratch. Write a JSON file at `.looper/ask.json` in the repository root with the shape:\n{\n  \"question\": \"<one concise question>\",\n  \"options\": [\"<option 1>\", \"<option 2>\"],\n  \"recommendation\": \"<1-2 sentences: what you found and what you'd do and why>\",\n  \"recommendedOption\": \"<the option you recommend, matching one of options>\",\n  \"consequences\": {\"<option 1>\": \"<what happens if picked>\", \"<option 2>\": \"<what happens if picked>\"},\n  \"confidence\": \"<high|medium|low>\"\n}\nThe question + options are required; recommendation, recommendedOption, consequences and confidence are strongly encouraged (a bare question with no research is a poor ask). Then STOP immediately without making further changes. A human will answer and you will be resumed in this same session with their decision. Use this only for genuine blockers; when a reasonable default exists, proceed autonomously.\n---"
 
 type hitlAsk struct {
-	Question string   `json:"question"`
-	Options  []string `json:"options"`
+	Question          string            `json:"question"`
+	Options           []string          `json:"options"`
+	Recommendation    string            `json:"recommendation,omitempty"`
+	RecommendedOption string            `json:"recommendedOption,omitempty"`
+	Consequences      map[string]string `json:"consequences,omitempty"`
+	Confidence        string            `json:"confidence,omitempty"`
 }
 
 // consumeAskSentinel reads and removes the agent's ask sentinel from the
@@ -63,6 +68,11 @@ type awaitingHumanError struct {
 	sessionID   string
 	executionID string
 	vendor      string
+	// The agent's decision brief (optional) — carried through to the ask card.
+	recommendation    string
+	recommendedOption string
+	consequences      map[string]string
+	confidence        string
 }
 
 func (e *awaitingHumanError) Error() string { return "worker paused awaiting human decision" }
@@ -153,7 +163,17 @@ func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePa
 		return nil, nil
 	}
 	sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)
-	return &awaitingHumanError{question: ask.Question, options: ask.Options, sessionID: sessionID, executionID: executionID, vendor: vendor}, nil
+	return &awaitingHumanError{
+		question:          ask.Question,
+		options:           ask.Options,
+		sessionID:         sessionID,
+		executionID:       executionID,
+		vendor:            vendor,
+		recommendation:    ask.Recommendation,
+		recommendedOption: ask.RecommendedOption,
+		consequences:      ask.Consequences,
+		confidence:        ask.Confidence,
+	}, nil
 }
 
 func (r *Runner) latestAgentSession(ctx context.Context, loopID string) (string, string) {
@@ -179,13 +199,17 @@ func (r *Runner) latestAgentSession(ctx context.Context, loopID string) (string,
 func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run storage.RunRecord, checkpoint workerCheckpoint, awaiting *awaitingHumanError) (ProcessResult, error) {
 	nowISO := r.nowISO()
 	ask := loops.HITLAsk{
-		Question:    awaiting.question,
-		Options:     awaiting.options,
-		SessionID:   awaiting.sessionID,
-		ExecutionID: awaiting.executionID,
-		Vendor:      awaiting.vendor,
-		Status:      "awaiting",
-		AskedAt:     nowISO,
+		Question:          awaiting.question,
+		Options:           awaiting.options,
+		SessionID:         awaiting.sessionID,
+		ExecutionID:       awaiting.executionID,
+		Vendor:            awaiting.vendor,
+		Status:            "awaiting",
+		AskedAt:           nowISO,
+		Recommendation:    awaiting.recommendation,
+		RecommendedOption: awaiting.recommendedOption,
+		Consequences:      awaiting.consequences,
+		Confidence:        awaiting.confidence,
 	}
 	// GitHub transport (default): post the question on a (draft) PR before parking,
 	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
@@ -216,16 +240,34 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		return ProcessResult{}, err
 	}
 	if !r.hitlTransportGitHub() && r.hitlNotify != nil {
-		if err := r.hitlNotify(ctx, HITLAskNotification{
-			ProjectID: input.Project.ID,
-			LoopID:    input.Loop.ID,
-			LoopSeq:   input.Loop.Seq,
-			RunID:     run.ID,
-			Repo:      derefString(input.Loop.Repo),
-			Title:     awaiting.question,
-			Question:  awaiting.question,
-			Options:   awaiting.options,
-		}); err != nil && r.logger != nil {
+		notif := HITLAskNotification{
+			ProjectID:         input.Project.ID,
+			LoopID:            input.Loop.ID,
+			LoopSeq:           input.Loop.Seq,
+			RunID:             run.ID,
+			Repo:              derefString(input.Loop.Repo),
+			Title:             awaiting.question,
+			Question:          awaiting.question,
+			Options:           awaiting.options,
+			Recommendation:    awaiting.recommendation,
+			RecommendedOption: awaiting.recommendedOption,
+			Consequences:      awaiting.consequences,
+			Confidence:        awaiting.confidence,
+		}
+		// Source + trigger come from the loop's work metadata (issue #, url, author).
+		if w := checkpoint.Work; w != nil {
+			notif.TriggerLogin = w.TriggerLogin
+			switch {
+			case w.PRNumber > 0:
+				notif.SourceType = "GitHub PR"
+				notif.SourceRef = "#" + strconv.FormatInt(w.PRNumber, 10)
+			case w.IssueNumber > 0:
+				notif.SourceType = "GitHub Issue"
+				notif.SourceRef = "#" + strconv.FormatInt(w.IssueNumber, 10)
+				notif.SourceURL = w.IssueURL
+			}
+		}
+		if err := r.hitlNotify(ctx, notif); err != nil && r.logger != nil {
 			// The loop is already parked in awaiting_human; if the human is never
 			// notified they must find it via the dashboard / API. Surface loudly so an
 			// unconfigured or failing notifier can't silently strand a run.

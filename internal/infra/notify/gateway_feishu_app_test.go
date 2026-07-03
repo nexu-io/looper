@@ -334,6 +334,69 @@ func TestBuildFeishuAskCardRendersMention(t *testing.T) {
 	}
 }
 
+func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
+	card, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq:  132,
+		Repo:     "nexu-io/synclo-test",
+		Title:    "welcome.txt 用哪种语言?",
+		Question: "welcome.txt 用哪种语言?",
+		Options:  []string{"中文", "英文"},
+
+		SourceType:   "GitHub Issue",
+		SourceRef:    "#132",
+		SourceURL:    "https://github.com/nexu-io/synclo-test/issues/132",
+		TriggerLogin: "lefarcen",
+
+		Recommendation:    "README 都是中文,推荐中文。",
+		RecommendedOption: "中文",
+		Consequences:      map[string]string{"中文": "写\"欢迎…\"", "英文": "写\"Welcome…\""},
+		Confidence:        "medium",
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard() error = %v", err)
+	}
+	raw := string(card)
+	for _, want := range []string{
+		"GitHub Issue #132",                                  // source label
+		"https://github.com/nexu-io/synclo-test/issues/132",  // clickable link
+		"由 @lefarcen 提出",                                     // trigger attribution
+		"README 都是中文",                                        // recommendation
+		"中文 ⭐",                                               // recommended option marked
+		"置信度 中",                                              // confidence
+		"写\\\"Welcome",                                        // a consequence (quote json-escaped)
+	} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("decision-brief card missing %q\ncard=%s", want, raw)
+		}
+	}
+
+	// A bare ask (no brief) must still render — the fields are optional.
+	bare, err := buildFeishuAskCard(HITLAskCard{LoopSeq: 1, Question: "A or B?", Options: []string{"A", "B"}})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(bare) error = %v", err)
+	}
+	if strings.Contains(string(bare), "⭐") || strings.Contains(string(bare), "置信度") {
+		t.Fatalf("bare ask should not render brief decorations: %s", string(bare))
+	}
+}
+
+func TestFeishuLoopStatusStyle(t *testing.T) {
+	cases := map[string]struct{ template, contains string }{
+		"awaiting_human": {"orange", "等你定夺"},
+		"completed":      {"green", "已完成"},
+		"failed":         {"red", "需要处理"},
+		"abandoned":      {"red", "需要处理"},
+		"running":        {"blue", "处理中"},
+		"":               {"blue", "处理中"},
+	}
+	for status, want := range cases {
+		gotT, gotL := feishuLoopStatusStyle(status)
+		if gotT != want.template || !strings.Contains(gotL, want.contains) {
+			t.Fatalf("feishuLoopStatusStyle(%q) = (%q, %q); want template %q label~%q", status, gotT, gotL, want.template, want.contains)
+		}
+	}
+}
+
 // cardText concatenates all lark_md element contents from a card JSON, decoded
 // (so JSON < escapes appear as the < the way Feishu renders them).
 func cardText(t *testing.T, card []byte) string {

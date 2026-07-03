@@ -445,6 +445,9 @@ func (g *Gateway) recordFeishuApp(ctx context.Context, payload SystemNotificatio
 	// message under the loop's root so a task's updates aggregate into one Feishu
 	// thread instead of stacking as separate cards.
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, payload.LoopID)
+	// Refresh the anchor card so its colour/label tracks the loop's status
+	// (processing → done/failed) as lifecycle updates arrive.
+	g.updateFeishuThreadHeader(ctx, token, payload.LoopID)
 	content, err := json.Marshal(map[string]string{"text": feishuNotificationText(payload)})
 	if err != nil {
 		return persist(build("failed", err.Error(), nil))
@@ -483,6 +486,29 @@ type HITLAskCard struct {
 	Question       string
 	Options        []string
 	MentionOpenIds []string
+
+	// Source identifies where the task came from so the human knows what they are
+	// deciding about. SourceType is a human label ("GitHub Issue", "GitHub PR",
+	// "Plane"), SourceRef the short id ("#132"), SourceURL the clickable link.
+	SourceType string
+	SourceRef  string
+	SourceURL  string
+	// TriggerLogin is who created/assigned the task (GitHub login / Plane account),
+	// rendered as attribution so the human knows whose work this is.
+	TriggerLogin string
+
+	// The following are the agent's decision brief — populated when the agent did
+	// its homework before asking. All optional: the card renders gracefully without
+	// them, but a good ask should carry them.
+	//
+	// Recommendation is a short "here's what I found + what I'd do" summary.
+	Recommendation string
+	// RecommendedOption, when it matches one of Options, marks that button ⭐.
+	RecommendedOption string
+	// Consequences maps an option to a one-line "what happens if you pick this".
+	Consequences map[string]string
+	// Confidence is the agent's self-assessed certainty ("high"/"medium"/"low").
+	Confidence string
 }
 
 // feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
@@ -523,6 +549,8 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	// Thread the ask card under the loop's root so the question lands in the same
 	// thread as the task's other updates. Card buttons still work inside a thread.
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
+	// The loop is awaiting_human now — turn the anchor card orange "等你定夺".
+	g.updateFeishuThreadHeader(ctx, token, card.LoopID)
 	if _, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON)); err != nil {
 		return err
 	}
@@ -539,33 +567,64 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 		body = title
 	}
 	seq := strconv.FormatInt(card.LoopSeq, 10)
+	recommended := strings.TrimSpace(card.RecommendedOption)
+
+	// Option buttons — the recommended one is marked ⭐ and stays "primary"; the
+	// rest drop to "default" so the recommendation reads at a glance.
 	actions := make([]any, 0, len(card.Options))
 	for _, option := range card.Options {
 		option = strings.TrimSpace(option)
 		if option == "" {
 			continue
 		}
+		label := option
+		btnType := "primary"
+		if recommended != "" {
+			if strings.EqualFold(option, recommended) {
+				label = option + " ⭐"
+			} else {
+				btnType = "default"
+			}
+		}
 		actions = append(actions, map[string]any{
 			"tag":   "button",
-			"type":  "primary",
-			"text":  map[string]any{"tag": "plain_text", "content": option},
+			"type":  btnType,
+			"text":  map[string]any{"tag": "plain_text", "content": label},
 			"value": map[string]any{"loopSeq": seq, "answer": option},
 		})
 	}
-	noteParts := []string{"Looper HITL · loop " + seq}
-	if strings.TrimSpace(card.Repo) != "" {
-		noteParts = append(noteParts, card.Repo)
-	}
-	elements := make([]any, 0, 4)
+
+	elements := make([]any, 0, 8)
 	// @-mention the humans who need to act, so an ask isn't missed in a busy group.
 	if mention := feishuMentionMarkup(card.MentionOpenIds); mention != "" {
-		elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": mention + " 需要你定夺 👇"}})
+		elements = append(elements, larkDiv(mention+" 需要你定夺 👇"))
 	}
-	elements = append(elements, map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": "**" + title + "**\n" + body}})
+	// Source line: what this is (Issue/PR + link) · repo · who triggered it.
+	if src := feishuSourceLine(card); src != "" {
+		elements = append(elements, larkDiv(src))
+		elements = append(elements, map[string]any{"tag": "hr"})
+	}
+	// The question itself.
+	elements = append(elements, larkDiv("**"+title+"**\n"+body))
+	// The agent's decision brief — research + recommendation.
+	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
+		elements = append(elements, larkDiv("🔎 "+rec))
+	}
+	// Options.
 	if len(actions) > 0 {
 		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
 	}
-	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ") + " · click an option to answer"}}})
+	// Per-option consequences: pick this → that happens.
+	if conseq := feishuConsequences(card); conseq != "" {
+		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": conseq}}})
+	}
+	// Footer note: confidence · blocking · loop.
+	noteParts := make([]string, 0, 4)
+	if c := feishuConfidenceLabel(card.Confidence); c != "" {
+		noteParts = append(noteParts, c)
+	}
+	noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
+	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
@@ -573,6 +632,59 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 		"elements": elements,
 	}
 	return json.Marshal(cardObj)
+}
+
+// larkDiv is a text block that renders lark markdown (bold, links, @-mentions).
+func larkDiv(content string) map[string]any {
+	return map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": content}}
+}
+
+// feishuSourceLine renders "📋 [GitHub Issue #132](url) · repo · 由 @who 提出".
+// Returns "" when there is nothing worth showing.
+func feishuSourceLine(card HITLAskCard) string {
+	parts := make([]string, 0, 3)
+	label := strings.TrimSpace(strings.TrimSpace(card.SourceType) + " " + strings.TrimSpace(card.SourceRef))
+	if label != "" {
+		if url := strings.TrimSpace(card.SourceURL); url != "" {
+			parts = append(parts, "📋 ["+label+"]("+url+")")
+		} else {
+			parts = append(parts, "📋 "+label)
+		}
+	}
+	if repo := strings.TrimSpace(card.Repo); repo != "" {
+		parts = append(parts, repo)
+	}
+	if who := strings.TrimSpace(card.TriggerLogin); who != "" {
+		parts = append(parts, "由 @"+strings.TrimPrefix(who, "@")+" 提出")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// feishuConsequences renders "中文 → …\n英文 → …" for options that have one.
+func feishuConsequences(card HITLAskCard) string {
+	if len(card.Consequences) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(card.Options))
+	for _, option := range card.Options {
+		option = strings.TrimSpace(option)
+		if v := strings.TrimSpace(card.Consequences[option]); v != "" {
+			lines = append(lines, option+" → "+v)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func feishuConfidenceLabel(confidence string) string {
+	switch strings.ToLower(strings.TrimSpace(confidence)) {
+	case "high":
+		return "置信度 高"
+	case "medium", "med":
+		return "置信度 中"
+	case "low":
+		return "置信度 低"
+	}
+	return ""
 }
 
 // feishuTenantToken returns a cached tenant_access_token when still valid, else
@@ -692,11 +804,20 @@ func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loo
 	if root, err := g.repositories.FeishuThreads.RootByLoop(ctx, loopID); err == nil && root != "" {
 		return root
 	}
-	content, err := json.Marshal(map[string]string{"text": g.feishuThreadHeaderText(ctx, loopID)})
-	if err != nil {
-		return ""
+	// The thread anchor is the first thing a human sees, so render it as a compact
+	// task-header card (linked source · repo · trigger · title); fall back to plain
+	// text if the loop can't be loaded into a card.
+	msgType, content := "text", ""
+	if cardJSON, ok := g.feishuThreadHeaderCard(ctx, loopID); ok {
+		msgType, content = "interactive", cardJSON
+	} else {
+		raw, err := json.Marshal(map[string]string{"text": g.feishuThreadHeaderText(ctx, loopID)})
+		if err != nil {
+			return ""
+		}
+		content = string(raw)
 	}
-	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, "", "text", string(content))
+	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, "", msgType, content)
 	if err != nil || msgID == "" {
 		return ""
 	}
@@ -733,6 +854,143 @@ func (g *Gateway) feishuThreadHeaderText(ctx context.Context, loopID string) str
 		head += "\n" + title
 	}
 	return head
+}
+
+// feishuThreadHeaderCard renders the thread anchor as a compact task-header card:
+// a linked source (Issue #N → url) · repo · who triggered it, plus the title.
+// Returns ("", false) when the loop can't be loaded, so the caller falls back to
+// the plain-text header.
+func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (string, bool) {
+	if g.repositories == nil || g.repositories.Loops == nil {
+		return "", false
+	}
+	loop, err := g.repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return "", false
+	}
+	target := ""
+	if loop.TargetID != nil {
+		target = *loop.TargetID
+	}
+	label := humanizeLoopTarget(target)
+	issueURL := loopWorkerString(loop.MetadataJSON, "issueUrl")
+	trigger := loopWorkerString(loop.MetadataJSON, "triggerLogin")
+	repo := ""
+	if loop.Repo != nil {
+		repo = strings.TrimSpace(*loop.Repo)
+	}
+	title := loopTitleFromMetadata(loop.MetadataJSON)
+
+	parts := make([]string, 0, 3)
+	if label != "" {
+		if issueURL != "" {
+			parts = append(parts, "📋 ["+label+"]("+issueURL+")")
+		} else {
+			parts = append(parts, "📋 "+label)
+		}
+	}
+	if repo != "" {
+		parts = append(parts, repo)
+	}
+	if trigger != "" {
+		parts = append(parts, "由 @"+strings.TrimPrefix(trigger, "@")+" 提出")
+	}
+	if len(parts) == 0 && title == "" {
+		return "", false
+	}
+	elements := make([]any, 0, 3)
+	if len(parts) > 0 {
+		elements = append(elements, larkDiv(strings.Join(parts, " · ")))
+	}
+	if title != "" {
+		elements = append(elements, larkDiv("**"+title+"**"))
+	}
+	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "展开话题看进展与待办 →"}}})
+	template, label := feishuLoopStatusStyle(loop.Status)
+	cardObj := map[string]any{
+		"config":   map[string]any{"wide_screen_mode": true},
+		"header":   map[string]any{"template": template, "title": map[string]any{"tag": "plain_text", "content": label}},
+		"elements": elements,
+	}
+	raw, err := json.Marshal(cardObj)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+// feishuLoopStatusStyle maps a loop status to the thread-header card's colour +
+// label, so the anchor card visibly reflects where the task is: processing (blue)
+// → awaiting a human (orange) → done (green) → needs attention (red).
+func feishuLoopStatusStyle(status string) (template, label string) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "awaiting_human":
+		return "orange", "⏸ Looper 等你定夺"
+	case "completed", "done", "merged":
+		return "green", "✅ Looper 已完成"
+	case "failed", "abandoned", "error":
+		return "red", "⚠️ Looper 需要处理"
+	default:
+		return "blue", "🔧 Looper 处理中"
+	}
+}
+
+// updateFeishuThreadHeader re-renders a loop's thread-anchor card to reflect its
+// current status (colour + label). Best-effort: a loop with no root card yet, or
+// a failed PATCH, is a no-op.
+func (g *Gateway) updateFeishuThreadHeader(ctx context.Context, token, loopID string) {
+	if g.repositories == nil || g.repositories.FeishuThreads == nil {
+		return
+	}
+	root, err := g.repositories.FeishuThreads.RootByLoop(ctx, strings.TrimSpace(loopID))
+	if err != nil || strings.TrimSpace(root) == "" {
+		return
+	}
+	cardJSON, ok := g.feishuThreadHeaderCard(ctx, loopID)
+	if !ok {
+		return
+	}
+	_ = g.patchFeishuAppCard(ctx, token, root, cardJSON)
+}
+
+// patchFeishuAppCard updates an already-sent interactive card in place.
+func (g *Gateway) patchFeishuAppCard(ctx context.Context, token, messageID, content string) error {
+	apiURL := feishuAPIBase + "/open-apis/im/v1/messages/" + strings.TrimSpace(messageID)
+	body, err := json.Marshal(map[string]any{"content": content})
+	if err != nil {
+		return err
+	}
+	status, respBody, err := g.feishuAppHTTP(ctx, http.MethodPatch, apiURL, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json; charset=utf-8",
+	}, body)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("feishu update card responded with status %d", status)
+	}
+	if code, msg := feishuResponseCode(respBody); code != 0 {
+		return fmt.Errorf("feishu update card error code %d: %s", code, msg)
+	}
+	return nil
+}
+
+// loopWorkerString extracts worker.<key> (a string) from a loop's metadata JSON.
+func loopWorkerString(metadataJSON *string, key string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return ""
+	}
+	if w, ok := meta["worker"].(map[string]any); ok {
+		if v, ok := w[key].(string); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // humanizeLoopTarget turns a loop target id ("issue:owner/repo:360",

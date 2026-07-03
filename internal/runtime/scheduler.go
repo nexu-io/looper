@@ -1519,7 +1519,7 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 	}
 	result := make([]worker.IssueSummary, 0, len(issues))
 	for _, issue := range issues {
-		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
+		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
 	}
 	return result, nil
 }
@@ -2155,7 +2155,16 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		HITLAnswerTransport: cfg.HITL.AnswerTransport,
 		HITLGitHub:          hitlGitHubSettings(cfg.HITL.GitHub),
 		HITLNotify: func(ctx context.Context, ask worker.HITLAskNotification) error {
-			return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq, Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options})
+			return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
+				ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
+				Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
+				SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
+				TriggerLogin:      ask.TriggerLogin,
+				Recommendation:    ask.Recommendation,
+				RecommendedOption: ask.RecommendedOption,
+				Consequences:      ask.Consequences,
+				Confidence:        ask.Confidence,
+			})
 		},
 	})
 	claimMu := &sync.Mutex{}
