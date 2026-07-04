@@ -20,7 +20,28 @@ const hitlSentinelRelPath = ".looper/ask.json"
 
 // hitlPromptInstruction is appended to the worker prompt ONLY when hitl.enabled
 // is true. It tells the agent how to pause and ask a human instead of guessing.
-const hitlPromptInstruction = "\n\n---\nHUMAN-IN-THE-LOOP: If you hit a point where you genuinely need a human decision to proceed — an ambiguous product/design choice, a risky or irreversible action, or missing information only a human has — do NOT guess. First DO YOUR HOMEWORK: investigate the codebase / context enough to form an opinion, then present it as a decision brief so the human can confirm in seconds rather than research from scratch. Write a JSON file at `.looper/ask.json` in the repository root with the shape:\n{\n  \"question\": \"<one concise question>\",\n  \"options\": [\"<option 1>\", \"<option 2>\"],\n  \"recommendation\": \"<1-2 sentences: what you found and what you'd do and why>\",\n  \"recommendedOption\": \"<the option you recommend, matching one of options>\",\n  \"consequences\": {\"<option 1>\": \"<what happens if picked>\", \"<option 2>\": \"<what happens if picked>\"},\n  \"confidence\": \"<high|medium|low>\"\n}\nThe question + options are required; recommendation, recommendedOption, consequences and confidence are strongly encouraged (a bare question with no research is a poor ask). Then STOP immediately without making further changes. A human will answer and you will be resumed in this same session with their decision. Use this only for genuine blockers; when a reasonable default exists, proceed autonomously.\n---"
+const hitlPromptInstruction = `
+
+---
+HUMAN-IN-THE-LOOP: You are trusted to make implementation decisions yourself. Being ABLE to form a reasonable recommendation is NOT a reason to ask a human — it is a reason to PROCEED. Do your homework (read the codebase and context), pick the best option, and carry on. State what you chose and why in your PR description so a human can course-correct in review — that review IS the checkpoint for reversible calls.
+
+Escalate to a human — by writing a JSON file at .looper/ask.json in the repository root and then STOPPING — ONLY when one of these genuinely holds:
+  1. You cannot form a confident recommendation: the options are a real toss-up, or the choice hinges on information only a human has (product intent, private context, an unstated requirement).
+  2. The action is high-stakes or hard to reverse: destructive or data-losing, security- or privacy-sensitive, a public or contractual commitment, or it spends real money — a human should sign off even when you have an opinion.
+  3. It is a direction or strategy call, not an implementation detail.
+For everything else — naming, file contents, formats, defaults, structure, which reversible approach to take — DECIDE and proceed. Do not ask.
+
+When you DO escalate, make it a decision brief the human can confirm in seconds (not raw research):
+{
+  "question": "<one concise question>",
+  "options": ["<option 1>", "<option 2>"],
+  "recommendation": "<1-2 sentences: what you found, what you'd do, and why>",
+  "recommendedOption": "<the option you recommend, matching one of options>",
+  "consequences": {"<option 1>": "<what happens if picked>", "<option 2>": "<what happens if picked>"},
+  "confidence": "<high|medium|low>"
+}
+question + options are required; the rest are strongly encouraged (a bare question with no homework is a poor ask). Then STOP immediately without making further changes. A human will answer and you will be resumed in this same session with their decision.
+---`
 
 type hitlAsk struct {
 	Question          string            `json:"question"`

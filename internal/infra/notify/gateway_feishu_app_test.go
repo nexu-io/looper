@@ -361,7 +361,7 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 		"https://github.com/nexu-io/synclo-test/issues/132",  // clickable link
 		"由 @lefarcen 提出",                                     // trigger attribution
 		"README 都是中文",                                        // recommendation
-		"中文 ⭐",                                               // recommended option marked
+		"⭐ 中文 · 推荐",                                          // recommended option marked prominently
 		"置信度 中",                                              // confidence
 		"写\\\"Welcome",                                        // a consequence (quote json-escaped)
 	} {

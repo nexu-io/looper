@@ -1929,6 +1929,19 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		Repositories:  repos,
 		Now:           now,
 	})
+	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
+	// CURRENT status (colour + label), without disturbing the retained live tail.
+	// The anchor is otherwise only patched opportunistically by the progress ticker
+	// (OnProgress) while an agent runs — so a loop that finishes quickly, or leaves
+	// awaiting_human on resume, would leave a stale "🔧 处理中 / ⏸ 等你定夺" header
+	// forever. Calling this on every run start/finish makes the header converge to
+	// the real status. App-mode only; a no-op otherwise.
+	refreshFeishuAnchor := func(ctx context.Context, loopID string) {
+		if strings.TrimSpace(loopID) == "" || !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+			return
+		}
+		notificationGateway.RefreshThreadHeader(ctx, loopID, nil, 0)
+	}
 	notifyAgentExecutionStarted := func(ctx context.Context, input agentExecutionNotificationInput) error {
 		notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
 			ID:         input.ExecutionID,
@@ -1943,6 +1956,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			EntityID:   input.ExecutionID,
 			DedupeKey:  input.DedupeKey,
 		})
+		refreshFeishuAnchor(ctx, input.LoopID)
 		return nil
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
@@ -1983,6 +1997,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			payload.DedupeKey = fmt.Sprintf("runtime.worker.completed:%s", input.RunID)
 		}
 		notificationGateway.Notify(ctx, payload)
+		refreshFeishuAnchor(ctx, input.LoopID)
 		return nil
 	}
 

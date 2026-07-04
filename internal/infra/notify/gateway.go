@@ -649,7 +649,7 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 		btnType := "primary"
 		if recommended != "" {
 			if strings.EqualFold(option, recommended) {
-				label = option + " ⭐"
+				label = "⭐ " + option + " · 推荐"
 			} else {
 				btnType = "default"
 			}
