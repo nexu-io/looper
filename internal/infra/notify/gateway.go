@@ -1063,6 +1063,12 @@ func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail [
 	if err != nil {
 		return
 	}
+	// Ensure the anchor exists NOW so live progress is visible DURING the run: the
+	// lifecycle Notify path that would otherwise create it is level-filtered (info
+	// updates are dropped) and only fires the anchor at completion. Idempotent.
+	if chatID := strings.TrimSpace(cfg.ChatID); chatID != "" {
+		g.ensureFeishuThreadRoot(ctx, token, chatID, loopID)
+	}
 	// Anchor (topic root) → human brief; live tool feed → its own reply in-thread.
 	g.updateFeishuThreadHeader(ctx, token, loopID)
 	g.updateLiveFeedComment(ctx, token, loopID, tail, elapsedSec)
