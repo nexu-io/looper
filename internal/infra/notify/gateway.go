@@ -89,6 +89,11 @@ type Gateway struct {
 	// built from) so the card can be patched to its resolved "✅ 已选:X" state when
 	// the answer arrives — keeping the full brief for review.
 	askCards map[string]askCardState
+	// liveFeeds remembers each loop's live-progress comment (a reply threaded under
+	// the anchor). The raw tool-call feed lives HERE — inside the thread — so the
+	// outer anchor card stays a human-scannable brief. Keyed by loop id → message id;
+	// posted on first activity, patched in place thereafter.
+	liveFeeds map[string]string
 }
 
 type askCardState struct {
@@ -981,19 +986,19 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if title != "" {
 		elements = append(elements, larkDiv("**"+title+"**"))
 	}
-	// Live activity tail (last few agent output lines) + elapsed. Written by the
-	// progress ticker while the agent runs, and left in place after completion so
-	// the card shows what it was doing right up to the end.
+	// A human-scannable brief — NOT the raw tool feed (that lives inside the thread,
+	// see updateLiveFeedComment). Prefer the agent's own summary; fall back to a
+	// one-line natural-language phase derived from the latest activity.
 	tail, elapsed := g.liveTailFor(loopID)
-	if len(tail) > 0 {
+	if brief := feishuAnchorBrief(loop, tail); brief != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})
-		elements = append(elements, larkDiv(feishuActivityTail(tail)))
+		elements = append(elements, larkDiv(brief))
 	}
 	noteParts := make([]string, 0, 2)
 	if elapsed > 0 {
 		noteParts = append(noteParts, "⏱ "+humanizeElapsedSeconds(elapsed))
 	}
-	noteParts = append(noteParts, "展开话题看进展与待办 →")
+	noteParts = append(noteParts, "展开话题看实时进度 →")
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 	template, label := feishuLoopStatusStyle(loop.Status)
 	cardObj := map[string]any{
@@ -1058,7 +1063,53 @@ func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail [
 	if err != nil {
 		return
 	}
+	// Anchor (topic root) → human brief; live tool feed → its own reply in-thread.
 	g.updateFeishuThreadHeader(ctx, token, loopID)
+	g.updateLiveFeedComment(ctx, token, loopID, tail, elapsedSec)
+}
+
+// updateLiveFeedComment posts (first time) or patches (thereafter) the raw
+// tool-call feed as a reply threaded under the loop's anchor — the in-thread
+// real-time status sync surface. A no-op until the anchor root exists or when
+// there is no activity yet (so a terminal refresh with an empty tail leaves the
+// last feed in place rather than blanking it).
+func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID string, tail []string, elapsedSec int64) {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" || len(tail) == 0 || g.repositories == nil || g.repositories.FeishuThreads == nil {
+		return
+	}
+	root, err := g.repositories.FeishuThreads.RootByLoop(ctx, loopID)
+	if err != nil || strings.TrimSpace(root) == "" {
+		return // anchor not posted yet — nothing to thread under
+	}
+	cardJSON, ok := feishuLiveFeedCard(tail, elapsedSec)
+	if !ok {
+		return
+	}
+	g.liveMu.Lock()
+	msgID := ""
+	if g.liveFeeds != nil {
+		msgID = g.liveFeeds[loopID]
+	}
+	g.liveMu.Unlock()
+	if msgID != "" {
+		_ = g.patchFeishuAppCard(ctx, token, msgID, cardJSON)
+		return
+	}
+	chatID := strings.TrimSpace(g.config.Webhook.ChatID)
+	if chatID == "" {
+		return
+	}
+	newID, err := g.postFeishuAppMessage(ctx, token, chatID, root, "interactive", cardJSON)
+	if err != nil || strings.TrimSpace(newID) == "" {
+		return
+	}
+	g.liveMu.Lock()
+	if g.liveFeeds == nil {
+		g.liveFeeds = map[string]string{}
+	}
+	g.liveFeeds[loopID] = newID
+	g.liveMu.Unlock()
 }
 
 // liveTailFor returns the retained live activity snapshot for a loop.
@@ -1139,7 +1190,7 @@ func loopWorkerString(metadataJSON *string, key string) string {
 // feishuActivityTail renders the last few agent output lines as a compact log.
 func feishuActivityTail(lines []string) string {
 	rendered := make([]string, 0, len(lines)+1)
-	rendered = append(rendered, "🔧 最近活动")
+	rendered = append(rendered, "🔧 实时进度")
 	for _, line := range lines {
 		if len(line) > 90 {
 			line = line[:90] + "…"
@@ -1147,6 +1198,91 @@ func feishuActivityTail(lines []string) string {
 		rendered = append(rendered, "· "+line)
 	}
 	return strings.Join(rendered, "\n")
+}
+
+// feishuAnchorBrief returns the one-line, human-scannable status for the anchor
+// card — NOT the raw tool feed. It prefers the agent's own summary (genuinely
+// AI-written, present once the loop reaches a terminal/awaiting state) and falls
+// back to a natural-language phase inferred from the latest activity while the
+// agent is still running. Returns "" when there is nothing meaningful to say yet.
+func feishuAnchorBrief(loop *storage.LoopRecord, tail []string) string {
+	if loop != nil {
+		for _, key := range []string{"summary", "changeSummary", "resultSummary", "outcome"} {
+			if s := loopWorkerString(loop.MetadataJSON, key); s != "" {
+				if len(s) > 160 {
+					s = s[:160] + "…"
+				}
+				return "📝 " + s
+			}
+		}
+	}
+	if phase := feishuPhaseFromTail(tail); phase != "" {
+		return "🔧 " + phase
+	}
+	return ""
+}
+
+// feishuPhaseFromTail maps the most recent tool command to a short natural-language
+// phase ("正在开 PR", "正在跑测试", …) so a human scanning the group sees WHAT the
+// agent is doing rather than a raw shell line. Falls back to the trimmed command.
+func feishuPhaseFromTail(tail []string) string {
+	if len(tail) == 0 {
+		return ""
+	}
+	line := tail[len(tail)-1]
+	// Strip the leading status icon ("✅ " / "❌ " / "⏳ ") the tool feed prefixes.
+	if i := strings.IndexByte(line, ' '); i >= 0 && len([]rune(line[:i])) <= 2 {
+		line = strings.TrimSpace(line[i+1:])
+	}
+	lower := strings.ToLower(line)
+	switch {
+	case strings.Contains(lower, "gh pr create") || strings.Contains(lower, "pull request"):
+		return "正在开 PR"
+	case strings.Contains(lower, "gh pr ") || strings.Contains(lower, "gh api"):
+		return "正在处理 PR"
+	case strings.Contains(lower, "git push"):
+		return "正在推送分支"
+	case strings.Contains(lower, "git commit"):
+		return "正在提交改动"
+	case strings.Contains(lower, "git clone") || strings.Contains(lower, "git checkout") || strings.Contains(lower, "git fetch") || strings.Contains(lower, "git worktree"):
+		return "正在准备代码"
+	case strings.Contains(lower, "test") || strings.Contains(lower, "vitest") || strings.Contains(lower, "jest") || strings.Contains(lower, "pytest") || strings.Contains(lower, "lint") || strings.Contains(lower, "build"):
+		return "正在跑测试/构建"
+	case strings.Contains(lower, "apply_patch") || strings.Contains(lower, "sed -i") || strings.Contains(lower, "tee ") || strings.HasPrefix(lower, "cat >") || strings.Contains(lower, " > "):
+		return "正在改动代码"
+	case strings.HasPrefix(lower, "rg ") || strings.HasPrefix(lower, "grep ") || strings.HasPrefix(lower, "ls ") || strings.HasPrefix(lower, "cat ") || strings.HasPrefix(lower, "find ") || strings.Contains(lower, "git status") || strings.Contains(lower, "git log") || strings.Contains(lower, "git diff"):
+		return "正在阅读代码"
+	default:
+		if len(line) > 60 {
+			line = line[:60] + "…"
+		}
+		return line
+	}
+}
+
+// feishuLiveFeedCard renders the raw tool-call feed as a standalone card, posted
+// as the first reply INSIDE the thread — the real-time status sync surface, kept
+// separate from the human-scannable anchor.
+func feishuLiveFeedCard(tail []string, elapsedSec int64) (string, bool) {
+	if len(tail) == 0 {
+		return "", false
+	}
+	elements := []any{larkDiv(feishuActivityTail(tail))}
+	note := "实时更新中"
+	if elapsedSec > 0 {
+		note = "⏱ " + humanizeElapsedSeconds(elapsedSec) + " · 实时更新中"
+	}
+	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": note}}})
+	cardObj := map[string]any{
+		"config":   map[string]any{"wide_screen_mode": true},
+		"header":   map[string]any{"template": "wathet", "title": map[string]any{"tag": "plain_text", "content": "⚙️ 实时进度同步"}},
+		"elements": elements,
+	}
+	raw, err := json.Marshal(cardObj)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
 }
 
 // humanizeElapsedSeconds turns 134 into "2m14s", 45 into "45s".

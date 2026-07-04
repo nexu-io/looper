@@ -405,8 +405,26 @@ func TestLiveStatusHelpers(t *testing.T) {
 		t.Fatalf("humanizeElapsedSeconds(45) = %q; want 45s", got)
 	}
 	tail := feishuActivityTail([]string{"read greet.js", "npm test → 12 pass"})
-	if !strings.Contains(tail, "最近活动") || !strings.Contains(tail, "· read greet.js") {
+	if !strings.Contains(tail, "实时进度") || !strings.Contains(tail, "· read greet.js") {
 		t.Fatalf("feishuActivityTail unexpected: %q", tail)
+	}
+	// Anchor brief: a human phrase from the latest tool line, not the raw command.
+	if got := feishuPhaseFromTail([]string{"✅ git status --short", "✅ gh pr create --fill"}); got != "正在开 PR" {
+		t.Fatalf("feishuPhaseFromTail(pr create) = %q; want 正在开 PR", got)
+	}
+	if got := feishuPhaseFromTail([]string{"✅ git push -u origin feat/x"}); got != "正在推送分支" {
+		t.Fatalf("feishuPhaseFromTail(push) = %q; want 正在推送分支", got)
+	}
+	// feishuAnchorBrief falls back to the phase when no summary is in metadata, and
+	// the live feed card carries the raw feed for the in-thread surface.
+	if brief := feishuAnchorBrief(nil, []string{"✅ gh pr create --fill"}); brief != "🔧 正在开 PR" {
+		t.Fatalf("feishuAnchorBrief = %q; want 🔧 正在开 PR", brief)
+	}
+	if _, ok := feishuLiveFeedCard(nil, 0); ok {
+		t.Fatalf("feishuLiveFeedCard(empty) should not render")
+	}
+	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || !strings.Contains(card, "实时进度同步") {
+		t.Fatalf("feishuLiveFeedCard missing header: %q", card)
 	}
 	// In-memory live tail store (kept off the loop record to avoid DB races).
 	g := &Gateway{liveTails: map[string]liveTailEntry{"loop_x": {lines: []string{"a", "b"}, elapsedSec: 90}}}
