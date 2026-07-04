@@ -1221,6 +1221,14 @@ func feishuAnchorBrief(loop *storage.LoopRecord, tail []string) string {
 				return "📝 " + s
 			}
 		}
+		// A terminal loop is no longer "正在…"; without a summary the green/orange/red
+		// header + title already say enough — don't contradict it with a stale phase.
+		if loop.Status != "" {
+			switch strings.ToLower(strings.TrimSpace(loop.Status)) {
+			case "completed", "done", "merged", "failed", "abandoned", "error", "awaiting_human", "terminated", "stopped":
+				return ""
+			}
+		}
 	}
 	if phase := feishuPhaseFromTail(tail); phase != "" {
 		return "🔧 " + phase
