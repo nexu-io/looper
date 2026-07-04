@@ -53,6 +53,11 @@ type ExecutorConfig struct {
 	Params              map[string]any
 	Env                 map[string]string
 	NativeResumeEnabled bool
+	// LiveToolEvents runs codex with `--json` and parses its JSONL event stream so
+	// the live status card can show a structured tool-call feed ("✅ <cmd>"). Only
+	// affects the codex vendor; the result + session are read from the JSONL. Off
+	// by default (env-gated) so it can't disturb the text-mode path until proven.
+	LiveToolEvents bool
 }
 
 type ExecutorOptions struct {
@@ -533,6 +538,17 @@ func (x *execution) run(ctx context.Context) {
 		}
 	}
 	completion := parseCompletion(stdout, stderr)
+	if x.jsonMode() {
+		// codex --json: stdout is JSONL. The completion marker + final message live
+		// inside agent_message / command-output events, and the session is the
+		// thread id — read both from the parsed event stream instead of raw stdout.
+		tr := newCodexJSONLTranslator()
+		tr.ingestAll(stdout)
+		completion = parseCompletion(tr.combinedText(), stderr)
+		if tr.threadID != "" {
+			x.nativeSessionID = tr.threadID
+		}
+	}
 	if status != "completed" {
 		completion = completionParse{ParseStatus: "missing"}
 	}
@@ -866,14 +882,33 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 	if elapsed < 0 {
 		elapsed = 0
 	}
-	// Combine streams; the last N lines skew toward whichever is actively writing.
+	var tail []string
+	if x.jsonMode() {
+		// Structured codex tool-call feed ("✅ <cmd>") parsed from the JSONL stream.
+		tail = codexToolTail(stdout, liveProgressTailLines)
+	} else {
+		// Combine streams; the last N lines skew toward whichever is actively writing.
+		tail = lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines)
+	}
 	x.executor.onProgress(context.Background(), ProgressUpdate{
 		LoopID:         x.input.LoopID,
 		RunID:          x.input.RunID,
 		ExecutionID:    x.input.ExecutionID,
-		TailLines:      lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines),
+		TailLines:      tail,
 		ElapsedSeconds: elapsed,
 	})
+}
+
+// jsonMode reports whether this run is a codex `--json` run (structured events).
+func (x *execution) jsonMode() bool {
+	return x.executor != nil && x.executor.config.LiveToolEvents && x.executor.config.Vendor == config.AgentVendorCodex
+}
+
+// codexToolTail renders the last n command executions from a codex JSONL blob.
+func codexToolTail(stdout string, n int) []string {
+	tr := newCodexJSONLTranslator()
+	tr.ingestAll(stdout)
+	return tr.recentToolLines(n)
 }
 
 var ansiEscapeRe = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
@@ -1231,6 +1266,9 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	resolved := append([]string{}, args...)
 	if !containsArg(resolved, "exec") {
 		resolved = append([]string{"exec"}, resolved...)
+	}
+	if cfg.LiveToolEvents && !containsArg(resolved, "--json") {
+		resolved = append(resolved, "--json")
 	}
 	withModel := prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
 	if hasAnyFlag(withModel, []string{"-"}) {

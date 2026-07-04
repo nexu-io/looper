@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1995,6 +1996,9 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			Params:              cfg.Agent.Params,
 			Env:                 cfg.Agent.Env,
 			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+			// Env-gated (not a config field yet) so it stays zero-risk to the schema
+			// / parity fixtures until the codex --json path is proven end-to-end.
+			LiveToolEvents: strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPER_CODEX_JSON_EVENTS")), "1"),
 		},
 		Repos:  repos,
 		LogDir: cfg.Daemon.LogDir,

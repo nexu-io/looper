@@ -45,3 +45,33 @@ func TestCodexJSONLTranslator(t *testing.T) {
 		t.Fatalf("recentToolLines = %v", lines2)
 	}
 }
+
+func TestResolveCodexArgsJSONFlag(t *testing.T) {
+	base := ExecutorConfig{Vendor: "codex"}
+	// off by default → no --json
+	got := resolveCodexArgs(base, []string{"-c", "model=gpt-5.4"}, "do it")
+	if containsArg(got, "--json") {
+		t.Fatalf("--json should be absent by default: %v", got)
+	}
+	// on → --json present, after exec, prompt still last
+	on := base
+	on.LiveToolEvents = true
+	got = resolveCodexArgs(on, []string{"-c", "model=gpt-5.4"}, "do it")
+	if got[0] != "exec" || !containsArg(got, "--json") || got[len(got)-1] != "do it" {
+		t.Fatalf("expected exec … --json … prompt: %v", got)
+	}
+}
+
+func TestCleanShellWrapper(t *testing.T) {
+	cases := map[string]string{
+		"/bin/zsh -lc 'gh api repos/x'":       "gh api repos/x",
+		`bash -c "npm test"`:                  "npm test",
+		"gh pr create --title x":              "gh pr create --title x",
+		"/usr/bin/sh -lc 'cat README.md'":     "cat README.md",
+	}
+	for in, want := range cases {
+		if got := cleanShellWrapper(in); got != want {
+			t.Fatalf("cleanShellWrapper(%q) = %q; want %q", in, got, want)
+		}
+	}
+}

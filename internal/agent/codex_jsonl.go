@@ -134,7 +134,7 @@ func (t *codexJSONLTranslator) recentToolLines(n int) []string {
 	}
 	out := make([]string, 0, len(t.tools)-start)
 	for _, e := range t.tools[start:] {
-		cmd := strings.Join(strings.Fields(e.Command), " ")
+		cmd := strings.Join(strings.Fields(cleanShellWrapper(e.Command)), " ")
 		if cmd == "" {
 			continue
 		}
@@ -154,6 +154,49 @@ func (t *codexJSONLTranslator) recentToolLines(n int) []string {
 		return nil
 	}
 	return out
+}
+
+// combinedText returns all human-readable text codex produced — command outputs
+// plus the final agent message — so the caller can find looper's completion
+// marker wherever the agent chose to emit it (in its message, or echoed by a
+// command). This is the text the text-mode result parser would have seen.
+func (t *codexJSONLTranslator) combinedText() string {
+	parts := make([]string, 0, len(t.tools)+1)
+	for _, e := range t.tools {
+		if strings.TrimSpace(e.Output) != "" {
+			parts = append(parts, e.Output)
+		}
+	}
+	if strings.TrimSpace(t.finalText) != "" {
+		parts = append(parts, t.finalText)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// ingestAll folds an entire JSONL blob (the full stdout) line by line.
+func (t *codexJSONLTranslator) ingestAll(blob string) {
+	for _, line := range strings.Split(blob, "\n") {
+		t.ingestLine(line)
+	}
+}
+
+// cleanShellWrapper unwraps a leading shell invocation ("/bin/zsh -lc '<cmd>'",
+// "bash -c \"<cmd>\"") to the inner command, so the tool feed reads as the actual
+// command rather than the shell plumbing around it.
+func cleanShellWrapper(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	for _, marker := range []string{" -lc '", " -c '", " -lc \"", " -c \""} {
+		idx := strings.Index(cmd, marker)
+		if idx < 0 || idx > 24 {
+			continue
+		}
+		inner := strings.TrimSpace(cmd[idx+len(marker):])
+		inner = strings.TrimRight(inner, "'\"")
+		if inner != "" {
+			return inner
+		}
+	}
+	return cmd
 }
 
 // --- small typed accessors over decoded JSON ---
