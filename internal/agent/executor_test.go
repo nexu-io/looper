@@ -1219,3 +1219,32 @@ func waitForPIDFile(t *testing.T, path string) int {
 	t.Fatalf("timed out waiting for pid file %s", path)
 	return 0
 }
+
+func TestLastNonEmptyLines(t *testing.T) {
+	got := lastNonEmptyLines("read greet.js\n\nrun tests\n  \nnpm test now → 12 pass\n", 5)
+	want := []string{"read greet.js", "run tests", "npm test now → 12 pass"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("line %d = %q want %q", i, got[i], want[i])
+		}
+	}
+	// ANSI colour codes are stripped; pure-punctuation, diff-fragment and hook
+	// noise lines are dropped so only real activity survives.
+	noisy := "\x1b[1mreading config.ts\x1b[0m\n+ },\n- old line\nhook: Stop\n}\ncompiling project now"
+	got = lastNonEmptyLines(noisy, 5)
+	want = []string{"reading config.ts", "compiling project now"}
+	if len(got) != len(want) {
+		t.Fatalf("noisy filter got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("noisy line %d = %q want %q", i, got[i], want[i])
+		}
+	}
+	if lastNonEmptyLines("   \n  \n+ \n}", 3) != nil {
+		t.Fatalf("blank/noise-only input should yield nil")
+	}
+}

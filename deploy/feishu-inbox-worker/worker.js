@@ -89,7 +89,33 @@ async function handleFeishuCallback(request, env) {
   // card.action.trigger expects a card-action response; a toast gives the clicker
   // immediate feedback. Plain events just get an ack.
   if (evt.kind === "card_action") {
-    return json({ toast: { type: "success", content: "已收到,继续处理中…" } });
+    // Reflect the click on the card itself (not just a toast): swap it for a
+    // "✓ you chose X" confirmation so the choice is visible + un-clickable again.
+    let answer = "";
+    try {
+      answer = (JSON.parse(evt.valueJson || "{}").answer || "").trim();
+    } catch {}
+    return json({
+      toast: { type: "success", content: answer ? "已选:" + answer : "已收到" },
+      card: {
+        type: "raw",
+        data: {
+          config: { wide_screen_mode: true },
+          header: { template: "green", title: { tag: "plain_text", content: "✓ 已收到你的选择" } },
+          elements: [
+            {
+              tag: "div",
+              text: {
+                tag: "lark_md",
+                content: answer
+                  ? "你选择了:**" + answer + "**\nLooper 正在按此继续处理 →"
+                  : "Looper 正在继续处理 →",
+              },
+            },
+          ],
+        },
+      },
+    });
   }
   return json({ code: 0, msg: "ok" });
 }

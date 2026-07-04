@@ -60,6 +60,20 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// OnProgress, when set, is called (throttled) while an agent run streams
+	// output, so a transport can surface live progress. Vendor-agnostic: it works
+	// off the subprocess's stdout tail, whatever agent (codex/opencode/claude) runs.
+	OnProgress func(context.Context, ProgressUpdate)
+}
+
+// ProgressUpdate is a throttled snapshot of a running agent's activity: the last
+// few lines it has emitted, plus how long it has been running.
+type ProgressUpdate struct {
+	LoopID         string
+	RunID          string
+	ExecutionID    string
+	TailLines      []string
+	ElapsedSeconds int64
 }
 
 type RunInput struct {
@@ -116,10 +130,11 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
-	config ExecutorConfig
-	repos  *storage.Repositories
-	logDir string
-	now    func() time.Time
+	config     ExecutorConfig
+	repos      *storage.Repositories
+	logDir     string
+	now        func() time.Time
+	onProgress func(context.Context, ProgressUpdate)
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -127,8 +142,15 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	if now == nil {
 		now = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now}
+	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, onProgress: options.OnProgress}
 }
+
+// liveProgressInterval throttles OnProgress so a chatty agent doesn't hammer the
+// transport: at most one update per window while output streams.
+const liveProgressInterval = 5 * time.Second
+
+// liveProgressTailLines is how many recent output lines a progress update carries.
+const liveProgressTailLines = 5
 
 type nativeResumeInfo struct {
 	Enabled           bool
@@ -317,6 +339,7 @@ type execution struct {
 	maxOutputBytes     int
 	lastHeartbeatAtISO string
 	lastOutputAt       time.Time
+	lastProgressAt     time.Time
 
 	mu                      sync.Mutex
 	status                  string
@@ -821,6 +844,76 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	outputJSON := x.outputJSON(stdout, stderr)
 	x.persistStatus(x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
 	x.bumpRunHeartbeat(nowISO)
+	x.maybeEmitProgress(now, stdout, stderr)
+}
+
+// maybeEmitProgress hands a throttled activity snapshot (last few output lines +
+// elapsed) to the injected OnProgress callback, at most once per interval. It
+// reads both stdout and stderr because agents narrate on different streams
+// (codex logs activity to stderr; the final answer lands on stdout).
+func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
+	if x.executor == nil || x.executor.onProgress == nil {
+		return
+	}
+	x.mu.Lock()
+	if !x.lastProgressAt.IsZero() && now.Sub(x.lastProgressAt) < liveProgressInterval {
+		x.mu.Unlock()
+		return
+	}
+	x.lastProgressAt = now
+	x.mu.Unlock()
+	elapsed := int64(now.Sub(x.startedAt).Seconds())
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	// Combine streams; the last N lines skew toward whichever is actively writing.
+	x.executor.onProgress(context.Background(), ProgressUpdate{
+		LoopID:         x.input.LoopID,
+		RunID:          x.input.RunID,
+		ExecutionID:    x.input.ExecutionID,
+		TailLines:      lastNonEmptyLines(stdout+"\n"+stderr, liveProgressTailLines),
+		ElapsedSeconds: elapsed,
+	})
+}
+
+var ansiEscapeRe = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+
+// lastNonEmptyLines returns the final n meaningful lines of s, in order: ANSI
+// colour codes stripped, and pure-punctuation / diff-fragment / lifecycle-hook
+// noise skipped so the tail reads as activity rather than terminal spew.
+func lastNonEmptyLines(s string, n int) []string {
+	if n <= 0 || strings.TrimSpace(s) == "" {
+		return nil
+	}
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, n)
+	for i := len(lines) - 1; i >= 0 && len(out) < n; i-- {
+		line := strings.TrimSpace(ansiEscapeRe.ReplaceAllString(lines[i], ""))
+		if !meaningfulProgressLine(line) {
+			continue
+		}
+		out = append([]string{line}, out...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// meaningfulProgressLine drops lines that are pure diff/bracket punctuation or
+// lifecycle-hook noise, which otherwise dominate a raw agent stream.
+func meaningfulProgressLine(line string) bool {
+	if len(line) < 4 {
+		return false
+	}
+	if strings.Trim(line, "+-}{[]()<> ,;:.\"'`|") == "" {
+		return false
+	}
+	lower := strings.ToLower(line)
+	if strings.HasPrefix(lower, "hook:") || strings.Contains(lower, " hook:") || strings.HasPrefix(lower, "+ ") || strings.HasPrefix(lower, "- ") {
+		return false
+	}
+	return true
 }
 
 func (x *execution) bumpRunHeartbeat(nowISO string) {

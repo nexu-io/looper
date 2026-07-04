@@ -78,6 +78,13 @@ type Gateway struct {
 	feishuTokenMu  sync.Mutex
 	feishuToken    string
 	feishuTokenExp time.Time
+
+	// liveTails holds the most recent agent-activity snapshot per loop, kept in
+	// memory (not the loop record) so frequent progress ticks never race the
+	// scheduler's loop/run writes. Retained across the completion rebuild so the
+	// final card still shows the last activity.
+	liveMu    sync.Mutex
+	liveTails map[string]liveTailEntry
 }
 
 func NewGateway(options Options) *Gateway {
@@ -898,14 +905,27 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if len(parts) == 0 && title == "" {
 		return "", false
 	}
-	elements := make([]any, 0, 3)
+	elements := make([]any, 0, 5)
 	if len(parts) > 0 {
 		elements = append(elements, larkDiv(strings.Join(parts, " · ")))
 	}
 	if title != "" {
 		elements = append(elements, larkDiv("**"+title+"**"))
 	}
-	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "展开话题看进展与待办 →"}}})
+	// Live activity tail (last few agent output lines) + elapsed. Written by the
+	// progress ticker while the agent runs, and left in place after completion so
+	// the card shows what it was doing right up to the end.
+	tail, elapsed := g.liveTailFor(loopID)
+	if len(tail) > 0 {
+		elements = append(elements, map[string]any{"tag": "hr"})
+		elements = append(elements, larkDiv(feishuActivityTail(tail)))
+	}
+	noteParts := make([]string, 0, 2)
+	if elapsed > 0 {
+		noteParts = append(noteParts, "⏱ "+humanizeElapsedSeconds(elapsed))
+	}
+	noteParts = append(noteParts, "展开话题看进展与待办 →")
+	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 	template, label := feishuLoopStatusStyle(loop.Status)
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
@@ -933,6 +953,54 @@ func feishuLoopStatusStyle(status string) (template, label string) {
 	default:
 		return "blue", "🔧 Looper 处理中"
 	}
+}
+
+// liveTailEntry is the most recent agent-activity snapshot for one loop.
+type liveTailEntry struct {
+	lines      []string
+	elapsedSec int64
+}
+
+// RefreshThreadHeader records a loop's latest live activity (last few agent
+// output lines + elapsed) in memory and re-renders its Feishu anchor card. Called
+// by the progress ticker while an agent runs. Best-effort + a no-op when the
+// app-bot isn't configured. In-memory storage means this never touches the loop
+// record, so it can't race the scheduler's loop/run writes.
+func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail []string, elapsedSec int64) {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return
+	}
+	if len(tail) > 0 || elapsedSec > 0 {
+		g.liveMu.Lock()
+		if g.liveTails == nil {
+			g.liveTails = map[string]liveTailEntry{}
+		}
+		g.liveTails[loopID] = liveTailEntry{lines: tail, elapsedSec: elapsedSec}
+		g.liveMu.Unlock()
+	}
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return
+	}
+	g.updateFeishuThreadHeader(ctx, token, loopID)
+}
+
+// liveTailFor returns the retained live activity snapshot for a loop.
+func (g *Gateway) liveTailFor(loopID string) ([]string, int64) {
+	g.liveMu.Lock()
+	defer g.liveMu.Unlock()
+	if g.liveTails == nil {
+		return nil, 0
+	}
+	e := g.liveTails[strings.TrimSpace(loopID)]
+	return e.lines, e.elapsedSec
 }
 
 // updateFeishuThreadHeader re-renders a loop's thread-anchor card to reflect its
@@ -976,21 +1044,51 @@ func (g *Gateway) patchFeishuAppCard(ctx context.Context, token, messageID, cont
 	return nil
 }
 
-// loopWorkerString extracts worker.<key> (a string) from a loop's metadata JSON.
-func loopWorkerString(metadataJSON *string, key string) string {
+// loopWorkerField extracts worker.<key> (any type) from a loop's metadata JSON.
+func loopWorkerField(metadataJSON *string, key string) any {
 	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
-		return ""
+		return nil
 	}
 	var meta map[string]any
 	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
-		return ""
+		return nil
 	}
 	if w, ok := meta["worker"].(map[string]any); ok {
-		if v, ok := w[key].(string); ok {
-			return strings.TrimSpace(v)
-		}
+		return w[key]
+	}
+	return nil
+}
+
+// loopWorkerString extracts worker.<key> (a string) from a loop's metadata JSON.
+func loopWorkerString(metadataJSON *string, key string) string {
+	if v, ok := loopWorkerField(metadataJSON, key).(string); ok {
+		return strings.TrimSpace(v)
 	}
 	return ""
+}
+
+// feishuActivityTail renders the last few agent output lines as a compact log.
+func feishuActivityTail(lines []string) string {
+	rendered := make([]string, 0, len(lines)+1)
+	rendered = append(rendered, "🔧 最近活动")
+	for _, line := range lines {
+		if len(line) > 90 {
+			line = line[:90] + "…"
+		}
+		rendered = append(rendered, "· "+line)
+	}
+	return strings.Join(rendered, "\n")
+}
+
+// humanizeElapsedSeconds turns 134 into "2m14s", 45 into "45s".
+func humanizeElapsedSeconds(sec int64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	if sec < 60 {
+		return strconv.FormatInt(sec, 10) + "s"
+	}
+	return strconv.FormatInt(sec/60, 10) + "m" + strconv.FormatInt(sec%60, 10) + "s"
 }
 
 // humanizeLoopTarget turns a loop target id ("issue:owner/repo:360",

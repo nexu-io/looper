@@ -380,6 +380,28 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 	}
 }
 
+func TestLiveStatusHelpers(t *testing.T) {
+	if got := humanizeElapsedSeconds(134); got != "2m14s" {
+		t.Fatalf("humanizeElapsedSeconds(134) = %q; want 2m14s", got)
+	}
+	if got := humanizeElapsedSeconds(45); got != "45s" {
+		t.Fatalf("humanizeElapsedSeconds(45) = %q; want 45s", got)
+	}
+	tail := feishuActivityTail([]string{"read greet.js", "npm test → 12 pass"})
+	if !strings.Contains(tail, "最近活动") || !strings.Contains(tail, "· read greet.js") {
+		t.Fatalf("feishuActivityTail unexpected: %q", tail)
+	}
+	// In-memory live tail store (kept off the loop record to avoid DB races).
+	g := &Gateway{liveTails: map[string]liveTailEntry{"loop_x": {lines: []string{"a", "b"}, elapsedSec: 90}}}
+	lines, el := g.liveTailFor("loop_x")
+	if len(lines) != 2 || lines[0] != "a" || el != 90 {
+		t.Fatalf("liveTailFor = %v, %d", lines, el)
+	}
+	if l, e := g.liveTailFor("unknown"); l != nil || e != 0 {
+		t.Fatalf("liveTailFor(unknown) = %v, %d; want nil, 0", l, e)
+	}
+}
+
 func TestFeishuLoopStatusStyle(t *testing.T) {
 	cases := map[string]struct{ template, contains string }{
 		"awaiting_human": {"orange", "等你定夺"},

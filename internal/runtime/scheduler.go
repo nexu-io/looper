@@ -1999,6 +1999,17 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		Repos:  repos,
 		LogDir: cfg.Daemon.LogDir,
 		Now:    now,
+		// Live progress → Feishu anchor card. Vendor-agnostic (works off the agent
+		// subprocess's stdout tail). Only wired when the Feishu app-bot transport is
+		// configured; a no-op otherwise.
+		OnProgress: func(ctx context.Context, p agent.ProgressUpdate) {
+			if p.LoopID == "" || !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+				return
+			}
+			// In-memory only — never writes the loop record, so it can't race the
+			// scheduler's loop/run writes.
+			notificationGateway.RefreshThreadHeader(ctx, p.LoopID, p.TailLines, p.ElapsedSeconds)
+		},
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
