@@ -953,8 +953,21 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if loop.TargetID != nil {
 		target = *loop.TargetID
 	}
-	label := humanizeLoopTarget(target)
+	// Source = where the task CAME FROM (the originating issue), kept stable even
+	// after the loop target flips to the PR it opens — so the anchor never relabels
+	// its own source line as "PR" (which mismatched the issue link before).
 	issueURL := loopWorkerString(loop.MetadataJSON, "issueUrl")
+	sourceLabel, sourceURL := "", ""
+	if issueURL != "" {
+		sourceLabel = "Issue"
+		if n := urlTrailingNumber(issueURL); n != "" {
+			sourceLabel = "Issue #" + n
+		}
+		sourceURL = issueURL
+	} else {
+		sourceLabel = humanizeLoopTarget(target) // PR-triggered loop: no originating issue
+	}
+	prURL := loopWorkerString(loop.MetadataJSON, "prUrl")
 	trigger := loopWorkerString(loop.MetadataJSON, "triggerLogin")
 	repo := ""
 	if loop.Repo != nil {
@@ -963,11 +976,11 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	title := loopTitleFromMetadata(loop.MetadataJSON)
 
 	parts := make([]string, 0, 3)
-	if label != "" {
-		if issueURL != "" {
-			parts = append(parts, "📋 ["+label+"]("+issueURL+")")
+	if sourceLabel != "" {
+		if sourceURL != "" {
+			parts = append(parts, "📋 ["+sourceLabel+"]("+sourceURL+")")
 		} else {
-			parts = append(parts, "📋 "+label)
+			parts = append(parts, "📋 "+sourceLabel)
 		}
 	}
 	if repo != "" {
@@ -979,12 +992,22 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if len(parts) == 0 && title == "" {
 		return "", false
 	}
-	elements := make([]any, 0, 5)
+	elements := make([]any, 0, 6)
 	if len(parts) > 0 {
 		elements = append(elements, larkDiv(strings.Join(parts, " · ")))
 	}
 	if title != "" {
 		elements = append(elements, larkDiv("**"+title+"**"))
+	}
+	// Key milestone, surfaced on the OUTER card: the PR this task opened, linked —
+	// so a human sees the deliverable without opening the thread and scrolling to
+	// the bottom for the "Opened a PR" reply.
+	if prURL != "" {
+		prLabel := "PR"
+		if n := urlTrailingNumber(prURL); n != "" {
+			prLabel = "PR #" + n
+		}
+		elements = append(elements, larkDiv("🔀 已开 ["+prLabel+"]("+prURL+") →"))
 	}
 	// A human-scannable brief — NOT the raw tool feed (that lives inside the thread,
 	// see updateLiveFeedComment). Prefer the agent's own summary; fall back to a
@@ -1308,6 +1331,27 @@ func humanizeElapsedSeconds(sec int64) string {
 		return strconv.FormatInt(sec, 10) + "s"
 	}
 	return strconv.FormatInt(sec/60, 10) + "m" + strconv.FormatInt(sec%60, 10) + "s"
+}
+
+// urlTrailingNumber extracts the trailing numeric path segment from a URL, e.g.
+// ".../issues/153" → "153", ".../pull/154" → "154". Returns "" when the last
+// segment is not a plain number (tolerant of trailing slashes / query strings).
+func urlTrailingNumber(u string) string {
+	u = strings.TrimSpace(u)
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
+	u = strings.TrimRight(u, "/")
+	if i := strings.LastIndexByte(u, '/'); i >= 0 {
+		u = u[i+1:]
+	}
+	if u == "" {
+		return ""
+	}
+	if _, err := strconv.Atoi(u); err != nil {
+		return ""
+	}
+	return u
 }
 
 // humanizeLoopTarget turns a loop target id ("issue:owner/repo:360",

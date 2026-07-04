@@ -426,6 +426,19 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || !strings.Contains(card, "实时进度同步") {
 		t.Fatalf("feishuLiveFeedCard missing header: %q", card)
 	}
+	// PR/issue number extraction for the anchor's source + milestone lines.
+	for u, want := range map[string]string{
+		"https://github.com/o/r/issues/153":   "153",
+		"https://github.com/o/r/pull/154":     "154",
+		"https://github.com/o/r/pull/154/":    "154",
+		"https://github.com/o/r/pull/154?x=1": "154",
+		"https://github.com/o/r/tree/main":    "",
+		"":                                    "",
+	} {
+		if got := urlTrailingNumber(u); got != want {
+			t.Fatalf("urlTrailingNumber(%q) = %q; want %q", u, got, want)
+		}
+	}
 	// In-memory live tail store (kept off the loop record to avoid DB races).
 	g := &Gateway{liveTails: map[string]liveTailEntry{"loop_x": {lines: []string{"a", "b"}, elapsedSec: 90}}}
 	lines, el := g.liveTailFor("loop_x")
