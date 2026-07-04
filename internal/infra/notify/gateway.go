@@ -85,6 +85,15 @@ type Gateway struct {
 	// final card still shows the last activity.
 	liveMu    sync.Mutex
 	liveTails map[string]liveTailEntry
+	// askCards remembers each loop's live ask card (message id + the card it was
+	// built from) so the card can be patched to its resolved "✅ 已选:X" state when
+	// the answer arrives — keeping the full brief for review.
+	askCards map[string]askCardState
+}
+
+type askCardState struct {
+	msgID string
+	card  HITLAskCard
 }
 
 func NewGateway(options Options) *Gateway {
@@ -516,6 +525,11 @@ type HITLAskCard struct {
 	Consequences map[string]string
 	// Confidence is the agent's self-assessed certainty ("high"/"medium"/"low").
 	Confidence string
+
+	// AnsweredWith, when set, renders the card in its resolved state: the option
+	// buttons are replaced by a "✅ 已选:<answer>" line while the question, research
+	// and consequences stay intact for later review.
+	AnsweredWith string
 }
 
 // feishuMentionMarkup renders Feishu open_ids as card @-mention tags, e.g.
@@ -558,10 +572,57 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	rootMessageID := g.ensureFeishuThreadRoot(ctx, token, chatID, card.LoopID)
 	// The loop is awaiting_human now — turn the anchor card orange "等你定夺".
 	g.updateFeishuThreadHeader(ctx, token, card.LoopID)
-	if _, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON)); err != nil {
+	msgID, err := g.postFeishuAppMessage(ctx, token, chatID, rootMessageID, "interactive", string(cardJSON))
+	if err != nil {
 		return err
 	}
+	// Remember the card so MarkAskAnswered can patch it in place on delivery.
+	if strings.TrimSpace(msgID) != "" && strings.TrimSpace(card.LoopID) != "" {
+		g.liveMu.Lock()
+		if g.askCards == nil {
+			g.askCards = map[string]askCardState{}
+		}
+		g.askCards[card.LoopID] = askCardState{msgID: msgID, card: card}
+		g.liveMu.Unlock()
+	}
 	return nil
+}
+
+// MarkAskAnswered patches a loop's ask card to its resolved "✅ 已选:X" state,
+// keeping the question + research + consequences intact. Best-effort; a no-op if
+// no ask card is remembered for the loop or the app-bot isn't configured.
+func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
+	loopID = strings.TrimSpace(loopID)
+	answer = strings.TrimSpace(answer)
+	if loopID == "" || answer == "" {
+		return
+	}
+	g.liveMu.Lock()
+	st, ok := g.askCards[loopID]
+	g.liveMu.Unlock()
+	if !ok || strings.TrimSpace(st.msgID) == "" {
+		return
+	}
+	st.card.AnsweredWith = answer
+	cardJSON, err := buildFeishuAskCard(st.card)
+	if err != nil {
+		return
+	}
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return
+	}
+	if err := g.patchFeishuAppCard(ctx, token, st.msgID, string(cardJSON)); err == nil {
+		g.liveMu.Lock()
+		delete(g.askCards, loopID)
+		g.liveMu.Unlock()
+	}
 }
 
 func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
@@ -617,8 +678,12 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	if rec := strings.TrimSpace(card.Recommendation); rec != "" {
 		elements = append(elements, larkDiv("🔎 "+rec))
 	}
-	// Options.
-	if len(actions) > 0 {
+	// Options — or, once answered, the resolved selection. Buttons are removed (so
+	// it can't be re-clicked) but the question, research and consequences stay for
+	// later review.
+	if answered := strings.TrimSpace(card.AnsweredWith); answered != "" {
+		elements = append(elements, larkDiv("✅ **已选:"+answered+"** · Looper 继续处理中 →"))
+	} else if len(actions) > 0 {
 		elements = append(elements, map[string]any{"tag": "action", "actions": actions})
 	}
 	// Per-option consequences: pick this → that happens.
@@ -633,9 +698,13 @@ func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
 	noteParts = append(noteParts, "loop "+seq, "点选项或直接回文字")
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
 
+	header := map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}}
+	if strings.TrimSpace(card.AnsweredWith) != "" {
+		header = map[string]any{"template": "green", "title": map[string]any{"tag": "plain_text", "content": "✅ 已定夺"}}
+	}
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
-		"header":   map[string]any{"template": "orange", "title": map[string]any{"tag": "plain_text", "content": "Looper needs a decision"}},
+		"header":   header,
 		"elements": elements,
 	}
 	return json.Marshal(cardObj)

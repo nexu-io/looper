@@ -150,7 +150,14 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return loop.ID
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
+			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer); err != nil {
+				return err
+			}
+			// Mark the ask card resolved ("✅ 已选:X", brief preserved).
+			if input.OnHITLAnswerDelivered != nil {
+				input.OnHITLAnswerDelivered(ctx, loopID, answer)
+			}
+			return nil
 		},
 	}
 	if input.Logger != nil {

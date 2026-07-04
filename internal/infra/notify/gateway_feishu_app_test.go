@@ -370,6 +370,23 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 		}
 	}
 
+	// Answered state: buttons gone, "✅ 已选" shown, brief still present for review.
+	answered, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 132, Title: "welcome.txt 用哪种语言?", Question: "welcome.txt 用哪种语言?",
+		Options: []string{"中文", "英文"}, Recommendation: "README 都是中文,推荐中文。",
+		AnsweredWith: "中文",
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(answered) error = %v", err)
+	}
+	ar := string(answered)
+	if !strings.Contains(ar, "已选:中文") || !strings.Contains(ar, "已定夺") || !strings.Contains(ar, "README 都是中文") {
+		t.Fatalf("answered card missing selection or brief: %s", ar)
+	}
+	if strings.Contains(ar, `"tag":"action"`) {
+		t.Fatalf("answered card should have no clickable action buttons: %s", ar)
+	}
+
 	// A bare ask (no brief) must still render — the fields are optional.
 	bare, err := buildFeishuAskCard(HITLAskCard{LoopSeq: 1, Question: "A or B?", Options: []string{"A", "B"}})
 	if err != nil {

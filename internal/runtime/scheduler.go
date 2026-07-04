@@ -97,6 +97,9 @@ type defaultSchedulerTickInput struct {
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
+	// delivered to a loop, so the transport can mark the ask card resolved.
+	OnHITLAnswerDelivered func(context.Context, string, string)
 }
 
 type defaultSchedulerHandlers struct {
@@ -2211,6 +2214,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
 	}
 
