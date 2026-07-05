@@ -25,6 +25,24 @@ exactly as before. Turn them on one at a time.
 
 ---
 
+## Teammate quick start (two files)
+A teammate joining the shared Feishu setup needs exactly two files:
+
+1. **The shared env file** — the team's Feishu/worker secrets (same for everyone).
+   Get the filled copy from whoever set it up, then `source` it.
+   ```sh
+   source ~/.looper/hitl.env
+   ```
+2. **Their own config** — copy the template and fill the few placeholders (agent
+   path, their group `chatId`, their `open_id`, the repo + local clone path):
+   ```sh
+   cp deploy/config.hitl.example.json ~/.looper/config.json
+   $EDITOR ~/.looper/config.json          # replace the REPLACE_/ABSOLUTE_ placeholders
+   looperd --config ~/.looper/config.json
+   ```
+The env file carries the shared **secret values**; the config carries the
+**feature switches + per-person settings**. You need both.
+
 ## 0. Prerequisites
 - A coding agent configured (`agent.vendor` = `codex` / `claude-code` / …).
 - For Feishu: a Feishu **custom app** (with `im:message` send + event subscription)

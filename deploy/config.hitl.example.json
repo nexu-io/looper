@@ -1,0 +1,84 @@
+{
+  "agent": {
+    "vendor": "codex",
+    "params": {
+      "command": "/ABSOLUTE/PATH/TO/codex",
+      "args": [
+        "-c",
+        "model=gpt-5.4",
+        "-s",
+        "workspace-write",
+        "-c",
+        "sandbox_workspace_write.network_access=true"
+      ]
+    },
+    "nativeResume": {
+      "enabled": true
+    }
+  },
+  "hitl": {
+    "enabled": true,
+    "answerTransport": "feishu",
+    "feishu": {
+      "inbound": "cf-inbox",
+      "eventInboxUrlEnv": "LOOPER_FEISHU_INBOX_URL",
+      "eventInboxTokenEnv": "LOOPER_FEISHU_INBOX_TOKEN"
+    }
+  },
+  "notifications": {
+    "inApp": false,
+    "webhook": {
+      "enabled": true,
+      "mode": "app",
+      "format": "feishu",
+      "appIdEnv": "LOOPER_FEISHU_APP_ID",
+      "appSecretEnv": "LOOPER_FEISHU_APP_SECRET",
+      "verificationTokenEnv": "LOOPER_FEISHU_VERIFY_TOKEN",
+      "chatId": "REPLACE_WITH_YOUR_GROUP_CHAT_ID_oc_xxx",
+      "mentionOpenIds": [
+        "REPLACE_WITH_YOUR_OPEN_ID_ou_xxx"
+      ]
+    }
+  },
+  "storage": {
+    "mode": "sqlite",
+    "dbPath": "/ABSOLUTE/PATH/looper.sqlite",
+    "backupDir": "/ABSOLUTE/PATH/backups"
+  },
+  "server": {
+    "authMode": "none",
+    "host": "127.0.0.1",
+    "port": 14567
+  },
+  "daemon": {
+    "logDir": "/ABSOLUTE/PATH/logs",
+    "mode": "foreground",
+    "shutdownTimeoutMs": 15000
+  },
+  "scheduler": {
+    "maxConcurrentRuns": 3,
+    "pollIntervalSeconds": 20,
+    "retryBaseDelayMs": 5000,
+    "retryMaxAttempts": 5
+  },
+  "projects": [
+    {
+      "id": "my-repo",
+      "name": "My Repo (GitHub)",
+      "repo": "OWNER/REPO",
+      "repoPath": "/ABSOLUTE/PATH/TO/LOCAL/CLONE",
+      "roles": {
+        "worker": {
+          "autoDiscovery": true,
+          "triggers": {
+            "labels": [
+              "looper:plan"
+            ],
+            "labelMode": "all",
+            "requireAssigneeCurrentUser": false
+          }
+        }
+      }
+    }
+  ]
+}
