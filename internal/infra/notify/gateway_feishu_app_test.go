@@ -426,6 +426,17 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || !strings.Contains(card, "实时进度同步") {
 		t.Fatalf("feishuLiveFeedCard missing header: %q", card)
 	}
+	// Terminal detection gates the takeover hint (shown only while live).
+	for _, s := range []string{"completed", "failed", "terminated", "stopped", "merged"} {
+		if !feishuLoopStatusTerminal(s) {
+			t.Fatalf("feishuLoopStatusTerminal(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"running", "queued", "awaiting_human", "human_takeover", "paused"} {
+		if feishuLoopStatusTerminal(s) {
+			t.Fatalf("feishuLoopStatusTerminal(%q) = true, want false", s)
+		}
+	}
 	// PR/issue number extraction for the anchor's source + milestone lines.
 	for u, want := range map[string]string{
 		"https://github.com/o/r/issues/153":   "153",

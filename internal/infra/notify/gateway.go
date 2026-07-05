@@ -1023,6 +1023,11 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	}
 	noteParts = append(noteParts, "展开话题看实时进度 →")
 	elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": strings.Join(noteParts, " · ")}}})
+	// One-command local takeover of the agent session (runs on the daemon host).
+	// Offered only while the loop is live; dropped once it reaches a terminal state.
+	if !feishuLoopStatusTerminal(loop.Status) {
+		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "💻 本地接管:`looper resume " + strconv.FormatInt(loop.Seq, 10) + "`"}}})
+	}
 	template, label := feishuLoopStatusStyle(loop.Status)
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
@@ -1034,6 +1039,17 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 		return "", false
 	}
 	return string(raw), true
+}
+
+// feishuLoopStatusTerminal reports whether a loop has reached an end state — no
+// further automated work will run, so surfaces like the takeover hint drop off.
+func feishuLoopStatusTerminal(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "done", "merged", "failed", "abandoned", "error", "terminated", "stopped":
+		return true
+	default:
+		return false
+	}
 }
 
 // feishuLoopStatusStyle maps a loop status to the thread-header card's colour +

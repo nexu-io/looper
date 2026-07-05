@@ -451,7 +451,10 @@ func worktreeCleanupCandidateActiveQueue(ctx context.Context, repos *storage.Rep
 
 func worktreeCleanupActiveLoopStatus(status string) bool {
 	switch status {
-	case "idle", "queued", "running", "paused", "waiting":
+	// human_takeover keeps the worktree pinned: a human is (or is about to be)
+	// driving the loop's agent session inside it — reclaiming it would pull the
+	// working tree out from under them.
+	case "idle", "queued", "running", "paused", "waiting", "human_takeover":
 		return true
 	default:
 		return false
