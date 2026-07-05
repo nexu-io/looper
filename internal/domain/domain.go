@@ -44,6 +44,12 @@ const (
 	// POST /api/v1/loops/{seq}/respond), which transitions it back to running.
 	// Only reachable when hitl.enabled is true.
 	LoopStatusAwaitingHuman LoopStatus = "awaiting_human"
+	// LoopStatusHumanTakeover means a human has taken the loop's agent session
+	// over interactively (via `looper resume <seq>`): the daemon's in-flight run
+	// was stopped and the scheduler leaves the loop alone until the human hands it
+	// back (POST /api/v1/loops/{seq}/handback → queued). The native session id and
+	// worktree are preserved so the daemon resumes seeing the human's turns.
+	LoopStatusHumanTakeover LoopStatus = "human_takeover"
 )
 
 type RunStatus string
@@ -81,11 +87,11 @@ type LoopSummary struct {
 }
 
 var activeLoopStatuses = map[LoopStatus]struct{}{
-	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusWaiting: {}, LoopStatusAwaitingHuman: {},
+	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusWaiting: {}, LoopStatusAwaitingHuman: {}, LoopStatusHumanTakeover: {},
 }
 
 var conflictingActiveLoopStatuses = map[LoopStatus]struct{}{
-	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusAwaitingHuman: {},
+	LoopStatusIdle: {}, LoopStatusQueued: {}, LoopStatusRunning: {}, LoopStatusPaused: {}, LoopStatusAwaitingHuman: {}, LoopStatusHumanTakeover: {},
 }
 
 var terminalRunStatuses = map[RunStatus]struct{}{
@@ -95,10 +101,11 @@ var terminalRunStatuses = map[RunStatus]struct{}{
 var loopStatusTransitions = map[LoopStatus][]LoopStatus{
 	LoopStatusIdle:          {LoopStatusQueued, LoopStatusPaused, LoopStatusTerminated},
 	LoopStatusQueued:        {LoopStatusRunning, LoopStatusPaused, LoopStatusTerminated},
-	LoopStatusRunning:       {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusAwaitingHuman, LoopStatusTerminated},
+	LoopStatusRunning:       {LoopStatusCompleted, LoopStatusFailed, LoopStatusPaused, LoopStatusInterrupted, LoopStatusWaiting, LoopStatusAwaitingHuman, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusPaused:        {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusWaiting:       {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
-	LoopStatusAwaitingHuman: {LoopStatusRunning, LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusTerminated},
+	LoopStatusAwaitingHuman: {LoopStatusRunning, LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
+	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusRunning, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusStopped:       {},
 	LoopStatusTerminated:    {},
 	LoopStatusCompleted:     {},
