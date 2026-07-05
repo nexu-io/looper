@@ -324,6 +324,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
 			updated.MetadataJSON = &meta
 		}
+		// The agent re-asked after reading the queued human messages, so they're
+		// consumed — clear the inbox so they aren't re-injected on the next resume.
+		if meta, werr := loops.ClearHumanInbox(updated.MetadataJSON); werr == nil {
+			updated.MetadataJSON = &meta
+		}
 		updated.Status = "awaiting_human"
 		updated.LastRunAt = stringPtr(nowISO)
 		updated.NextRunAt = nil
