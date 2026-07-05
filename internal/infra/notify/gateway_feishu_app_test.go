@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"github.com/nexu-io/looper/internal/loops"
 	"strings"
 	"testing"
 	"time"
@@ -357,13 +358,13 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 	}
 	raw := string(card)
 	for _, want := range []string{
-		"GitHub Issue #132",                                  // source label
-		"https://github.com/nexu-io/synclo-test/issues/132",  // clickable link
-		"由 @lefarcen 提出",                                     // trigger attribution
-		"README 都是中文",                                        // recommendation
-		"⭐ 中文 · 推荐",                                          // recommended option marked prominently
-		"置信度 中",                                              // confidence
-		"写\\\"Welcome",                                        // a consequence (quote json-escaped)
+		"GitHub Issue #132", // source label
+		"https://github.com/nexu-io/synclo-test/issues/132", // clickable link
+		"由 @lefarcen 提出",                                    // trigger attribution
+		"README 都是中文",                                       // recommendation
+		"⭐ 中文 · 推荐",                                         // recommended option marked prominently
+		"置信度 中",                                             // confidence
+		"写\\\"Welcome",                                      // a consequence (quote json-escaped)
 	} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("decision-brief card missing %q\ncard=%s", want, raw)
@@ -425,6 +426,11 @@ func TestLiveStatusHelpers(t *testing.T) {
 	}
 	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || !strings.Contains(card, "实时进度同步") {
 		t.Fatalf("feishuLiveFeedCard missing header: %q", card)
+	}
+	// Milestone narrative renders "HH:MM · text".
+	ml := feishuMilestoneList([]loops.Milestone{{At: "2026-07-05T10:30:00.000Z", Text: "已定夺:中文"}, {At: "2026-07-05T10:50:00.000Z", Text: "🔀 已开 PR #9"}})
+	if !strings.Contains(ml, "进展") || !strings.Contains(ml, "已定夺:中文") || !strings.Contains(ml, "已开 PR #9") {
+		t.Fatalf("feishuMilestoneList unexpected: %q", ml)
 	}
 	// Terminal detection gates the takeover hint (shown only while live).
 	for _, s := range []string{"completed", "failed", "terminated", "stopped", "merged"} {

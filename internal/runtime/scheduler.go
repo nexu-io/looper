@@ -1997,7 +1997,26 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			payload.DedupeKey = fmt.Sprintf("runtime.worker.completed:%s", input.RunID)
 		}
 		notificationGateway.Notify(ctx, payload)
-		refreshFeishuAnchor(ctx, input.LoopID)
+		// Log the outcome to the loop's story so the anchor reads as a narrative.
+		if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+			switch {
+			case input.PullRequestNumber > 0:
+				link := runtimeFirstNonEmpty(input.PullRequestURL, "")
+				if link != "" {
+					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 [PR #%d](%s)", input.PullRequestNumber, link))
+				} else {
+					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 PR #%d", input.PullRequestNumber))
+				}
+			case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
+			case input.Status == "failed":
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⚠️ 本轮失败,重试中")
+			case input.Status != "skipped":
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "✅ 完成")
+			}
+		} else {
+			refreshFeishuAnchor(ctx, input.LoopID)
+		}
 		return nil
 	}
 

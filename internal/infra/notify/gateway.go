@@ -15,6 +15,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -602,6 +603,9 @@ func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
 	if loopID == "" || answer == "" {
 		return
 	}
+	// Always log the decision to the loop's story (+ refresh the anchor), even if
+	// this process no longer holds the ask card to patch.
+	g.RecordMilestone(ctx, loopID, "🧑‍⚖️ 已定夺:"+answer)
 	g.liveMu.Lock()
 	st, ok := g.askCards[loopID]
 	g.liveMu.Unlock()
@@ -628,6 +632,76 @@ func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
 		delete(g.askCards, loopID)
 		g.liveMu.Unlock()
 	}
+}
+
+// RecordMilestone appends one human-scannable milestone to a loop's story
+// (persisted in loop metadata) and refreshes the anchor so the outer card reads
+// as a timestamped narrative — who decided what, phases, the PR — rather than a
+// single current-status line. Best-effort; a no-op when the loop can't be loaded.
+func (g *Gateway) RecordMilestone(ctx context.Context, loopID, text string) {
+	loopID = strings.TrimSpace(loopID)
+	text = strings.TrimSpace(text)
+	if loopID == "" || text == "" || g.repositories == nil || g.repositories.Loops == nil {
+		return
+	}
+	loop, err := g.repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(g.now().UTC())
+	meta, err := loops.AppendMilestone(loop.MetadataJSON, loops.Milestone{At: nowISO, Text: text})
+	if err != nil {
+		return
+	}
+	loop.MetadataJSON = &meta
+	loop.UpdatedAt = nowISO
+	if err := g.repositories.Loops.Upsert(ctx, *loop); err != nil {
+		return
+	}
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return
+	}
+	if token, err := g.feishuTenantToken(ctx, appID, appSecret); err == nil {
+		g.updateFeishuThreadHeader(ctx, token, loopID)
+	}
+}
+
+// feishuMilestoneList renders a loop's milestone log as a compact, timestamped
+// narrative for the anchor: "HH:MM · <text>", most recent last, capped.
+func feishuMilestoneList(milestones []loops.Milestone) string {
+	const show = 6
+	start := 0
+	if len(milestones) > show {
+		start = len(milestones) - show
+	}
+	lines := make([]string, 0, len(milestones)-start+1)
+	lines = append(lines, "📋 进展")
+	for _, m := range milestones[start:] {
+		if strings.TrimSpace(m.Text) == "" {
+			continue
+		}
+		lines = append(lines, "· "+feishuShortTime(m.At)+" "+m.Text)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// feishuShortTime turns an ISO timestamp into a local "HH:MM"; empty on parse
+// failure so the caller can omit it.
+func feishuShortTime(iso string) string {
+	iso = strings.TrimSpace(iso)
+	if iso == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339Nano, iso)
+	if err != nil {
+		if t, err = time.Parse("2006-01-02T15:04:05.000Z", iso); err != nil {
+			return ""
+		}
+	}
+	return t.Local().Format("15:04")
 }
 
 func buildFeishuAskCard(card HITLAskCard) ([]byte, error) {
@@ -1009,11 +1083,15 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 		}
 		elements = append(elements, larkDiv("🔀 已开 ["+prLabel+"]("+prURL+") →"))
 	}
-	// A human-scannable brief — NOT the raw tool feed (that lives inside the thread,
-	// see updateLiveFeedComment). Prefer the agent's own summary; fall back to a
-	// one-line natural-language phase derived from the latest activity.
+	// The narrative — NOT the raw tool feed (that lives inside the thread, see
+	// updateLiveFeedComment). A timestamped milestone log (decisions · phases · PR)
+	// when we have one, else a single current-phase brief while nothing notable has
+	// landed yet.
 	tail, elapsed := g.liveTailFor(loopID)
-	if brief := feishuAnchorBrief(loop, tail); brief != "" {
+	if milestones := loops.ReadMilestones(loop.MetadataJSON); len(milestones) > 0 {
+		elements = append(elements, map[string]any{"tag": "hr"})
+		elements = append(elements, larkDiv(feishuMilestoneList(milestones)))
+	} else if brief := feishuAnchorBrief(loop, tail); brief != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})
 		elements = append(elements, larkDiv(brief))
 	}
