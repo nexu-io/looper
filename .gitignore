@@ -11,6 +11,8 @@ task.md
 e2e/.env*
 !e2e/.env.example
 # Filled HITL / deploy env files hold secrets — never commit; only the template.
-deploy/*.env
-!deploy/*.env.example
+deploy/**/*.env
+!deploy/**/*.env.example
 *.env.local
+# Built onboarding bundles may contain the shared secrets — never commit.
+looper-hitl-onboarding*.zip
