@@ -2665,15 +2665,55 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	return queueItems, runScheduledQueueItems(ctx, queueItems, input)
 }
 
+// schedulerLoopParked reports whether a claimed queue item's loop was parked
+// (human takeover / paused) — a state the scheduler may observe AFTER the claim
+// due to a race, and must then decline to run.
+func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput) bool {
+	if item.LoopID == nil || input.Repos == nil || input.Repos.Loops == nil {
+		return false
+	}
+	loop, err := input.Repos.Loops.GetByID(ctx, *item.LoopID)
+	if err != nil || loop == nil {
+		return false
+	}
+	switch loop.Status {
+	case "human_takeover", "paused":
+		return true
+	default:
+		return false
+	}
+}
+
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
 	if len(queueItems) == 0 {
 		return nil
 	}
 
+	now := input.Now
+	if now == nil {
+		now = time.Now
+	}
 	errList := make([]error, 0)
 	for _, item := range queueItems {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		// A loop parked for human takeover (or paused) must never be run, even if a
+		// queue item survived a race with the parking and got claimed. Release the
+		// claim (so the slot frees) and skip — only an explicit handback re-arms it.
+		if schedulerLoopParked(ctx, item, input) {
+			if input.Repos != nil && input.Repos.Queue != nil {
+				_ = input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
+			}
+			if input.Logger != nil {
+				loopID := ""
+				if item.LoopID != nil {
+					loopID = *item.LoopID
+				}
+				input.Logger.Info("scheduler released claimed item for parked loop", map[string]any{"queueItemId": item.ID, "loopId": loopID})
+			}
+			continue
 		}
 
 		process, err := schedulerQueueProcessor(item, input)
