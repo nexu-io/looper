@@ -114,6 +114,46 @@ func asAwaitingHumanError(err error) (*awaitingHumanError, bool) {
 // decision. The answer is flipped to "consumed" only once the turn completes,
 // via markHumanAnswerConsumed. Returns empty strings when no answer is pending.
 // Only called when hitl.enabled is true.
+// pendingTakeoverResume returns the native session id (+ a continue prompt) a
+// human drove during an interactive takeover that has since been handed back, so
+// the daemon's next worker run resumes THAT session and sees their turns. Empty
+// when no takeover resume is pending. Independent of hitl.enabled.
+func (r *Runner) pendingTakeoverResume(loop *storage.LoopRecord) (string, string) {
+	tr, ok := loops.ReadTakeoverResume(loop.MetadataJSON)
+	if !ok || strings.TrimSpace(tr.SessionID) == "" {
+		return "", ""
+	}
+	prompt := strings.TrimSpace(tr.Prompt)
+	if prompt == "" {
+		prompt = "A human took this task's agent session over directly and has handed it back. Review the whole conversation so far — including their turns — and continue from where they left off; do not restart from scratch."
+	}
+	return prompt, tr.SessionID
+}
+
+// markTakeoverResumeConsumed clears the takeover-resume marker after a successful
+// resumed turn so it is not re-applied on later runs. No-op when absent.
+func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.LoopRecord) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	if _, ok := loops.ReadTakeoverResume(fresh.MetadataJSON); !ok {
+		return
+	}
+	meta, werr := loops.ClearTakeoverResume(fresh.MetadataJSON)
+	if werr != nil {
+		return
+	}
+	fresh.MetadataJSON = &meta
+	fresh.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
+		loop.MetadataJSON = &meta
+	}
+}
+
 func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecord) (string, string) {
 	ask, ok := r.readFreshHITLAsk(ctx, loop)
 	if !ok || ask.Status != "answered" || strings.TrimSpace(ask.Answer) == "" {

@@ -3087,13 +3087,10 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 		}
 		return h.takeoverLoop(r.Context(), loop.ID)
 	case "handback":
-		// Handing a taken-over loop back to the daemon is exactly a retry: re-arm the
-		// (non-terminal) loop to queued + requeue; the next run native-resumes the
-		// same session id and sees the human's turns.
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
-		return h.retryLoop(r.Context(), r, loop.ID)
+		return h.handbackLoop(r.Context(), r, loop.ID)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
@@ -4414,6 +4411,44 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude); the loop is parked in human_takeover — hand it back with `looper handback` to resume the daemon."
 	}
 	return resp, nil
+}
+
+// handbackLoop re-arms a taken-over loop so the daemon resumes it. It stamps the
+// loop with the native session id the human drove (so the next worker run resumes
+// THAT session and sees their turns), clears any queue item that survived the
+// takeover race, then re-arms via the shared retry path.
+func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
+	services := h.context.Runtime.Services()
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if loop == nil {
+			return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
+			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
+			if werr == nil {
+				loop.MetadataJSON = &meta
+				loop.UpdatedAt = nowISO
+				if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+					return struct{}{}, err
+				}
+			}
+		}
+		reason := "Cleared for takeover handback"
+		if _, err := repos.Queue.CancelByLoop(ctx, loopID, nowISO, &reason); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return h.retryLoop(ctx, r, loopID)
 }
 
 type respondLoopRequest struct {

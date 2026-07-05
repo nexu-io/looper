@@ -1683,6 +1683,14 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				prompt += "\n\n" + nativeResumePrompt
 			}
 		}
+		// Handed back from an interactive human takeover: resume the exact session
+		// the human drove (independent of HITL) so the daemon sees their turns.
+		if nativeSessionID == "" {
+			if takeoverPrompt, takeoverSession := r.pendingTakeoverResume(&input.Loop); takeoverSession != "" {
+				nativeResumePrompt, nativeSessionID = takeoverPrompt, takeoverSession
+				prompt += "\n\n" + takeoverPrompt
+			}
+		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -1729,6 +1737,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if r.hitlEnabled {
 			r.markHumanAnswerConsumed(ctx, &input.Loop)
 		}
+		r.markTakeoverResumeConsumed(ctx, &input.Loop)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
 		}
