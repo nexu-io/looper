@@ -34,6 +34,8 @@ Subcommands:
   unpause    Resume a paused loop by sequence number
   stop       Stop an active loop
   close      Terminally close a loop
+  resume     Take over a loop's agent session interactively
+  handback   Hand a taken-over loop back to the daemon
   run        Run commands
 
 Flags:
