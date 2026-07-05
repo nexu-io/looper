@@ -83,7 +83,11 @@ typed multi-round replies.
 
 ## 3. Environment variables
 The config stores env-var **names**; the secret values live in the environment
-(never in the config file, so the repo stays shareable).
+(never in the config file, so the repo stays shareable). Because the Feishu app +
+inbox worker are shared, these values are the **same for the whole team**: fill
+[`deploy/hitl.env.example`](../deploy/hitl.env.example) once, distribute the filled
+copy privately, and each teammate `source`s it before running looperd. (Per-person
+settings — `chatId`, `mentionOpenIds` — go in each person's config file, not here.)
 
 ```sh
 export LOOPER_FEISHU_APP_ID=cli_xxx            # Feishu app credentials
