@@ -130,6 +130,44 @@ func (r *Runner) pendingTakeoverResume(loop *storage.LoopRecord) (string, string
 	return prompt, tr.SessionID
 }
 
+// latestNativeSessionID returns the loop's most recent captured agent session id,
+// so a mailbox-driven turn can native-resume the SAME session and have the full
+// conversation context. Empty when none is recorded.
+func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) string {
+	if r.repos == nil || r.repos.AgentExecutions == nil {
+		return ""
+	}
+	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	if err != nil || execution == nil || execution.NativeSessionID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*execution.NativeSessionID)
+}
+
+// clearHumanInbox drops the loop's drained human messages after a successful turn
+// so they are not re-injected on a later run. No-op when the inbox is empty.
+func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
+		return
+	}
+	meta, werr := loops.ClearHumanInbox(fresh.MetadataJSON)
+	if werr != nil {
+		return
+	}
+	fresh.MetadataJSON = &meta
+	fresh.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
+		loop.MetadataJSON = &meta
+	}
+}
+
 // markTakeoverResumeConsumed clears the takeover-resume marker after a successful
 // resumed turn so it is not re-applied on later runs. No-op when absent.
 func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.LoopRecord) {

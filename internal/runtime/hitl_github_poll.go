@@ -145,6 +145,45 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 // handler's deliverHumanAnswer for the poll lane: it stores the human's answer on
 // an awaiting_human loop, flips it back to running, and requeues the queue item
 // that suspendForHuman cancelled — so the worker resumes with the answer.
+// enqueueHumanMessageToLoop queues a free-text human message for a loop and makes
+// sure it gets consumed soon: a loop that isn't actively running is nudged to
+// queued so the scheduler picks it up and the worker drains the message on its
+// next turn; a running loop drains it when the current turn ends. Terminal loops
+// are left alone (a message can't reopen a finished loop yet). Unlike a button
+// answer, a message does NOT resolve a pending ask — the agent reads it and
+// decides whether to proceed, answer, or ask again.
+func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return err
+	}
+	switch loop.Status {
+	case "completed", "failed", "stopped", "terminated", "human_takeover":
+		return nil
+	}
+	meta, werr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
+	if werr != nil {
+		return werr
+	}
+	updated := *loop
+	updated.MetadataJSON = &meta
+	updated.UpdatedAt = nowISO
+	notRunning := loop.Status != "running"
+	if notRunning {
+		// Wake it so the message is consumed ASAP; a running loop keeps running and
+		// drains on its next turn.
+		updated.Status = "queued"
+		updated.NextRunAt = &nowISO
+	}
+	if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		return err
+	}
+	if notRunning {
+		_, err = repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
+	}
+	return err
+}
+
 func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
 	loop, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil || loop == nil {

@@ -38,9 +38,13 @@ type feishuHITLPollDeps struct {
 	// loopBySeq maps a loop seq (from a card-action value) to a loop id; "" when
 	// unknown to this looper.
 	loopBySeq func(ctx contextType, seq int64) string
-	// deliverAnswer feeds the answer into the shared HITL core.
+	// deliverAnswer feeds a button-click decision into the shared HITL core.
 	deliverAnswer func(ctx contextType, loopID, answer string) error
-	logWarn       func(msg string, fields map[string]any)
+	// enqueueMessage queues a free-text thread reply for the loop (conversational /
+	// anytime), to be drained on the loop's next turn rather than treated as a final
+	// answer.
+	enqueueMessage func(ctx contextType, loopID, text string) error
+	logWarn        func(msg string, fields map[string]any)
 }
 
 // pollFeishuHITLInboxOnce delivers the answers among a batch of inbox events that
@@ -54,33 +58,40 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 			maxID = e.ID
 		}
 		loopID := ""
-		answer := ""
+		value := ""
+		var deliver func(contextType, string, string) error
 		switch strings.TrimSpace(e.Kind) {
 		case "message":
+			// A typed thread reply is conversational: queue it (question / new
+			// instruction / an answer the agent will interpret), don't force it to
+			// resolve the ask.
 			text := strings.TrimSpace(e.Text)
 			root := strings.TrimSpace(e.RootID)
-			if text == "" || root == "" || deps.loopByRoot == nil {
+			if text == "" || root == "" || deps.loopByRoot == nil || deps.enqueueMessage == nil {
 				continue
 			}
 			loopID = deps.loopByRoot(ctx, root)
-			answer = text
+			value = text
+			deliver = deps.enqueueMessage
 		case "card_action":
+			// A button click is a clean decision → the shared answer path.
 			ans := strings.TrimSpace(e.Value.Answer)
 			seq, err := strconv.ParseInt(strings.TrimSpace(e.Value.LoopSeq), 10, 64)
 			if ans == "" || err != nil || deps.loopBySeq == nil {
 				continue
 			}
 			loopID = deps.loopBySeq(ctx, seq)
-			answer = ans
+			value = ans
+			deliver = deps.deliverAnswer
 		default:
 			continue
 		}
 		if strings.TrimSpace(loopID) == "" {
 			continue // belongs to another looper (or already resumed)
 		}
-		if err := deps.deliverAnswer(ctx, loopID, answer); err != nil {
+		if err := deliver(ctx, loopID, value); err != nil {
 			if deps.logWarn != nil {
-				deps.logWarn("hitl feishu poll: deliver answer failed", map[string]any{"loopId": loopID, "error": err.Error()})
+				deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"loopId": loopID, "kind": e.Kind, "error": err.Error()})
 			}
 			continue
 		}
@@ -158,6 +169,9 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 				input.OnHITLAnswerDelivered(ctx, loopID, answer)
 			}
 			return nil
+		},
+		enqueueMessage: func(ctx contextType, loopID, text string) error {
+			return enqueueHumanMessageToLoop(ctx, input.Repos, nowISO, loopID, text)
 		},
 	}
 	if input.Logger != nil {

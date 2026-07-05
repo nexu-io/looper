@@ -1691,6 +1691,28 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				prompt += "\n\n" + takeoverPrompt
 			}
 		}
+		// Free-text human messages queued in the thread at any time (a follow-up
+		// question, a new instruction, or an answer to interpret) — drain them into
+		// this turn, resuming the same session so the agent has the full
+		// conversation. Conversational: the agent may answer + ask again rather than
+		// treat them as a final decision.
+		if r.hitlEnabled {
+			if inbox := loops.ReadHumanInbox(input.Loop.MetadataJSON); len(inbox) > 0 {
+				var msgs strings.Builder
+				msgs.WriteString("While you were working, the human sent these messages in the task thread:")
+				for _, m := range inbox {
+					if t := strings.TrimSpace(m.Text); t != "" {
+						msgs.WriteString("\n- ")
+						msgs.WriteString(t)
+					}
+				}
+				msgs.WriteString("\nRead them in context and respond appropriately: if a message answers a question you asked, proceed using it; if it is a follow-up question or a new instruction, address it — and if you still need a human decision, ask again (write .looper/ask.json) with your response to what they said. Do not ignore these messages.")
+				prompt += "\n\n" + msgs.String()
+				if nativeSessionID == "" {
+					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
+				}
+			}
+		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -1736,6 +1758,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// retry, while a successful one never re-injects it on a later run.
 		if r.hitlEnabled {
 			r.markHumanAnswerConsumed(ctx, &input.Loop)
+			r.clearHumanInbox(ctx, &input.Loop)
 		}
 		r.markTakeoverResumeConsumed(ctx, &input.Loop)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
