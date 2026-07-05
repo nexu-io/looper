@@ -1861,14 +1861,14 @@ func TestCommandPrefixMatchesRejectsMissingTail(t *testing.T) {
 	}
 }
 
-func TestCommandPrefixMatchesAcceptsPSEscapedNewlines(t *testing.T) {
+func TestCommandPrefixMatchesRejectsPSEscapedNewlinesAsAmbiguous(t *testing.T) {
 	t.Parallel()
 
-	if !commandPrefixMatches(
+	if commandPrefixMatches(
 		[]string{"codex", "exec", "Fix pull request nexu-io/vela#594.\n\nMinimal PR seed"},
 		splitProcessCommand(`codex exec Fix pull request nexu-io/vela#594.\012\012Minimal PR seed`),
 	) {
-		t.Fatal("commandPrefixMatches() = false, want true for ps-escaped newline prompt")
+		t.Fatal("commandPrefixMatches() = true, want false for ambiguous ps-escaped newline prompt")
 	}
 }
 

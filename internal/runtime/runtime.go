@@ -2497,10 +2497,7 @@ func commandPrefixMatches(expected, actual []string) bool {
 }
 
 func processCommandTokenMatches(expected, actual string) bool {
-	if expected == actual {
-		return true
-	}
-	return expected == decodeProcessCommandEscapes(actual)
+	return expected == actual
 }
 
 func splitProcessCommand(command string) []string {
@@ -2549,28 +2546,6 @@ func splitProcessCommand(command string) []string {
 
 	flush()
 	return tokens
-}
-
-func decodeProcessCommandEscapes(token string) string {
-	if !strings.Contains(token, `\`) {
-		return token
-	}
-	var decoded strings.Builder
-	decoded.Grow(len(token))
-	for i := 0; i < len(token); i++ {
-		if token[i] != '\\' || i+3 >= len(token) || !isOctalDigit(token[i+1]) || !isOctalDigit(token[i+2]) || !isOctalDigit(token[i+3]) {
-			decoded.WriteByte(token[i])
-			continue
-		}
-		value := (token[i+1]-'0')*64 + (token[i+2]-'0')*8 + (token[i+3] - '0')
-		decoded.WriteByte(value)
-		i += 3
-	}
-	return decoded.String()
-}
-
-func isOctalDigit(b byte) bool {
-	return b >= '0' && b <= '7'
 }
 
 func defaultReadProcessCommand(ctx context.Context, pid int) (string, error) {
