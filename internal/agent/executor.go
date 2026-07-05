@@ -1221,6 +1221,64 @@ func ResolveSpawnWithNativeResume(cfg ExecutorConfig, workingDirectory string, p
 	return command, args
 }
 
+// InteractiveTakeoverSupported reports whether a human can take over a loop's
+// agent session INTERACTIVELY for the given vendor. Distinct from
+// nativeResumeSupported (the daemon's headless resume): only vendors whose
+// interactive resume is verified to preserve the session id AND accumulate
+// history — so the daemon's later native-resume sees the human's turns — are
+// enabled. Verified 2026-07: codex (`codex resume <id>`) and claude-code
+// (`claude --resume <id>`) both keep the id and thread the conversation.
+// opencode/cursor stay disabled until the same 3-turn check passes for them.
+func InteractiveTakeoverSupported(vendor config.AgentVendor) bool {
+	switch vendor {
+	case config.AgentVendorCodex, config.AgentVendorClaudeCode:
+		return true
+	default:
+		return false
+	}
+}
+
+// InteractiveResumeCommandLine renders the shell command a human runs to take
+// over a loop's agent session interactively: the SAME native session id the
+// daemon was driving, in the loop's worktree. Because a resume preserves the id
+// and appends to the same conversation, the daemon's later native-resume then
+// sees everything the human did. Returns ("", false) when takeover isn't
+// supported for the vendor or the session id is missing.
+func InteractiveResumeCommandLine(cfg ExecutorConfig, workingDirectory, sessionID string) (string, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	workingDirectory = strings.TrimSpace(workingDirectory)
+	if sessionID == "" || !InteractiveTakeoverSupported(cfg.Vendor) {
+		return "", false
+	}
+	command := resolveCommand(cfg)
+	var resume string
+	switch cfg.Vendor {
+	case config.AgentVendorCodex:
+		resume = command + " resume " + shellSingleQuote(sessionID)
+	case config.AgentVendorClaudeCode:
+		resume = command + " --resume " + shellSingleQuote(sessionID)
+	default:
+		return "", false
+	}
+	if workingDirectory != "" {
+		return "cd " + shellSingleQuote(workingDirectory) + " && " + resume, true
+	}
+	return resume, true
+}
+
+// shellSingleQuote makes a string safe to paste into a POSIX shell. UUIDs and
+// plain paths pass through unquoted; anything with shell-special characters is
+// single-quoted with embedded quotes escaped.
+func shellSingleQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\n'\"\\$`&|;<>()*?[]{}#~!") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func resolveCommand(cfg ExecutorConfig) string {
 	if override, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(override) != "" {
 		return override
