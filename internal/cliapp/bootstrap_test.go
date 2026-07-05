@@ -477,6 +477,121 @@ func TestEnsureBootstrapConfigPreservesExplicitYAMLFormat(t *testing.T) {
 	}
 }
 
+func TestEnsureBootstrapConfigGeneratesLoadablePlaneConfig(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "bootstrap.json")
+	projectPath := filepath.Join(t.TempDir(), "open-design")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(projectPath) error = %v", err)
+	}
+
+	plan := bootstrapConfigPlan{
+		Provider:         bootstrapProviderPlane,
+		ProjectPath:      projectPath,
+		CodeRepo:         "acme/open-design",
+		TriggerLabel:     "afk:candidate",
+		PlaneBaseURL:     "https://plane.example.test/api/v1",
+		PlaneWorkspace:   "acme-design",
+		PlaneProject:     "49832a02-3158-4faf-bf2f-d0e39c40c7e6",
+		PlaneTokenEnv:    "PLANE_API_KEY",
+		FeishuWebhookEnv: "LOOPER_FEISHU_WEBHOOK_URL",
+	}
+
+	runtime := newCommandRuntime(New(Deps{}), nil)
+	created, projectAdded, err := runtime.ensureBootstrapConfig(configPath, t.TempDir(), plan)
+	if err != nil {
+		t.Fatalf("ensureBootstrapConfig() error = %v", err)
+	}
+	if !created {
+		t.Fatal("ensureBootstrapConfig() created = false, want true")
+	}
+	if !projectAdded {
+		t.Fatal("ensureBootstrapConfig() projectAdded = false, want true")
+	}
+
+	// The generated config must load + validate (strict JSON, normalize, validate).
+	loaded, err := config.LoadFile(config.LoadFileOptions{Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if len(loaded.Config.Providers) != 1 {
+		t.Fatalf("providers = %#v, want exactly one plane provider", loaded.Config.Providers)
+	}
+	provider := loaded.Config.Providers[0]
+	if provider.Kind != config.ProviderKindPlane {
+		t.Fatalf("provider kind = %q, want plane", provider.Kind)
+	}
+	if provider.BaseURL != "https://plane.example.test/api/v1" {
+		t.Fatalf("provider baseUrl = %q", provider.BaseURL)
+	}
+	if provider.TokenEnv == nil || *provider.TokenEnv != "PLANE_API_KEY" {
+		t.Fatalf("provider tokenEnv = %#v, want PLANE_API_KEY", provider.TokenEnv)
+	}
+	if provider.Workspace == nil || *provider.Workspace != "acme-design" {
+		t.Fatalf("provider workspace = %#v, want acme-design", provider.Workspace)
+	}
+	if provider.ProjectID == nil || *provider.ProjectID != "49832a02-3158-4faf-bf2f-d0e39c40c7e6" {
+		t.Fatalf("provider projectId = %#v", provider.ProjectID)
+	}
+
+	if len(loaded.Config.Projects) != 1 {
+		t.Fatalf("projects = %#v, want exactly one plane project", loaded.Config.Projects)
+	}
+	project := loaded.Config.Projects[0]
+	if project.Provider != provider.ID {
+		t.Fatalf("project provider = %q, want %q", project.Provider, provider.ID)
+	}
+	if project.Repo != "acme/open-design" {
+		t.Fatalf("project repo = %q, want acme/open-design", project.Repo)
+	}
+	if project.RepoPath != projectPath {
+		t.Fatalf("project repoPath = %q, want %q", project.RepoPath, projectPath)
+	}
+	if config.ResolvedProjectProviderKind(loaded.Config, project) != config.ProviderKindPlane {
+		t.Fatalf("resolved project provider kind = %q, want plane", config.ResolvedProjectProviderKind(loaded.Config, project))
+	}
+
+	if got := loaded.Config.Roles.Planner.Triggers.Labels; len(got) != 1 || got[0] != "afk:candidate" {
+		t.Fatalf("planner trigger labels = %#v, want [afk:candidate]", got)
+	}
+	if loaded.Config.Roles.Planner.Triggers.RequireAssigneeCurrentUser {
+		t.Fatal("planner requireAssigneeCurrentUser = true, want false for plane")
+	}
+	if got := loaded.Config.Roles.Worker.Triggers.Labels; len(got) != 1 || got[0] != "afk:candidate" {
+		t.Fatalf("worker trigger labels = %#v, want [afk:candidate]", got)
+	}
+	if loaded.Config.Roles.Worker.Triggers.RequireAssigneeCurrentUser {
+		t.Fatal("worker requireAssigneeCurrentUser = true, want false for plane")
+	}
+
+	webhook := loaded.Config.Notifications.Webhook
+	if !webhook.Enabled || webhook.URLEnv != "LOOPER_FEISHU_WEBHOOK_URL" || webhook.Format != "feishu" {
+		t.Fatalf("notifications.webhook = %#v, want enabled feishu on LOOPER_FEISHU_WEBHOOK_URL", webhook)
+	}
+	if len(webhook.Levels) != 2 {
+		t.Fatalf("notifications.webhook.levels = %#v, want action_required + failure", webhook.Levels)
+	}
+}
+
+func TestParseGitHubRepoSlug(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"git@github.com:acme/open-design.git":     "acme/open-design",
+		"https://github.com/acme/open-design.git": "acme/open-design",
+		"https://github.com/acme/open-design":     "acme/open-design",
+		"ssh://git@github.com/acme/open-design":   "acme/open-design",
+		"https://gitlab.com/acme/other.git":       "",
+		"":                                        "",
+	}
+	for input, want := range cases {
+		if got := parseGitHubRepoSlug(input); got != want {
+			t.Fatalf("parseGitHubRepoSlug(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestBootstrapDefaultPathReusesExistingLegacyDefaultConfig(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)

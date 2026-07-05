@@ -13,6 +13,7 @@ type ProviderKind = config.ProviderKind
 const (
 	ProviderKindGitHub  = config.ProviderKindGitHub
 	ProviderKindForgejo = config.ProviderKindForgejo
+	ProviderKindPlane   = config.ProviderKindPlane
 )
 
 type RepositoryRef struct {
@@ -71,6 +72,11 @@ func StaticCapabilities(kind ProviderKind) (Capabilities, bool) {
 		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: true, Webhooks: true, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionNative, WorkerClaim: WorkerClaimAssignSelf, Webhook: WebhookNative}, true
 	case ProviderKindForgejo:
 		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: false, ReviewRequests: false, AutoMerge: false, Webhooks: false, ReviewDiscovery: ReviewDiscoveryLabel, ReviewPublish: ReviewPublishCommentOnly, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
+	case ProviderKindPlane:
+		// Plane is a task-source: it owns issues/labels/comments/assignees but
+		// has no pull requests, diffs, or native reviews (those are delegated to
+		// the GitHub code repo). Issue discovery is polling by trigger label.
+		return Capabilities{Issues: true, PullRequests: false, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: false, NativeReviews: false, ReviewRequests: false, AutoMerge: false, Webhooks: false, ReviewDiscovery: ReviewDiscoveryLabel, ReviewPublish: ReviewPublishCommentOnly, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
 	default:
 		return Capabilities{}, false
 	}

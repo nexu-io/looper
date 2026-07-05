@@ -248,6 +248,10 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		}
 	}
 
+	// Keep common build artifacts (e.g. .pnpm-store/, node_modules/) out of every
+	// loop commit via the worktree-local git exclude file. Best-effort.
+	g.applyWorktreeArtifactExcludes(ctx, worktreePath)
+
 	headSHA, err := g.getHeadSHA(ctx, worktreePath)
 	if err != nil {
 		return storage.WorktreeRecord{}, err
@@ -339,6 +343,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					if err := g.repos.Worktrees.Upsert(ctx, restored); err != nil {
 						return nil, fmt.Errorf("upsert restored worktree record: %w", err)
 					}
+					g.applyWorktreeArtifactExcludes(ctx, restored.WorktreePath)
 					return &restored, nil
 				}
 				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch, input.ExpectedWorktreePath)
@@ -441,6 +446,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		}
 	}
 
+	g.applyWorktreeArtifactExcludes(ctx, record.WorktreePath)
 	return &record, nil
 }
 
@@ -894,6 +900,91 @@ func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath 
 	if err := g.runGit(ctx, repoPath, nil, "worktree", "remove", "--force", worktreePath); err != nil {
 		return
 	}
+}
+
+// worktreeArtifactExcludePatterns are common build-artifact directories/files
+// that must never be committed by the agent or by looper's fallback commit. On
+// pnpm/node repos whose .gitignore misses one of these (e.g. .pnpm-store/, a
+// 100MB+ content store), an `git add -A` would otherwise stage it and the push
+// would be rejected. The list is intentionally conservative — only universal
+// build output, never source.
+var worktreeArtifactExcludePatterns = []string{
+	".pnpm-store/",
+	"node_modules/",
+	".turbo/",
+	"dist/",
+	".next/",
+	".cache/",
+	"*.log",
+}
+
+const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed; safe to remove)"
+
+// applyWorktreeArtifactExcludes appends looper's build-artifact ignore patterns
+// to the worktree's git exclude file (info/exclude). That file is local to this
+// clone and is never committed, so it cannot alter the repo's tracked files or
+// its .gitignore. The write is idempotent (patterns already present are skipped)
+// and best-effort: any failure is swallowed so it never blocks a loop worktree.
+func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePath string) {
+	if strings.TrimSpace(worktreePath) == "" {
+		return
+	}
+	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-path", "info/exclude")
+	if err != nil {
+		return
+	}
+	excludePath := strings.TrimSpace(result.Stdout)
+	if excludePath == "" {
+		return
+	}
+	if !filepath.IsAbs(excludePath) {
+		excludePath = filepath.Join(worktreePath, excludePath)
+	}
+
+	existing, err := os.ReadFile(excludePath)
+	if err != nil && !os.IsNotExist(err) {
+		return
+	}
+	existingText := string(existing)
+
+	missing := make([]string, 0, len(worktreeArtifactExcludePatterns))
+	for _, pattern := range worktreeArtifactExcludePatterns {
+		if !worktreeExcludeContainsPattern(existingText, pattern) {
+			missing = append(missing, pattern)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil {
+		return
+	}
+	var builder strings.Builder
+	builder.WriteString(existingText)
+	if existingText != "" && !strings.HasSuffix(existingText, "\n") {
+		builder.WriteByte('\n')
+	}
+	if !strings.Contains(existingText, worktreeExcludeManagedHeader) {
+		builder.WriteString(worktreeExcludeManagedHeader)
+		builder.WriteByte('\n')
+	}
+	for _, pattern := range missing {
+		builder.WriteString(pattern)
+		builder.WriteByte('\n')
+	}
+	_ = os.WriteFile(excludePath, []byte(builder.String()), 0o644)
+}
+
+// worktreeExcludeContainsPattern reports whether pattern already appears as its
+// own line in the exclude file (ignoring surrounding whitespace).
+func worktreeExcludeContainsPattern(content, pattern string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == pattern {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) getRemoteHeadSHA(ctx context.Context, repoPath, remote, branch string) (string, error) {

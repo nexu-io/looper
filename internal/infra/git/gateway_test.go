@@ -223,6 +223,69 @@ func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {
 	}
 }
 
+func TestGatewayWorktreeExcludesBuildArtifactsFromCommits(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/pnpm",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	// The worktree's info/exclude must carry looper's artifact patterns.
+	excludeRelPath := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-path", "info/exclude"))
+	excludePath := excludeRelPath
+	if !filepath.IsAbs(excludePath) {
+		excludePath = filepath.Join(worktree.WorktreePath, excludeRelPath)
+	}
+	excludeContent := readFile(t, excludePath)
+	for _, pattern := range []string{".pnpm-store/", "node_modules/", ".turbo/", "dist/", ".next/", ".cache/", "*.log"} {
+		if !strings.Contains(excludeContent, "\n"+pattern) && !strings.HasPrefix(excludeContent, pattern) {
+			t.Fatalf("info/exclude missing pattern %q; content = %q", pattern, excludeContent)
+		}
+	}
+
+	// The real-world failure: `git add -A` must NOT stage a 100MB+ .pnpm-store,
+	// while ordinary source is still staged.
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, ".pnpm-store", "v3"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".pnpm-store", "v3", "huge.bin"), "artifact\n")
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "node_modules"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "node_modules", "dep.js"), "module\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "app.ts"), "export const x = 1\n")
+
+	runGit(t, worktree.WorktreePath, "add", "-A")
+	staged := runGit(t, worktree.WorktreePath, "diff", "--cached", "--name-only")
+	if !strings.Contains(staged, "app.ts") {
+		t.Fatalf("git add -A did not stage source app.ts; staged = %q", staged)
+	}
+	if strings.Contains(staged, ".pnpm-store") || strings.Contains(staged, "node_modules") {
+		t.Fatalf("git add -A staged an excluded build artifact; staged = %q", staged)
+	}
+
+	// Idempotent: re-creating (which restores the existing worktree) must not
+	// duplicate the exclude patterns.
+	if _, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/pnpm",
+		BaseBranch:   "main",
+	}); err != nil {
+		t.Fatalf("CreateWorktree() second call error = %v", err)
+	}
+	if got := strings.Count(readFile(t, excludePath), ".pnpm-store/"); got != 1 {
+		t.Fatalf(".pnpm-store/ appears %d times in info/exclude, want 1 (idempotent)", got)
+	}
+}
+
 func TestGatewayKeepsPrimaryCheckoutCleanForDetachedFixerWorktree(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

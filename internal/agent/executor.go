@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1338,11 +1339,27 @@ func stringArgs(value any) []string {
 	return result
 }
 
+// ansiEscapePattern matches ANSI CSI escape sequences (e.g. "\x1b[1m", "\x1b[0m").
+// Codex prints its session id as a styled human line rather than JSON, so escape
+// codes must be stripped before the id can be parsed out.
+var ansiEscapePattern = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
+
+func stripANSIEscapes(s string) string {
+	if !strings.Contains(s, "\x1b") {
+		return s
+	}
+	return ansiEscapePattern.ReplaceAllString(s, "")
+}
+
 func extractNativeSessionID(outputs ...string) string {
-	keys := []string{"nativeSessionId", "native_session_id", "sessionId", "session_id", "chatId", "chat_id"}
+	// "session id" (with a space) matches Codex's human-readable line
+	// "\x1b[1msession id:\x1b[0m <uuid>"; the others match JSON-emitting vendors.
+	keys := []string{"nativeSessionId", "native_session_id", "sessionId", "session_id", "session id", "chatId", "chat_id"}
 	for _, output := range outputs {
 		for _, line := range strings.Split(output, "\n") {
-			line = strings.TrimSpace(line)
+			// Strip ANSI styling first: Codex wraps the session id in escape codes,
+			// and a JSON line without styling passes through unchanged.
+			line = strings.TrimSpace(stripANSIEscapes(line))
 			if line == "" {
 				continue
 			}

@@ -31,6 +31,7 @@ type Repositories struct {
 	Worktrees            *WorktreesRepository
 	WebhookForwarders    *WebhookForwardersRepository
 	WebhookTunnelHooks   *WebhookTunnelHooksRepository
+	FeishuThreads        *FeishuThreadsRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -47,6 +48,7 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		Worktrees:            &WorktreesRepository{q: q},
 		WebhookForwarders:    &WebhookForwardersRepository{q: q},
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
+		FeishuThreads:        &FeishuThreadsRepository{q: q},
 	}
 }
 
@@ -328,6 +330,51 @@ func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel
 	}
 
 	return &record, nil
+}
+
+// FeishuThreadsRepository maps a Feishu message thread root to the loop whose
+// notifications thread under it, in both directions.
+type FeishuThreadsRepository struct{ q sqliteQuerier }
+
+// Upsert records that rootMessageID is the thread root for loopID in chatID.
+func (r *FeishuThreadsRepository) Upsert(ctx context.Context, rootMessageID, loopID, chatID, createdAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO feishu_threads (root_message_id, loop_id, chat_id, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(root_message_id) DO UPDATE SET
+			loop_id=excluded.loop_id,
+			chat_id=excluded.chat_id
+	`, rootMessageID, loopID, chatID, createdAt)
+	if err != nil {
+		return fmt.Errorf("upsert feishu thread: %w", err)
+	}
+	return nil
+}
+
+// RootByLoop returns the most recent thread root for a loop, or "" when none.
+func (r *FeishuThreadsRepository) RootByLoop(ctx context.Context, loopID string) (string, error) {
+	var rootMessageID string
+	err := r.q.QueryRowContext(ctx, `SELECT root_message_id FROM feishu_threads WHERE loop_id = ? ORDER BY created_at DESC LIMIT 1`, loopID).Scan(&rootMessageID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu thread root by loop: %w", err)
+	}
+	return rootMessageID, nil
+}
+
+// LoopByRoot returns the loop id a thread root belongs to, or "" when unknown.
+func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID string) (string, error) {
+	var loopID string
+	err := r.q.QueryRowContext(ctx, `SELECT loop_id FROM feishu_threads WHERE root_message_id = ?`, rootMessageID).Scan(&loopID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu thread loop by root: %w", err)
+	}
+	return loopID, nil
 }
 
 type EventsRepository struct{ q sqliteQuerier }

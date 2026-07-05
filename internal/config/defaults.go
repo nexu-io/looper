@@ -124,6 +124,11 @@ func DefaultConfig(cwd string) (Config, error) {
 				},
 				ThrottleWindowSeconds: 60,
 			},
+			Webhook: WebhookNotificationConfig{
+				Enabled:               false,
+				Format:                "generic",
+				ThrottleWindowSeconds: 60,
+			},
 		},
 		Disclosure: DefaultDisclosureConfig(),
 		Tools:      ToolPathsConfig{},

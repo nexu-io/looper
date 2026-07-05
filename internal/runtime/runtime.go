@@ -805,7 +805,12 @@ func runtimeProjectRepo(metadataJSON *string) string {
 
 func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 	for _, project := range cfg.Projects {
-		if config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindGitHub {
+		switch config.ResolvedProjectProviderKind(cfg, project) {
+		case config.ProviderKindGitHub:
+			return true
+		case config.ProviderKindPlane:
+			// Plane is a task-source only: its pull requests live on the
+			// project's GitHub code repo, so the GitHub gateway is required.
 			return true
 		}
 	}

@@ -262,6 +262,17 @@ func TestExtractNativeSessionID(t *testing.T) {
 	if got := extractNativeSessionID(`event "session_id": "session-quoted"`); got != "session-quoted" {
 		t.Fatalf("extractNativeSessionID(quoted text) = %q, want session-quoted", got)
 	}
+	// Codex prints its session id as an ANSI-styled human line with a space in the
+	// key ("session id"), not JSON. Both the escape codes and the space must be
+	// handled or native session resume silently degrades to a fresh session.
+	codexLine := "\x1b[1msession id:\x1b[0m 019f249b-606d-70a1-a646-4fdf5b6d196b"
+	if got := extractNativeSessionID(codexLine); got != "019f249b-606d-70a1-a646-4fdf5b6d196b" {
+		t.Fatalf("extractNativeSessionID(codex ansi) = %q, want the uuid", got)
+	}
+	// A plain "same session" mention (as in the HITL prompt echo) must not match.
+	if got := extractNativeSessionID("you will be resumed in this same session"); got != "" {
+		t.Fatalf("extractNativeSessionID(prose) = %q, want empty", got)
+	}
 }
 
 func TestOnOutputRecomputesNativeSessionIDFromBufferedOutput(t *testing.T) {

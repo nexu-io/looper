@@ -340,16 +340,18 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	Metadata         map[string]any
-	IdempotencyKey   string
+	ExecutionID        string
+	ProjectID          string
+	LoopID             string
+	RunID              string
+	Prompt             string
+	NativeResumePrompt string
+	NativeSessionID    string
+	WorkingDirectory   string
+	Timeout            time.Duration
+	HeartbeatTimeout   time.Duration
+	Metadata           map[string]any
+	IdempotencyKey     string
 }
 
 type AgentResult struct {
@@ -449,7 +451,29 @@ type Options struct {
 	DiscoveryPolicy                 DiscoveryPolicy
 	OnQueueItemEnqueued             func()
 	Network                         NetworkStatusGateway
+	// HITLEnabled gates the mid-run human-in-the-loop feature. When false (the
+	// default) none of the HITL code paths run and the worker behaves exactly as
+	// before. HITLNotify, when set, sends the ask-card to the human channel.
+	HITLEnabled bool
+	HITLNotify  HITLNotifyFunc
 }
+
+// HITLAskNotification is the payload the worker hands to HITLNotify when an agent
+// pauses mid-run to ask a human.
+type HITLAskNotification struct {
+	ProjectID string
+	LoopID    string
+	LoopSeq   int64
+	RunID     string
+	Repo      string
+	Title     string
+	Question  string
+	Options   []string
+}
+
+// HITLNotifyFunc delivers a mid-run ask to the human channel (e.g. a Feishu
+// app-bot card). Best-effort; a returned error is logged, not fatal.
+type HITLNotifyFunc func(context.Context, HITLAskNotification) error
 
 type DiscoveryPolicy struct {
 	AutoDiscovery              bool
@@ -489,6 +513,8 @@ type Runner struct {
 	discoveryPolicy         DiscoveryPolicy
 	onQueueItemEnqueued     func()
 	network                 NetworkStatusGateway
+	hitlEnabled             bool
+	hitlNotify              HITLNotifyFunc
 }
 
 func (r *Runner) providerKindForProject(projectID string) config.ProviderKind {
@@ -749,6 +775,8 @@ func New(options Options) *Runner {
 		discoveryPolicy:         policy,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 		network:                 options.Network,
+		hitlEnabled:             options.HITLEnabled,
+		hitlNotify:              options.HITLNotify,
 	}
 }
 
@@ -822,7 +850,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" {
+		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" {
 			result.Skipped++
 			continue
 		}
@@ -1054,6 +1082,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
+		if awaiting, ok := asAwaitingHumanError(err); ok {
+			return r.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint}, run, checkpoint, awaiting)
+		}
 		if err != nil {
 			failure := r.classifyFailureWithBoundary(err, workerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
@@ -1607,12 +1638,23 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		// HITL (gated): let the agent pause to ask a human, and on resume feed the
+		// human's answer back into the same agent session.
+		nativeResumePrompt := ""
+		nativeSessionID := ""
+		if r.hitlEnabled {
+			prompt += hitlPromptInstruction
+			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop)
+			if nativeResumePrompt != "" {
+				prompt += "\n\n" + nativeResumePrompt
+			}
+		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1622,6 +1664,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		result, err := execution.Wait(ctx)
 		if err != nil {
 			return checkpoint, err
+		}
+		// HITL (gated): after the agent turn, if it wrote an ask sentinel, suspend
+		// the run so a human can answer. Returned as a typed error the step loop
+		// converts into an awaiting_human suspension (not a failure).
+		if r.hitlEnabled && result.Status == "completed" {
+			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, executionID); awaitErr != nil {
+				return checkpoint, awaitErr
+			} else if awaiting != nil {
+				return checkpoint, awaiting
+			}
 		}
 		if result.Status != "completed" {
 			checkpoint.Execution = checkpointExecutionFromAgentResult(result)
@@ -1635,6 +1687,13 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				kind = FailureRetryableTransient
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
+		}
+		// HITL (gated): the resumed turn completed without asking again, so the human
+		// answer that seeded it has been acted on. Flip it to "consumed" now — after
+		// the turn, never before — so a failed/timed-out turn re-reads the answer on
+		// retry, while a successful one never re-injects it on a later run.
+		if r.hitlEnabled {
+			r.markHumanAnswerConsumed(ctx, &input.Loop)
 		}
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
@@ -2362,10 +2421,6 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	if r.db == nil {
 		return fmt.Errorf("worker runner database is not configured")
 	}
-	metadataJSON, err := mergeLoopMetadataJSON(loop.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
-	if err != nil {
-		return err
-	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, pr.Number)
 	updatedQueue := queueItem
 	updatedQueue.TargetType = "pull_request"
@@ -2390,6 +2445,15 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 		}
 		if current == nil {
 			return fmt.Errorf("loop not found: %s", loop.ID)
+		}
+		// Merge the PR fields into the FRESH metadata read inside this transaction,
+		// not the stale passed-in loop copy. Otherwise concurrent metadata writes made
+		// earlier in this same run — e.g. the HITL answer marked "consumed" by
+		// markHumanAnswerConsumed — are silently clobbered back to their pre-run value,
+		// which would re-inject an already-consumed human answer on any later re-run.
+		metadataJSON, err := mergeLoopMetadataJSON(current.MetadataJSON, map[string]any{"prUrl": pr.URL, "prNumber": pr.Number, "repo": repo})
+		if err != nil {
+			return err
 		}
 		updatedLoop := *current
 		updatedLoop.Repo = stringPtr(repo)
@@ -2417,7 +2481,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	}
 	for _, existing := range existingLoops {
 		if workerLoopTracksIssue(existing, project.ID, repo, issue.Number) {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
 			prLinked := existing.TargetType == "pull_request" || derefInt64(existing.PRNumber) > 0
 			if prLinked {
 				return loopUpsertResult{record: existing, skipEnqueue: true}, nil

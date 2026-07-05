@@ -88,6 +88,21 @@ func TestAssertStatusTransitions(t *testing.T) {
 	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusCompleted); err == nil {
 		t.Fatal("AssertLoopStatusTransition(queued, completed) error = nil, want failure")
 	}
+	if err := AssertLoopStatusTransition(LoopStatusRunning, LoopStatusAwaitingHuman); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(running, awaiting_human) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusAwaitingHuman, LoopStatusRunning); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(awaiting_human, running) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusCompleted, LoopStatusAwaitingHuman); err == nil {
+		t.Fatal("AssertLoopStatusTransition(completed, awaiting_human) error = nil, want failure")
+	}
+	if err := AssertKnownLoopStatus(LoopStatusAwaitingHuman); err != nil {
+		t.Fatalf("AssertKnownLoopStatus(awaiting_human) error = %v", err)
+	}
+	if !IsActiveLoopStatus(LoopStatusAwaitingHuman) {
+		t.Fatal("IsActiveLoopStatus(awaiting_human) = false, want true")
+	}
 	if err := AssertRunStatusTransition(RunStatusQueued, RunStatusRunning); err != nil {
 		t.Fatalf("AssertRunStatusTransition(queued, running) error = %v", err)
 	}

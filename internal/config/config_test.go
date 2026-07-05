@@ -338,6 +338,40 @@ func TestMinimalForgejoProviderConfigAppliesSafeProjectProfile(t *testing.T) {
 	}
 }
 
+func TestPlaneProviderConfigLoadsWorkspaceAndProjectID(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"notifications": {"osascript": {"enabled": false}},
+		"providers": [{"id":"plane-od","kind":"plane","baseUrl":"https://plane.powerformer.net/api/v1","tokenEnv":"PLANE_API_KEY","workspace":"open-design","projectId":"proj-uuid-123"}],
+		"projects": [{"id":"demo","name":"Demo","provider":"plane-od","repo":"OWNER/repo","repoPath":"/tmp/repo"}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if len(loaded.Config.Providers) != 1 {
+		t.Fatalf("LoadFile().Config.Providers len = %d, want 1", len(loaded.Config.Providers))
+	}
+	provider := loaded.Config.Providers[0]
+	if provider.Kind != ProviderKindPlane {
+		t.Fatalf("provider kind = %q, want %q", provider.Kind, ProviderKindPlane)
+	}
+	if provider.Workspace == nil || *provider.Workspace != "open-design" {
+		t.Fatalf("provider workspace = %#v, want open-design", provider.Workspace)
+	}
+	if provider.ProjectID == nil || *provider.ProjectID != "proj-uuid-123" {
+		t.Fatalf("provider projectId = %#v, want proj-uuid-123", provider.ProjectID)
+	}
+	if ResolvedProjectProviderKind(loaded.Config, loaded.Config.Projects[0]) != ProviderKindPlane {
+		t.Fatalf("project provider kind = %q, want plane", ResolvedProjectProviderKind(loaded.Config, loaded.Config.Projects[0]))
+	}
+}
+
 func TestForgejoExplicitUnsupportedProjectOptInFails(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")

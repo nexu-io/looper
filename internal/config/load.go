@@ -389,6 +389,9 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 		{key: "instructions", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "instructions", &partialConfig.Instructions)
 		}},
+		{key: "hitl", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "hitl", &partialConfig.HITL)
+		}},
 		{key: "roles", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "roles", &partialConfig.Roles)
 		}},

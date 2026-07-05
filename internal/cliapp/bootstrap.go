@@ -45,6 +45,14 @@ type bootstrapOptions struct {
 	ProjectPath      string
 	EnableLocalToken bool
 	DisableOsascript bool
+	Provider         string
+	CodeRepo         string
+	TriggerLabel     string
+	PlaneBaseURL     string
+	PlaneWorkspace   string
+	PlaneProject     string
+	PlaneTokenEnv    string
+	FeishuWebhookEnv string
 }
 
 type bootstrapConfigPlan struct {
@@ -52,7 +60,26 @@ type bootstrapConfigPlan struct {
 	EnableOsascript  bool
 	EnableLocalToken bool
 	ProjectPath      string
+	// Provider is the task-source provider for the generated project:
+	// "github" (default; unchanged behavior) or "plane".
+	Provider         string
+	CodeRepo         string
+	TriggerLabel     string
+	PlaneBaseURL     string
+	PlaneWorkspace   string
+	PlaneProject     string
+	PlaneTokenEnv    string
+	FeishuWebhookEnv string
 }
+
+const (
+	bootstrapProviderGitHub     = "github"
+	bootstrapProviderForgejo    = "forgejo"
+	bootstrapProviderPlane      = "plane"
+	defaultPlaneBootstrapBase   = "https://plane.powerformer.net/api/v1"
+	defaultPlaneBootstrapToken  = "PLANE_API_KEY"
+	defaultBootstrapTriggerText = "looper:plan"
+)
 
 func (r *commandRuntime) bootstrap(cmd *cobra.Command, args []string) error {
 	_ = args
@@ -65,6 +92,14 @@ func (r *commandRuntime) bootstrap(cmd *cobra.Command, args []string) error {
 		ProjectPath:      strings.TrimSpace(getStringFlag(cmd, "project-path")),
 		EnableLocalToken: getBoolFlag(cmd, "enable-local-token"),
 		DisableOsascript: getBoolFlag(cmd, "disable-osascript"),
+		Provider:         strings.TrimSpace(getStringFlag(cmd, "provider")),
+		CodeRepo:         strings.TrimSpace(getStringFlag(cmd, "code-repo")),
+		TriggerLabel:     strings.TrimSpace(getStringFlag(cmd, "trigger-label")),
+		PlaneBaseURL:     strings.TrimSpace(getStringFlag(cmd, "plane-base-url")),
+		PlaneWorkspace:   strings.TrimSpace(getStringFlag(cmd, "plane-workspace")),
+		PlaneProject:     strings.TrimSpace(getStringFlag(cmd, "plane-project")),
+		PlaneTokenEnv:    strings.TrimSpace(getStringFlag(cmd, "plane-token-env")),
+		FeishuWebhookEnv: strings.TrimSpace(getStringFlag(cmd, "feishu-webhook-env")),
 	}
 
 	result, err := r.runBootstrap(ctx, cmd, opts)
@@ -231,18 +266,28 @@ func (r *commandRuntime) planBootstrapConfig(cmd *cobra.Command, cwd string, opt
 		plan.ProjectPath = resolved
 	}
 
+	plan.FeishuWebhookEnv = opts.FeishuWebhookEnv
+	planeNotes, err := r.resolveBootstrapProviderPlan(cmd, &plan, opts)
+	if err != nil {
+		return bootstrapConfigPlan{}, nil, err
+	}
+
 	configPath, err := r.resolveBootstrapConfigPath(cwd)
 	if err != nil {
 		return bootstrapConfigPlan{}, nil, err
 	}
 	if _, err := os.Stat(configPath); err == nil {
+		if plan.Provider == bootstrapProviderPlane {
+			return bootstrapConfigPlan{}, nil, fmt.Errorf("config already exists at %s; --provider plane generates a fresh config — remove it or pass --config <new-path> and rerun", configPath)
+		}
 		return plan, nil, nil
 	} else if !os.IsNotExist(err) {
 		return bootstrapConfigPlan{}, nil, fmt.Errorf("check config path %s: %w", configPath, err)
 	}
 
-	if opts.Yes {
-		return plan, nil, nil
+	// The plane provider is fully specified by flags, so skip interactive prompts.
+	if opts.Yes || plan.Provider == bootstrapProviderPlane {
+		return plan, planeNotes, nil
 	}
 
 	reader := bufio.NewReader(cmd.InOrStdin())
@@ -281,7 +326,113 @@ func (r *commandRuntime) planBootstrapConfig(cmd *cobra.Command, cwd string, opt
 		}
 	}
 
-	return plan, nil, nil
+	return plan, planeNotes, nil
+}
+
+// resolveBootstrapProviderPlan validates the --provider selection and, for
+// plane, fills in defaults + required Plane coordinates and resolves the GitHub
+// code repo (from --code-repo or the --project-path git origin). It returns
+// human-readable notes (e.g. which env vars must be exported).
+func (r *commandRuntime) resolveBootstrapProviderPlan(cmd *cobra.Command, plan *bootstrapConfigPlan, opts bootstrapOptions) ([]string, error) {
+	provider := strings.ToLower(strings.TrimSpace(opts.Provider))
+	if provider == "" {
+		provider = bootstrapProviderGitHub
+	}
+	switch provider {
+	case bootstrapProviderGitHub:
+		plan.Provider = bootstrapProviderGitHub
+		return nil, nil
+	case bootstrapProviderForgejo:
+		return nil, fmt.Errorf("--provider forgejo is not scaffolded by bootstrap yet; use --provider github or plane, or edit config.json manually")
+	case bootstrapProviderPlane:
+		plan.Provider = bootstrapProviderPlane
+	default:
+		return nil, fmt.Errorf("unsupported --provider %q (supported: github, plane)", opts.Provider)
+	}
+
+	if plan.ProjectPath == "" {
+		return nil, fmt.Errorf("--provider plane requires --project-path (the local checkout of the GitHub code repo)")
+	}
+	if strings.TrimSpace(opts.PlaneWorkspace) == "" {
+		return nil, fmt.Errorf("--provider plane requires --plane-workspace (the Plane workspace slug)")
+	}
+	if strings.TrimSpace(opts.PlaneProject) == "" {
+		return nil, fmt.Errorf("--provider plane requires --plane-project (the Plane project UUID)")
+	}
+	plan.PlaneWorkspace = strings.TrimSpace(opts.PlaneWorkspace)
+	plan.PlaneProject = strings.TrimSpace(opts.PlaneProject)
+	plan.PlaneBaseURL = strings.TrimSpace(opts.PlaneBaseURL)
+	if plan.PlaneBaseURL == "" {
+		plan.PlaneBaseURL = defaultPlaneBootstrapBase
+	}
+	plan.PlaneTokenEnv = strings.TrimSpace(opts.PlaneTokenEnv)
+	if plan.PlaneTokenEnv == "" {
+		plan.PlaneTokenEnv = defaultPlaneBootstrapToken
+	}
+	plan.TriggerLabel = strings.TrimSpace(opts.TriggerLabel)
+	if plan.TriggerLabel == "" {
+		plan.TriggerLabel = defaultBootstrapTriggerText
+	}
+
+	codeRepo := strings.TrimSpace(opts.CodeRepo)
+	if codeRepo == "" {
+		detected := r.detectBootstrapOriginRepo(cmd.Context(), plan.ProjectPath)
+		codeRepo = detected
+	}
+	if codeRepo == "" {
+		return nil, fmt.Errorf("--provider plane requires the GitHub code repo: pass --code-repo owner/repo or ensure %s has a github.com origin remote", plan.ProjectPath)
+	}
+	plan.CodeRepo = codeRepo
+
+	notes := []string{
+		fmt.Sprintf("plane provider: export %s with your Plane API key before starting looperd", plan.PlaneTokenEnv),
+	}
+	if plan.FeishuWebhookEnv != "" {
+		notes = append(notes, fmt.Sprintf("feishu notifications: export %s with your Feishu (or generic) webhook URL", plan.FeishuWebhookEnv))
+	}
+	return notes, nil
+}
+
+// detectBootstrapOriginRepo best-effort resolves owner/repo from the git origin
+// remote of projectPath. Returns "" on any failure (caller falls back to
+// requiring --code-repo).
+func (r *commandRuntime) detectBootstrapOriginRepo(ctx context.Context, projectPath string) string {
+	gitPath, err := r.lookPath()("git")
+	if err != nil || strings.TrimSpace(gitPath) == "" {
+		gitPath = "git"
+	}
+	result, err := r.runCommand(ctx, gitPath, []string{"-C", projectPath, "config", "--get", "remote.origin.url"}, 3*time.Second)
+	if err != nil || result.ExitCode != 0 {
+		return ""
+	}
+	return parseGitHubRepoSlug(strings.TrimSpace(result.Stdout))
+}
+
+// parseGitHubRepoSlug extracts "owner/repo" from a github.com remote URL
+// (git@github.com:owner/repo.git, https://github.com/owner/repo.git, or ssh).
+func parseGitHubRepoSlug(remoteURL string) string {
+	remoteURL = strings.TrimSpace(remoteURL)
+	if remoteURL == "" {
+		return ""
+	}
+	remoteURL = strings.TrimSuffix(remoteURL, ".git")
+	var path string
+	switch {
+	case strings.HasPrefix(remoteURL, "git@"):
+		if _, after, ok := strings.Cut(remoteURL, ":"); ok {
+			path = after
+		}
+	case strings.Contains(remoteURL, "github.com/"):
+		if _, after, ok := strings.Cut(remoteURL, "github.com/"); ok {
+			path = after
+		}
+	}
+	path = strings.Trim(strings.TrimSpace(path), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return parts[0] + "/" + parts[1]
 }
 
 func (r *commandRuntime) bootstrapPreflight(ctx context.Context, configPath string, plan *bootstrapConfigPlan) ([]string, error) {
@@ -504,9 +655,73 @@ func applyBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
 		token := bootstrapLocalToken()
 		cfg.Server.LocalToken = &token
 	}
+	if strings.TrimSpace(plan.FeishuWebhookEnv) != "" {
+		cfg.Notifications.Webhook = config.WebhookNotificationConfig{
+			Enabled: true,
+			URLEnv:  plan.FeishuWebhookEnv,
+			Format:  "feishu",
+			Levels: []config.NotificationSoundLevel{
+				config.NotificationSoundLevelActionRequired,
+				config.NotificationSoundLevelFailure,
+			},
+			ThrottleWindowSeconds: cfg.Notifications.Webhook.ThrottleWindowSeconds,
+		}
+	}
+	if plan.Provider == bootstrapProviderPlane {
+		applyPlaneBootstrapPlan(cfg, plan)
+		return
+	}
 	if plan.ProjectPath != "" {
 		cfg.Projects = append(cfg.Projects, buildBootstrapProject(plan.ProjectPath, cfg.Defaults.BaseBranch))
 	}
+}
+
+// applyPlaneBootstrapPlan wires a Plane task-source provider + a project bound to
+// it (with the GitHub code repo for PRs) + planner/worker discovery on the
+// configured trigger label. Plane assignees are UUIDs (not GitHub logins), so
+// discovery keys on the label only (requireAssigneeCurrentUser=false).
+func applyPlaneBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
+	providerID := planeBootstrapProviderID(plan.PlaneWorkspace)
+	cfg.Providers = append(cfg.Providers, config.ProviderConfig{
+		ID:        providerID,
+		Kind:      config.ProviderKindPlane,
+		BaseURL:   plan.PlaneBaseURL,
+		TokenEnv:  stringPtr(plan.PlaneTokenEnv),
+		Workspace: stringPtr(plan.PlaneWorkspace),
+		ProjectID: stringPtr(plan.PlaneProject),
+	})
+
+	projectName := filepath.Base(plan.ProjectPath)
+	if strings.TrimSpace(projectName) == "" || projectName == "." || projectName == string(filepath.Separator) {
+		projectName = providerID
+	}
+	cfg.Projects = append(cfg.Projects, config.ProjectRefConfig{
+		ID:         deriveBootstrapProjectID(plan.ProjectPath),
+		Name:       projectName,
+		Provider:   providerID,
+		Repo:       plan.CodeRepo,
+		RepoPath:   plan.ProjectPath,
+		BaseBranch: stringPtr(cfg.Defaults.BaseBranch),
+	})
+
+	label := plan.TriggerLabel
+	if strings.TrimSpace(label) == "" {
+		label = defaultBootstrapTriggerText
+	}
+	cfg.Roles.Planner.Triggers.Labels = []string{label}
+	cfg.Roles.Planner.Triggers.LabelMode = config.LabelModeAll
+	cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser = false
+	cfg.Roles.Worker.Triggers.Labels = []string{label}
+	cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
+	cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+}
+
+func planeBootstrapProviderID(workspace string) string {
+	slug := deriveBootstrapProjectID(workspace)
+	if slug == "" || slug == "project" {
+		return "plane"
+	}
+	return "plane-" + slug
 }
 
 func writeBootstrapConfig(path string, cfg config.Config) error {

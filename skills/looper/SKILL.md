@@ -149,6 +149,31 @@ looper bootstrap --yes \
 
 If the user prefers to drive bootstrap themselves: `looper bootstrap` (interactive). See [`references/cli.md`](references/cli.md) for every supported flag.
 
+#### Plane task-source + Feishu HITL variant
+
+Use this when the issues live in a [Plane](https://plane.so) project (not GitHub) but the code + PRs stay on GitHub. Looper reads work-items from Plane and opens PRs on the GitHub `repo`. `--provider plane` generates a **fresh** config, so only use it when no config exists yet.
+
+```bash
+looper bootstrap --yes \
+  --provider plane \
+  --project-path "$REPO" \
+  --code-repo <owner>/<repo> \
+  --plane-workspace <workspace-slug> \
+  --plane-project <plane-project-uuid> \
+  --trigger-label looper:plan \
+  --feishu-webhook-env LOOPER_FEISHU_WEBHOOK_URL \
+  --agent-vendor "<selected-vendor>"
+```
+
+`--code-repo` may be omitted if `$REPO` has a `github.com` origin (it is auto-detected). Two env vars must be exported in the daemon's shell before Step 5 (never store them in the config):
+
+```bash
+export PLANE_API_KEY="<plane-api-key>"                     # matches --plane-token-env (default PLANE_API_KEY)
+export LOOPER_FEISHU_WEBHOOK_URL="<feishu-bot-webhook-url>" # matches --feishu-webhook-env
+```
+
+Full flag reference, config shape, and follow-ups: [`references/plane.md`](references/plane.md) and [`docs/plane-provider.md`](../../docs/plane-provider.md).
+
 ### Step 5 — Verify the install
 
 Run all of these and report the results. Do not restart the daemon if status is healthy.
@@ -222,6 +247,7 @@ For deeper detail, consult these bundled docs before acting:
 - [`references/cli.md`](references/cli.md) — installed `looper` CLI commands, install/uninstall scripts, `looper bootstrap`, `looper project add`, daemon lifecycle, loop inspection.
 - [`references/config.md`](references/config.md) — full Looper config shape, every field, validation rules, env var overrides, CLI flag overrides, role trigger customization, reviewer event mapping.
 - [`references/daemon.md`](references/daemon.md) — `looperd` startup, supervised vs detached mode, launchd integration, log locations, startup-failure triage.
+- [`references/plane.md`](references/plane.md) — Plane task-source provider + Feishu HITL: extra bootstrap flags, the two env vars, generated config shape, and a discovery verify step.
 - [`scripts/check.sh`](scripts/check.sh) — read-only local diagnostic. Verifies `git`, `gh`, `gh auth status`, optional `osascript`, `looper --version`, config presence, and `~/.looper` writability. Invoke via absolute skill path.
 
 When in doubt, prefer read-only checks first:

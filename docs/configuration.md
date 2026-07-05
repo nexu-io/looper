@@ -191,10 +191,11 @@ repoPath = "/absolute/path/to/repo"
 
 ## Provider support
 
-Looper supports two provider kinds:
+Looper supports three provider kinds:
 
 - `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
 - `forgejo` — REST-backed MVP for planner, worker, and summary-comment reviewer/fixer flows. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
+- `plane` — a **task-source** provider: issues (work-items) are read from a [Plane](https://plane.so) project, while pull requests, diffs, and reviews stay on the project's GitHub code repo. Use this to let Looper consume Plane work-items directly as its issue source without creating a redundant GitHub issue. See [Plane provider + Feishu HITL setup](plane-provider.md) for the full guide, including the one-command `looper bootstrap --provider plane …` flow.
 
 Forgejo provider example:
 
@@ -219,7 +220,7 @@ repo = "acme/example"
 Forgejo rules:
 
 - `providers[].id` must be unique.
-- `providers[].kind` must be `github` or `forgejo`; `gitea` is not a supported provider kind yet.
+- `providers[].kind` must be `github`, `forgejo`, or `plane`; `gitea` is not a supported provider kind yet.
 - Forgejo providers require an absolute `http(s)` `baseUrl` and a non-empty `tokenEnv`. The token value is read from the daemon environment and is never stored in project metadata.
 - Forgejo projects require explicit `provider` and `repo` (`owner/name`).
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
@@ -228,6 +229,15 @@ Forgejo rules:
 - Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
 
 Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Reviewer writes the top-level Reviewer Summary comment that Fixer treats as its repair-work authority; Fixer writes a top-level Fixer Summary comment and never resolves native Forgejo review threads.
+
+### Plane task-source provider
+
+`plane` splits the task source from the code forge: Planner/Worker read work-items from Plane (filtered by a trigger label), while pull requests are opened and reviewed on the project's GitHub `repo`. Plane rules:
+
+- `providers[].kind = "plane"` requires a non-empty `tokenEnv` (the env var holding the Plane API key), `workspace` (the Plane workspace slug), and `projectId` (the Plane project UUID). `baseUrl` is optional and defaults to the public Plane API base.
+- The project bound to a plane provider requires explicit `provider` and `repo`, where `repo` is the **GitHub code repo** (`owner/name`) where PRs are opened, and `repoPath` is its local checkout.
+- Discovery keys on the trigger label only; because Plane assignees are UUIDs (not GitHub logins), set `roles.*.triggers.requireAssigneeCurrentUser = false`.
+- One command scaffolds all of this: `looper bootstrap --provider plane …` (see [Plane provider + Feishu HITL setup](plane-provider.md)).
 
 ### Forgejo live sandbox e2e
 

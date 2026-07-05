@@ -3055,7 +3055,7 @@ func TestHandlerCreateLoopRejectsUnsupportedLoopStatus(t *testing.T) {
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	errMap := body["error"].(map[string]any)
 	assertEqual(t, errMap["code"], "VALIDATION_FAILED")
-	assertEqual(t, errMap["message"], "loop.status must be one of: idle, queued, running, paused, waiting, stopped, terminated, completed, failed, interrupted")
+	assertEqual(t, errMap["message"], "loop.status must be one of: idle, queued, running, paused, waiting, stopped, terminated, completed, failed, interrupted, awaiting_human")
 
 	loops, err := fixture.runtime.Services().Repositories.Loops.List(context.Background())
 	if err != nil {

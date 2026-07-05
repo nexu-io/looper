@@ -72,16 +72,16 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 	if err != nil {
 		t.Fatalf("Notifications.List() error = %v", err)
 	}
-	if len(notifications) != 4 {
-		t.Fatalf("Notifications.List() len = %d, want 4", len(notifications))
+	if len(notifications) != 6 {
+		t.Fatalf("Notifications.List() len = %d, want 6", len(notifications))
 	}
 
 	events, err := repos.Events.ListByEntity(ctx, "task", "task_1")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
 	}
-	if len(events) != 4 {
-		t.Fatalf("Events.ListByEntity() len = %d, want 4", len(events))
+	if len(events) != 6 {
+		t.Fatalf("Events.ListByEntity() len = %d, want 6", len(events))
 	}
 
 	osascriptCallsBytes, err := os.ReadFile(capturePath)

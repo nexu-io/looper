@@ -540,7 +540,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" {
+		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "awaiting_human" {
 			result.Skipped++
 			continue
 		}
@@ -1430,7 +1430,7 @@ func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.Project
 	}
 	for _, existing := range existingLoops {
 		if existing.Type == "planner" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
 			updated := existing
 			updated.Repo = stringPtr(repo)
 			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
