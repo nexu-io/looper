@@ -3650,6 +3650,11 @@ func TestShouldRequeueLoopKeepsPausedLoopsExcluded(t *testing.T) {
 	if shouldRequeueLoop(storage.LoopRecord{Status: "paused"}, &storage.RunRecord{Status: "interrupted"}, false) {
 		t.Fatal("shouldRequeueLoop() = true, want false for paused loop")
 	}
+	// A human-takeover loop's run is killed (looks interrupted) but must NOT be
+	// re-queued by recovery — only an explicit handback resumes it.
+	if shouldRequeueLoop(storage.LoopRecord{Status: "human_takeover"}, &storage.RunRecord{Status: "interrupted"}, false) {
+		t.Fatal("shouldRequeueLoop() = true, want false for human_takeover loop")
+	}
 }
 
 func TestShouldAutoRecoverFailedReviewerLoopIgnoresLegacyBudgetTermination(t *testing.T) {

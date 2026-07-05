@@ -2920,7 +2920,10 @@ func shouldRequeueLoop(loop storage.LoopRecord, latestRun *storage.RunRecord, la
 	if terminalReviewerRecoveryMetadataStatus(loop) != "" {
 		return false
 	}
-	if loop.Status == "paused" {
+	// paused + human_takeover are deliberately parked: a human paused it, or is
+	// driving its agent session via takeover. Recovery must NOT re-queue them (the
+	// killed run looks "interrupted", but that's expected) — only a handback does.
+	if loop.Status == "paused" || loop.Status == string(domain.LoopStatusHumanTakeover) {
 		return false
 	}
 	if loop.Status == "completed" || loop.Status == "failed" || loop.Status == "terminated" || loop.Status == "stopped" {
