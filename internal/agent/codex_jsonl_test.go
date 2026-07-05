@@ -75,3 +75,17 @@ func TestCleanShellWrapper(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractCodexThreadID(t *testing.T) {
+	blob := `{"type":"thread.started","thread_id":"019f2d12-279e-7a73"}
+{"type":"item.started","item":{"type":"command_execution","id":"c1","command":"ls"}}`
+	if got := extractCodexThreadID(blob); got != "019f2d12-279e-7a73" {
+		t.Fatalf("extractCodexThreadID = %q; want the thread id", got)
+	}
+	if got := extractCodexThreadID(`{"type":"item.started"}`); got != "" {
+		t.Fatalf("extractCodexThreadID(no thread.started) = %q; want empty", got)
+	}
+	if got := extractCodexThreadID("not json\n"); got != "" {
+		t.Fatalf("extractCodexThreadID(garbage) = %q; want empty", got)
+	}
+}

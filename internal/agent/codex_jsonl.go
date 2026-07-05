@@ -180,6 +180,30 @@ func (t *codexJSONLTranslator) ingestAll(blob string) {
 	}
 }
 
+// extractCodexThreadID scans a codex --json stdout blob for the session id from
+// the thread.started event, so a live run can persist its session id BEFORE
+// completion (needed for mid-run human takeover). Returns the first id found and
+// stops early — thread.started is the stream's first event — so callers can gate
+// on an empty session id and avoid rescanning once it's known.
+func extractCodexThreadID(stdout string) string {
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] != '{' || !strings.Contains(line, "thread") {
+			continue
+		}
+		var raw map[string]any
+		if json.Unmarshal([]byte(line), &raw) != nil {
+			continue
+		}
+		if typ, _ := raw["type"].(string); typ == "thread.started" {
+			if id := jsonlStr(raw, "thread_id", "threadId"); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
 // cleanShellWrapper unwraps a leading shell invocation ("/bin/zsh -lc '<cmd>'",
 // "bash -c \"<cmd>\"") to the inner command, so the tool feed reads as the actual
 // command rather than the shell plumbing around it.

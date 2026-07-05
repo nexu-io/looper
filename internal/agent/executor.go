@@ -852,8 +852,17 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	heartbeatCount := x.heartbeatCount
 	stdout := string(x.stdout)
 	stderr := string(x.stderr)
+	// Capture the native session id AS SOON as it appears, so it's persisted while
+	// the run is live (a human taking over mid-run needs it — completion is too
+	// late). Text-mode ids can stream in across chunks, so re-extract each time; the
+	// codex --json thread id arrives whole in a thread.started line, so capture it
+	// once (only when text extraction found nothing and it's not already known).
 	if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
 		x.nativeSessionID = nativeSessionID
+	} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
+		if threadID := extractCodexThreadID(stdout); threadID != "" {
+			x.nativeSessionID = threadID
+		}
 	}
 	x.mu.Unlock()
 
