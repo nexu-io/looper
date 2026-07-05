@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -69,8 +70,22 @@ type Context struct {
 	StopLoop             func(context.Context, string, string) (any, error)
 	CloseLoop            func(context.Context, string, string) (any, error)
 	StopAll              func(context.Context, string) (any, error)
+	// TakeoverLoop parks a loop for interactive human takeover: stops the daemon's
+	// in-flight run (session id preserved on disk) and transitions the loop to
+	// human_takeover, returning what a human needs to resume the exact session.
+	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
+}
+
+// TakeoverResult is what a takeover yields: the native session id + worktree +
+// vendor of the loop's last run, so the caller can hand a human the exact resume
+// command.
+type TakeoverResult struct {
+	LoopID       string
+	Vendor       string
+	SessionID    string
+	WorktreePath string
 }
 
 type Handler struct {
@@ -3066,6 +3081,19 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
 		return h.respondToLoop(r.Context(), r, loop.ID)
+	case "takeover":
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.takeoverLoop(r.Context(), loop.ID)
+	case "handback":
+		// Handing a taken-over loop back to the daemon is exactly a retry: re-arm the
+		// (non-terminal) loop to queued + requeue; the next run native-resumes the
+		// same session id and sees the human's turns.
+		if r.Method != http.MethodPost {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.retryLoop(r.Context(), r, loop.ID)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
@@ -4347,6 +4375,45 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	}
 
 	return serializeLoop(updated), nil
+}
+
+type takeoverLoopResponse struct {
+	LoopID        string `json:"loopId"`
+	Vendor        string `json:"vendor,omitempty"`
+	SessionID     string `json:"sessionId,omitempty"`
+	WorktreePath  string `json:"worktreePath,omitempty"`
+	Supported     bool   `json:"supported"`
+	ResumeCommand string `json:"resumeCommand,omitempty"`
+	Message       string `json:"message,omitempty"`
+}
+
+// takeoverLoop parks a loop for interactive human takeover and returns the exact
+// command a human runs to resume the loop's agent session (same native session id,
+// in the loop's worktree). The daemon's in-flight run is already stopped by the
+// wired TakeoverLoop closure; here we only shape the response + resume command.
+func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoopResponse, error) {
+	if h.context.TakeoverLoop == nil {
+		return takeoverLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusServiceUnavailable, message: "Takeover is not available on this daemon"}
+	}
+	result, err := h.context.TakeoverLoop(ctx, loopID, "Taken over by a human via looper resume")
+	if err != nil {
+		return takeoverLoopResponse{}, err
+	}
+	resp := takeoverLoopResponse{
+		LoopID:       result.LoopID,
+		Vendor:       result.Vendor,
+		SessionID:    result.SessionID,
+		WorktreePath: result.WorktreePath,
+	}
+	vendor := config.AgentVendor(strings.TrimSpace(result.Vendor))
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: h.context.Config.Agent.Params}, result.WorktreePath, result.SessionID)
+	resp.Supported = ok
+	if ok {
+		resp.ResumeCommand = cmdLine
+	} else {
+		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude); the loop is parked in human_takeover — hand it back with `looper handback` to resume the daemon."
+	}
+	return resp, nil
 }
 
 type respondLoopRequest struct {

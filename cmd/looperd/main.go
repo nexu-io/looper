@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
@@ -125,6 +127,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		StopAll: func(ctx context.Context, reason string) (any, error) {
 			return stopAllLoops(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
+		TakeoverLoop: func(ctx context.Context, loopID, reason string) (looperdapi.TakeoverResult, error) {
+			return takeoverLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
+		},
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
 		},
@@ -189,6 +194,37 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 
 func closeLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (any, error) {
 	return haltLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess, true)
+}
+
+// takeoverLoop parks a loop for interactive human takeover: it captures the loop's
+// latest agent session id + worktree + vendor, stops the daemon's in-flight run
+// (reusing stopLoop — pause + kill + cancel queue, so the scheduler leaves it
+// alone), then transitions the loop to human_takeover. The session id lives on
+// disk, so a human resumes the exact session and a later handback (retry) lets the
+// daemon native-resume it and see the human's turns.
+func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (looperdapi.TakeoverResult, error) {
+	result := looperdapi.TakeoverResult{LoopID: loopID}
+	if services.Loops == nil {
+		return result, fmt.Errorf("loops service is not configured")
+	}
+	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
+		if execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil {
+			result.Vendor = execution.Vendor
+			if execution.NativeSessionID != nil {
+				result.SessionID = strings.TrimSpace(*execution.NativeSessionID)
+			}
+			if execution.CWD != nil {
+				result.WorktreePath = strings.TrimSpace(*execution.CWD)
+			}
+		}
+	}
+	if _, err := stopLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess); err != nil {
+		return result, err
+	}
+	if _, err := services.Loops.TransitionStatus(ctx, loopID, loops.TransitionInput{Status: domain.LoopStatusHumanTakeover}); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
