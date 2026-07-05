@@ -1,20 +1,17 @@
 # DESIGN — one-command human takeover of a loop's agent session
 
-Status: **Phases 0–5 landed + e2e-verified** (branch `feat/human-takeover`).
-Verified end-to-end against a live daemon: `looper resume <seq>` parks the loop
-(stays `human_takeover` across ticks — the race guard released a stray claimed
-item), returns the exact `cd <worktree> && codex resume <sid>` command, and kills
-the run; `looper handback <seq>` re-arms it and the daemon continues.
+Status: **DONE + e2e-verified** (branch `feat/human-takeover`). Verified end to
+end against a live daemon:
+- `looper resume <seq>` parks the loop (stays `human_takeover` across ticks — the
+  scheduler race guard released a stray claimed item), returns the exact
+  `cd <worktree> && codex resume <sid>` command, and kills the run.
+- `looper handback <seq>` re-arms it (clearing any queue item that survived the
+  takeover race) and the daemon's next run resumes the SAME session:
+  `codex exec … resume <human-sid> "A human … continue from where they left off"`
+  — so the daemon sees the human's turns, not a fresh session.
 
-**Known limitation (follow-up):** on handback the daemon continues via the
-worker's `checkpoint_restart` (re-runs the step in the SAME worktree, so the
-human's file changes carry over) rather than native-resuming the human's exact
-codex conversation — so the daemon sees the human's *work* but not the *chat*.
-Full conversation continuity needs the worker's resume policy to choose
-native_resume for a takeover (the executor + captured session id already support
-it; `agent.nativeResume.enabled` must also be on). The human's OWN takeover has
-full conversation continuity (verified codex/claude resume semantics below);
-only the daemon-side handback resume is checkpoint-based today.
+Requires `agent.nativeResume.enabled: true` for the daemon-side handback resume
+(the human's own takeover has full conversation continuity regardless).
 
 Owner-facing goal:
 
