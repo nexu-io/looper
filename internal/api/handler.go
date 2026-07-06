@@ -60,16 +60,16 @@ type activeRunExecutionVerifier interface {
 }
 
 type Context struct {
-	Config               config.Config
-	Runtime              RuntimeState
-	WebhookForwarder     webhookforward.Forwarder
-	ProjectsService      projectService
-	Now                  func() time.Time
-	RecoverySummary      func() any
-	ReconcileStaleRuns   func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
-	StopLoop             func(context.Context, string, string) (any, error)
-	CloseLoop            func(context.Context, string, string) (any, error)
-	StopAll              func(context.Context, string) (any, error)
+	Config             config.Config
+	Runtime            RuntimeState
+	WebhookForwarder   webhookforward.Forwarder
+	ProjectsService    projectService
+	Now                func() time.Time
+	RecoverySummary    func() any
+	ReconcileStaleRuns func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
+	StopLoop           func(context.Context, string, string) (any, error)
+	CloseLoop          func(context.Context, string, string) (any, error)
+	StopAll            func(context.Context, string) (any, error)
 	// TakeoverLoop parks a loop for interactive human takeover: stops the daemon's
 	// in-flight run (session id preserved on disk) and transitions the loop to
 	// human_takeover, returning what a human needs to resume the exact session.

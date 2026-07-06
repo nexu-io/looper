@@ -5979,11 +5979,11 @@ type fakeGitGateway struct {
 	pushErrors     []error
 	pushIndex      int
 
-	createCalls  []CreateWorktreeInput
-	prepareCalls []PrepareWorktreeInput
-	inspectCalls []InspectHeadInput
-	commitCalls  []CommitInput
-	pushCalls    []PushInput
+	createCalls     []CreateWorktreeInput
+	prepareCalls    []PrepareWorktreeInput
+	inspectCalls    []InspectHeadInput
+	commitCalls     []CommitInput
+	pushCalls       []PushInput
 	fetchCalls      []string
 	mergeBaseCalls  []MergeBaseInput
 	mergeBaseResult MergeBaseResult
@@ -7053,7 +7053,7 @@ func TestReRequestReviewersAfterFix(t *testing.T) {
 		reviews: []ReviewSummary{
 			{ID: 1, State: "CHANGES_REQUESTED", Author: "reviewer-a"},
 			{ID: 2, State: "COMMENTED", Author: "reviewer-b"},
-			{ID: 3, State: "APPROVED", Author: "reviewer-c"},        // approved -> not re-requested
+			{ID: 3, State: "APPROVED", Author: "reviewer-c"},          // approved -> not re-requested
 			{ID: 4, State: "CHANGES_REQUESTED", Author: "looper-bot"}, // self -> excluded
 			{ID: 5, State: "CHANGES_REQUESTED", Author: "reviewer-a"}, // duplicate -> once
 		},

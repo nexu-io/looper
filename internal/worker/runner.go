@@ -587,11 +587,11 @@ type workerInput struct {
 	SpecPath string `json:"specPath,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	// IssueRepo is the source issue repository, which may differ from Repo for cross-repo closing references.
-	IssueRepo            string   `json:"issueRepo,omitempty"`
-	BaseBranch           string   `json:"baseBranch,omitempty"`
-	ExecutionMode        string   `json:"executionMode,omitempty"`
-	IssueNumber          int64    `json:"issueNumber,omitempty"`
-	IssueURL             string   `json:"issueUrl,omitempty"`
+	IssueRepo     string `json:"issueRepo,omitempty"`
+	BaseBranch    string `json:"baseBranch,omitempty"`
+	ExecutionMode string `json:"executionMode,omitempty"`
+	IssueNumber   int64  `json:"issueNumber,omitempty"`
+	IssueURL      string `json:"issueUrl,omitempty"`
 	// TriggerLogin is who created/assigned the source issue (GitHub login), shown
 	// as attribution on the HITL ask card so a human knows whose task this is.
 	TriggerLogin         string   `json:"triggerLogin,omitempty"`

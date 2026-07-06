@@ -64,10 +64,10 @@ func TestResolveCodexArgsJSONFlag(t *testing.T) {
 
 func TestCleanShellWrapper(t *testing.T) {
 	cases := map[string]string{
-		"/bin/zsh -lc 'gh api repos/x'":       "gh api repos/x",
-		`bash -c "npm test"`:                  "npm test",
-		"gh pr create --title x":              "gh pr create --title x",
-		"/usr/bin/sh -lc 'cat README.md'":     "cat README.md",
+		"/bin/zsh -lc 'gh api repos/x'":   "gh api repos/x",
+		`bash -c "npm test"`:              "npm test",
+		"gh pr create --title x":          "gh pr create --title x",
+		"/usr/bin/sh -lc 'cat README.md'": "cat README.md",
 	}
 	for in, want := range cases {
 		if got := cleanShellWrapper(in); got != want {

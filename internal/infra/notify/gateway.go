@@ -15,8 +15,8 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1487,7 +1487,6 @@ func loopTitleFromMetadata(metadataJSON *string) string {
 	}
 	return ""
 }
-
 
 func defaultFeishuAppHTTP(ctx context.Context, method, url string, headers map[string]string, body []byte) (int, []byte, error) {
 	client := &http.Client{Timeout: webhookTimeout}

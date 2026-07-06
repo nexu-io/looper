@@ -11,16 +11,22 @@ func TestPollFeishuHITLInboxOnce(t *testing.T) {
 	seqToLoop := map[int64]string{71: "loop-seq71"}
 	var answers, messages []string
 	deps := feishuHITLPollDeps{
-		loopByRoot:     func(_ contextType, root string) string { return rootToLoop[root] },
-		loopBySeq:      func(_ contextType, seq int64) string { return seqToLoop[seq] },
-		deliverAnswer:  func(_ contextType, loopID, answer string) error { answers = append(answers, loopID+"="+answer); return nil },
-		enqueueMessage: func(_ contextType, loopID, text string) error { messages = append(messages, loopID+"="+text); return nil },
+		loopByRoot: func(_ contextType, root string) string { return rootToLoop[root] },
+		loopBySeq:  func(_ contextType, seq int64) string { return seqToLoop[seq] },
+		deliverAnswer: func(_ contextType, loopID, answer string) error {
+			answers = append(answers, loopID+"="+answer)
+			return nil
+		},
+		enqueueMessage: func(_ contextType, loopID, text string) error {
+			messages = append(messages, loopID+"="+text)
+			return nil
+		},
 	}
 	events := []feishuInboxEvent{
 		{ID: 10, Kind: "message", RootID: "om_root_1", Text: "用 A,改 resize handle"}, // typed -> enqueue
-		{ID: 11, Kind: "message", RootID: "om_other", Text: "not ours"},              // another looper -> skip
-		{ID: 12, Kind: "message", RootID: "om_root_1", Text: "   "},                  // empty -> skip
-		mustCardAction(15, "71", "redis"),                                            // button -> deliver by seq
+		{ID: 11, Kind: "message", RootID: "om_other", Text: "not ours"},             // another looper -> skip
+		{ID: 12, Kind: "message", RootID: "om_root_1", Text: "   "},                 // empty -> skip
+		mustCardAction(15, "71", "redis"),                                           // button -> deliver by seq
 	}
 	n, maxID := pollFeishuHITLInboxOnce(context.Background(), events, deps)
 	if n != 2 {
