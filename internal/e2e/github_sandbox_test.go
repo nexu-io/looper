@@ -350,7 +350,14 @@ func workerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness
 
 func fixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, agentMode string) config.Config {
 	tb.Helper()
-	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", "")
+	// The fixer's resolve-comments drift guard requires the agent's reply to
+	// carry a `threadCommentsObserved` snapshot; a "fixed" decision without one
+	// is treated as drift and skipped (fixedDecisionMissingThreadSnapshot).
+	// The fake agent only fetches that snapshot when it has a gh path, so pass
+	// the same real `gh` the daemon uses. Before #513 the fake agent defaulted
+	// to `gh` on PATH; that fallback was removed, which silently regressed this
+	// live sandbox test into a deterministic thread-drift failure.
+	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", "gh")
 	cfg := harness.DefaultConfig(tb, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: "gh", Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
