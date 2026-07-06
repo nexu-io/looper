@@ -116,27 +116,55 @@ export LOOPER_FEISHU_INBOX_TOKEN=xxx           # shared secret to read /events (
 export LOOPER_CODEX_JSON_EVENTS=1              # optional: live tool-call feed in the thread
 ```
 
-## 3b. Per-person IDs (Feishu open_id · Plane member UUID)
-Two settings are per-person (they go in each teammate's own config, not the shared env):
+## 3b. Where every value comes from
+Nothing here has to be guessed. Grouped by who owns it.
 
-**Feishu `open_id`** — who a decision card @-mentions (`notifications.webhook.mentionOpenIds`). To get yours:
-- Easiest: ask whoever administers the Feishu app — they can read it from the group's member list in one call
-  (`GET open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id`).
-- Self-serve: Feishu 开放平台 → API 调试台 → `通讯录 / 批量获取用户 ID` (`contact/v3/users/batch_get_id`),
-  set `user_id_type=open_id`, pass your own email or mobile → the returned `user_id` is your `open_id` (`ou_...`).
+### Shared — pre-filled in `hitl.env`, same for the whole team (you don't fetch these)
+| Env var | What it is | Where it comes from |
+| --- | --- | --- |
+| `LOOPER_FEISHU_APP_ID` | Feishu app id (`cli_...`) | Feishu 开放平台 → your app → 凭证与基础信息 |
+| `LOOPER_FEISHU_APP_SECRET` | Feishu app secret | same page (凭证与基础信息) |
+| `LOOPER_FEISHU_VERIFY_TOKEN` | event verification token | Feishu app → 事件与回调 → 加密策略 → Verification Token |
+| `LOOPER_FEISHU_INBOX_URL` | CF inbox worker `/events` URL | the worker's domain + `/events` (see §4) |
+| `LOOPER_FEISHU_INBOX_TOKEN` | worker `POLL_TOKEN` | set when the worker was deployed (§4) |
 
-Leave `mentionOpenIds` empty for no @-mention, or default it to the team lead so an unset teammate still pings someone.
+Whoever set the team up fills these once and distributes the filled `hitl.env` privately.
 
-**Plane member UUID** — only needed for a Plane task-source project, to route work-items per person
-(`roles.worker.triggers.planeAssigneeId`). Get yours with your **own** Plane API key (Plane → Settings → API tokens):
-```sh
-curl -s -H "X-API-Key: <YOUR_PLANE_API_KEY>" -H "Accept: application/json" \
-  https://plane.powerformer.net/api/v1/users/me/ | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'
-```
-The printed `id` is your Plane member UUID. Put it in `planeAssigneeId` so your looper only picks up Plane
-work-items assigned to you; the daemon can then read the project with the shared `PLANE_API_KEY`. Leaving it empty
-falls back to label-only discovery (every looper watching that project sees every item — use one central looper then).
-See [`skills/looper/references/plane.md`](../skills/looper/references/plane.md) for the full Plane setup.
+### Per-person — Feishu
+- **`open_id`** (`notifications.webhook.mentionOpenIds`, who a card @-mentions):
+  - Easiest: ask the Feishu app admin — one call reads it from the group members
+    (`GET open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id`).
+  - Self-serve: Feishu 开放平台 → API 调试台 → `通讯录 / 批量获取用户 ID` (`contact/v3/users/batch_get_id`),
+    `user_id_type=open_id`, pass your own email/mobile → the returned `user_id` is your `open_id` (`ou_...`).
+  - Empty = no @-mention; or default it to the team lead so an unset teammate still pings someone.
+
+### Per-person — GitHub
+- **`repo`** (`owner/repo`) — the GitHub repo whose issues/PRs looper handles.
+- **`repoPath`** — the **absolute path** of your local clone of that repo.
+- **GitHub auth** — `gh auth login` as yourself; looper drives `gh`, so PRs/comments show as you.
+
+### Per-person — coding agent
+- **`agent.params.command`** — absolute path to your `codex` / `claude` binary (`which codex`), and it must be **logged in**.
+
+### Per-person — Plane (only if your tasks live in Plane) — use the `plane` CLI
+The self-developed [`plane` CLI](https://github.com/powerformer/plane-cli) reads everything with your own API key. Configure it once — put your key + workspace in `~/.plane/plane.toml` (or export `PLANE_API_KEY` / `PLANE_WORKSPACE_SLUG`) — then:
+
+| Config value | Command to get it |
+| --- | --- |
+| **`PLANE_API_KEY`** (env; each person their **own** key) | Plane → workspace settings → **API Tokens** → create one |
+| **`planeAssigneeId`** = your member UUID (`roles.worker.triggers.planeAssigneeId`) | `plane api me` → the `id:` line |
+| provider **`projectId`** (Plane project UUID) | `plane api project list` → first column of your project |
+| provider **`workspace`** (slug) | it's your workspace slug (e.g. `open-design`); `plane api me` echoes the base |
+| provider **`baseUrl`** | `https://plane.powerformer.net/api/v1` (the default) |
+
+`plane api me` doubles as an auth smoke-test. An admin can hand out anyone's UUID with `plane api member workspace-list`.
+Put your UUID in `planeAssigneeId` so your looper only picks up Plane work-items **assigned to you**; leaving it empty
+falls back to label-only discovery (every looper watching that project grabs every item — use one central looper then).
+Each teammate should use **their own** Plane API key (correct attribution + `plane api me` gives their UUID), not a
+shared one. Full Plane setup: [`skills/looper/references/plane.md`](../skills/looper/references/plane.md).
+
+### looper's own data
+- **`storage` / `daemon` paths** — anywhere you like; default `~/.looper` (`looper.sqlite`, `backups/`, `logs/`).
 
 ## 4. Cloudflare inbox worker (shared Feishu app)
 So one shared Feishu app can reach many NAT'd looper daemons, Feishu posts events

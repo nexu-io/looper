@@ -76,7 +76,7 @@ Redact both as `***` in any summary. An authenticated `gh` is still needed for t
 Key facts an agent must not get wrong:
 
 - Plane assignees are UUIDs, not GitHub logins, so `requireAssigneeCurrentUser` (which resolves the GitHub login) can't route them — keep it `false`, or discovery matches nothing.
-- To route Plane work-items **per person** (so each teammate's looper only picks up its owner's items instead of every looper racing for every labelled item), set `triggers.planeAssigneeId` to that person's Plane member UUID. Empty = label-only discovery (fine when a single central looper consumes the project). Ignored for github/forgejo providers. Get the UUID with the owner's own Plane API key: `curl -s -H "X-API-Key: <key>" -H "Accept: application/json" https://plane.powerformer.net/api/v1/users/me/` → the `id` field.
+- To route Plane work-items **per person** (so each teammate's looper only picks up its owner's items instead of every looper racing for every labelled item), set `triggers.planeAssigneeId` to that person's Plane member UUID. Empty = label-only discovery (fine when a single central looper consumes the project). Ignored for github/forgejo providers. Get the UUID with the `plane` CLI: `plane api me` → the `id:` line (or `plane api member workspace-list` for anyone's; raw: `curl -H "X-API-Key: <key>" .../api/v1/users/me/` → `id`). Get the `projectId` with `plane api project list`.
 - `repo` is the GitHub code repo where PRs land; `workspace`/`projectId` on the provider point at Plane.
 - Coordinator and Fixer lanes are skipped for plane projects; Reviewer runs against the GitHub PRs Worker opens.
 
