@@ -317,6 +317,54 @@ func TestDiscoverIssuesRoutedProjectCombinesTargetLabelWithAnyTriggerQueries(t *
 	}
 }
 
+func TestDiscoverIssuesScopesPlaneWorkItemsToConfiguredAssigneeUUID(t *testing.T) {
+	t.Parallel()
+	const planeUUID = "11111111-2222-3333-4444-555555555555"
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper"}}
+	fixture.cfg.Roles.Worker.AutoDiscovery = true
+	fixture.cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	fixture.cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
+	fixture.cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+	fixture.cfg.Roles.Worker.Triggers.PlaneAssigneeID = planeUUID
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 7, Title: "Plane item", Labels: []string{"looper:plan"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listIssueCalls) == 0 {
+		t.Fatalf("no ListOpenIssues call recorded")
+	}
+	if got := github.listIssueCalls[0].Assignee; got != planeUUID {
+		t.Fatalf("ListOpenIssues Assignee = %q, want the configured Plane UUID %q", got, planeUUID)
+	}
+}
+
+func TestDiscoverIssuesPlaneWithoutAssigneeUUIDStaysLabelOnly(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper"}}
+	fixture.cfg.Roles.Worker.AutoDiscovery = true
+	fixture.cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	fixture.cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
+	fixture.cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 7, Title: "Plane item", Labels: []string{"looper:plan"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listIssueCalls) == 0 {
+		t.Fatalf("no ListOpenIssues call recorded")
+	}
+	if got := github.listIssueCalls[0].Assignee; got != "" {
+		t.Fatalf("ListOpenIssues Assignee = %q, want empty (label-only) when no Plane UUID configured", got)
+	}
+}
+
 func TestDiscoverIssuesPreservesExistingWorkerMetadataOnRediscovery(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

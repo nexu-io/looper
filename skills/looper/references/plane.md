@@ -67,7 +67,7 @@ Redact both as `***` in any summary. An authenticated `gh` is still needed for t
   ],
   "roles": {
     "planner": { "autoDiscovery": true, "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false } },
-    "worker":  { "autoDiscovery": true, "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false } }
+    "worker":  { "autoDiscovery": true, "triggers": { "labels": ["looper:plan"], "labelMode": "all", "requireAssigneeCurrentUser": false, "planeAssigneeId": "<your-plane-member-uuid>" } }
   },
   "notifications": { "webhook": { "enabled": true, "urlEnv": "LOOPER_FEISHU_WEBHOOK_URL", "format": "feishu", "levels": ["action_required", "failure"] } }
 }
@@ -75,7 +75,8 @@ Redact both as `***` in any summary. An authenticated `gh` is still needed for t
 
 Key facts an agent must not get wrong:
 
-- Plane assignees are UUIDs, not GitHub logins, so discovery keys on the label only. Keep `requireAssigneeCurrentUser: false`; setting it `true` makes discovery match nothing.
+- Plane assignees are UUIDs, not GitHub logins, so `requireAssigneeCurrentUser` (which resolves the GitHub login) can't route them — keep it `false`, or discovery matches nothing.
+- To route Plane work-items **per person** (so each teammate's looper only picks up its owner's items instead of every looper racing for every labelled item), set `triggers.planeAssigneeId` to that person's Plane member UUID. Empty = label-only discovery (fine when a single central looper consumes the project). Ignored for github/forgejo providers. Get the UUID with the owner's own Plane API key: `curl -s -H "X-API-Key: <key>" -H "Accept: application/json" https://plane.powerformer.net/api/v1/users/me/` → the `id` field.
 - `repo` is the GitHub code repo where PRs land; `workspace`/`projectId` on the provider point at Plane.
 - Coordinator and Fixer lanes are skipped for plane projects; Reviewer runs against the GitHub PRs Worker opens.
 

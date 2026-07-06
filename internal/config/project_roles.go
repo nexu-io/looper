@@ -15,6 +15,16 @@ func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 	return roles
 }
 
+// ProjectProviderKind resolves the task-source provider kind for a project by
+// id (github / forgejo / plane). Unknown ids fall back to the GitHub default.
+func ProjectProviderKind(cfg Config, projectID string) ProviderKind {
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil {
+		return ProviderKindGitHub
+	}
+	return resolvedProjectProviderKind(cfg, *project)
+}
+
 func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 	roles := ProjectRoleConfigs(cfg, projectID)
 	switch role {

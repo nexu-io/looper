@@ -438,6 +438,13 @@ type IssueRoleTriggersConfig struct {
 	Labels                     []string  `json:"labels"`
 	LabelMode                  LabelMode `json:"labelMode"`
 	RequireAssigneeCurrentUser bool      `json:"requireAssigneeCurrentUser"`
+	// PlaneAssigneeID scopes discovery on a Plane task-source project to
+	// work-items assigned to this Plane member UUID. Plane assignees are UUIDs
+	// (not GitHub logins), so RequireAssigneeCurrentUser can't route them; set
+	// this per person instead so each looper only picks up its owner's items.
+	// Empty = label-only discovery (every watching looper sees every item).
+	// Ignored for non-Plane providers.
+	PlaneAssigneeID string `json:"planeAssigneeId,omitempty"`
 }
 
 type PullRequestRoleTriggersConfig struct {
@@ -922,6 +929,7 @@ type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
 	RequireAssigneeCurrentUser *bool      `json:"requireAssigneeCurrentUser,omitempty"`
+	PlaneAssigneeID            *string    `json:"planeAssigneeId,omitempty"`
 }
 
 type PartialPullRequestRoleTriggersConfig struct {

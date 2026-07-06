@@ -1274,6 +1274,9 @@ func mergeIssueRoleTriggersConfig(config *IssueRoleTriggersConfig, partial Parti
 	if partial.RequireAssigneeCurrentUser != nil {
 		config.RequireAssigneeCurrentUser = *partial.RequireAssigneeCurrentUser
 	}
+	if partial.PlaneAssigneeID != nil {
+		config.PlaneAssigneeID = *partial.PlaneAssigneeID
+	}
 }
 
 func mergePullRequestRoleTriggersConfig(config *PullRequestRoleTriggersConfig, partial PartialPullRequestRoleTriggersConfig) {

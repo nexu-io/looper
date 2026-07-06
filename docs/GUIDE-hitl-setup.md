@@ -116,6 +116,28 @@ export LOOPER_FEISHU_INBOX_TOKEN=xxx           # shared secret to read /events (
 export LOOPER_CODEX_JSON_EVENTS=1              # optional: live tool-call feed in the thread
 ```
 
+## 3b. Per-person IDs (Feishu open_id · Plane member UUID)
+Two settings are per-person (they go in each teammate's own config, not the shared env):
+
+**Feishu `open_id`** — who a decision card @-mentions (`notifications.webhook.mentionOpenIds`). To get yours:
+- Easiest: ask whoever administers the Feishu app — they can read it from the group's member list in one call
+  (`GET open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id`).
+- Self-serve: Feishu 开放平台 → API 调试台 → `通讯录 / 批量获取用户 ID` (`contact/v3/users/batch_get_id`),
+  set `user_id_type=open_id`, pass your own email or mobile → the returned `user_id` is your `open_id` (`ou_...`).
+
+Leave `mentionOpenIds` empty for no @-mention, or default it to the team lead so an unset teammate still pings someone.
+
+**Plane member UUID** — only needed for a Plane task-source project, to route work-items per person
+(`roles.worker.triggers.planeAssigneeId`). Get yours with your **own** Plane API key (Plane → Settings → API tokens):
+```sh
+curl -s -H "X-API-Key: <YOUR_PLANE_API_KEY>" -H "Accept: application/json" \
+  https://plane.powerformer.net/api/v1/users/me/ | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'
+```
+The printed `id` is your Plane member UUID. Put it in `planeAssigneeId` so your looper only picks up Plane
+work-items assigned to you; the daemon can then read the project with the shared `PLANE_API_KEY`. Leaving it empty
+falls back to label-only discovery (every looper watching that project sees every item — use one central looper then).
+See [`skills/looper/references/plane.md`](../skills/looper/references/plane.md) for the full Plane setup.
+
 ## 4. Cloudflare inbox worker (shared Feishu app)
 So one shared Feishu app can reach many NAT'd looper daemons, Feishu posts events
 to a small Cloudflare Worker; each daemon polls it. Setup in
