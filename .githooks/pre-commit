@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Auto-gofmt staged Go files so a formatting slip can never reach CI's
+# `gofmt -l` gate. Enable once per clone with:
+#   scripts/verify.sh --install-hooks     (sets core.hooksPath to .githooks)
+#
+# Kept bash-3.2 compatible (macOS default bash) — no mapfile/readarray.
+set -euo pipefail
+
+# Only the Go files staged for this commit.
+staged="$(git diff --cached --name-only --diff-filter=ACM -- '*.go')"
+[ -z "$staged" ] && exit 0
+
+# Which of them are not gofmt-clean.
+unformatted="$(printf '%s\n' "$staged" | xargs gofmt -l)"
+[ -z "$unformatted" ] && exit 0
+
+# Re-formatting a file that also has UNSTAGED edits and then `git add`-ing it
+# would silently sweep those edits into the commit. Refuse instead of guessing.
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  if ! git diff --quiet -- "$f"; then
+    printf 'pre-commit: %s needs gofmt but has unstaged changes.\n' "$f" >&2
+    printf "  run 'gofmt -w %s' and re-stage it yourself, then commit.\n" "$f" >&2
+    exit 1
+  fi
+done <<EOF
+$unformatted
+EOF
+
+printf '%s\n' "$unformatted" | xargs gofmt -w
+printf '%s\n' "$unformatted" | xargs git add
+printf 'pre-commit: gofmt reformatted + re-staged:\n'
+printf '%s\n' "$unformatted" | sed 's/^/  /'

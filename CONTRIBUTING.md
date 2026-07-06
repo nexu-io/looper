@@ -53,6 +53,18 @@ go test ./...
 
 Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `logs/`). The default config path is `~/.looper/config.json`. Configuration precedence is: defaults → config file → environment → CLI flags. See `docs/configuration.md` for every field.
 
+## Local pre-flight (so CI never surprises you)
+
+CI's `verify` job runs, in order: `gofmt -l .` → `go vet ./...` → `go test ./...` → `go build`. Two helpers keep you ahead of it:
+
+```bash
+scripts/verify.sh --install-hooks   # one-time per clone: git commits now auto-gofmt
+scripts/verify.sh                   # run the exact CI gates locally before you push
+scripts/verify.sh --fix             # gofmt -w first, then run the gates
+```
+
+After `--install-hooks`, the tracked `.githooks/pre-commit` reformats and re-stages any Go file you commit, so a formatting slip can't reach CI. It's the single most common way to redden `verify`.
+
 ## Branching and commits
 
 - Branch off `main`. Use short, descriptive names (e.g. `fix/reviewer-loop-deadlock`, `feat/cli-jump`).
@@ -69,8 +81,8 @@ Default runtime artifacts land in `~/.looper/` (`looper.sqlite`, `backups/`, `lo
 
 ## Coding conventions
 
-- Format code with `gofmt`. CI runs `gofmt -l .` and fails on any diff.
-- Run `go vet ./...` before pushing.
+- Format code with `gofmt`. CI runs `gofmt -l .` and fails on any diff — `scripts/verify.sh --install-hooks` makes commits auto-format so this can't happen.
+- Run `scripts/verify.sh` (or at least `go vet ./...`) before pushing.
 - Prefer small, well-named packages in `internal/`. Only put genuinely reusable code in `pkg/`.
 - Don't edit generated files or anything in `dist/`.
 - Tool paths (`git`, `gh`, `osascript`) are auto-detected — don't hard-code them.
