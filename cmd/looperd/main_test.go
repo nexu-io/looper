@@ -362,7 +362,7 @@ func TestStopLoopPausesLoopAndSignalsActiveExecution(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != pid {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != pid || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if !called || gotSignalPID != -int(pid) {
@@ -591,7 +591,7 @@ func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if signaled {
@@ -606,6 +606,70 @@ func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 	}
 	if storedExecution == nil || storedExecution.Status != "cancelling" {
 		t.Fatalf("AgentExecutions.GetByID() = %#v, want cancelling execution", storedExecution)
+	}
+}
+
+func TestStopLoopActiveInMemoryExecutionWinsBeforeVerifierRejectsPID(t *testing.T) {
+	ctx := context.Background()
+	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-21T12:00:00.000Z"
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 30, ProjectID: project.ID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	pid := int64(4321)
+	agentExecution := storage.AgentExecutionRecord{ID: "agentexec_1", ProjectID: &project.ID, LoopID: &loop.ID, RunID: &run.ID, Vendor: "codex", Status: "running", PID: &pid, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.AgentExecutions.Upsert(ctx, agentExecution); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	registry := looperdruntime.NewActiveExecutionRegistry()
+	active := &fakeActiveExecution{}
+	unregister := registry.Register(loop.ID, run.ID, agentExecution.ID, active)
+	defer unregister()
+	services := looperdruntime.Services{Coordinator: coordinator, Repositories: repos, Loops: &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}, ActiveExecutions: registry}
+
+	verifierCalled := false
+	gotResult, err := stopLoop(ctx, services, loop.ID, "Stopped by test", func() time.Time { return now }, func(int, syscall.Signal) error {
+		t.Fatal("signal invoked, want active execution kill path")
+		return nil
+	}, func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error) {
+		verifierCalled = true
+		return false, true, nil
+	})
+	if err != nil {
+		t.Fatalf("stopLoop() error = %v", err)
+	}
+	result, ok := gotResult.(stopLoopResult)
+	if !ok {
+		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
+	}
+	if !result.Stopped || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
+		t.Fatalf("stopLoop() result = %#v", result)
+	}
+	if verifierCalled {
+		t.Fatal("execution verifier called, want in-memory authority to win first")
+	}
+	if !active.killed {
+		t.Fatal("active execution Kill was not invoked")
 	}
 }
 
@@ -663,7 +727,7 @@ func TestStopLoopRetriesActiveInMemoryExecutionAlreadyCancelling(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if !active.killed {
@@ -729,11 +793,56 @@ func TestStopLoopSignalsExecutionAlreadyCancelling(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != pid {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != pid || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if len(signalCalls) != 2 || signalCalls[0] != -int(pid) || signalCalls[1] != int(pid) {
 		t.Fatalf("signal calls = %#v, want process group then process", signalCalls)
+	}
+}
+
+func TestStopLoopDoesNotClaimProcessSignaledWithoutSignaler(t *testing.T) {
+	ctx := context.Background()
+	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-21T12:00:00.000Z"
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 30, ProjectID: project.ID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	pid := int64(4321)
+	agentExecution := storage.AgentExecutionRecord{ID: "agentexec_1", ProjectID: &project.ID, LoopID: &loop.ID, RunID: &run.ID, Vendor: "codex", Status: "running", PID: &pid, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.AgentExecutions.Upsert(ctx, agentExecution); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	services := looperdruntime.Services{Coordinator: coordinator, Repositories: repos, Loops: &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}}
+
+	gotResult, err := stopLoop(ctx, services, loop.ID, "Stopped by test", func() time.Time { return now }, nil, func(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error) {
+		return true, true, nil
+	})
+	if err != nil {
+		t.Fatalf("stopLoop() error = %v", err)
+	}
+	result := gotResult.(stopLoopResult)
+	if result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipNoSignal {
+		t.Fatalf("stopLoop() result = %#v, want paused-only without signal authority", result)
 	}
 }
 
@@ -793,7 +902,7 @@ func TestStopLoopSkipsStaleActiveExecutionWhenLatestExecutionCompleted(t *testin
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomeAlreadyFinished || result.ProcessSkipReason != processSkipAlreadyFinished {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if active.killed {
@@ -866,7 +975,7 @@ func TestStopLoopDoesNotOverwriteCompletedExecutionAfterActiveKill(t *testing.T)
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.Outcome != stopOutcomeProcessSignaled || result.ProcessSkipReason != "" {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if !active.killed {
@@ -937,7 +1046,7 @@ func TestStopLoopSkipsSignalWhenExecutionVerifierRejectsPID(t *testing.T) {
 	if !ok {
 		t.Fatalf("stopLoop() result type = %T, want stopLoopResult", gotResult)
 	}
-	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 {
+	if !result.Stopped || result.LoopID != loop.ID || result.RunID != run.ID || result.ExecutionID != agentExecution.ID || result.Vendor != "codex" || result.PID != 0 || result.Outcome != stopOutcomePausedOnly || result.ProcessSkipReason != processSkipVerifierRejectedPID {
 		t.Fatalf("stopLoop() result = %#v", result)
 	}
 	if signaled {
@@ -982,7 +1091,7 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 		t.Fatalf("stopAllLoops() error = %v", err)
 	}
 
-	if got, want := response.Summary, (stopAllSummary{Total: 7, Stopped: 6, Failed: 1}); got != want {
+	if got, want := response.Summary, (stopAllSummary{Total: 7, Stopped: 4, AlreadyFinished: 2, Failed: 1}); got != want {
 		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
 	}
 	if got := stopAllItemTypes(response.Items); !slices.Equal(got, []string{"planner", "reviewer", "worker", "fixer", "auditor", "worker", "reviewer"}) {
@@ -991,8 +1100,8 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 	assertStopAllItemResult(t, response.Items, "loop_reviewer", string(stopAllResultFailed))
 	assertStopAllItemResult(t, response.Items, "loop_fixer", string(stopAllResultStopped))
 	assertStopAllItemResult(t, response.Items, "loop_future", string(stopAllResultStopped))
-	assertStopAllItemResult(t, response.Items, "loop_queued", string(stopAllResultStopped))
-	assertStopAllItemResult(t, response.Items, "loop_waiting", string(stopAllResultStopped))
+	assertStopAllItemResult(t, response.Items, "loop_queued", string(stopAllResultAlreadyFinished))
+	assertStopAllItemResult(t, response.Items, "loop_waiting", string(stopAllResultAlreadyFinished))
 	if !slices.Contains(signalPIDs, -4101) || !slices.Contains(signalPIDs, -4103) || !slices.Contains(signalPIDs, -4105) {
 		t.Fatalf("signal pids = %#v, want other loops processed after failure", signalPIDs)
 	}
@@ -1012,6 +1121,69 @@ func TestStopAllLoopsHandlesMixedTypesPartialFailureAndRepeatedCalls(t *testing.
 		t.Fatalf("second stopAllLoops() summary = %#v, want repeated call to report alreadyStopping", repeated.Summary)
 	}
 	assertStopAllItemResult(t, repeated.Items, "loop_future", string(stopAllResultAlreadyStopping))
+}
+
+func TestStopAllLoopsReportsPausedOnlyWhenPIDVerificationRejectsOwnership(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_worker", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_worker", runStatus: "running", executionID: "exec_worker", executionStatus: "running", pid: 4103})
+
+	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(int, syscall.Signal) error {
+		t.Fatal("signal invoked, want verifier-rejected PID skipped")
+		return nil
+	}, func(_ context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
+		return false, true, nil
+	})
+	if err != nil {
+		t.Fatalf("stopAllLoops() error = %v", err)
+	}
+	if got, want := response.Summary, (stopAllSummary{Total: 1, PausedOnly: 1}); got != want {
+		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
+	}
+	if item := response.Items[0]; item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipVerifierRejectedPID {
+		t.Fatalf("stopAllLoops() item = %#v", item)
+	}
+}
+
+func TestStopAllLoopsReportsPausedOnlyWhenSecondaryExecutionIsVerifierRejected(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_worker", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_worker", runStatus: "running", executionID: "exec_primary", executionStatus: "running", pid: 4103})
+	secondaryPID := int64(4104)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	if err := repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "exec_secondary", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_worker"), RunID: stringPtr("run_worker"), Vendor: "codex", Status: "running", PID: &secondaryPID, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(exec_secondary) error = %v", err)
+	}
+
+	var signalPIDs []int
+	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
+		if sig != syscall.SIGTERM {
+			return nil
+		}
+		signalPIDs = append(signalPIDs, pid)
+		return syscall.ESRCH
+	}, func(_ context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
+		return execution.ID == "exec_primary", true, nil
+	})
+	if err != nil {
+		t.Fatalf("stopAllLoops() error = %v", err)
+	}
+	if got, want := response.Summary, (stopAllSummary{Total: 1, PausedOnly: 1}); got != want {
+		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
+	}
+	item := response.Items[0]
+	if item.Result != string(stopAllResultPausedOnly) || item.Outcome != stopOutcomePausedOnly || item.ProcessSkipReason != processSkipVerifierRejectedPID {
+		t.Fatalf("stopAllLoops() item = %#v", item)
+	}
+	if !slices.Contains(signalPIDs, -4103) {
+		t.Fatalf("signal pids = %#v, want primary execution signaled", signalPIDs)
+	}
 }
 
 func TestClassifyStopAllResultChecksAllActiveExecutionsBeforeAlreadyStopping(t *testing.T) {

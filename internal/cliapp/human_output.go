@@ -188,13 +188,26 @@ type pullRequestOutput struct {
 	LoopStatus            struct {
 		LatestRunStatus *string `json:"latestRunStatus"`
 	} `json:"loopStatus"`
-	Stopped     bool    `json:"stopped"`
-	Reused      bool    `json:"reused"`
-	LoopID      string  `json:"loopId"`
-	RunID       *string `json:"runId"`
-	ExecutionID *string `json:"executionId"`
-	Vendor      *string `json:"vendor"`
-	PID         *int64  `json:"pid"`
+	Stopped           bool    `json:"stopped"`
+	Reused            bool    `json:"reused"`
+	LoopID            string  `json:"loopId"`
+	RunID             *string `json:"runId"`
+	ExecutionID       *string `json:"executionId"`
+	Vendor            *string `json:"vendor"`
+	PID               *int64  `json:"pid"`
+	Outcome           string  `json:"outcome"`
+	ProcessSkipReason *string `json:"processSkipReason"`
+}
+
+type stopLoopOutput struct {
+	Stopped           bool    `json:"stopped"`
+	LoopID            string  `json:"loopId"`
+	RunID             *string `json:"runId"`
+	ExecutionID       *string `json:"executionId"`
+	Vendor            *string `json:"vendor"`
+	PID               *int64  `json:"pid"`
+	Outcome           string  `json:"outcome"`
+	ProcessSkipReason *string `json:"processSkipReason"`
 }
 
 type activeRunsOutput struct {
@@ -205,6 +218,7 @@ type stopAllOutput struct {
 	Summary struct {
 		Total           int `json:"total"`
 		Stopped         int `json:"stopped"`
+		PausedOnly      int `json:"pausedOnly"`
 		AlreadyFinished int `json:"alreadyFinished"`
 		AlreadyStopping int `json:"alreadyStopping"`
 		Failed          int `json:"failed"`
@@ -219,6 +233,8 @@ type stopAllOutput struct {
 		PreviousRunStatus       string `json:"previousRunStatus"`
 		PreviousExecutionStatus string `json:"previousExecutionStatus"`
 		Result                  string `json:"result"`
+		Outcome                 string `json:"outcome"`
+		ProcessSkipReason       string `json:"processSkipReason"`
 		Error                   string `json:"error"`
 	} `json:"items"`
 }
@@ -694,11 +710,12 @@ func writeLoopLogContent(w io.Writer, content string) error {
 }
 
 func writeHumanStopLoop(w io.Writer, payload json.RawMessage) error {
-	var data pullRequestOutput
+	var data stopLoopOutput
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode stop response: %w", err)
 	}
-	printSection(w, "Loop stopped", [][2]any{{"loopId", data.LoopID}, {"runId", data.RunID}, {"executionId", data.ExecutionID}, {"vendor", data.Vendor}, {"pid", data.PID}, {"stopped", data.Stopped}})
+	title := stopOutcomeTitle(data.Outcome)
+	printSection(w, title, [][2]any{{"loopId", data.LoopID}, {"runId", data.RunID}, {"executionId", data.ExecutionID}, {"vendor", data.Vendor}, {"pid", data.PID}, {"outcome", data.Outcome}, {"processSkipReason", data.ProcessSkipReason}, {"stopped", data.Stopped}})
 	if !data.Stopped {
 		return fmt.Errorf("Loop %s could not be stopped", data.LoopID)
 	}
@@ -726,22 +743,43 @@ func writeHumanStopAll(w io.Writer, payload json.RawMessage) error {
 		_, err := fmt.Fprintln(w, "No running tasks to stop.")
 		return err
 	}
-	printSection(w, "Stopped running tasks", [][2]any{
+	title := "Stop results"
+	if data.Summary.Failed == 0 && data.Summary.PausedOnly == 0 && data.Summary.AlreadyFinished == 0 && data.Summary.AlreadyStopping == 0 {
+		title = "Stopped running tasks"
+	}
+	printSection(w, title, [][2]any{
 		{"total", data.Summary.Total},
 		{"stopped", data.Summary.Stopped},
+		{"pausedOnly", data.Summary.PausedOnly},
 		{"alreadyFinished", data.Summary.AlreadyFinished},
 		{"alreadyStopping", data.Summary.AlreadyStopping},
 		{"failed", data.Summary.Failed},
 	})
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"seq": item.Seq, "type": item.Type, "loopId": item.LoopID, "runId": item.RunID, "executionId": item.ExecutionID, "result": item.Result, "error": item.Error})
+		rows = append(rows, tableRow{"seq": item.Seq, "type": item.Type, "loopId": item.LoopID, "runId": item.RunID, "executionId": item.ExecutionID, "result": item.Result, "outcome": item.Outcome, "processSkipReason": item.ProcessSkipReason, "error": item.Error})
 	}
-	printTable(w, []string{"seq", "type", "loopId", "runId", "executionId", "result", "error"}, rows)
+	printTable(w, []string{"seq", "type", "loopId", "runId", "executionId", "result", "outcome", "processSkipReason", "error"}, rows)
 	if data.Summary.Failed > 0 {
 		return fmt.Errorf("failed to stop %d running task(s)", data.Summary.Failed)
 	}
+	if data.Summary.PausedOnly > 0 {
+		return fmt.Errorf("paused %d task(s) without signaling a verified process", data.Summary.PausedOnly)
+	}
 	return nil
+}
+
+func stopOutcomeTitle(outcome string) string {
+	switch outcome {
+	case "paused_only":
+		return "Loop paused only"
+	case "already_stopping":
+		return "Loop already stopping"
+	case "already_finished":
+		return "Loop already finished"
+	default:
+		return "Loop stopped"
+	}
 }
 
 func writeHumanRunList(w io.Writer, payload json.RawMessage) error {

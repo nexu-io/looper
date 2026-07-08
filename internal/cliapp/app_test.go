@@ -3453,6 +3453,80 @@ func TestCloseWithoutJSONUsesCloseRoute(t *testing.T) {
 	}
 }
 
+func TestStopWithoutJSONPrintsPausedOnlyOutcomeTruthfully(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/runs/active/12/stop"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"stopped": true, "loopId": "loop_12", "outcome": "paused_only", "processSkipReason": "pid_verification_rejected"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "12", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([stop 12]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([stop 12]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop paused only", "loop_12", "paused_only", "pid_verification_rejected"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([stop 12]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want paused-only title instead of plain stopped", stdout)
+	}
+}
+
+func TestStopWithoutJSONPrintsAlreadyStoppingOutcomeTruthfully(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"stopped": true, "loopId": "loop_12", "outcome": "already_stopping", "processSkipReason": "execution_already_stopping"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "12", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([stop 12]) = (%d, %q), want success with empty stderr", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Loop already stopping") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want already-stopping title", stdout)
+	}
+	if strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want non-success title", stdout)
+	}
+}
+
+func TestStopWithoutJSONPrintsAlreadyFinishedOutcomeTruthfully(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"stopped": true, "loopId": "loop_12", "outcome": "already_finished", "processSkipReason": "execution_already_finished"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "12", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([stop 12]) = (%d, %q), want success with empty stderr", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Loop already finished") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want already-finished title", stdout)
+	}
+	if strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want non-success title", stdout)
+	}
+}
+
 func TestStopAllWithoutJSONPrintsNoRunningWorkMessage(t *testing.T) {
 	t.Parallel()
 
@@ -3474,6 +3548,32 @@ func TestStopAllWithoutJSONPrintsNoRunningWorkMessage(t *testing.T) {
 	}
 }
 
+func TestStopAllWithoutJSONReturnsNonZeroForPausedOnlyItems(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all_partial", map[string]any{"summary": map[string]any{"total": 1, "stopped": 0, "pausedOnly": 1, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 0}, "items": []map[string]any{{"seq": 1, "type": "worker", "loopId": "loop_1", "runId": "run_1", "executionId": "exec_1", "result": "pausedOnly", "outcome": "paused_only", "processSkipReason": "pid_verification_rejected"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([stop all]) exit code = 0, want non-zero for paused-only partial outcome")
+	}
+	if !strings.Contains(stderr, "paused 1 task(s) without signaling a verified process") {
+		t.Fatalf("Run([stop all]) stderr = %q, want paused-only partial error", stderr)
+	}
+	for _, want := range []string{"Stop results", "pausedOnly", "paused_only", "pid_verification_rejected"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([stop all]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "Stopped running tasks") {
+		t.Fatalf("Run([stop all]) stdout = %q, want non-full-success heading", stdout)
+	}
+}
+
 func TestStopAllWithoutJSONReturnsNonZeroForPartialFailure(t *testing.T) {
 	t.Parallel()
 
@@ -3487,7 +3587,7 @@ func TestStopAllWithoutJSONReturnsNonZeroForPartialFailure(t *testing.T) {
 	if exitCode == 0 {
 		t.Fatal("Run([stop all]) exit code = 0, want non-zero")
 	}
-	if !strings.Contains(stdout, "Stopped running tasks") || !strings.Contains(stdout, "signal failed") {
+	if !strings.Contains(stdout, "Stop results") || !strings.Contains(stdout, "signal failed") {
 		t.Fatalf("Run([stop all]) stdout = %q, want summary and failure row", stdout)
 	}
 	if !strings.Contains(stderr, "failed to stop 1 running task(s)") {

@@ -563,10 +563,12 @@ func (r *commandRuntime) stopLoop(cmd *cobra.Command, args []string) error {
 		} else if err := writeHumanStopAll(cmd.OutOrStdout(), payload); err != nil {
 			return err
 		}
-		if failed, err := stopAllFailedCount(payload); err != nil {
+		if failed, pausedOnly, err := stopAllResultCounts(payload); err != nil {
 			return err
 		} else if failed > 0 {
 			return fmt.Errorf("failed to stop %d running task(s)", failed)
+		} else if pausedOnly > 0 {
+			return fmt.Errorf("paused %d task(s) without signaling a verified process", pausedOnly)
 		}
 		return nil
 	}
@@ -585,16 +587,17 @@ func (r *commandRuntime) closeLoop(cmd *cobra.Command, args []string) error {
 	}, writeHumanCloseLoop)
 }
 
-func stopAllFailedCount(payload json.RawMessage) (int, error) {
+func stopAllResultCounts(payload json.RawMessage) (int, int, error) {
 	var data struct {
 		Summary struct {
-			Failed int `json:"failed"`
+			Failed     int `json:"failed"`
+			PausedOnly int `json:"pausedOnly"`
 		} `json:"summary"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
-		return 0, fmt.Errorf("decode stop-all response: %w", err)
+		return 0, 0, fmt.Errorf("decode stop-all response: %w", err)
 	}
-	return data.Summary.Failed, nil
+	return data.Summary.Failed, data.Summary.PausedOnly, nil
 }
 
 func (r *commandRuntime) runList(cmd *cobra.Command, args []string) error {

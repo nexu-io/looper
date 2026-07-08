@@ -90,13 +90,31 @@ type daemonRuntime struct {
 }
 
 type stopLoopResult struct {
-	Stopped     bool   `json:"stopped"`
-	LoopID      string `json:"loopId"`
-	RunID       string `json:"runId,omitempty"`
-	ExecutionID string `json:"executionId,omitempty"`
-	Vendor      string `json:"vendor,omitempty"`
-	PID         int64  `json:"pid,omitempty"`
+	Stopped           bool   `json:"stopped"`
+	LoopID            string `json:"loopId"`
+	RunID             string `json:"runId,omitempty"`
+	ExecutionID       string `json:"executionId,omitempty"`
+	Vendor            string `json:"vendor,omitempty"`
+	PID               int64  `json:"pid,omitempty"`
+	Outcome           string `json:"outcome,omitempty"`
+	ProcessSkipReason string `json:"processSkipReason,omitempty"`
 }
+
+const (
+	stopOutcomeProcessSignaled = "process_signaled"
+	stopOutcomePausedOnly      = "paused_only"
+	stopOutcomeAlreadyStopping = "already_stopping"
+	stopOutcomeAlreadyFinished = "already_finished"
+
+	processSkipNoRuns              = "no_running_run"
+	processSkipNoExecution         = "no_execution"
+	processSkipAlreadyFinished     = "execution_already_finished"
+	processSkipAlreadyStopping     = "execution_already_stopping"
+	processSkipNoPID               = "pid_unavailable"
+	processSkipNoSignal            = "signal_unavailable"
+	processSkipVerifierNotRunning  = "pid_not_running"
+	processSkipVerifierRejectedPID = "pid_verification_rejected"
+)
 
 type signalProcessFunc func(int, syscall.Signal) error
 
@@ -228,7 +246,7 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 }
 
 func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
-	result := stopLoopResult{Stopped: false, LoopID: loopID}
+	result := stopLoopResult{Stopped: false, LoopID: loopID, Outcome: stopOutcomePausedOnly}
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
 	}
@@ -257,6 +275,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 
 	if services.Repositories == nil || services.Repositories.Runs == nil {
+		result.ProcessSkipReason = processSkipNoRuns
 		return complete()
 	}
 
@@ -265,11 +284,14 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return nil, err
 	}
 	if latestRun == nil || latestRun.Status != "running" {
+		result.Outcome = stopOutcomeAlreadyFinished
+		result.ProcessSkipReason = processSkipNoRuns
 		return complete()
 	}
 	result.RunID = latestRun.ID
 
 	if services.Repositories.AgentExecutions == nil {
+		result.ProcessSkipReason = processSkipNoExecution
 		return complete()
 	}
 
@@ -278,13 +300,20 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return nil, err
 	}
 	if latestExecution == nil {
+		result.ProcessSkipReason = processSkipNoExecution
 		return complete()
 	}
 
 	result.ExecutionID = latestExecution.ID
 	result.Vendor = latestExecution.Vendor
 	if !isStoppableExecutionStatus(latestExecution.Status) {
+		result.Outcome = stopOutcomeAlreadyFinished
+		result.ProcessSkipReason = processSkipAlreadyFinished
 		return complete()
+	}
+	if latestExecution.Status == "cancelling" {
+		result.Outcome = stopOutcomeAlreadyStopping
+		result.ProcessSkipReason = processSkipAlreadyStopping
 	}
 	if services.ActiveExecutions != nil {
 		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
@@ -292,6 +321,8 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			return nil, err
 		}
 		if killed {
+			result.Outcome = stopOutcomeProcessSignaled
+			result.ProcessSkipReason = ""
 			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 				return nil, err
 			}
@@ -299,6 +330,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		}
 	}
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
+		result.ProcessSkipReason = processSkipNoPID
 		return complete()
 	}
 
@@ -309,6 +341,12 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			return nil, err
 		}
 		if !running || !matches {
+			if !running {
+				result.Outcome = stopOutcomeAlreadyFinished
+				result.ProcessSkipReason = processSkipVerifierNotRunning
+			} else {
+				result.ProcessSkipReason = processSkipVerifierRejectedPID
+			}
 			return complete()
 		}
 	}
@@ -317,6 +355,11 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
 			return nil, err
 		}
+		result.Outcome = stopOutcomeProcessSignaled
+		result.ProcessSkipReason = ""
+	} else {
+		result.ProcessSkipReason = processSkipNoSignal
+		return complete()
 	}
 
 	if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
@@ -330,6 +373,7 @@ type stopAllResult string
 
 const (
 	stopAllResultStopped         stopAllResult = "stopped"
+	stopAllResultPausedOnly      stopAllResult = "pausedOnly"
 	stopAllResultAlreadyFinished stopAllResult = "alreadyFinished"
 	stopAllResultAlreadyStopping stopAllResult = "alreadyStopping"
 	stopAllResultFailed          stopAllResult = "failed"
@@ -338,6 +382,7 @@ const (
 type stopAllSummary struct {
 	Total           int `json:"total"`
 	Stopped         int `json:"stopped"`
+	PausedOnly      int `json:"pausedOnly"`
 	AlreadyFinished int `json:"alreadyFinished"`
 	AlreadyStopping int `json:"alreadyStopping"`
 	Failed          int `json:"failed"`
@@ -353,6 +398,8 @@ type stopAllItem struct {
 	PreviousRunStatus       string `json:"previousRunStatus,omitempty"`
 	PreviousExecutionStatus string `json:"previousExecutionStatus,omitempty"`
 	Result                  string `json:"result"`
+	Outcome                 string `json:"outcome,omitempty"`
+	ProcessSkipReason       string `json:"processSkipReason,omitempty"`
 	Error                   string `json:"error,omitempty"`
 }
 
@@ -405,11 +452,11 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 			continue
 		}
 
-		_, err := stopLoop(ctx, services, candidate.Loop.ID, reason, now, signal, executionMatchesProcess)
+		stopResultValue, err := stopLoop(ctx, services, candidate.Loop.ID, reason, now, signal, executionMatchesProcess)
 		if err != nil {
 			stopErr := err
 			if candidate.Execution != nil && candidate.Execution.Status == "running" {
-				if fallbackErr := stopCandidateExecution(ctx, services, candidate, reason, now, signal, executionMatchesProcess); fallbackErr != nil {
+				if _, fallbackErr := stopCandidateExecution(ctx, services, candidate, reason, now, signal, executionMatchesProcess); fallbackErr != nil {
 					err = errors.Join(stopErr, fallbackErr)
 				} else {
 					err = stopErr
@@ -428,15 +475,26 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 				item.Error = err.Error()
 			}
 		} else {
+			if stopResult, ok := stopResultValue.(stopLoopResult); ok {
+				item.Outcome = stopResult.Outcome
+				item.ProcessSkipReason = stopResult.ProcessSkipReason
+				item.Result = classifyStopAllItemResult(stopResult)
+			}
 			for _, execution := range candidate.Executions {
 				if execution.Status != "running" {
 					continue
 				}
 				execCandidate := candidate
 				execCandidate.Execution = &execution
-				if execErr := stopCandidateExecution(ctx, services, execCandidate, reason, now, signal, executionMatchesProcess); execErr != nil && item.Error == "" {
+				execResult, execErr := stopCandidateExecution(ctx, services, execCandidate, reason, now, signal, executionMatchesProcess)
+				if execErr != nil && item.Error == "" {
 					item.Result = string(stopAllResultFailed)
 					item.Error = execErr.Error()
+					continue
+				}
+				item = mergeStopAllItemExecutionOutcome(item, execResult)
+				if item.Result == string(stopAllResultPausedOnly) && item.Outcome == stopOutcomeProcessSignaled {
+					item.Outcome = stopOutcomePausedOnly
 				}
 			}
 		}
@@ -456,6 +514,8 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 		switch stopAllResult(item.Result) {
 		case stopAllResultStopped:
 			response.Summary.Stopped++
+		case stopAllResultPausedOnly:
+			response.Summary.PausedOnly++
 		case stopAllResultAlreadyFinished:
 			response.Summary.AlreadyFinished++
 		case stopAllResultAlreadyStopping:
@@ -466,6 +526,55 @@ func stopAllLoops(ctx context.Context, services looperdruntime.Services, reason 
 	}
 
 	return response, nil
+}
+
+func classifyStopAllItemResult(result stopLoopResult) string {
+	switch result.Outcome {
+	case stopOutcomeProcessSignaled:
+		return string(stopAllResultStopped)
+	case stopOutcomePausedOnly:
+		return string(stopAllResultPausedOnly)
+	case stopOutcomeAlreadyStopping:
+		return string(stopAllResultAlreadyStopping)
+	case stopOutcomeAlreadyFinished:
+		return string(stopAllResultAlreadyFinished)
+	default:
+		return string(stopAllResultStopped)
+	}
+}
+
+func mergeStopAllItemExecutionOutcome(item stopAllItem, result stopLoopResult) stopAllItem {
+	mergedResult, mergedOutcome := mergeStopOutcomes(item.Result, item.Outcome, classifyStopAllItemResult(result), result.Outcome)
+	item.Result = mergedResult
+	item.Outcome = mergedOutcome
+	if item.ProcessSkipReason == "" && result.ProcessSkipReason != "" {
+		item.ProcessSkipReason = result.ProcessSkipReason
+	}
+	return item
+}
+
+func mergeStopOutcomes(currentResult, currentOutcome, nextResult, nextOutcome string) (string, string) {
+	if stopAllResultRank(nextResult) > stopAllResultRank(currentResult) {
+		return nextResult, nextOutcome
+	}
+	return currentResult, currentOutcome
+}
+
+func stopAllResultRank(result string) int {
+	switch stopAllResult(result) {
+	case stopAllResultFailed:
+		return 4
+	case stopAllResultPausedOnly:
+		return 3
+	case stopAllResultAlreadyStopping:
+		return 2
+	case stopAllResultAlreadyFinished:
+		return 1
+	case stopAllResultStopped:
+		return 0
+	default:
+		return 0
+	}
 }
 
 func collectStopAllCandidates(ctx context.Context, repos *storage.Repositories) ([]stopAllCandidate, error) {
@@ -662,9 +771,17 @@ func classifyStopAllResult(candidate stopAllCandidate) stopAllResult {
 	return stopAllResultStopped
 }
 
-func stopCandidateExecution(ctx context.Context, services looperdruntime.Services, candidate stopAllCandidate, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) error {
+func stopCandidateExecution(ctx context.Context, services looperdruntime.Services, candidate stopAllCandidate, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (stopLoopResult, error) {
+	result := stopLoopResult{LoopID: candidate.Loop.ID, Outcome: stopOutcomePausedOnly}
 	if candidate.Execution == nil {
-		return nil
+		result.Outcome = stopOutcomeAlreadyFinished
+		result.ProcessSkipReason = processSkipNoExecution
+		return result, nil
+	}
+	result.ExecutionID = candidate.Execution.ID
+	result.Vendor = candidate.Execution.Vendor
+	if candidate.Execution.RunID != nil {
+		result.RunID = *candidate.Execution.RunID
 	}
 	runID := ""
 	if candidate.Execution.RunID != nil {
@@ -672,35 +789,55 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 	}
 	if runID == "" && candidate.Run != nil {
 		runID = candidate.Run.ID
+		result.RunID = candidate.Run.ID
 	}
 	if services.ActiveExecutions != nil && runID != "" {
 		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
-			return err
+			return result, err
 		}
 		if killed {
-			return markExecutionCancelling(ctx, services, *candidate.Execution, reason, now)
+			result.Outcome = stopOutcomeProcessSignaled
+			if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
+				return result, err
+			}
+			return result, nil
 		}
 	}
 	if candidate.Execution.PID == nil || *candidate.Execution.PID <= 0 {
-		return nil
+		result.ProcessSkipReason = processSkipNoPID
+		return result, nil
 	}
+	result.PID = *candidate.Execution.PID
 	pid := int(*candidate.Execution.PID)
 	if executionMatchesProcess != nil {
 		matches, running, err := executionMatchesProcess(ctx, *candidate.Execution, pid)
 		if err != nil {
-			return err
+			return result, err
 		}
 		if !running || !matches {
-			return nil
+			if !running {
+				result.Outcome = stopOutcomeAlreadyFinished
+				result.ProcessSkipReason = processSkipVerifierNotRunning
+			} else {
+				result.ProcessSkipReason = processSkipVerifierRejectedPID
+			}
+			return result, nil
 		}
 	}
-	if signal != nil {
-		if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
-			return err
-		}
+	if signal == nil {
+		result.ProcessSkipReason = processSkipNoSignal
+		return result, nil
 	}
-	return markExecutionCancelling(ctx, services, *candidate.Execution, reason, now)
+	if err := signalAgentProcessGroup(pid, signal, 5*time.Second); err != nil {
+		return result, err
+	}
+	result.Outcome = stopOutcomeProcessSignaled
+	result.ProcessSkipReason = ""
+	if err := markExecutionCancelling(ctx, services, *candidate.Execution, reason, now); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func isStoppableExecutionStatus(status string) bool {
