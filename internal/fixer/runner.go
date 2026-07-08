@@ -3003,9 +3003,6 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	if len(nativeCommentItems) > 0 {
-		if !checkpoint.Push.Pushed {
-			return checkpoint, &loopError{message: "resolve-comments requires an actual push before resolving Forgejo native review comments", kind: FailureManualIntervention}
-		}
 		resultsByProviderID := map[int64]nativeRepairResultEntry{}
 		for _, result := range checkpoint.Repair.NativeRepairResults {
 			resultsByProviderID[result.ProviderCommentID] = result
@@ -3031,6 +3028,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			if strings.TrimSpace(decision.Action) != "fixed" {
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_noop", UpdatedAt: r.nowISO()})
 				continue
+			}
+			if !checkpoint.Push.Pushed {
+				return checkpoint, &loopError{message: "resolve-comments requires an actual push before resolving fixed Forgejo native review comments", kind: FailureManualIntervention}
 			}
 			if strings.TrimSpace(decision.ObservedFingerprint) == "" || decision.ObservedFingerprint != strings.TrimSpace(live.ObservedFingerprint) {
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_thread_drift", Message: "Forgejo native review comment changed since the fixer inspected it", UpdatedAt: r.nowISO()})

@@ -3008,6 +3008,30 @@ func TestRunResolveCommentsStepForgejoNativeRequiresActualPush(t *testing.T) {
 	}
 }
 
+func TestRunResolveCommentsStepForgejoNativeNoopDoesNotRequirePush(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
+		{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"},
+		{ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true, Author: "bob"},
+	}}}
+	runner := New(Options{GitHub: github})
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{{Type: "comment", Source: NativeReviewCommentSource, ID: "101", ThreadID: "101", ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}, {Type: "comment", Source: NativeReviewCommentSource, ID: "102", ThreadID: "102", ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true}}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: false}, Repair: &checkpointRepair{NativeRepairResults: []nativeRepairResultEntry{{Source: NativeReviewCommentSource, FixItemID: "101", ProviderCommentID: 101, Action: "declined", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1")}, {Source: NativeReviewCommentSource, FixItemID: "102", ProviderCommentID: 102, Action: "deferred", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2")}}}}
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveNativeCalls) != 0 {
+		t.Fatalf("resolveNativeCalls = %#v, want no native resolve calls", github.resolveNativeCalls)
+	}
+	statuses := map[string]string{}
+	for _, item := range updated.ResolvedComments.Items {
+		statuses[item.FixItemID] = item.Status
+	}
+	if statuses["101"] != "skipped_noop" || statuses["102"] != "skipped_noop" {
+		t.Fatalf("ResolvedComments = %#v, want skipped_noop for non-fixed native comments", updated.ResolvedComments)
+	}
+}
+
 func TestRunResolveCommentsStepForgejoNativeResolvesFixedOnlyAndSkipsStates(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
