@@ -2321,26 +2321,9 @@ func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input st
 	if err != nil {
 		return err
 	}
+	nativeComments = actionableNativeReviewComments(nativeComments, currentUser)
 	comments := make([]map[string]any, 0, len(nativeComments)+len(checkpoint.Detail.Comments))
-	for _, comment := range nativeComments {
-		if comment.IsResolved || sameGitHubLogin(comment.Author, currentUser) {
-			continue
-		}
-		comments = append(comments, map[string]any{
-			"id":                  strconv.FormatInt(comment.ProviderCommentID, 10),
-			"databaseId":          comment.ProviderCommentID,
-			"threadId":            strconv.FormatInt(comment.ProviderCommentID, 10),
-			"threadFingerprint":   comment.ObservedFingerprint,
-			"observedFingerprint": comment.ObservedFingerprint,
-			"source":              NativeReviewCommentSource,
-			"body":                comment.Body,
-			"url":                 comment.URL,
-			"path":                comment.Path,
-			"diffHunk":            comment.DiffHunk,
-			"author":              comment.Author,
-			"resolverPresent":     comment.ResolverPresent,
-		})
-	}
+	comments = append(comments, nativeReviewCommentsToMaps(nativeComments)...)
 	for _, comment := range checkpoint.Detail.Comments {
 		source, _ := stringFromAny(comment["source"])
 		if source == NativeReviewCommentSource {
@@ -2847,6 +2830,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if err != nil {
 			return checkpoint, classifyForgejoNativeResolveError(err)
 		}
+		currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
+		}
+		liveNativeComments = nonSelfNativeReviewComments(liveNativeComments, currentUser)
 		liveDetail.Comments = append(nativeReviewCommentsToMaps(liveNativeComments), nonNativeComments(liveDetail.Comments)...)
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
@@ -5921,6 +5909,28 @@ func nonNativeComments(comments []map[string]any) []map[string]any {
 	for _, comment := range comments {
 		source, _ := stringFromAny(comment["source"])
 		if source == NativeReviewCommentSource {
+			continue
+		}
+		filtered = append(filtered, comment)
+	}
+	return filtered
+}
+
+func actionableNativeReviewComments(comments []NativeReviewComment, currentUser string) []NativeReviewComment {
+	filtered := make([]NativeReviewComment, 0, len(comments))
+	for _, comment := range comments {
+		if comment.IsResolved || sameGitHubLogin(comment.Author, currentUser) {
+			continue
+		}
+		filtered = append(filtered, comment)
+	}
+	return filtered
+}
+
+func nonSelfNativeReviewComments(comments []NativeReviewComment, currentUser string) []NativeReviewComment {
+	filtered := make([]NativeReviewComment, 0, len(comments))
+	for _, comment := range comments {
+		if sameGitHubLogin(comment.Author, currentUser) {
 			continue
 		}
 		filtered = append(filtered, comment)

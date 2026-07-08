@@ -74,6 +74,33 @@ func TestRunResolveCommentsStepForgejoNativeMissingDecisionRetriesDiscovery(t *t
 	}
 }
 
+func TestRunResolveCommentsStepForgejoNativeRereadSkipsLooperAuthoredComments(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
+		{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"},
+		{ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true, Author: "looper"},
+	}}}
+	runner := New(Options{GitHub: github})
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{{Type: "comment", Source: NativeReviewCommentSource, ID: "101", ThreadID: "101", ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply("101", "fixed")}}}
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveNativeCalls) != 1 || github.resolveNativeCalls[0].ProviderCommentID != 101 {
+		t.Fatalf("resolveNativeCalls = %#v, want only non-self native comment resolved", github.resolveNativeCalls)
+	}
+	statuses := map[string]string{}
+	for _, item := range updated.ResolvedComments.Items {
+		statuses[item.FixItemID] = item.Status
+	}
+	if statuses["101"] != "resolved" {
+		t.Fatalf("ResolvedComments = %#v, want original comment resolved", updated.ResolvedComments)
+	}
+	if _, ok := statuses["102"]; ok {
+		t.Fatalf("ResolvedComments = %#v, want self-authored native comment ignored", updated.ResolvedComments)
+	}
+}
+
 func TestRunResolveCommentsStepForgejoNativeResolvesFixedOnlyAndSkipsStates(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
