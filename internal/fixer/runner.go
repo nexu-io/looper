@@ -743,20 +743,19 @@ type checkpointWorktree struct {
 }
 
 type checkpointRepair struct {
-	AgentExecutionID             string                    `json:"agentExecutionId,omitempty"`
-	Summary                      string                    `json:"summary,omitempty"`
-	HeadSHA                      string                    `json:"headSha,omitempty"`
-	ParseStatus                  string                    `json:"parseStatus,omitempty"`
-	Lifecycle                    *lifecycle.State          `json:"gitPrLifecycle,omitempty"`
-	CompletedAt                  string                    `json:"completedAt,omitempty"`
-	Status                       string                    `json:"status,omitempty"`
-	TimeoutType                  string                    `json:"timeoutType,omitempty"`
-	ConfiguredIdleTimeoutSeconds int64                     `json:"configuredIdleTimeoutSeconds,omitempty"`
-	ConfiguredMaxRuntimeSeconds  int64                     `json:"configuredMaxRuntimeSeconds,omitempty"`
-	ElapsedRuntimeSeconds        int64                     `json:"elapsedRuntimeSeconds,omitempty"`
-	LastProgressAt               string                    `json:"lastProgressAt,omitempty"`
-	ReplyExplanations            []replyExplanationEntry   `json:"replyExplanations,omitempty"`
-	NativeRepairResults          []nativeRepairResultEntry `json:"nativeRepairResults,omitempty"`
+	AgentExecutionID             string                  `json:"agentExecutionId,omitempty"`
+	Summary                      string                  `json:"summary,omitempty"`
+	HeadSHA                      string                  `json:"headSha,omitempty"`
+	ParseStatus                  string                  `json:"parseStatus,omitempty"`
+	Lifecycle                    *lifecycle.State        `json:"gitPrLifecycle,omitempty"`
+	CompletedAt                  string                  `json:"completedAt,omitempty"`
+	Status                       string                  `json:"status,omitempty"`
+	TimeoutType                  string                  `json:"timeoutType,omitempty"`
+	ConfiguredIdleTimeoutSeconds int64                   `json:"configuredIdleTimeoutSeconds,omitempty"`
+	ConfiguredMaxRuntimeSeconds  int64                   `json:"configuredMaxRuntimeSeconds,omitempty"`
+	ElapsedRuntimeSeconds        int64                   `json:"elapsedRuntimeSeconds,omitempty"`
+	LastProgressAt               string                  `json:"lastProgressAt,omitempty"`
+	ReplyExplanations            []replyExplanationEntry `json:"replyExplanations,omitempty"`
 }
 
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
@@ -1056,7 +1055,7 @@ func normalizeNativeRepairAction(raw string) string {
 	}
 }
 
-func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []nativeRepairResultEntry {
+func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []replyExplanationEntry {
 	itemsByProviderID := make(map[int64]FixItem)
 	for _, item := range fixItems {
 		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
@@ -1102,7 +1101,7 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []nativ
 			continue
 		}
 		observedFingerprint := strings.TrimSpace(raw.ObservedFingerprint)
-		if observedFingerprint == "" {
+		if observedFingerprint == "" || observedFingerprint != item.ObservedFingerprint {
 			continue
 		}
 		if _, dup := seen[raw.ProviderCommentID]; dup {
@@ -1121,7 +1120,7 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []nativ
 	return normalizeNativeRepairResults(results, fixItems)
 }
 
-func normalizeNativeRepairResults(results []nativeRepairResultEntry, fixItems []FixItem) []nativeRepairResultEntry {
+func normalizeNativeRepairResults(results []nativeRepairResultEntry, fixItems []FixItem) []replyExplanationEntry {
 	nativeItems := make([]FixItem, 0)
 	for _, item := range fixItems {
 		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
@@ -1137,7 +1136,7 @@ func normalizeNativeRepairResults(results []nativeRepairResultEntry, fixItems []
 			byID[result.ProviderCommentID] = result
 		}
 	}
-	out := make([]nativeRepairResultEntry, 0, len(nativeItems))
+	out := make([]replyExplanationEntry, 0, len(nativeItems))
 	for _, item := range nativeItems {
 		result, ok := byID[item.ProviderCommentID]
 		if !ok {
@@ -1146,6 +1145,7 @@ func normalizeNativeRepairResults(results []nativeRepairResultEntry, fixItems []
 				FixItemID:           item.ID,
 				ProviderCommentID:   item.ProviderCommentID,
 				Action:              "deferred",
+				Explanation:         "No Forgejo native repair result was provided for this comment.",
 				ObservedFingerprint: item.ObservedFingerprint,
 			}
 		}
@@ -1155,7 +1155,7 @@ func normalizeNativeRepairResults(results []nativeRepairResultEntry, fixItems []
 		if result.Action == "deferred" && strings.TrimSpace(result.ObservedFingerprint) == "" {
 			result.ObservedFingerprint = item.ObservedFingerprint
 		}
-		out = append(out, result)
+		out = append(out, replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: result.Action, Explanation: result.Explanation})
 	}
 	return out
 }
@@ -2503,7 +2503,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	r.applyReviewDismissals(ctx, input, worktree.Path)
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
-	checkpoint.Repair.NativeRepairResults = parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)
+	checkpoint.Repair.ReplyExplanations = append(checkpoint.Repair.ReplyExplanations, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -2829,11 +2829,13 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	priorNativeCommentItems := make([]FixItem, 0)
+	priorNativeCommentItemsByProviderID := map[int64]FixItem{}
 	hasNativeForgejoItems := false
 	for _, item := range checkpoint.FixItems {
 		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
 			hasNativeForgejoItems = true
 			priorNativeCommentItems = append(priorNativeCommentItems, item)
+			priorNativeCommentItemsByProviderID[item.ProviderCommentID] = item
 		}
 	}
 	var liveNativeComments []NativeReviewComment
@@ -3003,10 +3005,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	if len(nativeCommentItems) > 0 {
-		resultsByProviderID := map[int64]nativeRepairResultEntry{}
-		for _, result := range checkpoint.Repair.NativeRepairResults {
-			resultsByProviderID[result.ProviderCommentID] = result
-		}
+		repliesByFixItemID := agentResolveRepliesByFixItemID(checkpoint)
 		liveByProviderID := map[int64]NativeReviewComment{}
 		for _, live := range liveNativeComments {
 			liveByProviderID[live.ProviderCommentID] = live
@@ -3015,7 +3014,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 				continue
 			}
-			decision := resultsByProviderID[item.ProviderCommentID]
+			decision := repliesByFixItemID[item.ID]
 			live, ok := liveByProviderID[item.ProviderCommentID]
 			if !ok {
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "deleted", UpdatedAt: r.nowISO()})
@@ -3032,7 +3031,8 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			if !checkpoint.Push.Pushed {
 				return checkpoint, &loopError{message: "resolve-comments requires an actual push before resolving fixed Forgejo native review comments", kind: FailureManualIntervention}
 			}
-			if strings.TrimSpace(decision.ObservedFingerprint) == "" || decision.ObservedFingerprint != strings.TrimSpace(live.ObservedFingerprint) {
+			priorItem := priorNativeCommentItemsByProviderID[item.ProviderCommentID]
+			if strings.TrimSpace(priorItem.ObservedFingerprint) == "" || priorItem.ObservedFingerprint != strings.TrimSpace(live.ObservedFingerprint) {
 				driftCount++
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_thread_drift", Message: "Forgejo native review comment changed since the fixer inspected it", UpdatedAt: r.nowISO()})
 				continue
