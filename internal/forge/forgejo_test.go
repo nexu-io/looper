@@ -455,7 +455,7 @@ func TestForgejoResolvePullRequestReviewCommentContract(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/repos/acme/looper/pulls/42/comments/101/resolve" {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/repos/acme/looper/pulls/comments/101/resolve" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -564,11 +564,11 @@ func TestForgejoHTTPErrorStatusCodeMethod(t *testing.T) {
 func TestForgejoAPIURLPreservesReviewCommentResolvePathEscaping(t *testing.T) {
 	t.Parallel()
 	client := newForgejoTestClient(t, "https://forgejo.example.test/root")
-	apiURL, err := client.apiURL(client.repoPath("pulls", "42", "comments", "101", "resolve"))
+	apiURL, err := client.apiURL(client.repoPath("pulls", "comments", "101", "resolve"))
 	if err != nil {
 		t.Fatalf("apiURL() error = %v", err)
 	}
-	if got, want := apiURL.Path, "/root/api/v1/repos/acme/looper/pulls/42/comments/101/resolve"; got != want {
+	if got, want := apiURL.Path, "/root/api/v1/repos/acme/looper/pulls/comments/101/resolve"; got != want {
 		t.Fatalf("apiURL.Path = %q, want %q", got, want)
 	}
 	if _, err := url.Parse(apiURL.String()); err != nil {

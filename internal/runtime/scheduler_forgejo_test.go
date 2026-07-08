@@ -525,7 +525,7 @@ func TestFixerGitHubAdapterForgejoResolveNativeReviewComment(t *testing.T) {
 	var calledPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/comments/101/resolve":
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/comments/101/resolve":
 			calledPath = r.URL.Path
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -544,7 +544,7 @@ func TestFixerGitHubAdapterForgejoResolveNativeReviewComment(t *testing.T) {
 	if err := adapter.ResolveNativeReviewComment(context.Background(), fixer.ResolveNativeReviewCommentInput{Repo: "acme/looper", PRNumber: 42, ProviderCommentID: 101, CWD: repoPath}); err != nil {
 		t.Fatalf("ResolveNativeReviewComment() error = %v", err)
 	}
-	if calledPath != "/api/v1/repos/acme/looper/pulls/42/comments/101/resolve" {
+	if calledPath != "/api/v1/repos/acme/looper/pulls/comments/101/resolve" {
 		t.Fatalf("calledPath = %q, want resolve endpoint", calledPath)
 	}
 }

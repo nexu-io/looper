@@ -428,7 +428,7 @@ func (forgejo *ForgejoClient) ListPullRequestReviewComments(ctx context.Context,
 }
 
 func (forgejo *ForgejoClient) ResolvePullRequestReviewComment(ctx context.Context, number int64, commentID int64) error {
-	return forgejo.do(ctx, http.MethodPost, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "comments", strconv.FormatInt(commentID, 10), "resolve"), nil, nil, nil)
+	return forgejo.do(ctx, http.MethodPost, forgejo.repoPath("pulls", "comments", strconv.FormatInt(commentID, 10), "resolve"), nil, nil, nil)
 }
 
 func parseForgejoBaseURL(value string) (*url.URL, error) {
