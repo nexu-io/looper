@@ -3014,14 +3014,19 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 				continue
 			}
-			decision := repliesByFixItemID[item.ID]
-			live, ok := liveByProviderID[item.ProviderCommentID]
-			if !ok {
+			decision, hasDecision := repliesByFixItemID[item.ID]
+			live, liveOK := liveByProviderID[item.ProviderCommentID]
+			if !liveOK {
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "deleted", UpdatedAt: r.nowISO()})
 				continue
 			}
 			if live.IsResolved {
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "already_resolved", UpdatedAt: r.nowISO()})
+				continue
+			}
+			if !hasDecision {
+				contractViolationCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_missing_agent_decision", Message: agentMissingThreadDecisionExplanation, UpdatedAt: r.nowISO()})
 				continue
 			}
 			if strings.TrimSpace(decision.Action) != "fixed" {
