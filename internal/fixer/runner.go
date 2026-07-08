@@ -3033,6 +3033,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 				return checkpoint, &loopError{message: "resolve-comments requires an actual push before resolving fixed Forgejo native review comments", kind: FailureManualIntervention}
 			}
 			if strings.TrimSpace(decision.ObservedFingerprint) == "" || decision.ObservedFingerprint != strings.TrimSpace(live.ObservedFingerprint) {
+				driftCount++
 				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_thread_drift", Message: "Forgejo native review comment changed since the fixer inspected it", UpdatedAt: r.nowISO()})
 				continue
 			}

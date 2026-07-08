@@ -3043,8 +3043,8 @@ func TestRunResolveCommentsStepForgejoNativeResolvesFixedOnlyAndSkipsStates(t *t
 	runner := New(Options{GitHub: github})
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{{Type: "comment", Source: NativeReviewCommentSource, ID: "101", ThreadID: "101", ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}, {Type: "comment", Source: NativeReviewCommentSource, ID: "102", ThreadID: "102", ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true}, {Type: "comment", Source: NativeReviewCommentSource, ID: "103", ThreadID: "103", ProviderCommentID: 103, ObservedFingerprint: NativeReviewCommentFingerprint(103, "u3"), ResolverPresent: true}, {Type: "comment", Source: NativeReviewCommentSource, ID: "104", ThreadID: "104", ProviderCommentID: 104, ObservedFingerprint: NativeReviewCommentFingerprint(104, "u4"), ResolverPresent: true}}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{NativeRepairResults: []nativeRepairResultEntry{{Source: NativeReviewCommentSource, FixItemID: "101", ProviderCommentID: 101, Action: "fixed", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1")}, {Source: NativeReviewCommentSource, FixItemID: "102", ProviderCommentID: 102, Action: "fixed", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2")}, {Source: NativeReviewCommentSource, FixItemID: "103", ProviderCommentID: 103, Action: "declined", ObservedFingerprint: NativeReviewCommentFingerprint(103, "u3")}, {Source: NativeReviewCommentSource, FixItemID: "104", ProviderCommentID: 104, Action: "fixed", ObservedFingerprint: NativeReviewCommentFingerprint(104, "u4")}}}}
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-	if err != nil {
-		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
+		t.Fatalf("runResolveCommentsStep() error = %v, want native thread drift retry", err)
 	}
 	if len(github.resolveNativeCalls) != 1 || github.resolveNativeCalls[0].ProviderCommentID != 101 {
 		t.Fatalf("resolveNativeCalls = %#v, want only fixed matching unresolved comment", github.resolveNativeCalls)
@@ -3058,6 +3058,9 @@ func TestRunResolveCommentsStepForgejoNativeResolvesFixedOnlyAndSkipsStates(t *t
 	}
 	if _, ok := statuses["101"]; !ok || statuses["101"] != "resolved" {
 		t.Fatalf("ResolvedComments = %#v", updated.ResolvedComments)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
 	}
 }
 
