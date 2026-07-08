@@ -6296,6 +6296,21 @@ func TestParseReplyExplanationsDropsUnknownAndMismatchedThread(t *testing.T) {
 	}
 }
 
+func TestParseReplyExplanationsIgnoresNativeReviewComments(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"review_thread_replies":[` +
+		`{"fixItemId":"native-101","threadId":"101","action":"fixed","explanation":"generic native reply must not win"},` +
+		`{"fixItemId":"c1","threadId":"t1","action":"fixed","explanation":"regular comment reply"}` +
+		`]}`
+	got := parseReplyExplanations(stdout, "", []FixItem{
+		{Type: "comment", ID: "native-101", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101},
+		{Type: "comment", ID: "c1", ThreadID: "t1"},
+	})
+	if len(got) != 1 || got[0].FixItemID != "c1" || got[0].Explanation != "regular comment reply" {
+		t.Fatalf("parseReplyExplanations() = %#v, want only non-native reply", got)
+	}
+}
+
 func TestParseReplyExplanationsDefaultsMissingActionToFixed(t *testing.T) {
 	t.Parallel()
 	stdout := `__LOOPER_RESULT__={"review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"good"}]}`

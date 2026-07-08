@@ -947,6 +947,9 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 		if item.Type != "comment" {
 			continue
 		}
+		if item.Source == NativeReviewCommentSource {
+			continue
+		}
 		if item.ID == "" {
 			continue
 		}
@@ -2309,7 +2312,7 @@ func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input st
 	}
 	nativeComments, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return err
+		return classifyForgejoNativeDiscoveryError(err)
 	}
 	if len(nativeComments) == 0 {
 		return nil
@@ -3120,6 +3123,26 @@ func classifyForgejoNativeResolveError(err error) error {
 		return &loopError{message: fmt.Sprintf("Forgejo provider did not acknowledge native review comment resolution; will retry: %v", err), kind: FailureRetryableAfterResume}
 	}
 	return &loopError{message: fmt.Sprintf("Failed to resolve Forgejo native review comment; will retry: %v", err), kind: FailureRetryableAfterResume}
+}
+
+func classifyForgejoNativeDiscoveryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var httpErr *forge.ForgejoHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case 404, 405:
+			return &loopError{message: fmt.Sprintf("Forgejo native review comment discovery is unsupported and requires manual intervention: %v", err), kind: FailureManualIntervention}
+		case 500, 502, 503, 504:
+			return &loopError{message: fmt.Sprintf("Forgejo provider did not acknowledge native review comment discovery; will retry: %v", err), kind: FailureRetryableAfterResume}
+		}
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "timeout") || strings.Contains(message, "timed out") {
+		return &loopError{message: fmt.Sprintf("Forgejo provider did not acknowledge native review comment discovery; will retry: %v", err), kind: FailureRetryableAfterResume}
+	}
+	return err
 }
 
 func isForgejoNativeResolveUnsupported(err error) bool {

@@ -1,6 +1,7 @@
 package fixer
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -174,5 +175,21 @@ func TestRunCollectFixesStepFailsUnsupportedWhenNativeResolverMissing(t *testing
 	_, err := runner.runCollectFixesStep(stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
 	if err == nil || !strings.Contains(err.Error(), "unsupported") {
 		t.Fatalf("runCollectFixesStep() error = %v, want unsupported manual intervention", err)
+	}
+}
+
+func TestRunCollectFixesStepClassifiesUnsupportedNativeDiscovery(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{404, 405} {
+		github := &fakeGitHubGateway{
+			currentUser:   "looper",
+			listNativeErr: &forge.ForgejoHTTPError{StatusCode: status, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
+		}
+		runner := New(Options{GitHub: github})
+		_, err := runner.runCollectFixesStep(stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
+		var loopErr *loopError
+		if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention || !strings.Contains(loopErr.Error(), "discovery is unsupported") {
+			t.Fatalf("runCollectFixesStep() error = %#v, want unsupported discovery manual intervention for status %d", err, status)
+		}
 	}
 }
