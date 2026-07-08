@@ -1222,6 +1222,42 @@ func TestStopAllLoopsReportsStoppedWhenOlderExecutionSignalsAfterLatestFinished(
 	}
 }
 
+func TestStopAllLoopsReportsStoppedWhenOlderExecutionSignalsAfterLatestCancelling(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	insertStopAllTestLoop(t, ctx, repos, now, stopAllLoopFixture{loopID: "loop_worker", seq: 1, loopType: "worker", loopStatus: "running", runID: "run_worker", runStatus: "running", executionID: "exec_running", executionStatus: "running", pid: 4103})
+	newerISO := now.Add(time.Minute).Format("2006-01-02T15:04:05.000Z")
+	if err := repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "exec_cancelling", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_worker"), RunID: stringPtr("run_worker"), Vendor: "codex", Status: "cancelling", StartedAt: newerISO, CreatedAt: newerISO, UpdatedAt: newerISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(exec_cancelling) error = %v", err)
+	}
+
+	var signalPIDs []int
+	response, err := stopAllLoops(ctx, services, "Stopped by test", func() time.Time { return now }, func(pid int, sig syscall.Signal) error {
+		if sig == syscall.SIGTERM {
+			signalPIDs = append(signalPIDs, pid)
+		}
+		return nil
+	}, func(_ context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {
+		return execution.ID == "exec_running", true, nil
+	})
+	if err != nil {
+		t.Fatalf("stopAllLoops() error = %v", err)
+	}
+	if got, want := response.Summary, (stopAllSummary{Total: 1, Stopped: 1}); got != want {
+		t.Fatalf("stopAllLoops() summary = %#v, want %#v", got, want)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("len(response.Items) = %d, want 1", len(response.Items))
+	}
+	item := response.Items[0]
+	if item.Result != string(stopAllResultStopped) || item.Outcome != stopOutcomeProcessSignaled || item.ProcessSkipReason != "" {
+		t.Fatalf("stopAllLoops() item = %#v", item)
+	}
+	if !slices.Contains(signalPIDs, -4103) {
+		t.Fatalf("signal pids = %#v, want running execution signaled", signalPIDs)
+	}
+}
+
 func TestStopAllLoopsReplacesFinishedSkipReasonWhenOlderExecutionVerifierRejected(t *testing.T) {
 	ctx := context.Background()
 	services, repos, now := newStopAllTestServices(t)

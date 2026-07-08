@@ -570,9 +570,9 @@ func stopAllResultRank(result string) int {
 		return 4
 	case stopAllResultPausedOnly:
 		return 3
-	case stopAllResultAlreadyStopping:
-		return 2
 	case stopAllResultStopped:
+		return 2
+	case stopAllResultAlreadyStopping:
 		return 1
 	case stopAllResultAlreadyFinished:
 		return 0
