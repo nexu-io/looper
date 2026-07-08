@@ -3038,6 +3038,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			}
 			if err := r.github.ResolveNativeReviewComment(ctx, ResolveNativeReviewCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, ProviderCommentID: item.ProviderCommentID, CWD: input.Project.RepoPath}); err != nil {
 				if isForgejoNativeResolveUnsupported(err) {
+					nativeMutationFailureCount++
+					if nativeMutationErr == nil {
+						nativeMutationErr = err
+					}
 					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "unsupported_remote_resolution", Message: err.Error(), UpdatedAt: r.nowISO()})
 					continue
 				}

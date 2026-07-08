@@ -3074,7 +3074,7 @@ func TestRunResolveCommentsStepForgejoNativeClassifiesHTTPAndTimeoutErrors(t *te
 	}
 }
 
-func TestRunResolveCommentsStepForgejoNativeUnsupportedResolveContinues(t *testing.T) {
+func TestRunResolveCommentsStepForgejoNativeUnsupportedResolveRequiresManualIntervention(t *testing.T) {
 	t.Parallel()
 	for _, errValue := range []error{
 		&forge.ForgejoHTTPError{StatusCode: 404, Method: "POST", Path: "/resolve", Message: "missing"},
@@ -3084,8 +3084,9 @@ func TestRunResolveCommentsStepForgejoNativeUnsupportedResolveContinues(t *testi
 		runner := New(Options{GitHub: github})
 		checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{{Type: "comment", Source: NativeReviewCommentSource, ID: "101", ThreadID: "101", ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{NativeRepairResults: []nativeRepairResultEntry{{Source: NativeReviewCommentSource, FixItemID: "101", ProviderCommentID: 101, Action: "fixed", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1")}}}}
 		updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-		if err != nil {
-			t.Fatalf("runResolveCommentsStep() error = %v, want graceful success", err)
+		var loopErr *loopError
+		if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention || !strings.Contains(loopErr.Error(), "requires manual intervention") {
+			t.Fatalf("runResolveCommentsStep() error = %#v, want manual intervention", err)
 		}
 		if updated.ResolvedComments == nil || len(updated.ResolvedComments.Items) != 1 || updated.ResolvedComments.Items[0].Status != "unsupported_remote_resolution" {
 			t.Fatalf("resolved comments = %#v, want unsupported_remote_resolution", updated.ResolvedComments)
