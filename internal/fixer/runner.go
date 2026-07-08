@@ -267,6 +267,10 @@ func NativeReviewCommentFingerprint(commentID int64, updatedAt string) string {
 	return fmt.Sprintf("%s:%d:%s", NativeReviewCommentSource, commentID, strings.TrimSpace(updatedAt))
 }
 
+func NativeReviewCommentFixItemID(commentID int64) string {
+	return fmt.Sprintf("%s:%d", NativeReviewCommentSource, commentID)
+}
+
 type ResolveNativeReviewCommentInput struct {
 	Repo              string
 	PRNumber          int64
@@ -2825,17 +2829,19 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	var liveNativeComments []NativeReviewComment
-	if hasNativeForgejoItems {
+	if hasNativeForgejoItems || isManualFixerLoop(input.Loop) {
 		liveNativeComments, err = r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 		if err != nil {
 			return checkpoint, classifyForgejoNativeResolveError(err)
 		}
-		currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-		if err != nil {
-			return checkpoint, err
+		if len(liveNativeComments) > 0 {
+			currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, err
+			}
+			liveNativeComments = nonSelfNativeReviewComments(liveNativeComments, currentUser)
+			liveDetail.Comments = append(nativeReviewCommentsToMaps(liveNativeComments), nonNativeComments(liveDetail.Comments)...)
 		}
-		liveNativeComments = nonSelfNativeReviewComments(liveNativeComments, currentUser)
-		liveDetail.Comments = append(nativeReviewCommentsToMaps(liveNativeComments), nonNativeComments(liveDetail.Comments)...)
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
 	fixItems := collectFixItems(liveDetail)
@@ -5942,7 +5948,7 @@ func nativeReviewCommentsToMaps(comments []NativeReviewComment) []map[string]any
 	out := make([]map[string]any, 0, len(comments))
 	for _, comment := range comments {
 		out = append(out, map[string]any{
-			"id":                  strconv.FormatInt(comment.ProviderCommentID, 10),
+			"id":                  NativeReviewCommentFixItemID(comment.ProviderCommentID),
 			"databaseId":          comment.ProviderCommentID,
 			"threadId":            strconv.FormatInt(comment.ProviderCommentID, 10),
 			"threadFingerprint":   comment.ObservedFingerprint,
@@ -6082,6 +6088,9 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 			}
 			providerCommentID = issueCommentDatabaseID(comment)
 			resolverPresent, _ = comment["resolverPresent"].(bool)
+			if source == NativeReviewCommentSource && providerCommentID > 0 {
+				id = NativeReviewCommentFixItemID(providerCommentID)
+			}
 		} else {
 			body = ""
 			diffHunk = ""

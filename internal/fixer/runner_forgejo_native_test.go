@@ -123,7 +123,7 @@ func TestCollectFixItemsPreservesGitHubCommentBehaviorWithExtendedModel(t *testi
 func TestCollectFixItemsAllowsForgejoNativeAndSummaryItemsToCoexist(t *testing.T) {
 	t.Parallel()
 
-	summary := forge.NewReviewerSummary(3, []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 3}})
+	summary := forge.NewReviewerSummary(3, []forge.ReviewItem{{ReviewItemID: "101", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 3}})
 	marker, err := forge.RenderReviewerSummary(summary)
 	if err != nil {
 		t.Fatalf("RenderReviewerSummary() error = %v", err)
@@ -152,6 +152,9 @@ func TestCollectFixItemsAllowsForgejoNativeAndSummaryItemsToCoexist(t *testing.T
 	}
 	if items[0].Source != NativeReviewCommentSource || items[1].Source != "forgejo-reviewer-summary" {
 		t.Fatalf("items = %#v, want native item before reviewer summary item", items)
+	}
+	if items[0].ID != NativeReviewCommentFixItemID(101) || items[1].ID != "101" {
+		t.Fatalf("items = %#v, want source-scoped native ID and unchanged summary ID", items)
 	}
 }
 
