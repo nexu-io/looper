@@ -544,10 +544,14 @@ func classifyStopAllItemResult(result stopLoopResult) string {
 }
 
 func mergeStopAllItemExecutionOutcome(item stopAllItem, result stopLoopResult) stopAllItem {
-	mergedResult, mergedOutcome := mergeStopOutcomes(item.Result, item.Outcome, classifyStopAllItemResult(result), result.Outcome)
+	nextResult := classifyStopAllItemResult(result)
+	nextWins := stopAllResultRank(nextResult) > stopAllResultRank(item.Result)
+	mergedResult, mergedOutcome := mergeStopOutcomes(item.Result, item.Outcome, nextResult, result.Outcome)
 	item.Result = mergedResult
 	item.Outcome = mergedOutcome
-	if item.ProcessSkipReason == "" && result.ProcessSkipReason != "" {
+	if nextWins {
+		item.ProcessSkipReason = result.ProcessSkipReason
+	} else if item.ProcessSkipReason == "" && result.ProcessSkipReason != "" {
 		item.ProcessSkipReason = result.ProcessSkipReason
 	}
 	return item
@@ -568,9 +572,9 @@ func stopAllResultRank(result string) int {
 		return 3
 	case stopAllResultAlreadyStopping:
 		return 2
-	case stopAllResultAlreadyFinished:
-		return 1
 	case stopAllResultStopped:
+		return 1
+	case stopAllResultAlreadyFinished:
 		return 0
 	default:
 		return 0
