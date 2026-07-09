@@ -2080,7 +2080,8 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
 		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
-		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+		adoptedWork := workerWorkForPullRequest(work, *existing)
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork); err != nil {
 			return checkpoint, err
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}
@@ -2118,6 +2119,14 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, nil
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
+		adoptedWork := workerWorkForPullRequest(work, *existing)
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork); err != nil {
+			return checkpoint, err
+		} else if held {
+			checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
+			checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
+			return checkpoint, &holdSkipError{summary: summary}
+		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
 		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2184,6 +2193,13 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		}
 	}
 	return false, "", nil
+}
+
+func workerWorkForPullRequest(work workerInput, pr PullRequestSummary) workerInput {
+	work.PRNumber = pr.Number
+	work.Branch = firstNonEmpty(pr.HeadRefName, work.Branch)
+	work.BaseBranch = firstNonEmpty(pr.BaseRefName, work.BaseBranch)
+	return work
 }
 
 func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (ProcessResult, error) {
