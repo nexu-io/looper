@@ -419,6 +419,25 @@ func TestValidateReviewerReviewSubmitHoldRejectsHeldAutomaticReviewerFlow(t *tes
 	}
 }
 
+func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
+	t.Parallel()
+
+	runtime := &commandRuntime{}
+	cmd := &cobra.Command{}
+	gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{Number: 42, Labels: []string{domain.HoldLabelReviewer}}}
+
+	err := runtime.validateLatestReviewerReviewSubmitHold(cmd, gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("validateLatestReviewerReviewSubmitHold() error = %v, want held rejection", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("ViewPullRequest calls = %#v, want one refresh", gh.calls)
+	}
+	if gh.calls[0].Repo != "acme/looper" || gh.calls[0].PRNumber != 42 || gh.calls[0].CWD != "/repo" {
+		t.Fatalf("ViewPullRequest call = %#v, want requested PR and cwd", gh.calls[0])
+	}
+}
+
 type reviewSubmitFakeGHRunner struct {
 	t       *testing.T
 	respond func(options shell.Options) (shell.Result, error)
@@ -430,4 +449,15 @@ func (f *reviewSubmitFakeGHRunner) run(_ context.Context, options shell.Options)
 		f.t.Fatalf("fake GH runner missing responder for args: %q", strings.Join(options.Args, " "))
 	}
 	return f.respond(options)
+}
+
+type reviewSubmitFakePRViewer struct {
+	detail githubinfra.PullRequestDetail
+	calls  []githubinfra.ViewPullRequestInput
+	err    error
+}
+
+func (f *reviewSubmitFakePRViewer) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	f.calls = append(f.calls, input)
+	return f.detail, f.err
 }

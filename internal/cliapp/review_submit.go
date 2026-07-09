@@ -44,6 +44,10 @@ type reviewSubmitDiagnosticFields struct {
 	Extra    map[string]any
 }
 
+type reviewSubmitPullRequestViewer interface {
+	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
+}
+
 func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	repo, prNumber, err := parsePullRequestRef(args[0])
 	if err != nil {
@@ -116,6 +120,9 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	var anchors *diffanchor.Index
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
+			if err := r.validateLatestReviewerReviewSubmitHold(cmd, gh, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+				return err
+			}
 			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
 		return fmt.Errorf("fetch PR diff for anchor validation: %w", err)
@@ -126,6 +133,9 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+	}
+	if err := r.validateLatestReviewerReviewSubmitHold(cmd, gh, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+		return err
 	}
 	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
 		return fmt.Errorf("submit validated PR review: %w", err)
@@ -336,6 +346,14 @@ func (r *commandRuntime) validateReviewerReviewSubmitHold(cmd *cobra.Command, cf
 		}
 	}
 	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, manual bool, runID string, cwd string) error {
+	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return fmt.Errorf("refresh pull request hold labels before review submit: %w", err)
+	}
+	return r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels)
 }
 
 func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (bool, error) {

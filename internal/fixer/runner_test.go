@@ -2406,6 +2406,35 @@ func TestDiscoverPullRequestsDoesNotRecoverLegacyNoopLoopWhenFixerHoldAppliedLiv
 	}
 }
 
+func TestDiscoverPullRequestsRecoversManualLegacyNoopLoopWhenFixerHoldAppliedLive(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{domain.HoldLabelFixer}, Comments: []map[string]any{comment}}
+	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy_hold", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want recovered manual legacy queue item while held", result.QueueItems)
+	}
+	if result.QueueItems[0].LoopID == nil || *result.QueueItems[0].LoopID != "loop_fixer_manual_legacy_hold" {
+		t.Fatalf("queue item = %#v, want manual legacy loop recovery", result.QueueItems[0])
+	}
+}
+
 func TestDiscoverPullRequestsSkipsClosedManualFollowUpCandidate(t *testing.T) {
 	t.Parallel()
 

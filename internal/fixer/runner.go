@@ -4725,7 +4725,7 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		if domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+		if !isManualFixerFollowupCandidate(loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
