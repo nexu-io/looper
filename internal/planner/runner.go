@@ -1112,6 +1112,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			if adopted != nil {
+				if held, summary, err := r.plannerAdoptedPullRequestHoldSummary(ctx, input.Project, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+					return checkpoint, err
+				} else if held {
+					return checkpoint, &holdSkipError{summary: summary}
+				}
 				if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, true); err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
@@ -1140,6 +1145,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if adopted != nil {
+			if held, summary, err := r.plannerAdoptedPullRequestHoldSummary(ctx, input.Project, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
 			if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, false); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
@@ -1262,6 +1272,20 @@ func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project st
 	}
 	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, prDetail.Labels) {
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Publish.PullRequest.Number), nil
+	}
+	return false, "", nil
+}
+
+func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, queueItem storage.QueueItemRecord) (bool, string, error) {
+	if plannerQueueItemIsManual(queueItem) || r.github == nil || repo == "" || prNumber == 0 {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, prNumber), nil
 	}
 	return false, "", nil
 }
