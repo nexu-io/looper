@@ -3334,7 +3334,7 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		}
 		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
 		shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, marker.Event, outcome)
-		if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, freshDetail, shouldTransitionSpecLabels); err != nil {
+		if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
 			return err
 		}
 	case "actionable", "non_blocking", "blocking":
@@ -3361,7 +3361,7 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	}
 	policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
 	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
-	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, freshDetail, shouldTransitionSpecLabels)
+	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
 }
 
 func cleanSpecLabelTransitionAllowed(policy config.ReviewerReviewEventsConfig, event ReviewEvent, outcome string) bool {

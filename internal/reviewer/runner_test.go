@@ -5120,6 +5120,78 @@ func TestProcessClaimedItemRefreshesReviewStateBeforeSpecReadyTransition(t *test
 	}
 }
 
+func TestApplyVerifiedReviewSideEffectsPreservesCheckedHeadForSpecTransition(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		labels:                 []string{specpr.ReviewingLabel},
+		reviewDecision:         "APPROVED",
+		changeHeadOnSecondView: true,
+	}
+	runner := New(Options{
+		DB:           fixture.coordinator.DB(),
+		Repos:        fixture.repos,
+		GitHub:       github,
+		Logger:       fixture.logger,
+		Now:          fixture.now,
+		ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove},
+	})
+	input := stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"},
+		Loop:     storage.LoopRecord{ProjectID: "project_1", Type: "reviewer"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+	}
+	checkpoint := reviewerCheckpoint{
+		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}},
+	}
+	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}}
+
+	err := runner.applyVerifiedReviewSideEffects(context.Background(), input, checkpoint, detail, ReviewMarkerResult{Found: true, Outcome: "clean", Event: ReviewEventApprove})
+	if err == nil || !contains(err.Error(), "PR head changed before spec-ready transition: expected abc123, got new-head") {
+		t.Fatalf("applyVerifiedReviewSideEffects() error = %v, want head drift failure", err)
+	}
+	if len(github.removeLabelCalls) != 0 || len(github.addLabelCalls) != 0 {
+		t.Fatalf("label calls = remove:%#v add:%#v, want none after head drift", github.removeLabelCalls, github.addLabelCalls)
+	}
+}
+
+func TestApplyCleanNoopReviewSideEffectsPreservesCheckedHeadForSpecTransition(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		labels:                 []string{specpr.ReviewingLabel},
+		reviewDecision:         "APPROVED",
+		changeHeadOnSecondView: true,
+	}
+	runner := New(Options{
+		DB:           fixture.coordinator.DB(),
+		Repos:        fixture.repos,
+		GitHub:       github,
+		Logger:       fixture.logger,
+		Now:          fixture.now,
+		ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove},
+	})
+	input := stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"},
+		Loop:     storage.LoopRecord{ProjectID: "project_1", Type: "reviewer"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+	}
+	checkpoint := reviewerCheckpoint{
+		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}},
+	}
+	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}}
+
+	err := runner.applyCleanNoopReviewSideEffects(context.Background(), input, checkpoint, detail)
+	if err == nil || !contains(err.Error(), "PR head changed before spec-ready transition: expected abc123, got new-head") {
+		t.Fatalf("applyCleanNoopReviewSideEffects() error = %v, want head drift failure", err)
+	}
+	if len(github.removeLabelCalls) != 0 || len(github.addLabelCalls) != 0 {
+		t.Fatalf("label calls = remove:%#v add:%#v, want none after head drift", github.removeLabelCalls, github.addLabelCalls)
+	}
+}
+
 func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanCommentReview(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
