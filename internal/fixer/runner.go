@@ -2702,14 +2702,6 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		r.appendEvent(ctx, eventInput{eventType: eventType, projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "message": message}})
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
-	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
-		return checkpoint, err
-	} else if held {
-		return checkpoint, &holdSkipError{summary: summary}
-	}
-	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
-	// re-reviewed promptly instead of waiting for the coordinator lane.
-	r.reRequestReviewersAfterFix(ctx, input)
 	finalHeadSHA := checkpoint.ReconcileCommits.FinalHeadSHA
 	if finalHeadSHA == "" {
 		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: FailureRetryableAfterResume}
@@ -2755,6 +2747,14 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	checkpoint.Lifecycle.PRNumber = input.PRNumber
 	checkpoint.Lifecycle.PRAdopted = true
 	checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
+	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
+	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
+	// re-reviewed promptly instead of waiting for the coordinator lane.
+	r.reRequestReviewersAfterFix(ctx, input)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }

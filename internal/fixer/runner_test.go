@@ -6993,6 +6993,63 @@ func TestRunPushStepAdoptsAgentLifecyclePushEvidence(t *testing.T) {
 	}
 }
 
+func TestRunPushStepRecordsPushEvidenceBeforePostPushHold(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopMetadata := `{}`
+	loopTarget := buildPullRequestTargetID("acme/looper", 42)
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_post_push_hold", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_post_push_hold", LoopID: "loop_post_push_hold", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{
+		{Number: 42, State: "OPEN", HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"},
+		{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"},
+		{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head", Labels: []string{domain.HoldLabelFixer}},
+	}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, ValidationRunner: passValidation, AllowAutoPush: true, Now: fixture.now, Logger: fixture.logger})
+	checkpoint := fixerCheckpoint{
+		Detail:           &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+		Worktree:         &checkpointWorktree{Path: t.TempDir(), Branch: "feature/fix-42", BaseHeadSHA: "base-head"},
+		FixItems:         []FixItem{{ID: "c1", ThreadID: "t1", ThreadFingerprint: "fp1"}},
+		FixItemsHash:     "fix-hash",
+		Repair:           &checkpointRepair{Status: "completed"},
+		Validation:       &ValidationResult{Passed: true, HeadSHA: "fix-head"},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "fix-head", NewCommitSHAs: []string{"fix-head"}, WorkingTreeClean: true},
+	}
+
+	updated, err := runner.runPushStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{ID: "loop_post_push_hold", MetadataJSON: &loopMetadata}, Run: run, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
+
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runPushStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("push calls = %d, want 1", len(git.pushCalls))
+	}
+	if updated.Push == nil || !updated.Push.Pushed || updated.Push.HeadSHA != "fix-head" || updated.Push.Evidence == nil || updated.Push.Evidence.HeadSHA != "fix-head" {
+		t.Fatalf("updated.Push = %#v, want recorded pushed head and evidence", updated.Push)
+	}
+	if updated.Lifecycle == nil || !updated.Lifecycle.Pushed || updated.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback {
+		t.Fatalf("updated.Lifecycle = %#v, want pushed fallback lifecycle before hold skip", updated.Lifecycle)
+	}
+	if len(github.reviewerRequests) != 0 {
+		t.Fatalf("reviewerRequests = %#v, want no post-hold reviewer requests", github.reviewerRequests)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_post_push_hold")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, `"lastFixHeadSha":"fix-head"`) {
+		t.Fatalf("loop metadata = %#v, want pushed head persisted before hold skip", loop)
+	}
+}
+
 func TestRunPushStepDoesNotAdoptAgentLifecyclePushEvidenceOnLiveHeadMismatch(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "other-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"}}}
