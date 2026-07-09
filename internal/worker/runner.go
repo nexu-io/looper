@@ -1755,6 +1755,12 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
+		holdWork, retargetedToPullRequest := workerHoldInputForTarget(work, input.Loop, input.QueueItem)
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
+			return checkpoint, err
+		} else if held {
+			return checkpoint, &holdSkipError{summary: summary}
+		}
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
@@ -2000,7 +2006,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			pushedByFallback = true
 		}
 		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, checkpoint.PullRequest.Number, checkpoint.PullRequest.URL, pushedByFallback, input.Loop.PRNumber != nil)
-		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+		holdWork := work
+		holdWork.PRNumber = checkpoint.PullRequest.Number
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork); err != nil {
 			return checkpoint, err
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}

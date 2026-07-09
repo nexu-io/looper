@@ -3530,7 +3530,14 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "applying criteria failure side effects"); err != nil {
 		return nil, err
 	}
-	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(issue.Labels), CWD: input.Project.RepoPath}); err != nil {
+	freshIssue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, CWD: input.Project.RepoPath})
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("Failed to refresh linked issue before applying criteria failure side effects: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshIssue.Labels) {
+		return nil, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
+	}
+	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels), CWD: input.Project.RepoPath}); err != nil {
 		return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {

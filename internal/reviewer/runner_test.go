@@ -4577,6 +4577,47 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 	}
 }
 
+func TestProcessClaimedItemSkipsLinkedIssueLabelRemovalWhenReviewerHoldApplied(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"looper:worker-ready"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses #358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", domain.HoldLabelReviewer}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
+		"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 1}}},
+		"add tests":       {Verdict: criteria.VerdictFail, Justification: "no test change in diff"},
+	}}})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "currently held") {
+		t.Fatalf("result = %#v, want held linked issue skip", result)
+	}
+	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventComment) {
+		t.Fatalf("submitReviewCalls = %#v, want criteria failure review before held side effects", github.submitReviewCalls)
+	}
+	if len(github.removeIssueLabelCalls) != 0 {
+		t.Fatalf("removeIssueLabelCalls = %#v, want no held issue mutation", github.removeIssueLabelCalls)
+	}
+}
+
 func TestProcessClaimedItemFallsBackWhenLinkedIssueLookupIsUnavailable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
