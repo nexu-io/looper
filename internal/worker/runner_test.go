@@ -3495,6 +3495,55 @@ func TestRunOpenPRStepStopsPushExistingSideEffectsWhenHeldAfterPush(t *testing.T
 	}
 }
 
+func TestRunOpenPRStepStopsNormalCreatePRSideEffectsWhenHeldAfterPush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issueNumber := int64(48)
+	github := &fakeGitHubGateway{issueDetailResponses: []IssueDetail{
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+	}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_worker_562", ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_562", LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Normal create hold", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", Branch: "feature/pr-562", IssueNumber: issueNumber, AutoDiscovered: true, Reviewers: []string{"octocat"}},
+		Worktree:   &checkpointWorktree{Branch: "feature/pr-562", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_562"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle:  &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "feature/pr-562", BaseBranch: "main"},
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: loop, Run: run, Checkpoint: checkpoint})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want normal create-pr push", len(git.pushCalls))
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.Pushed || checkpointAfter.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want pushed fallback lifecycle", checkpointAfter.Lifecycle)
+	}
+	if len(github.createPRCalls) != 0 || len(github.updatePRBodyCalls) != 0 || len(github.reviewerCalls) != 0 {
+		t.Fatalf("createPRCalls/updatePRBodyCalls/reviewerCalls = %d/%d/%d, want no PR-side mutations after hold", len(github.createPRCalls), len(github.updatePRBodyCalls), len(github.reviewerCalls))
+	}
+}
+
 func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

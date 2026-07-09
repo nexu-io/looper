@@ -2096,6 +2096,12 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, 0, "", true, false)
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	ahead, err := r.workerBranchAheadOfBase(ctx, input.Project, work, worktree)
 	if err != nil {
 		return checkpoint, err
