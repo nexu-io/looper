@@ -6046,23 +6046,24 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		diffHunk, _ := stringFromAny(comment["diffHunk"])
 		source, _ := stringFromAny(comment["source"])
 		threadFingerprint, _ := stringFromAny(comment["threadFingerprint"])
-		threadFingerprint = normalizeThreadFingerprint(threadFingerprint, threadID, id)
 		observedFingerprint := ""
 		providerCommentID := int64(0)
 		resolverPresent := false
 		if strings.TrimSpace(source) != "" {
 			observedFingerprint, _ = stringFromAny(comment["observedFingerprint"])
-			if strings.TrimSpace(observedFingerprint) == "" {
-				observedFingerprint = threadFingerprint
-			}
 			providerCommentID = issueCommentDatabaseID(comment)
 			resolverPresent, _ = comment["resolverPresent"].(bool)
 			if source == NativeReviewCommentSource && providerCommentID > 0 {
 				id = NativeReviewCommentFixItemID(providerCommentID)
+				threadID = NativeReviewCommentThreadID(providerCommentID)
 			}
 		} else {
 			body = ""
 			diffHunk = ""
+		}
+		threadFingerprint = normalizeThreadFingerprint(threadFingerprint, threadID, id)
+		if strings.TrimSpace(source) != "" && strings.TrimSpace(observedFingerprint) == "" {
+			observedFingerprint = threadFingerprint
 		}
 		var line int64
 		switch v := comment["line"].(type) {

@@ -103,7 +103,7 @@ func TestCollectFixItemsFromForgejoNativeReviewCommentPreservesNativeFields(t *t
 	if len(items) != 1 {
 		t.Fatalf("len(items) = %d, want 1", len(items))
 	}
-	if got := items[0]; got.Source != NativeReviewCommentSource || got.ProviderCommentID != 101 || got.ObservedFingerprint != NativeReviewCommentFingerprint(101, "updated-1") || got.Body != "Please rename this helper." || got.DiffHunk != "@@ -1,2 +1,2 @@" || got.URL == "" {
+	if got := items[0]; got.Source != NativeReviewCommentSource || got.ID != NativeReviewCommentFixItemID(101) || got.ThreadID != NativeReviewCommentThreadID(101) || got.ProviderCommentID != 101 || got.ObservedFingerprint != NativeReviewCommentFingerprint(101, "updated-1") || got.Body != "Please rename this helper." || got.DiffHunk != "@@ -1,2 +1,2 @@" || got.URL == "" {
 		t.Fatalf("item = %#v, want forgejo native review comment fields", got)
 	}
 }
@@ -133,7 +133,7 @@ func TestCollectFixItemsAllowsForgejoNativeAndSummaryItemsToCoexist(t *testing.T
 		Comments: []map[string]any{{
 			"id":                  NativeReviewCommentFixItemID(101),
 			"databaseId":          int64(101),
-			"threadId":            NativeReviewCommentThreadID(101),
+			"threadId":            "101",
 			"threadFingerprint":   NativeReviewCommentFingerprint(101, "updated-1"),
 			"observedFingerprint": NativeReviewCommentFingerprint(101, "updated-1"),
 			"source":              NativeReviewCommentSource,
