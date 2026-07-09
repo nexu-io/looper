@@ -584,7 +584,7 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 		if err != nil {
 			return planner.PullRequestDetail{}, err
 		}
-		return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name}, nil
+		return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, Labels: forgeLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name}, nil
 	}
 	if a.gateway == nil {
 		return planner.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -593,7 +593,7 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 	if err != nil {
 		return planner.PullRequestDetail{}, err
 	}
-	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
+	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, Labels: append([]string(nil), pr.Labels...), HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
 }
 
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {

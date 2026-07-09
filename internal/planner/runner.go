@@ -982,6 +982,13 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
+		if !plannerQueueItemIsManual(input.QueueItem) {
+			if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
+		}
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err

@@ -2,7 +2,9 @@ package planner
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -657,6 +659,50 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *t
 	}
 	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.Status != "completed" || !checkpoint.WriteSpec.GitReconciled {
 		t.Fatalf("checkpoint.WriteSpec = %#v, want completed and reconciled write-spec after worktree recovery", checkpoint.WriteSpec)
+	}
+}
+
+func TestRunWriteSpecStepRechecksPlannerHoldBeforeStartingAgent(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_held"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issue.IssueNumber, Labels: []string{domain.HoldLabelGlobal}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	_, err = runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue:    issue,
+			Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runWriteSpecStep() error = %v, want holdSkipError", err)
+	}
+	if !strings.Contains(holdErr.summary, "acme/looper#42") {
+		t.Fatalf("hold summary = %q, want held issue reference", holdErr.summary)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("len(agent.starts) = %d, want agent not started", len(agent.starts))
 	}
 }
 
