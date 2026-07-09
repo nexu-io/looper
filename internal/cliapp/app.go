@@ -360,6 +360,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("spec", "path", "Spec path"),
 					stringFlag("repo", "repo", "Repository slug"),
 					stringFlag("base-branch", "branch", "Base branch"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 				},
 				exampleLines: []string{
 					"$ looper work --project project_1 --title \"Ship CLI\" --spec specs/ship-cli.md",
@@ -400,6 +401,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep fixing when new PR comments arrive"),
 					boolFlag("no-loop", "Run only one fixer pass"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 				},
 				exampleLines: []string{
 					"$ looper fix 42",
@@ -417,11 +419,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("project", "projectId", "Project id"),
 					boolFlag("loop", "Keep reviewing when new commits are pushed"),
 					boolFlag("no-loop", "Run only one review pass"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 					stringFlag("clean-review-event", "event", "Clean review event override: COMMENT or APPROVE"),
 					stringFlag("blocking-review-event", "event", "Blocking review event override: COMMENT or REQUEST_CHANGES"),
 				},
 				subcommands: []*cobra.Command{
-					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA"), stringFlag("clean-review-event", "event", "Effective clean review event policy"), stringFlag("blocking-review-event", "event", "Effective blocking review event policy")}}),
+					newCommand(commandSpec{use: "submit <pr>", short: "Submit a validated PR review payload", args: cobra.ExactArgs(1), runE: runtime.reviewSubmit, localFlags: []flagSpec{stringFlag("event", "event", "Review event: COMMENT, APPROVE, or REQUEST_CHANGES"), stringFlag("commit-id", "sha", "Expected PR head commit SHA"), stringFlag("clean-review-event", "event", "Effective clean review event policy"), stringFlag("blocking-review-event", "event", "Effective blocking review event policy"), hiddenBoolFlag("reviewer-manual", "Allow held manual reviewer submissions")}}),
 					newCommand(commandSpec{use: "repair <pr>", short: "Diagnose and repair reviewer local state", args: cobra.ExactArgs(1), runE: runtime.reviewRepair, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id"), boolFlag("apply", "Apply planned local repair actions")}}),
 				},
 				exampleLines: []string{

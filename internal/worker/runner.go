@@ -20,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
@@ -684,6 +685,10 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+type holdSkipError struct{ summary string }
+
+func (e *holdSkipError) Error() string { return e.summary }
+
 type loopUpsertResult struct {
 	record      storage.LoopRecord
 	created     bool
@@ -877,6 +882,10 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
+		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !shouldClaimWorkerIssue(issue, login, policy) {
 			result.Skipped++
 			continue
@@ -1078,6 +1087,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil || handled {
 			return result, err
 		}
+		if resumedRun.StartStep != stepPrepareWork {
+			if held, summary, err := r.workerHoldSummary(ctx, *project, *loop, queueItem, checkpoint); err != nil {
+				return ProcessResult{}, err
+			} else if held {
+				return r.finishHeldWorkerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, summary)
+			}
+		}
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
@@ -1130,6 +1146,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return r.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint}, run, checkpoint, awaiting)
 		}
 		if err != nil {
+			var holdErr *holdSkipError
+			if errors.As(err, &holdErr) {
+				return r.finishHeldWorkerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, holdErr.summary)
+			}
 			failure := r.classifyFailureWithBoundary(err, workerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
@@ -1377,6 +1397,11 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	work, err := r.resolveWorkerInput(ctx, input.Project, input.Loop, input.QueueItem, checkpoint)
 	if err != nil {
 		return checkpoint, err
+	}
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
 	}
 	lockKey := derefString(input.QueueItem.LockKey)
 	if lockKey == "" {
@@ -1890,6 +1915,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err != nil {
 		return checkpoint, err
 	}
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if checkpoint.Validation != nil && !checkpoint.Validation.Passed {
 		failure := classifyValidationFailure(*checkpoint.Validation)
 		checkpoint.ResumePolicy = failure.resumePolicy
@@ -1940,6 +1970,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			checkpoint.PullRequest = &pr
 			checkpoint.markLifecycleAgentPullRequest(branch, work.BaseBranch, pr)
 		}
+	}
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
 	}
 	if work.ExecutionMode == "create-pr" && (checkpoint.PullRequest != nil || input.Loop.PRNumber != nil) {
 		if checkpoint.PullRequest == nil {
@@ -2091,6 +2126,65 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 	return checkpoint, nil
+}
+
+func (r *Runner) workerHoldSummary(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (bool, string, error) {
+	work, err := r.resolveWorkerInput(ctx, project, loop, queueItem, checkpoint)
+	if err != nil {
+		return false, "", err
+	}
+	return r.workerHoldSummaryForWork(ctx, project, work)
+}
+
+func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.ProjectRecord, work workerInput) (bool, string, error) {
+	if r.github == nil {
+		return false, "", nil
+	}
+	if !work.AutoDiscovered {
+		return false, "", nil
+	}
+	var labels []string
+	if work.IssueNumber > 0 {
+		detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: issueLookupRepo(work), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
+		if err != nil {
+			return false, "", err
+		}
+		labels = detail.Labels
+	} else {
+		return false, "", nil
+	}
+	if !domain.IsAutoLaneHeld(domain.LoopTypeWorker, labels) {
+		return false, "", nil
+	}
+	if work.IssueNumber > 0 {
+		return true, fmt.Sprintf("Worker stopped because %s is currently held", formatIssueReference(issueLookupRepo(work), work.IssueNumber)), nil
+	}
+	return true, "Worker stopped because the current target is currently held", nil
+}
+
+func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
 }
 
 func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint) (workerInput, error) {

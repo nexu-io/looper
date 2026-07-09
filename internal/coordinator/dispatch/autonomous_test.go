@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/coordinator/depgraph"
+	"github.com/nexu-io/looper/internal/domain"
 )
 
 func TestAutonomousGraceNotElapsedDoesNothing(t *testing.T) {
@@ -61,6 +62,39 @@ func TestAutonomousHoldLabelVetoesDispatch(t *testing.T) {
 	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "looper:hold"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
 	if !action.NoOp {
 		t.Fatalf("action = %#v, want no-op", action)
+	}
+}
+
+func TestAutonomousLegacyHoldLabelStillVetoesDispatch(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	cfg := autonomousConfig()
+	cfg.HoldLabel = "legacy:hold"
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "legacy:hold"}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now, nil)
+	if !action.NoOp {
+		t.Fatalf("action = %#v, want no-op", action)
+	}
+}
+
+func TestAutonomousOfficialGlobalHoldVetoesDispatchWhenLegacyHoldCustomized(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	cfg := autonomousConfig()
+	cfg.HoldLabel = "legacy:hold"
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, domain.HoldLabelGlobal}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now, nil)
+	if !action.NoOp {
+		t.Fatalf("action = %#v, want no-op", action)
+	}
+}
+
+func TestAutonomousLaneSpecificOfficialHoldDoesNotVetoDispatch(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	cfg := autonomousConfig()
+	cfg.HoldLabel = "legacy:hold"
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, domain.HoldLabelWorker}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now, nil)
+	if action.NoOp || len(action.TriggerLabels) != 1 || action.TriggerLabels[0] != "looper:plan" {
+		t.Fatalf("action = %#v, want dispatch despite lane-specific hold", action)
 	}
 }
 

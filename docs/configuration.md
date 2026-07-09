@@ -301,7 +301,7 @@ Coordinator dispatch lives under `roles.coordinator.dispatch.*`:
 | `roles.coordinator.dispatch.humanGate.slashCommands` | Accepted start-of-line slash commands | `[`"/plan"`, `"/implement"`]` |
 | `roles.coordinator.dispatch.humanGate.allowedUsers` | Extra users allowed to dispatch even without repo write access | `[]` |
 | `roles.coordinator.dispatch.autonomous.delayMinutes` | Grace window after `triaged` before autonomous dispatch can commit | `30` |
-| `roles.coordinator.dispatch.autonomous.holdLabel` | Global hold / veto label for autonomous dispatch | `"looper:hold"` |
+| `roles.coordinator.dispatch.autonomous.holdLabel` | Legacy compatibility-only veto label for autonomous dispatch | `"looper:hold"` |
 
 Behavior notes:
 
@@ -309,7 +309,29 @@ Behavior notes:
 - `/implement` maps to the first worker trigger label at `roles.worker.triggers.labels[0]`
 - autonomous mode uses the existing `dispatch/*` label to choose the same derived trigger labels
 - Coordinator never stores its own dispatch state; the authority chain stays on GitHub labels, comments, and timeline events
-- `roles.coordinator.dispatch.autonomous.holdLabel` is also a veto signal, alongside removing `dispatch/*` or manually applying the destination trigger label
+- `roles.coordinator.dispatch.autonomous.holdLabel` is compatibility-only for coordinator autonomous dispatch; the official global hold contract is `looper:hold`
+
+## Hold labels
+
+Official hold labels are fixed:
+
+- `looper:hold`
+- `looper:hold:worker`
+- `looper:hold:fixer`
+- `looper:hold:reviewer`
+
+Semantics:
+
+- `looper:hold` blocks all automatic Looper activity for the labeled issue or PR.
+- lane-specific hold labels block only their lane.
+- no issue/PR inheritance exists.
+- Looper never adds or removes hold labels.
+- removing a hold takes effect on the next normal scan.
+- only explicit manual `looper work/review/fix --force` or API create requests with `force=true` can bypass hold.
+
+Planner is special: only `looper:hold` blocks planner. There is no planner-specific hold label.
+
+Manual CLI/API create-time hold validation is best-effort only when the local project repo path or configured `gh` path needed for remote inspection is unavailable. If those are present but `gh` inspection itself fails, create-time validation fails.
 
 Coordinator example:
 

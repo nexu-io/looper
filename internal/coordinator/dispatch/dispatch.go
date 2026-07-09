@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/coordinator/depgraph"
+	"github.com/nexu-io/looper/internal/domain"
 )
 
 const (
@@ -95,7 +96,7 @@ func autonomousNeedsDependencyGate(issue Issue, cfg Config, now time.Time) bool 
 		return false
 	}
 	triggerLabels := triggerLabelsForDispatch(dispatchLabel, cfg)
-	if len(triggerLabels) == 0 || hasLabel(issue.Labels, strings.TrimSpace(cfg.HoldLabel)) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
+	if len(triggerLabels) == 0 || autonomousDispatchHeld(issue.Labels, cfg.HoldLabel) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
 		return false
 	}
 	if issue.TriagedAt.IsZero() || now.UTC().Before(issue.TriagedAt.UTC().Add(cfg.AutonomousDelay)) {
@@ -155,7 +156,7 @@ func decideAutonomous(issue Issue, cfg Config, now time.Time, graph *depgraph.De
 	if len(triggerLabels) == 0 {
 		return Action{NoOp: true}
 	}
-	if hasLabel(issue.Labels, strings.TrimSpace(cfg.HoldLabel)) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
+	if autonomousDispatchHeld(issue.Labels, cfg.HoldLabel) || len(missingLabels(issue.Labels, triggerLabels)) == 0 {
 		return Action{NoOp: true}
 	}
 	if issue.TriagedAt.IsZero() || now.UTC().Before(issue.TriagedAt.UTC().Add(cfg.AutonomousDelay)) {
@@ -310,6 +311,15 @@ func hasLabel(labels []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func autonomousDispatchHeld(labels []string, legacyHoldLabel string) bool {
+	// Coordinator autonomous dispatch is only blocked by the official global hold.
+	// Lane-specific official holds apply later in each lane's own discovery gate.
+	if hasLabel(labels, domain.HoldLabelGlobal) {
+		return true
+	}
+	return hasLabel(labels, strings.TrimSpace(legacyHoldLabel))
 }
 
 func dependencyFailureBody(blockers []depgraph.Blocker) string {

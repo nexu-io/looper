@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
@@ -330,6 +331,17 @@ func TestWriteReviewSubmitDiagnosticWritesStructuredJSON(t *testing.T) {
 	}
 	if entry["error"] == "" {
 		t.Fatalf("entry = %#v, want error field", entry)
+	}
+}
+
+func TestValidateReviewerReviewSubmitHoldRejectsHeldAutomaticReviewerFlow(t *testing.T) {
+	t.Parallel()
+	err := validateReviewerReviewSubmitHold("acme/looper", 42, false, []string{domain.HoldLabelReviewer})
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("validateReviewerReviewSubmitHold() error = %v, want held automatic reviewer rejection", err)
+	}
+	if err := validateReviewerReviewSubmitHold("acme/looper", 42, true, []string{domain.HoldLabelReviewer}); err != nil {
+		t.Fatalf("validateReviewerReviewSubmitHold(manual) error = %v, want manual reviewer allowed", err)
 	}
 }
 

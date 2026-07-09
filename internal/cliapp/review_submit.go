@@ -12,6 +12,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/spf13/cobra"
@@ -91,18 +92,21 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		writeReviewSubmitDiagnosticEntry(cmd.ErrOrStderr(), event, fields)
 	}
 	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run, ReviewSubmitDiagnostic: diagnosticWriter})
-	metadata, err := gh.GetPullRequestHeadAndAuthor(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
-		return fmt.Errorf("validate expected PR head commit: %w", err)
+		return fmt.Errorf("refresh pull request before review submit: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, metadata.HeadSHA); err != nil {
+	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, metadata.Author); err != nil {
+	if err := validateReviewerReviewSubmitHold(repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), detail.Labels); err != nil {
+		return err
+	}
+	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error()})
 		return err
 	}
-	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gh, repo, prNumber, event, metadata.Author, cwd)
+	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gh, repo, prNumber, event, detail.Author, cwd)
 	if err != nil {
 		return err
 	}
@@ -309,6 +313,13 @@ func validateExpectedHeadCommit(expected string, actual string) error {
 		return fmt.Errorf("review submit expected head commit %s but PR head is %s; refresh the review before submitting", expected, actual)
 	}
 	return nil
+}
+
+func validateReviewerReviewSubmitHold(repo string, prNumber int64, manual bool, labels []string) error {
+	if !domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, manual, labels) {
+		return nil
+	}
+	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
 }
 
 func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {

@@ -26,6 +26,8 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
@@ -3293,6 +3295,7 @@ type createLoopRequest struct {
 	PRNumber    *int64          `json:"prNumber"`
 	IssueNumber *int64          `json:"issueNumber"`
 	Status      *string         `json:"status"`
+	Force       *bool           `json:"force"`
 	Metadata    json.RawMessage `json:"metadata"`
 }
 
@@ -3305,6 +3308,7 @@ type createWorkerRequest struct {
 	BaseBranch  *string `json:"baseBranch"`
 	PRNumber    *int64  `json:"prNumber"`
 	IssueNumber *int64  `json:"issueNumber"`
+	Force       *bool   `json:"force"`
 }
 
 type createPlannerRequest struct {
@@ -3400,14 +3404,24 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return loopResponse{}, err
 		}
 	}
+	if services.Repositories == nil || services.Repositories.Projects == nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	project, err := requireActiveProjectRecord(r.Context(), services.Repositories.Projects, projectID)
+	if err != nil {
+		return loopResponse{}, err
+	}
+	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
+		return loopResponse{}, err
+	}
+	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopType(loopType), target, derefBool(body.Force)); err != nil {
+		return loopResponse{}, err
+	}
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		transactionRepos := storage.NewRepositories(tx)
-		project, err := requireActiveProjectRecord(r.Context(), transactionRepos.Projects, projectID)
+		_, err := requireActiveProjectRecord(r.Context(), transactionRepos.Projects, projectID)
 		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 			return storage.LoopRecord{}, err
 		}
 
@@ -3591,7 +3605,6 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if title == "" {
 		title = deriveWorkerTitle(prompt, effectiveSpecPath, repo, effectivePRNumber, issueNumber)
 	}
-
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetType := string(domain.LoopTargetTypeProject)
 	targetID := "project:" + projectID
@@ -3604,6 +3617,22 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		targetType = string(domain.LoopTargetTypeIssue)
 		targetID = fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
 		target = domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
+	}
+	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
+		return workerCreateResponse{}, err
+	}
+	if requestedIssueTarget != nil {
+		if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), *requestedIssueTarget); err != nil {
+			return workerCreateResponse{}, err
+		}
+		if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypeWorker, *requestedIssueTarget, derefBool(body.Force)); err != nil {
+			return workerCreateResponse{}, err
+		}
+	}
+	if requestedIssueTarget == nil || target.TargetType != requestedIssueTarget.TargetType || target.Repo != requestedIssueTarget.Repo || target.IssueNumber != requestedIssueTarget.IssueNumber {
+		if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypeWorker, target, derefBool(body.Force)); err != nil {
+			return workerCreateResponse{}, err
+		}
 	}
 
 	workerPayload := struct {
@@ -3751,6 +3780,59 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	return response, nil
+}
+
+func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, projectID string, loopType domain.LoopType, target domain.LoopTarget, force bool) error {
+	if force || (loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeReviewer && loopType != domain.LoopTypeFixer) {
+		return nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Projects == nil {
+		return nil
+	}
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, projectID)
+	if err != nil {
+		return err
+	}
+	// Hold preflight is best-effort at create time: when we cannot reliably talk to
+	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
+	// skip validation rather than blocking manual creation for unrelated local setup.
+	if strings.TrimSpace(project.RepoPath) == "" {
+		return nil
+	}
+	if _, err := os.Stat(project.RepoPath); err != nil {
+		return nil
+	}
+	ghPath := strings.TrimSpace(derefString(h.context.Config.Tools.GHPath))
+	if ghPath == "" {
+		return nil
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
+	labels := []string(nil)
+	switch target.TargetType {
+	case domain.LoopTargetTypeIssue:
+		detail, err := gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		labels = detail.Labels
+	case domain.LoopTargetTypePullRequest:
+		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		labels = detail.Labels
+	default:
+		return nil
+	}
+	if !domain.IsAutoLaneHeld(loopType, labels) {
+		return nil
+	}
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+func derefBool(value *bool) bool {
+	return value != nil && *value
 }
 
 func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, projectID string, issueTarget, effectiveTarget domain.LoopTarget) (storage.LoopRecord, domain.LoopTarget, bool, error) {
