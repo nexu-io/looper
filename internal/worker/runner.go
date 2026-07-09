@@ -108,6 +108,7 @@ type PullRequestDetail struct {
 	HeadRefName        string
 	BaseRefName        string
 	HeadSHA            string
+	Labels             []string
 	ReviewRequests     []string
 	ReviewRequestUsers []networkpolicy.GitHubUser
 }
@@ -2159,23 +2160,25 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 	if !work.AutoDiscovered {
 		return false, "", nil
 	}
-	var labels []string
+	if work.PRNumber > 0 {
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: work.Repo, PRNumber: work.PRNumber, CWD: project.RepoPath})
+		if err != nil {
+			return false, "", err
+		}
+		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, detail.Labels) {
+			return true, fmt.Sprintf("Worker stopped because %s#%d is currently held", work.Repo, work.PRNumber), nil
+		}
+	}
 	if work.IssueNumber > 0 {
 		detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: issueLookupRepo(work), IssueNumber: work.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return false, "", err
 		}
-		labels = detail.Labels
-	} else {
-		return false, "", nil
+		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, detail.Labels) {
+			return true, fmt.Sprintf("Worker stopped because %s is currently held", formatIssueReference(issueLookupRepo(work), work.IssueNumber)), nil
+		}
 	}
-	if !domain.IsAutoLaneHeld(domain.LoopTypeWorker, labels) {
-		return false, "", nil
-	}
-	if work.IssueNumber > 0 {
-		return true, fmt.Sprintf("Worker stopped because %s is currently held", formatIssueReference(issueLookupRepo(work), work.IssueNumber)), nil
-	}
-	return true, "Worker stopped because the current target is currently held", nil
+	return false, "", nil
 }
 
 func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (ProcessResult, error) {

@@ -158,6 +158,41 @@ func TestProcessClaimedItemSkipsHeldAutoDiscoveredWorkerIssue(t *testing.T) {
 	}
 }
 
+func TestWorkerHoldSummaryChecksRetargetedPullRequestLabels(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(46)
+	prNumber := int64(101)
+	prTarget := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	nowISO := fixture.nowISO()
+	metadataJSON := mustMarshalJSON(map[string]any{"worker": map[string]any{"repo": repo, "executionMode": "create-pr", "issueNumber": issueNumber, "specPath": "specs/worker/spec.md", "autoDiscovered": true}})
+	loop := storage.LoopRecord{ID: "loop_worker_pr_hold", Seq: 102, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_worker_pr_hold", Type: "worker", TargetType: "pull_request", TargetID: prTarget, Repo: &repo, PRNumber: &prNumber, PayloadJSON: &metadataJSON}
+	github := &fakeGitHubGateway{
+		issueDetail: IssueDetail{Number: issueNumber},
+		prDetailResponses: []PullRequestDetail{
+			{Number: prNumber, Title: "Worker PR", BaseRefName: "main", HeadRefName: "worker/46"},
+			{Number: prNumber, Labels: []string{domain.HoldLabelWorker}, BaseRefName: "main", HeadRefName: "worker/46"},
+		},
+	}
+	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	held, summary, err := runner.workerHoldSummary(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, loop, queue, workerCheckpoint{})
+	if err != nil {
+		t.Fatalf("workerHoldSummary() error = %v", err)
+	}
+	if !held || !strings.Contains(summary, "acme/looper#101") {
+		t.Fatalf("held, summary = %v, %q, want held PR summary", held, summary)
+	}
+	if len(github.viewPRCalls) != 2 {
+		t.Fatalf("viewPRCalls = %#v, want resolve lookup plus hold lookup", github.viewPRCalls)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("viewIssueCalls = %#v, want only resolve hydration before held PR check", github.viewIssueCalls)
+	}
+}
+
 func TestRunOpenPRStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
