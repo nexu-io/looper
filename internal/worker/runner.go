@@ -2147,8 +2147,16 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if created.Number <= 0 {
 		return checkpoint, &loopError{message: "Worker create-pr requires a pull request number", kind: FailureRetryableAfterResume}
 	}
-	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	pr := checkpointPullPR{Number: created.Number, URL: created.URL}
+	createdWork := workerWorkForPullRequest(work, PullRequestSummary{Number: created.Number, URL: created.URL, HeadRefName: worktree.Branch, BaseRefName: work.BaseBranch})
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, createdWork); err != nil {
+		return checkpoint, err
+	} else if held {
+		checkpoint.PullRequest = &pr
+		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, created.Number, created.URL, true, false)
+		return checkpoint, &holdSkipError{summary: summary}
+	}
+	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
 		return checkpoint, err
 	}
