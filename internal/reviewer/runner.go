@@ -1256,6 +1256,10 @@ func (r *Runner) commentOnlyPublishForProject(projectID string) bool {
 	if r.commentOnlyPublish {
 		return true
 	}
+	return r.forgejoCommentOnlyPublishForProject(projectID)
+}
+
+func (r *Runner) forgejoCommentOnlyPublishForProject(projectID string) bool {
 	if r.projectRoleConfig == nil {
 		return false
 	}
@@ -2834,7 +2838,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
-		if r.commentOnlyPublishForProject(input.Project.ID) {
+		reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		if r.forgejoCommentOnlyPublishForProject(input.Project.ID) || (r.commentOnlyPublishForProject(input.Project.ID) && reviewEvents.Clean != config.ReviewerReviewEventApprove) {
 			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 				return checkpoint, err
 			}
@@ -2843,7 +2848,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
-		if r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove {
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}

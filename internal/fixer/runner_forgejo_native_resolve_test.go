@@ -240,38 +240,35 @@ func TestParseNativeRepairResultsAcceptsExplicitActionsAndDefaultsMissingToDefer
 		`{"source":"forgejo_review_comment","providerCommentId":103,"action":"deferred","explanation":"Need product input.","observedFingerprint":"` + NativeReviewCommentFingerprint(103, "updated-3") + `"}` +
 		`]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
-	if len(got) != 4 {
-		t.Fatalf("len(parseNativeRepairResults()) = %d, want 4", len(got))
+	if len(got) != 3 {
+		t.Fatalf("len(parseNativeRepairResults()) = %d, want 3", len(got))
 	}
 	if got[0].Action != "fixed" || got[1].Action != "declined" || got[2].Action != "deferred" {
 		t.Fatalf("parseNativeRepairResults() actions = %#v", got)
 	}
-	if got[3].Action != "deferred" || got[3].FixItemID != "c4" || got[3].Explanation == "" {
-		t.Fatalf("parseNativeRepairResults() missing result = %#v, want deferred fallback", got[3])
-	}
 }
 
-func TestParseNativeRepairResultsMissingObservedFingerprintFallsBackToDeferred(t *testing.T) {
+func TestParseNativeRepairResultsMissingObservedFingerprintOmitsDecision(t *testing.T) {
 	t.Parallel()
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")}}
 	stdout := `__LOOPER_RESULT__={"repair_results":[{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"Renamed the helper."}]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
-	if len(got) != 1 || got[0].Action != "deferred" || got[0].FixItemID != "c1" {
-		t.Fatalf("parseNativeRepairResults() = %#v, want deferred fallback", got)
+	if len(got) != 0 {
+		t.Fatalf("parseNativeRepairResults() = %#v, want missing decision omitted", got)
 	}
 }
 
-func TestParseNativeRepairResultsBlankExplanationFallsBackToDeferred(t *testing.T) {
+func TestParseNativeRepairResultsBlankExplanationOmitsDecision(t *testing.T) {
 	t.Parallel()
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")}}
 	stdout := `__LOOPER_RESULT__={"repair_results":[{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"   ","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "updated-1") + `"}]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
-	if len(got) != 1 || got[0].Action != "deferred" || got[0].FixItemID != "c1" {
-		t.Fatalf("parseNativeRepairResults() = %#v, want deferred fallback", got)
+	if len(got) != 0 {
+		t.Fatalf("parseNativeRepairResults() = %#v, want missing decision omitted", got)
 	}
 }
 
-func TestParseNativeRepairResultsIgnoresUnknownExplicitEntriesAndFallsBackToDeferred(t *testing.T) {
+func TestParseNativeRepairResultsIgnoresUnknownExplicitEntriesWithoutFallback(t *testing.T) {
 	t.Parallel()
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")}}
 	stdout := `__LOOPER_RESULT__={"repair_results":[` +
@@ -279,8 +276,8 @@ func TestParseNativeRepairResultsIgnoresUnknownExplicitEntriesAndFallsBackToDefe
 		`{"source":"forgejo_review_comment","providerCommentId":999,"action":"fixed","explanation":"unknown provider","observedFingerprint":"ignored"}` +
 		`]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
-	if len(got) != 1 || got[0].Action != "deferred" || got[0].FixItemID != "c1" {
-		t.Fatalf("parseNativeRepairResults() = %#v, want deferred fallback for known item", got)
+	if len(got) != 0 {
+		t.Fatalf("parseNativeRepairResults() = %#v, want missing decision omitted", got)
 	}
 }
 

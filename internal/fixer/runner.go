@@ -1075,7 +1075,7 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 	combined := stdout + "\n" + stderr
 	payload := extractCompletionMarkerPayload(combined)
 	if payload == "" {
-		return normalizeNativeRepairResults(nil, fixItems)
+		return nil
 	}
 	var parsed struct {
 		RepairResults []struct {
@@ -1087,7 +1087,7 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 		} `json:"repair_results"`
 	}
 	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-		return normalizeNativeRepairResults(nil, fixItems)
+		return nil
 	}
 	results := make([]nativeRepairResultEntry, 0, len(parsed.RepairResults))
 	seen := map[int64]struct{}{}
@@ -1124,44 +1124,9 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 			ObservedFingerprint: observedFingerprint,
 		})
 	}
-	return normalizeNativeRepairResults(results, fixItems)
-}
-
-func normalizeNativeRepairResults(results []nativeRepairResultEntry, fixItems []FixItem) []replyExplanationEntry {
-	nativeItems := make([]FixItem, 0)
-	for _, item := range fixItems {
-		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
-			nativeItems = append(nativeItems, item)
-		}
-	}
-	if len(nativeItems) == 0 {
-		return nil
-	}
-	byID := make(map[int64]nativeRepairResultEntry, len(results))
+	out := make([]replyExplanationEntry, 0, len(results))
 	for _, result := range results {
-		if result.ProviderCommentID > 0 {
-			byID[result.ProviderCommentID] = result
-		}
-	}
-	out := make([]replyExplanationEntry, 0, len(nativeItems))
-	for _, item := range nativeItems {
-		result, ok := byID[item.ProviderCommentID]
-		if !ok {
-			result = nativeRepairResultEntry{
-				Source:              NativeReviewCommentSource,
-				FixItemID:           item.ID,
-				ProviderCommentID:   item.ProviderCommentID,
-				Action:              "deferred",
-				Explanation:         "No Forgejo native repair result was provided for this comment.",
-				ObservedFingerprint: item.ObservedFingerprint,
-			}
-		}
-		if strings.TrimSpace(result.FixItemID) == "" {
-			result.FixItemID = item.ID
-		}
-		if result.Action == "deferred" && strings.TrimSpace(result.ObservedFingerprint) == "" {
-			result.ObservedFingerprint = item.ObservedFingerprint
-		}
+		item := itemsByProviderID[result.ProviderCommentID]
 		out = append(out, replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: result.Action, Explanation: result.Explanation})
 	}
 	return out
