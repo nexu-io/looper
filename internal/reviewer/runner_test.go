@@ -8466,7 +8466,7 @@ func TestProcessClaimedItemGlobalCommentOnlyApprovePolicyRequiresCleanMarker(t *
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", reviewMarkerMissing: true}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LooperCLIPath: "/opt/looper/bin/looper", CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -8487,6 +8487,16 @@ func TestProcessClaimedItemGlobalCommentOnlyApprovePolicyRequiresCleanMarker(t *
 	}
 	if len(github.issueCommentCalls) != 0 {
 		t.Fatalf("issueCommentCalls = %#v, want no comment before APPROVE marker verification succeeds", github.issueCommentCalls)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts = %d, want one review prompt", len(agent.starts))
+	}
+	prompt := agent.starts[0].Prompt
+	if strings.Contains(prompt, "Comment-only publish contract") || strings.Contains(prompt, "Looper will post your final completion summary") {
+		t.Fatalf("prompt = %q, want normal APPROVE review instructions instead of comment-only contract", prompt)
+	}
+	if !strings.Contains(prompt, "review submit acme/looper#42 --event APPROVE") {
+		t.Fatalf("prompt = %q, want clean APPROVE submit instructions", prompt)
 	}
 }
 
