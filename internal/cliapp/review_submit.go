@@ -370,8 +370,60 @@ func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, 
 	if loop.Status != string(domain.LoopStatusRunning) {
 		return false, nil
 	}
+	currentRun, err := currentRunningReviewerRun(ctx, repos, repo, prNumber)
+	if err != nil {
+		return false, err
+	}
+	if currentRun == nil || currentRun.ID != run.ID {
+		return false, nil
+	}
 	manualValue, _ := parseReviewSubmitJSONObject(loop.MetadataJSON)["manual"].(bool)
 	return manualValue, nil
+}
+
+func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
+	loops, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusRunning)})
+	if err != nil {
+		return nil, fmt.Errorf("validate held manual reviewer loops: %w", err)
+	}
+	loopIDs := make([]string, 0, len(loops))
+	for _, loop := range loops {
+		loopRepo := ""
+		if loop.Repo != nil {
+			loopRepo = *loop.Repo
+		}
+		if loop.Type == string(domain.LoopTypeReviewer) && strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) && loop.PRNumber != nil && *loop.PRNumber == prNumber {
+			loopIDs = append(loopIDs, loop.ID)
+		}
+	}
+	if len(loopIDs) == 0 {
+		return nil, nil
+	}
+	runs, err := repos.Runs.ListLatestByLoopIDs(ctx, loopIDs)
+	if err != nil {
+		return nil, fmt.Errorf("validate held manual reviewer runs: %w", err)
+	}
+	var current *storage.RunRecord
+	for i := range runs {
+		if runs[i].Status != string(domain.RunStatusRunning) {
+			continue
+		}
+		if current == nil || reviewerRunNewer(runs[i], *current) {
+			run := runs[i]
+			current = &run
+		}
+	}
+	return current, nil
+}
+
+func reviewerRunNewer(candidate, current storage.RunRecord) bool {
+	if candidate.StartedAt != current.StartedAt {
+		return candidate.StartedAt > current.StartedAt
+	}
+	if candidate.CreatedAt != current.CreatedAt {
+		return candidate.CreatedAt > current.CreatedAt
+	}
+	return candidate.ID > current.ID
 }
 
 func parseReviewSubmitJSONObject(value *string) map[string]any {

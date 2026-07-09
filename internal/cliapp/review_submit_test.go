@@ -104,6 +104,18 @@ func TestTrustedManualReviewerRunRequiresMatchingManualLoop(t *testing.T) {
 	if err != nil || trusted {
 		t.Fatalf("trustedManualReviewerRun(wrong PR) = %v, %v; want false, nil", trusted, err)
 	}
+
+	later := "2026-04-11T12:01:00.000Z"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_newer_auto", Seq: 4, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &autoMetadata, CreatedAt: later, UpdatedAt: later}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_newer_auto) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_newer_auto", LoopID: "loop_newer_auto", Status: "running", StartedAt: later, CreatedAt: later, UpdatedAt: later}); err != nil {
+		t.Fatalf("Runs.Upsert(run_newer_auto) error = %v", err)
+	}
+	trusted, err = trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "run_manual")
+	if err != nil || trusted {
+		t.Fatalf("trustedManualReviewerRun(stale current manual) = %v, %v; want false, nil", trusted, err)
+	}
 }
 
 func TestValidateReviewSubmitEventAcceptsRequestChanges(t *testing.T) {
