@@ -1399,7 +1399,8 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if err != nil {
 		return checkpoint, err
 	}
-	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+	holdWork, retargetedToPullRequest := workerHoldInputForTarget(work, input.Loop, input.QueueItem)
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
@@ -2172,11 +2173,31 @@ func (r *Runner) workerHoldSummary(ctx context.Context, project storage.ProjectR
 	if err != nil {
 		return false, "", err
 	}
-	return r.workerHoldSummaryForWork(ctx, project, work, workerTargetIsPullRequest(loop, queueItem))
+	holdWork, retargetedToPullRequest := workerHoldInputForTarget(work, loop, queueItem)
+	return r.workerHoldSummaryForWork(ctx, project, holdWork, retargetedToPullRequest)
 }
 
 func workerTargetIsPullRequest(loop storage.LoopRecord, queueItem storage.QueueItemRecord) bool {
 	return loop.TargetType == "pull_request" || queueItem.TargetType == "pull_request"
+}
+
+func workerHoldInputForTarget(work workerInput, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (workerInput, bool) {
+	if !workerTargetIsPullRequest(loop, queueItem) {
+		return work, false
+	}
+	work.Repo = firstNonEmpty(work.Repo, derefString(loop.Repo), derefString(queueItem.Repo))
+	if work.PRNumber == 0 {
+		work.PRNumber = firstNonZero(derefInt64(loop.PRNumber), derefInt64(queueItem.PRNumber))
+	}
+	if work.PRNumber == 0 {
+		if loop.TargetType == "pull_request" {
+			work.PRNumber = parsePullRequestNumberFromTargetID(derefString(loop.TargetID))
+		}
+		if work.PRNumber == 0 && queueItem.TargetType == "pull_request" {
+			work.PRNumber = parsePullRequestNumberFromTargetID(queueItem.TargetID)
+		}
+	}
+	return work, true
 }
 
 func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.ProjectRecord, work workerInput, retargetedToPullRequest ...bool) (bool, string, error) {
@@ -2197,6 +2218,9 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		if len(retargetedToPullRequest) > 0 && retargetedToPullRequest[0] {
 			return false, "", nil
 		}
+	}
+	if len(retargetedToPullRequest) > 0 && retargetedToPullRequest[0] {
+		return false, "", nil
 	}
 	if work.IssueNumber > 0 {
 		detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: issueLookupRepo(work), IssueNumber: work.IssueNumber, CWD: project.RepoPath})

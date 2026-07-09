@@ -214,6 +214,40 @@ func TestWorkerHoldSummaryDoesNotInheritIssueHoldAfterPullRequestRetarget(t *tes
 	}
 }
 
+func TestRunPrepareWorkStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(46)
+	prNumber := int64(101)
+	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	nowISO := fixture.nowISO()
+	github := &fakeGitHubGateway{
+		issueDetail:          IssueDetail{Number: issueNumber, Labels: []string{domain.HoldLabelWorker}},
+		issueDetailResponses: []IssueDetail{{Number: issueNumber}},
+		prDetail:             PullRequestDetail{Number: prNumber, Labels: []string{}, BaseRefName: "main", HeadRefName: "worker/46"},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop := storage.LoopRecord{ID: "loop_worker_pr_prepare_hold", Seq: 103, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_worker_pr_prepare_hold", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "worker", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	checkpoint := workerCheckpoint{Work: &workerInput{Title: "Stale issue work", Repo: repo, BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: issueNumber, AutoDiscovered: true}}
+
+	_, err = runner.runPrepareWorkStep(context.Background(), stepInput{Project: *project, Loop: loop, QueueItem: queue, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runPrepareWorkStep() error = %v", err)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("viewIssueCalls = %#v, want only stale issue validation before PR hold check", github.viewIssueCalls)
+	}
+	if len(github.viewPRCalls) != 1 {
+		t.Fatalf("viewPRCalls = %#v, want PR hold lookup from retargeted loop", github.viewPRCalls)
+	}
+}
+
 func TestRunOpenPRStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
