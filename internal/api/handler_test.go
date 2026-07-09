@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
@@ -4454,6 +4455,78 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	work, _ := checkpoint["work"].(map[string]any)
 	if work["autoDiscovered"] == true {
 		t.Fatalf("checkpoint = %#v, want forced reused worker checkpoint to bypass auto-discovered hold checks", checkpoint)
+	}
+}
+
+func TestHandlerWorkersCreateForceRejectsRunningReusableIssueWorker(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	targetID := "issue:acme/looper:77"
+	metadataJSON := `{"worker":{"title":"Running issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}}`
+	checkpointJSON := `{"work":{"title":"Running issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}}`
+	loopID := "loop_running_issue_worker"
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           loopID,
+		Seq:          1,
+		ProjectID:    "project_1",
+		Type:         "worker",
+		TargetType:   "issue",
+		TargetID:     &targetID,
+		Repo:         stringPtr("acme/looper"),
+		Status:       "running",
+		MetadataJSON: &metadataJSON,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_running_issue_worker) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_running_issue_worker",
+		LoopID:         loopID,
+		Status:         "running",
+		CheckpointJSON: &checkpointJSON,
+		StartedAt:      nowISO,
+		CreatedAt:      nowISO,
+		UpdatedAt:      nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_running_issue_worker) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main","force":true}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	apiErr := body["error"].(map[string]any)
+	assertEqual(t, apiErr["code"], string(pkgapi.ErrorCodeLoopConflict))
+	if !strings.Contains(apiErr["message"].(string), "Cannot force reuse running worker loop") {
+		t.Fatalf("message = %q, want running reuse rejection", apiErr["message"])
+	}
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	workerMeta, _ := metadata["worker"].(map[string]any)
+	if workerMeta["autoDiscovered"] != true {
+		t.Fatalf("metadata = %#v, want running loop metadata unchanged", metadata)
+	}
+	run, err := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_running_issue_worker")
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	checkpoint := parseJSONObject(run.CheckpointJSON)
+	work, _ := checkpoint["work"].(map[string]any)
+	if work["autoDiscovered"] != true {
+		t.Fatalf("checkpoint = %#v, want running run checkpoint unchanged", checkpoint)
 	}
 }
 

@@ -1181,6 +1181,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if pr == nil || pr.Number == 0 {
 		return checkpoint, &loopError{message: "Planner publish requires a pull request number", kind: FailureRetryableAfterResume}
 	}
+	if plannerQueueItemIsManual(input.QueueItem) {
+		// Phase 2 applies only to automatic planner lanes.
+	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if !stringInSlice(specpr.ReviewingLabel, checkpoint.Publish.LabelsAdded) {
 		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}

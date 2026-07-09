@@ -193,6 +193,60 @@ func TestRunPublishStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
 	}
 }
 
+func TestRunPublishStepRechecksHoldAfterCreatingPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		issueDetails: []IssueDetail{
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan", domain.HoldLabelGlobal}},
+		},
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+	loopID := "loop_planner_publish_hold_after_pr"
+	runID := "run_planner_publish_hold_after_pr"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:      storage.LoopRecord{ID: loopID, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running"},
+		Run:       storage.RunRecord{ID: runID, LoopID: loopID},
+		QueueItem: storage.QueueItemRecord{ID: "queue_1", PayloadJSON: stringPtr(`{"issueNumber":42}`)},
+		Checkpoint: plannerCheckpoint{
+			Issue:     &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", RequestedReviewers: []string{"teammate"}},
+			Worktree:  &checkpointWorktree{Path: t.TempDir(), Branch: "planner/42", BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+		},
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("runPublishStep() error = %v, want hold skip after PR create", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("pushCalls = %#v, want one push before post-PR hold", git.pushCalls)
+	}
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("createPRCalls = %#v, want one created PR before post-PR hold", github.createPRCalls)
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number != 101 {
+		t.Fatalf("checkpoint.Publish = %#v, want PR reference preserved before hold skip", checkpoint.Publish)
+	}
+	if len(github.addLabelCalls) != 0 {
+		t.Fatalf("addLabelCalls = %#v, want no spec-reviewing label after post-PR hold", github.addLabelCalls)
+	}
+	if len(github.addReviewerCalls) != 0 {
+		t.Fatalf("addReviewerCalls = %#v, want no reviewers after post-PR hold", github.addReviewerCalls)
+	}
+}
+
 func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1290,6 +1344,8 @@ type fakeGitHubGateway struct {
 	issues             []IssueSummary
 	listOpenIssueCalls []ListOpenIssuesInput
 	issueDetail        IssueDetail
+	issueDetails       []IssueDetail
+	issueDetailIndex   int
 	openPullRequests   []PullRequestSummary
 	prDetail           PullRequestDetail
 	viewPRErr          error
@@ -1315,6 +1371,10 @@ func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssu
 
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {
 	detail := f.issueDetail
+	if f.issueDetailIndex < len(f.issueDetails) {
+		detail = f.issueDetails[f.issueDetailIndex]
+		f.issueDetailIndex++
+	}
 	if detail.Number == 0 {
 		detail.Number = input.IssueNumber
 	}

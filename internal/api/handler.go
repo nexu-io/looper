@@ -3859,6 +3859,10 @@ func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, proj
 }
 
 func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string, force bool) (storage.LoopRecord, error) {
+	status := domain.LoopStatus(loop.Status)
+	if force && status == domain.LoopStatusRunning {
+		return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Cannot force reuse running worker loop %s", loop.ID)}
+	}
 	if force {
 		normalized, err := forceManualWorkerLoopStateCompat(ctx, repos, loop, nowISO)
 		if err != nil {
@@ -3866,7 +3870,6 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 		}
 		loop = normalized
 	}
-	status := domain.LoopStatus(loop.Status)
 	shouldQueue := status == domain.LoopStatusIdle || status == domain.LoopStatusPaused || status == domain.LoopStatusQueued
 	if status == domain.LoopStatusIdle || status == domain.LoopStatusPaused {
 		if err := domain.AssertLoopStatusTransition(status, domain.LoopStatusQueued); err != nil {
