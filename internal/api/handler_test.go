@@ -4349,6 +4349,83 @@ func TestHandlerWorkersCreateReusesDuplicateIssueWorkers(t *testing.T) {
 	}
 }
 
+func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWorker(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	completedAt := fixture.now.Add(-time.Minute).UTC().Format(javaScriptISOString)
+	targetID := "issue:acme/looper:77"
+	metadataJSON := `{"worker":{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}}`
+	payloadJSON := `{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}`
+	projectID := "project_1"
+	loopID := "loop_existing_held_issue_worker"
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           loopID,
+		Seq:          1,
+		ProjectID:    projectID,
+		Type:         "worker",
+		TargetType:   "issue",
+		TargetID:     &targetID,
+		Repo:         stringPtr("acme/looper"),
+		Status:       "idle",
+		MetadataJSON: &metadataJSON,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_existing_held_issue_worker) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_existing_held_issue_worker",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "worker",
+		TargetType:  "issue",
+		TargetID:    targetID,
+		Repo:        stringPtr("acme/looper"),
+		DedupeKey:   "worker:project_1:acme/looper:77",
+		Priority:    storage.QueuePriorityWorker,
+		Status:      "completed",
+		AvailableAt: completedAt,
+		Attempts:    1,
+		MaxAttempts: 3,
+		LockKey:     &targetID,
+		PayloadJSON: &payloadJSON,
+		FinishedAt:  &completedAt,
+		CreatedAt:   completedAt,
+		UpdatedAt:   completedAt,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_existing_held_issue_worker) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main","force":true}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], loopID)
+	assertEqual(t, data["reused"], true)
+
+	queueItem, err := fixture.runtime.Services().Repositories.Queue.FindActiveByDedupe(context.Background(), "worker:project_1:acme/looper:77")
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByDedupe() error = %v", err)
+	}
+	if queueItem == nil || queueItem.PayloadJSON == nil {
+		t.Fatalf("active queue item = %#v, want forced reused worker payload", queueItem)
+	}
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	if payload["autoDiscovered"] == true {
+		t.Fatalf("payload = %#v, want forced reused worker to bypass auto-discovered hold checks", payload)
+	}
+}
+
 func TestHandlerWorkersCreateReusesIssueWorkerBeforePlannerPRTarget(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)

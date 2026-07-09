@@ -3679,7 +3679,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 				return storage.LoopRecord{}, reuseErr
 			} else if ok {
 				reusedWorkerLoop = true
-				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO)
+				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
 				if resumeErr != nil {
 					return storage.LoopRecord{}, resumeErr
 				}
@@ -3858,7 +3858,7 @@ func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, proj
 	return storage.LoopRecord{}, domain.LoopTarget{}, false, nil
 }
 
-func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string) (storage.LoopRecord, error) {
+func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string, force bool) (storage.LoopRecord, error) {
 	status := domain.LoopStatus(loop.Status)
 	shouldQueue := status == domain.LoopStatusIdle || status == domain.LoopStatusPaused || status == domain.LoopStatusQueued
 	if status == domain.LoopStatusIdle || status == domain.LoopStatusPaused {
@@ -3911,6 +3911,9 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 					replacement.LastErrorKind = nil
 					replacement.CreatedAt = nowISO
 					replacement.UpdatedAt = nowISO
+					if force {
+						replacement.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(replacement.PayloadJSON)
+					}
 					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
 						return storage.LoopRecord{}, err
 					}
@@ -3920,16 +3923,54 @@ func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *sto
 						return storage.LoopRecord{}, queueErr
 					}
 					if ok {
+						if force {
+							queueRecord.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(queueRecord.PayloadJSON)
+						}
 						if _, _, upsertQueueErr := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); upsertQueueErr != nil {
 							return storage.LoopRecord{}, upsertQueueErr
 						}
 					}
+				}
+			} else if force {
+				activeQueue.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(activeQueue.PayloadJSON)
+				activeQueue.UpdatedAt = nowISO
+				if err := repos.Queue.Upsert(ctx, *activeQueue); err != nil {
+					return storage.LoopRecord{}, err
+				}
+			}
+		} else if force {
+			activeQueue, findErr := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+			if findErr != nil {
+				return storage.LoopRecord{}, findErr
+			}
+			if activeQueue != nil {
+				activeQueue.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(activeQueue.PayloadJSON)
+				activeQueue.UpdatedAt = nowISO
+				if err := repos.Queue.Upsert(ctx, *activeQueue); err != nil {
+					return storage.LoopRecord{}, err
 				}
 			}
 		}
 	}
 
 	return loop, nil
+}
+
+func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
+	payload := parseJSONObject(payloadJSON)
+	if len(payload) == 0 {
+		return payloadJSON
+	}
+	if payload["autoDiscovered"] != true {
+		return payloadJSON
+	}
+	delete(payload, "autoDiscovered")
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return payloadJSON
+	}
+	text := string(encoded)
+	return &text
 }
 
 func reusedWorkerResponseFields(loop storage.LoopRecord, fallbackTitle string, fallbackPrompt, fallbackSpecPath, fallbackBaseBranch *string, fallbackIssueNumber *int64) (string, *string, *string, *string, *int64) {
