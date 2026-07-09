@@ -353,6 +353,9 @@ func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, 
 	if run == nil {
 		return false, nil
 	}
+	if run.Status != string(domain.RunStatusRunning) {
+		return false, nil
+	}
 	loop, err := repos.Loops.GetByID(ctx, run.LoopID)
 	if err != nil {
 		return false, fmt.Errorf("validate held manual reviewer loop: %w", err)
@@ -362,6 +365,9 @@ func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, 
 		loopRepo = *loop.Repo
 	}
 	if loop == nil || loop.Type != string(domain.LoopTypeReviewer) || !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
+		return false, nil
+	}
+	if loop.Status != string(domain.LoopStatusRunning) {
 		return false, nil
 	}
 	manualValue, _ := parseReviewSubmitJSONObject(loop.MetadataJSON)["manual"].(bool)

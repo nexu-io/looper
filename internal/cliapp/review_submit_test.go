@@ -75,11 +75,17 @@ func TestTrustedManualReviewerRunRequiresMatchingManualLoop(t *testing.T) {
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_auto", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &autoMetadata, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Loops.Upsert(loop_auto) error = %v", err)
 	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_old_manual", Seq: 3, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &manualMetadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_old_manual) error = %v", err)
+	}
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual", LoopID: "loop_manual", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Runs.Upsert(run_manual) error = %v", err)
 	}
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_auto", LoopID: "loop_auto", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Runs.Upsert(run_auto) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_old_manual", LoopID: "loop_old_manual", Status: "success", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(run_old_manual) error = %v", err)
 	}
 
 	trusted, err := trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "run_manual")
@@ -89,6 +95,10 @@ func TestTrustedManualReviewerRunRequiresMatchingManualLoop(t *testing.T) {
 	trusted, err = trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "run_auto")
 	if err != nil || trusted {
 		t.Fatalf("trustedManualReviewerRun(auto) = %v, %v; want false, nil", trusted, err)
+	}
+	trusted, err = trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "run_old_manual")
+	if err != nil || trusted {
+		t.Fatalf("trustedManualReviewerRun(old manual) = %v, %v; want false, nil", trusted, err)
 	}
 	trusted, err = trustedManualReviewerRun(context.Background(), repos, repo, 99, "run_manual")
 	if err != nil || trusted {
