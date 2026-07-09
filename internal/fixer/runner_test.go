@@ -5800,6 +5800,7 @@ type fakeGitHubGateway struct {
 	compareErr            error
 	nativeComments        []NativeReviewComment
 	nativeCommentBatches  [][]NativeReviewComment
+	listNativeContextErr  error
 	listNativeErr         error
 	resolveNativeCalls    []ResolveNativeReviewCommentInput
 	resolveNativeErr      error
@@ -5922,7 +5923,8 @@ func (f *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddRev
 	return f.replyErr
 }
 
-func (f *fakeGitHubGateway) ListNativeReviewComments(_ context.Context, _ ListNativeReviewCommentsInput) ([]NativeReviewComment, error) {
+func (f *fakeGitHubGateway) ListNativeReviewComments(ctx context.Context, _ ListNativeReviewCommentsInput) ([]NativeReviewComment, error) {
+	f.listNativeContextErr = ctx.Err()
 	if f.listNativeErr != nil {
 		return nil, f.listNativeErr
 	}

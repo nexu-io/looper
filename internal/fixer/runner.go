@@ -2143,7 +2143,7 @@ func (r *Runner) executeStep(ctx context.Context, step FixerStep, input stepInpu
 	case stepClaimPR:
 		return r.runClaimPRStep(ctx, input)
 	case stepCollectFixes:
-		return r.runCollectFixesStep(input)
+		return r.runCollectFixesStep(ctx, input)
 	case stepPrepareWorktree:
 		return r.runPrepareWorktreeStep(ctx, input)
 	case stepRepair:
@@ -2244,7 +2244,7 @@ func (r *Runner) runClaimPRStep(ctx context.Context, input stepInput) (fixerChec
 	return checkpoint, nil
 }
 
-func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
+func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
@@ -2255,7 +2255,7 @@ func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
 		return checkpoint, nil
 	}
 	if isManualFixerLoop(input.Loop) {
-		if err := r.attachManualForgejoNativeComments(context.Background(), input, &checkpoint); err != nil {
+		if err := r.attachManualForgejoNativeComments(ctx, input, &checkpoint); err != nil {
 			return checkpoint, err
 		}
 	}

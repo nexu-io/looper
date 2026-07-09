@@ -1,6 +1,7 @@
 package fixer
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -165,7 +166,7 @@ func TestRunCollectFixesStepIncludesManualForgejoNativeCommentsAndFiltersLooperA
 	t.Parallel()
 	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}, {ProviderCommentID: 102, Body: "my own comment", Author: "looper", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true}}}
 	runner := New(Options{GitHub: github})
-	checkpoint, err := runner.runCollectFixesStep(stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
+	checkpoint, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
 	if err != nil {
 		t.Fatalf("runCollectFixesStep() error = %v", err)
 	}
@@ -178,9 +179,24 @@ func TestRunCollectFixesStepFailsUnsupportedWhenNativeResolverMissing(t *testing
 	t.Parallel()
 	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: false}}}
 	runner := New(Options{GitHub: github})
-	_, err := runner.runCollectFixesStep(stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
+	_, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
 	if err == nil || !strings.Contains(err.Error(), "unsupported") {
 		t.Fatalf("runCollectFixesStep() error = %v, want unsupported manual intervention", err)
+	}
+}
+
+func TestRunCollectFixesStepUsesStepContextForManualForgejoNativeComments(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	github := &fakeGitHubGateway{currentUser: "looper"}
+	runner := New(Options{GitHub: github})
+	_, err := runner.runCollectFixesStep(ctx, stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
+	if err != nil {
+		t.Fatalf("runCollectFixesStep() error = %v", err)
+	}
+	if !errors.Is(github.listNativeContextErr, context.Canceled) {
+		t.Fatalf("ListNativeReviewComments context error = %v, want context.Canceled", github.listNativeContextErr)
 	}
 }
 
@@ -192,7 +208,7 @@ func TestRunCollectFixesStepClassifiesUnsupportedNativeDiscovery(t *testing.T) {
 			listNativeErr: &forge.ForgejoHTTPError{StatusCode: status, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
 		}
 		runner := New(Options{GitHub: github})
-		_, err := runner.runCollectFixesStep(stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
+		_, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
 		var loopErr *loopError
 		if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention || !strings.Contains(loopErr.Error(), "discovery is unsupported") {
 			t.Fatalf("runCollectFixesStep() error = %#v, want unsupported discovery manual intervention for status %d", err, status)
