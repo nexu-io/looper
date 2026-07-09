@@ -909,6 +909,10 @@ type holdSkipError struct{ summary string }
 
 func (e *holdSkipError) Error() string { return e.summary }
 
+type labelMismatchSkipError struct{ summary string }
+
+func (e *labelMismatchSkipError) Error() string { return e.summary }
+
 type runtimeSkipKind string
 
 const (
@@ -1967,6 +1971,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if errors.As(err, &holdErr) {
 				return r.finishHeldFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
 			}
+			var labelMismatchErr *labelMismatchSkipError
+			if errors.As(err, &labelMismatchErr) {
+				return r.finishLabelMismatchFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, labelMismatchErr.summary)
+			}
 			failure := r.classifyFailureWithBoundary(err, fixerFailureBoundaryForStep(step))
 			latest := checkpoint
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
@@ -2214,8 +2222,7 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if !isManualFixerLoop(input.Loop) && len(prQueryLabels(policy.Labels)) > 0 && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
-		checkpoint.SkipReason = fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", input.Repo, input.PRNumber)
-		return checkpoint, nil
+		return checkpoint, &labelMismatchSkipError{summary: fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", input.Repo, input.PRNumber)}
 	}
 	checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
 	checkpoint.ResumePolicy = "replay_step"
@@ -2300,6 +2307,34 @@ func (r *Runner) finishHeldFixerQueueItem(ctx context.Context, loop storage.Loop
 	}
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
+}
+
+func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+		return ProcessResult{}, err
+	}
+	pausedLoop, err := r.markLoopPausedForLabelMismatch(ctx, loop)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, pausedLoop, func(updated *storage.LoopRecord) {
+		updated.Status = "paused"
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	}); err != nil {

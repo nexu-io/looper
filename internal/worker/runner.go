@@ -2164,10 +2164,14 @@ func (r *Runner) workerHoldSummary(ctx context.Context, project storage.ProjectR
 	if err != nil {
 		return false, "", err
 	}
-	return r.workerHoldSummaryForWork(ctx, project, work)
+	return r.workerHoldSummaryForWork(ctx, project, work, workerTargetIsPullRequest(loop, queueItem))
 }
 
-func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.ProjectRecord, work workerInput) (bool, string, error) {
+func workerTargetIsPullRequest(loop storage.LoopRecord, queueItem storage.QueueItemRecord) bool {
+	return loop.TargetType == "pull_request" || queueItem.TargetType == "pull_request"
+}
+
+func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.ProjectRecord, work workerInput, retargetedToPullRequest ...bool) (bool, string, error) {
 	if r.github == nil {
 		return false, "", nil
 	}
@@ -2181,6 +2185,9 @@ func (r *Runner) workerHoldSummaryForWork(ctx context.Context, project storage.P
 		}
 		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, detail.Labels) {
 			return true, fmt.Sprintf("Worker stopped because %s#%d is currently held", work.Repo, work.PRNumber), nil
+		}
+		if len(retargetedToPullRequest) > 0 && retargetedToPullRequest[0] {
+			return false, "", nil
 		}
 	}
 	if work.IssueNumber > 0 {

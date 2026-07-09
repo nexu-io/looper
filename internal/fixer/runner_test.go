@@ -4306,6 +4306,52 @@ func TestProcessClaimedItemPausesWhenLabelsNoLongerMatchAtRuntime(t *testing.T) 
 	}
 }
 
+func TestRunDiscoverPRStepLabelMismatchFinalizerPausesLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{"needs-review"}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, AuthorFilter: config.FixerAuthorFilterCurrentUser, Labels: []string{"bug"}, LabelMode: config.LabelModeAll}})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_discover_step_label_mismatch", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_discover_step_label_mismatch", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_discover_step_label_mismatch", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:discover-step-label-mismatch", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runDiscoverPRStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: loop, Run: run, QueueItem: queue, Repo: repo, PRNumber: prNumber, Checkpoint: fixerCheckpoint{}})
+	var mismatchErr *labelMismatchSkipError
+	if !errors.As(err, &mismatchErr) {
+		t.Fatalf("runDiscoverPRStep() error = %v, want labelMismatchSkipError", err)
+	}
+	result, err := runner.finishLabelMismatchFixerQueueItem(context.Background(), loop, &run, queue, checkpoint, mismatchErr.summary)
+	if err != nil {
+		t.Fatalf("finishLabelMismatchFixerQueueItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "labels no longer match") {
+		t.Fatalf("result = %#v, want skipped label mismatch", result)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persistedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persistedLoop, err)
+	}
+	if persistedLoop.Status != "paused" || persistedLoop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop after discover-step label mismatch", persistedLoop)
+	}
+	metadata := parseJSONObject(persistedLoop.MetadataJSON)
+	if metadata["pauseReason"] != labelMismatchPauseReason {
+		t.Fatalf("metadata = %#v, want label mismatch pause reason", metadata)
+	}
+}
+
 func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

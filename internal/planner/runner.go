@@ -131,6 +131,7 @@ type PullRequestDetail struct {
 	Body        string
 	URL         string
 	State       string
+	Labels      []string
 	HeadRefName string
 	BaseRefName string
 }
@@ -1249,10 +1250,20 @@ func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project st
 	if err != nil {
 		return false, "", err
 	}
-	if !domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber), nil
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number == 0 {
 		return false, "", nil
 	}
-	return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber), nil
+	prDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, prDetail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Publish.PullRequest.Number), nil
+	}
+	return false, "", nil
 }
 
 func (r *Runner) finishHeldPlannerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint plannerCheckpoint, summary string) (ProcessResult, error) {

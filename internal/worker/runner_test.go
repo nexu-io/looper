@@ -193,6 +193,27 @@ func TestWorkerHoldSummaryChecksRetargetedPullRequestLabels(t *testing.T) {
 	}
 }
 
+func TestWorkerHoldSummaryDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		issueDetail: IssueDetail{Number: 46, Labels: []string{domain.HoldLabelWorker}},
+		prDetail:    PullRequestDetail{Number: 101, Labels: []string{}},
+	}
+	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	held, summary, err := runner.workerHoldSummaryForWork(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, workerInput{Repo: "acme/looper", IssueNumber: 46, PRNumber: 101, AutoDiscovered: true}, true)
+	if err != nil {
+		t.Fatalf("workerHoldSummaryForWork() error = %v", err)
+	}
+	if held || summary != "" {
+		t.Fatalf("held, summary = %v, %q, want unheld PR to ignore stale issue hold", held, summary)
+	}
+	if len(github.viewIssueCalls) != 0 {
+		t.Fatalf("viewIssueCalls = %#v, want no issue lookup after PR retarget", github.viewIssueCalls)
+	}
+}
+
 func TestRunOpenPRStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
