@@ -4357,6 +4357,7 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	targetID := "issue:acme/looper:77"
 	metadataJSON := `{"worker":{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}}`
 	payloadJSON := `{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}`
+	checkpointJSON := `{"work":{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true},"skipReason":"held"}`
 	projectID := "project_1"
 	loopID := "loop_existing_held_issue_worker"
 
@@ -4397,6 +4398,18 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	}); err != nil {
 		t.Fatalf("Queue.Upsert(queue_existing_held_issue_worker) error = %v", err)
 	}
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_existing_held_issue_worker",
+		LoopID:         loopID,
+		Status:         "success",
+		CheckpointJSON: &checkpointJSON,
+		StartedAt:      completedAt,
+		EndedAt:        &completedAt,
+		CreatedAt:      completedAt,
+		UpdatedAt:      completedAt,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_existing_held_issue_worker) error = %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main","force":true}`)))
 	req.Header.Set("x-request-id", "fixture-request-id")
@@ -4423,6 +4436,24 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	payload := parseJSONObject(queueItem.PayloadJSON)
 	if payload["autoDiscovered"] == true {
 		t.Fatalf("payload = %#v, want forced reused worker to bypass auto-discovered hold checks", payload)
+	}
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	workerMeta, _ := metadata["worker"].(map[string]any)
+	if workerMeta["autoDiscovered"] == true {
+		t.Fatalf("metadata = %#v, want forced reused worker metadata to bypass auto-discovered hold checks", metadata)
+	}
+	run, err := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_existing_held_issue_worker")
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	checkpoint := parseJSONObject(run.CheckpointJSON)
+	work, _ := checkpoint["work"].(map[string]any)
+	if work["autoDiscovered"] == true {
+		t.Fatalf("checkpoint = %#v, want forced reused worker checkpoint to bypass auto-discovered hold checks", checkpoint)
 	}
 }
 

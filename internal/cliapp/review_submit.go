@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -99,7 +101,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	if err := validateReviewerReviewSubmitHold(repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), detail.Labels); err != nil {
+	if err := r.validateReviewerReviewSubmitHold(cmd, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), detail.Labels); err != nil {
 		return err
 	}
 	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
@@ -315,11 +317,66 @@ func validateExpectedHeadCommit(expected string, actual string) error {
 	return nil
 }
 
-func validateReviewerReviewSubmitHold(repo string, prNumber int64, manual bool, labels []string) error {
-	if !domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, manual, labels) {
+func (r *commandRuntime) validateReviewerReviewSubmitHold(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, manual bool, runID string, labels []string) error {
+	if !domain.IsAutoLaneHeld(domain.LoopTypeReviewer, labels) {
 		return nil
 	}
+	if manual {
+		db, err := storage.OpenSQLiteDB(cmd.Context(), cfg.Storage.DBPath)
+		if err != nil {
+			return fmt.Errorf("validate held manual reviewer run: %w", err)
+		}
+		defer func() { _ = db.Close() }()
+		trusted, err := trustedManualReviewerRun(cmd.Context(), storage.NewRepositories(db), repo, prNumber, runID)
+		if err != nil {
+			return err
+		}
+		if trusted {
+			return nil
+		}
+	}
 	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
+}
+
+func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (bool, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return false, nil
+	}
+	if repos == nil || repos.Runs == nil || repos.Loops == nil {
+		return false, fmt.Errorf("validate held manual reviewer run: storage is not configured")
+	}
+	run, err := repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("validate held manual reviewer run: %w", err)
+	}
+	if run == nil {
+		return false, nil
+	}
+	loop, err := repos.Loops.GetByID(ctx, run.LoopID)
+	if err != nil {
+		return false, fmt.Errorf("validate held manual reviewer loop: %w", err)
+	}
+	loopRepo := ""
+	if loop != nil && loop.Repo != nil {
+		loopRepo = *loop.Repo
+	}
+	if loop == nil || loop.Type != string(domain.LoopTypeReviewer) || !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
+		return false, nil
+	}
+	manualValue, _ := parseReviewSubmitJSONObject(loop.MetadataJSON)["manual"].(bool)
+	return manualValue, nil
+}
+
+func parseReviewSubmitJSONObject(value *string) map[string]any {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return map[string]any{}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(*value), &parsed); err != nil || parsed == nil {
+		return map[string]any{}
+	}
+	return parsed
 }
 
 func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {

@@ -6305,7 +6305,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
 	reviewerModeFlag := ""
 	if manual {
-		reviewerModeFlag = " --reviewer-manual"
+		reviewerModeFlag = fmt.Sprintf(" --reviewer-manual --reviewer-run-id %s", runID)
 	}
 	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" && !(autoMergeEnabled && phase != "spec") {

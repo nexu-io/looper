@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -43,6 +45,54 @@ func TestValidateExpectedHeadCommit(t *testing.T) {
 	}
 	if err := validateExpectedHeadCommit("abc123", "def456"); err == nil || !strings.Contains(err.Error(), "expected head commit abc123 but PR head is def456") {
 		t.Fatalf("validateExpectedHeadCommit(stale) error = %v, want stale head failure", err)
+	}
+}
+
+func TestTrustedManualReviewerRunRequiresMatchingManualLoop(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+	manualMetadata := `{"manual":true}`
+	autoMetadata := `{"manual":false}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_manual", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &manualMetadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_manual) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_auto", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &autoMetadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_auto) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual", LoopID: "loop_manual", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(run_manual) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_auto", LoopID: "loop_auto", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(run_auto) error = %v", err)
+	}
+
+	trusted, err := trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "run_manual")
+	if err != nil || !trusted {
+		t.Fatalf("trustedManualReviewerRun(manual) = %v, %v; want true, nil", trusted, err)
+	}
+	trusted, err = trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "run_auto")
+	if err != nil || trusted {
+		t.Fatalf("trustedManualReviewerRun(auto) = %v, %v; want false, nil", trusted, err)
+	}
+	trusted, err = trustedManualReviewerRun(context.Background(), repos, repo, 99, "run_manual")
+	if err != nil || trusted {
+		t.Fatalf("trustedManualReviewerRun(wrong PR) = %v, %v; want false, nil", trusted, err)
 	}
 }
 
@@ -336,12 +386,14 @@ func TestWriteReviewSubmitDiagnosticWritesStructuredJSON(t *testing.T) {
 
 func TestValidateReviewerReviewSubmitHoldRejectsHeldAutomaticReviewerFlow(t *testing.T) {
 	t.Parallel()
-	err := validateReviewerReviewSubmitHold("acme/looper", 42, false, []string{domain.HoldLabelReviewer})
+	runtime := &commandRuntime{}
+	cmd := &cobra.Command{}
+	err := runtime.validateReviewerReviewSubmitHold(cmd, config.Config{}, "acme/looper", 42, false, "", []string{domain.HoldLabelReviewer})
 	if err == nil || !strings.Contains(err.Error(), "currently held") {
 		t.Fatalf("validateReviewerReviewSubmitHold() error = %v, want held automatic reviewer rejection", err)
 	}
-	if err := validateReviewerReviewSubmitHold("acme/looper", 42, true, []string{domain.HoldLabelReviewer}); err != nil {
-		t.Fatalf("validateReviewerReviewSubmitHold(manual) error = %v, want manual reviewer allowed", err)
+	if err := runtime.validateReviewerReviewSubmitHold(cmd, config.Config{}, "acme/looper", 42, false, "", nil); err != nil {
+		t.Fatalf("validateReviewerReviewSubmitHold(unheld) error = %v", err)
 	}
 }
 

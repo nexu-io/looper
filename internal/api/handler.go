@@ -3859,6 +3859,13 @@ func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, proj
 }
 
 func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string, force bool) (storage.LoopRecord, error) {
+	if force {
+		normalized, err := forceManualWorkerLoopStateCompat(ctx, repos, loop, nowISO)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		loop = normalized
+	}
 	status := domain.LoopStatus(loop.Status)
 	shouldQueue := status == domain.LoopStatusIdle || status == domain.LoopStatusPaused || status == domain.LoopStatusQueued
 	if status == domain.LoopStatusIdle || status == domain.LoopStatusPaused {
@@ -3971,6 +3978,79 @@ func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
 	}
 	text := string(encoded)
 	return &text
+}
+
+func forceManualWorkerLoopStateCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
+	metadataJSON := forcedManualWorkerMetadataJSONCompat(loop.MetadataJSON)
+	if !stringPtrEqual(metadataJSON, loop.MetadataJSON) {
+		loop.MetadataJSON = metadataJSON
+		loop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
+	if repos.Runs != nil {
+		latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if latestRun != nil {
+			checkpointJSON := forcedManualWorkerCheckpointJSONCompat(latestRun.CheckpointJSON)
+			if !stringPtrEqual(checkpointJSON, latestRun.CheckpointJSON) {
+				latestRun.CheckpointJSON = checkpointJSON
+				latestRun.UpdatedAt = nowISO
+				if err := repos.Runs.Upsert(ctx, *latestRun); err != nil {
+					return storage.LoopRecord{}, err
+				}
+			}
+		}
+	}
+	return loop, nil
+}
+
+func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
+	metadata := parseJSONObject(metadataJSON)
+	if len(metadata) == 0 {
+		return metadataJSON
+	}
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker["autoDiscovered"] != true {
+		return metadataJSON
+	}
+	delete(worker, "autoDiscovered")
+	metadata["worker"] = worker
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return metadataJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {
+	checkpoint := parseJSONObject(checkpointJSON)
+	if len(checkpoint) == 0 {
+		return checkpointJSON
+	}
+	work, _ := checkpoint["work"].(map[string]any)
+	if work["autoDiscovered"] != true {
+		return checkpointJSON
+	}
+	delete(work, "autoDiscovered")
+	checkpoint["work"] = work
+	encoded, err := json.Marshal(checkpoint)
+	if err != nil {
+		return checkpointJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func stringPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func reusedWorkerResponseFields(loop storage.LoopRecord, fallbackTitle string, fallbackPrompt, fallbackSpecPath, fallbackBaseBranch *string, fallbackIssueNumber *int64) (string, *string, *string, *string, *int64) {
