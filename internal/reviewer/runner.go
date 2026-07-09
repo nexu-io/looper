@@ -1259,6 +1259,10 @@ func (r *Runner) commentOnlyPublishForProject(projectID string) bool {
 	return r.forgejoCommentOnlyPublishForProject(projectID)
 }
 
+func (r *Runner) commentOnlyCompletionForProject(projectID string, reviewEvents config.ReviewerReviewEventsConfig) bool {
+	return r.forgejoCommentOnlyPublishForProject(projectID) || (r.commentOnlyPublishForProject(projectID) && reviewEvents.Clean != config.ReviewerReviewEventApprove)
+}
+
 func (r *Runner) forgejoCommentOnlyPublishForProject(projectID string) bool {
 	if r.projectRoleConfig == nil {
 		return false
@@ -2649,7 +2653,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		reviewRequestBypassReason = "follow_up_new_head"
 	}
 	reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
-	commentOnlyCompletion := r.forgejoCommentOnlyPublishForProject(input.Project.ID) || (r.commentOnlyPublishForProject(input.Project.ID) && reviewEvents.Clean != config.ReviewerReviewEventApprove)
+	commentOnlyCompletion := r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
@@ -2840,7 +2844,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, nil
 		}
 		reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
-		if r.forgejoCommentOnlyPublishForProject(input.Project.ID) || (r.commentOnlyPublishForProject(input.Project.ID) && reviewEvents.Clean != config.ReviewerReviewEventApprove) {
+		if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
 			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 				return checkpoint, err
 			}
@@ -2901,7 +2905,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
 		return next, err
 	}
-	if r.commentOnlyPublishForProject(input.Project.ID) {
+	reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
 		if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 			return checkpoint, err
 		}

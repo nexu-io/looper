@@ -8500,6 +8500,41 @@ func TestProcessClaimedItemGlobalCommentOnlyApprovePolicyRequiresCleanMarker(t *
 	}
 }
 
+func TestProcessClaimedItemGlobalCommentOnlyApprovePolicyVerifiesActionableNativeMarker(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", reviewMarkerOutcome: "blocking", reviewMarkerEvent: ReviewEventRequestChanges}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: publish predicate must match review completion mode", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: publish predicate must match review completion mode","outcome":"blocking"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LooperCLIPath: "/opt/looper/bin/looper", CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success from verified native marker", result)
+	}
+	if github.reviewMarkerCalls == 0 {
+		t.Fatalf("reviewMarkerCalls = %d, want native marker verification", github.reviewMarkerCalls)
+	}
+	if len(github.issueCommentCalls) != 0 || len(github.updateIssueCommentCalls) != 0 {
+		t.Fatalf("issue comment mutations = (%#v, %#v), want no comment-only publish", github.issueCommentCalls, github.updateIssueCommentCalls)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts = %d, want one review prompt", len(agent.starts))
+	}
+	if strings.Contains(agent.starts[0].Prompt, "Comment-only publish contract") {
+		t.Fatalf("prompt = %q, want native review instructions", agent.starts[0].Prompt)
+	}
+}
+
 func TestProcessClaimedItemCommentOnlyPublishesBlockingOutcome(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
