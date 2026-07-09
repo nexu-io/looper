@@ -271,6 +271,10 @@ func NativeReviewCommentFixItemID(commentID int64) string {
 	return fmt.Sprintf("%s:%d", NativeReviewCommentSource, commentID)
 }
 
+func NativeReviewCommentThreadID(commentID int64) string {
+	return NativeReviewCommentFixItemID(commentID)
+}
+
 type ResolveNativeReviewCommentInput struct {
 	Repo              string
 	PRNumber          int64
@@ -5915,7 +5919,7 @@ func nativeReviewCommentsToMaps(comments []NativeReviewComment) []map[string]any
 		out = append(out, map[string]any{
 			"id":                  NativeReviewCommentFixItemID(comment.ProviderCommentID),
 			"databaseId":          comment.ProviderCommentID,
-			"threadId":            strconv.FormatInt(comment.ProviderCommentID, 10),
+			"threadId":            NativeReviewCommentThreadID(comment.ProviderCommentID),
 			"threadFingerprint":   comment.ObservedFingerprint,
 			"observedFingerprint": comment.ObservedFingerprint,
 			"source":              NativeReviewCommentSource,

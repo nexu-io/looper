@@ -131,9 +131,9 @@ func TestCollectFixItemsAllowsForgejoNativeAndSummaryItemsToCoexist(t *testing.T
 
 	items, err := collectFixItemsFromCheckpointForStep(fixerCheckpoint{Detail: &checkpointDetail{
 		Comments: []map[string]any{{
-			"id":                  "101",
+			"id":                  NativeReviewCommentFixItemID(101),
 			"databaseId":          int64(101),
-			"threadId":            "101",
+			"threadId":            NativeReviewCommentThreadID(101),
 			"threadFingerprint":   NativeReviewCommentFingerprint(101, "updated-1"),
 			"observedFingerprint": NativeReviewCommentFingerprint(101, "updated-1"),
 			"source":              NativeReviewCommentSource,
@@ -155,6 +155,9 @@ func TestCollectFixItemsAllowsForgejoNativeAndSummaryItemsToCoexist(t *testing.T
 	}
 	if items[0].ID != NativeReviewCommentFixItemID(101) || items[1].ID != "101" {
 		t.Fatalf("items = %#v, want source-scoped native ID and unchanged summary ID", items)
+	}
+	if items[0].ThreadID != NativeReviewCommentThreadID(101) || items[1].ThreadID != "101" {
+		t.Fatalf("items = %#v, want source-scoped native thread ID and unchanged summary thread ID", items)
 	}
 }
 
