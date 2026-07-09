@@ -3399,7 +3399,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		}
 	}
 	if domain.LoopType(loopType) == domain.LoopTypeReviewer {
-		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Roles.Reviewer.Behavior, target, nowISO)
+		metadataJSON, err = reviewerLoopMetadataJSON(metadataJSON, h.context.Config.Roles.Reviewer.Behavior, target, nowISO, derefBool(body.Force))
 		if err != nil {
 			return loopResponse{}, err
 		}
@@ -5185,8 +5185,11 @@ func manualFixerMetadataJSON(existing *string, nowISO string) (*string, error) {
 	return &text, nil
 }
 
-func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerConfig, target domain.LoopTarget, nowISO string) (*string, error) {
+func reviewerLoopMetadataJSON(existing *string, reviewerConfig config.ReviewerConfig, target domain.LoopTarget, nowISO string, force bool) (*string, error) {
 	metadata := parseJSONObject(existing)
+	if force {
+		metadata["manual"] = true
+	}
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	if loopMeta == nil {
 		loopMeta = map[string]any{}

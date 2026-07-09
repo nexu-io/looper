@@ -764,7 +764,7 @@ func TestReviewerLoopMetadataJSONRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	existing := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_iterations_per_pr","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
 	target := domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}
 
-	metadataJSON, err := reviewerLoopMetadataJSON(&existing, cfg.Roles.Reviewer.Behavior, target, "2026-04-11T12:00:00.000Z")
+	metadataJSON, err := reviewerLoopMetadataJSON(&existing, cfg.Roles.Reviewer.Behavior, target, "2026-04-11T12:00:00.000Z", false)
 	if err != nil {
 		t.Fatalf("reviewerLoopMetadataJSON() error = %v", err)
 	}
@@ -3037,6 +3037,41 @@ func TestHandlerCreateManualLoopForceBypassesHoldButStillConflicts(t *testing.T)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestHandlerCreateReviewerLoopForcePersistsManualMetadata(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	repoPath := filepath.Join(fixture.rootDir, "repo-force-reviewer")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	metadata := `{"repo":"acme/looper"}`
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	data := parseJSONMap(t, rec.Body.Bytes())["data"].(map[string]any)
+	loopID := data["id"].(string)
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil {
+		t.Fatalf("loop = %#v, want stored metadata", loop)
+	}
+	loopMetadata := parseJSONObject(loop.MetadataJSON)
+	assertEqual(t, loopMetadata["manual"], true)
 }
 
 func TestHandlerCreateManualHoldValidationSkipsWhenRepoPathOrGHPathMissing(t *testing.T) {
