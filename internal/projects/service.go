@@ -34,8 +34,8 @@ type DetectedRepo struct {
 
 type DetectRepoFunc func(context.Context, string) (DetectedRepo, error)
 
-// RegisterBindingFunc is invoked after an API project is added/updated with a
-// non-empty provider binding so the runtime can mirror it into live config.
+// RegisterBindingFunc is invoked after an API project is added or updated so
+// the runtime can mirror or clear its provider binding in live config.
 type RegisterBindingFunc func(binding ProjectBinding)
 
 // ProjectBinding is the provider/repo association discovered for an API project.
@@ -277,11 +277,11 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return AddResult{}, err
 	}
 
-	if provider != nil && s.RegisterBinding != nil {
+	if s.RegisterBinding != nil {
 		s.RegisterBinding(ProjectBinding{
 			ProjectID: projectID,
 			Name:      input.Name,
-			Provider:  *provider,
+			Provider:  stringValue(provider),
 			Repo:      stringValue(repo),
 			RepoPath:  input.RepoPath,
 		})

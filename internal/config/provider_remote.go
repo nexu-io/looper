@@ -20,7 +20,7 @@ func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo,
 	providerID = strings.TrimSpace(providerID)
 	repo = strings.TrimSpace(repo)
 	repoPath = strings.TrimSpace(repoPath)
-	if projectID == "" || providerID == "" || repo == "" || repoPath == "" {
+	if projectID == "" {
 		return
 	}
 	existingIndex := -1
@@ -29,6 +29,13 @@ func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo,
 			existingIndex = index
 			break
 		}
+	}
+	if providerID == "" || repo == "" || repoPath == "" {
+		if existingIndex >= 0 && cfg.hasRuntimeProjectBinding(projectID) {
+			cfg.Projects = append(cfg.Projects[:existingIndex], cfg.Projects[existingIndex+1:]...)
+			delete(cfg.runtimeProjectBindingIDs, projectID)
+		}
+		return
 	}
 	if existingIndex >= 0 && !cfg.hasRuntimeProjectBinding(projectID) {
 		return

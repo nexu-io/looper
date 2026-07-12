@@ -90,3 +90,27 @@ func TestUpsertRuntimeProjectBindingKeepsConfigFileProjectAuthority(t *testing.T
 		t.Fatalf("config project was overwritten: %#v", cfg.Projects[0])
 	}
 }
+
+func TestUpsertRuntimeProjectBindingRemovesRuntimeBindingWhenProviderIsCleared(t *testing.T) {
+	cfg := Config{}
+	UpsertRuntimeProjectBinding(&cfg, "odcrew", "odcrew", "forgejo-main", "core/odcrew", "/tmp/odcrew")
+
+	UpsertRuntimeProjectBinding(&cfg, "odcrew", "odcrew", "", "core/odcrew", "/tmp/odcrew")
+
+	if len(cfg.Projects) != 0 {
+		t.Fatalf("Projects = %#v, want runtime binding removed", cfg.Projects)
+	}
+	if cfg.hasRuntimeProjectBinding("odcrew") {
+		t.Fatal("runtime binding marker remains after provider was cleared")
+	}
+}
+
+func TestUpsertRuntimeProjectBindingDoesNotRemoveConfigFileProject(t *testing.T) {
+	cfg := Config{Projects: []ProjectRefConfig{{ID: "odcrew", Provider: "forgejo-main"}}}
+
+	UpsertRuntimeProjectBinding(&cfg, "odcrew", "odcrew", "", "core/odcrew", "/tmp/odcrew")
+
+	if len(cfg.Projects) != 1 || cfg.Projects[0].Provider != "forgejo-main" {
+		t.Fatalf("Projects = %#v, want config-file project preserved", cfg.Projects)
+	}
+}

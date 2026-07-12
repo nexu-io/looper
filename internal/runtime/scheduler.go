@@ -98,7 +98,6 @@ type defaultSchedulerTickInput struct {
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
-	ConfigReadLock           func() func()
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
@@ -2448,7 +2447,6 @@ func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() fun
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "worker")),
-			ConfigReadLock:           configReadLock,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
 	}
@@ -2954,18 +2952,14 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 
 		if input.AsyncRunner != nil {
 			input.AsyncRunner.Go(func() {
-				if err := runWithConfigReadLock(input.ConfigReadLock, func() error {
-					return processFn(ctx)
-				}); err != nil && input.Logger != nil {
+				if err := processFn(ctx); err != nil && input.Logger != nil {
 					input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
 				}
 			})
 			continue
 		}
 		go func() {
-			if err := runWithConfigReadLock(input.ConfigReadLock, func() error {
-				return processFn(ctx)
-			}); err != nil && input.Logger != nil {
+			if err := processFn(ctx); err != nil && input.Logger != nil {
 				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
 			}
 		}()
@@ -2974,15 +2968,6 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 	return errors.Join(errList...)
-}
-
-func runWithConfigReadLock(lock func() func(), fn func() error) error {
-	if lock == nil {
-		return fn()
-	}
-	unlock := lock()
-	defer unlock()
-	return fn()
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {
