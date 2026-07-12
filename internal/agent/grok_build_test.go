@@ -23,7 +23,7 @@ func TestResolveGrokArgs(t *testing.T) {
 		args []string
 		want []string
 	}{
-		{"default", nil, []string{"--model", model, "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace"}},
+		{"default", nil, []string{"--model", model, "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace", "--no-auto-update"}},
 		{"configured model", []string{"-m", "custom"}, []string{"-m", "custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace"}},
 		{"long model", []string{"--model", "custom"}, []string{"--model", "custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace"}},
 		{"equals model", []string{"--model=custom"}, []string{"--model=custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace"}},
@@ -38,15 +38,20 @@ func TestResolveGrokArgs(t *testing.T) {
 		{"approval aliases", []string{"--yolo"}, []string{"--model", model, "--yolo", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "workspace"}},
 		{"dangerous approval alias", []string{"--dangerously-skip-permissions"}, []string{"--model", model, "--dangerously-skip-permissions", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "workspace"}},
 		{"prompt sources retain generated prompt", []string{"--prompt-file", "task.txt", "--prompt-json"}, []string{"--model", model, "--prompt-file", "task.txt", "--prompt-json", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace"}},
+		{"configured no auto update", []string{"--no-auto-update"}, []string{"--model", model, "--no-auto-update", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			original := append([]string(nil), tt.args...)
+			want := append([]string(nil), tt.want...)
+			if !hasAnyFlag(want, []string{"--no-auto-update"}) {
+				want = append(want, "--no-auto-update")
+			}
 			cfg := base
 			cfg.Params = map[string]any{"args": tt.args}
 			command, got := ResolveSpawn(cfg, workdir, prompt)
-			if command != "grok" || !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("ResolveSpawn() = (%q, %#v), want (grok, %#v)", command, got, tt.want)
+			if command != "grok" || !reflect.DeepEqual(got, want) {
+				t.Fatalf("ResolveSpawn() = (%q, %#v), want (grok, %#v)", command, got, want)
 			}
 			if !reflect.DeepEqual(tt.args, original) {
 				t.Fatalf("configured args mutated: got %#v, want %#v", tt.args, original)
@@ -81,7 +86,7 @@ func TestGrokBuildExecutionContractAndUnsupportedResume(t *testing.T) {
 		t.Fatalf("read observed args: %v", err)
 	}
 	got := strings.Split(strings.TrimSpace(string(observed)), "\n")
-	want := []string{"-p", "fresh prompt", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace", "env:" + workdir, "dir:" + workdir}
+	want := []string{"-p", "fresh prompt", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "workspace", "--no-auto-update", "env:" + workdir, "dir:" + workdir}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("observed = %#v, want %#v", got, want)
 	}

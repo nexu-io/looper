@@ -1388,6 +1388,9 @@ func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string,
 	if !hasAnyFlag(resolved, []string{"--sandbox"}) {
 		resolved = append(resolved, "--sandbox", "workspace")
 	}
+	if !hasAnyFlag(resolved, []string{"--no-auto-update"}) {
+		resolved = append(resolved, "--no-auto-update")
+	}
 	return resolved
 }
 
