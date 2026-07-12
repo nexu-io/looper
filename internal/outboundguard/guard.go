@@ -35,14 +35,14 @@ var (
 
 // sensitiveEnvNameKeywords are matched only as whole underscore/hyphen-delimited
 // segments so compound words like TOKENIZATION or PASSWORDLESS are not rejected.
-// "token" is handled separately: only as the full name or a leading/trailing
-// segment (TOKEN, *_TOKEN, TOKEN_*), so names like refresh_token_ttl stay safe.
-// "pass" covers DB_PASS / REDIS_PASS; "pgpassword" is the Postgres libpq name
-// (single segment, so "password" alone does not match inside it).
+// "token" and "pass" are handled separately (see isSensitiveEnvName): short words
+// that appear in many non-secret config names (PASS_RATE, TOKENIZATION) must not
+// match as middle/leading segments.
+// "pgpassword" is the Postgres libpq name (single segment, so "password" alone
+// does not match inside it).
 var sensitiveEnvNameKeywords = []string{
 	"secret",
 	"password",
-	"pass",
 	"pgpassword",
 	"credential",
 	"credentials",
@@ -236,8 +236,15 @@ func isSensitiveEnvName(name string) bool {
 			return true
 		}
 	}
-	// "token" only as full name or leading/trailing segment.
+	// "token": full name or leading/trailing segment (TOKEN, TOKEN_*, *_TOKEN).
+	// Middle segments like refresh_token_ttl stay safe.
 	if normalized == "token" || strings.HasPrefix(normalized, "token_") || strings.HasSuffix(normalized, "_token") {
+		return true
+	}
+	// "pass": full name or trailing segment only (PASS, DB_PASS, REDIS_PASS).
+	// Leading PASS_* is excluded: PASS_RATE / PASS_COUNT / PASS_THROUGH are
+	// common non-secret config names.
+	if normalized == "pass" || strings.HasSuffix(normalized, "_pass") {
 		return true
 	}
 	return false
