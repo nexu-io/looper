@@ -38,6 +38,31 @@ func TestFakeAgentWritesEvidenceAndCompletion(t *testing.T) {
 	}
 }
 
+func TestFakeAgentConfigMergesExtraEnv(t *testing.T) {
+	bins := MustBinaries(t)
+	agent := NewFakeAgent(t, bins)
+	_, command, env := agent.AgentConfig("commit", "git", "gh", map[string]string{
+		"GH_TOKEN":           "sandbox-token",
+		"GITHUB_TOKEN":       "sandbox-token",
+		"GH_PROMPT_DISABLED": "1",
+	})
+	if command != agent.Path {
+		t.Fatalf("command = %q, want fake-agent path", command)
+	}
+	if env[envFakeAgentMode] != "commit" {
+		t.Fatalf("mode = %q, want commit", env[envFakeAgentMode])
+	}
+	if env[envFakeAgentGHPath] != "gh" {
+		t.Fatalf("gh path = %q, want gh", env[envFakeAgentGHPath])
+	}
+	if env["GH_TOKEN"] != "sandbox-token" || env["GITHUB_TOKEN"] != "sandbox-token" {
+		t.Fatalf("agent env missing sandbox GitHub credentials: %#v", env)
+	}
+	if env["GH_PROMPT_DISABLED"] != "1" {
+		t.Fatalf("GH_PROMPT_DISABLED = %q, want 1", env["GH_PROMPT_DISABLED"])
+	}
+}
+
 func TestFakeAgentTransientFailure(t *testing.T) {
 	bins := MustBinaries(t)
 	agent := NewFakeAgent(t, bins)
