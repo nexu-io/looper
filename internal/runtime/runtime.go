@@ -108,6 +108,7 @@ type WebhookForwarder interface {
 	Stats() webhookforward.Stats
 	Close()
 	CloseAndWait()
+	CancelAndWait()
 }
 
 type Runtime struct {
@@ -154,6 +155,7 @@ type Runtime struct {
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
 	webhookForwarder            WebhookForwarder
+	drainingWebhookForwarders   []WebhookForwarder
 	webhookForwarderForConfig   func(config.Config) WebhookForwarder
 	networkManager              *networkclient.Manager
 	schedulerDisabled           bool
@@ -263,6 +265,8 @@ func (r *Runtime) Stop(reason string) {
 		r.stopped = true
 		forwarder := r.webhookForwarder
 		r.webhookForwarder = nil
+		drainingForwarders := r.drainingWebhookForwarders
+		r.drainingWebhookForwarders = nil
 		networkManager := r.networkManager
 		r.networkManager = nil
 		coordinator := r.services.Coordinator
@@ -282,6 +286,11 @@ func (r *Runtime) Stop(reason string) {
 
 		if forwarder != nil {
 			forwarder.CloseAndWait()
+		}
+		for _, drainingForwarder := range drainingForwarders {
+			if drainingForwarder != nil {
+				drainingForwarder.CancelAndWait()
+			}
 		}
 		if networkManager != nil {
 			networkManager.Stop()
@@ -687,6 +696,9 @@ func (r *Runtime) syncRuntimeProjectBinding(binding projects.ProjectBinding) {
 	}
 	previous := r.webhookForwarder
 	r.webhookForwarder = next
+	if previous != nil {
+		r.drainingWebhookForwarders = append(r.drainingWebhookForwarders, previous)
+	}
 	r.mu.Unlock()
 	if previous != nil {
 		previous.Close()

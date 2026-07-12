@@ -6311,6 +6311,8 @@ func (f *fakeWebhookForwarder) Close() {}
 
 func (f *fakeWebhookForwarder) CloseAndWait() {}
 
+func (f *fakeWebhookForwarder) CancelAndWait() {}
+
 func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
 	t.Helper()
 	seedStatusData(t, rt)

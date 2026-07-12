@@ -3030,6 +3030,8 @@ func (stubRuntimeWebhookForwarder) Close() {}
 
 func (stubRuntimeWebhookForwarder) CloseAndWait() {}
 
+func (stubRuntimeWebhookForwarder) CancelAndWait() {}
+
 type trackingRuntimeWebhookForwarder struct{ closed bool }
 
 func (*trackingRuntimeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
@@ -3041,6 +3043,8 @@ func (*trackingRuntimeWebhookForwarder) Stats() webhookforward.Stats { return we
 func (f *trackingRuntimeWebhookForwarder) Close() { f.closed = true }
 
 func (f *trackingRuntimeWebhookForwarder) CloseAndWait() { f.Close() }
+
+func (f *trackingRuntimeWebhookForwarder) CancelAndWait() { f.Close() }
 
 func TestSyncRuntimeProjectBindingRefreshesWebhookForwarder(t *testing.T) {
 	t.Parallel()

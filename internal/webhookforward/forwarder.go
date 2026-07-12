@@ -86,6 +86,7 @@ type Forwarder interface {
 	Stats() Stats
 	Close()
 	CloseAndWait()
+	CancelAndWait()
 }
 
 type TargetedReviewer interface {
@@ -211,6 +212,7 @@ type forwarder struct {
 	mu              sync.Mutex
 	cond            *sync.Cond
 	closed          bool
+	canceled        bool
 	queue           []workKey
 	works           map[string]*workItem
 	deliveries      map[string]deliveryRecord
@@ -355,6 +357,17 @@ func (f *forwarder) CloseAndWait() {
 	f.workerWG.Wait()
 }
 
+func (f *forwarder) CancelAndWait() {
+	f.mu.Lock()
+	f.closed = true
+	f.canceled = true
+	f.queue = nil
+	f.cancelWorkers()
+	f.cond.Broadcast()
+	f.mu.Unlock()
+	f.workerWG.Wait()
+}
+
 func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed routedDelivery, metadata workMetadata) (int, error) {
 	type candidate struct {
 		key   workKey
@@ -482,7 +495,7 @@ func (f *forwarder) finishWork(key workKey, outcome Outcome) {
 		item.running = false
 		if len(item.lanes) == 0 {
 			delete(f.works, itemKey)
-		} else if !item.enqueued {
+		} else if !item.enqueued && !f.canceled {
 			if len(f.queue) < f.queueCapacity {
 				item.enqueued = true
 				f.queue = append(f.queue, key)

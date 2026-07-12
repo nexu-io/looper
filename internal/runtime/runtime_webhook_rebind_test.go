@@ -131,6 +131,49 @@ func TestRuntimeStopKeepsStorageOpenUntilWebhookWorkDrains(t *testing.T) {
 	}
 }
 
+func TestRuntimeStopCancelsReboundWebhookWorkBeforeClosingStorage(t *testing.T) {
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	repositories := storage.NewRepositories(coordinator.DB())
+	metadata := `{"repo":"acme/looper"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: workingDir, MetadataJSON: &metadata, CreatedAt: "2026-07-12T12:00:00.000Z", UpdatedAt: "2026-07-12T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = true
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test"}}
+	runner := &cancelCheckingReviewer{repositories: repositories, started: make(chan struct{}), result: make(chan error, 1)}
+	previous := webhookforward.New(webhookforward.Options{Repos: repositories, Config: cfg, Reviewer: runner, MaxConcurrent: 1, QueueCapacity: 8})
+	rt := New(Options{Config: cfg})
+	rt.services = Services{Coordinator: coordinator, Repositories: repositories}
+	rt.webhookForwarder = previous
+	rt.webhookForwarderForConfig = func(config.Config) WebhookForwarder { return &trackingRuntimeWebhookForwarder{} }
+
+	if _, err := previous.Forward(context.Background(), webhookforward.DeliveryRequest{DeliveryID: "running-github", EventType: "pull_request", Payload: []byte(`{"action":"review_requested","repository":{"full_name":"acme/looper"},"pull_request":{"number":1}}`)}); err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("webhook delivery did not start")
+	}
+	rt.syncRuntimeProjectBinding(projects.ProjectBinding{ProjectID: "project_1", Name: "Looper", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: workingDir})
+
+	rt.Stop("test")
+	select {
+	case err := <-runner.result:
+		if err != nil {
+			t.Fatalf("Projects.List() after cancellation error = %v; storage closed before rebound work joined", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rebound webhook work was not canceled during shutdown")
+	}
+}
+
 type rebindBlockingReviewer struct {
 	mu      sync.Mutex
 	calls   int
@@ -143,6 +186,20 @@ type storageCheckingReviewer struct {
 	started      chan struct{}
 	release      chan struct{}
 	result       chan error
+}
+
+type cancelCheckingReviewer struct {
+	repositories *storage.Repositories
+	started      chan struct{}
+	result       chan error
+}
+
+func (r *cancelCheckingReviewer) DiscoverPullRequest(ctx context.Context, _ reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	close(r.started)
+	<-ctx.Done()
+	_, err := r.repositories.Projects.List(context.Background())
+	r.result <- err
+	return reviewer.DiscoveryResult{}, ctx.Err()
 }
 
 func (r *storageCheckingReviewer) DiscoverPullRequest(ctx context.Context, _ reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
