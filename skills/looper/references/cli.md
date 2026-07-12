@@ -192,14 +192,19 @@ If Looper is already installed and the user has an existing local GitHub reposit
 
 ```bash
 looper project add /absolute/path/to/repo --id myproj --repo owner/repo
+# Forgejo (provider type or configured id; type requires exactly one matching [[providers]] entry):
+looper project add /absolute/path/to/forgejo-repo --provider forgejo --repo owner/name
+looper project add /absolute/path/to/forgejo-repo --provider forgejo-main --repo owner/name
 ```
 
 Preflight before adding:
 
 - Confirm `/absolute/path/to/repo` is the user's intended local Git repository.
 - Prefer an absolute path; avoid registering a guessed or relative path without confirmation.
-- Confirm the GitHub repository slug (`owner/repo`) or let the user provide it.
-- Check `gh auth status` and ensure the authenticated account can access the repository.
+- Confirm the repository slug (`owner/repo`) or let the user provide it.
+- GitHub: check `gh auth status` and ensure the authenticated account can access the repository.
+- Forgejo: ensure a `[[providers]]` entry exists (`kind = "forgejo"`, `baseUrl`, `tokenEnv`) and the token env is exported for looperd.
+- If `origin` is not github.com and `--provider` is omitted, interactive add asks whether the project is Forgejo; non-interactive/`--json` requires `--provider forgejo` (or a provider id). Do not silently infer provider from the remote host.
 - If `--id` is omitted, Looper generates or infers a project id; use `--id` when the user needs a stable, memorable project id.
 - Use `--name`, `--base-branch`, and `--worktree-root` only when the user wants non-default values.
 - Use `--snapshot-mode async`, `full`, or `off` only when the user asks to control initial PR snapshot behavior; default behavior is configured by `defaults.addSnapshotMode`.
@@ -212,8 +217,6 @@ looper status
 ```
 
 After a project is registered, Looper can often infer it from commands run inside that repo. If no project matches the current directory, or multiple projects match, pass `--project <id>` explicitly.
-
-Forgejo projects are config-driven in the MVP. Do not use GitHub autodetection for them; add a `[[providers]]` entry with `kind = "forgejo"`, `baseUrl`, and `tokenEnv`, then add a project with `provider` and explicit `repo = "owner/name"`.
 
 Daemon lifecycle commands:
 

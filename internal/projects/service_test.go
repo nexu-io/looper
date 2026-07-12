@@ -42,7 +42,7 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 }
 
-func TestServiceAddProjectDetectsForgejoProviderAndRepo(t *testing.T) {
+func TestServiceAddProjectResolvesForgejoProviderTypeAndRepo(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -68,7 +68,8 @@ func TestServiceAddProjectDetectsForgejoProviderAndRepo(t *testing.T) {
 		Config: cfg,
 		Now:    func() time.Time { return now },
 		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{Repo: "core/odcrew", Provider: "forgejo-main"}, nil
+			// Non-GitHub host must not auto-bind provider; kind is explicit.
+			return DetectedRepo{Repo: "core/odcrew", Host: "ssh.code.powerformer.net"}, nil
 		},
 		RegisterBinding: func(binding ProjectBinding) {
 			registered = &binding
@@ -79,11 +80,13 @@ func TestServiceAddProjectDetectsForgejoProviderAndRepo(t *testing.T) {
 		},
 	}
 
+	providerType := "forgejo"
 	result, err := service.AddProject(ctx, AddInput{
 		ID:         "odcrew",
 		Name:       "odcrew",
 		RepoPath:   "/tmp/odcrew",
 		BaseBranch: "main",
+		Provider:   &providerType,
 	})
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
@@ -105,6 +108,59 @@ func TestServiceAddProjectDetectsForgejoProviderAndRepo(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectDoesNotInferProviderFromNonGitHubRemote(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "LOOPER_FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{
+		ID:       "forgejo-main",
+		Kind:     config.ProviderKindForgejo,
+		BaseURL:  "https://code.powerformer.net",
+		TokenEnv: &tokenEnv,
+	}}
+
+	var registered *ProjectBinding
+	service := &Service{
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		Config: cfg,
+		Now:    func() time.Time { return now },
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "core/odcrew", Host: "ssh.code.powerformer.net"}, nil
+		},
+		RegisterBinding: func(binding ProjectBinding) {
+			registered = &binding
+		},
+	}
+
+	result, err := service.AddProject(ctx, AddInput{
+		ID:         "odcrew",
+		Name:       "odcrew",
+		RepoPath:   "/tmp/odcrew",
+		BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.Provider != nil {
+		t.Fatalf("AddProject().Provider = %v, want nil without explicit confirmation", result.Provider)
+	}
+	if result.Repo != nil {
+		t.Fatalf("AddProject().Repo = %v, want nil for unconfirmed non-GitHub remote", result.Repo)
+	}
+	if registered != nil && registered.Provider != "" {
+		t.Fatalf("RegisterBinding() = %#v, want no forgejo binding", registered)
+	}
+}
+
 func TestServiceAddProjectRejectsUnknownProvider(t *testing.T) {
 	t.Parallel()
 
@@ -123,8 +179,8 @@ func TestServiceAddProjectRejectsUnknownProvider(t *testing.T) {
 		Repo:     &repo,
 		Provider: &provider,
 	})
-	if err == nil || !strings.Contains(err.Error(), "unknown provider") {
-		t.Fatalf("AddProject() error = %v, want unknown provider", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown provider id or type") {
+		t.Fatalf("AddProject() error = %v, want unknown provider id or type", err)
 	}
 }
 

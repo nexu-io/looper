@@ -307,7 +307,7 @@ func (g *Gateway) DetectGitHubRepo(ctx context.Context, repoPath string) (string
 	if err != nil {
 		return "", err
 	}
-	if !isGitHubRemoteHost(remote.Host) {
+	if !IsGitHubRemoteHost(remote.Host) {
 		return "", nil
 	}
 	return remote.Repo, nil
@@ -1187,7 +1187,7 @@ func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {
 	host, repo := parseRemoteRepoFromURL(remoteURL)
-	if !isGitHubRemoteHost(host) {
+	if !IsGitHubRemoteHost(host) {
 		return ""
 	}
 	return repo
@@ -1240,7 +1240,9 @@ func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
 	return "", ""
 }
 
-func isGitHubRemoteHost(host string) bool {
+// IsGitHubRemoteHost reports whether a git remote host is GitHub (including
+// github.com enterprise-style hosts that end with .github.com).
+func IsGitHubRemoteHost(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	return host == "github.com" || strings.HasSuffix(host, ".github.com")
 }

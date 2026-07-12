@@ -5,6 +5,39 @@ import (
 	"testing"
 )
 
+func TestResolveProviderRef(t *testing.T) {
+	cfg := Config{
+		Providers: []ProviderConfig{
+			{ID: "forgejo-main", Kind: ProviderKindForgejo, BaseURL: "https://code.powerformer.net"},
+			{ID: "plane-main", Kind: ProviderKindPlane},
+		},
+	}
+
+	id, ok, err := ResolveProviderRef(cfg, "forgejo-main")
+	if err != nil || !ok || id != "forgejo-main" {
+		t.Fatalf("ResolveProviderRef(id) = (%q, %v, %v), want forgejo-main", id, ok, err)
+	}
+
+	id, ok, err = ResolveProviderRef(cfg, "forgejo")
+	if err != nil || !ok || id != "forgejo-main" {
+		t.Fatalf("ResolveProviderRef(kind) = (%q, %v, %v), want forgejo-main", id, ok, err)
+	}
+
+	id, ok, err = ResolveProviderRef(cfg, "github")
+	if err != nil || ok || id != "" {
+		t.Fatalf("ResolveProviderRef(github) = (%q, %v, %v), want empty", id, ok, err)
+	}
+
+	if _, _, err := ResolveProviderRef(cfg, "missing"); err == nil {
+		t.Fatal("ResolveProviderRef(missing) error = nil, want error")
+	}
+
+	cfg.Providers = append(cfg.Providers, ProviderConfig{ID: "forgejo-other", Kind: ProviderKindForgejo, BaseURL: "https://other.example"})
+	if _, _, err := ResolveProviderRef(cfg, "forgejo"); err == nil || !strings.Contains(err.Error(), "multiple") {
+		t.Fatalf("ResolveProviderRef(ambiguous kind) error = %v, want multiple", err)
+	}
+}
+
 func TestMatchForgejoProviderByRemoteHost(t *testing.T) {
 	cfg := Config{
 		Providers: []ProviderConfig{

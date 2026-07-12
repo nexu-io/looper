@@ -27,10 +27,12 @@ const legacyProjectIDPrefix = "legacy-id-"
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
 
 // DetectedRepo is the result of inspecting a local checkout's origin remote.
-// Provider is empty for the legacy GitHub default path.
+// Host is the remote host (for example "github.com" or "code.example.com").
+// Provider is never filled by remote host inference; callers must pass an
+// explicit provider id/type or confirm interactively at the CLI.
 type DetectedRepo struct {
-	Repo     string
-	Provider string
+	Repo string
+	Host string
 }
 
 type DetectRepoFunc func(context.Context, string) (DetectedRepo, error)
@@ -196,25 +198,23 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	}
 
 	repo := input.Repo
-	provider := normalizeOptionalProvider(input.Provider)
+	provider, err := s.resolveProviderInput(input.Provider)
+	if err != nil {
+		return AddResult{}, err
+	}
 	warnings := []string{}
-	if (repo == nil || provider == nil) && s.DetectRepo != nil {
+	if repo == nil && s.DetectRepo != nil {
 		detected, detectErr := s.DetectRepo(ctx, input.RepoPath)
 		if detectErr != nil {
 			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
-		} else {
-			if repo == nil && strings.TrimSpace(detected.Repo) != "" {
+		} else if strings.TrimSpace(detected.Repo) != "" {
+			// Fill repo from origin only for GitHub hosts, or when the caller has
+			// already confirmed a non-GitHub provider. Never infer provider from host.
+			if provider != nil || isGitHubDetectedHost(detected.Host) {
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
 			}
-			if provider == nil && strings.TrimSpace(detected.Provider) != "" {
-				value := strings.TrimSpace(detected.Provider)
-				provider = &value
-			}
 		}
-	}
-	if err := s.validateExplicitProvider(provider); err != nil {
-		return AddResult{}, err
 	}
 	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
 		return AddResult{}, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
@@ -719,17 +719,34 @@ func normalizeOptionalProvider(value *string) *string {
 	return &trimmed
 }
 
-func (s *Service) validateExplicitProvider(provider *string) error {
-	if provider == nil {
-		return nil
+// resolveProviderInput accepts a configured provider id or a provider kind/type
+// (forgejo, plane, github). github clears the binding; kinds resolve to the
+// unique matching configured provider id.
+func (s *Service) resolveProviderInput(value *string) (*string, error) {
+	normalized := normalizeOptionalProvider(value)
+	if normalized == nil {
+		return nil, nil
 	}
-	providerID := strings.TrimSpace(*provider)
-	for _, configured := range s.Config.Providers {
-		if configured.ID == providerID {
-			return nil
-		}
+	providerID, ok, err := config.ResolveProviderRef(s.Config, *normalized)
+	if err != nil {
+		return nil, ProjectValidationError{Message: err.Error()}
 	}
-	return ProjectValidationError{Message: fmt.Sprintf("unknown provider id %q; configure it under [[providers]] first", providerID)}
+	if !ok {
+		// Explicit github (or empty resolution): no provider binding.
+		return nil, nil
+	}
+	return &providerID, nil
+}
+
+// isGitHubDetectedHost treats an empty host as GitHub-compatible so unit tests
+// and callers that only supply a repo slug keep the legacy path.
+func isGitHubDetectedHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return true
+	}
+	host = strings.ToLower(host)
+	return host == "github.com" || strings.HasSuffix(host, ".github.com")
 }
 
 func isForgejoProvider(cfg config.Config, provider *string) bool {

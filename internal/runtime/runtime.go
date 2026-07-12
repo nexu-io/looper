@@ -553,11 +553,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		Config: r.config,
 		Now:    r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
-			r.mu.RLock()
-			cfg := r.config
-			cfg.Projects = append([]config.ProjectRefConfig(nil), r.config.Projects...)
-			r.mu.RUnlock()
-			return detectProjectRepo(ctx, gitGateway, cfg, repoPath)
+			return detectProjectRepo(ctx, gitGateway, repoPath)
 		},
 		ValidateBinding: func(binding projects.ProjectBinding) error {
 			r.mu.RLock()
@@ -887,7 +883,11 @@ func runtimeProjectProviderKindWithMetadata(cfg config.Config, projectID string,
 	return config.ProviderKindGitHub
 }
 
-func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
+// detectProjectRepo reads origin host + owner/name. It never selects a provider
+// from the remote host — provider binding requires an explicit id/type or CLI
+// confirmation. Repo slug is still returned for non-GitHub hosts so an explicit
+// provider can reuse it.
+func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, repoPath string) (projects.DetectedRepo, error) {
 	if gitGateway == nil {
 		return projects.DetectedRepo{}, fmt.Errorf("git gateway is not configured")
 	}
@@ -898,14 +898,7 @@ func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg co
 	if strings.TrimSpace(remote.Repo) == "" {
 		return projects.DetectedRepo{}, nil
 	}
-	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, remote.Host); ok {
-		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.ID}, nil
-	}
-	// Keep GitHub autodetection behavior for github.com remotes (and unknown hosts stay empty).
-	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
-		return projects.DetectedRepo{Repo: remote.Repo}, nil
-	}
-	return projects.DetectedRepo{}, nil
+	return projects.DetectedRepo{Repo: remote.Repo, Host: remote.Host}, nil
 }
 
 func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storage.Repositories) error {

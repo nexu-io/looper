@@ -1266,6 +1266,57 @@ func TestProjectAddJSONPostsExpectedBody(t *testing.T) {
 	assertJSONContains(t, stdout, "id", "project_1")
 }
 
+func TestProjectAddJSONPostsProviderType(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if got, want := body["provider"], "forgejo"; got != want {
+			t.Fatalf("body.provider = %#v, want %#v", got, want)
+		}
+		if got, want := body["repo"], "core/odcrew"; got != want {
+			t.Fatalf("body.repo = %#v, want %#v", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_project", map[string]any{"id": "odcrew", "repoPath": "/tmp/odcrew", "provider": "forgejo"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "project", "add", "/tmp/odcrew", "--id", "odcrew", "--provider", "forgejo", "--repo", "core/odcrew", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([project add --provider forgejo --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([project add --provider forgejo --json]) stderr = %q, want empty", stderr)
+	}
+	assertJSONContains(t, stdout, "id", "odcrew")
+}
+
+func TestProjectAddJSONRequiresProviderForNonGitHubRemote(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	runGit(t, repoPath, "init")
+	runGit(t, repoPath, "remote", "add", "origin", "git@ssh.code.powerformer.net:core/odcrew.git")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("project add should fail before posting when non-GitHub remote lacks --provider")
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "project", "add", repoPath, "--json", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatal("Run([project add non-github --json]) exit code = 0, want failure")
+	}
+	if !strings.Contains(stderr, "not github.com") || !strings.Contains(stderr, "--provider") {
+		t.Fatalf("stderr = %q, want non-github --provider guidance", stderr)
+	}
+}
+
 func TestProjectAddResolvesRelativePathsBeforePosting(t *testing.T) {
 	root := t.TempDir()
 	originalCWD, err := os.Getwd()

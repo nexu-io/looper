@@ -35,7 +35,7 @@ Also make sure:
 - Forgejo projects: the configured provider `tokenEnv` is exported in the daemon environment
 - `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
 
-Forgejo projects need a configured `[[providers]]` entry (`kind = "forgejo"`, `baseUrl`, `tokenEnv`) first. After that, `looper project add /path/to/repo` auto-detects Forgejo remotes whose host matches the provider `baseUrl` (including common `ssh.<host>` remotes) and stores `provider` + `repo`. You can also pass them explicitly: `looper project add . --provider forgejo-main --repo owner/name`. See [configuration](configuration.md#provider-support).
+Forgejo projects need a configured `[[providers]]` entry (`kind = "forgejo"`, `baseUrl`, `tokenEnv`) first. Provider binding is explicit: pass a type or id on add (`looper project add . --provider forgejo --repo owner/name`, or `--provider forgejo-main`). If `origin` is not `github.com` and you omit `--provider`, interactive `project add` asks whether the repo is Forgejo; non-interactive / `--json` mode requires `--provider`. Remote host matching is only a hint, never silent authority. See [configuration](configuration.md#provider-support).
 
 ## 1a. Local-only vs Routed projects
 
