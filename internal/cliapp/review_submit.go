@@ -33,13 +33,14 @@ type reviewSubmitComment struct {
 }
 
 type reviewSubmitDiagnosticFields struct {
-	Repo     string
-	PRNumber int64
-	Event    string
-	CommitID string
-	Payload  reviewSubmitPayload
-	Error    string
-	Extra    map[string]any
+	Repo        string
+	PRNumber    int64
+	Event       string
+	CommitID    string
+	Payload     reviewSubmitPayload
+	Error       string
+	Extra       map[string]any
+	RedactPaths bool
 }
 
 func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
@@ -130,11 +131,11 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 
 // wrapReviewSubmitError keeps content-safety rejections actionable for agents
 // still in-session: surface the gate reason + recovery guidance, never the
-// rejected payload, and record a validation diagnostic.
+// rejected payload, and record a validation diagnostic without raw paths.
 func wrapReviewSubmitError(cmd *cobra.Command, repo string, prNumber int64, event string, commitID string, payload reviewSubmitPayload, prefix string, err error) error {
 	if outboundguard.IsRejection(err) {
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
-			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(),
+			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(), RedactPaths: true,
 		})
 		return fmt.Errorf("%s blocked by content safety gate: %w", prefix, err)
 	}
@@ -347,7 +348,7 @@ func writeReviewSubmitDiagnostic(w io.Writer, event string, fields reviewSubmitD
 		"endpoint":     fmt.Sprintf("repos/%s/pulls/%d/reviews", fields.Repo, fields.PRNumber),
 		"payload": map[string]any{
 			"body_marker": reviewSubmitPayloadBodyMarker(fields.Payload.Body),
-			"comments":    reviewSubmitPayloadComments(fields.Payload.Comments),
+			"comments":    reviewSubmitPayloadComments(fields.Payload.Comments, fields.RedactPaths),
 		},
 	}
 	if strings.TrimSpace(fields.Error) != "" {
@@ -383,12 +384,16 @@ func reviewSubmitPayloadBodyMarker(body string) map[string]any {
 	return map[string]any{"id": fields["id"], "head": fields["head"], "outcome": fields["outcome"]}
 }
 
-func reviewSubmitPayloadComments(comments []reviewSubmitComment) []map[string]any {
+func reviewSubmitPayloadComments(comments []reviewSubmitComment, redactPaths bool) []map[string]any {
 	summary := make([]map[string]any, 0, len(comments))
 	for idx, comment := range comments {
 		entry := map[string]any{"index": idx}
 		if comment.Path != "" {
-			entry["path"] = comment.Path
+			if redactPaths {
+				entry["path_present"] = true
+			} else {
+				entry["path"] = comment.Path
+			}
 		}
 		if comment.Line > 0 {
 			entry["line"] = comment.Line

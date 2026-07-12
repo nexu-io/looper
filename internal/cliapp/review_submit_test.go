@@ -296,15 +296,19 @@ func TestWrapReviewSubmitErrorSurfacesContentSafetyRecoveryGuidance(t *testing.T
 	cmd := &cobra.Command{}
 	stderr := &bytes.Buffer{}
 	cmd.SetErr(stderr)
-	payload := reviewSubmitPayload{Body: "SERVICE_TOKEN=secret-value"}
-	err := wrapReviewSubmitError(cmd, "acme/looper", 42, "COMMENT", "abc123", payload, "submit validated PR review", outboundguard.Validate(outboundguard.Field{Name: "review body", Text: payload.Body}))
+	secretPath := "SERVICE_TOKEN=secret-value"
+	payload := reviewSubmitPayload{
+		Body:     "Please address the findings.",
+		Comments: []reviewSubmitComment{{Body: "Null check missing", Path: secretPath, Line: 1, Side: "RIGHT"}},
+	}
+	err := wrapReviewSubmitError(cmd, "acme/looper", 42, "COMMENT", "abc123", payload, "submit validated PR review", outboundguard.Validate(outboundguard.Field{Name: "inline review comment 1 path", Text: secretPath}))
 	if err == nil {
 		t.Fatal("wrapReviewSubmitError() error = nil, want content safety rejection")
 	}
 	msg := err.Error()
 	for _, want := range []string{
 		"blocked by content safety gate",
-		"outbound content safety gate rejected review body",
+		"outbound content safety gate rejected inline review comment 1 path",
 		"credential-shaped",
 		outboundguard.RecoveryGuidance,
 	} {
@@ -312,11 +316,17 @@ func TestWrapReviewSubmitErrorSurfacesContentSafetyRecoveryGuidance(t *testing.T
 			t.Fatalf("error = %q, want substring %q", msg, want)
 		}
 	}
-	if strings.Contains(msg, payload.Body) {
-		t.Fatalf("error %q echoed rejected payload body", msg)
+	if strings.Contains(msg, secretPath) {
+		t.Fatalf("error %q echoed rejected path", msg)
+	}
+	if strings.Contains(stderr.String(), secretPath) {
+		t.Fatalf("stderr diagnostic echoed rejected path: %s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "github_review_submit_validation_failed") {
 		t.Fatalf("stderr = %q, want validation diagnostic", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"path_present":true`) {
+		t.Fatalf("stderr = %q, want path_present without raw path", stderr.String())
 	}
 }
 

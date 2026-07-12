@@ -777,14 +777,21 @@ func TestSubmitReviewRejectsCredentialInCommentPathAfterNormalization(t *testing
 		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
 		return shell.Result{}, nil
 	}
-	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	var events []reviewSubmitDiagnosticEvent
+	gateway := New(Options{
+		GHPath: "gh", GHRun: runner.run,
+		ReviewSubmitDiagnostic: func(event string, fields map[string]any) {
+			events = append(events, reviewSubmitDiagnosticEvent{Name: event, Fields: fields})
+		},
+	})
 	anchors := diffanchor.Index{Ranges: []diffanchor.Range{{Path: "app.go", Side: "RIGHT", Start: 1, End: 1}}}
+	secretPath := "SERVICE_TOKEN=secret-value"
 
 	// Secret lives only in Path; body is safe. Without post-normalize / path
 	// guarding, FallbackBody would publish "Location: SERVICE_TOKEN=secret-value ...".
 	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{
 		Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Please address the findings.", CommitID: "abc123",
-		Comments: []ReviewComment{{Body: "Null check is missing here.", Path: "SERVICE_TOKEN=secret-value", Line: 99, Side: "RIGHT"}},
+		Comments: []ReviewComment{{Body: "Null check is missing here.", Path: secretPath, Line: 99, Side: "RIGHT"}},
 		Anchors:  &anchors,
 	})
 	if err == nil || !strings.Contains(err.Error(), "credential-shaped environment assignment") {
@@ -792,6 +799,25 @@ func TestSubmitReviewRejectsCredentialInCommentPathAfterNormalization(t *testing
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+	if len(events) != 1 || events[0].Name != "github_review_submit_validation_failed" {
+		t.Fatalf("diagnostic events = %#v, want one validation failure", events)
+	}
+	// Diagnostics must not echo the rejected path (no-echo contract).
+	if encoded := fmt.Sprintf("%#v", events[0].Fields); strings.Contains(encoded, secretPath) {
+		t.Fatalf("diagnostic fields echoed rejected path: %s", encoded)
+	}
+	request, _ := events[0].Fields["request"].(map[string]any)
+	payload, _ := request["payload"].(map[string]any)
+	comments, _ := payload["comments"].([]map[string]any)
+	if len(comments) != 1 {
+		t.Fatalf("diagnostic comments = %#v, want one sanitized comment", comments)
+	}
+	if _, hasPath := comments[0]["path"]; hasPath {
+		t.Fatalf("diagnostic comment still has raw path: %#v", comments[0])
+	}
+	if comments[0]["path_present"] != true {
+		t.Fatalf("diagnostic comment = %#v, want path_present=true", comments[0])
 	}
 }
 

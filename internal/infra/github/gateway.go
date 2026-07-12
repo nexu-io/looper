@@ -1802,7 +1802,7 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
 	request := g.reviewSubmitRequest(input)
 	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": reviewSubmitDiagnosticRequest(request, err), "error": err.Error()})
 		return err
 	}
 	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
@@ -1816,7 +1816,7 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	// Re-validate after normalization: FallbackBody / retarget prefixes embed agent path
 	// into the top-level review body, which was not present in the pre-normalize fields.
 	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": reviewSubmitDiagnosticRequest(request, err), "error": err.Error()})
 		return err
 	}
 	request = g.reviewSubmitRequest(input)
@@ -1975,15 +1975,97 @@ func reviewSubmitBodyMarkerSummary(body string) map[string]any {
 }
 
 func reviewSubmitCommentsSummary(comments []ReviewComment) []map[string]any {
+	return reviewSubmitCommentsSummaryWithPaths(comments, true)
+}
+
+func reviewSubmitCommentsSummaryWithPaths(comments []ReviewComment, includePaths bool) []map[string]any {
 	summary := make([]map[string]any, 0, len(comments))
 	for idx, comment := range comments {
 		entry := map[string]any{"index": reviewCommentDiagnosticIndex(comment, idx)}
 		for key, value := range reviewCommentAnchorMap(comment) {
+			if key == "path" && !includePaths {
+				if strings.TrimSpace(comment.Path) != "" {
+					entry["path_present"] = true
+				}
+				continue
+			}
 			entry[key] = value
 		}
 		summary = append(summary, entry)
 	}
 	return summary
+}
+
+// reviewSubmitDiagnosticRequest returns a diagnostic-safe request summary.
+// Content-safety rejections omit raw comment paths so secret-shaped values in
+// path fields cannot leak into logs/stderr while the gate rejects publication.
+func reviewSubmitDiagnosticRequest(request map[string]any, err error) map[string]any {
+	if !outboundguard.IsRejection(err) {
+		return request
+	}
+	return redactReviewSubmitRequestPaths(request)
+}
+
+func redactReviewSubmitRequestPaths(request map[string]any) map[string]any {
+	if request == nil {
+		return nil
+	}
+	sanitized := make(map[string]any, len(request))
+	for key, value := range request {
+		sanitized[key] = value
+	}
+	payload, ok := sanitized["payload"].(map[string]any)
+	if !ok {
+		return sanitized
+	}
+	payloadCopy := make(map[string]any, len(payload))
+	for key, value := range payload {
+		payloadCopy[key] = value
+	}
+	comments, ok := payloadCopy["comments"].([]map[string]any)
+	if !ok {
+		// reviewSubmitCommentsSummary returns []map[string]any but JSON-like maps
+		// may also be stored as []any after round-trips; handle both.
+		if rawComments, ok := payloadCopy["comments"].([]any); ok {
+			redacted := make([]map[string]any, 0, len(rawComments))
+			for _, raw := range rawComments {
+				entry, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+			}
+			payloadCopy["comments"] = redacted
+			sanitized["payload"] = payloadCopy
+			return sanitized
+		}
+		sanitized["payload"] = payloadCopy
+		return sanitized
+	}
+	redacted := make([]map[string]any, 0, len(comments))
+	for _, entry := range comments {
+		redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+	}
+	payloadCopy["comments"] = redacted
+	sanitized["payload"] = payloadCopy
+	return sanitized
+}
+
+func redactReviewCommentDiagnosticEntry(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	out := make(map[string]any, len(entry))
+	for key, value := range entry {
+		if key == "path" {
+			if path, ok := value.(string); ok && strings.TrimSpace(path) != "" {
+				out["path_present"] = true
+			}
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func reviewCommentDiagnosticIndex(comment ReviewComment, fallback int) int {
