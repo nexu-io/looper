@@ -863,6 +863,41 @@ func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.
 	assertEqual(t, recorded, 1)
 }
 
+func TestHandlerWebhookForwardUsesCurrentRuntimeForwarder(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	previous := &fakeWebhookForwarder{}
+	current := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	active := looperdruntime.WebhookForwarder(previous)
+	runtime := webhookForwardRuntime{
+		Runtime: fixture.runtime,
+		status: func() looperdruntime.WebhookStatus {
+			return looperdruntime.WebhookStatus{Enabled: true}
+		},
+		forwarder: func() looperdruntime.WebhookForwarder { return active },
+	}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime})
+	active = current
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-GitHub-Delivery", "delivery-after-swap")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if previous.calls != 0 {
+		t.Fatalf("previous forwarder calls = %d, want 0", previous.calls)
+	}
+	if current.calls != 1 {
+		t.Fatalf("current forwarder calls = %d, want 1", current.calls)
+	}
+}
+
 func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.T) {
 	fixture := newTestFixture(t)
 	fixture.config.Webhook.Enabled = true
@@ -6010,8 +6045,9 @@ func (r webhookReconcileRuntime) RefreshWebhookForwarders() error {
 
 type webhookForwardRuntime struct {
 	*looperdruntime.Runtime
-	status func() looperdruntime.WebhookStatus
-	record func(string, string)
+	status    func() looperdruntime.WebhookStatus
+	record    func(string, string)
+	forwarder func() looperdruntime.WebhookForwarder
 }
 
 type executionVerifierRuntime struct {
@@ -6032,6 +6068,13 @@ func (r webhookForwardRuntime) RecordWebhookDelivery(eventType, deliveryID strin
 		return
 	}
 	r.Runtime.RecordWebhookDelivery(eventType, deliveryID)
+}
+
+func (r webhookForwardRuntime) WebhookForwarder() looperdruntime.WebhookForwarder {
+	if r.forwarder != nil {
+		return r.forwarder()
+	}
+	return r.Runtime.WebhookForwarder()
 }
 
 func (r executionVerifierRuntime) ExecutionMatchesProcess(ctx context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {

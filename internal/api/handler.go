@@ -89,10 +89,10 @@ type TakeoverResult struct {
 }
 
 type Handler struct {
-	context          Context
-	now              func() time.Time
-	recoverySummary  func() any
-	webhookForwarder webhookforward.Forwarder
+	context                 Context
+	now                     func() time.Time
+	recoverySummary         func() any
+	currentWebhookForwarder func() webhookforward.Forwarder
 }
 
 func NewHandler(context Context) *Handler {
@@ -115,20 +115,22 @@ func NewHandler(context Context) *Handler {
 			}
 		}
 	}
-	forwarder := context.WebhookForwarder
-	if forwarder == nil {
+	currentForwarder := func() webhookforward.Forwarder { return context.WebhookForwarder }
+	if context.WebhookForwarder == nil {
 		if runtimeWithForwarder, ok := any(context.Runtime).(interface {
 			WebhookForwarder() looperdruntime.WebhookForwarder
 		}); ok {
-			forwarder = runtimeWithForwarder.WebhookForwarder()
+			currentForwarder = func() webhookforward.Forwarder {
+				return runtimeWithForwarder.WebhookForwarder()
+			}
 		}
 	}
 
 	return &Handler{
-		context:          context,
-		now:              now,
-		recoverySummary:  recoverySummary,
-		webhookForwarder: forwarder,
+		context:                 context,
+		now:                     now,
+		recoverySummary:         recoverySummary,
+		currentWebhookForwarder: currentForwarder,
 	}
 }
 
@@ -458,7 +460,8 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	if !isLoopbackRequest(r) {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding is limited to loopback callers"}
 	}
-	if h.webhookForwarder == nil {
+	forwarder := h.currentWebhookForwarder()
+	if forwarder == nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
 	}
 	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
@@ -475,7 +478,7 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	}
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	eventType := r.Header.Get("X-GitHub-Event")
-	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
+	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
 	if err != nil {
 		status := http.StatusBadRequest
 		code := pkgapi.ErrorCodeValidationFailed
