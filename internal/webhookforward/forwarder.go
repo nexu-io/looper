@@ -210,13 +210,14 @@ type forwarder struct {
 	mu              sync.Mutex
 	cond            *sync.Cond
 	closed          bool
-	workersDone     sync.WaitGroup
 	queue           []workKey
 	works           map[string]*workItem
 	deliveries      map[string]deliveryRecord
 	stats           Stats
 	recentOutcomes  []Outcome
 	currentInFlight int
+	workerCtx       context.Context
+	cancelWorkers   context.CancelFunc
 }
 
 func New(options Options) Forwarder {
@@ -244,6 +245,7 @@ func New(options Options) Forwarder {
 	if recentOutcomeLimit <= 0 {
 		recentOutcomeLimit = defaultRecentOutcomeSize
 	}
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 	f := &forwarder{
 		repos:              options.Repos,
 		cfg:                options.Config,
@@ -258,10 +260,11 @@ func New(options Options) Forwarder {
 		recentOutcomeLimit: recentOutcomeLimit,
 		works:              map[string]*workItem{},
 		deliveries:         map[string]deliveryRecord{},
+		workerCtx:          workerCtx,
+		cancelWorkers:      cancelWorkers,
 	}
 	f.cond = sync.NewCond(&f.mu)
 	for i := 0; i < f.maxConcurrent; i++ {
-		f.workersDone.Add(1)
 		go f.worker()
 	}
 	return f
@@ -337,9 +340,18 @@ func (f *forwarder) Close() {
 		return
 	}
 	f.closed = true
+	f.queue = nil
+	for key, item := range f.works {
+		if item == nil || !item.running {
+			delete(f.works, key)
+			continue
+		}
+		item.lanes = map[Lane]struct{}{}
+		item.enqueued = false
+	}
+	f.cancelWorkers()
 	f.cond.Broadcast()
 	f.mu.Unlock()
-	f.workersDone.Wait()
 }
 
 func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed routedDelivery, metadata workMetadata) (int, error) {
@@ -417,13 +429,12 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 }
 
 func (f *forwarder) worker() {
-	defer f.workersDone.Done()
 	for {
 		key, item, ok := f.nextWork()
 		if !ok {
 			return
 		}
-		outcome := f.executeWithRetry(context.Background(), key, item)
+		outcome := f.executeWithRetry(f.workerCtx, key, item)
 		f.finishWork(key, outcome)
 	}
 }
@@ -527,6 +538,9 @@ func (f *forwarder) executeWithRetry(ctx context.Context, key workKey, item work
 }
 
 func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, ok := item.lanes[LaneReviewer]; ok {
 		if f.reviewer == nil {
 			return fmt.Errorf("reviewer targeted discovery is not configured")
@@ -534,6 +548,9 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 		if _, err := f.reviewer.DiscoverPullRequest(ctx, reviewer.TargetedDiscoveryInput{ProjectID: key.ProjectID, Repo: key.Repo, PRNumber: key.Number}); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if _, ok := item.lanes[LaneFixer]; ok {
 		if f.fixer == nil {
