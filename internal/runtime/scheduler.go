@@ -2107,6 +2107,10 @@ func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() fun
 }
 
 func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool) defaultSchedulerHandlers {
+	return buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg, configReadLock, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, includeWebhook, nil)
+}
+
+func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2127,6 +2131,9 @@ func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock
 		return defaultSchedulerHandlers{tick: noop, claim: noop}
 	}
 	if configReadLock != nil {
+		if claimMu == nil {
+			claimMu = &sync.Mutex{}
+		}
 		snapshot := func() config.Config {
 			unlock := configReadLock()
 			defer unlock()
@@ -2136,7 +2143,7 @@ func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock
 		}
 		buildSnapshotHandlers := func() defaultSchedulerHandlers {
 			cloned := snapshot()
-			return buildDefaultSchedulerHandlersWithWebhook(&cloned, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false)
+			return buildDefaultSchedulerHandlersWithWebhookAndClaimMu(&cloned, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu)
 		}
 		// Runtime startup already holds the config write lock while constructing
 		// handlers, so take the initial webhook snapshot directly. Tick and claim
@@ -2452,7 +2459,9 @@ func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock
 			})
 		},
 	})
-	claimMu := &sync.Mutex{}
+	if claimMu == nil {
+		claimMu = &sync.Mutex{}
+	}
 
 	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
