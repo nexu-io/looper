@@ -14,7 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
-func TestSyncRuntimeProjectBindingCancelsQueuedGitHubWorkBeforeForgejoRebind(t *testing.T) {
+func TestSyncRuntimeProjectBindingDrainsAcceptedGitHubWorkAcrossForgejoRebind(t *testing.T) {
 	workingDir := t.TempDir()
 	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
 	t.Cleanup(func() { _ = coordinator.Close() })
@@ -64,9 +64,12 @@ func TestSyncRuntimeProjectBindingCancelsQueuedGitHubWorkBeforeForgejoRebind(t *
 		t.Fatal("GitHub to Forgejo rebind blocked on old webhook work")
 	}
 	close(githubRunner.release)
-	time.Sleep(20 * time.Millisecond)
-	if got := githubRunner.callCount(); got != 1 {
-		t.Fatalf("old GitHub runner call count = %d, want 1; queued delivery ran after Forgejo rebind", got)
+	deadline := time.Now().Add(time.Second)
+	for githubRunner.callCount() != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := githubRunner.callCount(); got != 2 {
+		t.Fatalf("old GitHub runner call count = %d, want 2; accepted queued delivery was lost during Forgejo rebind", got)
 	}
 	if got := rt.WebhookForwarder(); got != next {
 		t.Fatalf("WebhookForwarder() = %T, want Forgejo replacement", got)

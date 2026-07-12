@@ -324,7 +324,7 @@ func TestForwardKeepsFixedSizeRecentOutcomes(t *testing.T) {
 	}
 }
 
-func TestCloseCancelsQueuedWorkWithoutWaitingForRunningWork(t *testing.T) {
+func TestCloseDrainsAcceptedWorkWithoutWaitingForRunningWork(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
 	block := make(chan struct{})
@@ -351,8 +351,8 @@ func TestCloseCancelsQueuedWorkWithoutWaitingForRunningWork(t *testing.T) {
 	}
 
 	close(block)
-	time.Sleep(20 * time.Millisecond)
-	reviewerRunner.assertCallCount(t, 1)
+	reviewerRunner.waitForCall(t, 2)
+	reviewerRunner.assertCallCount(t, 2)
 	if stats := forwarder.Stats(); stats.Queued != 0 {
 		t.Fatalf("Stats().Queued = %d, want 0 after close", stats.Queued)
 	}

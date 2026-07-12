@@ -340,16 +340,9 @@ func (f *forwarder) Close() {
 		return
 	}
 	f.closed = true
-	f.queue = nil
-	for key, item := range f.works {
-		if item == nil || !item.running {
-			delete(f.works, key)
-			continue
-		}
-		item.lanes = map[Lane]struct{}{}
-		item.enqueued = false
+	if len(f.queue) == 0 && f.currentInFlight == 0 {
+		f.cancelWorkers()
 	}
-	f.cancelWorkers()
 	f.cond.Broadcast()
 	f.mu.Unlock()
 }
@@ -502,6 +495,9 @@ func (f *forwarder) finishWork(key workKey, outcome Outcome) {
 			fields["error"] = outcome.Error
 		}
 		f.logger.Info("webhook targeted discovery completed", fields)
+	}
+	if f.closed && len(f.queue) == 0 && f.currentInFlight == 0 {
+		f.cancelWorkers()
 	}
 }
 
