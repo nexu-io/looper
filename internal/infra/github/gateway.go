@@ -1791,6 +1791,10 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
 	request := g.reviewSubmitRequest(input)
+	if err := validateReviewContentSafety(input.Body, input.Comments); err != nil {
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		return err
+	}
 	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
 		err := fmt.Errorf("clean review marker cannot be submitted with review comments")
 		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})

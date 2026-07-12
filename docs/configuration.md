@@ -510,6 +510,10 @@ reasoning = "medium"
 [agent.env]
 OPENAI_API_KEY = "replace-me"
 
+# Agent subprocesses inherit only execution-safe host variables (for example,
+# PATH, HOME, locale, temporary/configuration directories, certificate paths,
+# and SSH_AUTH_SOCK). Add required credentials or tool-specific variables here.
+
 [agent.nativeResume]
 enabled = true
 

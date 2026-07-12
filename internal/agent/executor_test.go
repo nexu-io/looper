@@ -140,13 +140,17 @@ func TestResolveSpawnWithNativeResumeDoesNotDuplicateEqualsFlags(t *testing.T) {
 	}
 }
 
-func TestBuildCommandEnvSanitizesInheritedCWDAndGitOverrides(t *testing.T) {
+func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *testing.T) {
 	t.Setenv("PWD", "/Users/mrc/Projects/looper")
 	t.Setenv("OLDPWD", "/Users/mrc")
 	t.Setenv("GIT_DIR", "/tmp/unsafe-git-dir")
 	t.Setenv("GIT_WORK_TREE", "/tmp/unsafe-git-worktree")
 	t.Setenv("GIT_PREFIX", "unsafe-prefix")
-	t.Setenv("KEEP_ME", "1")
+	t.Setenv("PATH", "/safe/bin")
+	t.Setenv("LANG", "en_US.UTF-8")
+	t.Setenv("LC_ALL", "C.UTF-8")
+	t.Setenv("UNRELATED_API_KEY", "must-not-reach-agent")
+	t.Setenv("KEEP_ME", "must-not-reach-agent")
 
 	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{"CONFIG_ONLY": "true", "PWD": "/tmp/config-override", "GIT_DIR": "/tmp/config-git-dir"}, map[string]string{"INPUT_ONLY": "yes", "OLDPWD": "/tmp/input-oldpwd"}))
 
@@ -158,8 +162,19 @@ func TestBuildCommandEnvSanitizesInheritedCWDAndGitOverrides(t *testing.T) {
 			t.Fatalf("%s present in sanitized env, want removed", key)
 		}
 	}
-	if got := env["KEEP_ME"]; got != "1" {
-		t.Fatalf("KEEP_ME = %q, want inherited value", got)
+	for _, key := range []string{"KEEP_ME", "UNRELATED_API_KEY"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("%s present in agent env, want ambient value excluded", key)
+		}
+	}
+	if got := env["PATH"]; got != "/safe/bin" {
+		t.Fatalf("PATH = %q, want inherited safe value", got)
+	}
+	if got := env["LANG"]; got != "en_US.UTF-8" {
+		t.Fatalf("LANG = %q, want inherited safe value", got)
+	}
+	if got := env["LC_ALL"]; got != "C.UTF-8" {
+		t.Fatalf("LC_ALL = %q, want inherited locale value", got)
 	}
 	if got := env["CONFIG_ONLY"]; got != "true" {
 		t.Fatalf("CONFIG_ONLY = %q, want true", got)

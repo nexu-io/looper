@@ -733,6 +733,44 @@ func TestSubmitReviewRejectsQualityFlagsBeforePublishing(t *testing.T) {
 	}
 }
 
+func TestSubmitReviewRejectsEnvironmentDumpBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	body := "Database transaction feedback.\nHOME=/Users/reviewer\nPATH=/usr/bin\nSHELL=/bin/zsh\nLANG=en_US.UTF-8\nTERM=xterm-256color"
+
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: body, CommitID: "abc123"})
+	if err == nil || !strings.Contains(err.Error(), "environment-dump-shaped block") {
+		t.Fatalf("SubmitReview() error = %v, want environment dump rejection", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+}
+
+func TestSubmitReviewRejectsCredentialAssignmentInInlineCommentBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{
+		Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Please address the inline finding.", CommitID: "abc123",
+		Comments: []ReviewComment{{Body: "The command printed this:\nOPENAI_API_KEY=sk-sensitive", Path: "app.go", Line: 1, Side: "RIGHT"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential-shaped environment assignment") {
+		t.Fatalf("SubmitReview() error = %v, want credential assignment rejection", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+}
+
 func TestSubmitReviewAllowsCleanOutcomeWithoutLocation(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

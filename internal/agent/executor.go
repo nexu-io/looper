@@ -47,6 +47,34 @@ var unsafeAgentEnvKeys = []string{
 	"GIT_SHALLOW_FILE",
 }
 
+var inheritedAgentEnvKeys = []string{
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"LANG",
+	"TERM",
+	"COLORTERM",
+	"NO_COLOR",
+	"FORCE_COLOR",
+	"XDG_CONFIG_HOME",
+	"XDG_CACHE_HOME",
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+	"SSH_AUTH_SOCK",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"NODE_EXTRA_CA_CERTS",
+	"GIT_SSL_CAINFO",
+	"CODEX_HOME",
+	"CLAUDE_CONFIG_DIR",
+	"OPENCODE_CONFIG_DIR",
+}
+
 type ExecutorConfig struct {
 	Vendor              config.AgentVendor
 	Model               *string
@@ -1448,7 +1476,18 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 }
 
 func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {
-	envMap := envSliceToMap(os.Environ())
+	inherited := envSliceToMap(os.Environ())
+	envMap := make(map[string]string, len(inheritedAgentEnvKeys))
+	for _, key := range inheritedAgentEnvKeys {
+		if value, ok := inherited[key]; ok {
+			envMap[key] = value
+		}
+	}
+	for key, value := range inherited {
+		if strings.HasPrefix(key, "LC_") {
+			envMap[key] = value
+		}
+	}
 	for _, source := range envSources {
 		maps.Copy(envMap, source)
 	}
