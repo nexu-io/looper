@@ -24,8 +24,13 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 		{name: "shell prompt credential", text: "$ SERVICE_TOKEN=secret-value", want: "credential-shaped"},
 		{name: "xtrace export credential", text: "+ export TOKEN=short", want: "credential-shaped"},
 		{name: "stacked xtrace credential", text: "++ PASSWORD=abc", want: "credential-shaped"},
+		{name: "declare -x credential", text: `declare -x SERVICE_TOKEN="secret-value"`, want: "credential-shaped"},
+		{name: "declare -px credential", text: `declare -px TOKEN=short`, want: "credential-shaped"},
+		{name: "declare -x api key", text: `declare -x OPENAI_API_KEY="sk-sensitive"`, want: "credential-shaped"},
+		{name: "typeset -x credential", text: "typeset -x PASSWORD=abc", want: "credential-shaped"},
 		{name: "environment", text: "HOME=/tmp\nPATH=/bin\nSHELL=/bin/sh\nLANG=C\nTERM=dumb", want: "environment-dump-shaped"},
 		{name: "shell-prefixed environment dump", text: "$ HOME=/tmp\n$ PATH=/bin\n$ SHELL=/bin/sh\n$ LANG=C\n$ TERM=dumb", want: "environment-dump-shaped"},
+		{name: "declare -x environment dump", text: "declare -x HOME=/tmp\ndeclare -x PATH=/bin\ndeclare -x SHELL=/bin/sh\ndeclare -x LANG=C\ndeclare -x TERM=dumb", want: "environment-dump-shaped"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -76,6 +81,8 @@ func TestValidateAllowsCodeReviewAndCompoundWordAssignments(t *testing.T) {
 		"Do not hardcode token = value in production.",
 		`{"password": "secret"}`,
 		"password: hunter2",
+		`declare -x FEATURE_FLAG=true`,
+		`declare -x PATH="/usr/bin"`,
 	} {
 		if err := Validate(Field{Name: "body", Text: text}); err != nil {
 			t.Errorf("Validate(%q) error = %v, want safe", text, err)

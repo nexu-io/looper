@@ -56,7 +56,7 @@ func unsafeText(text string) string {
 	}
 	environmentAssignments := 0
 	for _, rawLine := range strings.Split(text, "\n") {
-		line := stripShellLinePrefix(rawLine)
+		line := stripShellAssignmentDecorators(stripShellLinePrefix(rawLine))
 		if isSensitiveAssignment(line) {
 			return "contains a credential-shaped environment assignment"
 		}
@@ -80,6 +80,8 @@ func unsafeText(text string) string {
 
 // isSensitiveAssignment reports env-style credential assignments such as
 // TOKEN=..., export OPENAI_API_KEY=..., or SERVICE_TOKEN=....
+// Callers should pass lines through stripShellAssignmentDecorators first so
+// bash export -p / declare -px forms are normalized to NAME=value.
 //
 // It intentionally requires shell/env form NAME=value with no spaces around '='
 // and only treats sensitive words as whole name segments. That keeps common
@@ -94,9 +96,6 @@ func unsafeText(text string) string {
 // fail closed (PASSWORD=abc, TOKEN=short).
 func isSensitiveAssignment(line string) bool {
 	line = strings.TrimSpace(line)
-	if len(line) >= 7 && strings.EqualFold(line[:6], "export") && isASCIISpace(line[6]) {
-		line = strings.TrimSpace(line[6:])
-	}
 	eq := strings.IndexByte(line, '=')
 	if eq <= 0 {
 		return false
@@ -109,6 +108,66 @@ func isSensitiveAssignment(line string) bool {
 		return false
 	}
 	return !looksLikeBooleanConfigValue(line[eq+1:])
+}
+
+// stripShellAssignmentDecorators removes common shell export/declaration
+// prefixes so assignment matching works on export -p / declare -px output.
+// Examples: "export TOKEN=...", `declare -x SERVICE_TOKEN="..."`, "typeset -x TOKEN=...".
+func stripShellAssignmentDecorators(line string) string {
+	line = strings.TrimSpace(line)
+	if next, ok := stripLeadingKeyword(line, "export"); ok {
+		line = next
+	}
+	if next, ok := stripLeadingKeywordWithFlags(line, "declare"); ok {
+		return next
+	}
+	if next, ok := stripLeadingKeywordWithFlags(line, "typeset"); ok {
+		return next
+	}
+	return line
+}
+
+func stripLeadingKeyword(line, keyword string) (string, bool) {
+	if len(line) < len(keyword)+1 || !strings.EqualFold(line[:len(keyword)], keyword) || !isASCIISpace(line[len(keyword)]) {
+		return line, false
+	}
+	return strings.TrimSpace(line[len(keyword):]), true
+}
+
+// stripLeadingKeywordWithFlags strips "declare -x ..." / "typeset -px ..." style
+// prefixes, consuming one or more leading "-" flag tokens after the keyword.
+func stripLeadingKeywordWithFlags(line, keyword string) (string, bool) {
+	rest, ok := stripLeadingKeyword(line, keyword)
+	if !ok {
+		return line, false
+	}
+	strippedFlags := false
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" || rest[0] != '-' {
+			break
+		}
+		end := 1
+		for end < len(rest) && !isASCIISpace(rest[end]) {
+			if !isShellFlagChar(rest[end]) {
+				return line, false
+			}
+			end++
+		}
+		if end == 1 {
+			return line, false
+		}
+		rest = strings.TrimSpace(rest[end:])
+		strippedFlags = true
+	}
+	if !strippedFlags || rest == "" {
+		return line, false
+	}
+	return rest, true
+}
+
+func isShellFlagChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 func isEnvVarName(name string) bool {
