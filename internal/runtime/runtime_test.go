@@ -3128,6 +3128,34 @@ func TestRehydrateAPIProjectBindingsRejectsDuplicateRepo(t *testing.T) {
 	}
 }
 
+func TestRehydrateAPIProjectBindingsRejectsProviderBindingDuplicatingGitHubRepo(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(workingDir, "backups"))
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := formatJavaScriptISOString(time.Now().UTC())
+	for _, item := range []storage.ProjectRecord{
+		{ID: "github-project", Name: "GitHub project", RepoPath: filepath.Join(workingDir, "github"), MetadataJSON: stringPtr(`{"repo":"acme/looper"}`), CreatedAt: now, UpdatedAt: now},
+		{ID: "forgejo-project", Name: "Forgejo project", RepoPath: filepath.Join(workingDir, "forgejo"), MetadataJSON: stringPtr(`{"provider":"forgejo-main","repo":"ACME/LOOPER"}`), CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repositories.Projects.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	rt := &Runtime{config: config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}}
+	err := rt.rehydrateAPIProjectBindings(context.Background(), repositories)
+	if err == nil || !strings.Contains(err.Error(), "repository ACME/LOOPER is already bound to project github-project") {
+		t.Fatalf("rehydrateAPIProjectBindings() error = %v, want duplicate GitHub repo error", err)
+	}
+	if len(rt.config.Projects) != 0 {
+		t.Fatalf("runtime projects = %#v, want no bindings after duplicate validation failure", rt.config.Projects)
+	}
+}
+
 func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
 	t.Parallel()
 

@@ -926,7 +926,15 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 		}
 		providerID := projects.ProviderFromMetadata(item.MetadataJSON)
 		repo := runtimeProjectRepo(item.MetadataJSON)
-		if providerID == "" || repo == "" {
+		if repo == "" {
+			continue
+		}
+		normalizedRepo := strings.ToLower(strings.TrimSpace(repo))
+		if existingID, ok := seenRepos[normalizedRepo]; ok && existingID != item.ID {
+			return fmt.Errorf("rehydrate API project %s: repository %s is already bound to project %s", item.ID, repo, existingID)
+		}
+		seenRepos[normalizedRepo] = item.ID
+		if providerID == "" {
 			continue
 		}
 		providerConfigured := false
@@ -942,11 +950,6 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 		if err := config.ValidateRuntimeProjectBinding(r.config, item.ID, repo); err != nil {
 			return fmt.Errorf("rehydrate API project %s: %w", item.ID, err)
 		}
-		normalizedRepo := strings.ToLower(strings.TrimSpace(repo))
-		if existingID, ok := seenRepos[normalizedRepo]; ok && existingID != item.ID {
-			return fmt.Errorf("rehydrate API project %s: repository %s is already bound to project %s", item.ID, repo, existingID)
-		}
-		seenRepos[normalizedRepo] = item.ID
 	}
 	for _, item := range items {
 		if item.Archived {
