@@ -211,6 +211,59 @@ func TestServiceAddProjectValidatesBindingBeforePersisting(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectRejectsRepoStoredByAnotherAPIProject(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	metadata := `{"repo":"Acme/Looper","source":"api"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID:           "github-project",
+		Name:         "GitHub project",
+		RepoPath:     "/tmp/github-project",
+		MetadataJSON: &metadata,
+		CreatedAt:    currentISO(func() time.Time { return now }),
+		UpdatedAt:    currentISO(func() time.Time { return now }),
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "LOOPER_FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{
+		ID:       "forgejo-main",
+		Kind:     config.ProviderKindForgejo,
+		BaseURL:  "https://code.example.com",
+		TokenEnv: &tokenEnv,
+	}}
+	service := &Service{DB: coordinator.DB(), Repos: repos, Config: cfg, Now: func() time.Time { return now }}
+	provider := "forgejo-main"
+	repo := "acme/looper"
+
+	_, err = service.AddProject(ctx, AddInput{
+		ID:       "forgejo-project",
+		Name:     "Forgejo project",
+		RepoPath: "/tmp/forgejo-project",
+		Repo:     &repo,
+		Provider: &provider,
+	})
+	if err == nil || !strings.Contains(err.Error(), "repository acme/looper is already bound to project github-project") {
+		t.Fatalf("AddProject() error = %v, want stored repo binding error", err)
+	}
+	stored, getErr := repos.Projects.GetByID(ctx, "forgejo-project")
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID() error = %v", getErr)
+	}
+	if stored != nil {
+		t.Fatalf("Projects.GetByID() = %#v, want no persisted duplicate", stored)
+	}
+}
+
 func TestServiceAddProjectRejectsProjectIDWithBackslash(t *testing.T) {
 	t.Parallel()
 

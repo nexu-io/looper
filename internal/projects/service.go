@@ -226,6 +226,9 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		Repo:      stringValue(repo),
 		RepoPath:  input.RepoPath,
 	}
+	if err := s.validateStoredRepoBinding(ctx, binding); err != nil {
+		return AddResult{}, err
+	}
 	if s.ValidateBinding != nil {
 		if err := s.ValidateBinding(binding); err != nil {
 			return AddResult{}, err
@@ -324,6 +327,28 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		CapturedSnapshots:      capturedSnapshots,
 		Warnings:               warnings,
 	}, nil
+}
+
+func (s *Service) validateStoredRepoBinding(ctx context.Context, binding ProjectBinding) error {
+	repo := strings.TrimSpace(binding.Repo)
+	if repo == "" {
+		return nil
+	}
+	storedProjects, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, stored := range storedProjects {
+		if stored.Archived || stored.ID == binding.ProjectID {
+			continue
+		}
+		metadata := parseMetadata(stored.MetadataJSON)
+		storedRepo, _ := metadata["repo"].(string)
+		if strings.EqualFold(strings.TrimSpace(storedRepo), repo) {
+			return ProjectValidationError{Message: fmt.Sprintf("repository %s is already bound to project %s", repo, stored.ID)}
+		}
+	}
+	return nil
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*storage.ProjectRecord, error) {
