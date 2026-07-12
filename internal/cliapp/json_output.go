@@ -204,6 +204,9 @@ func (r *commandRuntime) resolveProjectAddProvider(ctx context.Context, cmd *cob
 	if strings.TrimSpace(repoPath) == "" {
 		return provider, repo, nil
 	}
+	if repo != "" {
+		return provider, repo, nil
+	}
 
 	host, detectedRepo := r.detectProjectOrigin(ctx, repoPath)
 	if host == "" || gitinfra.IsGitHubRemoteHost(host) {

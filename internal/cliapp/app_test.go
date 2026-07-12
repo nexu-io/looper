@@ -1317,6 +1317,32 @@ func TestProjectAddJSONRequiresProviderForNonGitHubRemote(t *testing.T) {
 	}
 }
 
+func TestProjectAddJSONAllowsExplicitRepoForNonGitHubRemote(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	runGit(t, repoPath, "init")
+	runGit(t, repoPath, "remote", "add", "origin", "git@ghe.example.com:acme/looper.git")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if got, want := body["repo"], "ghe.example.com/acme/looper"; got != want {
+			t.Fatalf("body.repo = %#v, want %#v", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_project", map[string]any{"id": "looper", "repoPath": repoPath}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "project", "add", repoPath, "--repo", "ghe.example.com/acme/looper", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([project add --repo ... --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+}
+
 func TestProjectAddResolvesRelativePathsBeforePosting(t *testing.T) {
 	root := t.TempDir()
 	originalCWD, err := os.Getwd()

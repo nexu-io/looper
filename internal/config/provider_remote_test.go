@@ -82,6 +82,8 @@ func TestUpsertRuntimeProjectBindingAppliesForgejoProfile(t *testing.T) {
 			{ID: "forgejo-main", Kind: ProviderKindForgejo, BaseURL: "https://code.example.com"},
 		},
 	}
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
 	UpsertRuntimeProjectBinding(&cfg, "odcrew", "odcrew", "forgejo-main", "core/odcrew", "/tmp/odcrew")
 	if len(cfg.Projects) != 1 {
 		t.Fatalf("Projects len = %d, want 1", len(cfg.Projects))
@@ -95,6 +97,13 @@ func TestUpsertRuntimeProjectBindingAppliesForgejoProfile(t *testing.T) {
 	}
 	if project.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest == nil || *project.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
 		t.Fatalf("RequireReviewRequest = %#v, want false", project.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest)
+	}
+	effectiveRoles := ProjectRoleConfigs(cfg, "odcrew")
+	if effectiveRoles.Coordinator.Enabled {
+		t.Fatal("runtime forgejo coordinator enabled = true, want false")
+	}
+	if effectiveRoles.Coordinator.Dependencies.Enabled {
+		t.Fatal("runtime forgejo coordinator dependencies enabled = true, want false")
 	}
 	// Runtime projects are updated when the API registers the same ID again.
 	UpsertRuntimeProjectBinding(&cfg, "odcrew", "other", "forgejo-main", "core/other", "/tmp/other")
