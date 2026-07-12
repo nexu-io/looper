@@ -200,7 +200,7 @@ vendor = "grok-build"
 
 Authenticate the daemon safely with `grok login --device-auth`, or make `XAI_API_KEY` available in the daemon environment. Do not put API-key values in committed config files or examples.
 
-For fresh unattended runs, Looper supplies `--always-approve` and `--sandbox none` so Grok can update Git metadata outside a linked worktree. Configured agent arguments override these defaults; in particular, operators can select a stricter `--sandbox` when the repository layout permits it, `--permission-mode` may prompt or fail unattended runs, non-`plain` `--output-format` can prevent direct `__LOOPER_RESULT__=` completion-marker parsing, and configured `-p` or `--single` replaces Looper's generated task prompt.
+For fresh unattended runs, Looper supplies `--always-approve` and `--sandbox off` so Grok can update Git metadata outside a linked worktree. Configured agent arguments override these defaults; in particular, operators can select a stricter `--sandbox` when the repository layout permits it, `--permission-mode` may prompt or fail unattended runs, non-`plain` `--output-format` can prevent direct `__LOOPER_RESULT__=` completion-marker parsing, and configured `-p` or `--single` replaces Looper's generated task prompt.
 
 Grok Build support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt, and Looper never uses Grok Build's ambient `--continue`.
 

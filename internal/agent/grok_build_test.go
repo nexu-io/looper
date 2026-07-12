@@ -23,23 +23,23 @@ func TestResolveGrokArgs(t *testing.T) {
 		args []string
 		want []string
 	}{
-		{"default", nil, []string{"--model", model, "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none", "--no-auto-update"}},
-		{"configured model", []string{"-m", "custom"}, []string{"-m", "custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
-		{"long model", []string{"--model", "custom"}, []string{"--model", "custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
-		{"equals model", []string{"--model=custom"}, []string{"--model=custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
-		{"short prompt", []string{"-p", "custom"}, []string{"--model", model, "-p", "custom", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
-		{"long prompt", []string{"--single", "custom"}, []string{"--model", model, "--single", "custom", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
-		{"prompt forms", []string{"--single=custom"}, []string{"--model", model, "--single=custom", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
+		{"default", nil, []string{"--model", model, "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off", "--no-auto-update"}},
+		{"configured model", []string{"-m", "custom"}, []string{"-m", "custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
+		{"long model", []string{"--model", "custom"}, []string{"--model", "custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
+		{"equals model", []string{"--model=custom"}, []string{"--model=custom", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
+		{"short prompt", []string{"-p", "custom"}, []string{"--model", model, "-p", "custom", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
+		{"long prompt", []string{"--single", "custom"}, []string{"--model", model, "--single", "custom", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
+		{"prompt forms", []string{"--single=custom"}, []string{"--model", model, "--single=custom", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
 		{"cwd output sandbox", []string{"--cwd", "/operator", "--output-format", "json", "--sandbox", "none"}, []string{"--model", model, "--cwd", "/operator", "--output-format", "json", "--sandbox", "none", "-p", prompt, "--always-approve"}},
 		{"cwd output sandbox equals", []string{"--cwd=/operator", "--output-format=json", "--sandbox=none"}, []string{"--model", model, "--cwd=/operator", "--output-format=json", "--sandbox=none", "-p", prompt, "--always-approve"}},
 		{"configured workspace sandbox", []string{"--sandbox", "workspace"}, []string{"--model", model, "--sandbox", "workspace", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve"}},
-		{"permission mode", []string{"--permission-mode", "ask"}, []string{"--model", model, "--permission-mode", "ask", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "none"}},
-		{"permission mode equals", []string{"--permission-mode=ask"}, []string{"--model", model, "--permission-mode=ask", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "none"}},
-		{"always approve", []string{"--always-approve"}, []string{"--model", model, "--always-approve", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "none"}},
-		{"approval aliases", []string{"--yolo"}, []string{"--model", model, "--yolo", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "none"}},
-		{"dangerous approval alias", []string{"--dangerously-skip-permissions"}, []string{"--model", model, "--dangerously-skip-permissions", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "none"}},
-		{"prompt sources retain generated prompt", []string{"--prompt-file", "task.txt", "--prompt-json"}, []string{"--model", model, "--prompt-file", "task.txt", "--prompt-json", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
-		{"configured no auto update", []string{"--no-auto-update"}, []string{"--model", model, "--no-auto-update", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none"}},
+		{"permission mode", []string{"--permission-mode", "ask"}, []string{"--model", model, "--permission-mode", "ask", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "off"}},
+		{"permission mode equals", []string{"--permission-mode=ask"}, []string{"--model", model, "--permission-mode=ask", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "off"}},
+		{"always approve", []string{"--always-approve"}, []string{"--model", model, "--always-approve", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "off"}},
+		{"approval aliases", []string{"--yolo"}, []string{"--model", model, "--yolo", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "off"}},
+		{"dangerous approval alias", []string{"--dangerously-skip-permissions"}, []string{"--model", model, "--dangerously-skip-permissions", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--sandbox", "off"}},
+		{"prompt sources retain generated prompt", []string{"--prompt-file", "task.txt", "--prompt-json"}, []string{"--model", model, "--prompt-file", "task.txt", "--prompt-json", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
+		{"configured no auto update", []string{"--no-auto-update"}, []string{"--model", model, "--no-auto-update", "-p", prompt, "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -87,7 +87,7 @@ func TestGrokBuildExecutionContractAndUnsupportedResume(t *testing.T) {
 		t.Fatalf("read observed args: %v", err)
 	}
 	got := strings.Split(strings.TrimSpace(string(observed)), "\n")
-	want := []string{"-p", "fresh prompt", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "none", "--no-auto-update", "env:" + workdir, "dir:" + workdir}
+	want := []string{"-p", "fresh prompt", "--cwd", workdir, "--output-format", "plain", "--always-approve", "--sandbox", "off", "--no-auto-update", "env:" + workdir, "dir:" + workdir}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("observed = %#v, want %#v", got, want)
 	}
