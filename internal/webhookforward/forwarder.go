@@ -85,6 +85,7 @@ type Forwarder interface {
 	Forward(context.Context, DeliveryRequest) (ForwardResult, error)
 	Stats() Stats
 	Close()
+	CloseAndWait()
 }
 
 type TargetedReviewer interface {
@@ -218,6 +219,7 @@ type forwarder struct {
 	currentInFlight int
 	workerCtx       context.Context
 	cancelWorkers   context.CancelFunc
+	workerWG        sync.WaitGroup
 }
 
 func New(options Options) Forwarder {
@@ -265,6 +267,7 @@ func New(options Options) Forwarder {
 	}
 	f.cond = sync.NewCond(&f.mu)
 	for i := 0; i < f.maxConcurrent; i++ {
+		f.workerWG.Add(1)
 		go f.worker()
 	}
 	return f
@@ -347,6 +350,11 @@ func (f *forwarder) Close() {
 	f.mu.Unlock()
 }
 
+func (f *forwarder) CloseAndWait() {
+	f.Close()
+	f.workerWG.Wait()
+}
+
 func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed routedDelivery, metadata workMetadata) (int, error) {
 	type candidate struct {
 		key   workKey
@@ -422,6 +430,7 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 }
 
 func (f *forwarder) worker() {
+	defer f.workerWG.Done()
 	for {
 		key, item, ok := f.nextWork()
 		if !ok {

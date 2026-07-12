@@ -76,11 +76,81 @@ func TestSyncRuntimeProjectBindingDrainsAcceptedGitHubWorkAcrossForgejoRebind(t 
 	}
 }
 
+func TestRuntimeStopKeepsStorageOpenUntilWebhookWorkDrains(t *testing.T) {
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
+	repositories := storage.NewRepositories(coordinator.DB())
+	metadata := `{"repo":"acme/looper"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: workingDir, MetadataJSON: &metadata, CreatedAt: "2026-07-12T12:00:00.000Z", UpdatedAt: "2026-07-12T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = true
+	runner := &storageCheckingReviewer{repositories: repositories, started: make(chan struct{}), release: make(chan struct{}), result: make(chan error, 1)}
+	forwarder := webhookforward.New(webhookforward.Options{Repos: repositories, Config: cfg, Reviewer: runner, MaxConcurrent: 1, QueueCapacity: 8})
+	rt := New(Options{Config: cfg})
+	rt.services = Services{Coordinator: coordinator, Repositories: repositories}
+	rt.webhookForwarder = forwarder
+
+	if _, err := forwarder.Forward(context.Background(), webhookforward.DeliveryRequest{DeliveryID: "running-github", EventType: "pull_request", Payload: []byte(`{"action":"review_requested","repository":{"full_name":"acme/looper"},"pull_request":{"number":1}}`)}); err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("webhook delivery did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		rt.Stop("test")
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("Runtime.Stop() returned before webhook work drained")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(runner.release)
+	select {
+	case err := <-runner.result:
+		if err != nil {
+			t.Fatalf("Projects.List() while draining error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("webhook work did not access storage")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime.Stop() did not return after webhook work drained")
+	}
+}
+
 type rebindBlockingReviewer struct {
 	mu      sync.Mutex
 	calls   int
 	started chan struct{}
 	release chan struct{}
+}
+
+type storageCheckingReviewer struct {
+	repositories *storage.Repositories
+	started      chan struct{}
+	release      chan struct{}
+	result       chan error
+}
+
+func (r *storageCheckingReviewer) DiscoverPullRequest(ctx context.Context, _ reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	close(r.started)
+	<-r.release
+	_, err := r.repositories.Projects.List(ctx)
+	r.result <- err
+	return reviewer.DiscoveryResult{}, err
 }
 
 func (r *rebindBlockingReviewer) DiscoverPullRequest(context.Context, reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {

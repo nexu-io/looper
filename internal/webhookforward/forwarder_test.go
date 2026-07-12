@@ -358,6 +358,37 @@ func TestCloseDrainsAcceptedWorkWithoutWaitingForRunningWork(t *testing.T) {
 	}
 }
 
+func TestCloseAndWaitDrainsAcceptedWorkBeforeReturning(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	block := make(chan struct{})
+	reviewerRunner := newFakeTargetedRunner(block)
+	forwarder := New(Options{Repos: repos, Config: testConfig(t), Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: newFakeTargetedRunner(nil)}, MaxConcurrent: 1, QueueCapacity: 8})
+
+	if _, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "running-github", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 1)}); err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	reviewerRunner.waitForCall(t, 1)
+
+	closed := make(chan struct{})
+	go func() {
+		forwarder.CloseAndWait()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("CloseAndWait() returned before running work completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(block)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("CloseAndWait() did not return after running work completed")
+	}
+}
+
 func TestForwardRoutesPushToBaseBranchFixerDiscovery(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")

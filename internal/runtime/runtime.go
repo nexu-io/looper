@@ -107,6 +107,7 @@ type WebhookForwarder interface {
 	Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error)
 	Stats() webhookforward.Stats
 	Close()
+	CloseAndWait()
 }
 
 type Runtime struct {
@@ -280,7 +281,7 @@ func (r *Runtime) Stop(reason string) {
 		r.mu.Unlock()
 
 		if forwarder != nil {
-			forwarder.Close()
+			forwarder.CloseAndWait()
 		}
 		if networkManager != nil {
 			networkManager.Stop()

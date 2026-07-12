@@ -178,6 +178,8 @@ func (f *testTunnelForwarder) Stats() webhookforward.Stats { return webhookforwa
 
 func (f *testTunnelForwarder) Close() {}
 
+func (f *testTunnelForwarder) CloseAndWait() {}
+
 func (f *testTunnelForwarder) reset() {
 	f.calls = 0
 	f.lastRequest = webhookforward.DeliveryRequest{}
