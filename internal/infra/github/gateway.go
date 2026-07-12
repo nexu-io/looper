@@ -1801,11 +1801,7 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
 	request := g.reviewSubmitRequest(input)
-	fields := []outboundguard.Field{{Name: "review body", Text: input.Body}}
-	for i, comment := range input.Comments {
-		fields = append(fields, outboundguard.Field{Name: fmt.Sprintf("inline review comment %d", i+1), Text: comment.Body})
-	}
-	if err := outboundguard.Validate(fields...); err != nil {
+	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
 		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
 		return err
 	}
@@ -1817,6 +1813,12 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	var flags []reviewQualityFlag
 	var processing reviewCommentProcessing
 	input.Body, input.Comments, flags, processing = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
+	// Re-validate after normalization: FallbackBody / retarget prefixes embed agent path
+	// into the top-level review body, which was not present in the pre-normalize fields.
+	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		return err
+	}
 	request = g.reviewSubmitRequest(input)
 	request["comment_processing"] = map[string]any{
 		"original_count":   processing.OriginalCount,
@@ -1925,6 +1927,27 @@ func (g *Gateway) emitReviewSubmitDiagnostic(event string, fields map[string]any
 	if g.reviewSubmitDiagnostic != nil {
 		g.reviewSubmitDiagnostic(event, fields)
 	}
+}
+
+// validateReviewOutboundContent checks review body, inline comment bodies, and
+// anchor paths. Paths are included because normalizeReviewAnchors can embed
+// them into the published top-level body via FallbackBody / retarget prefixes,
+// and kept comments publish path on the GitHub review API.
+func validateReviewOutboundContent(body string, comments []ReviewComment) error {
+	fields := []outboundguard.Field{{Name: "review body", Text: body}}
+	for i, comment := range comments {
+		fields = append(fields, outboundguard.Field{
+			Name: fmt.Sprintf("inline review comment %d", i+1),
+			Text: comment.Body,
+		})
+		if path := strings.TrimSpace(comment.Path); path != "" {
+			fields = append(fields, outboundguard.Field{
+				Name: fmt.Sprintf("inline review comment %d path", i+1),
+				Text: path,
+			})
+		}
+	}
+	return outboundguard.Validate(fields...)
 }
 
 func (g *Gateway) reviewSubmitRequest(input SubmitReviewInput) map[string]any {

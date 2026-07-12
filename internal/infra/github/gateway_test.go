@@ -771,6 +771,30 @@ func TestSubmitReviewRejectsCredentialAssignmentInInlineCommentBeforePublishing(
 	}
 }
 
+func TestSubmitReviewRejectsCredentialInCommentPathAfterNormalization(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	anchors := diffanchor.Index{Ranges: []diffanchor.Range{{Path: "app.go", Side: "RIGHT", Start: 1, End: 1}}}
+
+	// Secret lives only in Path; body is safe. Without post-normalize / path
+	// guarding, FallbackBody would publish "Location: SERVICE_TOKEN=secret-value ...".
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{
+		Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Please address the findings.", CommitID: "abc123",
+		Comments: []ReviewComment{{Body: "Null check is missing here.", Path: "SERVICE_TOKEN=secret-value", Line: 99, Side: "RIGHT"}},
+		Anchors:  &anchors,
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential-shaped environment assignment") {
+		t.Fatalf("SubmitReview() error = %v, want credential assignment rejection for path", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+}
+
 func TestOutboundPublicationMethodsRejectUnsafeContentBeforePublishing(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {

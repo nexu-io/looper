@@ -21,7 +21,11 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 		{name: "database URL", text: "DATABASE_URL=postgres://app:pw@db.example/prod", want: "credential-bearing"},
 		{name: "exported connection URL", text: "export CACHE_URL=redis://worker:p%40ss@cache.example/0", want: "credential-bearing"},
 		{name: "connection URL in prose", text: "Connect with mongodb+srv://agent:short@db.example/prod.", want: "credential-bearing"},
+		{name: "shell prompt credential", text: "$ SERVICE_TOKEN=secret-value", want: "credential-shaped"},
+		{name: "xtrace export credential", text: "+ export TOKEN=short", want: "credential-shaped"},
+		{name: "stacked xtrace credential", text: "++ PASSWORD=abc", want: "credential-shaped"},
 		{name: "environment", text: "HOME=/tmp\nPATH=/bin\nSHELL=/bin/sh\nLANG=C\nTERM=dumb", want: "environment-dump-shaped"},
+		{name: "shell-prefixed environment dump", text: "$ HOME=/tmp\n$ PATH=/bin\n$ SHELL=/bin/sh\n$ LANG=C\n$ TERM=dumb", want: "environment-dump-shaped"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -42,7 +42,7 @@ func unsafeText(text string) string {
 	}
 	environmentAssignments := 0
 	for _, rawLine := range strings.Split(text, "\n") {
-		line := strings.TrimSpace(rawLine)
+		line := stripShellLinePrefix(rawLine)
 		if sensitiveAssignmentRE.MatchString(line) {
 			return "contains a credential-shaped environment assignment"
 		}
@@ -62,6 +62,40 @@ func unsafeText(text string) string {
 		}
 	}
 	return ""
+}
+
+// stripShellLinePrefix removes common shell prompt and xtrace prefixes so
+// assignment detection works on terminal output copied into review text.
+// Examples: "$ SERVICE_TOKEN=...", "+ export TOKEN=...", "++ FOO=bar".
+func stripShellLinePrefix(line string) string {
+	line = strings.TrimSpace(line)
+	for {
+		if !strings.HasPrefix(line, "+") {
+			break
+		}
+		if len(line) == 1 {
+			return ""
+		}
+		next := line[1]
+		if next == '+' {
+			line = line[1:]
+			continue
+		}
+		if next == ' ' || next == '\t' {
+			line = strings.TrimSpace(line[1:])
+			continue
+		}
+		break
+	}
+	if len(line) >= 2 {
+		switch line[0] {
+		case '$', '#', '%':
+			if line[1] == ' ' || line[1] == '\t' {
+				line = strings.TrimSpace(line[1:])
+			}
+		}
+	}
+	return line
 }
 
 func characterClassCount(value string) int {
