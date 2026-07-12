@@ -919,6 +919,7 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	seenRepos := make(map[string]string)
 	for _, item := range items {
 		if item.Archived {
 			continue
@@ -937,6 +938,24 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 		}
 		if !providerConfigured {
 			return fmt.Errorf("rehydrate API project %s: provider %q is not configured", item.ID, providerID)
+		}
+		if err := config.ValidateRuntimeProjectBinding(r.config, item.ID, repo); err != nil {
+			return fmt.Errorf("rehydrate API project %s: %w", item.ID, err)
+		}
+		normalizedRepo := strings.ToLower(strings.TrimSpace(repo))
+		if existingID, ok := seenRepos[normalizedRepo]; ok && existingID != item.ID {
+			return fmt.Errorf("rehydrate API project %s: repository %s is already bound to project %s", item.ID, repo, existingID)
+		}
+		seenRepos[normalizedRepo] = item.ID
+	}
+	for _, item := range items {
+		if item.Archived {
+			continue
+		}
+		providerID := projects.ProviderFromMetadata(item.MetadataJSON)
+		repo := runtimeProjectRepo(item.MetadataJSON)
+		if providerID == "" || repo == "" {
+			continue
 		}
 		config.UpsertRuntimeProjectBinding(&r.config, item.ID, item.Name, providerID, repo, item.RepoPath)
 	}

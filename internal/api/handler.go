@@ -478,7 +478,14 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	}
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	eventType := r.Header.Get("X-GitHub-Event")
-	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
+	delivery := webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body}
+	result, err := forwarder.Forward(r.Context(), delivery)
+	if errors.Is(err, webhookforward.ErrForwarderClosed) {
+		current := h.currentWebhookForwarder()
+		if current != nil && current != forwarder {
+			result, err = current.Forward(r.Context(), delivery)
+		}
+	}
 	if err != nil {
 		status := http.StatusBadRequest
 		code := pkgapi.ErrorCodeValidationFailed

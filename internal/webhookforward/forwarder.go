@@ -26,6 +26,8 @@ const (
 	maxRetries               = 2
 )
 
+var ErrForwarderClosed = errors.New("webhook forwarder is closed")
+
 type Lane string
 
 const (
@@ -286,7 +288,7 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
-		return ForwardResult{}, fmt.Errorf("webhook forwarder is closed")
+		return ForwardResult{}, ErrForwarderClosed
 	}
 	f.stats.DeliveriesReceived++
 	f.pruneExpiredDeliveriesLocked(now)
