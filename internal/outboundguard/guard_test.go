@@ -14,6 +14,10 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 	}{
 		{name: "entropy", text: "The process returned q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/ unexpectedly.", want: "high-entropy"},
 		{name: "credential", text: "OPENAI_API_KEY=sk-sensitive", want: "credential-shaped"},
+		{name: "token at start", text: "TOKEN=short", want: "credential-shaped"},
+		{name: "secret at start", text: "SECRET_KEY=1234", want: "credential-shaped"},
+		{name: "password at start", text: "PASSWORD=abc", want: "credential-shaped"},
+		{name: "API key at start", text: "API_KEY=deadbeef", want: "credential-shaped"},
 		{name: "environment", text: "HOME=/tmp\nPATH=/bin\nSHELL=/bin/sh\nLANG=C\nTERM=dumb", want: "environment-dump-shaped"},
 	}
 	for _, tc := range tests {
