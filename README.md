@@ -35,7 +35,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 - 🐙 **The forge is the source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline. GitHub is fully supported; Forgejo is supported for planner, worker, and summary-comment reviewer/fixer flows.
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
-- 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`) so you're not locked into one model or CLI.
+- 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`, `grok-build`) so you're not locked into one model or CLI.
 - 🧰 **Local, inspectable, stoppable.** Daemon on your machine, thin CLI to drive it. `looper ps`, `looper logs`, `looper stop` — no hosted control plane.
 
 ## Quick start
@@ -120,7 +120,7 @@ looper takeover acme/repo#42
 - starts a continuous **reviewer** loop and **fixer** loop on the PR, which ping-pong until the review comes back clean;
 - with `--merge`, lets the reviewer enable GitHub auto-merge so the PR merges itself once it's approved and green.
 
-It picks your coding agent automatically when exactly one of `claude` / `codex` / `opencode` is on `PATH`, prompts when it's ambiguous, and accepts `--agent-vendor` / `--yes` for non-interactive (agent-driven) runs:
+It picks your coding agent automatically when exactly one of `claude` / `codex` / `grok` / `opencode` is on `PATH`, prompts when it's ambiguous, and accepts `--agent-vendor` / `--yes` for non-interactive (agent-driven) runs:
 
 ```bash
 looper takeover acme/repo#42 --merge --agent-vendor claude-code
@@ -135,7 +135,7 @@ looper takeover stop acme/repo#42    # stop this takeover's reviewer + fixer loo
 looper takeover stop --all
 ```
 
-Requirements: `git`, an authenticated `gh`, and one supported agent CLI installed locally (the agent runs on your machine with your own credentials).
+Requirements: `git`, an authenticated `gh`, and one supported agent CLI installed locally (the agent runs on your machine with your own credentials). Grok Build from xAI uses `agent.vendor = "grok-build"` and the `grok` executable; see [Grok Build configuration](docs/configuration.md#grok-build-xai) for daemon authentication and automation limits.
 
 ### One-liner for not-yet-installed users
 

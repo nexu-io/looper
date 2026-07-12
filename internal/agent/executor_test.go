@@ -24,32 +24,32 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 	if command != "claude" {
 		t.Fatalf("claude command = %q, want claude", command)
 	}
-	if len(args) < 4 || args[0] != "--model" || args[2] != "--print" {
-		t.Fatalf("claude args = %#v, want --model <model> --print <prompt>", args)
+	if got, want := strings.Join(args, " "), "--model gpt-5 --print hello --dangerously-skip-permissions"; got != want {
+		t.Fatalf("claude args = %q, want %q", got, want)
 	}
 
 	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex, Model: &model}, workDir, "hello")
 	if command != "codex" {
 		t.Fatalf("codex command = %q, want codex", command)
 	}
-	if len(args) < 4 || args[0] != "exec" || args[1] != "--model" || args[len(args)-1] != "hello" {
-		t.Fatalf("codex args = %#v, want exec --model <model> <prompt>", args)
+	if got, want := strings.Join(args, " "), "exec --model gpt-5 hello"; got != want {
+		t.Fatalf("codex args = %q, want %q", got, want)
 	}
 
 	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorOpenCode, Model: &model}, workDir, "hello")
 	if command != "opencode" {
 		t.Fatalf("opencode command = %q, want opencode", command)
 	}
-	if len(args) < 6 || args[0] != "run" || args[1] != "--model" || args[3] != "--dir" || args[4] != workDir || args[len(args)-1] != "hello" {
-		t.Fatalf("opencode args = %#v, want run --model <model> --dir <cwd> <prompt>", args)
+	if got, want := strings.Join(args, " "), "run --model gpt-5 --dir "+workDir+" hello"; got != want {
+		t.Fatalf("opencode args = %q, want %q", got, want)
 	}
 
 	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCursorCLI, Model: &model}, workDir, "hello")
 	if command != "agent" {
 		t.Fatalf("cursor command = %q, want agent", command)
 	}
-	if len(args) < 4 || args[0] != "--model" || args[2] != "--print" {
-		t.Fatalf("cursor args = %#v, want --model <model> --print <prompt>", args)
+	if got, want := strings.Join(args, " "), "--model gpt-5 --print hello"; got != want {
+		t.Fatalf("cursor args = %q, want %q", got, want)
 	}
 }
 

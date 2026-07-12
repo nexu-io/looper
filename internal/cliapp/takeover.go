@@ -32,6 +32,7 @@ var takeoverVendorBinaries = []struct {
 	{config.AgentVendorClaudeCode, "claude"},
 	{config.AgentVendorCodex, "codex"},
 	{config.AgentVendorOpenCode, "opencode"},
+	{config.AgentVendorGrokBuild, "grok"},
 }
 
 type takeoverOptions struct {
@@ -297,7 +298,7 @@ func (r *commandRuntime) resolveTakeoverVendor(cmd *cobra.Command, opts takeover
 	if opts.AgentVendor != "" {
 		vendor := config.AgentVendor(opts.AgentVendor)
 		if !isSupportedBootstrapVendor(vendor) {
-			return "", "", fmt.Errorf("unsupported --agent-vendor %q (supported: claude-code, codex, opencode, cursor-cli)", opts.AgentVendor)
+			return "", "", fmt.Errorf("unsupported --agent-vendor %q (supported: claude-code, codex, opencode, cursor-cli, grok-build)", opts.AgentVendor)
 		}
 		return vendor, "", nil
 	}
@@ -313,7 +314,7 @@ func (r *commandRuntime) resolveTakeoverVendor(cmd *cobra.Command, opts takeover
 
 	if opts.Yes {
 		if len(detected) == 0 {
-			return "", "", fmt.Errorf("no supported agent CLI detected on PATH; install one (claude, codex, or opencode) or pass --agent-vendor")
+			return "", "", fmt.Errorf("no supported agent CLI detected on PATH; install one (claude, codex, opencode, or grok) or pass --agent-vendor")
 		}
 		return "", "", fmt.Errorf("multiple agent CLIs detected (%s); pass --agent-vendor to choose one", joinVendors(detected))
 	}
@@ -345,9 +346,9 @@ func (r *commandRuntime) promptTakeoverVendor(cmd *cobra.Command, detected []con
 	if len(detected) > 0 {
 		defaultValue = string(detected[0])
 	}
-	label := "Agent vendor [claude-code/codex/opencode/cursor-cli]"
+	label := "Agent vendor [claude-code/codex/opencode/cursor-cli/grok-build]"
 	if len(detected) > 0 {
-		label = fmt.Sprintf("Agent vendor (detected: %s) [claude-code/codex/opencode/cursor-cli]", joinVendors(detected))
+		label = fmt.Sprintf("Agent vendor (detected: %s) [claude-code/codex/opencode/cursor-cli/grok-build]", joinVendors(detected))
 	}
 	answer, err := promptBootstrapString(reader, cmd.OutOrStdout(), label, defaultValue)
 	if err != nil {
@@ -359,7 +360,7 @@ func (r *commandRuntime) promptTakeoverVendor(cmd *cobra.Command, detected []con
 	}
 	vendor := config.AgentVendor(answer)
 	if !isSupportedBootstrapVendor(vendor) {
-		return "", fmt.Errorf("unsupported agent vendor %q (supported: claude-code, codex, opencode, cursor-cli)", answer)
+		return "", fmt.Errorf("unsupported agent vendor %q (supported: claude-code, codex, opencode, cursor-cli, grok-build)", answer)
 	}
 	return vendor, nil
 }

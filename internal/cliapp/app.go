@@ -439,7 +439,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				runE:            runtime.takeover,
 				helpSubcommands: []helpSubcommand{{name: "list", description: "List active takeovers"}, {name: "stop", description: "Stop a takeover's reviewer and fixer loops"}},
 				localFlags: []flagSpec{
-					stringFlag("agent-vendor", "vendor", "Agent vendor to run loops (claude-code, codex, opencode, cursor-cli)"),
+					stringFlag("agent-vendor", "vendor", "Agent vendor to run loops (claude-code, codex, opencode, cursor-cli, grok-build)"),
 					boolFlag("merge", "Let the reviewer enable auto-merge once the PR is approved and green"),
 					boolFlag("no-fix", "Only run the reviewer loop; skip the fixer loop"),
 					boolFlag("yes", "Run non-interactively; fail instead of prompting for the agent vendor"),

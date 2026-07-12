@@ -1297,6 +1297,8 @@ func resolveCommand(cfg ExecutorConfig) string {
 		return "claude"
 	case config.AgentVendorCursorCLI:
 		return "agent"
+	case config.AgentVendorGrokBuild:
+		return "grok"
 	default:
 		return string(cfg.Vendor)
 	}
@@ -1313,6 +1315,8 @@ func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []s
 		return resolveOpenCodeArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	case config.AgentVendorCursorCLI:
 		return resolveCursorArgs(cfg, resolvedArgs, prompt)
+	case config.AgentVendorGrokBuild:
+		return resolveGrokArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	default:
 		return append([]string{}, resolvedArgs...)
 	}
@@ -1365,6 +1369,26 @@ func resolveCursorArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 		return resolved
 	}
 	return append(resolved, "--print", prompt)
+}
+
+func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"-m", "--model"})
+	if !hasAnyFlag(resolved, []string{"-p", "--single"}) {
+		resolved = append(resolved, "-p", prompt)
+	}
+	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--cwd"}) {
+		resolved = append(resolved, "--cwd", workingDirectory)
+	}
+	if !hasAnyFlag(resolved, []string{"--output-format"}) {
+		resolved = append(resolved, "--output-format", "plain")
+	}
+	if !hasAnyFlag(resolved, []string{"--always-approve", "--yolo", "--dangerously-skip-permissions", "--permission-mode"}) {
+		resolved = append(resolved, "--always-approve")
+	}
+	if !hasAnyFlag(resolved, []string{"--sandbox"}) {
+		resolved = append(resolved, "--sandbox", "workspace")
+	}
+	return resolved
 }
 
 func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
