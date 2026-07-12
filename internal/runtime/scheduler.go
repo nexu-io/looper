@@ -2121,6 +2121,34 @@ func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() fun
 		noop := func(context.Context, Services) error { return nil }
 		return defaultSchedulerHandlers{tick: noop, claim: noop}
 	}
+	if configReadLock != nil {
+		snapshot := func() config.Config {
+			unlock := configReadLock()
+			defer unlock()
+			cloned := *cfg
+			cloned.Projects = append([]config.ProjectRefConfig(nil), cfg.Projects...)
+			return cloned
+		}
+		buildSnapshotHandlers := func() defaultSchedulerHandlers {
+			cloned := snapshot()
+			return buildDefaultSchedulerHandlers(&cloned, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns)
+		}
+		// Runtime startup already holds the config write lock while constructing
+		// handlers, so take the initial webhook snapshot directly. Tick and claim
+		// snapshots are taken later through configReadLock.
+		initialConfig := *cfg
+		initialConfig.Projects = append([]config.ProjectRefConfig(nil), cfg.Projects...)
+		initial := buildDefaultSchedulerHandlers(&initialConfig, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns)
+		return defaultSchedulerHandlers{
+			tick: func(ctx context.Context, services Services) error {
+				return buildSnapshotHandlers().tick(ctx, services)
+			},
+			claim: func(ctx context.Context, services Services) error {
+				return buildSnapshotHandlers().claim(ctx, services)
+			},
+			webhook: initial.webhook,
+		}
+	}
 	notificationGateway := notify.NewGateway(notify.Options{
 		Config:        cfg.Notifications,
 		OsascriptPath: derefString(cfg.Tools.OsascriptPath),

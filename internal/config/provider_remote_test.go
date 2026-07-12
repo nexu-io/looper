@@ -91,6 +91,18 @@ func TestUpsertRuntimeProjectBindingKeepsConfigFileProjectAuthority(t *testing.T
 	}
 }
 
+func TestUpsertRuntimeProjectBindingRejectsDuplicateRepo(t *testing.T) {
+	cfg := Config{Projects: []ProjectRefConfig{{
+		ID: "configured", Provider: "forgejo-a", Repo: "Core/Looper", RepoPath: "/tmp/configured",
+	}}}
+
+	UpsertRuntimeProjectBinding(&cfg, "runtime", "runtime", "forgejo-b", "core/looper", "/tmp/runtime")
+
+	if len(cfg.Projects) != 1 {
+		t.Fatalf("Projects = %#v, want duplicate runtime repo rejected", cfg.Projects)
+	}
+}
+
 func TestUpsertRuntimeProjectBindingRemovesRuntimeBindingWhenProviderIsCleared(t *testing.T) {
 	cfg := Config{}
 	UpsertRuntimeProjectBinding(&cfg, "odcrew", "odcrew", "forgejo-main", "core/odcrew", "/tmp/odcrew")

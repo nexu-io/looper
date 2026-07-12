@@ -40,6 +40,11 @@ func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo,
 	if existingIndex >= 0 && !cfg.hasRuntimeProjectBinding(projectID) {
 		return
 	}
+	for index, existing := range cfg.Projects {
+		if index != existingIndex && strings.EqualFold(strings.TrimSpace(existing.Repo), repo) {
+			return
+		}
+	}
 	if name = strings.TrimSpace(name); name == "" {
 		name = projectID
 	}
