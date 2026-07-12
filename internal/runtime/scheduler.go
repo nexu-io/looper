@@ -2640,7 +2640,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if project.Archived {
 			continue
 		}
-		if input.Config != nil && !runtimeProjectBindingInstalled(*input.Config, project.ID, project.MetadataJSON) {
+		if input.Config != nil && !runtimeProjectVisible(*input.Config, project.ID, project.MetadataJSON) {
 			if input.Logger != nil {
 				input.Logger.Debug("scheduler skipped provider project without runtime binding", map[string]any{"projectId": project.ID})
 			}
@@ -2916,12 +2916,24 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		now = time.Now
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
+	var runnableProjectIDs []string
+	if input.Config != nil && input.Repos.Projects != nil {
+		projectsList, err := input.Repos.Projects.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, project := range projectsList {
+			if !project.Archived && runtimeProjectVisible(*input.Config, project.ID, project.MetadataJSON) {
+				runnableProjectIDs = append(runnableProjectIDs, project.ID)
+			}
+		}
+	}
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
 		}
-		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
+		item, err := input.Repos.Queue.ClaimNextNonLongTermRetryForProjects(ctx, nowISO, "scheduler", runnableProjectIDs, input.Config != nil)
 		if err != nil {
 			return queueItems, err
 		}
@@ -2934,7 +2946,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
 		}
-		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
+		item, err := input.Repos.Queue.ClaimNextLongTermRetryForProjects(ctx, nowISO, "scheduler", runnableProjectIDs, input.Config != nil)
 		if err != nil {
 			return queueItems, err
 		}

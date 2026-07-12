@@ -919,6 +919,18 @@ func runtimeProjectBindingInstalled(cfg config.Config, projectID string, metadat
 	return false
 }
 
+func runtimeProjectVisible(cfg config.Config, projectID string, metadataJSON *string) bool {
+	if runtimeProjectSource(metadataJSON) == "config" {
+		for _, project := range cfg.Projects {
+			if project.ID == projectID {
+				return true
+			}
+		}
+		return false
+	}
+	return runtimeProjectBindingInstalled(cfg, projectID, metadataJSON)
+}
+
 // detectProjectRepo reads origin host + owner/name. It never selects a provider
 // from the remote host — provider binding requires an explicit id/type or CLI
 // confirmation. Repo slug is still returned for non-GitHub hosts so an explicit

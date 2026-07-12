@@ -273,6 +273,13 @@ func TestServiceAddProjectIgnoresRepoStoredByRemovedConfigProject(t *testing.T) 
 	if result.Project.ID != "api-project" {
 		t.Fatalf("AddProject().Project.ID = %q, want api-project", result.Project.ID)
 	}
+	listed, err := service.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != "api-project" {
+		t.Fatalf("List() = %#v, want only replacement API project", listed)
+	}
 }
 
 func TestServiceAddProjectRejectsProjectIDWithBackslash(t *testing.T) {

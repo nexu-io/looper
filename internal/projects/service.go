@@ -384,11 +384,17 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 	}
 	active := make([]storage.ProjectRecord, 0, len(items))
 	for _, item := range items {
-		if !item.Archived {
+		if !item.Archived && !s.isStaleConfiguredProject(item) {
 			active = append(active, item)
 		}
 	}
 	return active, nil
+}
+
+func (s *Service) isStaleConfiguredProject(project storage.ProjectRecord) bool {
+	metadata := parseMetadata(project.MetadataJSON)
+	source, _ := metadata["source"].(string)
+	return source == "config" && !s.isConfiguredProject(project.ID)
 }
 
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
