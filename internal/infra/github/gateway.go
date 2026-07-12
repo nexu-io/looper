@@ -1802,12 +1802,15 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
 	request := g.reviewSubmitRequest(input)
 	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": reviewSubmitDiagnosticRequest(request, err), "error": err.Error()})
+		// Always redact paths on validation_failed: pre-publish diagnostics must
+		// not echo secret-shaped path fields even when the rejection reason is
+		// not path-related (and for content-safety rejections of the path itself).
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
 		err := fmt.Errorf("clean review marker cannot be submitted with review comments")
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	var flags []reviewQualityFlag
@@ -1816,7 +1819,7 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	// Re-validate after normalization: FallbackBody / retarget prefixes embed agent path
 	// into the top-level review body, which was not present in the pre-normalize fields.
 	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": reviewSubmitDiagnosticRequest(request, err), "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	request = g.reviewSubmitRequest(input)
@@ -1830,12 +1833,12 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	}
 	gateApplies, err := reviewQualityGateApplies(input.Event, input.Body)
 	if err != nil {
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	if gateApplies && len(flags) > 0 {
 		err := fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error(), "quality_flags": reviewQualityFlagsSummary(flags)})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error(), "quality_flags": reviewQualityFlagsSummary(flags)})
 		return err
 	}
 	comments := input.Comments[:0]
@@ -1996,16 +1999,10 @@ func reviewSubmitCommentsSummaryWithPaths(comments []ReviewComment, includePaths
 	return summary
 }
 
-// reviewSubmitDiagnosticRequest returns a diagnostic-safe request summary.
-// Content-safety rejections omit raw comment paths so secret-shaped values in
-// path fields cannot leak into logs/stderr while the gate rejects publication.
-func reviewSubmitDiagnosticRequest(request map[string]any, err error) map[string]any {
-	if !outboundguard.IsRejection(err) {
-		return request
-	}
-	return redactReviewSubmitRequestPaths(request)
-}
-
+// redactReviewSubmitRequestPaths returns a diagnostic-safe request summary for
+// validation_failed events. Raw comment paths and nested processing anchors are
+// replaced with path_present so secret-shaped path values cannot leak into
+// logs/stderr while publication is rejected.
 func redactReviewSubmitRequestPaths(request map[string]any) map[string]any {
 	if request == nil {
 		return nil
@@ -2014,41 +2011,69 @@ func redactReviewSubmitRequestPaths(request map[string]any) map[string]any {
 	for key, value := range request {
 		sanitized[key] = value
 	}
-	payload, ok := sanitized["payload"].(map[string]any)
-	if !ok {
-		return sanitized
-	}
-	payloadCopy := make(map[string]any, len(payload))
-	for key, value := range payload {
-		payloadCopy[key] = value
-	}
-	comments, ok := payloadCopy["comments"].([]map[string]any)
-	if !ok {
-		// reviewSubmitCommentsSummary returns []map[string]any but JSON-like maps
-		// may also be stored as []any after round-trips; handle both.
-		if rawComments, ok := payloadCopy["comments"].([]any); ok {
-			redacted := make([]map[string]any, 0, len(rawComments))
-			for _, raw := range rawComments {
-				entry, ok := raw.(map[string]any)
-				if !ok {
-					continue
-				}
-				redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
-			}
-			payloadCopy["comments"] = redacted
-			sanitized["payload"] = payloadCopy
-			return sanitized
+	if payload, ok := sanitized["payload"].(map[string]any); ok {
+		payloadCopy := make(map[string]any, len(payload))
+		for key, value := range payload {
+			payloadCopy[key] = value
 		}
+		payloadCopy["comments"] = redactDiagnosticCommentList(payloadCopy["comments"])
 		sanitized["payload"] = payloadCopy
-		return sanitized
 	}
-	redacted := make([]map[string]any, 0, len(comments))
-	for _, entry := range comments {
-		redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+	if processing, ok := sanitized["comment_processing"].(map[string]any); ok {
+		processingCopy := make(map[string]any, len(processing))
+		for key, value := range processing {
+			processingCopy[key] = value
+		}
+		processingCopy["comments"] = redactDiagnosticProcessingCommentList(processingCopy["comments"])
+		sanitized["comment_processing"] = processingCopy
 	}
-	payloadCopy["comments"] = redacted
-	sanitized["payload"] = payloadCopy
 	return sanitized
+}
+
+func redactDiagnosticCommentList(raw any) any {
+	switch comments := raw.(type) {
+	case []map[string]any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, entry := range comments {
+			redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	case []any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, rawEntry := range comments {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	default:
+		return raw
+	}
+}
+
+func redactDiagnosticProcessingCommentList(raw any) any {
+	switch comments := raw.(type) {
+	case []map[string]any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, entry := range comments {
+			redacted = append(redacted, redactProcessingCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	case []any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, rawEntry := range comments {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			redacted = append(redacted, redactProcessingCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	default:
+		return raw
+	}
 }
 
 func redactReviewCommentDiagnosticEntry(entry map[string]any) map[string]any {
@@ -2062,6 +2087,24 @@ func redactReviewCommentDiagnosticEntry(entry map[string]any) map[string]any {
 				out["path_present"] = true
 			}
 			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func redactProcessingCommentDiagnosticEntry(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	out := make(map[string]any, len(entry))
+	for key, value := range entry {
+		switch key {
+		case "original_anchor", "final_anchor":
+			if anchor, ok := value.(map[string]any); ok {
+				out[key] = redactReviewCommentDiagnosticEntry(anchor)
+				continue
+			}
 		}
 		out[key] = value
 	}

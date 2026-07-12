@@ -101,7 +101,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, metadata.Author); err != nil {
-		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error()})
+		// Always redact paths on pre-gate validation diagnostics: a malformed
+		// marker or APPROVE-with-comments path never reaches SubmitReview's
+		// content guard, and path may itself be secret-shaped.
+		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(), RedactPaths: true,
+		})
 		return err
 	}
 	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gh, repo, prNumber, event, metadata.Author, cwd)

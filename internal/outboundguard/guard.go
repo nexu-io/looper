@@ -21,7 +21,13 @@ const (
 var (
 	environmentAssignmentRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 	// Username may be empty so password-only DSNs match: redis://:pw@host/0
-	credentialURLRE        = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^/@\s:]*:[^/@\s]+@`)
+	credentialURLRE = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^/@\s:]*:[^/@\s]+@`)
+	// Query-parameter credentials, including compound names like refresh_token /
+	// db_password and JDBC-style ?user=app&password=pw. Param suffixes are the
+	// sensitive words; values must be non-empty.
+	credentialQueryRE = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s]*[?&][^=&\s]*?(?:password|passwd|pwd|pass|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|access[_-]?key)=[^\s&"'<>]+`)
+	// PEM private keys pasted into review bodies.
+	privateKeyRE           = regexp.MustCompile(`(?i)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----`)
 	highEntropyCandidateRE = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
 	gitObjectIDRE          = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 	uuidRE                 = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -40,6 +46,7 @@ var sensitiveEnvNameKeywords = []string{
 	"pwd",
 	"apikey",
 	"api_key",
+	"access_key",
 }
 
 type Field struct {
@@ -78,8 +85,11 @@ func Validate(fields ...Field) error {
 }
 
 func unsafeText(text string) string {
-	if credentialURLRE.MatchString(text) {
+	if credentialURLRE.MatchString(text) || credentialQueryRE.MatchString(text) {
 		return "contains a credential-bearing connection URL"
+	}
+	if privateKeyRE.MatchString(text) {
+		return "contains a private key block"
 	}
 	environmentAssignments := 0
 	for _, rawLine := range strings.Split(text, "\n") {

@@ -24,6 +24,15 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 		{name: "password-only redis URL", text: "REDIS_URL=redis://:pw@cache.example/0", want: "credential-bearing"},
 		{name: "password-only postgres URL", text: "DATABASE_URL=postgres://:secret@db.example/prod", want: "credential-bearing"},
 		{name: "password-only URL in prose", text: "Connect with redis://:s3cret@cache.example/0.", want: "credential-bearing"},
+		{name: "query password redis URL", text: "DATABASE_URL=redis://cache.example/0?password=pw", want: "credential-bearing"},
+		{name: "query password jdbc URL", text: "jdbc:postgresql://db.example/prod?user=app&password=pw", want: "credential-bearing"},
+		{name: "query token URL in prose", text: "Hit https://api.example/v1?access_token=abc123 to reproduce.", want: "credential-bearing"},
+		{name: "query client_secret URL", text: "AUTH_URL=https://auth.example/token?client_secret=s3cret&grant_type=client_credentials", want: "credential-bearing"},
+		{name: "query pass alias", text: "CACHE_URL=redis://cache.example/0?pass=s3cret", want: "credential-bearing"},
+		{name: "query refresh_token", text: "https://auth.example/callback?refresh_token=abc123", want: "credential-bearing"},
+		{name: "query api-key", text: "https://api.example/v1?api-key=deadbeef", want: "credential-bearing"},
+		{name: "private key PEM", text: "key material:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----", want: "private key"},
+		{name: "aws access key assignment", text: "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE", want: "credential-shaped"},
 		{name: "shell prompt credential", text: "$ SERVICE_TOKEN=secret-value", want: "credential-shaped"},
 		{name: "xtrace export credential", text: "+ export TOKEN=short", want: "credential-shaped"},
 		{name: "stacked xtrace credential", text: "++ PASSWORD=abc", want: "credential-shaped"},
@@ -62,7 +71,11 @@ func TestValidateAllowsCommonPublicationIdentifiers(t *testing.T) {
 		"Use ${OPENAI_API_KEY} from the process environment.",
 		"The configuration example is FEATURE_FLAG=true.",
 		"DATABASE_URL=postgres://db.example/prod",
+		"DATABASE_URL=redis://cache.example/0?db=0",
 		"Repository URL https://git.example/org/repo and contact ops@example.com.",
+		"Docs: https://example.com/auth?passwordless=true for the login flow.",
+		"Docs: https://example.com/oauth?token_type=bearer&expires_in=3600",
+		"-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKH\n-----END CERTIFICATE-----",
 	} {
 		if err := Validate(Field{Name: "body", Text: text}); err != nil {
 			t.Errorf("Validate(%q) error = %v, want safe", text, err)

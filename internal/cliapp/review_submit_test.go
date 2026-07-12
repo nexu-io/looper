@@ -373,6 +373,30 @@ func TestWriteReviewSubmitDiagnosticWritesStructuredJSON(t *testing.T) {
 	}
 }
 
+// Pre-gate validation (malformed marker / APPROVE-with-comments) never reaches
+// SubmitReview's content guard, so diagnostics must redact paths — a path may
+// itself be secret-shaped (SERVICE_TOKEN=...).
+func TestPreGateValidationDiagnosticRedactsSecretShapedPaths(t *testing.T) {
+	t.Parallel()
+	stderr := &bytes.Buffer{}
+	secretPath := "SERVICE_TOKEN=secret-value"
+	payload := reviewSubmitPayload{
+		Body:     "missing marker",
+		Comments: []reviewSubmitComment{{Body: "note", Path: secretPath, Line: 1, Side: "RIGHT"}},
+	}
+	writeReviewSubmitDiagnostic(stderr, "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+		Repo: "acme/looper", PRNumber: 42, Event: "APPROVE", CommitID: "abc123", Payload: payload,
+		Error: "APPROVE reviews require clean outcome without inline comments", RedactPaths: true,
+	})
+	out := stderr.String()
+	if strings.Contains(out, secretPath) {
+		t.Fatalf("stderr diagnostic echoed secret-shaped path: %s", out)
+	}
+	if !strings.Contains(out, `"path_present":true`) {
+		t.Fatalf("stderr = %q, want path_present without raw path", out)
+	}
+}
+
 type reviewSubmitFakeGHRunner struct {
 	t       *testing.T
 	respond func(options shell.Options) (shell.Result, error)

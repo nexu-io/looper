@@ -2551,8 +2551,9 @@ func TestSubmitReviewLogsValidationFailureDiagnostics(t *testing.T) {
 		t.Fatalf("body marker = %#v, want marker fields", marker)
 	}
 	comments, _ := payload["comments"].([]map[string]any)
-	if len(comments) != 1 || comments[0]["path"] != "app.go" || comments[0]["line"] != int64(1) || comments[0]["side"] != "RIGHT" {
-		t.Fatalf("payload comments = %#v, want inline anchor summary", comments)
+	// validation_failed diagnostics always redact paths (path may be secret-shaped).
+	if len(comments) != 1 || comments[0]["path_present"] != true || comments[0]["path"] != nil || comments[0]["line"] != int64(1) || comments[0]["side"] != "RIGHT" {
+		t.Fatalf("payload comments = %#v, want redacted path_present + line/side", comments)
 	}
 }
 
