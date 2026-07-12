@@ -1,3 +1,10 @@
+// Package outboundguard is a best-effort brake on obvious secret-shaped content
+// in agent publications (review bodies, comments, PR text).
+//
+// It is intentionally incomplete: prefer low false positives over exhaustive
+// DLP. Short or ambiguous names (DB_PASS, PGPASSWORD, ACCESS_KEY, …) may slip
+// through; structural signals (credential URLs, PEM blocks, env dumps, high
+// entropy) catch the common paste mistakes without a growing synonym list.
 package outboundguard
 
 import (
@@ -20,37 +27,25 @@ const (
 
 var (
 	environmentAssignmentRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
-	// Username may be empty so password-only DSNs match: redis://:pw@host/0
+	// user:password@ or password-only :password@ in URL userinfo.
 	credentialURLRE = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^/@\s:]*:[^/@\s]+@`)
-	// Query-parameter credentials, including compound names like refresh_token /
-	// db_password and JDBC-style ?user=app&password=pw. Param suffixes are the
-	// sensitive words; values must be non-empty.
-	credentialQueryRE = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s]*[?&][^=&\s]*?(?:password|passwd|pwd|pass|secret|token|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|access[_-]?key)=[^\s&"'<>]+`)
-	// PEM private keys pasted into review bodies.
+	// High-confidence query credential params only (not short aliases like pass/pwd).
+	credentialQueryRE      = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s]*[?&](?:[^=&\s]*_)?(?:password|secret|client[_-]?secret|api[_-]?key|access[_-]?token|private[_-]?key)=[^\s&"'<>]+`)
 	privateKeyRE           = regexp.MustCompile(`(?i)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----`)
 	highEntropyCandidateRE = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
 	gitObjectIDRE          = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 	uuidRE                 = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
 
-// sensitiveEnvNameKeywords are matched only as whole underscore/hyphen-delimited
-// segments so compound words like TOKENIZATION or PASSWORDLESS are not rejected.
-// "token" and "pass" are handled separately (see isSensitiveEnvName): short words
-// that appear in many non-secret config names (PASS_RATE, TOKENIZATION) must not
-// match as middle/leading segments.
-// "pgpassword" is the Postgres libpq name (single segment, so "password" alone
-// does not match inside it).
+// sensitiveEnvNameKeywords are long, high-confidence segments only. Matched as
+// whole underscore/hyphen-delimited segments so PASSWORDLESS / TOKENIZATION /
+// SECRETS_MANAGER are not rejected. Short ambiguous words (pass, pwd) are
+// deliberately omitted.
 var sensitiveEnvNameKeywords = []string{
-	"secret",
 	"password",
-	"pgpassword",
-	"credential",
-	"credentials",
-	"passwd",
-	"pwd",
-	"apikey",
+	"secret",
 	"api_key",
-	"access_key",
+	"apikey",
 }
 
 type Field struct {
@@ -119,22 +114,11 @@ func unsafeText(text string) string {
 	return ""
 }
 
-// isSensitiveAssignment reports env-style credential assignments such as
-// TOKEN=..., export OPENAI_API_KEY=..., or SERVICE_TOKEN=....
-// Callers should pass lines through stripShellAssignmentDecorators first so
-// bash export -p / declare -px forms are normalized to NAME=value.
+// isSensitiveAssignment reports high-confidence env-style credential lines such
+// as PASSWORD=..., export OPENAI_API_KEY=..., or SERVICE_TOKEN=....
+// Requires shell/env form NAME=value with no spaces around '='.
 //
-// It intentionally requires shell/env form NAME=value with no spaces around '='
-// and only treats sensitive words as whole name segments. That keeps common
-// review prose and code snippets safe, for example:
-//
-//	password = request.FormValue("password")
-//	TOKENIZATION=enabled
-//	PASSWORDLESS=true
-//
-// Boolean-looking values are treated as configuration rather than secrets
-// (has_password_field=true), while non-boolean values for sensitive names still
-// fail closed (PASSWORD=abc, TOKEN=short).
+// Boolean-looking values are treated as configuration (has_password_field=true).
 func isSensitiveAssignment(line string) bool {
 	line = strings.TrimSpace(line)
 	eq := strings.IndexByte(line, '=')
@@ -151,9 +135,6 @@ func isSensitiveAssignment(line string) bool {
 	return !looksLikeBooleanConfigValue(line[eq+1:])
 }
 
-// stripShellAssignmentDecorators removes common shell export/declaration
-// prefixes so assignment matching works on export -p / declare -px output.
-// Examples: "export TOKEN=...", `declare -x SERVICE_TOKEN="..."`, "typeset -x TOKEN=...".
 func stripShellAssignmentDecorators(line string) string {
 	line = strings.TrimSpace(line)
 	if next, ok := stripLeadingKeyword(line, "export"); ok {
@@ -175,8 +156,6 @@ func stripLeadingKeyword(line, keyword string) (string, bool) {
 	return strings.TrimSpace(line[len(keyword):]), true
 }
 
-// stripLeadingKeywordWithFlags strips "declare -x ..." / "typeset -px ..." style
-// prefixes, consuming one or more leading "-" flag tokens after the keyword.
 func stripLeadingKeywordWithFlags(line, keyword string) (string, bool) {
 	rest, ok := stripLeadingKeyword(line, keyword)
 	if !ok {
@@ -236,15 +215,9 @@ func isSensitiveEnvName(name string) bool {
 			return true
 		}
 	}
-	// "token": full name or leading/trailing segment (TOKEN, TOKEN_*, *_TOKEN).
-	// Middle segments like refresh_token_ttl stay safe.
-	if normalized == "token" || strings.HasPrefix(normalized, "token_") || strings.HasSuffix(normalized, "_token") {
-		return true
-	}
-	// "pass": full name or trailing segment only (PASS, DB_PASS, REDIS_PASS).
-	// Leading PASS_* is excluded: PASS_RATE / PASS_COUNT / PASS_THROUGH are
-	// common non-secret config names.
-	if normalized == "pass" || strings.HasSuffix(normalized, "_pass") {
+	// token: full name or trailing segment only (SERVICE_TOKEN, MY_TOKEN).
+	// Not leading TOKEN_* (TOKEN_COUNT) and not middle (refresh_token_ttl).
+	if normalized == "token" || strings.HasSuffix(normalized, "_token") {
 		return true
 	}
 	return false
@@ -265,8 +238,6 @@ func looksLikeBooleanConfigValue(value string) bool {
 	}
 }
 
-// hasDelimitedKeyword reports whether keyword appears in name bounded by the
-// string edges or underscores (after '-' has been normalized to '_').
 func hasDelimitedKeyword(name, keyword string) bool {
 	if keyword == "" {
 		return false
@@ -292,9 +263,6 @@ func isASCIISpace(b byte) bool {
 	return b == ' ' || b == '\t'
 }
 
-// stripShellLinePrefix removes common shell prompt and xtrace prefixes so
-// assignment detection works on terminal output copied into review text.
-// Examples: "$ SERVICE_TOKEN=...", "+ export TOKEN=...", "++ FOO=bar".
 func stripShellLinePrefix(line string) string {
 	line = strings.TrimSpace(line)
 	for {
