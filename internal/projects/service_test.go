@@ -240,6 +240,41 @@ func TestServiceAddProjectRejectsRepoStoredByAnotherAPIProject(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectIgnoresRepoStoredByRemovedConfigProject(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	metadata := `{"repo":"Acme/Looper","source":"config"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID:           "removed-config-project",
+		Name:         "Removed config project",
+		RepoPath:     "/tmp/removed-config-project",
+		MetadataJSON: &metadata,
+		CreatedAt:    currentISO(func() time.Time { return now }),
+		UpdatedAt:    currentISO(func() time.Time { return now }),
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	repo := "acme/looper"
+	result, err := service.AddProject(ctx, AddInput{
+		ID:       "api-project",
+		Name:     "API project",
+		RepoPath: "/tmp/api-project",
+		Repo:     &repo,
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.Project.ID != "api-project" {
+		t.Fatalf("AddProject().Project.ID = %q, want api-project", result.Project.ID)
+	}
+}
+
 func TestServiceAddProjectRejectsProjectIDWithBackslash(t *testing.T) {
 	t.Parallel()
 
