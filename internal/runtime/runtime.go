@@ -901,6 +901,13 @@ func runtimeProjectProviderKindWithMetadata(cfg config.Config, projectID string,
 func runtimeProjectBindingInstalled(cfg config.Config, projectID string, metadataJSON *string) bool {
 	providerID := projects.ProviderFromMetadata(metadataJSON)
 	if providerID == "" {
+		if runtimeProjectSource(metadataJSON) == "api" {
+			for _, project := range cfg.Projects {
+				if project.ID == projectID && strings.TrimSpace(project.Provider) != "" {
+					return false
+				}
+			}
+		}
 		return true
 	}
 	repo := runtimeProjectRepo(metadataJSON)
