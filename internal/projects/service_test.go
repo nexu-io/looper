@@ -704,7 +704,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	repoPath := "/tmp/looper"
 	baseBranch := "main"
-	metadata := `{"repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
+	metadata := `{"provider":"forgejo-main","repo":"powerformer/looper","worktreeRoot":null,"source":"api"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -730,7 +730,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 		t.Fatalf("Projects.GetByID() error = %v", err)
 	}
 	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"config"}` {
-		t.Fatalf("project.MetadataJSON = %#v, want refreshed transferred repo metadata", project)
+		t.Fatalf("project.MetadataJSON = %#v, want refreshed config metadata without stale provider", project)
 	}
 }
 

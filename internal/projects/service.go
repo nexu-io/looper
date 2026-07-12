@@ -637,7 +637,7 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 		existingMetadata := parseMetadata(existing.MetadataJSON)
 		for key, value := range existingMetadata {
 			switch key {
-			case "repo":
+			case "provider", "repo":
 				continue
 			case "worktreeRoot", "source":
 				continue
