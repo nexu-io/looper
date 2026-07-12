@@ -25,9 +25,11 @@ func TestUniqueConfiguredWebhookRepos(t *testing.T) {
 		{ID: "c", MetadataJSON: stringPtr(`{"repo":"acme/beta"}`)},
 		{ID: "d", Archived: true, MetadataJSON: stringPtr(`{"repo":"acme/ignored"}`)},
 		{ID: "e", MetadataJSON: stringPtr(`{"repo":null}`)},
+		{ID: "f", MetadataJSON: stringPtr(`{"provider":"forgejo-main","repo":"acme/forgejo"}`)},
 	}
+	cfg := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
 
-	got := uniqueConfiguredWebhookRepos(projects)
+	got := uniqueConfiguredWebhookRepos(cfg, projects)
 	want := []string{"acme/alpha", "acme/beta"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("uniqueConfiguredWebhookRepos() = %v, want %v", got, want)
