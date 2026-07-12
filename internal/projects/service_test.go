@@ -240,7 +240,7 @@ func TestServiceAddProjectRejectsRepoStoredByAnotherAPIProject(t *testing.T) {
 	}
 }
 
-func TestServiceAddProjectIgnoresRepoStoredByRemovedConfigProject(t *testing.T) {
+func TestServiceAddProjectRejectsRepoStoredByRemovedConfigProject(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -261,24 +261,14 @@ func TestServiceAddProjectIgnoresRepoStoredByRemovedConfigProject(t *testing.T) 
 
 	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
 	repo := "acme/looper"
-	result, err := service.AddProject(ctx, AddInput{
+	_, err := service.AddProject(ctx, AddInput{
 		ID:       "api-project",
 		Name:     "API project",
 		RepoPath: "/tmp/api-project",
 		Repo:     &repo,
 	})
-	if err != nil {
-		t.Fatalf("AddProject() error = %v", err)
-	}
-	if result.Project.ID != "api-project" {
-		t.Fatalf("AddProject().Project.ID = %q, want api-project", result.Project.ID)
-	}
-	listed, err := service.List(ctx)
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
-	}
-	if len(listed) != 1 || listed[0].ID != "api-project" {
-		t.Fatalf("List() = %#v, want only replacement API project", listed)
+	if err == nil || !strings.Contains(err.Error(), "repository acme/looper is already bound to project removed-config-project") {
+		t.Fatalf("AddProject() error = %v, want stale config row to block repo reuse", err)
 	}
 }
 

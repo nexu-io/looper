@@ -347,9 +347,6 @@ func (s *Service) validateStoredRepoBinding(ctx context.Context, binding Project
 			continue
 		}
 		metadata := parseMetadata(stored.MetadataJSON)
-		if source, _ := metadata["source"].(string); source == "config" && !s.isConfiguredProject(stored.ID) {
-			continue
-		}
 		storedRepo, _ := metadata["repo"].(string)
 		if strings.EqualFold(strings.TrimSpace(storedRepo), repo) {
 			return ProjectValidationError{Message: fmt.Sprintf("repository %s is already bound to project %s", repo, stored.ID)}

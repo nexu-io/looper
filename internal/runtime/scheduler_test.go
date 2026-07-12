@@ -208,6 +208,44 @@ func TestRunDefaultSchedulerTickDoesNotClaimProjectWithStaleRuntimeBinding(t *te
 	}
 }
 
+func TestRunScheduledQueueItemsDoesNotProcessClaimedItemAfterProviderRebind(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 12, 15, 1, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	metadata := `{"repo":"acme/looper","source":"api"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: workingDir, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	item := schedulerTestQueueItem("queue_reviewer_rebound", "reviewer", nowISO)
+	item.Status = "running"
+	if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+		Projects:  []config.ProjectRefConfig{{ID: "looper", Provider: "forgejo-main", Repo: "acme/looper"}},
+	}
+	reviewerRunner := &stubReviewerScheduler{}
+
+	if err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{item}, defaultSchedulerTickInput{Config: &cfg, Repos: repos, Now: func() time.Time { return now }, Reviewer: reviewerRunner}); err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	stored, err := repos.Queue.GetByID(context.Background(), item.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.Status != "completed" {
+		t.Fatalf("Queue.GetByID() = %#v, want stale claimed item completed without processing", stored)
+	}
+	if len(reviewerRunner.processClaims) != 0 {
+		t.Fatalf("reviewer process claims = %#v, want none", reviewerRunner.processClaims)
+	}
+}
+
 func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	t.Parallel()
 

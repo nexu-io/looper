@@ -2992,6 +2992,24 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			return err
 		}
 
+		visible, err := schedulerQueueProjectVisible(ctx, item, input)
+		if err != nil {
+			errList = append(errList, err)
+			continue
+		}
+		if !visible {
+			if input.Repos != nil && input.Repos.Queue != nil {
+				if err := input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC())); err != nil {
+					errList = append(errList, err)
+					continue
+				}
+			}
+			if input.Logger != nil {
+				input.Logger.Info("scheduler released claimed item for stale project binding", map[string]any{"queueItemId": item.ID, "projectId": derefString(item.ProjectID)})
+			}
+			continue
+		}
+
 		// A loop parked for human takeover (or paused) must never be run, even if a
 		// queue item survived a race with the parking and got claimed. Release the
 		// claim (so the slot frees) and skip — only an explicit handback re-arms it.
@@ -3035,6 +3053,20 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+func schedulerQueueProjectVisible(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput) (bool, error) {
+	if input.Config == nil || item.ProjectID == nil || strings.TrimSpace(*item.ProjectID) == "" {
+		return true, nil
+	}
+	if input.Repos == nil || input.Repos.Projects == nil {
+		return false, nil
+	}
+	project, err := input.Repos.Projects.GetByID(ctx, *item.ProjectID)
+	if err != nil {
+		return false, err
+	}
+	return project != nil && !project.Archived && runtimeProjectVisible(*input.Config, project.ID, project.MetadataJSON), nil
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {
