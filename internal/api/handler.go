@@ -1384,11 +1384,13 @@ type loopLogsAgentPayload struct {
 }
 
 type projectResponse struct {
-	ID           string  `json:"id"`
-	Name         string  `json:"name"`
-	RepoPath     string  `json:"repoPath"`
-	BaseBranch   string  `json:"baseBranch"`
-	Archived     bool    `json:"archived"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	RepoPath   string `json:"repoPath"`
+	BaseBranch string `json:"baseBranch"`
+	Archived   bool   `json:"archived"`
+	// Provider is the resolved provider kind for display (github, forgejo, plane).
+	Provider     string  `json:"provider"`
 	Repo         *string `json:"repo"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	CreatedAt    string  `json:"createdAt"`
@@ -1537,7 +1539,7 @@ func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
 
 		responseItems := make([]projectResponse, 0, len(items))
 		for _, item := range items {
-			responseItems = append(responseItems, serializeProject(item, h.context.Config.Defaults.BaseBranch))
+			responseItems = append(responseItems, serializeProject(item, h.context.Config, h.context.Config.Defaults.BaseBranch))
 		}
 		return projectsListResponse{Items: responseItems}, nil
 	case http.MethodPost:
@@ -1593,7 +1595,7 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 	}
 	_ = h.refreshWebhookForwarders()
 
-	return serializeProject(removed, h.context.Config.Defaults.BaseBranch), nil
+	return serializeProject(removed, h.context.Config, h.context.Config.Defaults.BaseBranch), nil
 }
 
 func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
@@ -5702,6 +5704,7 @@ type createProjectRequest struct {
 	BaseBranch   *string `json:"baseBranch"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	Repo         *string `json:"repo"`
+	Provider     *string `json:"provider"`
 	SnapshotMode *string `json:"snapshotMode"`
 }
 
@@ -5750,13 +5753,17 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
+		Provider:     normalizeOptionalString(body.Provider),
 		SnapshotMode: snapshotMode,
 	})
 	if err != nil {
 		var collision projects.ProjectIDCollisionError
+		var validation projects.ProjectValidationError
 		switch {
 		case errors.As(err, &collision):
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeProjectIDConflict, status: http.StatusConflict, message: err.Error()}
+		case errors.As(err, &validation):
+			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 		case strings.HasPrefix(err.Error(), "invalid project id"):
 			message := strings.Replace(err.Error(), "invalid project id", "Invalid project id", 1)
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: message}
@@ -5767,7 +5774,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	_ = h.refreshWebhookForwarders()
 
 	return createProjectResponse{
-		projectResponse:        serializeProject(result.Project, h.context.Config.Defaults.BaseBranch),
+		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
 		DiscoveredPullRequests: result.DiscoveredPullRequests,
 		DiscoveredWorktrees:    result.DiscoveredWorktrees,
 		PendingSnapshots:       result.PendingSnapshots,
@@ -5786,7 +5793,7 @@ func (h *Handler) refreshWebhookForwarders() error {
 	return nil
 }
 
-func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) projectResponse {
+func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultBaseBranch string) projectResponse {
 	metadata := parseProjectMetadata(project.MetadataJSON)
 
 	baseBranch := defaultBaseBranch
@@ -5800,11 +5807,43 @@ func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) p
 		RepoPath:     project.RepoPath,
 		BaseBranch:   baseBranch,
 		Archived:     project.Archived,
+		Provider:     resolveProjectProviderKind(cfg, project.ID, metadata),
 		Repo:         stringMetadataPtr(metadata, "repo"),
 		WorktreeRoot: stringMetadataPtr(metadata, "worktreeRoot"),
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
+}
+
+// resolveProjectProviderKind returns the display provider kind for a project:
+// config binding first, then API metadata provider id, else github.
+func resolveProjectProviderKind(cfg config.Config, projectID string, metadata map[string]any) string {
+	for _, configured := range cfg.Projects {
+		if configured.ID != projectID {
+			continue
+		}
+		kind := config.ResolvedProjectProviderKind(cfg, configured)
+		if kind != "" {
+			return string(kind)
+		}
+		break
+	}
+	if providerID := strings.TrimSpace(stringMetadataValue(metadata, "provider")); providerID != "" {
+		for _, provider := range cfg.Providers {
+			if provider.ID == providerID && provider.Kind != "" {
+				return string(provider.Kind)
+			}
+		}
+	}
+	return string(config.ProviderKindGitHub)
+}
+
+func stringMetadataValue(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return value
 }
 
 func requireActiveProjectRecord(ctx context.Context, repo *storage.ProjectsRepository, projectID string) (*storage.ProjectRecord, error) {

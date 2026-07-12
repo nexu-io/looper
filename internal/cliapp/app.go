@@ -187,12 +187,14 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("name", "name", "Project name"),
 					stringFlag("base-branch", "branch", "Base branch"),
 					stringFlag("worktree-root", "path", "Worktree root"),
-					stringFlag("repo", "repo", "Repository slug"),
+					stringFlag("repo", "repo", "Repository slug (owner/name)"),
+					stringFlag("provider", "id", "Provider id for non-GitHub projects (auto-detected for configured Forgejo hosts)"),
 					stringFlag("snapshot-mode", "mode", "Snapshot mode for project add: async, full, or off"),
 				},
 				exampleLines: []string{
 					"$ looper project list",
 					"$ looper project add /path/to/repo",
+					"$ looper project add /path/to/forgejo-repo --provider forgejo-main --repo owner/name",
 					"$ looper project remove project_1 --force",
 				},
 				subcommands: []*cobra.Command{

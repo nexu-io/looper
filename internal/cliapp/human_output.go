@@ -92,6 +92,7 @@ type projectOutput struct {
 	RepoPath               string   `json:"repoPath"`
 	BaseBranch             string   `json:"baseBranch"`
 	Archived               bool     `json:"archived"`
+	Provider               string   `json:"provider"`
 	Repo                   *string  `json:"repo"`
 	UpdatedAt              string   `json:"updatedAt"`
 	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
@@ -341,9 +342,21 @@ func writeHumanProjectList(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, project := range data.Items {
-		rows = append(rows, tableRow{"id": project.ID, "name": project.Name, "repoPath": project.RepoPath, "baseBranch": project.BaseBranch, "repo": project.Repo, "updatedAt": project.UpdatedAt})
+		provider := strings.TrimSpace(project.Provider)
+		if provider == "" {
+			provider = "github"
+		}
+		rows = append(rows, tableRow{
+			"id":         project.ID,
+			"name":       project.Name,
+			"repoPath":   project.RepoPath,
+			"baseBranch": project.BaseBranch,
+			"provider":   provider,
+			"repo":       project.Repo,
+			"updatedAt":  project.UpdatedAt,
+		})
 	}
-	printTable(w, []string{"id", "name", "repoPath", "baseBranch", "repo", "updatedAt"}, rows)
+	printTable(w, []string{"id", "name", "repoPath", "baseBranch", "provider", "repo", "updatedAt"}, rows)
 	return nil
 }
 
@@ -353,7 +366,11 @@ func writeHumanProjectAdd(w io.Writer, payload json.RawMessage) error {
 		return fmt.Errorf("decode project response: %w", err)
 	}
 
-	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"queuedSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
+	provider := strings.TrimSpace(data.Provider)
+	if provider == "" {
+		provider = "github"
+	}
+	printSection(w, "Project added", [][2]any{{"id", data.ID}, {"name", data.Name}, {"repoPath", data.RepoPath}, {"baseBranch", data.BaseBranch}, {"provider", provider}, {"repo", data.Repo}, {"discoveredPullRequests", data.DiscoveredPullRequests}, {"discoveredWorktrees", data.DiscoveredWorktrees}, {"queuedSnapshots", data.PendingSnapshots}, {"capturedSnapshots", data.CapturedSnapshots}})
 	if len(data.Warnings) > 0 {
 		fmt.Fprintln(w)
 		entries := make([][2]any, 0, len(data.Warnings))

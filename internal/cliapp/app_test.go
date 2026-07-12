@@ -3169,7 +3169,7 @@ func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
 		if got, want := r.URL.Path, "/api/v1/projects"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "provider": "github", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
 	}))
 	defer server.Close()
 
@@ -3181,7 +3181,7 @@ func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([project list]) stderr = %q, want empty string", stderr)
 	}
-	for _, want := range []string{"id", "repoPath", "project_1", "/tmp/repo", "acme/looper"} {
+	for _, want := range []string{"id", "repoPath", "provider", "project_1", "/tmp/repo", "github", "acme/looper"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([project list]) stdout = %q, want to contain %q", stdout, want)
 		}

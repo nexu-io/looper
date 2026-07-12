@@ -302,12 +302,32 @@ func (g *Gateway) ListWorktrees(ctx context.Context, repoPath string) ([]Worktre
 }
 
 func (g *Gateway) DetectGitHubRepo(ctx context.Context, repoPath string) (string, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "config", "--get", "remote.origin.url")
+	remote, err := g.DetectOriginRemote(ctx, repoPath)
 	if err != nil {
 		return "", err
 	}
+	if !isGitHubRemoteHost(remote.Host) {
+		return "", nil
+	}
+	return remote.Repo, nil
+}
 
-	return parseGitHubRepoFromRemoteURL(strings.TrimSpace(result.Stdout)), nil
+// OriginRemote is the parsed remote.origin URL for a local checkout.
+type OriginRemote struct {
+	URL  string
+	Host string
+	Repo string // owner/name
+}
+
+// DetectOriginRemote reads remote.origin.url and extracts host + owner/name when possible.
+func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (OriginRemote, error) {
+	result, err := g.runGitResult(ctx, repoPath, nil, "config", "--get", "remote.origin.url")
+	if err != nil {
+		return OriginRemote{}, err
+	}
+	remoteURL := strings.TrimSpace(result.Stdout)
+	host, repo := parseRemoteRepoFromURL(remoteURL)
+	return OriginRemote{URL: remoteURL, Host: host, Repo: repo}, nil
 }
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
@@ -1165,14 +1185,27 @@ func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 }
 
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {
-	if remoteURL == "" {
+	host, repo := parseRemoteRepoFromURL(remoteURL)
+	if !isGitHubRemoteHost(host) {
 		return ""
+	}
+	return repo
+}
+
+// parseRemoteRepoFromURL extracts host and owner/name from common git remote URL forms:
+//   - git@host:owner/repo.git
+//   - ssh://git@host/owner/repo.git
+//   - https://host/owner/repo.git
+//   - http://host/owner/repo.git
+func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
+	remoteURL = strings.TrimSpace(remoteURL)
+	if remoteURL == "" {
+		return "", ""
 	}
 
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^git@github\.com:(?P<repo>.+?)(?:\.git)?$`),
-		regexp.MustCompile(`^ssh://git@github\.com/(?P<repo>.+?)(?:\.git)?$`),
-		regexp.MustCompile(`^https://github\.com/(?P<repo>.+?)(?:\.git)?$`),
+		regexp.MustCompile(`^(?:ssh://)?(?:git@)?(?P<host>[^/:]+)[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
+		regexp.MustCompile(`^https?://(?P<host>[^/]+)/(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
 	}
 
 	for _, pattern := range patterns {
@@ -1180,13 +1213,33 @@ func parseGitHubRepoFromRemoteURL(remoteURL string) string {
 		if match == nil {
 			continue
 		}
-		index := pattern.SubexpIndex("repo")
-		if index > 0 {
-			return match[index]
+		hostIndex := pattern.SubexpIndex("host")
+		repoIndex := pattern.SubexpIndex("repo")
+		if hostIndex <= 0 || repoIndex <= 0 {
+			continue
 		}
+		host = strings.ToLower(strings.TrimSpace(match[hostIndex]))
+		repo = strings.TrimSpace(match[repoIndex])
+		repo = strings.TrimSuffix(repo, ".git")
+		if host == "" || !isOwnerNameRepo(repo) {
+			continue
+		}
+		return host, repo
 	}
+	return "", ""
+}
 
-	return ""
+func isGitHubRemoteHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "github.com" || strings.HasSuffix(host, ".github.com")
+}
+
+func isOwnerNameRepo(repo string) bool {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	return strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
 }
 
 func sanitizeBranchName(branch string) string {

@@ -161,7 +161,7 @@ func TestServiceSyncConfiguredValidatesReviewerAutoMerge(t *testing.T) {
 	baseBranch := "main"
 	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch}}
 
-	service.DetectRepo = func(context.Context, string) (string, error) { return repoName, nil }
+	service.DetectRepo = func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: repoName}, nil }
 	err = service.SyncConfigured(context.Background(), cfg, time.Date(2026, time.May, 1, 0, 0, 0, 0, time.UTC))
 	if err == nil || !strings.Contains(err.Error(), "default branch protection is missing or has no required checks") {
 		t.Fatalf("SyncConfigured() error = %v, want branch protection validation failure", err)
@@ -191,7 +191,7 @@ func TestServiceSyncConfiguredAllowsUnknownBaseBranchWithoutProtectionRequiremen
 	cfg.Defaults.BaseBranch = ""
 	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper"}}
 
-	service.DetectRepo = func(context.Context, string) (string, error) { return repoName, nil }
+	service.DetectRepo = func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: repoName}, nil }
 	err = service.SyncConfigured(context.Background(), cfg, time.Date(2026, time.May, 1, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("SyncConfigured() error = %v, want nil", err)

@@ -2101,9 +2101,15 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlers(cfg *config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
+	}
+	if cfg == nil {
+		fail := func(context.Context, Services) error {
+			return fmt.Errorf("default scheduler config is not configured")
+		}
+		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	if repos == nil || coordinator == nil {
 		fail := func(context.Context, Services) error {
@@ -2246,7 +2252,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
-	stamper := disclosure.FromConfig(cfg)
+	stamper := disclosure.FromConfig(*cfg)
 	agentRuntime := ""
 	if cfg.Agent.Vendor != nil {
 		agentRuntime = string(*cfg.Agent.Vendor)
@@ -2254,7 +2260,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	plannerRunner = planner.New(planner.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
+		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
 		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
@@ -2262,7 +2268,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
 		Disclosure:         &cfg.Disclosure,
 		AgentRuntime:       agentRuntime,
-		CustomInstructions: &cfg,
+		CustomInstructions: cfg,
 		AgentModel:         cfg.Agent.Model,
 		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
@@ -2282,7 +2288,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
 		Repos:   repos,
 		GitHub:  githubGateway,
-		Config:  &cfg,
+		Config:  cfg,
 		Logger:  logger,
 		Now:     now,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
@@ -2294,7 +2300,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	reviewerRunner = reviewer.New(reviewer.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
+		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
 		Git:              reviewerGitAdapter{gateway: gitGateway},
 		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:           logger,
@@ -2318,7 +2324,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		ThreadResolution:        cfg.Roles.Reviewer.Behavior.ThreadResolution,
 		Disclosure:              &cfg.Disclosure,
 		AgentRuntime:            agentRuntime,
-		CustomInstructions:      &cfg,
+		CustomInstructions:      cfg,
 		LooperCLIPath:           derefString(cfg.Tools.LooperPath),
 		AgentModel:              cfg.Agent.Model,
 		AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
@@ -2334,7 +2340,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	fixerRunner = fixer.New(fixer.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
+		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
 		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
@@ -2352,7 +2358,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 		Disclosure:          &cfg.Disclosure,
 		AgentRuntime:        agentRuntime,
-		CustomInstructions:  &cfg,
+		CustomInstructions:  cfg,
 		AgentModel:          cfg.Agent.Model,
 		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
@@ -2366,9 +2372,9 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	workerRunner = worker.New(worker.Options{
 		DB:     coordinator.DB(),
 		Repos:  repos,
-		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
+		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
 		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
-			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
+			return githubCLIAutoPROpeningAvailable(ctx, *cfg, githubGateway, logger, repo, cwd)
 		},
 		Git:             workerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:   workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
@@ -2385,7 +2391,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 		Disclosure:          &cfg.Disclosure,
 		AgentRuntime:        agentRuntime,
-		CustomInstructions:  &cfg,
+		CustomInstructions:  cfg,
 		Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
 		AgentModel:          cfg.Agent.Model,
 		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
@@ -2435,12 +2441,12 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
 			Snapshotter:              githubGateway,
-			Config:                   &cfg,
-			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
-			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
-			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
-			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
-			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			Config:                   cfg,
+			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "planner")),
+			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(*cfg, projectID).Coordinator.Enabled },
+			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "reviewer")),
+			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "fixer")),
+			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "worker")),
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
 	}
@@ -2454,7 +2460,7 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		},
 		webhook: webhookforward.New(webhookforward.Options{
 			Repos:    repos,
-			Config:   cfg,
+			Config:   *cfg,
 			Reviewer: reviewerRunner,
 			Fixer:    fixerRunner,
 			Logger:   logger,
@@ -2579,7 +2585,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		providerKind := config.ProviderKindGitHub
 		if input.Config != nil {
-			providerKind = runtimeProjectProviderKind(*input.Config, project.ID)
+			providerKind = runtimeProjectProviderKindWithMetadata(*input.Config, project.ID, project.MetadataJSON)
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		var snapshot *githubinfra.DiscoverySnapshot

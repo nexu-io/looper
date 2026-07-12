@@ -551,8 +551,13 @@ func (r *Runtime) start(ctx context.Context) error {
 		Logger: r.logger,
 		Config: r.config,
 		Now:    r.now,
-		DetectRepo: func(ctx context.Context, repoPath string) (string, error) {
-			return gitGateway.DetectGitHubRepo(ctx, repoPath)
+		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
+			return detectProjectRepo(ctx, gitGateway, r.config, repoPath)
+		},
+		RegisterBinding: func(binding projects.ProjectBinding) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			config.UpsertRuntimeProjectBinding(&r.config, binding.ProjectID, binding.Name, binding.Provider, binding.Repo, binding.RepoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 			if githubGateway == nil {
@@ -607,6 +612,11 @@ func (r *Runtime) start(ctx context.Context) error {
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
 	}
+	// Rehydrate from local DB metadata only; do not inherit a canceled parent
+	// context from earlier startup steps (CompleteStartup still observes ctx).
+	if err := r.rehydrateAPIProjectBindings(context.Background(), repositories); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
@@ -623,7 +633,9 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		handlers := buildDefaultSchedulerHandlers(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		// Pass a pointer so API-added forgejo bindings registered into r.config
+		// remain visible to scheduler forgejo client resolution.
+		handlers := buildDefaultSchedulerHandlers(&r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
@@ -818,12 +830,68 @@ func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 }
 
 func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
+	return runtimeProjectProviderKindWithMetadata(cfg, projectID, nil)
+}
+
+func runtimeProjectProviderKindWithMetadata(cfg config.Config, projectID string, metadataJSON *string) config.ProviderKind {
 	for _, project := range cfg.Projects {
 		if project.ID == projectID {
 			return config.ResolvedProjectProviderKind(cfg, project)
 		}
 	}
+	if providerID := projects.ProviderFromMetadata(metadataJSON); providerID != "" {
+		for _, provider := range cfg.Providers {
+			if provider.ID == providerID {
+				return provider.Kind
+			}
+		}
+	}
 	return config.ProviderKindGitHub
+}
+
+func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
+	if gitGateway == nil {
+		return projects.DetectedRepo{}, fmt.Errorf("git gateway is not configured")
+	}
+	remote, err := gitGateway.DetectOriginRemote(ctx, repoPath)
+	if err != nil {
+		return projects.DetectedRepo{}, err
+	}
+	if strings.TrimSpace(remote.Repo) == "" {
+		return projects.DetectedRepo{}, nil
+	}
+	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, remote.Host); ok {
+		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.ID}, nil
+	}
+	// Keep GitHub autodetection behavior for github.com remotes (and unknown hosts stay empty).
+	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
+		return projects.DetectedRepo{Repo: remote.Repo}, nil
+	}
+	return projects.DetectedRepo{}, nil
+}
+
+func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storage.Repositories) error {
+	if repos == nil || repos.Projects == nil {
+		return nil
+	}
+	items, err := repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, item := range items {
+		if item.Archived {
+			continue
+		}
+		providerID := projects.ProviderFromMetadata(item.MetadataJSON)
+		repo := runtimeProjectRepo(item.MetadataJSON)
+		if providerID == "" || repo == "" {
+			continue
+		}
+		config.UpsertRuntimeProjectBinding(&r.config, item.ID, item.Name, providerID, repo, item.RepoPath)
+	}
+	return nil
 }
 
 func runtimeDependencyTimeout(seconds int) time.Duration {
