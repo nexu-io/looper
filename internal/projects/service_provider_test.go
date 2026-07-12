@@ -2,12 +2,67 @@ package projects
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+func TestServiceAddProjectRejectsConfigOwnedProjectBeforePersistingProviderMetadata(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "LOOPER_FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{
+		ID:       "forgejo-main",
+		Kind:     config.ProviderKindForgejo,
+		BaseURL:  "https://code.example.com",
+		TokenEnv: &tokenEnv,
+	}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Repo: "nexu-io/looper"}}
+	originalMetadata := `{"repo":"nexu-io/looper","source":"config"}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID:           "looper",
+		Name:         "Looper",
+		RepoPath:     "/tmp/configured-looper",
+		MetadataJSON: &originalMetadata,
+		CreatedAt:    "2026-04-17T12:34:56Z",
+		UpdatedAt:    "2026-04-17T12:34:56Z",
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	provider := "forgejo-main"
+	repo := "fork/looper"
+	service := &Service{DB: coordinator.DB(), Repos: repos, Config: cfg}
+	_, err = service.AddProject(ctx, AddInput{
+		ID:         "looper",
+		IDSource:   "derived",
+		Name:       "Looper fork",
+		RepoPath:   "/tmp/looper",
+		Repo:       &repo,
+		Provider:   &provider,
+		BaseBranch: "main",
+	})
+	if err == nil || !strings.Contains(err.Error(), "managed by config") {
+		t.Fatalf("AddProject() error = %v, want config-owned project validation error", err)
+	}
+	stored, getErr := repos.Projects.GetByID(ctx, "looper")
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID() error = %v", getErr)
+	}
+	if stored == nil || stored.MetadataJSON == nil || *stored.MetadataJSON != originalMetadata {
+		t.Fatalf("Projects.GetByID().MetadataJSON = %v, want unchanged config metadata %s", stored, originalMetadata)
+	}
+}
 
 func TestServiceAddProjectResolvesForgejoProviderTypeAndRepo(t *testing.T) {
 	t.Parallel()

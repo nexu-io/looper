@@ -196,6 +196,9 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 			return AddResult{}, err
 		}
 	}
+	if s.isConfiguredProject(projectID) {
+		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be updated with project add", projectID)}
+	}
 
 	repo := input.Repo
 	provider, err := s.resolveProviderInput(input.Provider)
