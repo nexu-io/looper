@@ -3167,6 +3167,33 @@ func TestRehydrateAPIProjectBindingsRejectsProviderBindingDuplicatingGitHubRepo(
 	}
 }
 
+func TestRehydrateAPIProjectBindingsIgnoresStaleConfiguredRepo(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(workingDir, "backups"))
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := formatJavaScriptISOString(time.Now().UTC())
+	for _, item := range []storage.ProjectRecord{
+		{ID: "old-config-id", Name: "Old config project", RepoPath: filepath.Join(workingDir, "old"), MetadataJSON: stringPtr(`{"repo":"acme/looper","source":"config"}`), CreatedAt: now, UpdatedAt: now},
+		{ID: "new-config-id", Name: "New config project", RepoPath: filepath.Join(workingDir, "new"), MetadataJSON: stringPtr(`{"repo":"acme/looper","source":"config"}`), CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repositories.Projects.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	rt := &Runtime{config: config.Config{Projects: []config.ProjectRefConfig{{ID: "new-config-id", Name: "New config project", RepoPath: filepath.Join(workingDir, "new"), Repo: "acme/looper"}}}}
+	if err := rt.rehydrateAPIProjectBindings(context.Background(), repositories); err != nil {
+		t.Fatalf("rehydrateAPIProjectBindings() error = %v", err)
+	}
+	if len(rt.config.Projects) != 1 || rt.config.Projects[0].ID != "new-config-id" {
+		t.Fatalf("runtime projects = %#v, want only current config project", rt.config.Projects)
+	}
+}
+
 func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
 	t.Parallel()
 

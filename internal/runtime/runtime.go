@@ -289,7 +289,7 @@ func (r *Runtime) Stop(reason string) {
 		}
 		for _, drainingForwarder := range drainingForwarders {
 			if drainingForwarder != nil {
-				drainingForwarder.CancelAndWait()
+				drainingForwarder.CloseAndWait()
 			}
 		}
 		if networkManager != nil {
@@ -862,6 +862,18 @@ func runtimeProjectRepo(metadataJSON *string) string {
 	return strings.TrimSpace(value)
 }
 
+func runtimeProjectSource(metadataJSON *string) string {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return ""
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
+		return ""
+	}
+	value, _ := metadata["source"].(string)
+	return strings.TrimSpace(value)
+}
+
 func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
 	return runtimeProjectProviderKindWithMetadata(cfg, projectID, nil)
 }
@@ -910,9 +922,20 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	configuredProjectIDs := make(map[string]struct{}, len(r.config.Projects))
+	for _, project := range r.config.Projects {
+		configuredProjectIDs[project.ID] = struct{}{}
+	}
+	isStaleConfiguredProject := func(item storage.ProjectRecord) bool {
+		if runtimeProjectSource(item.MetadataJSON) != "config" {
+			return false
+		}
+		_, configured := configuredProjectIDs[item.ID]
+		return !configured
+	}
 	seenRepos := make(map[string]string)
 	for _, item := range items {
-		if item.Archived {
+		if item.Archived || isStaleConfiguredProject(item) {
 			continue
 		}
 		providerID := projects.ProviderFromMetadata(item.MetadataJSON)
@@ -943,7 +966,7 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 		}
 	}
 	for _, item := range items {
-		if item.Archived {
+		if item.Archived || isStaleConfiguredProject(item) {
 			continue
 		}
 		providerID := projects.ProviderFromMetadata(item.MetadataJSON)

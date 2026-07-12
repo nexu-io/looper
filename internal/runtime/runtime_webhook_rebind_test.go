@@ -131,7 +131,7 @@ func TestRuntimeStopKeepsStorageOpenUntilWebhookWorkDrains(t *testing.T) {
 	}
 }
 
-func TestRuntimeStopCancelsReboundWebhookWorkBeforeClosingStorage(t *testing.T) {
+func TestRuntimeStopDrainsReboundWebhookWorkBeforeClosingStorage(t *testing.T) {
 	workingDir := t.TempDir()
 	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "runtime.sqlite"), filepath.Join(workingDir, "backups"))
 	repositories := storage.NewRepositories(coordinator.DB())
@@ -146,7 +146,7 @@ func TestRuntimeStopCancelsReboundWebhookWorkBeforeClosingStorage(t *testing.T) 
 	}
 	cfg.Roles.Reviewer.Discovery.AutoDiscovery = true
 	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test"}}
-	runner := &cancelCheckingReviewer{repositories: repositories, started: make(chan struct{}), result: make(chan error, 1)}
+	runner := &storageCheckingReviewer{repositories: repositories, started: make(chan struct{}), release: make(chan struct{}), result: make(chan error, 1)}
 	previous := webhookforward.New(webhookforward.Options{Repos: repositories, Config: cfg, Reviewer: runner, MaxConcurrent: 1, QueueCapacity: 8})
 	rt := New(Options{Config: cfg})
 	rt.services = Services{Coordinator: coordinator, Repositories: repositories}
@@ -163,14 +163,29 @@ func TestRuntimeStopCancelsReboundWebhookWorkBeforeClosingStorage(t *testing.T) 
 	}
 	rt.syncRuntimeProjectBinding(projects.ProjectBinding{ProjectID: "project_1", Name: "Looper", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: workingDir})
 
-	rt.Stop("test")
+	stopped := make(chan struct{})
+	go func() {
+		rt.Stop("test")
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("Runtime.Stop() returned before rebound webhook work drained")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(runner.release)
 	select {
 	case err := <-runner.result:
 		if err != nil {
-			t.Fatalf("Projects.List() after cancellation error = %v; storage closed before rebound work joined", err)
+			t.Fatalf("Projects.List() while draining rebound work error = %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("rebound webhook work was not canceled during shutdown")
+		t.Fatal("rebound webhook work did not access storage")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Runtime.Stop() did not return after rebound webhook work drained")
 	}
 }
 
@@ -186,20 +201,6 @@ type storageCheckingReviewer struct {
 	started      chan struct{}
 	release      chan struct{}
 	result       chan error
-}
-
-type cancelCheckingReviewer struct {
-	repositories *storage.Repositories
-	started      chan struct{}
-	result       chan error
-}
-
-func (r *cancelCheckingReviewer) DiscoverPullRequest(ctx context.Context, _ reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
-	close(r.started)
-	<-ctx.Done()
-	_, err := r.repositories.Projects.List(context.Background())
-	r.result <- err
-	return reviewer.DiscoveryResult{}, ctx.Err()
 }
 
 func (r *storageCheckingReviewer) DiscoverPullRequest(ctx context.Context, _ reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
