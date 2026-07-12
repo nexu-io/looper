@@ -2757,6 +2757,8 @@ type runtimeReviewerRecoveryPolicy struct {
 }
 
 func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeReviewerRecoveryPolicy {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	roles := config.ProjectRoleConfigs(r.config, projectID)
 	return runtimeReviewerRecoveryPolicy{
 		includeDrafts:    roles.Reviewer.Discovery.Triggers.IncludeDrafts,
