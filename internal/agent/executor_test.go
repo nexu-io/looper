@@ -149,6 +149,7 @@ func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *tes
 	t.Setenv("PATH", "/safe/bin")
 	t.Setenv("LANG", "en_US.UTF-8")
 	t.Setenv("LC_ALL", "C.UTF-8")
+	t.Setenv("LOOPER_CONFIG", "/custom/looper/config.toml")
 	t.Setenv("UNRELATED_API_KEY", "must-not-reach-agent")
 	t.Setenv("KEEP_ME", "must-not-reach-agent")
 
@@ -175,6 +176,9 @@ func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *tes
 	}
 	if got := env["LC_ALL"]; got != "C.UTF-8" {
 		t.Fatalf("LC_ALL = %q, want inherited locale value", got)
+	}
+	if got := env["LOOPER_CONFIG"]; got != "/custom/looper/config.toml" {
+		t.Fatalf("LOOPER_CONFIG = %q, want custom path for review-submit wrappers", got)
 	}
 	if got := env["CONFIG_ONLY"]; got != "true" {
 		t.Fatalf("CONFIG_ONLY = %q, want true", got)

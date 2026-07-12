@@ -37,9 +37,13 @@ var (
 // segments so compound words like TOKENIZATION or PASSWORDLESS are not rejected.
 // "token" is handled separately: only as the full name or a leading/trailing
 // segment (TOKEN, *_TOKEN, TOKEN_*), so names like refresh_token_ttl stay safe.
+// "pass" covers DB_PASS / REDIS_PASS; "pgpassword" is the Postgres libpq name
+// (single segment, so "password" alone does not match inside it).
 var sensitiveEnvNameKeywords = []string{
 	"secret",
 	"password",
+	"pass",
+	"pgpassword",
 	"credential",
 	"credentials",
 	"passwd",

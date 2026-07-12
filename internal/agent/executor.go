@@ -73,6 +73,9 @@ var inheritedAgentEnvKeys = []string{
 	"CODEX_HOME",
 	"CLAUDE_CONFIG_DIR",
 	"OPENCODE_CONFIG_DIR",
+	// Config path selector for trusted wrappers (looper review submit, etc.)
+	// that load via LOOPER_CONFIG when --config is not passed.
+	"LOOPER_CONFIG",
 }
 
 type ExecutorConfig struct {
