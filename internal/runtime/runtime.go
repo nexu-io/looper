@@ -793,6 +793,10 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 	if repositories == nil || repositories.Projects == nil || githubGateway == nil {
 		return nil
 	}
+	r.mu.RLock()
+	cfg := r.config
+	cfg.Projects = append([]config.ProjectRefConfig(nil), r.config.Projects...)
+	r.mu.RUnlock()
 	projectsList, err := repositories.Projects.List(ctx)
 	if err != nil {
 		return err
@@ -801,10 +805,10 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		if project.Archived {
 			continue
 		}
-		if runtimeProjectProviderKindWithMetadata(r.config, project.ID, project.MetadataJSON) != config.ProviderKindGitHub {
+		if runtimeProjectProviderKindWithMetadata(cfg, project.ID, project.MetadataJSON) != config.ProviderKindGitHub {
 			continue
 		}
-		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
+		roleCfg := config.ProjectRoleConfigs(cfg, project.ID).Coordinator
 		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
 			continue
 		}
@@ -892,6 +896,20 @@ func runtimeProjectProviderKindWithMetadata(cfg config.Config, projectID string,
 		}
 	}
 	return config.ProviderKindGitHub
+}
+
+func runtimeProjectBindingInstalled(cfg config.Config, projectID string, metadataJSON *string) bool {
+	providerID := projects.ProviderFromMetadata(metadataJSON)
+	if providerID == "" {
+		return true
+	}
+	repo := runtimeProjectRepo(metadataJSON)
+	for _, project := range cfg.Projects {
+		if project.ID == projectID && project.Provider == providerID && strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectProjectRepo reads origin host + owner/name. It never selects a provider

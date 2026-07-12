@@ -2640,6 +2640,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if project.Archived {
 			continue
 		}
+		if input.Config != nil && !runtimeProjectBindingInstalled(*input.Config, project.ID, project.MetadataJSON) {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler skipped provider project without runtime binding", map[string]any{"projectId": project.ID})
+			}
+			continue
+		}
 		providerKind := config.ProviderKindGitHub
 		if input.Config != nil {
 			providerKind = runtimeProjectProviderKindWithMetadata(*input.Config, project.ID, project.MetadataJSON)

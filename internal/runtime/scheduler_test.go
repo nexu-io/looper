@@ -124,6 +124,28 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 }
 
+func TestRunDefaultSchedulerTickSkipsProviderProjectWithoutRuntimeBinding(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 12, 14, 0, 0, 0, time.UTC)
+	metadata := `{"provider":"forgejo-main","repo":"acme/looper","source":"api"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: workingDir, MetadataJSON: &metadata, CreatedAt: formatJavaScriptISOString(now), UpdatedAt: formatJavaScriptISOString(now)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	cfg := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
+	reviewerRunner := &stubReviewerScheduler{}
+
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{Config: &cfg, Repos: repos, Now: func() time.Time { return now }, Reviewer: reviewerRunner}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if len(reviewerRunner.discoverCalls) != 0 {
+		t.Fatalf("reviewer discover calls = %#v, want none before runtime binding installation", reviewerRunner.discoverCalls)
+	}
+}
+
 func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	t.Parallel()
 
