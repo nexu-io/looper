@@ -55,3 +55,47 @@ func TestValidateAllowsCommonPublicationIdentifiers(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateAllowsCodeReviewAndCompoundWordAssignments(t *testing.T) {
+	t.Parallel()
+	// These previously false-positived when sensitive keywords were matched as
+	// bare substrings or when code-style "name = value" spacing was accepted.
+	for _, text := range []string{
+		"password = request.FormValue(\"password\")",
+		"api_key = loadFromEnv()",
+		"token = \"example\" in the docs",
+		"Change:\n```\napi_key = loadFromEnv()\n```",
+		"TOKENIZATION=enabled",
+		"PASSWORDLESS=true",
+		"AUTHENTICATION_MODE=oauth",
+		"SECRETS_MANAGER=aws",
+		"refresh_token_ttl=3600",
+		"has_password_field=true",
+		"const TOKEN = 'x'",
+		"export const API_KEY = process.env.API_KEY",
+		"Do not hardcode token = value in production.",
+		`{"password": "secret"}`,
+		"password: hunter2",
+	} {
+		if err := Validate(Field{Name: "body", Text: text}); err != nil {
+			t.Errorf("Validate(%q) error = %v, want safe", text, err)
+		}
+	}
+}
+
+func TestValidateStillRejectsSegmentBoundedCredentialNames(t *testing.T) {
+	t.Parallel()
+	for _, text := range []string{
+		"MY_TOKEN=short",
+		"AUTH_PASSWORD=abc",
+		"app-secret=value",
+		"DB_CREDENTIALS=abc",
+		"export APIKEY=deadbeef",
+		"X_API_KEY=deadbeef",
+	} {
+		err := Validate(Field{Name: "body", Text: text})
+		if err == nil || !strings.Contains(err.Error(), "credential-shaped") {
+			t.Errorf("Validate(%q) error = %v, want credential-shaped rejection", text, err)
+		}
+	}
+}

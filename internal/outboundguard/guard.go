@@ -15,12 +15,26 @@ const (
 
 var (
 	environmentAssignmentRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
-	sensitiveAssignmentRE   = regexp.MustCompile(`(?i)^(?:export[ \t]+)?(?:[A-Za-z_][A-Za-z0-9_]*)?(?:api[_-]?key|token|secret|password|credential)[A-Za-z0-9_]*[ \t]*=`)
 	credentialURLRE         = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@`)
 	highEntropyCandidateRE  = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
 	gitObjectIDRE           = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 	uuidRE                  = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
+
+// sensitiveEnvNameKeywords are matched only as whole underscore/hyphen-delimited
+// segments so compound words like TOKENIZATION or PASSWORDLESS are not rejected.
+// "token" is handled separately: only as the full name or a leading/trailing
+// segment (TOKEN, *_TOKEN, TOKEN_*), so names like refresh_token_ttl stay safe.
+var sensitiveEnvNameKeywords = []string{
+	"secret",
+	"password",
+	"credential",
+	"credentials",
+	"passwd",
+	"pwd",
+	"apikey",
+	"api_key",
+}
 
 type Field struct {
 	Name string
@@ -43,7 +57,7 @@ func unsafeText(text string) string {
 	environmentAssignments := 0
 	for _, rawLine := range strings.Split(text, "\n") {
 		line := stripShellLinePrefix(rawLine)
-		if sensitiveAssignmentRE.MatchString(line) {
+		if isSensitiveAssignment(line) {
 			return "contains a credential-shaped environment assignment"
 		}
 		if environmentAssignmentRE.MatchString(line) {
@@ -62,6 +76,113 @@ func unsafeText(text string) string {
 		}
 	}
 	return ""
+}
+
+// isSensitiveAssignment reports env-style credential assignments such as
+// TOKEN=..., export OPENAI_API_KEY=..., or SERVICE_TOKEN=....
+//
+// It intentionally requires shell/env form NAME=value with no spaces around '='
+// and only treats sensitive words as whole name segments. That keeps common
+// review prose and code snippets safe, for example:
+//
+//	password = request.FormValue("password")
+//	TOKENIZATION=enabled
+//	PASSWORDLESS=true
+//
+// Boolean-looking values are treated as configuration rather than secrets
+// (has_password_field=true), while non-boolean values for sensitive names still
+// fail closed (PASSWORD=abc, TOKEN=short).
+func isSensitiveAssignment(line string) bool {
+	line = strings.TrimSpace(line)
+	if len(line) >= 7 && strings.EqualFold(line[:6], "export") && isASCIISpace(line[6]) {
+		line = strings.TrimSpace(line[6:])
+	}
+	eq := strings.IndexByte(line, '=')
+	if eq <= 0 {
+		return false
+	}
+	name := line[:eq]
+	if !isEnvVarName(name) {
+		return false
+	}
+	if !isSensitiveEnvName(name) {
+		return false
+	}
+	return !looksLikeBooleanConfigValue(line[eq+1:])
+}
+
+func isEnvVarName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if r != '_' && !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if r != '_' && r != '-' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isSensitiveEnvName(name string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(name, "-", "_"))
+	for _, keyword := range sensitiveEnvNameKeywords {
+		if hasDelimitedKeyword(normalized, keyword) {
+			return true
+		}
+	}
+	// "token" only as full name or leading/trailing segment.
+	if normalized == "token" || strings.HasPrefix(normalized, "token_") || strings.HasSuffix(normalized, "_token") {
+		return true
+	}
+	return false
+}
+
+func looksLikeBooleanConfigValue(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		if q := value[0]; (q == '"' || q == '\'') && value[len(value)-1] == q {
+			value = value[1 : len(value)-1]
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "false", "yes", "no", "on", "off", "null", "none", "nil":
+		return true
+	default:
+		return false
+	}
+}
+
+// hasDelimitedKeyword reports whether keyword appears in name bounded by the
+// string edges or underscores (after '-' has been normalized to '_').
+func hasDelimitedKeyword(name, keyword string) bool {
+	if keyword == "" {
+		return false
+	}
+	for start := 0; start <= len(name); {
+		idx := strings.Index(name[start:], keyword)
+		if idx < 0 {
+			return false
+		}
+		idx += start
+		beforeOK := idx == 0 || name[idx-1] == '_'
+		after := idx + len(keyword)
+		afterOK := after == len(name) || name[after] == '_'
+		if beforeOK && afterOK {
+			return true
+		}
+		start = idx + 1
+	}
+	return false
+}
+
+func isASCIISpace(b byte) bool {
+	return b == ' ' || b == '\t'
 }
 
 // stripShellLinePrefix removes common shell prompt and xtrace prefixes so
