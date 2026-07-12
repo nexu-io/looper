@@ -209,8 +209,9 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
 		} else if strings.TrimSpace(detected.Repo) != "" {
 			// Fill repo from origin only for GitHub hosts, or when the caller has
-			// already confirmed a non-GitHub provider. Never infer provider from host.
-			if provider != nil || isGitHubDetectedHost(detected.Host) {
+			// explicitly selected a Forgejo provider. Plane still requires a GitHub
+			// repo, so a non-GitHub origin cannot supply its repository binding.
+			if isForgejoProvider(s.Config, provider) || isGitHubDetectedHost(detected.Host) {
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
 			}

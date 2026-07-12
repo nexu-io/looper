@@ -161,6 +161,48 @@ func TestServiceAddProjectDoesNotInferProviderFromNonGitHubRemote(t *testing.T) 
 	}
 }
 
+func TestServiceAddProjectRejectsPlaneProviderWithNonGitHubDetectedRepo(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Providers = []config.ProviderConfig{{
+		ID:   "plane-main",
+		Kind: config.ProviderKindPlane,
+	}}
+	service := &Service{
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		Config: cfg,
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "core/odcrew", Host: "code.example.com"}, nil
+		},
+	}
+	provider := "plane-main"
+
+	_, err = service.AddProject(ctx, AddInput{
+		ID:       "odcrew",
+		Name:     "odcrew",
+		RepoPath: "/tmp/odcrew",
+		Provider: &provider,
+	})
+	if err == nil || !strings.Contains(err.Error(), "provider is set but repo is missing") {
+		t.Fatalf("AddProject() error = %v, want explicit repo validation error", err)
+	}
+	stored, getErr := repos.Projects.GetByID(ctx, "odcrew")
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID() error = %v", getErr)
+	}
+	if stored != nil {
+		t.Fatalf("Projects.GetByID() = %#v, want no persisted Plane project", stored)
+	}
+}
+
 func TestServiceAddProjectRejectsUnknownProvider(t *testing.T) {
 	t.Parallel()
 
