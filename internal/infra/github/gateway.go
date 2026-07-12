@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1152,6 +1153,9 @@ func (g *Gateway) AddIssueReaction(ctx context.Context, input CreateIssueReactio
 }
 
 func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return IssueCommentResult{}, err
+	}
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--method", "POST", "-f", "body=" + input.Body}
 	if hostname != "" {
@@ -1169,6 +1173,9 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 }
 
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return err
+	}
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/issues/comments/%d", repo, input.CommentID), "--method", "PATCH", "-f", "body=" + input.Body}
 	if hostname != "" {
@@ -1736,6 +1743,9 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 }
 
 func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThreadReplyInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "review thread reply body", Text: input.Body}); err != nil {
+		return err
+	}
 	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
 		"mutation($threadId: ID!, $body: String!) {",
 		"  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {",
@@ -1791,7 +1801,11 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
 	request := g.reviewSubmitRequest(input)
-	if err := validateReviewContentSafety(input.Body, input.Comments); err != nil {
+	fields := []outboundguard.Field{{Name: "review body", Text: input.Body}}
+	for i, comment := range input.Comments {
+		fields = append(fields, outboundguard.Field{Name: fmt.Sprintf("inline review comment %d", i+1), Text: comment.Body})
+	}
+	if err := outboundguard.Validate(fields...); err != nil {
 		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
 		return err
 	}
@@ -2056,6 +2070,9 @@ func containsVisibleInlineReviewDisclosure(body string) bool {
 }
 
 func (g *Gateway) AddPullRequestComment(ctx context.Context, input PullRequestCommentInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request comment body", Text: input.Body}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "comment", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--body", input.Body)
 	return err
 }
@@ -2477,6 +2494,9 @@ func (g *Gateway) DismissReview(ctx context.Context, input DismissReviewInput) e
 	if message == "" {
 		message = "Dismissed by looper."
 	}
+	if err := outboundguard.Validate(outboundguard.Field{Name: "review dismissal message", Text: message}); err != nil {
+		return err
+	}
 	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/reviews/%d/dismissals", repo, input.PRNumber, input.ReviewID), "--method", "PUT", "-f", "message=" + message, "-f", "event=DISMISS"}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
@@ -2486,6 +2506,12 @@ func (g *Gateway) DismissReview(ctx context.Context, input DismissReviewInput) e
 }
 
 func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {
+	if err := outboundguard.Validate(
+		outboundguard.Field{Name: "pull request title", Text: input.Title},
+		outboundguard.Field{Name: "pull request body", Text: input.Body},
+	); err != nil {
+		return CreatePullRequestResult{}, err
+	}
 	args := []string{"pr", "create", "--repo", input.Repo, "--head", input.HeadBranch, "--base", input.BaseBranch, "--title", input.Title, "--body", input.Body}
 	if input.Draft {
 		args = append(args, "--draft")
@@ -2525,11 +2551,17 @@ func (g *Gateway) CompareBranches(ctx context.Context, input CompareBranchesInpu
 }
 
 func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRequestTitleInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request title", Text: input.Title}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--title", input.Title)
 	return err
 }
 
 func (g *Gateway) UpdatePullRequestBody(ctx context.Context, input UpdatePullRequestBodyInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request body", Text: input.Body}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--body", input.Body)
 	return err
 }

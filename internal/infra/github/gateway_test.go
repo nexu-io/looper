@@ -771,6 +771,57 @@ func TestSubmitReviewRejectsCredentialAssignmentInInlineCommentBeforePublishing(
 	}
 }
 
+func TestOutboundPublicationMethodsRejectUnsafeContentBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	unsafe := "SERVICE_TOKEN=secret-value"
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "create issue comment", run: func() error {
+			_, err := gateway.CreateIssueComment(context.Background(), IssueCommentInput{Repo: "acme/looper", IssueNumber: 1, Body: unsafe})
+			return err
+		}},
+		{name: "update issue comment", run: func() error {
+			return gateway.UpdateIssueComment(context.Background(), UpdateIssueCommentInput{Repo: "acme/looper", CommentID: 1, Body: unsafe})
+		}},
+		{name: "review thread reply", run: func() error {
+			return gateway.AddReviewThreadReply(context.Background(), AddReviewThreadReplyInput{ThreadID: "thread-1", Body: unsafe})
+		}},
+		{name: "pull request comment", run: func() error {
+			return gateway.AddPullRequestComment(context.Background(), PullRequestCommentInput{Repo: "acme/looper", PRNumber: 1, Body: unsafe})
+		}},
+		{name: "create pull request", run: func() error {
+			_, err := gateway.CreatePullRequest(context.Background(), CreatePullRequestInput{Repo: "acme/looper", HeadBranch: "feature", BaseBranch: "main", Title: "Feature", Body: unsafe})
+			return err
+		}},
+		{name: "update pull request title", run: func() error {
+			return gateway.UpdatePullRequestTitle(context.Background(), UpdatePullRequestTitleInput{Repo: "acme/looper", PRNumber: 1, Title: unsafe})
+		}},
+		{name: "update pull request body", run: func() error {
+			return gateway.UpdatePullRequestBody(context.Background(), UpdatePullRequestBodyInput{Repo: "acme/looper", PRNumber: 1, Body: unsafe})
+		}},
+		{name: "dismiss review", run: func() error {
+			return gateway.DismissReview(context.Background(), DismissReviewInput{Repo: "acme/looper", PRNumber: 1, ReviewID: 1, Message: unsafe})
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); err == nil || !strings.Contains(err.Error(), "outbound content safety gate") {
+				t.Fatalf("publication error = %v, want content safety rejection", err)
+			}
+		})
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("publication methods made gh calls after content safety failures: %#v", runner.calls)
+	}
+}
+
 func TestSubmitReviewAllowsCleanOutcomeWithoutLocation(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

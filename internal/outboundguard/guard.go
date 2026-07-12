@@ -1,4 +1,4 @@
-package github
+package outboundguard
 
 import (
 	"fmt"
@@ -8,9 +8,10 @@ import (
 	"unicode"
 )
 
-const environmentAssignmentLimit = 5
-
-const highEntropyThreshold = 4.25
+const (
+	environmentAssignmentLimit = 5
+	highEntropyThreshold       = 4.25
+)
 
 var (
 	environmentAssignmentRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
@@ -20,19 +21,21 @@ var (
 	uuidRE                  = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
 
-func validateReviewContentSafety(body string, comments []ReviewComment) error {
-	if reason := unsafeReviewText(body); reason != "" {
-		return fmt.Errorf("review content safety gate rejected review body: %s", reason)
-	}
-	for i, comment := range comments {
-		if reason := unsafeReviewText(comment.Body); reason != "" {
-			return fmt.Errorf("review content safety gate rejected inline comment %d: %s", i+1, reason)
+type Field struct {
+	Name string
+	Text string
+}
+
+func Validate(fields ...Field) error {
+	for _, field := range fields {
+		if reason := unsafeText(field.Text); reason != "" {
+			return fmt.Errorf("outbound content safety gate rejected %s: %s", field.Name, reason)
 		}
 	}
 	return nil
 }
 
-func unsafeReviewText(text string) string {
+func unsafeText(text string) string {
 	environmentAssignments := 0
 	for _, rawLine := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(rawLine)
@@ -47,7 +50,7 @@ func unsafeReviewText(text string) string {
 		return "contains an environment-dump-shaped block"
 	}
 	for _, token := range highEntropyCandidateRE.FindAllString(text, -1) {
-		if safeHighEntropyIdentifier(token) {
+		if gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token) {
 			continue
 		}
 		if characterClassCount(token) >= 3 && shannonEntropy(token) >= highEntropyThreshold {
@@ -55,10 +58,6 @@ func unsafeReviewText(text string) string {
 		}
 	}
 	return ""
-}
-
-func safeHighEntropyIdentifier(token string) bool {
-	return gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token)
 }
 
 func characterClassCount(value string) int {
