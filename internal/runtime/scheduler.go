@@ -98,6 +98,7 @@ type defaultSchedulerTickInput struct {
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	ConfigReadLock           func() func()
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
@@ -2101,7 +2102,7 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildDefaultSchedulerHandlers(cfg *config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2447,15 +2448,24 @@ func buildDefaultSchedulerHandlers(cfg *config.Config, logger bootstrap.Logger, 
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "worker")),
+			ConfigReadLock:           configReadLock,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
 	}
 
 	return defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
+			if configReadLock != nil {
+				unlock := configReadLock()
+				defer unlock()
+			}
 			return runDefaultSchedulerTick(ctx, inputForServices(services))
 		},
 		claim: func(ctx context.Context, services Services) error {
+			if configReadLock != nil {
+				unlock := configReadLock()
+				defer unlock()
+			}
 			return runIndependentClaimPass(ctx, inputForServices(services))
 		},
 		webhook: webhookforward.New(webhookforward.Options{
@@ -2944,14 +2954,18 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 
 		if input.AsyncRunner != nil {
 			input.AsyncRunner.Go(func() {
-				if err := processFn(ctx); err != nil && input.Logger != nil {
+				if err := runWithConfigReadLock(input.ConfigReadLock, func() error {
+					return processFn(ctx)
+				}); err != nil && input.Logger != nil {
 					input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
 				}
 			})
 			continue
 		}
 		go func() {
-			if err := processFn(ctx); err != nil && input.Logger != nil {
+			if err := runWithConfigReadLock(input.ConfigReadLock, func() error {
+				return processFn(ctx)
+			}); err != nil && input.Logger != nil {
 				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
 			}
 		}()
@@ -2960,6 +2974,15 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+func runWithConfigReadLock(lock func() func(), fn func() error) error {
+	if lock == nil {
+		return fn()
+	}
+	unlock := lock()
+	defer unlock()
+	return fn()
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {

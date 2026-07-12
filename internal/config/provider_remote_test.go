@@ -60,9 +60,33 @@ func TestUpsertRuntimeProjectBindingAppliesForgejoProfile(t *testing.T) {
 	if project.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest == nil || *project.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
 		t.Fatalf("RequireReviewRequest = %#v, want false", project.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest)
 	}
-	// Config-file projects keep authority.
+	// Runtime projects are updated when the API registers the same ID again.
 	UpsertRuntimeProjectBinding(&cfg, "odcrew", "other", "forgejo-main", "core/other", "/tmp/other")
-	if cfg.Projects[0].Repo != "core/odcrew" {
+	if cfg.Projects[0].Repo != "core/other" {
+		t.Fatalf("runtime project was not updated: %#v", cfg.Projects[0])
+	}
+}
+
+func TestUpsertRuntimeProjectBindingKeepsConfigFileProjectAuthority(t *testing.T) {
+	cfg := Config{
+		Providers: []ProviderConfig{
+			{ID: "forgejo-main", Kind: ProviderKindForgejo, BaseURL: "https://code.example.com"},
+		},
+		Projects: []ProjectRefConfig{{
+			ID:       "odcrew",
+			Name:     "Config file",
+			Provider: "forgejo-main",
+			Repo:     "core/configured",
+			RepoPath: "/tmp/configured",
+		}},
+	}
+
+	UpsertRuntimeProjectBinding(&cfg, "odcrew", "runtime", "forgejo-main", "core/runtime", "/tmp/runtime")
+
+	if len(cfg.Projects) != 1 {
+		t.Fatalf("Projects len = %d, want 1", len(cfg.Projects))
+	}
+	if cfg.Projects[0].Repo != "core/configured" || cfg.Projects[0].RepoPath != "/tmp/configured" {
 		t.Fatalf("config project was overwritten: %#v", cfg.Projects[0])
 	}
 }

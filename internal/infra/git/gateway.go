@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1202,10 +1203,20 @@ func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
 	if remoteURL == "" {
 		return "", ""
 	}
+	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Scheme != "" {
+		switch parsed.Scheme {
+		case "ssh", "https", "http":
+			host = strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+			repo = strings.Trim(strings.TrimSpace(parsed.Path), "/")
+			repo = strings.TrimSuffix(repo, ".git")
+			if host != "" && isOwnerNameRepo(repo) {
+				return host, repo
+			}
+		}
+	}
 
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^(?:ssh://)?(?:git@)?(?P<host>[^/:]+)[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
-		regexp.MustCompile(`^https?://(?P<host>[^/]+)/(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
+		regexp.MustCompile(`^(?:git@)?(?P<host>[^/:]+):(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
 	}
 
 	for _, pattern := range patterns {

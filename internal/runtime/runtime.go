@@ -633,9 +633,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		// Pass a pointer so API-added forgejo bindings registered into r.config
-		// remain visible to scheduler forgejo client resolution.
-		handlers := buildDefaultSchedulerHandlers(&r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		handlers := buildDefaultSchedulerHandlers(&r.config, r.configReadLock, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
@@ -664,6 +662,11 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	started = true
 	return nil
+}
+
+func (r *Runtime) configReadLock() func() {
+	r.mu.RLock()
+	return r.mu.RUnlock
 }
 
 func (r *Runtime) CompleteStartup(ctx context.Context) error {

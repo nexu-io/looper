@@ -10,7 +10,8 @@ import (
 // profiles work for projects that were not declared in the config file.
 //
 // Config-file projects keep authority: an existing config entry with the same
-// id is left unchanged.
+// id is left unchanged. Runtime-added entries are replaced on repeat API adds so
+// provider/repo metadata stays aligned with the project database.
 func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo, repoPath string) {
 	if cfg == nil {
 		return
@@ -22,10 +23,15 @@ func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo,
 	if projectID == "" || providerID == "" || repo == "" || repoPath == "" {
 		return
 	}
-	for _, existing := range cfg.Projects {
+	existingIndex := -1
+	for index, existing := range cfg.Projects {
 		if existing.ID == projectID {
-			return
+			existingIndex = index
+			break
 		}
+	}
+	if existingIndex >= 0 && !cfg.hasRuntimeProjectBinding(projectID) {
+		return
 	}
 	if name = strings.TrimSpace(name); name == "" {
 		name = projectID
@@ -40,7 +46,28 @@ func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo,
 	if resolvedProjectProviderKind(*cfg, project) == ProviderKindForgejo {
 		applyForgejoProjectProfile(&project)
 	}
+	if existingIndex >= 0 {
+		cfg.Projects[existingIndex] = project
+		cfg.markRuntimeProjectBinding(projectID)
+		return
+	}
 	cfg.Projects = append(cfg.Projects, project)
+	cfg.markRuntimeProjectBinding(projectID)
+}
+
+func (cfg *Config) hasRuntimeProjectBinding(projectID string) bool {
+	if cfg == nil || cfg.runtimeProjectBindingIDs == nil {
+		return false
+	}
+	_, ok := cfg.runtimeProjectBindingIDs[projectID]
+	return ok
+}
+
+func (cfg *Config) markRuntimeProjectBinding(projectID string) {
+	if cfg.runtimeProjectBindingIDs == nil {
+		cfg.runtimeProjectBindingIDs = map[string]struct{}{}
+	}
+	cfg.runtimeProjectBindingIDs[projectID] = struct{}{}
 }
 
 // MatchForgejoProviderByRemoteHost finds a configured forgejo provider whose
