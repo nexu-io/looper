@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +40,67 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 	if result.Project.MetadataJSON == nil || *result.Project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"api"}` {
 		t.Fatalf("AddProject().Project.MetadataJSON = %v, want api metadata", result.Project.MetadataJSON)
+	}
+}
+
+func TestServiceConcurrentAddsPublishCommittedCatalog(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	firstPublishStarted := make(chan struct{})
+	releaseFirstPublish := make(chan struct{})
+	var publishMu sync.Mutex
+	var published []config.ProjectRefConfig
+	publishCount := 0
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   time.Now,
+		PublishProjects: func(projects []config.ProjectRefConfig) {
+			publishMu.Lock()
+			publishCount++
+			count := publishCount
+			published = append([]config.ProjectRefConfig(nil), projects...)
+			publishMu.Unlock()
+			if count == 1 {
+				close(firstPublishStarted)
+				<-releaseFirstPublish
+			}
+		},
+	}
+
+	errorsCh := make(chan error, 2)
+	go func() {
+		_, err := service.AddProject(ctx, AddInput{ID: "a", Name: "A", RepoPath: "/tmp/a", BaseBranch: "main"})
+		errorsCh <- err
+	}()
+	<-firstPublishStarted
+	go func() {
+		_, err := service.AddProject(ctx, AddInput{ID: "b", Name: "B", RepoPath: "/tmp/b", BaseBranch: "main"})
+		errorsCh <- err
+	}()
+
+	close(releaseFirstPublish)
+	for range 2 {
+		if err := <-errorsCh; err != nil {
+			t.Fatalf("AddProject() error = %v", err)
+		}
+	}
+
+	publishMu.Lock()
+	got := append([]config.ProjectRefConfig(nil), published...)
+	publishMu.Unlock()
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("last published projects = %#v, want a and b", got)
+	}
+	stored, err := service.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("len(List()) = %d, want 2", len(stored))
 	}
 }
 

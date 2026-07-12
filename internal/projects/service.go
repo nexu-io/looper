@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
@@ -71,6 +72,7 @@ type CapturePullRequestSnapshotInput struct {
 }
 
 type Service struct {
+	mutationMu                 sync.Mutex
 	DB                         *sql.DB
 	Repos                      *storage.Repositories
 	Logger                     bootstrap.Logger
@@ -134,6 +136,8 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return AddResult{}, fmt.Errorf("projects repository is not configured")
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
 	existing, err := s.Repos.Projects.GetByID(ctx, input.ID)
 	if err != nil {
@@ -292,6 +296,8 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
 	trimmed := strings.TrimSpace(identifier)
 	if trimmed == "" {
@@ -381,6 +387,8 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return fmt.Errorf("projects repository is not configured")
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
 	nowISO := currentISO(func() time.Time { return now })
 	existingProjects, err := s.Repos.Projects.List(ctx)
