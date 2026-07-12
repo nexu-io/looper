@@ -509,7 +509,9 @@ func (w *webhookRuntime) configuredWebhookReposForMode(projects []storage.Projec
 	seen := map[string]struct{}{}
 	repos := make([]string, 0, len(projects))
 	for _, project := range projects {
-		if project.Archived || w.webhookModeForProject(project.ID) != mode {
+		if project.Archived ||
+			runtimeProjectProviderKindWithMetadata(w.cfg, project.ID, project.MetadataJSON) == config.ProviderKindForgejo ||
+			w.webhookModeForProject(project.ID) != mode {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)

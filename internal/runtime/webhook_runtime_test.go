@@ -361,6 +361,39 @@ func TestWebhookRuntimeReconcileAddsMissingForwardersWithoutDuplicates(t *testin
 	}
 }
 
+func TestWebhookRuntimeReconcileSkipsForgejoProjects(t *testing.T) {
+	t.Parallel()
+
+	repositories := openWebhookRuntimeTestRepositories(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"provider":"forgejo-main","repo":"acme/forgejo"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "forgejo_project", Name: "Forgejo", RepoPath: "/tmp/forgejo", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(forgejo_project) error = %v", err)
+	}
+
+	rt := newWebhookRuntime(config.Config{
+		Webhook: config.WebhookConfig{Enabled: true, Mode: config.WebhookModeGHForward},
+		Tools:   config.ToolPathsConfig{GHPath: stringPtr("/usr/bin/gh")},
+		Server:  config.ServerConfig{Host: "127.0.0.1", Port: 7777},
+		Providers: []config.ProviderConfig{{
+			ID:   "forgejo-main",
+			Kind: config.ProviderKindForgejo,
+		}},
+	}, nil, time.Now)
+	t.Cleanup(rt.Stop)
+
+	if err := rt.Reconcile(repositories); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	status := rt.Status()
+	if len(status.Forwarders) != 0 {
+		t.Fatalf("Status().Forwarders = %#v, want no GitHub forwarder for Forgejo project", status.Forwarders)
+	}
+	if !strings.Contains(strings.Join(status.DegradedReasons, "\n"), noConfiguredWebhookReposReason) {
+		t.Fatalf("Status().DegradedReasons = %v, want %q", status.DegradedReasons, noConfiguredWebhookReposReason)
+	}
+}
+
 func TestWebhookRuntimeReconcilePassesDeadlineToTunnelHookReconcile(t *testing.T) {
 	t.Parallel()
 
