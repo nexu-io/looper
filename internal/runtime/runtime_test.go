@@ -100,7 +100,7 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
-func TestRuntimeStartForgejoOnlyDoesNotRequireGitHubGateway(t *testing.T) {
+func TestRuntimeStartForgejoOnlyRetainsGitHubGatewayForRuntimeProjectAdd(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -126,8 +126,23 @@ func TestRuntimeStartForgejoOnlyDoesNotRequireGitHubGateway(t *testing.T) {
 	}
 	t.Cleanup(func() { rt.Stop("test cleanup") })
 
-	if rt.githubGateway != nil {
-		t.Fatal("runtime githubGateway = non-nil, want nil for Forgejo-only config")
+	if rt.githubGateway == nil {
+		t.Fatal("runtime githubGateway = nil, want GitHub support for runtime project adds")
+	}
+	githubRepo := "nexu-io/looper"
+	result, err := rt.Services().Projects.AddProject(context.Background(), projects.AddInput{
+		ID:           "github_project",
+		Name:         "GitHub Project",
+		RepoPath:     filepath.Join(workingDir, "github-repo"),
+		BaseBranch:   "main",
+		Repo:         &githubRepo,
+		SnapshotMode: projects.SnapshotModeOff,
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.Repo == nil || *result.Repo != githubRepo || result.Provider != nil {
+		t.Fatalf("AddProject() binding = (repo %v, provider %v), want provider-less GitHub repo %q", result.Repo, result.Provider, githubRepo)
 	}
 	project, err := rt.Services().Repositories.Projects.GetByID(context.Background(), "forgejo_project")
 	if err != nil {
@@ -3052,24 +3067,6 @@ func TestSyncRuntimeProjectBindingRefreshesWebhookForwarder(t *testing.T) {
 	}
 	if len(factoryConfig.Projects) != 1 || factoryConfig.Projects[0].ID != "odcrew" || factoryConfig.Projects[0].Repo != "core/odcrew" {
 		t.Fatalf("webhook factory config projects = %#v, want new runtime binding", factoryConfig.Projects)
-	}
-}
-
-func TestRuntimeConfigHasGitHubProjectsForRuntimePlaneAdds(t *testing.T) {
-	t.Parallel()
-
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{
-			{ID: "forgejo-main", Kind: config.ProviderKindForgejo},
-			{ID: "plane-main", Kind: config.ProviderKindPlane},
-		},
-		Projects: []config.ProjectRefConfig{{
-			ID: "forgejo-project", Provider: "forgejo-main", Repo: "acme/forgejo-project",
-		}},
-	}
-
-	if !runtimeConfigHasGitHubProjects(cfg) {
-		t.Fatal("runtimeConfigHasGitHubProjects() = false, want GitHub support for runtime Plane adds")
 	}
 }
 

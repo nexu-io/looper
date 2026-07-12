@@ -542,10 +542,7 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
-	var githubGateway *githubinfra.Gateway
-	if runtimeConfigHasGitHubProjects(r.config) {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
-	}
+	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	projectService := &projects.Service{
 		DB:     coordinator.DB(),
 		Repos:  repositories,
@@ -847,28 +844,6 @@ func runtimeProjectRepo(metadataJSON *string) string {
 	}
 	value, _ := metadata["repo"].(string)
 	return strings.TrimSpace(value)
-}
-
-func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
-	for _, project := range cfg.Projects {
-		switch config.ResolvedProjectProviderKind(cfg, project) {
-		case config.ProviderKindGitHub:
-			return true
-		case config.ProviderKindPlane:
-			// Plane is a task-source only: its pull requests live on the
-			// project's GitHub code repo, so the GitHub gateway is required.
-			return true
-		}
-	}
-	// Plane is a task source whose code-repository operations use GitHub. Keep
-	// that gateway available for Plane projects added through the API after
-	// startup, even when the static project list contains only Forgejo projects.
-	for _, provider := range cfg.Providers {
-		if provider.Kind == config.ProviderKindPlane {
-			return true
-		}
-	}
-	return len(cfg.Projects) == 0
 }
 
 func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
