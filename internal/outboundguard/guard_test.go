@@ -18,6 +18,9 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 		{name: "secret at start", text: "SECRET_KEY=1234", want: "credential-shaped"},
 		{name: "password at start", text: "PASSWORD=abc", want: "credential-shaped"},
 		{name: "API key at start", text: "API_KEY=deadbeef", want: "credential-shaped"},
+		{name: "database URL", text: "DATABASE_URL=postgres://app:pw@db.example/prod", want: "credential-bearing"},
+		{name: "exported connection URL", text: "export CACHE_URL=redis://worker:p%40ss@cache.example/0", want: "credential-bearing"},
+		{name: "connection URL in prose", text: "Connect with mongodb+srv://agent:short@db.example/prod.", want: "credential-bearing"},
 		{name: "environment", text: "HOME=/tmp\nPATH=/bin\nSHELL=/bin/sh\nLANG=C\nTERM=dumb", want: "environment-dump-shaped"},
 	}
 	for _, tc := range tests {
@@ -40,6 +43,8 @@ func TestValidateAllowsCommonPublicationIdentifiers(t *testing.T) {
 		"Trace ID 019f5693-81ce-4893-8df5-89db82778ac7 identifies the request.",
 		"Use ${OPENAI_API_KEY} from the process environment.",
 		"The configuration example is FEATURE_FLAG=true.",
+		"DATABASE_URL=postgres://db.example/prod",
+		"Repository URL https://git.example/org/repo and contact ops@example.com.",
 	} {
 		if err := Validate(Field{Name: "body", Text: text}); err != nil {
 			t.Errorf("Validate(%q) error = %v, want safe", text, err)

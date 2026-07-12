@@ -16,6 +16,7 @@ const (
 var (
 	environmentAssignmentRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 	sensitiveAssignmentRE   = regexp.MustCompile(`(?i)^(?:export[ \t]+)?(?:[A-Za-z_][A-Za-z0-9_]*)?(?:api[_-]?key|token|secret|password|credential)[A-Za-z0-9_]*[ \t]*=`)
+	credentialURLRE         = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@`)
 	highEntropyCandidateRE  = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
 	gitObjectIDRE           = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 	uuidRE                  = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -36,6 +37,9 @@ func Validate(fields ...Field) error {
 }
 
 func unsafeText(text string) string {
+	if credentialURLRE.MatchString(text) {
+		return "contains a credential-bearing connection URL"
+	}
 	environmentAssignments := 0
 	for _, rawLine := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(rawLine)
