@@ -104,9 +104,10 @@ type defaultSchedulerTickInput struct {
 }
 
 type defaultSchedulerHandlers struct {
-	tick    RunSchedulerTickFunc
-	claim   RunSchedulerTickFunc
-	webhook WebhookForwarder
+	tick             RunSchedulerTickFunc
+	claim            RunSchedulerTickFunc
+	webhook          WebhookForwarder
+	webhookForConfig func(config.Config) WebhookForwarder
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -2150,7 +2151,8 @@ func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock
 			claim: func(ctx context.Context, services Services) error {
 				return buildSnapshotHandlers().claim(ctx, services)
 			},
-			webhook: initial.webhook,
+			webhook:          initial.webhook,
+			webhookForConfig: initial.webhookForConfig,
 		}
 	}
 	notificationGateway := notify.NewGateway(notify.Options{
@@ -2508,6 +2510,9 @@ func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock
 			Logger:   logger,
 			Now:      now,
 		})
+		handlers.webhookForConfig = func(next config.Config) WebhookForwarder {
+			return buildDefaultSchedulerHandlersWithWebhook(&next, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true).webhook
+		}
 	}
 	return handlers
 }

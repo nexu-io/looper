@@ -798,7 +798,15 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
+	var removedBinding *ProjectBinding
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return now.Add(time.Minute) },
+		RegisterBinding: func(binding ProjectBinding) {
+			removedBinding = &binding
+		},
+	}
 
 	removed, err := service.RemoveProject(ctx, "looper")
 	if err != nil {
@@ -806,6 +814,9 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	}
 	if !removed.Archived {
 		t.Fatalf("RemoveProject().Archived = %v, want true", removed.Archived)
+	}
+	if removedBinding == nil || removedBinding.ProjectID != "looper" || removedBinding.Provider != "" || removedBinding.Repo != "" {
+		t.Fatalf("RegisterBinding() = %#v, want cleared looper binding", removedBinding)
 	}
 
 	stored, err := repos.Projects.GetByID(ctx, "looper")

@@ -351,6 +351,9 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 }
 
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
+	s.addMu.Lock()
+	defer s.addMu.Unlock()
+
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
 	}
@@ -398,6 +401,9 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	}
 	project.Archived = true
 	project.UpdatedAt = nowISO
+	if s.RegisterBinding != nil {
+		s.RegisterBinding(ProjectBinding{ProjectID: project.ID})
+	}
 
 	return *project, nil
 }

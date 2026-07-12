@@ -153,6 +153,7 @@ type Runtime struct {
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
 	webhookForwarder            WebhookForwarder
+	webhookForwarderForConfig   func(config.Config) WebhookForwarder
 	networkManager              *networkclient.Manager
 	schedulerDisabled           bool
 	startupReadyOnce            sync.Once
@@ -563,11 +564,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			defer r.mu.RUnlock()
 			return config.ValidateRuntimeProjectBinding(r.config, binding.ProjectID, binding.Repo)
 		},
-		RegisterBinding: func(binding projects.ProjectBinding) {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			config.UpsertRuntimeProjectBinding(&r.config, binding.ProjectID, binding.Name, binding.Provider, binding.Repo, binding.RepoPath)
-		},
+		RegisterBinding: r.syncRuntimeProjectBinding,
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 			if githubGateway == nil {
 				return githubinfra.RepositorySettings{}, fmt.Errorf("github gateway is not configured")
@@ -650,6 +647,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
+		r.webhookForwarderForConfig = handlers.webhookForConfig
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
@@ -671,6 +669,34 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	started = true
 	return nil
+}
+
+func (r *Runtime) syncRuntimeProjectBinding(binding projects.ProjectBinding) {
+	r.mu.Lock()
+	config.UpsertRuntimeProjectBinding(&r.config, binding.ProjectID, binding.Name, binding.Provider, binding.Repo, binding.RepoPath)
+	factory := r.webhookForwarderForConfig
+	cfg := r.config
+	cfg.Projects = append([]config.ProjectRefConfig(nil), r.config.Projects...)
+	r.mu.Unlock()
+
+	if factory == nil {
+		return
+	}
+	next := factory(cfg)
+	r.mu.Lock()
+	if r.stopped {
+		r.mu.Unlock()
+		if next != nil {
+			next.Close()
+		}
+		return
+	}
+	previous := r.webhookForwarder
+	r.webhookForwarder = next
+	r.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
 }
 
 func (r *Runtime) configReadLock() func() {

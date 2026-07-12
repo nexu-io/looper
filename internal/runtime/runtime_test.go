@@ -3007,6 +3007,54 @@ func (s stubRuntimeWebhookForwarder) Stats() webhookforward.Stats { return s.sta
 
 func (stubRuntimeWebhookForwarder) Close() {}
 
+type trackingRuntimeWebhookForwarder struct{ closed bool }
+
+func (*trackingRuntimeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
+	return webhookforward.ForwardResult{}, nil
+}
+
+func (*trackingRuntimeWebhookForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
+
+func (f *trackingRuntimeWebhookForwarder) Close() { f.closed = true }
+
+func TestSyncRuntimeProjectBindingRefreshesWebhookForwarder(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	previous := &trackingRuntimeWebhookForwarder{}
+	next := &trackingRuntimeWebhookForwarder{}
+	var factoryConfig config.Config
+	rt := &Runtime{
+		config:           cfg,
+		webhookForwarder: previous,
+		webhookForwarderForConfig: func(cfg config.Config) WebhookForwarder {
+			factoryConfig = cfg
+			return next
+		},
+	}
+
+	rt.syncRuntimeProjectBinding(projects.ProjectBinding{
+		ProjectID: "odcrew",
+		Name:      "odcrew",
+		Provider:  "forgejo-main",
+		Repo:      "core/odcrew",
+		RepoPath:  "/tmp/odcrew",
+	})
+
+	if !previous.closed {
+		t.Fatal("previous webhook forwarder was not closed")
+	}
+	if got := rt.WebhookForwarder(); got != next {
+		t.Fatalf("WebhookForwarder() = %T, want refreshed forwarder", got)
+	}
+	if len(factoryConfig.Projects) != 1 || factoryConfig.Projects[0].ID != "odcrew" || factoryConfig.Projects[0].Repo != "core/odcrew" {
+		t.Fatalf("webhook factory config projects = %#v, want new runtime binding", factoryConfig.Projects)
+	}
+}
+
 func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
 	t.Parallel()
 
