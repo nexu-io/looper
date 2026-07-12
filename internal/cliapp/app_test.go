@@ -1295,6 +1295,44 @@ func TestProjectAddJSONPostsProviderType(t *testing.T) {
 	assertJSONContains(t, stdout, "id", "odcrew")
 }
 
+func TestProjectAddInteractiveForgejoReusesPromptReader(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	runGit(t, repoPath, "init")
+	runGit(t, repoPath, "remote", "add", "origin", "git@ssh.code.example.com:core/odcrew.git")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if got, want := body["provider"], "forgejo-main"; got != want {
+			t.Fatalf("body.provider = %#v, want %#v", got, want)
+		}
+		if got, want := body["repo"], "core/odcrew"; got != want {
+			t.Fatalf("body.repo = %#v, want %#v", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_project", map[string]any{"id": "odcrew", "repoPath": repoPath, "provider": "forgejo-main", "repo": "core/odcrew"}))
+	}))
+	defer server.Close()
+
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"server": map[string]any{"baseUrl": server.URL, "authMode": "none"},
+		"providers": []map[string]any{
+			{"id": "forgejo-main", "kind": "forgejo", "baseUrl": "https://code.example.com", "tokenEnv": "FORGEJO_MAIN_TOKEN"},
+			{"id": "forgejo-alt", "kind": "forgejo", "baseUrl": "https://alt.example.com", "tokenEnv": "FORGEJO_ALT_TOKEN"},
+		},
+	})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdin: strings.NewReader("y\ny\n"), Stdout: stdout, Stderr: stderr})
+	exitCode := app.Run(context.Background(), []string{"project", "add", repoPath, "--id", "odcrew", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("Run([project add interactive Forgejo]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+}
+
 func TestProjectAddJSONRequiresProviderForNonGitHubRemote(t *testing.T) {
 	t.Parallel()
 

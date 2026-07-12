@@ -227,7 +227,8 @@ func (r *commandRuntime) resolveProjectAddProvider(ctx context.Context, cmd *cob
 		return "", "", fmt.Errorf("origin host %q is not github.com; pass --provider forgejo (or a configured provider id)%s to confirm this is a Forgejo project", host, hint)
 	}
 
-	confirmed, err := promptProjectAddForgejo(cmd, host, loaded.Config)
+	reader := bufio.NewReader(cmd.InOrStdin())
+	confirmed, err := promptProjectAddForgejo(reader, cmd, host, loaded.Config)
 	if err != nil {
 		return "", "", err
 	}
@@ -237,7 +238,7 @@ func (r *commandRuntime) resolveProjectAddProvider(ctx context.Context, cmd *cob
 		return "", userRepo, nil
 	}
 
-	providerID, err := selectProjectAddForgejoProvider(cmd, loaded.Config, host)
+	providerID, err := selectProjectAddForgejoProvider(reader, cmd, loaded.Config, host)
 	if err != nil {
 		return "", "", err
 	}
@@ -274,16 +275,15 @@ func projectAddProviderHint(cfg config.Config, host string) string {
 	return ""
 }
 
-func promptProjectAddForgejo(cmd *cobra.Command, host string, cfg config.Config) (bool, error) {
+func promptProjectAddForgejo(reader *bufio.Reader, cmd *cobra.Command, host string, cfg config.Config) (bool, error) {
 	hint := ""
 	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, host); ok {
 		hint = fmt.Sprintf(" (matches provider %q)", provider.ID)
 	}
-	reader := bufio.NewReader(cmd.InOrStdin())
 	return promptBootstrapBool(reader, cmd.ErrOrStderr(), fmt.Sprintf("origin host %q is not github.com%s. Treat this as a Forgejo project?", host, hint), false)
 }
 
-func selectProjectAddForgejoProvider(cmd *cobra.Command, cfg config.Config, host string) (string, error) {
+func selectProjectAddForgejoProvider(reader *bufio.Reader, cmd *cobra.Command, cfg config.Config, host string) (string, error) {
 	forgejo := config.ProvidersByKind(cfg, config.ProviderKindForgejo)
 	if len(forgejo) == 0 {
 		return "", fmt.Errorf("no forgejo provider configured; add a [[providers]] entry with kind = \"forgejo\" first")
@@ -292,7 +292,6 @@ func selectProjectAddForgejoProvider(cmd *cobra.Command, cfg config.Config, host
 		return forgejo[0].ID, nil
 	}
 	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, host); ok {
-		reader := bufio.NewReader(cmd.InOrStdin())
 		useHint, err := promptBootstrapBool(reader, cmd.ErrOrStderr(), fmt.Sprintf("Use provider %q?", provider.ID), true)
 		if err != nil {
 			return "", err
@@ -305,7 +304,6 @@ func selectProjectAddForgejoProvider(cmd *cobra.Command, cfg config.Config, host
 	for _, provider := range forgejo {
 		ids = append(ids, provider.ID)
 	}
-	reader := bufio.NewReader(cmd.InOrStdin())
 	answer, err := promptBootstrapString(reader, cmd.ErrOrStderr(), fmt.Sprintf("Forgejo provider id [%s]", strings.Join(ids, "/")), "")
 	if err != nil {
 		return "", err
