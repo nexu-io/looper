@@ -542,6 +542,9 @@ func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *sto
 			}
 			return nil, nil
 		}
+		if !isGitHubDetectedHost(detected.Host) {
+			return nil, nil
+		}
 		detectedRepo := strings.TrimSpace(detected.Repo)
 		if detectedRepo == "" {
 			if existing != nil && existing.RepoPath == project.RepoPath {

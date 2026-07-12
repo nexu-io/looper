@@ -734,6 +734,39 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	}
 }
 
+func TestServiceSyncConfiguredIgnoresRepoDetectedFromNonGitHubHost(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.May, 8, 12, 0, 0, 0, time.UTC)
+	repoPath := "/tmp/odcrew"
+	baseBranch := "main"
+	service := &Service{
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "core/odcrew", Host: "ssh.code.powerformer.net"}, nil
+		},
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "odcrew", Name: "odcrew", RepoPath: repoPath, BaseBranch: &baseBranch}}
+
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured() error = %v", err)
+	}
+	project, err := repos.Projects.GetByID(context.Background(), "odcrew")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"config"}` {
+		t.Fatalf("project.MetadataJSON = %#v, want non-GitHub detected repo ignored", project)
+	}
+}
+
 func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionReturnsEmpty(t *testing.T) {
 	t.Parallel()
 
