@@ -157,6 +157,27 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 	return rt
 }
 
+func (w *webhookRuntime) updateConfig(cfg config.Config) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	w.cfg.Projects = append([]config.ProjectRefConfig(nil), cfg.Projects...)
+	w.status.ConfiguredTunnelProjectIDs = configuredTunnelProjectIDs(cfg)
+	w.mu.Unlock()
+}
+
+func (w *webhookRuntime) configSnapshot() config.Config {
+	if w == nil {
+		return config.Config{}
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	cfg := w.cfg
+	cfg.Projects = append([]config.ProjectRefConfig(nil), w.cfg.Projects...)
+	return cfg
+}
+
 func (w *webhookRuntime) RecordDelivery(eventType, deliveryID string) {
 	if w == nil {
 		return

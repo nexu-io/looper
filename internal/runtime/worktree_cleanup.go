@@ -137,8 +137,8 @@ func (r *Runtime) executeWorktreeCleanupPass(ctx context.Context) {
 	}
 	r.worktreeCleanupRunning = true
 	services := r.services
-	cfg := r.config
 	r.mu.Unlock()
+	cfg := r.Config()
 
 	defer func() {
 		r.mu.Lock()

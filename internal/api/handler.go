@@ -886,6 +886,9 @@ type configDaemonResponse struct {
 
 func (h *Handler) buildConfigResponse() configResponse {
 	cfg := h.context.Config
+	if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+		cfg = runtimeConfig.Config()
+	}
 
 	return configResponse{
 		Server: configServerResponse{

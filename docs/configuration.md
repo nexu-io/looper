@@ -165,6 +165,18 @@ Looper's frozen canonical top-level config roots are:
 | `providers` | forge provider definitions such as GitHub or Forgejo hosts and credentials |
 | `projects` | per-project metadata and supported project-scoped overrides |
 
+### Project authority and import
+
+`[[projects]]` is a declarative startup import, not a second runtime project store. During daemon startup Looper validates and transactionally imports configured projects into SQLite, then builds the runtime Project Catalog exclusively from active database records. Scheduler, Webhook, Network, and Roles all capture that same Catalog.
+
+- Removing a config-managed project from `[[projects]]` archives its SQLite record on the next startup.
+- Config import never removes API-managed projects.
+- Reusing an API-managed project ID in `[[projects]]` fails startup instead of transferring ownership implicitly.
+- CLI/API add and remove operations publish one atomic Catalog replacement after the database commit; already-started work keeps its captured snapshot, while new work observes the new Catalog.
+- A project referencing a missing Provider fails validation; it never falls back to GitHub.
+
+See [ADR-0012](adr/0012-sqlite-project-authority.md) for the Authority and lifecycle decision.
+
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
 
 Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths or legacy JSON defaults.

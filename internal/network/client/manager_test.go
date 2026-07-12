@@ -27,6 +27,20 @@ func TestManagerStartWithoutNetworkStateLeavesStatusUnconfigured(t *testing.T) {
 	}
 }
 
+func TestManagerUpdateConfigPublishesProjectCatalog(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(filepath.Join(t.TempDir(), "network.json"), config.Config{}, nil, nil)
+	manager.UpdateConfig(config.Config{Projects: []config.ProjectRefConfig{
+		{ID: "routed", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}},
+		{ID: "local"},
+	}})
+	routed, local := countProjectModes(manager.configSnapshot())
+	if routed != 1 || local != 1 {
+		t.Fatalf("countProjectModes(updated config) = (%d, %d), want (1, 1)", routed, local)
+	}
+}
+
 func TestManagerStartWithoutRoutedProjectsPreservesProjectCounts(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "network.json")
 	if err := SaveState(statePath, LocalState{NetworkID: "net-1", NodeID: "node-1", NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "stored-user"}}); err != nil {

@@ -149,6 +149,7 @@ type Runtime struct {
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
 	activeExecutions            *ActiveExecutionRegistry
+	projectCatalog              *projects.Catalog
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
@@ -199,6 +200,7 @@ func New(options Options) *Runtime {
 		shutdownTimeout = time.Second
 	}
 
+	projectCatalog := projects.NewCatalog(options.Config)
 	rt := &Runtime{
 		config:                      options.Config,
 		logger:                      options.Logger,
@@ -215,6 +217,7 @@ func New(options Options) *Runtime {
 		recovery:                    createEmptyRecoverySummary(),
 		shutdownCh:                  make(chan struct{}),
 		activeExecutions:            NewActiveExecutionRegistry(),
+		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 	}
 	if rt.webhook != nil {
@@ -316,6 +319,17 @@ func (r *Runtime) Services() Services {
 	return r.services
 }
 
+// Config returns the current runtime configuration with Projects materialized
+// from the authoritative Project Catalog.
+func (r *Runtime) Config() config.Config {
+	if r.projectCatalog != nil {
+		return r.projectCatalog.Snapshot()
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.config
+}
+
 func (r *Runtime) StartedAt() (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -349,13 +363,6 @@ func runtimeHomeDirOrEmpty() string {
 		return ""
 	}
 	return homeDir
-}
-
-func (r *Runtime) Config() config.Config {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.config
 }
 
 func (r *Runtime) RecoverySummary() RecoverySummary {
@@ -542,15 +549,16 @@ func (r *Runtime) start(ctx context.Context) error {
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
 	var githubGateway *githubinfra.Gateway
-	if runtimeConfigHasGitHubProjects(r.config) {
+	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
 		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	}
 	projectService := &projects.Service{
-		DB:     coordinator.DB(),
-		Repos:  repositories,
-		Logger: r.logger,
-		Config: r.config,
-		Now:    r.now,
+		DB:           coordinator.DB(),
+		Repos:        repositories,
+		Logger:       r.logger,
+		Config:       r.config,
+		ConfigSource: r.projectCatalog,
+		Now:          r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (string, error) {
 			return gitGateway.DetectGitHubRepo(ctx, repoPath)
 		},
@@ -600,12 +608,28 @@ func (r *Runtime) start(ctx context.Context) error {
 		AsyncSnapshotQueueEnabled: func() bool {
 			return r.customSchedulerTick || r.config.Agent.Vendor != nil
 		},
+		PublishProjects: func(projects []config.ProjectRefConfig) {
+			r.publishProjects(projects)
+		},
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
 	startedAt := r.now().UTC()
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
+	}
+	// Project import is already committed. Materialize that durable state even
+	// when the startup request is canceled; CompleteStartup still observes ctx.
+	if err := r.reloadProjectCatalog(context.Background(), repositories); err != nil {
+		return err
+	}
+	r.config = r.projectCatalog.Snapshot()
+	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
+		if githubGateway == nil {
+			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+		}
+	} else {
+		githubGateway = nil
 	}
 	r.mu.Lock()
 	if r.stopped {
@@ -623,7 +647,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		handlers := buildDefaultSchedulerHandlers(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
@@ -719,9 +743,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.startDeferredReviewerRecovery(githubGateway)
 
 		if r.logger != nil {
+			catalog := r.Config()
 			r.logger.Info("looperd runtime assembled", map[string]any{
 				"dbPath":                 r.config.Storage.DBPath,
-				"projectCount":           len(r.config.Projects),
+				"projectCount":           len(catalog.Projects),
 				"autoMigrate":            r.config.Package.AutoMigrateOnStartup,
 				"backupRequired":         r.config.Package.RequireBackupBeforeMigrate,
 				"recoverySummary":        recoverySummary,
@@ -741,11 +766,12 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 	if err != nil {
 		return err
 	}
+	catalog := r.Config()
 	for _, project := range projectsList {
 		if project.Archived {
 			continue
 		}
-		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
+		roleCfg := config.ProjectRoleConfigs(catalog, project.ID).Coordinator
 		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
 			continue
 		}
@@ -824,6 +850,48 @@ func runtimeProjectProviderKind(cfg config.Config, projectID string) config.Prov
 		}
 	}
 	return config.ProviderKindGitHub
+}
+
+func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repositories) error {
+	if r.projectCatalog == nil || repos == nil || repos.Projects == nil {
+		return fmt.Errorf("project catalog dependencies are not configured")
+	}
+	records, err := repos.Projects.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list projects for runtime catalog: %w", err)
+	}
+	global := r.projectCatalog.Snapshot()
+	materialized, err := projects.MaterializeCatalog(global, records)
+	if err != nil {
+		return fmt.Errorf("materialize runtime project catalog: %w", err)
+	}
+	r.publishProjects(materialized)
+	return nil
+}
+
+func (r *Runtime) publishProjects(materialized []config.ProjectRefConfig) {
+	if r == nil || r.projectCatalog == nil {
+		return
+	}
+	r.projectCatalog.Publish(materialized)
+	next := r.projectCatalog.Snapshot()
+
+	r.mu.Lock()
+	webhook := r.webhook
+	networkManager := r.networkManager
+	started := r.startedAt != nil
+	r.mu.Unlock()
+	if webhook != nil {
+		webhook.updateConfig(next)
+	}
+	if networkManager != nil {
+		networkManager.UpdateConfig(next)
+	}
+	if started {
+		r.TriggerSchedulerTick()
+		r.TriggerSchedulerClaim()
+		r.ReconcileWebhookForwarders()
+	}
 }
 
 func runtimeDependencyTimeout(seconds int) time.Duration {
@@ -2618,7 +2686,7 @@ type runtimeReviewerRecoveryPolicy struct {
 }
 
 func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeReviewerRecoveryPolicy {
-	roles := config.ProjectRoleConfigs(r.config, projectID)
+	roles := config.ProjectRoleConfigs(r.Config(), projectID)
 	return runtimeReviewerRecoveryPolicy{
 		includeDrafts:    roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 		stopOnApproved:   roles.Reviewer.Behavior.Loop.StopOnApproved,

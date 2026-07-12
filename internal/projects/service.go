@@ -75,6 +75,7 @@ type Service struct {
 	Repos                      *storage.Repositories
 	Logger                     bootstrap.Logger
 	Config                     config.Config
+	ConfigSource               ConfigSource
 	Now                        func() time.Time
 	DetectRepo                 DetectRepoFunc
 	GetRepositorySettings      GetRepositorySettingsFunc
@@ -83,6 +84,7 @@ type Service struct {
 	ListOpenPullRequests       ListOpenPullRequestsFunc
 	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
 	AsyncSnapshotQueueEnabled  func() bool
+	PublishProjects            func([]config.ProjectRefConfig)
 }
 
 type AddInput struct {
@@ -137,6 +139,9 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if err != nil {
 		return AddResult{}, err
 	}
+	if existing != nil && metadataString(parseMetadata(existing.MetadataJSON), "source") == "config" {
+		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
+	}
 	if existing != nil && !existing.Archived && input.IDSource != "derived" {
 		return AddResult{}, ProjectIDCollisionError{ProjectID: input.ID}
 	}
@@ -175,7 +180,7 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		}
 	}
 
-	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, s.Config); err != nil {
+	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, s.currentConfig()); err != nil {
 		return AddResult{}, err
 	}
 
@@ -229,8 +234,15 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if existing != nil {
 		record.CreatedAt = existing.CreatedAt
 	}
+	nextProjects, err := s.materializeCandidate(ctx, &record, "")
+	if err != nil {
+		return AddResult{}, ProjectValidationError{Message: err.Error()}
+	}
 	if err := s.Repos.Projects.Upsert(ctx, record); err != nil {
 		return AddResult{}, err
+	}
+	if s.PublishProjects != nil {
+		s.PublishProjects(nextProjects)
 	}
 
 	discoveredWorktrees, err := s.discoverWorktrees(ctx, record, nowISO, &warnings)
@@ -241,7 +253,6 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if err != nil {
 		return AddResult{}, err
 	}
-
 	return AddResult{
 		Project:                record,
 		Repo:                   repo,
@@ -300,6 +311,10 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 
 	nowISO := currentISO(s.Now)
 	cancelReason := "project archived"
+	nextProjects, err := s.materializeCandidate(ctx, nil, project.ID)
+	if err != nil {
+		return storage.ProjectRecord{}, err
+	}
 	archived, err := storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (bool, error) {
 		repos := storage.NewRepositories(tx)
 		archived, err := repos.Projects.Archive(ctx, project.ID, nowISO)
@@ -325,6 +340,9 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	}
 	project.Archived = true
 	project.UpdatedAt = nowISO
+	if s.PublishProjects != nil {
+		s.PublishProjects(nextProjects)
+	}
 
 	return *project, nil
 }
@@ -365,11 +383,27 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	}
 
 	nowISO := currentISO(func() time.Time { return now })
+	existingProjects, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	desiredIDs := make(map[string]struct{}, len(cfg.Projects))
+	existingByID := make(map[string]*storage.ProjectRecord, len(existingProjects))
+	for index := range existingProjects {
+		existingByID[existingProjects[index].ID] = &existingProjects[index]
+	}
+	desiredRecords := make([]storage.ProjectRecord, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {
-		existing, err := s.Repos.Projects.GetByID(ctx, project.ID)
-		if err != nil {
-			return err
+		desiredIDs[project.ID] = struct{}{}
+		if existing := existingByID[project.ID]; existing != nil {
+			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source == "api" {
+				return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project", project.ID)}
+			}
 		}
+	}
+
+	for _, project := range cfg.Projects {
+		existing := existingByID[project.ID]
 
 		repo, err := s.detectConfiguredProjectRepo(ctx, existing, project)
 		if err != nil {
@@ -404,19 +438,49 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 			CreatedAt:    createdAt,
 			UpdatedAt:    nowISO,
 		}
-		if err := s.Repos.Projects.Upsert(ctx, record); err != nil {
-			return err
-		}
+		desiredRecords = append(desiredRecords, record)
 	}
 
-	return nil
+	applyImport := func(repos *storage.Repositories) error {
+		for _, record := range desiredRecords {
+			if err := repos.Projects.Upsert(ctx, record); err != nil {
+				return err
+			}
+		}
+		for index := range existingProjects {
+			existing := existingProjects[index]
+			if existing.Archived {
+				continue
+			}
+			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source != "config" {
+				continue
+			}
+			if _, configured := desiredIDs[existing.ID]; configured {
+				continue
+			}
+			if _, err := repos.Projects.Archive(ctx, existing.ID, nowISO); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if s.DB == nil {
+		return applyImport(s.Repos)
+	}
+	_, err = storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (struct{}, error) {
+		if err := applyImport(storage.NewRepositories(tx)); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *storage.ProjectRecord, project config.ProjectRefConfig) (*string, error) {
 	if repo := strings.TrimSpace(project.Repo); repo != "" {
 		return &repo, nil
 	}
-	if config.ResolvedProjectProviderKind(s.Config, project) != config.ProviderKindGitHub {
+	if config.ResolvedProjectProviderKind(s.currentConfig(), project) != config.ProviderKindGitHub {
 		if existing != nil && existing.RepoPath == project.RepoPath {
 			return stringMetadataPtr(existing.MetadataJSON, "repo"), nil
 		}
@@ -552,6 +616,33 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 			return "", err
 		}
 		repoRaw = encoded
+	}
+	setProjectMetadata := func(key string, value any, keep bool) error {
+		if !keep {
+			delete(extras, key)
+			return nil
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		extras[key] = encoded
+		return nil
+	}
+	if err := setProjectMetadata("provider", strings.TrimSpace(project.Provider), strings.TrimSpace(project.Provider) != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("path", strings.TrimSpace(project.Path), strings.TrimSpace(project.Path) != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("network", project.Network, project.Network.Mode != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("webhook", project.Webhook, project.Webhook.Mode != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("roles", project.Roles, project.Roles != nil); err != nil {
+		return "", err
 	}
 
 	entries := make([]orderedJSONEntry, 0, len(extras)+3)
@@ -849,10 +940,45 @@ func (s *Service) enqueuePullRequestSnapshot(ctx context.Context, project storag
 }
 
 func (s *Service) snapshotRetryMaxAttempts() int64 {
-	if s.Config.Scheduler.RetryMaxAttempts == 0 {
+	cfg := s.currentConfig()
+	if cfg.Scheduler.RetryMaxAttempts == 0 {
 		return -1
 	}
-	return int64(s.Config.Scheduler.RetryMaxAttempts)
+	return int64(cfg.Scheduler.RetryMaxAttempts)
+}
+
+func (s *Service) currentConfig() config.Config {
+	if s != nil && s.ConfigSource != nil {
+		return s.ConfigSource.Snapshot()
+	}
+	if s == nil {
+		return config.Config{}
+	}
+	return s.Config
+}
+
+func (s *Service) materializeCandidate(ctx context.Context, replacement *storage.ProjectRecord, archiveID string) ([]config.ProjectRefConfig, error) {
+	if s == nil || s.Repos == nil || s.Repos.Projects == nil {
+		return nil, fmt.Errorf("projects repository is not configured")
+	}
+	records, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	replaced := false
+	for index := range records {
+		if replacement != nil && records[index].ID == replacement.ID {
+			records[index] = *replacement
+			replaced = true
+		}
+		if records[index].ID == archiveID {
+			records[index].Archived = true
+		}
+	}
+	if replacement != nil && !replaced {
+		records = append(records, *replacement)
+	}
+	return MaterializeCatalog(s.currentConfig(), records)
 }
 
 func snapshotModeOrDefault(mode SnapshotMode) SnapshotMode {

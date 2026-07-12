@@ -141,6 +141,83 @@ func TestRuntimeStartForgejoOnlyDoesNotRequireGitHubGateway(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartMaterializesProjectCatalogFromDatabase(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Projects = []config.ProjectRefConfig{{ID: "config-only", Name: "Config Only", RepoPath: "/stale"}}
+	metadata := `{"repo":"acme/database","source":"api"}`
+	nowISO := "2026-07-12T00:00:00.000Z"
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		SyncConfiguredProjects: func(ctx context.Context, service *projects.Service, _ config.Config, _ time.Time) error {
+			return service.Repos.Projects.Upsert(ctx, storage.ProjectRecord{
+				ID: "database", Name: "Database", RepoPath: "/repos/database", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			})
+		},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	if len(rt.config.Projects) != 1 || rt.config.Projects[0].ID != "database" || rt.config.Projects[0].Repo != "acme/database" {
+		t.Fatalf("runtime project catalog = %#v, want database-owned project only", rt.config.Projects)
+	}
+}
+
+func TestRuntimeProjectMutationsAtomicallyPublishCatalog(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	rt := New(Options{
+		Config:           cfg,
+		Logger:           &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	projectService := rt.Services().Projects
+	projectService.ListWorktrees = nil
+	repo := "acme/live"
+	added, err := projectService.AddProject(context.Background(), projects.AddInput{
+		ID: "live", Name: "Live", RepoPath: workingDir, Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if added.Project.ID != "live" {
+		t.Fatalf("AddProject().Project.ID = %q, want live", added.Project.ID)
+	}
+	afterAdd := rt.Config()
+	if len(afterAdd.Projects) != 1 || afterAdd.Projects[0].ID != "live" || afterAdd.Projects[0].Repo != repo {
+		t.Fatalf("Config().Projects after add = %#v, want live project", afterAdd.Projects)
+	}
+
+	if _, err := projectService.RemoveProject(context.Background(), "live"); err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+	if got := rt.Config().Projects; len(got) != 0 {
+		t.Fatalf("Config().Projects after remove = %#v, want empty catalog", got)
+	}
+}
+
 func TestRuntimeStartIsIdempotent(t *testing.T) {
 	t.Parallel()
 

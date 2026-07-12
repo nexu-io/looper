@@ -527,8 +527,9 @@ func (w *webhookRuntime) configuredWebhookReposForMode(projects []storage.Projec
 }
 
 func (w *webhookRuntime) webhookModeForProject(projectID string) config.WebhookMode {
-	mode := w.cfg.Webhook.Mode
-	for _, project := range w.cfg.Projects {
+	cfg := w.configSnapshot()
+	mode := cfg.Webhook.Mode
+	for _, project := range cfg.Projects {
 		if project.ID == projectID && project.Webhook.Mode != "" {
 			mode = project.Webhook.Mode
 			break

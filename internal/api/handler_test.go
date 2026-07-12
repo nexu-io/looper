@@ -755,6 +755,34 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	}
 }
 
+func TestHandlerConfigProjectsComeFromRuntimeCatalog(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	projectService := rt.Services().Projects
+	projectService.ListWorktrees = nil
+	repo := "acme/catalog"
+	if _, err := projectService.AddProject(context.Background(), projects.AddInput{
+		ID: "catalog", Name: "Catalog", RepoPath: t.TempDir(), Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
+	}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if len(cfg.Projects) != 0 {
+		t.Fatalf("fixture config projects = %#v, want original config unchanged", cfg.Projects)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	projectItems := data["projects"].([]any)
+	if len(projectItems) != 1 || projectItems[0].(map[string]any)["id"] != "catalog" {
+		t.Fatalf("config projects = %#v, want runtime catalog project", projectItems)
+	}
+}
+
 func TestReviewerLoopMetadataJSONRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	t.Parallel()
 	cfg, err := config.DefaultConfig("")

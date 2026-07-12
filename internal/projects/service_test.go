@@ -668,6 +668,89 @@ func TestServiceSyncConfiguredDoesNotDeleteUnlistedProjects(t *testing.T) {
 	}
 }
 
+func TestServiceSyncConfiguredArchivesConfigProjectsRemovedFromConfig(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC)
+	createdAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	configMetadata := `{"repo":"nexu-io/removed","source":"config"}`
+	apiMetadata := `{"repo":"nexu-io/api","source":"api"}`
+	baseBranch := "main"
+	for _, project := range []storage.ProjectRecord{
+		{ID: "removed", Name: "Removed", RepoPath: "/tmp/removed", BaseBranch: &baseBranch, MetadataJSON: &configMetadata, CreatedAt: createdAt, UpdatedAt: createdAt},
+		{ID: "api-project", Name: "API", RepoPath: "/tmp/api", BaseBranch: &baseBranch, MetadataJSON: &apiMetadata, CreatedAt: createdAt, UpdatedAt: createdAt},
+	} {
+		if err := repos.Projects.Upsert(context.Background(), project); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", project.ID, err)
+		}
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = nil
+
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured() error = %v", err)
+	}
+	removed, err := repos.Projects.GetByID(context.Background(), "removed")
+	if err != nil {
+		t.Fatalf("Projects.GetByID(removed) error = %v", err)
+	}
+	if removed == nil || !removed.Archived || removed.UpdatedAt != currentISO(func() time.Time { return now }) {
+		t.Fatalf("removed = %#v, want archived config project at import time", removed)
+	}
+	apiProject, err := repos.Projects.GetByID(context.Background(), "api-project")
+	if err != nil {
+		t.Fatalf("Projects.GetByID(api-project) error = %v", err)
+	}
+	if apiProject == nil || apiProject.Archived || apiProject.UpdatedAt != createdAt {
+		t.Fatalf("api project = %#v, want untouched active API project", apiProject)
+	}
+}
+
+func TestServiceSyncConfiguredRejectsAPIManagedIDCollision(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 12, 10, 0, 0, 0, time.UTC)
+	createdAt := now.Add(-time.Hour).Format(time.RFC3339Nano)
+	baseBranch := "main"
+	metadata := `{"repo":"nexu-io/api","source":"api"}`
+	existing := storage.ProjectRecord{ID: "shared", Name: "API Project", RepoPath: "/tmp/api", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: createdAt, UpdatedAt: createdAt}
+	if err := repos.Projects.Upsert(context.Background(), existing); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "shared", Name: "Configured Project", RepoPath: "/tmp/config"}}
+
+	err = service.SyncConfigured(context.Background(), cfg, now)
+	var validationErr ProjectValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("SyncConfigured() error = %T %v, want ProjectValidationError", err, err)
+	}
+	if !strings.Contains(err.Error(), "conflicts with an API-managed project") {
+		t.Fatalf("SyncConfigured() error = %q, want API ownership conflict", err)
+	}
+	stored, getErr := repos.Projects.GetByID(context.Background(), "shared")
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID() error = %v", getErr)
+	}
+	if stored == nil || stored.Name != existing.Name || stored.RepoPath != existing.RepoPath || stored.UpdatedAt != existing.UpdatedAt || stored.MetadataJSON == nil || *stored.MetadataJSON != metadata {
+		t.Fatalf("stored = %#v, want API project unchanged", stored)
+	}
+}
+
 func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	t.Parallel()
 
@@ -1074,6 +1157,32 @@ func TestServiceRemoveProjectRejectsConfigManagedProject(t *testing.T) {
 	}
 	if stored == nil || stored.Archived {
 		t.Fatalf("stored project = %#v, want non-archived project", stored)
+	}
+}
+
+func TestServiceAddProjectRejectsConfigManagedProject(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	metadata := `{"repo":"acme/configured","source":"config"}`
+	nowISO := "2026-07-12T10:00:00.000Z"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "configured", Name: "Configured", RepoPath: "/repos/configured", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	service := &Service{DB: coordinator.DB(), Repos: repos}
+	_, err := service.AddProject(context.Background(), AddInput{ID: "configured", IDSource: "derived", Name: "Changed", RepoPath: "/repos/changed"})
+	if err == nil || !strings.Contains(err.Error(), "managed by config") {
+		t.Fatalf("AddProject() error = %v, want config authority rejection", err)
+	}
+	stored, getErr := repos.Projects.GetByID(context.Background(), "configured")
+	if getErr != nil {
+		t.Fatalf("GetByID() error = %v", getErr)
+	}
+	if stored == nil || stored.Name != "Configured" || stored.RepoPath != "/repos/configured" {
+		t.Fatalf("stored project = %#v, want unchanged config project", stored)
 	}
 }
 
