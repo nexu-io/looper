@@ -39,7 +39,7 @@ Forgejo projects are added in config, not by `looper project add` autodetection.
 
 ### Grok Build (xAI)
 
-For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `grok` executable. Authenticate the daemon with `grok login --device-auth` or by providing `XAI_API_KEY` in its environment—never commit an API-key value. Looper defaults to `--always-approve --sandbox workspace`; workspace sandboxing is not full isolation and may permit the workspace, `/tmp`, `~/.grok`, and documented network access.
+For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `grok` executable. Authenticate the daemon with `grok login --device-auth` or by providing `XAI_API_KEY` in its environment—never commit an API-key value. Looper defaults to `--always-approve --sandbox none` so Grok can update Git metadata outside a linked worktree; configure `--sandbox` explicitly if a stricter profile works with your repository layout.
 
 Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive `looper resume` takeover. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
 
