@@ -7189,6 +7189,8 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"Review body style contract",
 		"Never post terminal/tool output",
 		"never build review JSON inside a double-quoted shell string",
+		"outbound content safety gate rejection",
+		"resubmit in the same session",
 		"ANSI escape sequences",
 		"file-read traces",
 		"submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment",

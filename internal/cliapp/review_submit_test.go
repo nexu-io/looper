@@ -11,6 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/spf13/cobra"
 )
 
@@ -287,6 +288,35 @@ func TestEffectiveReviewSubmitEventDoesNotFetchUserForComment(t *testing.T) {
 	}
 	if got != "COMMENT" {
 		t.Fatalf("effectiveReviewSubmitEvent() = %q, want COMMENT", got)
+	}
+}
+
+func TestWrapReviewSubmitErrorSurfacesContentSafetyRecoveryGuidance(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{}
+	stderr := &bytes.Buffer{}
+	cmd.SetErr(stderr)
+	payload := reviewSubmitPayload{Body: "SERVICE_TOKEN=secret-value"}
+	err := wrapReviewSubmitError(cmd, "acme/looper", 42, "COMMENT", "abc123", payload, "submit validated PR review", outboundguard.Validate(outboundguard.Field{Name: "review body", Text: payload.Body}))
+	if err == nil {
+		t.Fatal("wrapReviewSubmitError() error = nil, want content safety rejection")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"blocked by content safety gate",
+		"outbound content safety gate rejected review body",
+		"credential-shaped",
+		outboundguard.RecoveryGuidance,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error = %q, want substring %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, payload.Body) {
+		t.Fatalf("error %q echoed rejected payload body", msg)
+	}
+	if !strings.Contains(stderr.String(), "github_review_submit_validation_failed") {
+		t.Fatalf("stderr = %q, want validation diagnostic", stderr.String())
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/spf13/cobra"
 )
 
@@ -122,9 +123,22 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
 	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
-		return fmt.Errorf("submit validated PR review: %w", err)
+		return wrapReviewSubmitError(cmd, repo, prNumber, submissionEvent, commitID, payload, "submit validated PR review", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+// wrapReviewSubmitError keeps content-safety rejections actionable for agents
+// still in-session: surface the gate reason + recovery guidance, never the
+// rejected payload, and record a validation diagnostic.
+func wrapReviewSubmitError(cmd *cobra.Command, repo string, prNumber int64, event string, commitID string, payload reviewSubmitPayload, prefix string, err error) error {
+	if outboundguard.IsRejection(err) {
+		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(),
+		})
+		return fmt.Errorf("%s blocked by content safety gate: %w", prefix, err)
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
 }
 
 func (r *commandRuntime) effectiveReviewSubmitEvent(cmd *cobra.Command, gh *githubinfra.Gateway, repo string, prNumber int64, event string, authorLogin string, cwd string) (string, error) {
@@ -317,7 +331,7 @@ func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment)
 
 func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh *githubinfra.Gateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {
 	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Disclosure: disclosureCfg, CWD: cwd}); err != nil {
-		return fmt.Errorf("submit PR review without anchor validation: %w", err)
+		return wrapReviewSubmitError(cmd, repo, prNumber, event, commitID, payload, "submit PR review without anchor validation", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
 }

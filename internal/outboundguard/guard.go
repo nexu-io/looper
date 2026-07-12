@@ -1,6 +1,7 @@
 package outboundguard
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -11,6 +12,10 @@ import (
 const (
 	environmentAssignmentLimit = 5
 	highEntropyThreshold       = 4.25
+
+	// RecoveryGuidance is appended to rejection errors so in-session agents can
+	// rewrite and resubmit without Looper echoing the rejected secret content.
+	RecoveryGuidance = "rewrite the rejected field in plain review prose without secret-shaped env assignments (NAME=value), credential-bearing URLs, multi-line environment dumps, or high-entropy tokens; resubmit through the same tool in this session; do not exit solely because of this rejection; never paste the rejected value into logs, prompts, or comments"
 )
 
 var (
@@ -41,10 +46,31 @@ type Field struct {
 	Text string
 }
 
+// Rejection is returned when outbound content fails the safety gate.
+// Error text includes the field name and detection category only — never the
+// rejected value — plus recovery guidance for same-session rewrite/resubmit.
+type Rejection struct {
+	Field  string
+	Reason string
+}
+
+func (e *Rejection) Error() string {
+	if e == nil {
+		return "outbound content safety gate rejected content"
+	}
+	return fmt.Sprintf("outbound content safety gate rejected %s: %s; %s", e.Field, e.Reason, RecoveryGuidance)
+}
+
+// IsRejection reports whether err is or wraps a content-safety Rejection.
+func IsRejection(err error) bool {
+	var rejected *Rejection
+	return errors.As(err, &rejected)
+}
+
 func Validate(fields ...Field) error {
 	for _, field := range fields {
 		if reason := unsafeText(field.Text); reason != "" {
-			return fmt.Errorf("outbound content safety gate rejected %s: %s", field.Name, reason)
+			return &Rejection{Field: field.Name, Reason: reason}
 		}
 	}
 	return nil

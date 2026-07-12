@@ -38,6 +38,12 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Validate() error = %v, want %q rejection", err, tc.want)
 			}
+			if !IsRejection(err) {
+				t.Fatalf("Validate() error type = %T, want *Rejection", err)
+			}
+			if !strings.Contains(err.Error(), RecoveryGuidance) {
+				t.Fatalf("error %q missing recovery guidance", err)
+			}
 			if strings.Contains(err.Error(), tc.text) {
 				t.Fatalf("error %q echoed rejected content", err)
 			}
