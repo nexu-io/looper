@@ -107,8 +107,6 @@ type WebhookForwarder interface {
 	Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error)
 	Stats() webhookforward.Stats
 	Close()
-	CloseAndWait()
-	CancelAndWait()
 }
 
 type Runtime struct {
@@ -155,8 +153,6 @@ type Runtime struct {
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
 	webhookForwarder            WebhookForwarder
-	drainingWebhookForwarders   []WebhookForwarder
-	webhookForwarderForConfig   func(config.Config) WebhookForwarder
 	networkManager              *networkclient.Manager
 	schedulerDisabled           bool
 	startupReadyOnce            sync.Once
@@ -265,8 +261,6 @@ func (r *Runtime) Stop(reason string) {
 		r.stopped = true
 		forwarder := r.webhookForwarder
 		r.webhookForwarder = nil
-		drainingForwarders := r.drainingWebhookForwarders
-		r.drainingWebhookForwarders = nil
 		networkManager := r.networkManager
 		r.networkManager = nil
 		coordinator := r.services.Coordinator
@@ -285,12 +279,7 @@ func (r *Runtime) Stop(reason string) {
 		r.mu.Unlock()
 
 		if forwarder != nil {
-			forwarder.CloseAndWait()
-		}
-		for _, drainingForwarder := range drainingForwarders {
-			if drainingForwarder != nil {
-				drainingForwarder.CloseAndWait()
-			}
+			forwarder.Close()
 		}
 		if networkManager != nil {
 			networkManager.Stop()
@@ -552,7 +541,10 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
-	githubGateway := githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+	var githubGateway *githubinfra.Gateway
+	if runtimeConfigHasGitHubProjects(r.config) {
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+	}
 	projectService := &projects.Service{
 		DB:     coordinator.DB(),
 		Repos:  repositories,
@@ -560,14 +552,8 @@ func (r *Runtime) start(ctx context.Context) error {
 		Config: r.config,
 		Now:    r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
-			return detectProjectRepo(ctx, gitGateway, repoPath)
+			return detectProjectRepo(ctx, gitGateway, r.config, repoPath)
 		},
-		ValidateBinding: func(binding projects.ProjectBinding) error {
-			r.mu.RLock()
-			defer r.mu.RUnlock()
-			return config.ValidateRuntimeProjectBinding(r.config, binding.ProjectID, binding.Repo)
-		},
-		RegisterBinding: r.syncRuntimeProjectBinding,
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 			if githubGateway == nil {
 				return githubinfra.RepositorySettings{}, fmt.Errorf("github gateway is not configured")
@@ -632,6 +618,9 @@ func (r *Runtime) start(ctx context.Context) error {
 		return fmt.Errorf("runtime already stopped")
 	}
 	r.startedAt = &startedAt
+	// The webhook runtime is constructed before storage opens. Publish the
+	// startup-only rehydrated config before any reconciliation begins.
+	r.webhook.cfg = r.config
 	r.services = Services{
 		Coordinator:      coordinator,
 		Repositories:     repositories,
@@ -642,7 +631,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		handlers := buildDefaultSchedulerHandlers(&r.config, r.configReadLock, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		handlers := buildDefaultSchedulerHandlers(r.config, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
@@ -650,7 +639,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
-		r.webhookForwarderForConfig = handlers.webhookForConfig
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
@@ -672,42 +660,6 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	started = true
 	return nil
-}
-
-func (r *Runtime) syncRuntimeProjectBinding(binding projects.ProjectBinding) {
-	r.mu.Lock()
-	config.UpsertRuntimeProjectBinding(&r.config, binding.ProjectID, binding.Name, binding.Provider, binding.Repo, binding.RepoPath)
-	factory := r.webhookForwarderForConfig
-	cfg := r.config
-	cfg.Projects = append([]config.ProjectRefConfig(nil), r.config.Projects...)
-	r.mu.Unlock()
-
-	if factory == nil {
-		return
-	}
-	next := factory(cfg)
-	r.mu.Lock()
-	if r.stopped {
-		r.mu.Unlock()
-		if next != nil {
-			next.Close()
-		}
-		return
-	}
-	previous := r.webhookForwarder
-	r.webhookForwarder = next
-	if previous != nil {
-		r.drainingWebhookForwarders = append(r.drainingWebhookForwarders, previous)
-	}
-	r.mu.Unlock()
-	if previous != nil {
-		previous.Close()
-	}
-}
-
-func (r *Runtime) configReadLock() func() {
-	r.mu.RLock()
-	return r.mu.RUnlock
 }
 
 func (r *Runtime) CompleteStartup(ctx context.Context) error {
@@ -793,10 +745,6 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 	if repositories == nil || repositories.Projects == nil || githubGateway == nil {
 		return nil
 	}
-	r.mu.RLock()
-	cfg := r.config
-	cfg.Projects = append([]config.ProjectRefConfig(nil), r.config.Projects...)
-	r.mu.RUnlock()
 	projectsList, err := repositories.Projects.List(ctx)
 	if err != nil {
 		return err
@@ -805,10 +753,7 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		if project.Archived {
 			continue
 		}
-		if runtimeProjectProviderKindWithMetadata(cfg, project.ID, project.MetadataJSON) != config.ProviderKindGitHub {
-			continue
-		}
-		roleCfg := config.ProjectRoleConfigs(cfg, project.ID).Coordinator
+		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
 		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
 			continue
 		}
@@ -866,76 +811,30 @@ func runtimeProjectRepo(metadataJSON *string) string {
 	return strings.TrimSpace(value)
 }
 
-func runtimeProjectSource(metadataJSON *string) string {
-	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
-		return ""
+func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
+	for _, project := range cfg.Projects {
+		switch config.ResolvedProjectProviderKind(cfg, project) {
+		case config.ProviderKindGitHub:
+			return true
+		case config.ProviderKindPlane:
+			// Plane is a task-source only: its pull requests live on the
+			// project's GitHub code repo, so the GitHub gateway is required.
+			return true
+		}
 	}
-	var metadata map[string]any
-	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil {
-		return ""
-	}
-	value, _ := metadata["source"].(string)
-	return strings.TrimSpace(value)
+	return len(cfg.Projects) == 0
 }
 
 func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
-	return runtimeProjectProviderKindWithMetadata(cfg, projectID, nil)
-}
-
-func runtimeProjectProviderKindWithMetadata(cfg config.Config, projectID string, metadataJSON *string) config.ProviderKind {
 	for _, project := range cfg.Projects {
 		if project.ID == projectID {
 			return config.ResolvedProjectProviderKind(cfg, project)
 		}
 	}
-	if providerID := projects.ProviderFromMetadata(metadataJSON); providerID != "" {
-		for _, provider := range cfg.Providers {
-			if provider.ID == providerID {
-				return provider.Kind
-			}
-		}
-	}
 	return config.ProviderKindGitHub
 }
 
-func runtimeProjectBindingInstalled(cfg config.Config, projectID string, metadataJSON *string) bool {
-	providerID := projects.ProviderFromMetadata(metadataJSON)
-	if providerID == "" {
-		if runtimeProjectSource(metadataJSON) == "api" {
-			for _, project := range cfg.Projects {
-				if project.ID == projectID && strings.TrimSpace(project.Provider) != "" {
-					return false
-				}
-			}
-		}
-		return true
-	}
-	repo := runtimeProjectRepo(metadataJSON)
-	for _, project := range cfg.Projects {
-		if project.ID == projectID && project.Provider == providerID && strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			return true
-		}
-	}
-	return false
-}
-
-func runtimeProjectVisible(cfg config.Config, projectID string, metadataJSON *string) bool {
-	if runtimeProjectSource(metadataJSON) == "config" {
-		for _, project := range cfg.Projects {
-			if project.ID == projectID {
-				return true
-			}
-		}
-		return false
-	}
-	return runtimeProjectBindingInstalled(cfg, projectID, metadataJSON)
-}
-
-// detectProjectRepo reads origin host + owner/name. It never selects a provider
-// from the remote host — provider binding requires an explicit id/type or CLI
-// confirmation. Repo slug is still returned for non-GitHub hosts so an explicit
-// provider can reuse it.
-func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, repoPath string) (projects.DetectedRepo, error) {
+func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
 	if gitGateway == nil {
 		return projects.DetectedRepo{}, fmt.Errorf("git gateway is not configured")
 	}
@@ -946,7 +845,14 @@ func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, repoPa
 	if strings.TrimSpace(remote.Repo) == "" {
 		return projects.DetectedRepo{}, nil
 	}
-	return projects.DetectedRepo{Repo: remote.Repo, Host: remote.Host}, nil
+	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, remote.Host); ok {
+		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.ID}, nil
+	}
+	// Keep GitHub autodetection behavior for github.com remotes (and unknown hosts stay empty).
+	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
+		return projects.DetectedRepo{Repo: remote.Repo}, nil
+	}
+	return projects.DetectedRepo{}, nil
 }
 
 func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storage.Repositories) error {
@@ -959,51 +865,8 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	configuredProjectIDs := make(map[string]struct{}, len(r.config.Projects))
-	for _, project := range r.config.Projects {
-		configuredProjectIDs[project.ID] = struct{}{}
-	}
-	isStaleConfiguredProject := func(item storage.ProjectRecord) bool {
-		if runtimeProjectSource(item.MetadataJSON) != "config" {
-			return false
-		}
-		_, configured := configuredProjectIDs[item.ID]
-		return !configured
-	}
-	seenRepos := make(map[string]string)
 	for _, item := range items {
-		if item.Archived || isStaleConfiguredProject(item) {
-			continue
-		}
-		providerID := projects.ProviderFromMetadata(item.MetadataJSON)
-		repo := runtimeProjectRepo(item.MetadataJSON)
-		if repo == "" {
-			continue
-		}
-		normalizedRepo := strings.ToLower(strings.TrimSpace(repo))
-		if existingID, ok := seenRepos[normalizedRepo]; ok && existingID != item.ID {
-			return fmt.Errorf("rehydrate API project %s: repository %s is already bound to project %s", item.ID, repo, existingID)
-		}
-		seenRepos[normalizedRepo] = item.ID
-		if providerID == "" {
-			continue
-		}
-		providerConfigured := false
-		for _, provider := range r.config.Providers {
-			if provider.ID == providerID {
-				providerConfigured = true
-				break
-			}
-		}
-		if !providerConfigured {
-			return fmt.Errorf("rehydrate API project %s: provider %q is not configured", item.ID, providerID)
-		}
-		if err := config.ValidateRuntimeProjectBinding(r.config, item.ID, repo); err != nil {
-			return fmt.Errorf("rehydrate API project %s: %w", item.ID, err)
-		}
-	}
-	for _, item := range items {
-		if item.Archived || isStaleConfiguredProject(item) {
+		if item.Archived {
 			continue
 		}
 		providerID := projects.ProviderFromMetadata(item.MetadataJSON)
@@ -2808,8 +2671,6 @@ type runtimeReviewerRecoveryPolicy struct {
 }
 
 func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeReviewerRecoveryPolicy {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
 	roles := config.ProjectRoleConfigs(r.config, projectID)
 	return runtimeReviewerRecoveryPolicy{
 		includeDrafts:    roles.Reviewer.Discovery.Triggers.IncludeDrafts,

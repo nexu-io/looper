@@ -26,8 +26,6 @@ const (
 	maxRetries               = 2
 )
 
-var ErrForwarderClosed = errors.New("webhook forwarder is closed")
-
 type Lane string
 
 const (
@@ -85,8 +83,6 @@ type Forwarder interface {
 	Forward(context.Context, DeliveryRequest) (ForwardResult, error)
 	Stats() Stats
 	Close()
-	CloseAndWait()
-	CancelAndWait()
 }
 
 type TargetedReviewer interface {
@@ -212,16 +208,13 @@ type forwarder struct {
 	mu              sync.Mutex
 	cond            *sync.Cond
 	closed          bool
-	canceled        bool
+	workersDone     sync.WaitGroup
 	queue           []workKey
 	works           map[string]*workItem
 	deliveries      map[string]deliveryRecord
 	stats           Stats
 	recentOutcomes  []Outcome
 	currentInFlight int
-	workerCtx       context.Context
-	cancelWorkers   context.CancelFunc
-	workerWG        sync.WaitGroup
 }
 
 func New(options Options) Forwarder {
@@ -249,7 +242,6 @@ func New(options Options) Forwarder {
 	if recentOutcomeLimit <= 0 {
 		recentOutcomeLimit = defaultRecentOutcomeSize
 	}
-	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 	f := &forwarder{
 		repos:              options.Repos,
 		cfg:                options.Config,
@@ -264,12 +256,10 @@ func New(options Options) Forwarder {
 		recentOutcomeLimit: recentOutcomeLimit,
 		works:              map[string]*workItem{},
 		deliveries:         map[string]deliveryRecord{},
-		workerCtx:          workerCtx,
-		cancelWorkers:      cancelWorkers,
 	}
 	f.cond = sync.NewCond(&f.mu)
 	for i := 0; i < f.maxConcurrent; i++ {
-		f.workerWG.Add(1)
+		f.workersDone.Add(1)
 		go f.worker()
 	}
 	return f
@@ -296,7 +286,7 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
-		return ForwardResult{}, ErrForwarderClosed
+		return ForwardResult{}, fmt.Errorf("webhook forwarder is closed")
 	}
 	f.stats.DeliveriesReceived++
 	f.pruneExpiredDeliveriesLocked(now)
@@ -345,27 +335,9 @@ func (f *forwarder) Close() {
 		return
 	}
 	f.closed = true
-	if len(f.queue) == 0 && f.currentInFlight == 0 {
-		f.cancelWorkers()
-	}
 	f.cond.Broadcast()
 	f.mu.Unlock()
-}
-
-func (f *forwarder) CloseAndWait() {
-	f.Close()
-	f.workerWG.Wait()
-}
-
-func (f *forwarder) CancelAndWait() {
-	f.mu.Lock()
-	f.closed = true
-	f.canceled = true
-	f.queue = nil
-	f.cancelWorkers()
-	f.cond.Broadcast()
-	f.mu.Unlock()
-	f.workerWG.Wait()
+	f.workersDone.Wait()
 }
 
 func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed routedDelivery, metadata workMetadata) (int, error) {
@@ -443,13 +415,13 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 }
 
 func (f *forwarder) worker() {
-	defer f.workerWG.Done()
+	defer f.workersDone.Done()
 	for {
 		key, item, ok := f.nextWork()
 		if !ok {
 			return
 		}
-		outcome := f.executeWithRetry(f.workerCtx, key, item)
+		outcome := f.executeWithRetry(context.Background(), key, item)
 		f.finishWork(key, outcome)
 	}
 }
@@ -495,7 +467,7 @@ func (f *forwarder) finishWork(key workKey, outcome Outcome) {
 		item.running = false
 		if len(item.lanes) == 0 {
 			delete(f.works, itemKey)
-		} else if !item.enqueued && !f.canceled {
+		} else if !item.enqueued {
 			if len(f.queue) < f.queueCapacity {
 				item.enqueued = true
 				f.queue = append(f.queue, key)
@@ -517,9 +489,6 @@ func (f *forwarder) finishWork(key workKey, outcome Outcome) {
 			fields["error"] = outcome.Error
 		}
 		f.logger.Info("webhook targeted discovery completed", fields)
-	}
-	if f.closed && len(f.queue) == 0 && f.currentInFlight == 0 {
-		f.cancelWorkers()
 	}
 }
 
@@ -556,9 +525,6 @@ func (f *forwarder) executeWithRetry(ctx context.Context, key workKey, item work
 }
 
 func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	if _, ok := item.lanes[LaneReviewer]; ok {
 		if f.reviewer == nil {
 			return fmt.Errorf("reviewer targeted discovery is not configured")
@@ -566,9 +532,6 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 		if _, err := f.reviewer.DiscoverPullRequest(ctx, reviewer.TargetedDiscoveryInput{ProjectID: key.ProjectID, Repo: key.Repo, PRNumber: key.Number}); err != nil {
 			return err
 		}
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 	if _, ok := item.lanes[LaneFixer]; ok {
 		if f.fixer == nil {

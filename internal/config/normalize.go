@@ -446,18 +446,6 @@ func applyForgejoProjectProfile(project *ProjectRefConfig) {
 	if roles.Fixer.AutoDiscovery == nil {
 		roles.Fixer.AutoDiscovery = boolPtr(false)
 	}
-	if roles.Coordinator == nil {
-		roles.Coordinator = &PartialCoordinatorRoleConfig{}
-	}
-	if roles.Coordinator.Enabled == nil {
-		roles.Coordinator.Enabled = boolPtr(false)
-	}
-	if roles.Coordinator.Dependencies == nil {
-		roles.Coordinator.Dependencies = &PartialCoordinatorDependenciesConfig{}
-	}
-	if roles.Coordinator.Dependencies.Enabled == nil {
-		roles.Coordinator.Dependencies.Enabled = boolPtr(false)
-	}
 }
 
 func normalizeProviderConfig(provider *ProviderConfig) {

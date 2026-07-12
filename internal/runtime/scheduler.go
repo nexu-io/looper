@@ -104,10 +104,9 @@ type defaultSchedulerTickInput struct {
 }
 
 type defaultSchedulerHandlers struct {
-	tick             RunSchedulerTickFunc
-	claim            RunSchedulerTickFunc
-	webhook          WebhookForwarder
-	webhookForConfig func(config.Config) WebhookForwarder
+	tick    RunSchedulerTickFunc
+	claim   RunSchedulerTickFunc
+	webhook WebhookForwarder
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -2102,23 +2101,9 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithWebhook(cfg, configReadLock, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true)
-}
-
-func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg, configReadLock, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, includeWebhook, nil)
-}
-
-func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
-	}
-	if cfg == nil {
-		fail := func(context.Context, Services) error {
-			return fmt.Errorf("default scheduler config is not configured")
-		}
-		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	if repos == nil || coordinator == nil {
 		fail := func(context.Context, Services) error {
@@ -2129,38 +2114,6 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 	if cfg.Agent.Vendor == nil {
 		noop := func(context.Context, Services) error { return nil }
 		return defaultSchedulerHandlers{tick: noop, claim: noop}
-	}
-	if configReadLock != nil {
-		if claimMu == nil {
-			claimMu = &sync.Mutex{}
-		}
-		snapshot := func() config.Config {
-			unlock := configReadLock()
-			defer unlock()
-			cloned := *cfg
-			cloned.Projects = append([]config.ProjectRefConfig(nil), cfg.Projects...)
-			return cloned
-		}
-		buildSnapshotHandlers := func() defaultSchedulerHandlers {
-			cloned := snapshot()
-			return buildDefaultSchedulerHandlersWithWebhookAndClaimMu(&cloned, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu)
-		}
-		// Runtime startup already holds the config write lock while constructing
-		// handlers, so take the initial webhook snapshot directly. Tick and claim
-		// snapshots are taken later through configReadLock.
-		initialConfig := *cfg
-		initialConfig.Projects = append([]config.ProjectRefConfig(nil), cfg.Projects...)
-		initial := buildDefaultSchedulerHandlers(&initialConfig, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns)
-		return defaultSchedulerHandlers{
-			tick: func(ctx context.Context, services Services) error {
-				return buildSnapshotHandlers().tick(ctx, services)
-			},
-			claim: func(ctx context.Context, services Services) error {
-				return buildSnapshotHandlers().claim(ctx, services)
-			},
-			webhook:          initial.webhook,
-			webhookForConfig: initial.webhookForConfig,
-		}
 	}
 	notificationGateway := notify.NewGateway(notify.Options{
 		Config:        cfg.Notifications,
@@ -2293,7 +2246,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 		},
 	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
-	stamper := disclosure.FromConfig(*cfg)
+	stamper := disclosure.FromConfig(cfg)
 	agentRuntime := ""
 	if cfg.Agent.Vendor != nil {
 		agentRuntime = string(*cfg.Agent.Vendor)
@@ -2301,7 +2254,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 	plannerRunner = planner.New(planner.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
+		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
@@ -2309,7 +2262,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
 		Disclosure:         &cfg.Disclosure,
 		AgentRuntime:       agentRuntime,
-		CustomInstructions: cfg,
+		CustomInstructions: &cfg,
 		AgentModel:         cfg.Agent.Model,
 		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
@@ -2329,7 +2282,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
 		Repos:   repos,
 		GitHub:  githubGateway,
-		Config:  cfg,
+		Config:  &cfg,
 		Logger:  logger,
 		Now:     now,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
@@ -2341,7 +2294,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 	reviewerRunner = reviewer.New(reviewer.Options{
 		DB:               coordinator.DB(),
 		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
+		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:              reviewerGitAdapter{gateway: gitGateway},
 		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:           logger,
@@ -2365,7 +2318,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 		ThreadResolution:        cfg.Roles.Reviewer.Behavior.ThreadResolution,
 		Disclosure:              &cfg.Disclosure,
 		AgentRuntime:            agentRuntime,
-		CustomInstructions:      cfg,
+		CustomInstructions:      &cfg,
 		LooperCLIPath:           derefString(cfg.Tools.LooperPath),
 		AgentModel:              cfg.Agent.Model,
 		AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
@@ -2381,7 +2334,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 	fixerRunner = fixer.New(fixer.Options{
 		DB:                 coordinator.DB(),
 		Repos:              repos,
-		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
+		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:             logger,
@@ -2399,7 +2352,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 		},
 		Disclosure:          &cfg.Disclosure,
 		AgentRuntime:        agentRuntime,
-		CustomInstructions:  cfg,
+		CustomInstructions:  &cfg,
 		AgentModel:          cfg.Agent.Model,
 		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
@@ -2413,9 +2366,9 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 	workerRunner = worker.New(worker.Options{
 		DB:     coordinator.DB(),
 		Repos:  repos,
-		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: cfg},
+		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
-			return githubCLIAutoPROpeningAvailable(ctx, *cfg, githubGateway, logger, repo, cwd)
+			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 		},
 		Git:             workerGitAdapter{gateway: gitGateway, stamper: stamper},
 		AgentExecutor:   workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
@@ -2432,7 +2385,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 		},
 		Disclosure:          &cfg.Disclosure,
 		AgentRuntime:        agentRuntime,
-		CustomInstructions:  cfg,
+		CustomInstructions:  &cfg,
 		Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
 		AgentModel:          cfg.Agent.Model,
 		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
@@ -2459,9 +2412,7 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 			})
 		},
 	})
-	if claimMu == nil {
-		claimMu = &sync.Mutex{}
-	}
+	claimMu := &sync.Mutex{}
 
 	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
@@ -2484,46 +2435,32 @@ func buildDefaultSchedulerHandlersWithWebhookAndClaimMu(cfg *config.Config, conf
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
 			Snapshotter:              githubGateway,
-			Config:                   cfg,
-			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "planner")),
-			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(*cfg, projectID).Coordinator.Enabled },
-			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "reviewer")),
-			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "fixer")),
-			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(*cfg, "worker")),
+			Config:                   &cfg,
+			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
+			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
+			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
+			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
 	}
 
-	handlers := defaultSchedulerHandlers{
+	return defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
-			if configReadLock != nil {
-				unlock := configReadLock()
-				defer unlock()
-			}
 			return runDefaultSchedulerTick(ctx, inputForServices(services))
 		},
 		claim: func(ctx context.Context, services Services) error {
-			if configReadLock != nil {
-				unlock := configReadLock()
-				defer unlock()
-			}
 			return runIndependentClaimPass(ctx, inputForServices(services))
 		},
-	}
-	if includeWebhook {
-		handlers.webhook = webhookforward.New(webhookforward.Options{
+		webhook: webhookforward.New(webhookforward.Options{
 			Repos:    repos,
-			Config:   *cfg,
+			Config:   cfg,
 			Reviewer: reviewerRunner,
 			Fixer:    fixerRunner,
 			Logger:   logger,
 			Now:      now,
-		})
-		handlers.webhookForConfig = func(next config.Config) WebhookForwarder {
-			return buildDefaultSchedulerHandlersWithWebhook(&next, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true).webhook
-		}
+		}),
 	}
-	return handlers
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
@@ -2640,15 +2577,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if project.Archived {
 			continue
 		}
-		if input.Config != nil && !runtimeProjectVisible(*input.Config, project.ID, project.MetadataJSON) {
-			if input.Logger != nil {
-				input.Logger.Debug("scheduler skipped provider project without runtime binding", map[string]any{"projectId": project.ID})
-			}
-			continue
-		}
 		providerKind := config.ProviderKindGitHub
 		if input.Config != nil {
-			providerKind = runtimeProjectProviderKindWithMetadata(*input.Config, project.ID, project.MetadataJSON)
+			providerKind = runtimeProjectProviderKind(*input.Config, project.ID)
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		var snapshot *githubinfra.DiscoverySnapshot
@@ -2916,24 +2847,12 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		now = time.Now
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
-	var runnableProjectIDs []string
-	if input.Config != nil && input.Repos.Projects != nil {
-		projectsList, err := input.Repos.Projects.List(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, project := range projectsList {
-			if !project.Archived && runtimeProjectVisible(*input.Config, project.ID, project.MetadataJSON) {
-				runnableProjectIDs = append(runnableProjectIDs, project.ID)
-			}
-		}
-	}
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
 		}
-		item, err := input.Repos.Queue.ClaimNextNonLongTermRetryForProjects(ctx, nowISO, "scheduler", runnableProjectIDs, input.Config != nil)
+		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
 			return queueItems, err
 		}
@@ -2946,7 +2865,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
 		}
-		item, err := input.Repos.Queue.ClaimNextLongTermRetryForProjects(ctx, nowISO, "scheduler", runnableProjectIDs, input.Config != nil)
+		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
 			return queueItems, err
 		}
@@ -2992,24 +2911,6 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			return err
 		}
 
-		visible, err := schedulerQueueProjectVisible(ctx, item, input)
-		if err != nil {
-			errList = append(errList, err)
-			continue
-		}
-		if !visible {
-			if input.Repos != nil && input.Repos.Queue != nil {
-				if err := input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC())); err != nil {
-					errList = append(errList, err)
-					continue
-				}
-			}
-			if input.Logger != nil {
-				input.Logger.Info("scheduler released claimed item for stale project binding", map[string]any{"queueItemId": item.ID, "projectId": derefString(item.ProjectID)})
-			}
-			continue
-		}
-
 		// A loop parked for human takeover (or paused) must never be run, even if a
 		// queue item survived a race with the parking and got claimed. Release the
 		// claim (so the slot frees) and skip — only an explicit handback re-arms it.
@@ -3053,20 +2954,6 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		return nil
 	}
 	return errors.Join(errList...)
-}
-
-func schedulerQueueProjectVisible(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput) (bool, error) {
-	if input.Config == nil || item.ProjectID == nil || strings.TrimSpace(*item.ProjectID) == "" {
-		return true, nil
-	}
-	if input.Repos == nil || input.Repos.Projects == nil {
-		return false, nil
-	}
-	project, err := input.Repos.Projects.GetByID(ctx, *item.ProjectID)
-	if err != nil {
-		return false, err
-	}
-	return project != nil && !project.Archived && runtimeProjectVisible(*input.Config, project.ID, project.MetadataJSON), nil
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {

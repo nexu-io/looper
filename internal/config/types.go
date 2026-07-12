@@ -631,8 +631,6 @@ type Config struct {
 	Roles         RoleConfigs        `json:"roles"`
 	Providers     []ProviderConfig   `json:"providers,omitempty"`
 	Projects      []ProjectRefConfig `json:"projects"`
-
-	runtimeProjectBindingIDs map[string]struct{}
 }
 
 // HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents

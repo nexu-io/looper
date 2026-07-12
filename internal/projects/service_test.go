@@ -42,7 +42,7 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 }
 
-func TestServiceAddProjectDoesNotInferProviderFromNonGitHubRemote(t *testing.T) {
+func TestServiceAddProjectDetectsForgejoProviderAndRepo(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -61,17 +61,17 @@ func TestServiceAddProjectDoesNotInferProviderFromNonGitHubRemote(t *testing.T) 
 		TokenEnv: &tokenEnv,
 	}}
 
-	var registered *ProjectBinding
 	service := &Service{
 		DB:     coordinator.DB(),
 		Repos:  repos,
 		Config: cfg,
 		Now:    func() time.Time { return now },
 		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{Repo: "core/odcrew", Host: "ssh.code.powerformer.net"}, nil
+			return DetectedRepo{Repo: "core/odcrew", Provider: "forgejo-main"}, nil
 		},
-		RegisterBinding: func(binding ProjectBinding) {
-			registered = &binding
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			t.Fatal("ListOpenPullRequests should not run for forgejo projects")
+			return nil, nil
 		},
 	}
 
@@ -80,60 +80,52 @@ func TestServiceAddProjectDoesNotInferProviderFromNonGitHubRemote(t *testing.T) 
 		Name:       "odcrew",
 		RepoPath:   "/tmp/odcrew",
 		BaseBranch: "main",
+		Provider:   stringPointer("forgejo-main"),
 	})
 	if err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}
-	if result.Provider != nil {
-		t.Fatalf("AddProject().Provider = %v, want nil without explicit confirmation", result.Provider)
+	if result.Repo == nil || *result.Repo != "core/odcrew" {
+		t.Fatalf("AddProject().Repo = %v, want core/odcrew", result.Repo)
 	}
-	if result.Repo != nil {
-		t.Fatalf("AddProject().Repo = %v, want nil for unconfirmed non-GitHub remote", result.Repo)
+	if result.Provider == nil || *result.Provider != "forgejo-main" {
+		t.Fatalf("AddProject().Provider = %v, want forgejo-main", result.Provider)
 	}
-	if registered != nil && registered.Provider != "" {
-		t.Fatalf("RegisterBinding() = %#v, want no forgejo binding", registered)
+	if result.Project.MetadataJSON == nil || *result.Project.MetadataJSON != `{"provider":"forgejo-main","repo":"core/odcrew","worktreeRoot":null,"source":"api"}` {
+		t.Fatalf("AddProject().Project.MetadataJSON = %v, want forgejo api metadata", result.Project.MetadataJSON)
+	}
+	if result.DiscoveredPullRequests != 0 {
+		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 0 for forgejo", result.DiscoveredPullRequests)
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "restart looperd") {
+		t.Fatalf("AddProject().Warnings = %#v, want restart warning", result.Warnings)
 	}
 }
 
-func TestServiceAddProjectRejectsPlaneProviderWithNonGitHubDetectedRepo(t *testing.T) {
+func TestServiceAddProjectRequiresExplicitDetectedForgejoProvider(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
-	ctx := context.Background()
 	repos := storage.NewRepositories(coordinator.DB())
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Providers = []config.ProviderConfig{{
-		ID:   "plane-main",
-		Kind: config.ProviderKindPlane,
-	}}
 	service := &Service{
 		DB:     coordinator.DB(),
 		Repos:  repos,
-		Config: cfg,
+		Config: config.Config{},
 		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{Repo: "core/odcrew", Host: "code.example.com"}, nil
+			return DetectedRepo{Repo: "core/odcrew", Provider: "forgejo-main"}, nil
 		},
 	}
-	provider := "plane-main"
 
-	_, err = service.AddProject(ctx, AddInput{
-		ID:       "odcrew",
-		Name:     "odcrew",
-		RepoPath: "/tmp/odcrew",
-		Provider: &provider,
-	})
-	if err == nil || !strings.Contains(err.Error(), "provider is set but repo is missing") {
-		t.Fatalf("AddProject() error = %v, want explicit repo validation error", err)
+	_, err := service.AddProject(context.Background(), AddInput{ID: "odcrew", Name: "odcrew", RepoPath: "/tmp/odcrew"})
+	if err == nil || !strings.Contains(err.Error(), "rerun with --provider forgejo-main") {
+		t.Fatalf("AddProject() error = %v, want explicit provider confirmation", err)
 	}
-	stored, getErr := repos.Projects.GetByID(ctx, "odcrew")
+	project, getErr := repos.Projects.GetByID(context.Background(), "odcrew")
 	if getErr != nil {
-		t.Fatalf("Projects.GetByID() error = %v", getErr)
+		t.Fatalf("GetByID() error = %v", getErr)
 	}
-	if stored != nil {
-		t.Fatalf("Projects.GetByID() = %#v, want no persisted Plane project", stored)
+	if project != nil {
+		t.Fatalf("GetByID() = %#v, want no persisted project", project)
 	}
 }
 
@@ -155,120 +147,8 @@ func TestServiceAddProjectRejectsUnknownProvider(t *testing.T) {
 		Repo:     &repo,
 		Provider: &provider,
 	})
-	if err == nil || !strings.Contains(err.Error(), "unknown provider id or type") {
-		t.Fatalf("AddProject() error = %v, want unknown provider id or type", err)
-	}
-}
-
-func TestServiceAddProjectValidatesBindingBeforePersisting(t *testing.T) {
-	t.Parallel()
-
-	coordinator := openCoordinator(t)
-	repos := storage.NewRepositories(coordinator.DB())
-	repo := "core/looper"
-	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		ValidateBinding: func(ProjectBinding) error {
-			return ProjectValidationError{Message: "repository is already bound"}
-		},
-	}
-
-	_, err := service.AddProject(context.Background(), AddInput{ID: "duplicate", Name: "duplicate", RepoPath: "/tmp/duplicate", Repo: &repo})
-	if err == nil || !strings.Contains(err.Error(), "already bound") {
-		t.Fatalf("AddProject() error = %v, want duplicate binding error", err)
-	}
-	stored, getErr := repos.Projects.GetByID(context.Background(), "duplicate")
-	if getErr != nil {
-		t.Fatalf("GetByID() error = %v", getErr)
-	}
-	if stored != nil {
-		t.Fatalf("GetByID() = %#v, want no persisted project", stored)
-	}
-}
-
-func TestServiceAddProjectRejectsRepoStoredByAnotherAPIProject(t *testing.T) {
-	t.Parallel()
-
-	coordinator := openCoordinator(t)
-	ctx := context.Background()
-	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
-	metadata := `{"repo":"Acme/Looper","source":"api"}`
-	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
-		ID:           "github-project",
-		Name:         "GitHub project",
-		RepoPath:     "/tmp/github-project",
-		MetadataJSON: &metadata,
-		CreatedAt:    currentISO(func() time.Time { return now }),
-		UpdatedAt:    currentISO(func() time.Time { return now }),
-	}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	tokenEnv := "LOOPER_FORGEJO_TOKEN"
-	cfg.Providers = []config.ProviderConfig{{
-		ID:       "forgejo-main",
-		Kind:     config.ProviderKindForgejo,
-		BaseURL:  "https://code.example.com",
-		TokenEnv: &tokenEnv,
-	}}
-	service := &Service{DB: coordinator.DB(), Repos: repos, Config: cfg, Now: func() time.Time { return now }}
-	provider := "forgejo-main"
-	repo := "acme/looper"
-
-	_, err = service.AddProject(ctx, AddInput{
-		ID:       "forgejo-project",
-		Name:     "Forgejo project",
-		RepoPath: "/tmp/forgejo-project",
-		Repo:     &repo,
-		Provider: &provider,
-	})
-	if err == nil || !strings.Contains(err.Error(), "repository acme/looper is already bound to project github-project") {
-		t.Fatalf("AddProject() error = %v, want stored repo binding error", err)
-	}
-	stored, getErr := repos.Projects.GetByID(ctx, "forgejo-project")
-	if getErr != nil {
-		t.Fatalf("Projects.GetByID() error = %v", getErr)
-	}
-	if stored != nil {
-		t.Fatalf("Projects.GetByID() = %#v, want no persisted duplicate", stored)
-	}
-}
-
-func TestServiceAddProjectRejectsRepoStoredByRemovedConfigProject(t *testing.T) {
-	t.Parallel()
-
-	coordinator := openCoordinator(t)
-	ctx := context.Background()
-	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
-	metadata := `{"repo":"Acme/Looper","source":"config"}`
-	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
-		ID:           "removed-config-project",
-		Name:         "Removed config project",
-		RepoPath:     "/tmp/removed-config-project",
-		MetadataJSON: &metadata,
-		CreatedAt:    currentISO(func() time.Time { return now }),
-		UpdatedAt:    currentISO(func() time.Time { return now }),
-	}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-
-	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
-	repo := "acme/looper"
-	_, err := service.AddProject(ctx, AddInput{
-		ID:       "api-project",
-		Name:     "API project",
-		RepoPath: "/tmp/api-project",
-		Repo:     &repo,
-	})
-	if err == nil || !strings.Contains(err.Error(), "repository acme/looper is already bound to project removed-config-project") {
-		t.Fatalf("AddProject() error = %v, want stale config row to block repo reuse", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown provider") {
+		t.Fatalf("AddProject() error = %v, want unknown provider", err)
 	}
 }
 
@@ -712,7 +592,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	nowISO := now.UTC().Format(time.RFC3339Nano)
 	repoPath := "/tmp/looper"
 	baseBranch := "main"
-	metadata := `{"provider":"forgejo-main","repo":"powerformer/looper","worktreeRoot":null,"source":"api"}`
+	metadata := `{"repo":"powerformer/looper","worktreeRoot":null,"source":"config"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: repoPath, BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -738,40 +618,7 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 		t.Fatalf("Projects.GetByID() error = %v", err)
 	}
 	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"config"}` {
-		t.Fatalf("project.MetadataJSON = %#v, want refreshed config metadata without stale provider", project)
-	}
-}
-
-func TestServiceSyncConfiguredIgnoresRepoDetectedFromNonGitHubHost(t *testing.T) {
-	t.Parallel()
-
-	coordinator := openCoordinator(t)
-	repos := storage.NewRepositories(coordinator.DB())
-	now := time.Date(2026, time.May, 8, 12, 0, 0, 0, time.UTC)
-	repoPath := "/tmp/odcrew"
-	baseBranch := "main"
-	service := &Service{
-		Repos: repos,
-		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{Repo: "core/odcrew", Host: "ssh.code.powerformer.net"}, nil
-		},
-	}
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Projects = []config.ProjectRefConfig{{ID: "odcrew", Name: "odcrew", RepoPath: repoPath, BaseBranch: &baseBranch}}
-
-	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
-		t.Fatalf("SyncConfigured() error = %v", err)
-	}
-	project, err := repos.Projects.GetByID(context.Background(), "odcrew")
-	if err != nil {
-		t.Fatalf("Projects.GetByID() error = %v", err)
-	}
-	if project == nil || project.MetadataJSON == nil || *project.MetadataJSON != `{"repo":null,"worktreeRoot":null,"source":"config"}` {
-		t.Fatalf("project.MetadataJSON = %#v, want non-GitHub detected repo ignored", project)
+		t.Fatalf("project.MetadataJSON = %#v, want refreshed transferred repo metadata", project)
 	}
 }
 
@@ -948,15 +795,7 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	var removedBinding *ProjectBinding
-	service := &Service{
-		DB:    coordinator.DB(),
-		Repos: repos,
-		Now:   func() time.Time { return now.Add(time.Minute) },
-		RegisterBinding: func(binding ProjectBinding) {
-			removedBinding = &binding
-		},
-	}
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now.Add(time.Minute) }}
 
 	removed, err := service.RemoveProject(ctx, "looper")
 	if err != nil {
@@ -964,9 +803,6 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	}
 	if !removed.Archived {
 		t.Fatalf("RemoveProject().Archived = %v, want true", removed.Archived)
-	}
-	if removedBinding == nil || removedBinding.ProjectID != "looper" || removedBinding.Provider != "" || removedBinding.Repo != "" {
-		t.Fatalf("RegisterBinding() = %#v, want cleared looper binding", removedBinding)
 	}
 
 	stored, err := repos.Projects.GetByID(ctx, "looper")

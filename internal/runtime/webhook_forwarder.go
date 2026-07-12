@@ -168,7 +168,7 @@ func (m *webhookForwarderManager) Sync(ctx context.Context, projects []storage.P
 	}
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
-	desiredRepos := uniqueConfiguredWebhookRepos(m.config, projects)
+	desiredRepos := uniqueConfiguredWebhookRepos(projects)
 	if !m.canRun() {
 		m.stopAllForwarders()
 		return
@@ -514,14 +514,11 @@ func (m *webhookForwarderManager) waitForForwarderDone(forwarder *managedWebhook
 	}
 }
 
-func uniqueConfiguredWebhookRepos(cfg config.Config, projects []storage.ProjectRecord) []string {
+func uniqueConfiguredWebhookRepos(projects []storage.ProjectRecord) []string {
 	seen := map[string]struct{}{}
 	repos := make([]string, 0, len(projects))
 	for _, project := range projects {
 		if project.Archived {
-			continue
-		}
-		if runtimeProjectProviderKindWithMetadata(cfg, project.ID, project.MetadataJSON) == config.ProviderKindForgejo {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)

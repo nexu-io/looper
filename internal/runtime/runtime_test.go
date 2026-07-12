@@ -100,7 +100,7 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
-func TestRuntimeStartForgejoOnlyRetainsGitHubGatewayForRuntimeProjectAdd(t *testing.T) {
+func TestRuntimeStartForgejoOnlyDoesNotRequireGitHubGateway(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -110,13 +110,7 @@ func TestRuntimeStartForgejoOnlyRetainsGitHubGatewayForRuntimeProjectAdd(t *test
 	}
 
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-	unusableGH := filepath.Join(workingDir, "gh")
-	if err := os.WriteFile(unusableGH, []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile(gh) error = %v", err)
-	}
-	cfg.Tools.GHPath = &unusableGH
-	cfg.Roles.Coordinator.Enabled = true
-	cfg.Roles.Coordinator.Dependencies.Enabled = true
+	cfg.Tools.GHPath = nil
 	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
 	cfg.Projects = []config.ProjectRefConfig{{
 		ID:       "forgejo_project",
@@ -132,23 +126,8 @@ func TestRuntimeStartForgejoOnlyRetainsGitHubGatewayForRuntimeProjectAdd(t *test
 	}
 	t.Cleanup(func() { rt.Stop("test cleanup") })
 
-	if rt.githubGateway == nil {
-		t.Fatal("runtime githubGateway = nil, want GitHub support for runtime project adds")
-	}
-	githubRepo := "nexu-io/looper"
-	result, err := rt.Services().Projects.AddProject(context.Background(), projects.AddInput{
-		ID:           "github_project",
-		Name:         "GitHub Project",
-		RepoPath:     filepath.Join(workingDir, "github-repo"),
-		BaseBranch:   "main",
-		Repo:         &githubRepo,
-		SnapshotMode: projects.SnapshotModeOff,
-	})
-	if err != nil {
-		t.Fatalf("AddProject() error = %v", err)
-	}
-	if result.Repo == nil || *result.Repo != githubRepo || result.Provider != nil {
-		t.Fatalf("AddProject() binding = (repo %v, provider %v), want provider-less GitHub repo %q", result.Repo, result.Provider, githubRepo)
+	if rt.githubGateway != nil {
+		t.Fatal("runtime githubGateway = non-nil, want nil for Forgejo-only config")
 	}
 	project, err := rt.Services().Repositories.Projects.GetByID(context.Background(), "forgejo_project")
 	if err != nil {
@@ -3027,172 +3006,6 @@ func (s stubRuntimeWebhookForwarder) Forward(context.Context, webhookforward.Del
 func (s stubRuntimeWebhookForwarder) Stats() webhookforward.Stats { return s.stats }
 
 func (stubRuntimeWebhookForwarder) Close() {}
-
-func (stubRuntimeWebhookForwarder) CloseAndWait() {}
-
-func (stubRuntimeWebhookForwarder) CancelAndWait() {}
-
-type trackingRuntimeWebhookForwarder struct{ closed bool }
-
-func (*trackingRuntimeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
-	return webhookforward.ForwardResult{}, nil
-}
-
-func (*trackingRuntimeWebhookForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
-
-func (f *trackingRuntimeWebhookForwarder) Close() { f.closed = true }
-
-func (f *trackingRuntimeWebhookForwarder) CloseAndWait() { f.Close() }
-
-func (f *trackingRuntimeWebhookForwarder) CancelAndWait() { f.Close() }
-
-func TestSyncRuntimeProjectBindingRefreshesWebhookForwarder(t *testing.T) {
-	t.Parallel()
-
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	previous := &trackingRuntimeWebhookForwarder{}
-	next := &trackingRuntimeWebhookForwarder{}
-	var factoryConfig config.Config
-	rt := &Runtime{
-		config:           cfg,
-		webhookForwarder: previous,
-		webhookForwarderForConfig: func(cfg config.Config) WebhookForwarder {
-			factoryConfig = cfg
-			return next
-		},
-	}
-
-	rt.syncRuntimeProjectBinding(projects.ProjectBinding{
-		ProjectID: "odcrew",
-		Name:      "odcrew",
-		Provider:  "forgejo-main",
-		Repo:      "core/odcrew",
-		RepoPath:  "/tmp/odcrew",
-	})
-
-	if !previous.closed {
-		t.Fatal("previous webhook forwarder was not closed")
-	}
-	if got := rt.WebhookForwarder(); got != next {
-		t.Fatalf("WebhookForwarder() = %T, want refreshed forwarder", got)
-	}
-	if len(factoryConfig.Projects) != 1 || factoryConfig.Projects[0].ID != "odcrew" || factoryConfig.Projects[0].Repo != "core/odcrew" {
-		t.Fatalf("webhook factory config projects = %#v, want new runtime binding", factoryConfig.Projects)
-	}
-}
-
-func TestRehydrateAPIProjectBindingsRejectsUnknownProvider(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	dbPath := filepath.Join(workingDir, "runtime.sqlite")
-	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(workingDir, "backups"))
-	t.Cleanup(func() { _ = coordinator.Close() })
-	repositories := storage.NewRepositories(coordinator.DB())
-	metadata := `{"provider":"removed-provider","repo":"acme/looper"}`
-	now := formatJavaScriptISOString(time.Now().UTC())
-	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: "api-project", Name: "API project", RepoPath: workingDir, MetadataJSON: &metadata,
-		CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-
-	rt := &Runtime{config: config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}}
-	err := rt.rehydrateAPIProjectBindings(context.Background(), repositories)
-	if err == nil || !strings.Contains(err.Error(), `provider "removed-provider" is not configured`) {
-		t.Fatalf("rehydrateAPIProjectBindings() error = %v, want unknown provider error", err)
-	}
-	if len(rt.config.Projects) != 0 {
-		t.Fatalf("runtime projects = %#v, want no invalid binding", rt.config.Projects)
-	}
-}
-
-func TestRehydrateAPIProjectBindingsRejectsDuplicateRepo(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	dbPath := filepath.Join(workingDir, "runtime.sqlite")
-	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(workingDir, "backups"))
-	t.Cleanup(func() { _ = coordinator.Close() })
-	repositories := storage.NewRepositories(coordinator.DB())
-	now := formatJavaScriptISOString(time.Now().UTC())
-	for _, item := range []storage.ProjectRecord{
-		{ID: "api-project-a", Name: "API project A", RepoPath: filepath.Join(workingDir, "a"), MetadataJSON: stringPtr(`{"provider":"forgejo-main","repo":"acme/looper"}`), CreatedAt: now, UpdatedAt: now},
-		{ID: "api-project-b", Name: "API project B", RepoPath: filepath.Join(workingDir, "b"), MetadataJSON: stringPtr(`{"provider":"forgejo-main","repo":"ACME/LOOPER"}`), CreatedAt: now, UpdatedAt: now},
-	} {
-		if err := repositories.Projects.Upsert(context.Background(), item); err != nil {
-			t.Fatalf("Projects.Upsert(%s) error = %v", item.ID, err)
-		}
-	}
-
-	rt := &Runtime{config: config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}}
-	err := rt.rehydrateAPIProjectBindings(context.Background(), repositories)
-	if err == nil || !strings.Contains(err.Error(), "repository ACME/LOOPER is already bound to project api-project-a") {
-		t.Fatalf("rehydrateAPIProjectBindings() error = %v, want duplicate repo error", err)
-	}
-	if len(rt.config.Projects) != 0 {
-		t.Fatalf("runtime projects = %#v, want no bindings after duplicate validation failure", rt.config.Projects)
-	}
-}
-
-func TestRehydrateAPIProjectBindingsRejectsProviderBindingDuplicatingGitHubRepo(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	dbPath := filepath.Join(workingDir, "runtime.sqlite")
-	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(workingDir, "backups"))
-	t.Cleanup(func() { _ = coordinator.Close() })
-	repositories := storage.NewRepositories(coordinator.DB())
-	now := formatJavaScriptISOString(time.Now().UTC())
-	for _, item := range []storage.ProjectRecord{
-		{ID: "github-project", Name: "GitHub project", RepoPath: filepath.Join(workingDir, "github"), MetadataJSON: stringPtr(`{"repo":"acme/looper"}`), CreatedAt: now, UpdatedAt: now},
-		{ID: "forgejo-project", Name: "Forgejo project", RepoPath: filepath.Join(workingDir, "forgejo"), MetadataJSON: stringPtr(`{"provider":"forgejo-main","repo":"ACME/LOOPER"}`), CreatedAt: now, UpdatedAt: now},
-	} {
-		if err := repositories.Projects.Upsert(context.Background(), item); err != nil {
-			t.Fatalf("Projects.Upsert(%s) error = %v", item.ID, err)
-		}
-	}
-
-	rt := &Runtime{config: config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}}
-	err := rt.rehydrateAPIProjectBindings(context.Background(), repositories)
-	if err == nil || !strings.Contains(err.Error(), "repository ACME/LOOPER is already bound to project github-project") {
-		t.Fatalf("rehydrateAPIProjectBindings() error = %v, want duplicate GitHub repo error", err)
-	}
-	if len(rt.config.Projects) != 0 {
-		t.Fatalf("runtime projects = %#v, want no bindings after duplicate validation failure", rt.config.Projects)
-	}
-}
-
-func TestRehydrateAPIProjectBindingsIgnoresStaleConfiguredRepo(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	dbPath := filepath.Join(workingDir, "runtime.sqlite")
-	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(workingDir, "backups"))
-	t.Cleanup(func() { _ = coordinator.Close() })
-	repositories := storage.NewRepositories(coordinator.DB())
-	now := formatJavaScriptISOString(time.Now().UTC())
-	for _, item := range []storage.ProjectRecord{
-		{ID: "old-config-id", Name: "Old config project", RepoPath: filepath.Join(workingDir, "old"), MetadataJSON: stringPtr(`{"repo":"acme/looper","source":"config"}`), CreatedAt: now, UpdatedAt: now},
-		{ID: "new-config-id", Name: "New config project", RepoPath: filepath.Join(workingDir, "new"), MetadataJSON: stringPtr(`{"repo":"acme/looper","source":"config"}`), CreatedAt: now, UpdatedAt: now},
-	} {
-		if err := repositories.Projects.Upsert(context.Background(), item); err != nil {
-			t.Fatalf("Projects.Upsert(%s) error = %v", item.ID, err)
-		}
-	}
-
-	rt := &Runtime{config: config.Config{Projects: []config.ProjectRefConfig{{ID: "new-config-id", Name: "New config project", RepoPath: filepath.Join(workingDir, "new"), Repo: "acme/looper"}}}}
-	if err := rt.rehydrateAPIProjectBindings(context.Background(), repositories); err != nil {
-		t.Fatalf("rehydrateAPIProjectBindings() error = %v", err)
-	}
-	if len(rt.config.Projects) != 1 || rt.config.Projects[0].ID != "new-config-id" {
-		t.Fatalf("runtime projects = %#v, want only current config project", rt.config.Projects)
-	}
-}
 
 func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
 	t.Parallel()

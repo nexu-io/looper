@@ -1,32 +1,16 @@
 package config
 
 import (
-	"fmt"
 	"net/url"
 	"strings"
 )
 
-func ValidateRuntimeProjectBinding(cfg Config, projectID, repo string) error {
-	projectID = strings.TrimSpace(projectID)
-	repo = strings.TrimSpace(repo)
-	if projectID == "" || repo == "" {
-		return nil
-	}
-	for _, existing := range cfg.Projects {
-		if existing.ID != projectID && strings.EqualFold(strings.TrimSpace(existing.Repo), repo) {
-			return fmt.Errorf("repository %s is already bound to project %s", repo, existing.ID)
-		}
-	}
-	return nil
-}
-
-// UpsertRuntimeProjectBinding mirrors an API-discovered project provider binding
-// into the live config project list so forgejo client resolution and role
-// profiles work for projects that were not declared in the config file.
+// UpsertRuntimeProjectBinding restores a persisted API project binding into the
+// startup config before scheduler and webhook consumers are constructed. It is
+// intentionally not used after startup; API changes take effect after restart.
 //
 // Config-file projects keep authority: an existing config entry with the same
-// id is left unchanged. Runtime-added entries are replaced on repeat API adds so
-// provider/repo metadata stays aligned with the project database.
+// id is left unchanged.
 func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo, repoPath string) {
 	if cfg == nil {
 		return
@@ -35,28 +19,11 @@ func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo,
 	providerID = strings.TrimSpace(providerID)
 	repo = strings.TrimSpace(repo)
 	repoPath = strings.TrimSpace(repoPath)
-	if projectID == "" {
+	if projectID == "" || providerID == "" || repo == "" || repoPath == "" {
 		return
 	}
-	existingIndex := -1
-	for index, existing := range cfg.Projects {
+	for _, existing := range cfg.Projects {
 		if existing.ID == projectID {
-			existingIndex = index
-			break
-		}
-	}
-	if providerID == "" || repo == "" || repoPath == "" {
-		if existingIndex >= 0 && cfg.hasRuntimeProjectBinding(projectID) {
-			cfg.Projects = append(cfg.Projects[:existingIndex], cfg.Projects[existingIndex+1:]...)
-			delete(cfg.runtimeProjectBindingIDs, projectID)
-		}
-		return
-	}
-	if existingIndex >= 0 && !cfg.hasRuntimeProjectBinding(projectID) {
-		return
-	}
-	for index, existing := range cfg.Projects {
-		if index != existingIndex && strings.EqualFold(strings.TrimSpace(existing.Repo), repo) {
 			return
 		}
 	}
@@ -73,98 +40,11 @@ func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo,
 	if resolvedProjectProviderKind(*cfg, project) == ProviderKindForgejo {
 		applyForgejoProjectProfile(&project)
 	}
-	if existingIndex >= 0 {
-		cfg.Projects[existingIndex] = project
-		cfg.markRuntimeProjectBinding(projectID)
-		return
-	}
 	cfg.Projects = append(cfg.Projects, project)
-	cfg.markRuntimeProjectBinding(projectID)
-}
-
-func (cfg *Config) hasRuntimeProjectBinding(projectID string) bool {
-	if cfg == nil || cfg.runtimeProjectBindingIDs == nil {
-		return false
-	}
-	_, ok := cfg.runtimeProjectBindingIDs[projectID]
-	return ok
-}
-
-func (cfg *Config) markRuntimeProjectBinding(projectID string) {
-	if cfg.runtimeProjectBindingIDs == nil {
-		cfg.runtimeProjectBindingIDs = map[string]struct{}{}
-	}
-	cfg.runtimeProjectBindingIDs[projectID] = struct{}{}
-}
-
-// ResolveProviderRef resolves a user-supplied provider reference to a configured
-// provider id.
-//
-// Accepted forms:
-//   - configured provider id (exact match)
-//   - provider kind/type ("forgejo", "plane") when exactly one configured provider
-//     has that kind
-//   - "github" means the legacy GitHub path (no provider binding); ok=false
-//
-// Authority is the caller's explicit ref — this does not infer a provider from
-// git remotes.
-func ResolveProviderRef(cfg Config, ref string) (providerID string, ok bool, err error) {
-	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		return "", false, nil
-	}
-	for _, provider := range cfg.Providers {
-		if provider.ID == ref {
-			return provider.ID, true, nil
-		}
-	}
-
-	kind := ProviderKind(strings.ToLower(ref))
-	if kind == ProviderKindGitHub {
-		// Explicit GitHub: no provider id is stored on the project.
-		return "", false, nil
-	}
-	if kind != ProviderKindForgejo && kind != ProviderKindPlane {
-		return "", false, fmt.Errorf("unknown provider id or type %q; configure it under [[providers]] or pass a kind (forgejo, plane, github)", ref)
-	}
-
-	var matches []ProviderConfig
-	for _, provider := range cfg.Providers {
-		if provider.Kind == kind {
-			matches = append(matches, provider)
-		}
-	}
-	switch len(matches) {
-	case 0:
-		return "", false, fmt.Errorf("no configured provider with kind %q; add a [[providers]] entry first", kind)
-	case 1:
-		return matches[0].ID, true, nil
-	default:
-		ids := make([]string, 0, len(matches))
-		for _, provider := range matches {
-			ids = append(ids, provider.ID)
-		}
-		return "", false, fmt.Errorf("provider kind %q matches multiple configured providers (%s); pass a specific provider id", kind, strings.Join(ids, ", "))
-	}
-}
-
-// ProvidersByKind returns configured providers with the given kind, in config order.
-func ProvidersByKind(cfg Config, kind ProviderKind) []ProviderConfig {
-	var matches []ProviderConfig
-	for _, provider := range cfg.Providers {
-		if provider.Kind == kind {
-			matches = append(matches, provider)
-		}
-	}
-	return matches
 }
 
 // MatchForgejoProviderByRemoteHost finds a configured forgejo provider whose
 // baseUrl host is compatible with a git remote host.
-//
-// This is a hint only (for CLI prompts / error messages). Do not use it as
-// authority for project provider binding — require an explicit provider id/type
-// or interactive confirmation instead.
 //
 // Matching is intentionally host-based (not full URL): git remotes often use
 // ssh.<api-host> (for example code.example.com vs ssh.code.example.com) while

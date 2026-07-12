@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -307,7 +306,7 @@ func (g *Gateway) DetectGitHubRepo(ctx context.Context, repoPath string) (string
 	if err != nil {
 		return "", err
 	}
-	if !IsGitHubRemoteHost(remote.Host) {
+	if !isGitHubRemoteHost(remote.Host) {
 		return "", nil
 	}
 	return remote.Repo, nil
@@ -1187,7 +1186,7 @@ func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {
 	host, repo := parseRemoteRepoFromURL(remoteURL)
-	if !IsGitHubRemoteHost(host) {
+	if !isGitHubRemoteHost(host) {
 		return ""
 	}
 	return repo
@@ -1203,20 +1202,10 @@ func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
 	if remoteURL == "" {
 		return "", ""
 	}
-	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Scheme != "" {
-		switch parsed.Scheme {
-		case "ssh", "https", "http":
-			host = strings.ToLower(strings.TrimSpace(parsed.Hostname()))
-			repo = strings.Trim(strings.TrimSpace(parsed.Path), "/")
-			repo = strings.TrimSuffix(repo, ".git")
-			if host != "" && isOwnerNameRepo(repo) {
-				return host, repo
-			}
-		}
-	}
 
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^(?:git@)?(?P<host>[^/:]+):(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
+		regexp.MustCompile(`^(?:ssh://)?(?:git@)?(?P<host>[^/:]+)[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
+		regexp.MustCompile(`^https?://(?P<host>[^/]+)/(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
 	}
 
 	for _, pattern := range patterns {
@@ -1240,9 +1229,7 @@ func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
 	return "", ""
 }
 
-// IsGitHubRemoteHost reports whether a git remote host is GitHub (including
-// github.com enterprise-style hosts that end with .github.com).
-func IsGitHubRemoteHost(host string) bool {
+func isGitHubRemoteHost(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	return host == "github.com" || strings.HasSuffix(host, ".github.com")
 }

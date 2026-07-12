@@ -425,14 +425,7 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "webhook forwarder unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	delivery := webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body}
-	result, err := forwarder.Forward(r.Context(), delivery)
-	if errors.Is(err, webhookforward.ErrForwarderClosed) {
-		current := s.runtime.currentForwarder()
-		if current != nil && current != forwarder {
-			result, err = current.Forward(r.Context(), delivery)
-		}
-	}
+	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -516,9 +509,7 @@ func (w *webhookRuntime) configuredWebhookReposForMode(projects []storage.Projec
 	seen := map[string]struct{}{}
 	repos := make([]string, 0, len(projects))
 	for _, project := range projects {
-		if project.Archived ||
-			runtimeProjectProviderKindWithMetadata(w.cfg, project.ID, project.MetadataJSON) == config.ProviderKindForgejo ||
-			w.webhookModeForProject(project.ID) != mode {
+		if project.Archived || runtimeProjectProviderKind(w.cfg, project.ID) == config.ProviderKindForgejo || w.webhookModeForProject(project.ID) != mode {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)

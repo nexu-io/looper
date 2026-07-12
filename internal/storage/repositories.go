@@ -1586,40 +1586,15 @@ func (r *QueueRepository) ClaimNext(ctx context.Context, nowISO, claimedBy strin
 }
 
 func (r *QueueRepository) ClaimNextNonLongTermRetry(ctx context.Context, nowISO, claimedBy string) (*QueueItemRecord, error) {
-	return r.ClaimNextNonLongTermRetryForProjects(ctx, nowISO, claimedBy, nil, false)
-}
-
-func (r *QueueRepository) ClaimNextNonLongTermRetryForProjects(ctx context.Context, nowISO, claimedBy string, projectIDs []string, filterProjects bool) (*QueueItemRecord, error) {
-	predicate, args := queueProjectPredicate(projectIDs, filterProjects)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
 		AND NOT (`+longTermRetryPredicateParam+`)
-	`+predicate, append([]any{QueueLongTermRetryAttemptThreshold}, args...))
+	`, []any{QueueLongTermRetryAttemptThreshold})
 }
 
 func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, claimedBy string) (*QueueItemRecord, error) {
-	return r.ClaimNextLongTermRetryForProjects(ctx, nowISO, claimedBy, nil, false)
-}
-
-func (r *QueueRepository) ClaimNextLongTermRetryForProjects(ctx context.Context, nowISO, claimedBy string, projectIDs []string, filterProjects bool) (*QueueItemRecord, error) {
-	predicate, args := queueProjectPredicate(projectIDs, filterProjects)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
 		AND (`+longTermRetryPredicateParam+`)
-	`+predicate, append([]any{QueueLongTermRetryAttemptThreshold}, args...))
-}
-
-func queueProjectPredicate(projectIDs []string, enabled bool) (string, []any) {
-	if !enabled {
-		return "", nil
-	}
-	if len(projectIDs) == 0 {
-		return "\n\t\tAND qi.project_id IS NULL\n\t", nil
-	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(projectIDs)), ",")
-	args := make([]any, len(projectIDs))
-	for i, projectID := range projectIDs {
-		args[i] = projectID
-	}
-	return "\n\t\tAND (qi.project_id IS NULL OR qi.project_id IN (" + placeholders + "))\n\t", args
+	`, []any{QueueLongTermRetryAttemptThreshold})
 }
 
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {

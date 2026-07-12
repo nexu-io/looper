@@ -109,34 +109,6 @@ func TestWebhookTunnelServerServeHTTP(t *testing.T) {
 		}
 	})
 
-	t.Run("delivery captured during forwarder rebind retries current forwarder", func(t *testing.T) {
-		current := &testTunnelForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-		active := WebhookForwarder(nil)
-		previous := &testTunnelForwarder{err: webhookforward.ErrForwarderClosed}
-		previous.onForward = func() { active = current }
-		active = previous
-		rt.forwarder = func() WebhookForwarder { return active }
-		body := []byte(`{"repository":{"full_name":"acme/looper"}}`)
-		req := httptest.NewRequest(http.MethodPost, "/base/webhook/acme/looper", bytes.NewReader(body))
-		req.Header.Set("X-GitHub-Event", "pull_request")
-		req.Header.Set("X-GitHub-Delivery", "delivery-during-rebind")
-		req.Header.Set("X-Hub-Signature-256", testGitHubSignature(secret, body))
-		resp := httptest.NewRecorder()
-
-		server.ServeHTTP(resp, req)
-
-		if resp.Code != http.StatusAccepted {
-			t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusAccepted)
-		}
-		if previous.calls != 1 || current.calls != 1 {
-			t.Fatalf("forwarder calls = previous %d, current %d; want 1 each", previous.calls, current.calls)
-		}
-		if current.lastRequest.DeliveryID != "delivery-during-rebind" {
-			t.Fatalf("current forwarder delivery = %q, want delivery-during-rebind", current.lastRequest.DeliveryID)
-		}
-		rt.forwarder = func() WebhookForwarder { return forwarder }
-	})
-
 	t.Run("bad hmac rejected", func(t *testing.T) {
 		forwarder.reset()
 		body := []byte(`{"repository":{"full_name":"acme/looper"}}`)

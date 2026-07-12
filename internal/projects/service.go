@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
@@ -27,30 +26,13 @@ const legacyProjectIDPrefix = "legacy-id-"
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
 
 // DetectedRepo is the result of inspecting a local checkout's origin remote.
-// Host is the remote host (for example "github.com" or "code.example.com").
-// Provider is never filled by remote host inference; callers must pass an
-// explicit provider id/type or confirm interactively at the CLI.
+// Provider is empty for the legacy GitHub default path.
 type DetectedRepo struct {
-	Repo string
-	Host string
+	Repo     string
+	Provider string
 }
 
 type DetectRepoFunc func(context.Context, string) (DetectedRepo, error)
-
-// RegisterBindingFunc is invoked after an API project is added or updated so
-// the runtime can mirror or clear its provider binding in live config.
-type RegisterBindingFunc func(binding ProjectBinding)
-
-type ValidateBindingFunc func(binding ProjectBinding) error
-
-// ProjectBinding is the provider/repo association discovered for an API project.
-type ProjectBinding struct {
-	ProjectID string
-	Name      string
-	Provider  string
-	Repo      string
-	RepoPath  string
-}
 
 type ListWorktreesFunc func(context.Context, string) ([]WorktreeListEntry, error)
 
@@ -96,15 +78,12 @@ type CapturePullRequestSnapshotInput struct {
 }
 
 type Service struct {
-	addMu                      sync.Mutex
 	DB                         *sql.DB
 	Repos                      *storage.Repositories
 	Logger                     bootstrap.Logger
 	Config                     config.Config
 	Now                        func() time.Time
 	DetectRepo                 DetectRepoFunc
-	ValidateBinding            ValidateBindingFunc
-	RegisterBinding            RegisterBindingFunc
 	GetRepositorySettings      GetRepositorySettingsFunc
 	GetBranchProtection        GetBranchProtectionFunc
 	ListWorktrees              ListWorktreesFunc
@@ -159,9 +138,6 @@ type ProjectValidationError struct{ Message string }
 func (e ProjectValidationError) Error() string { return e.Message }
 
 func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, error) {
-	s.addMu.Lock()
-	defer s.addMu.Unlock()
-
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return AddResult{}, fmt.Errorf("projects repository is not configured")
 	}
@@ -196,47 +172,29 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 			return AddResult{}, err
 		}
 	}
-	if s.isConfiguredProject(projectID) {
-		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be updated with project add", projectID)}
-	}
 
 	repo := input.Repo
-	provider, err := s.resolveProviderInput(input.Provider)
-	if err != nil {
-		return AddResult{}, err
-	}
+	provider := normalizeOptionalProvider(input.Provider)
 	warnings := []string{}
-	if repo == nil && s.DetectRepo != nil {
+	if (repo == nil || provider == nil) && s.DetectRepo != nil {
 		detected, detectErr := s.DetectRepo(ctx, input.RepoPath)
 		if detectErr != nil {
 			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
-		} else if strings.TrimSpace(detected.Repo) != "" {
-			// Fill repo from origin only for GitHub hosts, or when the caller has
-			// explicitly selected a Forgejo provider. Plane still requires a GitHub
-			// repo, so a non-GitHub origin cannot supply its repository binding.
-			if isForgejoProvider(s.Config, provider) || isGitHubDetectedHost(detected.Host) {
+		} else {
+			if repo == nil && strings.TrimSpace(detected.Repo) != "" {
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
 			}
+			if provider == nil && strings.TrimSpace(detected.Provider) != "" {
+				return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; rerun with --provider %s to confirm the binding", strings.TrimSpace(detected.Provider), strings.TrimSpace(detected.Provider))}
+			}
 		}
+	}
+	if err := s.validateExplicitProvider(provider); err != nil {
+		return AddResult{}, err
 	}
 	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
 		return AddResult{}, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
-	}
-	binding := ProjectBinding{
-		ProjectID: projectID,
-		Name:      input.Name,
-		Provider:  stringValue(provider),
-		Repo:      stringValue(repo),
-		RepoPath:  input.RepoPath,
-	}
-	if err := s.validateStoredRepoBinding(ctx, binding); err != nil {
-		return AddResult{}, err
-	}
-	if s.ValidateBinding != nil {
-		if err := s.ValidateBinding(binding); err != nil {
-			return AddResult{}, err
-		}
 	}
 
 	if !isForgejoProvider(s.Config, provider) {
@@ -304,8 +262,8 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		return AddResult{}, err
 	}
 
-	if s.RegisterBinding != nil {
-		s.RegisterBinding(binding)
+	if provider != nil {
+		warnings = append(warnings, "Provider binding saved; restart looperd before this project can be scheduled.")
 	}
 
 	discoveredWorktrees, err := s.discoverWorktrees(ctx, record, nowISO, &warnings)
@@ -333,37 +291,6 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	}, nil
 }
 
-func (s *Service) validateStoredRepoBinding(ctx context.Context, binding ProjectBinding) error {
-	repo := strings.TrimSpace(binding.Repo)
-	if repo == "" {
-		return nil
-	}
-	storedProjects, err := s.Repos.Projects.List(ctx)
-	if err != nil {
-		return err
-	}
-	for _, stored := range storedProjects {
-		if stored.Archived || stored.ID == binding.ProjectID {
-			continue
-		}
-		metadata := parseMetadata(stored.MetadataJSON)
-		storedRepo, _ := metadata["repo"].(string)
-		if strings.EqualFold(strings.TrimSpace(storedRepo), repo) {
-			return ProjectValidationError{Message: fmt.Sprintf("repository %s is already bound to project %s", repo, stored.ID)}
-		}
-	}
-	return nil
-}
-
-func (s *Service) isConfiguredProject(projectID string) bool {
-	for _, project := range s.Config.Projects {
-		if project.ID == projectID {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *Service) Get(ctx context.Context, id string) (*storage.ProjectRecord, error) {
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return nil, fmt.Errorf("projects repository is not configured")
@@ -381,23 +308,14 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 	}
 	active := make([]storage.ProjectRecord, 0, len(items))
 	for _, item := range items {
-		if !item.Archived && !s.isStaleConfiguredProject(item) {
+		if !item.Archived {
 			active = append(active, item)
 		}
 	}
 	return active, nil
 }
 
-func (s *Service) isStaleConfiguredProject(project storage.ProjectRecord) bool {
-	metadata := parseMetadata(project.MetadataJSON)
-	source, _ := metadata["source"].(string)
-	return source == "config" && !s.isConfiguredProject(project.ID)
-}
-
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
-	s.addMu.Lock()
-	defer s.addMu.Unlock()
-
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
 	}
@@ -445,9 +363,6 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	}
 	project.Archived = true
 	project.UpdatedAt = nowISO
-	if s.RegisterBinding != nil {
-		s.RegisterBinding(ProjectBinding{ProjectID: project.ID})
-	}
 
 	return *project, nil
 }
@@ -561,9 +476,6 @@ func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *sto
 			}
 			return nil, nil
 		}
-		if !isGitHubDetectedHost(detected.Host) {
-			return nil, nil
-		}
 		detectedRepo := strings.TrimSpace(detected.Repo)
 		if detectedRepo == "" {
 			if existing != nil && existing.RepoPath == project.RepoPath {
@@ -659,7 +571,7 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 		existingMetadata := parseMetadata(existing.MetadataJSON)
 		for key, value := range existingMetadata {
 			switch key {
-			case "provider", "repo":
+			case "repo":
 				continue
 			case "worktreeRoot", "source":
 				continue
@@ -766,34 +678,20 @@ func normalizeOptionalProvider(value *string) *string {
 	return &trimmed
 }
 
-// resolveProviderInput accepts a configured provider id or a provider kind/type
-// (forgejo, plane, github). github clears the binding; kinds resolve to the
-// unique matching configured provider id.
-func (s *Service) resolveProviderInput(value *string) (*string, error) {
-	normalized := normalizeOptionalProvider(value)
-	if normalized == nil {
-		return nil, nil
+func (s *Service) validateExplicitProvider(provider *string) error {
+	if provider == nil {
+		return nil
 	}
-	providerID, ok, err := config.ResolveProviderRef(s.Config, *normalized)
-	if err != nil {
-		return nil, ProjectValidationError{Message: err.Error()}
+	providerID := strings.TrimSpace(*provider)
+	for _, configured := range s.Config.Providers {
+		if configured.ID == providerID {
+			if configured.Kind != config.ProviderKindForgejo {
+				return ProjectValidationError{Message: fmt.Sprintf("provider %q has kind %q; project add currently supports provider bindings only for Forgejo", providerID, configured.Kind)}
+			}
+			return nil
+		}
 	}
-	if !ok {
-		// Explicit github (or empty resolution): no provider binding.
-		return nil, nil
-	}
-	return &providerID, nil
-}
-
-// isGitHubDetectedHost treats an empty host as GitHub-compatible so unit tests
-// and callers that only supply a repo slug keep the legacy path.
-func isGitHubDetectedHost(host string) bool {
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return true
-	}
-	host = strings.ToLower(host)
-	return host == "github.com" || strings.HasSuffix(host, ".github.com")
+	return ProjectValidationError{Message: fmt.Sprintf("unknown provider id %q; configure it under [[providers]] first", providerID)}
 }
 
 func isForgejoProvider(cfg config.Config, provider *string) bool {

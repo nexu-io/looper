@@ -294,7 +294,7 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 		if project.Archived {
 			continue
 		}
-		if runtimeProjectProviderKindWithMetadata(w.cfg, project.ID, project.MetadataJSON) == config.ProviderKindForgejo {
+		if runtimeProjectProviderKind(w.cfg, project.ID) == config.ProviderKindForgejo {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)

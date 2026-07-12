@@ -14,10 +14,8 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 const daemonVersionProbeTimeout = 250 * time.Millisecond
@@ -173,168 +171,18 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 			return nil, fmt.Errorf("resolve worktree root: %w", err)
 		}
 
-		provider := strings.TrimSpace(getStringFlag(cmd, "provider"))
-		repo := strings.TrimSpace(getStringFlag(cmd, "repo"))
-		provider, repo, err = r.resolveProjectAddProvider(ctx, cmd, repoPath, provider, repo)
-		if err != nil {
-			return nil, err
-		}
-
 		body := map[string]any{}
 		setString(body, "repoPath", repoPath)
 		setString(body, "id", getStringFlag(cmd, "id"))
 		setString(body, "name", getStringFlag(cmd, "name"))
 		setString(body, "baseBranch", getStringFlag(cmd, "base-branch"))
 		setString(body, "worktreeRoot", worktreeRoot)
-		setString(body, "repo", repo)
-		setString(body, "provider", provider)
+		setString(body, "repo", getStringFlag(cmd, "repo"))
+		setString(body, "provider", getStringFlag(cmd, "provider"))
 		setString(body, "snapshotMode", getStringFlag(cmd, "snapshot-mode"))
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
 	}, writeHumanProjectAdd)
-}
-
-// resolveProjectAddProvider applies user-confirmed provider selection for
-// non-GitHub remotes. Explicit --provider (id or type like "forgejo") wins.
-// Host matching is only used as a prompt/error hint, never as silent authority.
-func (r *commandRuntime) resolveProjectAddProvider(ctx context.Context, cmd *cobra.Command, repoPath, provider, repo string) (string, string, error) {
-	if provider != "" {
-		return provider, repo, nil
-	}
-	if strings.TrimSpace(repoPath) == "" {
-		return provider, repo, nil
-	}
-	if repo != "" {
-		return provider, repo, nil
-	}
-
-	host, detectedRepo := r.detectProjectOrigin(ctx, repoPath)
-	if host == "" || gitinfra.IsGitHubRemoteHost(host) {
-		return provider, repo, nil
-	}
-	userRepo := repo
-	if repo == "" {
-		repo = detectedRepo
-	}
-
-	loaded, err := r.loadConfig()
-	if err != nil {
-		return "", "", err
-	}
-
-	if !projectAddCanPrompt(cmd) {
-		hint := projectAddProviderHint(loaded.Config, host)
-		return "", "", fmt.Errorf("origin host %q is not github.com; pass --provider forgejo (or a configured provider id)%s to confirm this is a Forgejo project", host, hint)
-	}
-
-	reader := bufio.NewReader(cmd.InOrStdin())
-	confirmed, err := promptProjectAddForgejo(reader, cmd, host, loaded.Config)
-	if err != nil {
-		return "", "", err
-	}
-	if !confirmed {
-		// User declined Forgejo: keep only an explicitly passed --repo; do not
-		// invent a non-GitHub slug for the GitHub-default path.
-		return "", userRepo, nil
-	}
-
-	providerID, err := selectProjectAddForgejoProvider(reader, cmd, loaded.Config, host)
-	if err != nil {
-		return "", "", err
-	}
-	return providerID, repo, nil
-}
-
-func projectAddCanPrompt(cmd *cobra.Command) bool {
-	if getBoolFlag(cmd, "json") {
-		return false
-	}
-	if file, ok := cmd.InOrStdin().(*os.File); ok {
-		return term.IsTerminal(int(file.Fd()))
-	}
-	// Tests inject non-file readers; treat them as interactive so prompts can
-	// be exercised with scripted stdin.
-	return cmd.InOrStdin() != nil && cmd.InOrStdin() != os.Stdin
-}
-
-func projectAddProviderHint(cfg config.Config, host string) string {
-	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, host); ok {
-		return fmt.Sprintf(` (hint: host looks like provider %q)`, provider.ID)
-	}
-	forgejo := config.ProvidersByKind(cfg, config.ProviderKindForgejo)
-	if len(forgejo) == 1 {
-		return fmt.Sprintf(` (configured: %q)`, forgejo[0].ID)
-	}
-	if len(forgejo) > 1 {
-		ids := make([]string, 0, len(forgejo))
-		for _, provider := range forgejo {
-			ids = append(ids, provider.ID)
-		}
-		return fmt.Sprintf(" (configured forgejo providers: %s)", strings.Join(ids, ", "))
-	}
-	return ""
-}
-
-func promptProjectAddForgejo(reader *bufio.Reader, cmd *cobra.Command, host string, cfg config.Config) (bool, error) {
-	hint := ""
-	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, host); ok {
-		hint = fmt.Sprintf(" (matches provider %q)", provider.ID)
-	}
-	return promptBootstrapBool(reader, cmd.ErrOrStderr(), fmt.Sprintf("origin host %q is not github.com%s. Treat this as a Forgejo project?", host, hint), false)
-}
-
-func selectProjectAddForgejoProvider(reader *bufio.Reader, cmd *cobra.Command, cfg config.Config, host string) (string, error) {
-	forgejo := config.ProvidersByKind(cfg, config.ProviderKindForgejo)
-	if len(forgejo) == 0 {
-		return "", fmt.Errorf("no forgejo provider configured; add a [[providers]] entry with kind = \"forgejo\" first")
-	}
-	if len(forgejo) == 1 {
-		return forgejo[0].ID, nil
-	}
-	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, host); ok {
-		useHint, err := promptBootstrapBool(reader, cmd.ErrOrStderr(), fmt.Sprintf("Use provider %q?", provider.ID), true)
-		if err != nil {
-			return "", err
-		}
-		if useHint {
-			return provider.ID, nil
-		}
-	}
-	ids := make([]string, 0, len(forgejo))
-	for _, provider := range forgejo {
-		ids = append(ids, provider.ID)
-	}
-	answer, err := promptBootstrapString(reader, cmd.ErrOrStderr(), fmt.Sprintf("Forgejo provider id [%s]", strings.Join(ids, "/")), "")
-	if err != nil {
-		return "", err
-	}
-	answer = strings.TrimSpace(answer)
-	if answer == "" {
-		return "", fmt.Errorf("a provider id is required when multiple forgejo providers are configured")
-	}
-	for _, provider := range forgejo {
-		if provider.ID == answer {
-			return provider.ID, nil
-		}
-	}
-	return "", fmt.Errorf("unknown forgejo provider id %q (configured: %s)", answer, strings.Join(ids, ", "))
-}
-
-func (r *commandRuntime) detectProjectOrigin(ctx context.Context, repoPath string) (host, repo string) {
-	gitPath := "git"
-	if loaded, err := r.loadConfig(); err == nil && loaded.Config.Tools.GitPath != nil {
-		if trimmed := strings.TrimSpace(*loaded.Config.Tools.GitPath); trimmed != "" {
-			gitPath = trimmed
-		}
-	} else if resolved, err := r.lookPath()("git"); err == nil && strings.TrimSpace(resolved) != "" {
-		gitPath = resolved
-	}
-	gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath})
-	remote, err := gateway.DetectOriginRemote(ctx, repoPath)
-	if err != nil {
-		return "", ""
-	}
-	return remote.Host, remote.Repo
 }
 
 func absolutePathIfSet(path string) (string, error) {

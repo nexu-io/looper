@@ -14,7 +14,6 @@ func TestParseRemoteRepoFromURL(t *testing.T) {
 		{url: "ssh://git@github.com/nexu-io/looper.git", wantHost: "github.com", wantRepo: "nexu-io/looper"},
 		{url: "https://github.com/nexu-io/looper.git", wantHost: "github.com", wantRepo: "nexu-io/looper"},
 		{url: "ssh://git@ssh.code.powerformer.net/core/odcrew.git", wantHost: "ssh.code.powerformer.net", wantRepo: "core/odcrew"},
-		{url: "ssh://git@code.powerformer.net:2222/core/odcrew.git", wantHost: "code.powerformer.net", wantRepo: "core/odcrew"},
 		{url: "https://code.powerformer.net/core/odcrew.git", wantHost: "code.powerformer.net", wantRepo: "core/odcrew"},
 		{url: "git@code.powerformer.net:core/odcrew.git", wantHost: "code.powerformer.net", wantRepo: "core/odcrew"},
 		{url: "", wantHost: "", wantRepo: ""},
