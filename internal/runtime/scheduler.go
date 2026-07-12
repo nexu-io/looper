@@ -2102,6 +2102,10 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 }
 
 func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+	return buildDefaultSchedulerHandlersWithWebhook(cfg, configReadLock, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true)
+}
+
+func buildDefaultSchedulerHandlersWithWebhook(cfg *config.Config, configReadLock func() func(), logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2131,7 +2135,7 @@ func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() fun
 		}
 		buildSnapshotHandlers := func() defaultSchedulerHandlers {
 			cloned := snapshot()
-			return buildDefaultSchedulerHandlers(&cloned, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns)
+			return buildDefaultSchedulerHandlersWithWebhook(&cloned, nil, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false)
 		}
 		// Runtime startup already holds the config write lock while constructing
 		// handlers, so take the initial webhook snapshot directly. Tick and claim
@@ -2479,7 +2483,7 @@ func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() fun
 		}
 	}
 
-	return defaultSchedulerHandlers{
+	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
 			if configReadLock != nil {
 				unlock := configReadLock()
@@ -2494,15 +2498,18 @@ func buildDefaultSchedulerHandlers(cfg *config.Config, configReadLock func() fun
 			}
 			return runIndependentClaimPass(ctx, inputForServices(services))
 		},
-		webhook: webhookforward.New(webhookforward.Options{
+	}
+	if includeWebhook {
+		handlers.webhook = webhookforward.New(webhookforward.Options{
 			Repos:    repos,
 			Config:   *cfg,
 			Reviewer: reviewerRunner,
 			Fixer:    fixerRunner,
 			Logger:   logger,
 			Now:      now,
-		}),
+		})
 	}
+	return handlers
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {

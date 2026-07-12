@@ -552,7 +552,16 @@ func (r *Runtime) start(ctx context.Context) error {
 		Config: r.config,
 		Now:    r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
-			return detectProjectRepo(ctx, gitGateway, r.config, repoPath)
+			r.mu.RLock()
+			cfg := r.config
+			cfg.Projects = append([]config.ProjectRefConfig(nil), r.config.Projects...)
+			r.mu.RUnlock()
+			return detectProjectRepo(ctx, gitGateway, cfg, repoPath)
+		},
+		ValidateBinding: func(binding projects.ProjectBinding) error {
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+			return config.ValidateRuntimeProjectBinding(r.config, binding.ProjectID, binding.Repo)
 		},
 		RegisterBinding: func(binding projects.ProjectBinding) {
 			r.mu.Lock()

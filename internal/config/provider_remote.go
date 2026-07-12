@@ -1,9 +1,24 @@
 package config
 
 import (
+	"fmt"
 	"net/url"
 	"strings"
 )
+
+func ValidateRuntimeProjectBinding(cfg Config, projectID, repo string) error {
+	projectID = strings.TrimSpace(projectID)
+	repo = strings.TrimSpace(repo)
+	if projectID == "" || repo == "" {
+		return nil
+	}
+	for _, existing := range cfg.Projects {
+		if existing.ID != projectID && strings.EqualFold(strings.TrimSpace(existing.Repo), repo) {
+			return fmt.Errorf("repository %s is already bound to project %s", repo, existing.ID)
+		}
+	}
+	return nil
+}
 
 // UpsertRuntimeProjectBinding mirrors an API-discovered project provider binding
 // into the live config project list so forgejo client resolution and role

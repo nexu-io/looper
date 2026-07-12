@@ -128,6 +128,33 @@ func TestServiceAddProjectRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectValidatesBindingBeforePersisting(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	repo := "core/looper"
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		ValidateBinding: func(ProjectBinding) error {
+			return ProjectValidationError{Message: "repository is already bound"}
+		},
+	}
+
+	_, err := service.AddProject(context.Background(), AddInput{ID: "duplicate", Name: "duplicate", RepoPath: "/tmp/duplicate", Repo: &repo})
+	if err == nil || !strings.Contains(err.Error(), "already bound") {
+		t.Fatalf("AddProject() error = %v, want duplicate binding error", err)
+	}
+	stored, getErr := repos.Projects.GetByID(context.Background(), "duplicate")
+	if getErr != nil {
+		t.Fatalf("GetByID() error = %v", getErr)
+	}
+	if stored != nil {
+		t.Fatalf("GetByID() = %#v, want no persisted project", stored)
+	}
+}
+
 func TestServiceAddProjectRejectsProjectIDWithBackslash(t *testing.T) {
 	t.Parallel()
 

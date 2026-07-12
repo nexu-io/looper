@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMatchForgejoProviderByRemoteHost(t *testing.T) {
 	cfg := Config{
@@ -100,6 +103,16 @@ func TestUpsertRuntimeProjectBindingRejectsDuplicateRepo(t *testing.T) {
 
 	if len(cfg.Projects) != 1 {
 		t.Fatalf("Projects = %#v, want duplicate runtime repo rejected", cfg.Projects)
+	}
+}
+
+func TestValidateRuntimeProjectBindingRejectsDuplicateRepo(t *testing.T) {
+	cfg := Config{Projects: []ProjectRefConfig{{ID: "configured", Repo: "Core/Looper"}}}
+
+	err := ValidateRuntimeProjectBinding(cfg, "runtime", "core/looper")
+
+	if err == nil || !strings.Contains(err.Error(), "already bound to project configured") {
+		t.Fatalf("ValidateRuntimeProjectBinding() error = %v, want duplicate repo error", err)
 	}
 }
 

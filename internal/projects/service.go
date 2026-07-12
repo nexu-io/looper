@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
@@ -37,6 +38,8 @@ type DetectRepoFunc func(context.Context, string) (DetectedRepo, error)
 // RegisterBindingFunc is invoked after an API project is added or updated so
 // the runtime can mirror or clear its provider binding in live config.
 type RegisterBindingFunc func(binding ProjectBinding)
+
+type ValidateBindingFunc func(binding ProjectBinding) error
 
 // ProjectBinding is the provider/repo association discovered for an API project.
 type ProjectBinding struct {
@@ -91,12 +94,14 @@ type CapturePullRequestSnapshotInput struct {
 }
 
 type Service struct {
+	addMu                      sync.Mutex
 	DB                         *sql.DB
 	Repos                      *storage.Repositories
 	Logger                     bootstrap.Logger
 	Config                     config.Config
 	Now                        func() time.Time
 	DetectRepo                 DetectRepoFunc
+	ValidateBinding            ValidateBindingFunc
 	RegisterBinding            RegisterBindingFunc
 	GetRepositorySettings      GetRepositorySettingsFunc
 	GetBranchProtection        GetBranchProtectionFunc
@@ -152,6 +157,9 @@ type ProjectValidationError struct{ Message string }
 func (e ProjectValidationError) Error() string { return e.Message }
 
 func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, error) {
+	s.addMu.Lock()
+	defer s.addMu.Unlock()
+
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return AddResult{}, fmt.Errorf("projects repository is not configured")
 	}
@@ -210,6 +218,18 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	}
 	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
 		return AddResult{}, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
+	}
+	binding := ProjectBinding{
+		ProjectID: projectID,
+		Name:      input.Name,
+		Provider:  stringValue(provider),
+		Repo:      stringValue(repo),
+		RepoPath:  input.RepoPath,
+	}
+	if s.ValidateBinding != nil {
+		if err := s.ValidateBinding(binding); err != nil {
+			return AddResult{}, err
+		}
 	}
 
 	if !isForgejoProvider(s.Config, provider) {
@@ -278,13 +298,7 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	}
 
 	if s.RegisterBinding != nil {
-		s.RegisterBinding(ProjectBinding{
-			ProjectID: projectID,
-			Name:      input.Name,
-			Provider:  stringValue(provider),
-			Repo:      stringValue(repo),
-			RepoPath:  input.RepoPath,
-		})
+		s.RegisterBinding(binding)
 	}
 
 	discoveredWorktrees, err := s.discoverWorktrees(ctx, record, nowISO, &warnings)
