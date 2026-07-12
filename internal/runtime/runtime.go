@@ -860,6 +860,14 @@ func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 			return true
 		}
 	}
+	// Plane is a task source whose code-repository operations use GitHub. Keep
+	// that gateway available for Plane projects added through the API after
+	// startup, even when the static project list contains only Forgejo projects.
+	for _, provider := range cfg.Providers {
+		if provider.Kind == config.ProviderKindPlane {
+			return true
+		}
+	}
 	return len(cfg.Projects) == 0
 }
 
@@ -919,6 +927,16 @@ func (r *Runtime) rehydrateAPIProjectBindings(ctx context.Context, repos *storag
 		repo := runtimeProjectRepo(item.MetadataJSON)
 		if providerID == "" || repo == "" {
 			continue
+		}
+		providerConfigured := false
+		for _, provider := range r.config.Providers {
+			if provider.ID == providerID {
+				providerConfigured = true
+				break
+			}
+		}
+		if !providerConfigured {
+			return fmt.Errorf("rehydrate API project %s: provider %q is not configured", item.ID, providerID)
 		}
 		config.UpsertRuntimeProjectBinding(&r.config, item.ID, item.Name, providerID, repo, item.RepoPath)
 	}

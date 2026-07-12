@@ -3055,6 +3055,51 @@ func TestSyncRuntimeProjectBindingRefreshesWebhookForwarder(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigHasGitHubProjectsForRuntimePlaneAdds(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-main", Kind: config.ProviderKindForgejo},
+			{ID: "plane-main", Kind: config.ProviderKindPlane},
+		},
+		Projects: []config.ProjectRefConfig{{
+			ID: "forgejo-project", Provider: "forgejo-main", Repo: "acme/forgejo-project",
+		}},
+	}
+
+	if !runtimeConfigHasGitHubProjects(cfg) {
+		t.Fatal("runtimeConfigHasGitHubProjects() = false, want GitHub support for runtime Plane adds")
+	}
+}
+
+func TestRehydrateAPIProjectBindingsRejectsUnknownProvider(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, dbPath, filepath.Join(workingDir, "backups"))
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repositories := storage.NewRepositories(coordinator.DB())
+	metadata := `{"provider":"removed-provider","repo":"acme/looper"}`
+	now := formatJavaScriptISOString(time.Now().UTC())
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "api-project", Name: "API project", RepoPath: workingDir, MetadataJSON: &metadata,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	rt := &Runtime{config: config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}}
+	err := rt.rehydrateAPIProjectBindings(context.Background(), repositories)
+	if err == nil || !strings.Contains(err.Error(), `provider "removed-provider" is not configured`) {
+		t.Fatalf("rehydrateAPIProjectBindings() error = %v, want unknown provider error", err)
+	}
+	if len(rt.config.Projects) != 0 {
+		t.Fatalf("runtime projects = %#v, want no invalid binding", rt.config.Projects)
+	}
+}
+
 func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
 	t.Parallel()
 
