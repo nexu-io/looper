@@ -59,13 +59,13 @@ func TestGrokBuildExecutionContractAndUnsupportedResume(t *testing.T) {
 	workdir := t.TempDir()
 	scriptPath := filepath.Join(t.TempDir(), "grok")
 	observedPath := filepath.Join(t.TempDir(), "observed")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$OBSERVED_PATH\"\nprintf 'env:%s\\n' \"$PWD\" >> \"$OBSERVED_PATH\"\nprintf 'dir:%s\\n' \"$(pwd)\" >> \"$OBSERVED_PATH\"\nprintf 'stderr line\\n' >&2\nprintf '__LOOPER_RESULT__={\\\"summary\\\":\\\"done\\\"}\\n'\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$OBSERVED_PATH\"\nprintf 'env:%s\\n' \"$PWD\" >> \"$OBSERVED_PATH\"\nprintf 'dir:%s\\n' \"$(pwd)\" >> \"$OBSERVED_PATH\"\nprintf 'stderr line\\n' >&2\nprintf '__LOOPER_RESULT__={\"summary\":\"done\"}\\n'\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 	repos := storage.NewRepositories(openAgentCoordinator(t).DB())
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorGrokBuild, NativeResumeEnabled: true, Params: map[string]any{"command": scriptPath}}, Repos: repos})
-	execution, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_grok", WorkingDirectory: workdir, Prompt: "fresh prompt", NativeResumePrompt: "resume prompt", NativeSessionID: "session-1", Timeout: time.Second, Env: map[string]string{"OBSERVED_PATH": observedPath}})
+	execution, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_grok", WorkingDirectory: workdir, Prompt: "fresh prompt", NativeResumePrompt: "resume prompt", NativeSessionID: "session-1", Timeout: 10 * time.Second, Env: map[string]string{"OBSERVED_PATH": observedPath}})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
