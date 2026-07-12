@@ -159,11 +159,15 @@ type testTunnelForwarder struct {
 	err         error
 	calls       int
 	lastRequest webhookforward.DeliveryRequest
+	onForward   func()
 }
 
 func (f *testTunnelForwarder) Forward(_ context.Context, req webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
 	f.calls++
 	f.lastRequest = req
+	if f.onForward != nil {
+		f.onForward()
+	}
 	if f.err != nil {
 		return webhookforward.ForwardResult{}, f.err
 	}
@@ -178,6 +182,7 @@ func (f *testTunnelForwarder) reset() {
 	f.calls = 0
 	f.lastRequest = webhookforward.DeliveryRequest{}
 	f.err = nil
+	f.onForward = nil
 }
 
 func testGitHubSignature(secret string, body []byte) string {

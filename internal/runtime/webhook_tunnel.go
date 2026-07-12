@@ -425,7 +425,14 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "webhook forwarder unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
+	delivery := webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body}
+	result, err := forwarder.Forward(r.Context(), delivery)
+	if errors.Is(err, webhookforward.ErrForwarderClosed) {
+		current := s.runtime.currentForwarder()
+		if current != nil && current != forwarder {
+			result, err = current.Forward(r.Context(), delivery)
+		}
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
