@@ -789,6 +789,9 @@ func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, reposi
 		if project.Archived {
 			continue
 		}
+		if runtimeProjectProviderKindWithMetadata(r.config, project.ID, project.MetadataJSON) != config.ProviderKindGitHub {
+			continue
+		}
 		roleCfg := config.ProjectRoleConfigs(r.config, project.ID).Coordinator
 		if !roleCfg.Enabled || !roleCfg.Dependencies.Enabled {
 			continue

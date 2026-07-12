@@ -110,7 +110,13 @@ func TestRuntimeStartForgejoOnlyRetainsGitHubGatewayForRuntimeProjectAdd(t *test
 	}
 
 	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-	cfg.Tools.GHPath = nil
+	unusableGH := filepath.Join(workingDir, "gh")
+	if err := os.WriteFile(unusableGH, []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(gh) error = %v", err)
+	}
+	cfg.Tools.GHPath = &unusableGH
+	cfg.Roles.Coordinator.Enabled = true
+	cfg.Roles.Coordinator.Dependencies.Enabled = true
 	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
 	cfg.Projects = []config.ProjectRefConfig{{
 		ID:       "forgejo_project",
