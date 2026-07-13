@@ -190,6 +190,13 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
 		} else {
 			if repo == nil && strings.TrimSpace(detected.Repo) != "" {
+				if provider != nil && strings.TrimSpace(detected.Provider) != strings.TrimSpace(*provider) {
+					detectedProvider := strings.TrimSpace(detected.Provider)
+					if detectedProvider == "" {
+						detectedProvider = "the GitHub default"
+					}
+					return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("detected origin belongs to %s, not provider %q; pass --repo owner/name explicitly or use a checkout whose origin matches the provider", detectedProvider, strings.TrimSpace(*provider))}
+				}
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
 			}

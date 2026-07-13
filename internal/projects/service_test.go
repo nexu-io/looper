@@ -43,7 +43,7 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 }
 
-func TestServiceAddForgejoProjectPublishesProviderBinding(t *testing.T) {
+func TestServiceAddForgejoProjectActivatesProviderBinding(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)

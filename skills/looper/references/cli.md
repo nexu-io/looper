@@ -219,7 +219,7 @@ For Forgejo, configure the provider first, then confirm it explicitly:
 looper project add /absolute/path/to/repo --provider forgejo-main
 ```
 
-The repository slug is detected from a matching origin when possible; otherwise pass `--repo owner/name`. The binding is saved immediately but scheduling uses it only after `looperd` restarts. Confirm before restarting because daemon startup can launch background automation.
+The repository slug is detected from an origin matching the selected provider when possible; otherwise pass `--repo owner/name`. The binding is saved and activated immediately through the runtime Project Catalog, so background automation may begin as soon as the command succeeds.
 
 Daemon lifecycle commands:
 

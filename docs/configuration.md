@@ -249,7 +249,7 @@ Forgejo rules:
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`, `forgejo`, or `plane`; `gitea` is not a supported provider kind yet.
 - Forgejo providers require an absolute `http(s)` `baseUrl` and a non-empty `tokenEnv`. The token value is read from the daemon environment and is never stored in project metadata.
-- Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, or persisted by `looper project add --provider <id>`; the repo may be detected from a matching origin. API-added provider bindings become active after restarting `looperd`.
+- Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, or persisted by `looper project add --provider <id>`; the repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
 - Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and summary-comment publish, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.

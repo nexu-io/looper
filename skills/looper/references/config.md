@@ -123,7 +123,7 @@ Forgejo validation notes:
 
 - `baseUrl` must be an absolute `http(s)` URL.
 - `tokenEnv` must name an environment variable available to `looperd`; do not write token values into config.
-- Forgejo projects require a `provider` and repo. Configure them in `[[projects]]`, or persist them with `looper project add --provider <id>` and restart `looperd`; the repo may be detected from a matching origin.
+- Forgejo projects require a `provider` and repo. Configure them in `[[projects]]`, or persist and activate them immediately with `looper project add --provider <id>`; the repo may be detected only from an origin matching that provider.
 - Duplicate `repo` values are rejected case-insensitively, even across providers.
 - Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
 - The provider profile disables unsupported GitHub-shaped defaults. Explicit opt-ins to Forgejo-unsupported behavior fail fast.
