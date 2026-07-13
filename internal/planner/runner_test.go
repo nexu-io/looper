@@ -150,7 +150,7 @@ func TestProcessClaimedItemSkipsHeldPlannerIssue(t *testing.T) {
 	}
 	projectID := "project_1"
 	loopID := "loop_planner_hold"
-	lockKey := buildIssueLockKey(repo, issueNumber)
+	lockKey := storage.IssueLockKey(projectID, repo, issueNumber)
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_planner_hold", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: loopTarget, Repo: &repo, DedupeKey: "planner:hold", Priority: storage.QueuePriorityPlanner, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
