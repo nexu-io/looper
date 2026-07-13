@@ -213,13 +213,23 @@ looper status
 
 After a project is registered, Looper can often infer it from commands run inside that repo. If no project matches the current directory, or multiple projects match, pass `--project <id>` explicitly.
 
-For Forgejo, configure the provider first, then confirm it explicitly:
+For Forgejo, select an existing provider explicitly:
 
 ```bash
 looper project add /absolute/path/to/repo --provider forgejo-main
 ```
 
 The repository slug is detected from an origin matching the selected provider when possible; otherwise pass `--repo owner/name`. The binding is saved and activated immediately through the runtime Project Catalog, so background automation may begin as soon as the command succeeds.
+
+To create the provider and bind the project non-interactively in the same flow:
+
+```bash
+export FORGEJO_TOKEN=<forgejo-token>
+looper project add /absolute/path/to/repo \
+  --provider forgejo-main \
+  --forgejo-url https://code.example.com \
+  --forgejo-token-env FORGEJO_TOKEN
+```
 
 Daemon lifecycle commands:
 

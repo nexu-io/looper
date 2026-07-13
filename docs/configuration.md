@@ -226,6 +226,18 @@ Looper supports three provider kinds:
 
 Forgejo provider example:
 
+For a new installation, bootstrap validates the origin, current Forgejo identity, and repository access before writing the provider and project binding:
+
+```bash
+export FORGEJO_TOKEN=<forgejo-token>
+looper bootstrap --provider forgejo \
+  --project-path /absolute/path/to/example \
+  --forgejo-url https://code.example.com \
+  --forgejo-token-env FORGEJO_TOKEN
+```
+
+Existing installations can manage providers with `looper provider add|list|test|remove`. The commands persist only the token environment-variable name and report when `looperd` must be restarted.
+
 ```toml
 [agent]
 vendor = "opencode"
@@ -249,7 +261,7 @@ Forgejo rules:
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`, `forgejo`, or `plane`; `gitea` is not a supported provider kind yet.
 - Forgejo providers require an absolute `http(s)` `baseUrl` and a non-empty `tokenEnv`. The token value is read from the daemon environment and is never stored in project metadata.
-- Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, or persisted by `looper project add --provider <id>`; the repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
+- Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, persisted by `looper project add --provider <id>`, or created with `--forgejo-url` plus `--forgejo-token-env`. The repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
 - Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and summary-comment publish, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.

@@ -115,6 +115,21 @@ func (forgejo *ForgejoClient) CurrentUser(ctx context.Context) (Identity, error)
 	return Identity{Login: user.Login, ID: user.ID}, nil
 }
 
+// CheckRepository verifies that the configured token can access the bound
+// repository without returning or logging repository metadata.
+func (forgejo *ForgejoClient) CheckRepository(ctx context.Context) error {
+	var repository struct {
+		FullName string `json:"full_name"`
+	}
+	if err := forgejo.do(ctx, http.MethodGet, forgejo.repoPath(), nil, nil, &repository); err != nil {
+		return err
+	}
+	if strings.TrimSpace(repository.FullName) == "" {
+		return fmt.Errorf("forgejo repository response did not include full_name")
+	}
+	return nil
+}
+
 type ListIssuesInput struct {
 	State    string
 	Labels   []string

@@ -156,11 +156,15 @@ func (r *commandRuntime) projectList(cmd *cobra.Command, args []string) error {
 }
 
 func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
+	repoPath := strings.TrimSpace(getStringFlag(cmd, "repo-path"))
+	if repoPath == "" && len(args) > 0 {
+		repoPath = strings.TrimSpace(args[0])
+	}
+	resolvedProvider, resolvedRepo, err := r.prepareProjectAddProvider(cmd, repoPath)
+	if err != nil {
+		return err
+	}
 	return r.outputCommand(cmd, func(ctx context.Context) (json.RawMessage, error) {
-		repoPath := strings.TrimSpace(getStringFlag(cmd, "repo-path"))
-		if repoPath == "" && len(args) > 0 {
-			repoPath = strings.TrimSpace(args[0])
-		}
 		repoPath, err := absolutePathIfSet(repoPath)
 		if err != nil {
 			return nil, fmt.Errorf("resolve repo path: %w", err)
@@ -177,8 +181,8 @@ func (r *commandRuntime) projectAdd(cmd *cobra.Command, args []string) error {
 		setString(body, "name", getStringFlag(cmd, "name"))
 		setString(body, "baseBranch", getStringFlag(cmd, "base-branch"))
 		setString(body, "worktreeRoot", worktreeRoot)
-		setString(body, "repo", getStringFlag(cmd, "repo"))
-		setString(body, "provider", getStringFlag(cmd, "provider"))
+		setString(body, "repo", resolvedRepo)
+		setString(body, "provider", resolvedProvider)
 		setString(body, "snapshotMode", getStringFlag(cmd, "snapshot-mode"))
 
 		return r.postJSON(ctx, "/api/v1/projects", body)
