@@ -199,9 +199,9 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 				}
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
-			}
-			if provider == nil && strings.TrimSpace(detected.Provider) != "" {
-				return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; rerun with --provider %s to confirm the binding", strings.TrimSpace(detected.Provider), strings.TrimSpace(detected.Provider))}
+				if provider == nil && strings.TrimSpace(detected.Provider) != "" {
+					return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; rerun with --provider %s to confirm the binding", strings.TrimSpace(detected.Provider), strings.TrimSpace(detected.Provider))}
+				}
 			}
 		}
 	}

@@ -43,6 +43,43 @@ func TestServiceSyncConfiguredIgnoresForgejoDetectionForGitHubDefault(t *testing
 	}
 }
 
+func TestServiceAddProjectAllowsExplicitGitHubRepoOnDetectedForgejoOrigin(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "LOOPER_FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
+	service := &Service{
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		Config: cfg,
+		Now:    time.Now,
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "forgejo/checkout", Provider: "forgejo-main"}, nil
+		},
+	}
+	repo := "github-org/repo"
+
+	result, err := service.AddProject(context.Background(), AddInput{
+		ID: "project", Name: "Project", RepoPath: "/tmp/project", Repo: &repo,
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	metadata := parseMetadata(result.Project.MetadataJSON)
+	if got := metadataString(metadata, "repo"); got != repo {
+		t.Fatalf("stored repo = %q, want explicit repo %q", got, repo)
+	}
+	if got := metadataString(metadata, "provider"); got != "" {
+		t.Fatalf("stored provider = %q, want GitHub default", got)
+	}
+}
+
 func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T) {
 	t.Parallel()
 
