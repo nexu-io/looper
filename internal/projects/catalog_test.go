@@ -171,6 +171,22 @@ func TestMaterializeCatalogRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestMaterializeCatalogRejectsDuplicateActiveRepoBindings(t *testing.T) {
+	t.Parallel()
+
+	githubMetadata := `{"repo":"nexu-io/looper","source":"config"}`
+	forgejoMetadata := `{"provider":"forgejo-main","repo":"NEXU-IO/LOOPER","source":"api"}`
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
+
+	_, err := MaterializeCatalog(global, []storage.ProjectRecord{
+		{ID: "github", MetadataJSON: &githubMetadata},
+		{ID: "forgejo", MetadataJSON: &forgejoMetadata},
+	})
+	if err == nil || !strings.Contains(err.Error(), `repo "NEXU-IO/LOOPER" duplicates active project "github"`) {
+		t.Fatalf("MaterializeCatalog() error = %v, want duplicate active repo binding", err)
+	}
+}
+
 func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	t.Parallel()
 

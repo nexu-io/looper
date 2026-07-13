@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1203,27 +1204,26 @@ func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
 		return "", ""
 	}
 
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^(?:ssh://)?(?:git@)?(?P<host>[^/:]+)[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
-		regexp.MustCompile(`^https?://(?P<host>[^/]+)/(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`),
+	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Scheme != "" {
+		switch strings.ToLower(parsed.Scheme) {
+		case "ssh", "http", "https":
+			host = strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+			repo = strings.TrimSuffix(strings.Trim(strings.TrimSpace(parsed.Path), "/"), ".git")
+			if host != "" && isOwnerNameRepo(repo) {
+				return host, repo
+			}
+		}
+		return "", ""
 	}
 
-	for _, pattern := range patterns {
-		match := pattern.FindStringSubmatch(remoteURL)
-		if match == nil {
-			continue
-		}
-		hostIndex := pattern.SubexpIndex("host")
-		repoIndex := pattern.SubexpIndex("repo")
-		if hostIndex <= 0 || repoIndex <= 0 {
-			continue
-		}
-		host = strings.ToLower(strings.TrimSpace(match[hostIndex]))
-		repo = strings.TrimSpace(match[repoIndex])
-		repo = strings.TrimSuffix(repo, ".git")
-		if host == "" || !isOwnerNameRepo(repo) {
-			continue
-		}
+	pattern := regexp.MustCompile(`^(?:git@)?(?P<host>[^/:]+):(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`)
+	match := pattern.FindStringSubmatch(remoteURL)
+	if match == nil {
+		return "", ""
+	}
+	host = strings.ToLower(strings.TrimSpace(match[pattern.SubexpIndex("host")]))
+	repo = strings.TrimSuffix(strings.TrimSpace(match[pattern.SubexpIndex("repo")]), ".git")
+	if host != "" && isOwnerNameRepo(repo) {
 		return host, repo
 	}
 	return "", ""

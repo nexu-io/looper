@@ -80,12 +80,20 @@ func TestServiceAddForgejoProjectPublishesProviderBinding(t *testing.T) {
 	if result.Provider == nil || *result.Provider != "forgejo-main" {
 		t.Fatalf("AddProject().Provider = %v, want forgejo-main", result.Provider)
 	}
-	if result.Project.MetadataJSON == nil || *result.Project.MetadataJSON != `{"provider":"forgejo-main","repo":"core/odcrew","worktreeRoot":null,"source":"api"}` {
+	metadata := parseMetadata(result.Project.MetadataJSON)
+	if metadataString(metadata, "provider") != "forgejo-main" || metadataString(metadata, "repo") != "core/odcrew" {
 		t.Fatalf("metadata = %v, want persisted provider binding", result.Project.MetadataJSON)
+	}
+	if _, ok := metadata["roles"]; !ok {
+		t.Fatalf("metadata = %v, want persisted Forgejo role profile", result.Project.MetadataJSON)
 	}
 	snapshot := catalog.Snapshot()
 	if len(snapshot.Projects) != 1 || snapshot.Projects[0].Provider != "forgejo-main" || snapshot.Projects[0].Repo != "core/odcrew" {
 		t.Fatalf("catalog projects = %#v, want published Forgejo binding", snapshot.Projects)
+	}
+	triggers := snapshot.Projects[0].Roles.Reviewer.Discovery.Triggers
+	if triggers.RequireReviewRequest == nil || *triggers.RequireReviewRequest || triggers.Labels == nil || len(*triggers.Labels) != 1 || (*triggers.Labels)[0] != "looper:review" {
+		t.Fatalf("catalog reviewer triggers = %#v, want Forgejo label profile", triggers)
 	}
 }
 

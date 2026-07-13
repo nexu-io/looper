@@ -363,7 +363,7 @@ func applyProviderProfiles(config *Config, partials ...PartialConfig) error {
 		if resolvedProjectProviderKind(*config, *project) != ProviderKindForgejo {
 			continue
 		}
-		applyForgejoProjectProfile(project)
+		ApplyForgejoProjectProfile(project)
 	}
 	return nil
 }
@@ -394,7 +394,9 @@ func ResolvedProjectProviderKind(config Config, project ProjectRefConfig) Provid
 	return resolvedProjectProviderKind(config, project)
 }
 
-func applyForgejoProjectProfile(project *ProjectRefConfig) {
+// ApplyForgejoProjectProfile fills provider-specific role defaults without
+// replacing explicit project overrides.
+func ApplyForgejoProjectProfile(project *ProjectRefConfig) {
 	roles := project.Roles
 	if roles == nil {
 		roles = &PartialRoleConfigs{}

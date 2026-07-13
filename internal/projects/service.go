@@ -233,6 +233,11 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	} else {
 		delete(metadata, "provider")
 	}
+	if isForgejoProvider(cfg, provider) {
+		profile := config.ProjectRefConfig{}
+		config.ApplyForgejoProjectProfile(&profile)
+		metadata["roles"] = profile.Roles
+	}
 	if input.WorktreeRoot != nil {
 		metadata["worktreeRoot"] = *input.WorktreeRoot
 	} else if _, ok := metadata["worktreeRoot"]; !ok {
@@ -547,6 +552,9 @@ func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *sto
 			if s.Logger != nil {
 				s.Logger.Warn("skipping configured project repo detection after failure", map[string]any{"projectId": project.ID, "repoPath": project.RepoPath, "error": err.Error()})
 			}
+			return nil, nil
+		}
+		if strings.TrimSpace(detected.Provider) != "" {
 			return nil, nil
 		}
 		detectedRepo := strings.TrimSpace(detected.Repo)
