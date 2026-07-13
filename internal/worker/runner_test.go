@@ -286,9 +286,16 @@ func TestRunOpenPRStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing
 		issueDetail: IssueDetail{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
 		prDetail:    PullRequestDetail{Number: prNumber, State: "open", Labels: []string{}},
 	}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, OpenPRStrategy: config.OpenPRStrategyManual})
-	loop := storage.LoopRecord{ID: "loop_worker_pr_open_hold", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber}
-	queue := storage.QueueItemRecord{ID: "queue_worker_pr_open_hold", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+	loop := storage.LoopRecord{ID: "loop_worker_pr_open_hold", ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	projectID := "project_1"
+	queue := storage.QueueItemRecord{ID: "queue_worker_pr_open_hold", ProjectID: &projectID, LoopID: &loop.ID, Type: "worker", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "worker:acme/looper:101", Status: "running", Priority: storage.QueuePriorityWorker, MaxAttempts: 3, AvailableAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_pr_open_hold", LoopID: "loop_worker_1", Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -299,19 +306,24 @@ func TestRunOpenPRStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing
 		QueueItem: queue,
 		Run:       storage.RunRecord{ID: "run_worker_pr_open_hold"},
 		Checkpoint: workerCheckpoint{
-			Work:       &workerInput{Repo: repo, BaseBranch: "main", IssueNumber: issueNumber, PRNumber: prNumber, AutoDiscovered: true},
-			Worktree:   &checkpointWorktree{Path: t.TempDir(), Branch: "worker/46", BaseBranch: "main"},
-			Validation: &ValidationResult{Passed: true},
+			Work:        &workerInput{Repo: repo, BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: issueNumber, PRNumber: prNumber, AutoDiscovered: true},
+			Worktree:    &checkpointWorktree{Path: t.TempDir(), Branch: "worker/46", BaseBranch: "main"},
+			Validation:  &ValidationResult{Passed: true},
+			PullRequest: &checkpointPullPR{Number: prNumber, URL: "https://example/pr/101"},
+			Lifecycle:   &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "worker/46", BaseBranch: "main", Pushed: true},
 		},
 	})
 	if err != nil {
 		t.Fatalf("runOpenPRStep() error = %v", err)
 	}
-	if !strings.Contains(checkpoint.SkipReason, "PR opening is manual") {
-		t.Fatalf("checkpoint.SkipReason = %q, want manual opening result", checkpoint.SkipReason)
+	if checkpoint.ResumePolicy != loops.ResumePolicyAdvanceFromCheckpoint {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want advance after PR persistence", checkpoint.ResumePolicy)
 	}
-	if len(github.viewPRCalls) != 2 {
-		t.Fatalf("viewPRCalls = %#v, want both open-pr hold checks to target PR", github.viewPRCalls)
+	if len(github.viewPRCalls) != 4 {
+		t.Fatalf("viewPRCalls = %#v, want all open-pr hold checks to target PR", github.viewPRCalls)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("viewIssueCalls = %#v, want only issue-open validation and no stale issue hold lookup", github.viewIssueCalls)
 	}
 }
 

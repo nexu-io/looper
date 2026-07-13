@@ -2009,7 +2009,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, checkpoint.PullRequest.Number, checkpoint.PullRequest.URL, pushedByFallback, input.Loop.PRNumber != nil)
 		holdWork := work
 		holdWork.PRNumber = checkpoint.PullRequest.Number
-		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork); err != nil {
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 			return checkpoint, err
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}
@@ -2091,7 +2091,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
 		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
 		adoptedWork := workerWorkForPullRequest(work, *existing)
-		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork); err != nil {
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork, true); err != nil {
 			return checkpoint, err
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}
@@ -2130,7 +2130,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
 		adoptedWork := workerWorkForPullRequest(work, *existing)
-		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork); err != nil {
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork, true); err != nil {
 			return checkpoint, err
 		} else if held {
 			checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
