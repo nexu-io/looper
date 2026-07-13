@@ -3314,6 +3314,7 @@ type createWorkerRequest struct {
 type createPlannerRequest struct {
 	ProjectID   *string `json:"projectId"`
 	IssueNumber *int64  `json:"issueNumber"`
+	Force       *bool   `json:"force"`
 }
 
 type workerCreateResponse struct {
@@ -3783,7 +3784,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 }
 
 func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, projectID string, loopType domain.LoopType, target domain.LoopTarget, force bool) error {
-	if force || (loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeReviewer && loopType != domain.LoopTypeFixer) {
+	if force || (loopType != domain.LoopTypePlanner && loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeReviewer && loopType != domain.LoopTypeFixer) {
 		return nil
 	}
 	services := h.context.Runtime.Services()
@@ -4118,6 +4119,10 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	if repo == nil {
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "project repo is required"}
 	}
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
+	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypePlanner, target, derefBool(body.Force)); err != nil {
+		return plannerCreateResponse{}, err
+	}
 
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
@@ -4134,7 +4139,6 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			return storage.LoopRecord{}, seqErr
 		}
 
-		target := domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
 		existing, listErr := repos.Loops.List(r.Context())
 		if listErr != nil {
 			return storage.LoopRecord{}, listErr

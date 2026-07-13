@@ -374,6 +374,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				localFlags: []flagSpec{
 					stringFlag("project", "projectId", "Project id"),
 					stringFlag("issue", "number", "Issue number"),
+					boolFlag("force", "Bypass hold labels for this manual run"),
 				},
 				exampleLines: []string{"$ looper plan --project project_1 --issue 123"},
 			}),

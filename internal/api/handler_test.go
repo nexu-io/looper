@@ -2972,6 +2972,7 @@ func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
 	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
 	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
 	for _, tc := range []struct{ name, path, body string }{
+		{name: "planner", path: "/api/v1/planners", body: `{"projectId":"project_1","issueNumber":77}`},
 		{name: "reviewer", path: "/api/v1/loops", body: `{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`},
 		{name: "fixer", path: "/api/v1/loops", body: `{"projectId":"project_1","type":"fixer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`},
 		{name: "worker issue", path: "/api/v1/workers", body: `{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`},
@@ -2988,6 +2989,28 @@ func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
 				t.Fatalf("body = %s, want --force guidance", rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestHandlerPlannerCreateForceBypassesHold(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	repoPath := filepath.Join(fixture.rootDir, "repo-force-planner")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	metadata := `{"repo":"acme/looper"}`
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77,"force":true}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

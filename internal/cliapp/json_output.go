@@ -700,6 +700,7 @@ func (r *commandRuntime) planCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		setString(body, "projectId", resolvedProjectID)
+		body["force"] = getBoolFlag(cmd, "force")
 
 		return r.postJSON(ctx, "/api/v1/planners", body)
 	}, writeHumanPlannerCreate)

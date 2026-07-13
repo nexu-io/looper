@@ -4442,6 +4442,9 @@ func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 			if got, want := body["issueNumber"], float64(54); got != want {
 				t.Fatalf("body.issueNumber = %#v, want %#v", got, want)
 			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
 			writeEnvelope(t, w, pkgapi.Success("req_planner", map[string]any{"id": "planner_1", "projectId": "project_1", "issueNumber": 54, "status": "queued"}))
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)
@@ -4460,7 +4463,7 @@ func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 		},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"plan", "--issue", "54", "--config", configPath})
+	exitCode := app.Run(context.Background(), []string{"plan", "--issue", "54", "--force", "--config", configPath})
 	if exitCode != 0 {
 		t.Fatalf("Run([plan --issue 54]) exit code = %d, want 0", exitCode)
 	}
