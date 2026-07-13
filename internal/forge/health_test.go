@@ -13,7 +13,7 @@ import (
 func TestProbeForgejoProviderReportsHealthAccessAndCapabilities(t *testing.T) {
 	t.Setenv("FORGEJO_HEALTH_TOKEN", "secret")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); r.URL.Path != "/api/v1/version" && r.URL.Path != "/swagger.v1.json" && got != "token secret" {
+		if got := r.Header.Get("Authorization"); r.URL.Path != "/api/v1/version" && got != "token secret" {
 			t.Fatalf("Authorization = %q", got)
 		}
 		switch r.URL.Path {

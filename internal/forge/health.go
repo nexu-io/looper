@@ -152,7 +152,7 @@ func ProbeForgejoProvider(ctx context.Context, provider config.ProviderConfig, p
 		health.VersionState = ProbeStateUnsupported
 	}
 
-	openAPIResponse, openAPIErr := forgejoProbeGET(probeCtx, client, forgejoProbeURL(baseURL, "swagger.v1.json"), "", maxForgejoOpenAPIBytes)
+	openAPIResponse, openAPIErr := forgejoProbeGET(probeCtx, client, forgejoProbeURL(baseURL, "swagger.v1.json"), token, maxForgejoOpenAPIBytes)
 	if openAPIErr == nil || openAPIResponse.statusCode > 0 {
 		health.Reachability = ReachabilityReachable
 	}
