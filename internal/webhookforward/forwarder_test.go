@@ -208,6 +208,39 @@ func TestForwardFansOutToMultipleProjectsForSameRepo(t *testing.T) {
 	reviewerRunner.assertRepos(t, []string{"acme/looper", "acme/looper"})
 }
 
+func TestForwardDoesNotRouteGitHubWebhookToSameSlugForgejoProject(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "github", "acme/looper")
+	seedProject(t, repos, "plane", "acme/looper")
+	forgejoMetadata := `{"provider":"forgejo-main","repo":"acme/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "forgejo", Name: "forgejo", RepoPath: "/tmp/forgejo", MetadataJSON: &forgejoMetadata, CreatedAt: "2026-05-16T12:00:00.000Z", UpdatedAt: "2026-05-16T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert(forgejo) error = %v", err)
+	}
+	cfg := testConfig(t)
+	cfg.Providers = []config.ProviderConfig{
+		{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test"},
+		{ID: "plane-main", Kind: config.ProviderKindPlane},
+	}
+	cfg.Projects = []config.ProjectRefConfig{
+		{ID: "github", Repo: "acme/looper", RepoPath: "/tmp/github"},
+		{ID: "forgejo", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: "/tmp/forgejo"},
+		{ID: "plane", Provider: "plane-main", Repo: "acme/looper", RepoPath: "/tmp/plane"},
+	}
+	reviewerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: cfg, Reviewer: reviewerRunner, Fixer: targetedFixerAdapter{runner: newFakeTargetedRunner(nil)}, MaxConcurrent: 2, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "github-only", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 55)})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	if result.WorkItems != 2 {
+		t.Fatalf("WorkItems = %d, want GitHub and Plane projects", result.WorkItems)
+	}
+	reviewerRunner.waitForCalls(t, 2)
+	reviewerRunner.assertProjects(t, []string{"github", "plane"})
+}
+
 func TestForwardCoalescesQueuedWorkAndUnionsLanes(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")

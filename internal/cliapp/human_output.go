@@ -445,9 +445,9 @@ func writeHumanPullRequestList(w io.Writer, payload json.RawMessage) error {
 
 	rows := make([]tableRow, 0, len(data.Items))
 	for _, item := range data.Items {
-		rows = append(rows, tableRow{"pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "mergeability": item.Mergeability, "blocker": item.BlockingReason, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
+		rows = append(rows, tableRow{"project": item.ProjectID, "pr": fmt.Sprintf("%s#%d", item.Repo, item.PRNumber), "title": item.Title, "mergeability": item.Mergeability, "blocker": item.BlockingReason, "reviewState": item.ReviewState, "checks": item.ChecksSummary, "reviewer": item.Reviewer, "fixer": item.Fixer})
 	}
-	printTable(w, []string{"pr", "title", "mergeability", "blocker", "reviewState", "checks", "reviewer", "fixer"}, rows)
+	printTable(w, []string{"project", "pr", "title", "mergeability", "blocker", "reviewState", "checks", "reviewer", "fixer"}, rows)
 	return nil
 }
 
@@ -456,7 +456,7 @@ func writeHumanPullRequestShow(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode pull request response: %w", err)
 	}
-	printSection(w, "Pull request", [][2]any{{"repo", data.Repo}, {"prNumber", data.PRNumber}, {"title", data.Title}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}})
+	printSection(w, "Pull request", [][2]any{{"projectId", data.ProjectID}, {"repo", data.Repo}, {"prNumber", data.PRNumber}, {"title", data.Title}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}})
 	return nil
 }
 
@@ -465,7 +465,7 @@ func writeHumanPullRequestStatus(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode pull request status response: %w", err)
 	}
-	printSection(w, "Pull request status", [][2]any{{"pr", fmt.Sprintf("%s#%d", data.Repo, data.PRNumber)}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}, {"unresolvedThreads", data.UnresolvedThreadCount}, {"latestRunStatus", data.LoopStatus.LatestRunStatus}})
+	printSection(w, "Pull request status", [][2]any{{"projectId", data.ProjectID}, {"pr", fmt.Sprintf("%s#%d", data.Repo, data.PRNumber)}, {"reviewState", data.ReviewState}, {"checksSummary", data.ChecksSummary}, {"unresolvedThreads", data.UnresolvedThreadCount}, {"latestRunStatus", data.LoopStatus.LatestRunStatus}})
 	return nil
 }
 

@@ -167,18 +167,18 @@ func TestServiceAddProjectRejectsDuplicateActiveRepoBeforeUpsert(t *testing.T) {
 	}
 	repo := "NEXU-IO/LOOPER"
 	provider := "forgejo-main"
-	_, err = service.AddProject(context.Background(), AddInput{
+	added, err := service.AddProject(context.Background(), AddInput{
 		ID: "forgejo", Name: "Forgejo", RepoPath: "/tmp/forgejo", Repo: &repo, Provider: &provider,
 	})
-	if err == nil || !strings.Contains(err.Error(), `duplicates active project "github"`) {
-		t.Fatalf("AddProject() error = %v, want duplicate active repo binding", err)
+	if err != nil {
+		t.Fatalf("AddProject() error = %v, want cross-provider duplicate repo accepted", err)
 	}
 	stored, getErr := repos.Projects.GetByID(context.Background(), "forgejo")
 	if getErr != nil {
 		t.Fatalf("Projects.GetByID() error = %v", getErr)
 	}
-	if stored != nil || published {
-		t.Fatalf("stored = %#v, published = %v; want rejection before upsert and publish", stored, published)
+	if stored == nil || added.Project.ID != "forgejo" || !published {
+		t.Fatalf("stored = %#v, added = %#v, published = %v; want persisted provider-qualified project", stored, added, published)
 	}
 }
 

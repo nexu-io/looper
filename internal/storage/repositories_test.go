@@ -302,6 +302,77 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 }
 
+func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	const repo = "acme/looper"
+	const prNumber int64 = 42
+
+	for _, projectID := range []string{"github", "forgejo", "unrelated"} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{
+			ID:        projectID,
+			Name:      projectID,
+			RepoPath:  "/tmp/" + projectID,
+			CreatedAt: "2026-07-13T09:00:00.000Z",
+			UpdatedAt: "2026-07-13T09:00:00.000Z",
+		}); err != nil {
+			t.Fatalf("Projects.Upsert(%q) error = %v", projectID, err)
+		}
+	}
+
+	snapshots := []PullRequestSnapshotRecord{
+		{ID: "github-old", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-old", CapturedAt: "2026-07-13T09:00:00.000Z", CreatedAt: "2026-07-13T09:00:00.000Z"},
+		{ID: "github-new", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-new", CapturedAt: "2026-07-13T10:00:00.000Z", CreatedAt: "2026-07-13T10:00:00.000Z"},
+		{ID: "forgejo-new", ProjectID: "forgejo", Repo: repo, PRNumber: prNumber, HeadSHA: "forgejo-new", CapturedAt: "2026-07-13T11:00:00.000Z", CreatedAt: "2026-07-13T11:00:00.000Z"},
+		{ID: "other-pr", ProjectID: "unrelated", Repo: repo, PRNumber: 99, HeadSHA: "other-pr", CapturedAt: "2026-07-13T12:00:00.000Z", CreatedAt: "2026-07-13T12:00:00.000Z"},
+		{ID: "other-repo", ProjectID: "unrelated", Repo: "acme/other", PRNumber: prNumber, HeadSHA: "other-repo", CapturedAt: "2026-07-13T13:00:00.000Z", CreatedAt: "2026-07-13T13:00:00.000Z"},
+	}
+	for _, snapshot := range snapshots {
+		if err := repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
+			t.Fatalf("PullRequestSnapshots.Upsert(%q) error = %v", snapshot.ID, err)
+		}
+	}
+
+	gotSnapshots, err := repos.PullRequestSnapshots.ListLatestByRepoAndPR(ctx, "Acme/Looper", prNumber)
+	if err != nil {
+		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() error = %v", err)
+	}
+	if got := snapshotIDs(gotSnapshots); !reflect.DeepEqual(got, []string{"forgejo-new", "github-new"}) {
+		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [forgejo-new github-new]", got)
+	}
+
+	matchingRepo := "Acme/Looper"
+	matchingPR := prNumber
+	otherPR := int64(99)
+	for _, loop := range []LoopRecord{
+		{ID: "github-loop", Seq: 1, ProjectID: "github", Type: "reviewer", TargetType: "pull_request", Repo: &matchingRepo, PRNumber: &matchingPR, Status: "idle", CreatedAt: "2026-07-13T09:00:00.000Z", UpdatedAt: "2026-07-13T09:00:00.000Z"},
+		{ID: "other-loop", Seq: 2, ProjectID: "unrelated", Type: "reviewer", TargetType: "pull_request", Repo: &matchingRepo, PRNumber: &otherPR, Status: "idle", CreatedAt: "2026-07-13T09:00:00.000Z", UpdatedAt: "2026-07-13T09:00:00.000Z"},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%q) error = %v", loop.ID, err)
+		}
+	}
+
+	gotLoops, err := repos.Loops.ListByRepoAndPR(ctx, repo, prNumber)
+	if err != nil {
+		t.Fatalf("Loops.ListByRepoAndPR() error = %v", err)
+	}
+	if len(gotLoops) != 1 || gotLoops[0].ID != "github-loop" {
+		t.Fatalf("Loops.ListByRepoAndPR() = %#v, want github-loop", gotLoops)
+	}
+}
+
+func snapshotIDs(records []PullRequestSnapshotRecord) []string {
+	ids := make([]string, 0, len(records))
+	for _, record := range records {
+		ids = append(ids, record.ID)
+	}
+	return ids
+}
+
 func TestRepositoriesStatusAggregates(t *testing.T) {
 	t.Parallel()
 

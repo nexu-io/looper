@@ -115,7 +115,11 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 			return nil, fmt.Errorf("project %q references unknown provider %q", project.ID, project.Provider)
 		}
 		if project.Repo != "" {
-			repoKey := strings.ToLower(project.Repo)
+			identity, resolved := config.ProjectRepositoryIdentity(global, project)
+			if !resolved {
+				return nil, fmt.Errorf("project %q repository identity cannot be resolved", project.ID)
+			}
+			repoKey := identity.Key()
 			if existingID, ok := seenRepos[repoKey]; ok {
 				return nil, fmt.Errorf("project %q repo %q duplicates active project %q", project.ID, project.Repo, existingID)
 			}

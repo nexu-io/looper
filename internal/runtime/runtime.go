@@ -2408,11 +2408,12 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 			}
 			return storage.QueueItemRecord{}, false, err
 		}
-		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+		lockKey := storage.IssueLockKey(loop.ProjectID, repo, issueNumber)
+		targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 		payload := map[string]any{"issueNumber": issueNumber}
 		payloadJSON := mustMarshalJSON(payload)
 		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = nil
 		queueRecord.DedupeKey = fmt.Sprintf("planner:%s:%s:%s:%d", loop.ProjectID, loop.ID, repo, issueNumber)
@@ -2425,9 +2426,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 			return storage.QueueItemRecord{}, false, fmt.Errorf("reviewer loop requires repo and pull request target")
 		}
 		prNumber := *loop.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(loop.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("reviewer:%s:%s:%s:%d", loop.ProjectID, loop.ID, repo, prNumber)
@@ -2439,9 +2441,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 			return storage.QueueItemRecord{}, false, fmt.Errorf("fixer loop requires repo and pull request target")
 		}
 		prNumber := *loop.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(loop.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("fixer:%s", loop.ID)
@@ -2464,9 +2467,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 				}
 				return storage.QueueItemRecord{}, false, err
 			}
-			lockKey = fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+			lockKey = storage.IssueLockKey(loop.ProjectID, repo, issueNumber)
+			targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = nil
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", loop.ProjectID, repo, issueNumber)
@@ -2476,9 +2480,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 				return storage.QueueItemRecord{}, false, fmt.Errorf("worker loop requires repo and prNumber")
 			}
 			prNumber := *loop.PRNumber
-			lockKey = fmt.Sprintf("pr:%s:%d", repo, prNumber)
+			lockKey = storage.PullRequestLockKey(loop.ProjectID, repo, prNumber)
+			targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = &prNumber
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", loop.ProjectID, repo, prNumber)

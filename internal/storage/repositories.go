@@ -586,6 +586,16 @@ func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
 	return scanLoops(rows)
 }
 
+func (r *LoopsRepository) ListByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]LoopRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY updated_at DESC, seq DESC`, repo, prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("list loops by repository and pull request: %w", err)
+	}
+	defer rows.Close()
+
+	return scanLoops(rows)
+}
+
 func (r *LoopsRepository) ListByStatuses(ctx context.Context, statuses []string) ([]LoopRecord, error) {
 	if len(statuses) == 0 {
 		return []LoopRecord{}, nil
@@ -1082,21 +1092,49 @@ func (r *PullRequestSnapshotsRepository) List(ctx context.Context) ([]PullReques
 	return scanPullRequestSnapshots(rows)
 }
 
-func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE repo = ? AND pr_number = ? ORDER BY captured_at DESC LIMIT 1`, repo, prNumber)
-	record, err := scanPullRequestSnapshot(row)
+func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]PullRequestSnapshotRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		WITH ranked AS (
+			SELECT id, ROW_NUMBER() OVER (
+				PARTITION BY project_id
+				ORDER BY captured_at DESC, created_at DESC, id DESC
+			) AS row_number
+			FROM pull_request_snapshots
+			WHERE repo = ? COLLATE NOCASE AND pr_number = ?
+		)
+		SELECT snapshots.*
+		FROM pull_request_snapshots snapshots
+		JOIN ranked ON ranked.id = snapshots.id
+		WHERE ranked.row_number = 1
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.id DESC
+	`, repo, prNumber)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
+		return nil, fmt.Errorf("list latest pull request snapshots by repository and pull request: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPullRequestSnapshots(rows)
+}
+
+func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
+	records, err := r.ListLatestByRepoAndPR(ctx, repo, prNumber)
+	if err != nil {
 		return nil, fmt.Errorf("get latest pull request snapshot: %w", err)
 	}
-
-	return &record, nil
+	if len(records) == 0 {
+		return nil, nil
+	}
+	projectID := records[0].ProjectID
+	for _, record := range records[1:] {
+		if record.ProjectID != projectID {
+			return nil, fmt.Errorf("get latest pull request snapshot: repository %s#%d matches multiple projects; use GetLatestByProject", repo, prNumber)
+		}
+	}
+	return &records[0], nil
 }
 
 func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context, projectID, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE project_id = ? AND repo = ? AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
 	record, err := scanPullRequestSnapshot(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1119,7 +1157,7 @@ func (r *LocksRepository) SetNow(now func() time.Time) {
 
 func (r *LocksRepository) Acquire(ctx context.Context, record LockRecord) (bool, error) {
 	nowISO := r.now().UTC().Format(javaScriptISOStringLayout)
-	result, err := r.q.ExecContext(ctx, `
+	query := `
 		INSERT INTO locks (key, owner, reason, expires_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -1128,7 +1166,37 @@ func (r *LocksRepository) Acquire(ctx context.Context, record LockRecord) (bool,
 			expires_at=excluded.expires_at,
 			updated_at=excluded.updated_at
 		WHERE locks.expires_at <= ?
-	`, record.Key, record.Owner, record.Reason, record.ExpiresAt, record.CreatedAt, record.UpdatedAt, nowISO)
+	`
+	args := []any{record.Key, record.Owner, record.Reason, record.ExpiresAt, record.CreatedAt, record.UpdatedAt, nowISO}
+	legacyKey, scopedSuffix, kind, scoped, transitionKey := lockTransitionAlias(record.Key)
+	if transitionKey {
+		aliasPredicate := "key = ?"
+		aliasArgs := []any{legacyKey}
+		if !scoped {
+			aliasPredicate = "key LIKE ? AND lower(substr(key, -?)) = lower(?)"
+			aliasArgs = []any{kind + ":%", len(scopedSuffix), scopedSuffix}
+		} else {
+			aliasPredicate = "lower(key) = lower(?)"
+		}
+		query = `
+			INSERT INTO locks (key, owner, reason, expires_at, created_at, updated_at)
+			SELECT ?, ?, ?, ?, ?, ?
+			WHERE NOT EXISTS (
+				SELECT 1 FROM locks
+				WHERE key != ? AND expires_at > ? AND (` + aliasPredicate + `)
+			)
+			ON CONFLICT(key) DO UPDATE SET
+				owner=excluded.owner,
+				reason=excluded.reason,
+				expires_at=excluded.expires_at,
+				updated_at=excluded.updated_at
+			WHERE locks.expires_at <= ?
+		`
+		args = []any{record.Key, record.Owner, record.Reason, record.ExpiresAt, record.CreatedAt, record.UpdatedAt, record.Key, nowISO}
+		args = append(args, aliasArgs...)
+		args = append(args, nowISO)
+	}
+	result, err := r.q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("acquire lock: %w", err)
 	}
@@ -1522,7 +1590,7 @@ func (r *QueueRepository) Stats(ctx context.Context, nowISO string) (QueueStats,
 				AND EXISTS (
 					SELECT 1
 					FROM queue_items lock_blocker
-					WHERE lock_blocker.lock_key = qi.lock_key
+					WHERE ` + queueLockConflictPredicate + `
 						AND lock_blocker.status = 'running'
 						AND lock_blocker.id != qi.id
 				)
@@ -1541,6 +1609,7 @@ func (r *QueueRepository) Stats(ctx context.Context, nowISO string) (QueueStats,
 					WHERE blocker.type = 'reviewer'
 						AND blocker.repo = qi.repo
 						AND blocker.pr_number = qi.pr_number
+						AND (blocker.project_id = qi.project_id OR blocker.project_id IS NULL OR qi.project_id IS NULL)
 						AND blocker.status IN ('queued', 'running')
 						AND blocker.id != qi.id
 				)
@@ -2160,6 +2229,16 @@ func chunkStrings(values []string, chunkSize int) [][]string {
 	return chunks
 }
 
+const queueLockConflictPredicate = `(
+	lock_blocker.lock_key = qi.lock_key
+	OR (
+		lock_blocker.repo = qi.repo
+		AND lock_blocker.target_type = qi.target_type
+		AND lock_blocker.target_id = qi.target_id
+		AND (lock_blocker.lock_key = lock_blocker.target_id OR qi.lock_key = qi.target_id)
+	)
+)`
+
 const scheduledQueueBaseQuery = `
 	SELECT qi.*
 	FROM queue_items qi
@@ -2174,7 +2253,7 @@ const scheduledQueueBaseQuery = `
 			OR NOT EXISTS (
 				SELECT 1
 				FROM queue_items lock_blocker
-				WHERE lock_blocker.lock_key = qi.lock_key
+				WHERE ` + queueLockConflictPredicate + `
 					AND lock_blocker.status = 'running'
 					AND lock_blocker.id != qi.id
 			)
@@ -2189,6 +2268,7 @@ const scheduledQueueBaseQuery = `
 				WHERE blocker.type = 'reviewer'
 					AND blocker.repo = qi.repo
 					AND blocker.pr_number = qi.pr_number
+					AND (blocker.project_id = qi.project_id OR blocker.project_id IS NULL OR qi.project_id IS NULL)
 					AND blocker.status IN ('queued', 'running')
 					AND blocker.id != qi.id
 			)

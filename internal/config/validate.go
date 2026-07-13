@@ -348,11 +348,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			}
 		}
 		if strings.TrimSpace(project.Repo) != "" {
-			repo := strings.ToLower(strings.TrimSpace(project.Repo))
-			if previousIndex, exists := projectRepos[repo]; exists {
+			identity, resolved := ProjectRepositoryIdentity(config, project)
+			if previousIndex, exists := projectRepos[identity.Key()]; resolved && exists {
 				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: fmt.Sprintf("duplicates projects[%d].repo: %s", previousIndex, project.Repo)})
-			} else {
-				projectRepos[repo] = index
+			} else if resolved {
+				projectRepos[identity.Key()] = index
 			}
 		}
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {

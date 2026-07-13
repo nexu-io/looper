@@ -138,7 +138,7 @@ func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue(project_1) error = %v", err)
 	}
-	project1Queue := storage.QueueItemRecord{ID: "queue_existing", ProjectID: stringPtr("project_1"), LoopID: &loopResult.record.ID, Type: "planner", TargetType: "issue", TargetID: buildIssueTargetID("acme/looper", issue.Number), Repo: stringPtr("acme/looper"), DedupeKey: buildPlannerDedupeKey("project_1", loopResult.record.ID, "acme/looper", issue.Number), Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: stringPtr(buildIssueLockKey("acme/looper", issue.Number)), CreatedAt: nowISO, UpdatedAt: nowISO}
+	project1Queue := storage.QueueItemRecord{ID: "queue_existing", ProjectID: stringPtr("project_1"), LoopID: &loopResult.record.ID, Type: "planner", TargetType: "issue", TargetID: buildIssueTargetID("acme/looper", issue.Number), Repo: stringPtr("acme/looper"), DedupeKey: buildPlannerDedupeKey("project_1", loopResult.record.ID, "acme/looper", issue.Number), Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: stringPtr(storage.IssueLockKey("project_1", "acme/looper", issue.Number)), CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), project1Queue); err != nil {
 		t.Fatalf("Queue.Upsert(existing) error = %v", err)
 	}
@@ -844,7 +844,7 @@ func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T)
 	if err != nil {
 		t.Fatalf("enqueue() error = %v", err)
 	}
-	checkpointJSON := `{"claimedLockKey":"` + buildIssueLockKey("acme/looper", issue.Number) + `"}`
+	checkpointJSON := `{"claimedLockKey":"` + storage.IssueLockKey("project_1", "acme/looper", issue.Number) + `"}`
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_resume", LoopID: loopResult.record.ID, Status: "failed", LastCompletedStep: stringPtr(string(stepDiscoverIssues)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -872,7 +872,7 @@ func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "forced loop update failure") {
 		t.Fatalf("ProcessClaimedItem() error = %v, want forced loop update failure", err)
 	}
-	lockKey := buildIssueLockKey("acme/looper", issue.Number)
+	lockKey := storage.IssueLockKey("project_1", "acme/looper", issue.Number)
 	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
 	if err != nil {
 		t.Fatalf("Locks.Get() error = %v", err)

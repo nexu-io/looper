@@ -338,7 +338,7 @@ func (r *commandRuntime) pullRequestShow(cmd *cobra.Command, args []string) erro
 		if err != nil {
 			return nil, err
 		}
-		return r.getJSON(ctx, pullRequestPath(repo, prNumber))
+		return r.getJSON(ctx, withProjectQuery(pullRequestPath(repo, prNumber), getStringFlag(cmd, "project")))
 	}, writeHumanPullRequestShow)
 }
 
@@ -348,7 +348,7 @@ func (r *commandRuntime) pullRequestStatus(cmd *cobra.Command, args []string) er
 		if err != nil {
 			return nil, err
 		}
-		return r.getJSON(ctx, pullRequestPath(repo, prNumber)+"/status")
+		return r.getJSON(ctx, withProjectQuery(pullRequestPath(repo, prNumber)+"/status", getStringFlag(cmd, "project")))
 	}, writeHumanPullRequestStatus)
 }
 
@@ -778,6 +778,16 @@ func writeJSON(w io.Writer, payload any) error {
 
 func pullRequestPath(repo string, prNumber int64) string {
 	return "/api/v1/pull-requests/" + url.PathEscape(repo) + "/" + strconv.FormatInt(prNumber, 10)
+}
+
+func withProjectQuery(path, projectID string) string {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return path
+	}
+	query := url.Values{}
+	query.Set("projectId", projectID)
+	return path + "?" + query.Encode()
 }
 
 type activeRunDetailOutput struct {

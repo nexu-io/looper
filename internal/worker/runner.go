@@ -1059,7 +1059,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			releaseCtx := context.Background()
 			_ = r.repos.Locks.Release(releaseCtx, claimedLockKey)
 			if strings.HasPrefix(claimedLockKey, "issue:") && checkpoint.PullRequest != nil && checkpoint.Work != nil && checkpoint.Work.Repo != "" && checkpoint.PullRequest.Number > 0 {
-				prLockKey := fmt.Sprintf("pr:%s:%d", checkpoint.Work.Repo, checkpoint.PullRequest.Number)
+				prLockKey := storage.PullRequestLockKey(derefString(queueItem.ProjectID), checkpoint.Work.Repo, checkpoint.PullRequest.Number)
 				if err := r.repos.Queue.UpdateLockKey(releaseCtx, queueItem.ID, prLockKey, r.nowISO()); err != nil {
 					if r.logger != nil {
 						r.logger.Warn("worker queue lock retarget failed", map[string]any{"queueItemId": queueItem.ID, "lockKey": prLockKey, "error": err.Error()})
@@ -1381,9 +1381,9 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	lockKey := derefString(input.QueueItem.LockKey)
 	if lockKey == "" {
 		if work.ExecutionMode == "push-existing" && work.Repo != "" && work.PRNumber > 0 {
-			lockKey = fmt.Sprintf("pr:%s:%d", work.Repo, work.PRNumber)
+			lockKey = storage.PullRequestLockKey(input.Project.ID, work.Repo, work.PRNumber)
 		} else if work.IssueNumber > 0 {
-			lockKey = buildIssueLockKey(issueLookupRepo(work), work.IssueNumber)
+			lockKey = storage.IssueLockKey(input.Project.ID, issueLookupRepo(work), work.IssueNumber)
 		} else {
 			lockKey = fmt.Sprintf("worker:%s", input.Loop.ID)
 		}
@@ -2504,7 +2504,7 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	updatedQueue.Repo = stringPtr(repo)
 	updatedQueue.PRNumber = int64Ptr(pr.Number)
 	if !strings.HasPrefix(derefString(queueItem.LockKey), "issue:") {
-		updatedQueue.LockKey = stringPtr(targetID)
+		updatedQueue.LockKey = stringPtr(storage.PullRequestLockKey(derefString(queueItem.ProjectID), repo, pr.Number))
 	}
 	projectID := derefString(queueItem.ProjectID)
 	if projectID != "" {
@@ -2605,7 +2605,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
 	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
 	targetID := buildIssueTargetID(repo, issue.Number)
-	lockKey := targetID
+	lockKey := storage.IssueLockKey(project.ID, repo, issue.Number)
 	projectID := project.ID
 	loopID := loop.ID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID, Repo: &repo, DedupeKey: dedupeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -3116,10 +3116,6 @@ func (c *workerCheckpoint) markLifecycleAgentPullRequest(branch, baseBranch stri
 	c.Lifecycle.PRAdopted = true
 	c.Lifecycle.Actions.PR = lifecycle.ActionSourceAgent
 	c.Lifecycle.Normalize()
-}
-
-func buildIssueLockKey(repo string, issueNumber int64) string {
-	return fmt.Sprintf("issue:%s:%d", strings.TrimSpace(repo), issueNumber)
 }
 
 func buildWorkerFallbackCommitMessage(work workerInput) string {

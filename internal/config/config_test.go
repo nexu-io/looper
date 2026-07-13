@@ -525,6 +525,72 @@ func TestForgejoProviderConfigRequiresRepoAndRejectsDuplicateBareRepos(t *testin
 	}
 }
 
+func TestValidateAllowsSameRepoAcrossForgeProviders(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "FORGE_TOKEN"
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{
+			{ID: "forgejo-one", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://one.example.test/"), TokenEnv: &tokenEnv},
+			{ID: "forgejo-two", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://two.example.test"), TokenEnv: &tokenEnv},
+		},
+		Projects: &[]PartialProjectRefConfig{
+			{ID: "github", Name: "GitHub", Repo: stringPtr("Acme/App"), RepoPath: "/tmp/github"},
+			{ID: "one", Name: "One", Provider: stringPtr("forgejo-one"), Repo: stringPtr("acme/app"), RepoPath: "/tmp/one"},
+			{ID: "two", Name: "Two", Provider: stringPtr("forgejo-two"), Repo: stringPtr("ACME/APP"), RepoPath: "/tmp/two"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v, want provider-qualified repositories to coexist", err)
+	}
+}
+
+func TestValidateRejectsSameRepoThroughProviderAliases(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "FORGE_TOKEN"
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{
+			{ID: "alias-one", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://code.example.test/"), TokenEnv: &tokenEnv},
+			{ID: "alias-two", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("HTTPS://CODE.EXAMPLE.TEST"), TokenEnv: &tokenEnv},
+		},
+		Projects: &[]PartialProjectRefConfig{
+			{ID: "one", Name: "One", Provider: stringPtr("alias-one"), Repo: stringPtr("acme/app"), RepoPath: "/tmp/one"},
+			{ID: "two", Name: "Two", Provider: stringPtr("alias-two"), Repo: stringPtr("ACME/APP"), RepoPath: "/tmp/two"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("ValidateWithOptions() error = %v, want physical endpoint duplicate rejection", err)
+	}
+}
+
+func TestValidateTreatsPlaneCodeRepoAsGitHubIdentity(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "PLANE_TOKEN"
+	workspace := "acme"
+	planeProjectID := "plane-project"
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{ID: "plane", Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &planeProjectID}},
+		Projects: &[]PartialProjectRefConfig{
+			{ID: "github", Name: "GitHub", Repo: stringPtr("acme/app"), RepoPath: "/tmp/github"},
+			{ID: "plane", Name: "Plane", Provider: stringPtr("plane"), Repo: stringPtr("ACME/APP"), RepoPath: "/tmp/plane"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("ValidateWithOptions() error = %v, want Plane/GitHub code repo duplicate rejection", err)
+	}
+}
+
 func TestMixedGitHubWebhookAndForgejoPollingConfigValidates(t *testing.T) {
 	t.Parallel()
 

@@ -1761,13 +1761,14 @@ func (h *Handler) buildPullRequestsRouteResponse(r *http.Request) (pullRequestsL
 	identities := collectPullRequestIdentities(latestSnapshots, loops)
 	snapshotByKey := map[string]storage.PullRequestSnapshotRecord{}
 	for _, snapshot := range latestSnapshots {
-		snapshotByKey[pullRequestKey(snapshot.Repo, snapshot.PRNumber)] = snapshot
+		snapshotByKey[pullRequestKey(snapshot.ProjectID, snapshot.Repo, snapshot.PRNumber)] = snapshot
 	}
 
 	items := make([]pullRequestResponse, 0, len(identities))
 	for _, identity := range identities {
-		loopMatches := loopMatchesByPullRequest[pullRequestKey(identity.Repo, identity.PRNumber)]
-		snapshot, ok := snapshotByKey[pullRequestKey(identity.Repo, identity.PRNumber)]
+		key := pullRequestKey(identity.ProjectID, identity.Repo, identity.PRNumber)
+		loopMatches := loopMatchesByPullRequest[key]
+		snapshot, ok := snapshotByKey[key]
 		if ok {
 			items = append(items, h.serializePullRequestListItem(identity.Repo, identity.PRNumber, &snapshot, loopMatches))
 			continue
@@ -1801,7 +1802,37 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 		return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "prNumber must be a positive integer"}
 	}
 
-	snapshot, err := services.Repositories.PullRequestSnapshots.GetLatest(r.Context(), repo, prNumber)
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
+	var snapshot *storage.PullRequestSnapshotRecord
+	if projectID != "" {
+		snapshot, err = services.Repositories.PullRequestSnapshots.GetLatestByProject(r.Context(), projectID, repo, prNumber)
+	} else {
+		snapshots, listErr := services.Repositories.PullRequestSnapshots.ListLatestByRepoAndPR(r.Context(), repo, prNumber)
+		if listErr != nil {
+			err = listErr
+		} else {
+			matchedProjects := map[string]struct{}{}
+			for index := range snapshots {
+				candidate := snapshots[index]
+				matchedProjects[candidate.ProjectID] = struct{}{}
+				if snapshot == nil {
+					candidateCopy := candidate
+					snapshot = &candidateCopy
+				}
+			}
+			loops, loopErr := services.Repositories.Loops.ListByRepoAndPR(r.Context(), repo, prNumber)
+			if loopErr != nil {
+				err = loopErr
+			} else {
+				for _, loop := range loops {
+					matchedProjects[loop.ProjectID] = struct{}{}
+				}
+			}
+			if err == nil && len(matchedProjects) > 1 {
+				return nil, apiError{code: pkgapi.ErrorCodeProjectAmbiguous, status: http.StatusConflict, message: fmt.Sprintf("Multiple projects match pull request %s#%d; pass projectId explicitly", repo, prNumber)}
+			}
+		}
+	}
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -1823,7 +1854,7 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
 
-	loopMatches, err := h.findPullRequestLoops(r.Context(), repo, prNumber)
+	loopMatches, err := h.findPullRequestLoops(r.Context(), snapshot.ProjectID, snapshot.Repo, prNumber)
 	if err != nil {
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -1831,7 +1862,7 @@ func (h *Handler) buildPullRequestRouteResponse(r *http.Request, path string) (a
 }
 
 func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot storage.PullRequestSnapshotRecord) (pullRequestStatusResponse, error) {
-	loopMatches, err := h.findPullRequestLoops(ctx, snapshot.Repo, snapshot.PRNumber)
+	loopMatches, err := h.findPullRequestLoops(ctx, snapshot.ProjectID, snapshot.Repo, snapshot.PRNumber)
 	if err != nil {
 		return pullRequestStatusResponse{}, err
 	}
@@ -1886,14 +1917,14 @@ func (h *Handler) buildPullRequestStatusResponse(ctx context.Context, snapshot s
 	}, nil
 }
 
-func (h *Handler) findPullRequestLoops(ctx context.Context, repo string, prNumber int64) ([]storage.LoopRecord, error) {
-	loops, err := h.context.Runtime.Services().Repositories.Loops.List(ctx)
+func (h *Handler) findPullRequestLoops(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
+	loops, err := h.context.Runtime.Services().Repositories.Loops.ListByRepoAndPR(ctx, repo, prNumber)
 	if err != nil {
 		return nil, err
 	}
 	matches := make([]storage.LoopRecord, 0)
 	for _, loop := range loops {
-		if loop.Repo != nil && loop.PRNumber != nil && *loop.Repo == repo && *loop.PRNumber == prNumber {
+		if loop.ProjectID == projectID {
 			matches = append(matches, loop)
 		}
 	}
@@ -2047,8 +2078,8 @@ func snapshotString(snapshot *storage.PullRequestSnapshotRecord, getter func(sto
 	return getter(*snapshot)
 }
 
-func pullRequestKey(repo string, prNumber int64) string {
-	return fmt.Sprintf("%s#%d", repo, prNumber)
+func pullRequestKey(projectID, repo string, prNumber int64) string {
+	return fmt.Sprintf("%s:%s#%d", projectID, repo, prNumber)
 }
 
 func groupPullRequestLoops(loops []storage.LoopRecord) map[string][]storage.LoopRecord {
@@ -2057,7 +2088,7 @@ func groupPullRequestLoops(loops []storage.LoopRecord) map[string][]storage.Loop
 		if loop.Repo == nil || loop.PRNumber == nil {
 			continue
 		}
-		key := pullRequestKey(*loop.Repo, *loop.PRNumber)
+		key := pullRequestKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
 		grouped[key] = append(grouped[key], loop)
 	}
 	return grouped
@@ -2067,7 +2098,7 @@ func dedupeLatestSnapshots(snapshots []storage.PullRequestSnapshotRecord) []stor
 	seen := map[string]struct{}{}
 	deduped := make([]storage.PullRequestSnapshotRecord, 0, len(snapshots))
 	for _, snapshot := range snapshots {
-		key := fmt.Sprintf("%s#%d", snapshot.Repo, snapshot.PRNumber)
+		key := pullRequestKey(snapshot.ProjectID, snapshot.Repo, snapshot.PRNumber)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -2090,7 +2121,7 @@ func collectPullRequestIdentities(snapshots []storage.PullRequestSnapshotRecord,
 		if repo == nil || prNumber == nil {
 			return
 		}
-		key := fmt.Sprintf("%s#%d", *repo, *prNumber)
+		key := pullRequestKey(projectID, *repo, *prNumber)
 		if _, ok := seen[key]; ok {
 			return
 		}
@@ -3694,10 +3725,10 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		lockKey := "worker:" + loopID
 		if effectivePRNumber != nil {
 			dedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, *repo, *effectivePRNumber)
-			lockKey = fmt.Sprintf("pr:%s:%d", *repo, *effectivePRNumber)
+			lockKey = storage.PullRequestLockKey(projectID, *repo, *effectivePRNumber)
 		} else if issueNumber != nil {
 			dedupeKey = fmt.Sprintf("worker:%s:%s:%d", projectID, *repo, *issueNumber)
-			lockKey = fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
+			lockKey = storage.IssueLockKey(projectID, *repo, *issueNumber)
 		}
 		payloadJSON := string(queuePayloadJSONBytes)
 		queueRecord := storage.QueueItemRecord{
@@ -5304,7 +5335,8 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 		if target.TargetType != domain.LoopTargetTypeIssue || repo == "" || issueNumber <= 0 {
 			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and issueNumber", record.Type)}
 		}
-		lockKey := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+		lockKey := storage.IssueLockKey(record.ProjectID, repo, issueNumber)
+		targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 		manual := false
 		if metadata := parseJSONObject(metadataJSON); metadata["manual"] == true {
 			if boolValue, ok := metadata["manual"].(bool); ok {
@@ -5321,7 +5353,7 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 		}
 		payloadJSON := string(payloadBytes)
 		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = nil
 		queueRecord.DedupeKey = fmt.Sprintf("planner:%s:%s:%s:%d", record.ProjectID, record.ID, repo, issueNumber)
@@ -5334,9 +5366,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", record.Type)}
 		}
 		prNumber := *record.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(record.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("reviewer:%s:%s:%s:%d", record.ProjectID, record.ID, repo, prNumber)
@@ -5348,9 +5381,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 			return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", record.Type)}
 		}
 		prNumber := *record.PRNumber
-		lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+		lockKey := storage.PullRequestLockKey(record.ProjectID, repo, prNumber)
+		targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 		queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-		queueRecord.TargetID = lockKey
+		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
 		queueRecord.PRNumber = &prNumber
 		queueRecord.DedupeKey = fmt.Sprintf("fixer:%s", record.ID)
@@ -5370,9 +5404,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 			if repo == "" || issueNumber <= 0 {
 				return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and issueNumber", record.Type)}
 			}
-			lockKey = fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+			lockKey = storage.IssueLockKey(record.ProjectID, repo, issueNumber)
+			targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = nil
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", record.ProjectID, repo, issueNumber)
@@ -5382,9 +5417,10 @@ func buildQueuedLoopQueueRecordCompat(record storage.LoopRecord, target domain.L
 				return storage.QueueItemRecord{}, false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s loop requires repo and prNumber", record.Type)}
 			}
 			prNumber := *record.PRNumber
-			lockKey = fmt.Sprintf("pr:%s:%d", repo, prNumber)
+			lockKey = storage.PullRequestLockKey(record.ProjectID, repo, prNumber)
+			targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 			queueRecord.TargetType = string(domain.LoopTargetTypePullRequest)
-			queueRecord.TargetID = lockKey
+			queueRecord.TargetID = targetID
 			queueRecord.Repo = &repo
 			queueRecord.PRNumber = &prNumber
 			queueRecord.DedupeKey = fmt.Sprintf("worker:%s:%s:%d", record.ProjectID, repo, prNumber)

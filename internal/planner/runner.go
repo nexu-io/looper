@@ -808,7 +808,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		return input.Checkpoint, err
 	}
 	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
-	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), buildIssueLockKey(repo, issueNumber))
+	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), storage.IssueLockKey(input.Project.ID, repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
 	acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: lockKey, Owner: input.QueueItem.ID, Reason: &reason, ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL)), CreatedAt: nowISO, UpdatedAt: nowISO})
@@ -1481,7 +1481,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	}
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(input.Repo, input.IssueNumber)
-	lockKey := buildIssueLockKey(input.Repo, input.IssueNumber)
+	lockKey := storage.IssueLockKey(input.ProjectID, input.Repo, input.IssueNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
 	payload := mustMarshalJSON(input.Payload)
@@ -2017,10 +2017,6 @@ func (r *Runner) stampFailedDiscoveryFingerprint(updated *storage.LoopRecord, qu
 func buildPlannerDedupeKey(projectID, loopID, repo string, issueNumber int64) string {
 	return fmt.Sprintf("planner:%s:%s:%s:%d", projectID, loopID, repo, issueNumber)
 }
-func buildIssueLockKey(repo string, issueNumber int64) string {
-	return fmt.Sprintf("issue:%s:%d", repo, issueNumber)
-}
-
 func parseIssueNumberFromTargetID(targetID string) int64 {
 	if targetID == "" {
 		return 0

@@ -171,19 +171,34 @@ func TestMaterializeCatalogRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
-func TestMaterializeCatalogRejectsDuplicateActiveRepoBindings(t *testing.T) {
+func TestMaterializeCatalogAllowsDuplicateReposAcrossProviders(t *testing.T) {
 	t.Parallel()
 
 	githubMetadata := `{"repo":"nexu-io/looper","source":"config"}`
 	forgejoMetadata := `{"provider":"forgejo-main","repo":"NEXU-IO/LOOPER","source":"api"}`
 	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
 
-	_, err := MaterializeCatalog(global, []storage.ProjectRecord{
+	got, err := MaterializeCatalog(global, []storage.ProjectRecord{
 		{ID: "github", MetadataJSON: &githubMetadata},
 		{ID: "forgejo", MetadataJSON: &forgejoMetadata},
 	})
-	if err == nil || !strings.Contains(err.Error(), `repo "NEXU-IO/LOOPER" duplicates active project "github"`) {
-		t.Fatalf("MaterializeCatalog() error = %v, want duplicate active repo binding", err)
+	if err != nil {
+		t.Fatalf("MaterializeCatalog() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("MaterializeCatalog() projects = %d, want 2", len(got))
+	}
+}
+
+func TestMaterializeCatalogRejectsDuplicateRepoWithinProvider(t *testing.T) {
+	t.Parallel()
+
+	first := `{"provider":"forgejo-main","repo":"nexu-io/looper"}`
+	second := `{"provider":"forgejo-main","repo":"NEXU-IO/LOOPER"}`
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test"}}}
+	_, err := MaterializeCatalog(global, []storage.ProjectRecord{{ID: "one", MetadataJSON: &first}, {ID: "two", MetadataJSON: &second}})
+	if err == nil || !strings.Contains(err.Error(), `duplicates active project "one"`) {
+		t.Fatalf("MaterializeCatalog() error = %v, want same-provider duplicate rejection", err)
 	}
 }
 

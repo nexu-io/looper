@@ -622,7 +622,7 @@ func TestBuildRecoveryQueueItemRecordUsesIssueLockForWorkerTargets(t *testing.T)
 	if record.TargetID != "issue:acme/looper:77" {
 		t.Fatalf("record.TargetID = %q, want issue target id", record.TargetID)
 	}
-	if record.LockKey == nil || *record.LockKey != "issue:acme/looper:77" {
+	if record.LockKey == nil || *record.LockKey != storage.IssueLockKey("project_1", "acme/looper", 77) {
 		t.Fatalf("record.LockKey = %#v, want issue lock key", record.LockKey)
 	}
 	if record.DedupeKey != "worker:project_1:acme/looper:77" {

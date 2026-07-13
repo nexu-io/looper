@@ -211,70 +211,138 @@ func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderCon
 		return config.ProviderConfig{}, false, nil
 	}
 	repo = strings.TrimSpace(repo)
+	var matched *config.ProjectRefConfig
 	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.Repo) != repo {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
 			continue
 		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		if matched != nil {
+			return config.ProviderConfig{}, false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindForgejo {
 			return config.ProviderConfig{}, false, nil
 		}
-		provider, ok := forgejoProviderByID(*cfg, project.Provider)
+		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
 		if !ok {
-			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", project.Provider, repo)
+			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", matched.Provider, repo)
 		}
 		return provider, true, nil
 	}
 	return config.ProviderConfig{}, false, nil
 }
 
-func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo string) []string {
+func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string) []string {
 	if cfg == nil {
 		return nil
 	}
 	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
 	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.Repo) != repo {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
 			continue
 		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		if matched != nil {
 			return nil
 		}
-		labels := config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Discovery.Triggers.Labels
-		result := make([]string, 0, len(labels))
-		for _, label := range labels {
-			label = strings.TrimSpace(label)
-			if label == "" {
-				continue
-			}
-			result = append(result, label)
-		}
-		return result
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerDiscoveryLabelsForProject(*cfg, *matched)
 	}
 	return nil
+}
+
+func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return nil
+	}
+	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
+	result := make([]string, 0, len(labels))
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label != "" {
+			result = append(result, label)
+		}
+	}
+	return result
 }
 
 func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
 	if cfg == nil {
 		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
 	}
-	cwd = strings.TrimSpace(cwd)
-	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.RepoPath) != cwd {
-			continue
-		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, project.Provider)
-		if !ok {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
-		}
-		if strings.TrimSpace(project.Repo) == "" {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
-		}
-		return project, provider, true, nil
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil || !matched {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
 	}
-	return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	provider, ok := forgejoProviderByID(*cfg, project.Provider)
+	if !ok {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
+	}
+	if strings.TrimSpace(project.Repo) == "" {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
+	}
+	return project, provider, true, nil
+}
+
+func projectForCWD(cfg config.Config, cwd string) (config.ProjectRefConfig, bool, error) {
+	matches := make([]config.ProjectRefConfig, 0, 1)
+	for _, project := range cfg.Projects {
+		if cwdBelongsToProject(project, cwd) {
+			matches = append(matches, project)
+		}
+	}
+	if len(matches) == 0 {
+		return config.ProjectRefConfig{}, false, nil
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, project := range matches {
+			ids = append(ids, project.ID)
+		}
+		return config.ProjectRefConfig{}, false, fmt.Errorf("working directory %s matches multiple projects: %s", strings.TrimSpace(cwd), strings.Join(ids, ", "))
+	}
+	return matches[0], true, nil
+}
+
+func cwdBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
+	cwd = filepath.Clean(strings.TrimSpace(cwd))
+	if cwd == "." || cwd == "" {
+		return false
+	}
+	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
+	if repoPath != "." && cwd == repoPath {
+		return true
+	}
+	worktreeRoot := ""
+	if project.WorktreeRoot != nil {
+		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
+	}
+	if worktreeRoot == "" {
+		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+		if err != nil {
+			return false
+		}
+		worktreeRoot = resolved
+	}
+	worktreeRoot = filepath.Clean(worktreeRoot)
+	relative, err := filepath.Rel(worktreeRoot, cwd)
+	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderConfig, bool) {
@@ -323,18 +391,26 @@ func planeProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfi
 		return config.ProviderConfig{}, "", false, nil
 	}
 	repo = strings.TrimSpace(repo)
+	var matched *config.ProjectRefConfig
 	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.Repo) != repo {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
 			continue
 		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindPlane {
+		if matched != nil {
+			return config.ProviderConfig{}, "", false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindPlane {
 			return config.ProviderConfig{}, "", false, nil
 		}
-		provider, ok := forgejoProviderByID(*cfg, project.Provider)
+		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
 		if !ok {
-			return config.ProviderConfig{}, "", false, fmt.Errorf("plane provider %q not configured for repo %s", project.Provider, repo)
+			return config.ProviderConfig{}, "", false, fmt.Errorf("plane provider %q not configured for repo %s", matched.Provider, repo)
 		}
-		return provider, strings.TrimSpace(project.Repo), true, nil
+		return provider, strings.TrimSpace(matched.Repo), true, nil
 	}
 	return config.ProviderConfig{}, "", false, nil
 }
@@ -343,24 +419,21 @@ func planeProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectR
 	if cfg == nil {
 		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
 	}
-	cwd = strings.TrimSpace(cwd)
-	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.RepoPath) != cwd {
-			continue
-		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindPlane {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, project.Provider)
-		if !ok {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane provider %q not configured for project %s", project.Provider, project.ID)
-		}
-		if strings.TrimSpace(project.Repo) == "" {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane project %s is missing repo", project.ID)
-		}
-		return project, provider, true, nil
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil || !matched {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
 	}
-	return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindPlane {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	provider, ok := forgejoProviderByID(*cfg, project.Provider)
+	if !ok {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane provider %q not configured for project %s", project.Provider, project.ID)
+	}
+	if strings.TrimSpace(project.Repo) == "" {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane project %s is missing repo", project.ID)
+	}
+	return project, provider, true, nil
 }
 
 func forgeIdentityLogins(identities []forge.Identity) []string {
@@ -409,21 +482,40 @@ func forgeNetworkPolicyUsers(users []forge.Identity) []networkpolicy.GitHubUser 
 	return converted
 }
 
-func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
 	return client, ok, err
 }
 
 // plane returns a Plane task-source client when repo belongs to a plane-kind
 // project. Issue-side reads/mutations for such projects are served by Plane;
 // pull-request operations are left to the GitHub path (repo is the code repo).
-func (a plannerGitHubAdapter) plane(ctx context.Context, repo string) (*forge.PlaneClient, bool, error) {
-	client, ok, err := planeClientForRepo(a.config, repo)
+func (a plannerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
 	return client, ok, err
 }
 
+func forgeClientForLocation[T any](cfg *config.Config, repo string, cwd []string, byCWD func(*config.Config, string) (*T, bool, error), byRepo func(*config.Config, string) (*T, bool, error)) (*T, bool, error) {
+	if len(cwd) > 0 && strings.TrimSpace(cwd[0]) != "" {
+		client, ok, err := byCWD(cfg, cwd[0])
+		if ok || err != nil {
+			return client, ok, err
+		}
+		// A configured project path is authoritative even when it belongs to
+		// GitHub; do not fall through and select a same-slug Forgejo project.
+		if cfg != nil {
+			for _, project := range cfg.Projects {
+				if cwdBelongsToProject(project, cwd[0]) {
+					return nil, false, nil
+				}
+			}
+		}
+	}
+	return byRepo(cfg, repo)
+}
+
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
-	if client, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -437,7 +529,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		}
 		return result, nil
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -466,7 +558,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {
-	if client, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.IssueDetail{}, err
 		}
@@ -476,7 +568,7 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 		}
 		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.IssueDetail{}, err
 		}
@@ -518,13 +610,13 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 }
 
 func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
-	if client, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
 		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -548,7 +640,7 @@ func networkPolicyUsers(users []githubinfra.GitHubUser) []networkpolicy.GitHubUs
 }
 
 func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input planner.ListOpenPullRequestsInput) ([]planner.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -577,7 +669,7 @@ func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input pl
 }
 
 func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner.ViewPullRequestInput) (planner.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.PullRequestDetail{}, err
 		}
@@ -599,7 +691,7 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
 	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.CreatePullRequestResult{}, err
 		}
@@ -621,7 +713,7 @@ func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input plann
 
 func (a plannerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input planner.UpdatePullRequestBodyInput) error {
 	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -635,7 +727,7 @@ func (a plannerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input p
 }
 
 func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input planner.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -649,7 +741,7 @@ func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input pl
 }
 
 func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input planner.PullRequestReviewersInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -720,13 +812,13 @@ type reviewerGitHubAdapter struct {
 	config  *config.Config
 }
 
-func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
 	return client, ok, err
 }
 
 func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input reviewer.ListOpenPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -759,7 +851,7 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Context, input reviewer.ListReviewRequestedPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -794,7 +886,7 @@ func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd stri
 }
 
 func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
@@ -835,7 +927,7 @@ func (a reviewerGitHubAdapter) GetBranchProtection(ctx context.Context, input gi
 }
 
 func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -849,7 +941,7 @@ func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input 
 }
 
 func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, input reviewer.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
@@ -867,7 +959,7 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 		}
 		baseSHA := strings.TrimSpace(pr.Base.SHA)
 		return storage.PullRequestSnapshotRecord{
-			ID:          fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt),
+			ID:          fmt.Sprintf("snapshot:%s:%d:%s", input.ProjectID, input.PRNumber, input.CapturedAt),
 			ProjectID:   input.ProjectID,
 			Repo:        input.Repo,
 			PRNumber:    input.PRNumber,
@@ -888,7 +980,7 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 }
 
 func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return reviewer.ReviewMarkerResult{}, err
 		}
@@ -1033,7 +1125,7 @@ func forgejoReviewMarkerAllowed(outcome string, allowed []reviewer.ReviewEvent, 
 
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
 	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return reviewer.IssueCommentResult{}, err
 		}
@@ -1054,7 +1146,7 @@ func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input rev
 }
 
 func (a reviewerGitHubAdapter) ListIssueComments(ctx context.Context, input reviewer.ViewPullRequestInput) ([]reviewer.IssueComment, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1084,7 +1176,7 @@ func (a reviewerGitHubAdapter) ListIssueComments(ctx context.Context, input revi
 
 func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input reviewer.UpdateIssueCommentInput) error {
 	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1118,7 +1210,7 @@ func (a reviewerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1140,7 +1232,7 @@ func (a reviewerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input gith
 }
 
 func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input reviewer.ListReviewThreadsInput) ([]reviewer.ReviewThread, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1165,7 +1257,7 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 }
 
 func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input reviewer.AddReviewThreadReplyInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		return err
 	}
 	if a.gateway == nil {
@@ -1176,7 +1268,7 @@ func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input reviewer.ResolveReviewThreadInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		return err
 	}
 	if a.gateway == nil {
@@ -1236,8 +1328,8 @@ type fixerGitHubAdapter struct {
 	config  *config.Config
 }
 
-func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
 	return client, ok, err
 }
 
@@ -1247,7 +1339,7 @@ func (a fixerGitHubAdapter) forgejoForCWD(ctx context.Context, cwd string) (*for
 }
 
 func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1290,7 +1382,7 @@ func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string)
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -1304,7 +1396,7 @@ func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.PullRequestDetail{}, err
 		}
@@ -1356,7 +1448,7 @@ func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1396,7 +1488,7 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1406,7 +1498,7 @@ func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer
 }
 
 func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input fixer.ListNativeReviewCommentsInput) ([]fixer.NativeReviewComment, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1435,7 +1527,7 @@ func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input 
 }
 
 func (a fixerGitHubAdapter) ResolveNativeReviewComment(ctx context.Context, input fixer.ResolveNativeReviewCommentInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1445,7 +1537,7 @@ func (a fixerGitHubAdapter) ResolveNativeReviewComment(ctx context.Context, inpu
 }
 
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1456,7 +1548,7 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.CompareCommitsResult{}, err
 		}
@@ -1475,7 +1567,7 @@ func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.Comp
 
 func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
 	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.IssueCommentResult{}, err
 		}
@@ -1494,7 +1586,7 @@ func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.
 
 func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.UpdateIssueCommentInput) error {
 	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1505,7 +1597,7 @@ func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.
 }
 
 func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1516,7 +1608,7 @@ func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1637,21 +1729,21 @@ type workerGitHubAdapter struct {
 	config  *config.Config
 }
 
-func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
 	return client, ok, err
 }
 
 // plane returns a Plane task-source client when repo belongs to a plane-kind
 // project. The worker reads issues and posts issue-side comments/labels through
 // Plane; pull-request creation stays on the GitHub code repo.
-func (a workerGitHubAdapter) plane(ctx context.Context, repo string) (*forge.PlaneClient, bool, error) {
-	client, ok, err := planeClientForRepo(a.config, repo)
+func (a workerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
 	return client, ok, err
 }
 
 func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1680,7 +1772,7 @@ func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input wor
 }
 
 func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.ListOpenIssuesInput) ([]worker.IssueSummary, error) {
-	if client, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1694,7 +1786,7 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 		}
 		return result, nil
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1744,13 +1836,13 @@ func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string
 }
 
 func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
-	if client, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
 		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1763,7 +1855,7 @@ func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker
 }
 
 func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.PullRequestDetail{}, err
 		}
@@ -1784,7 +1876,7 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 }
 
 func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
-	if client, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueDetail{}, err
 		}
@@ -1794,7 +1886,7 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 		}
 		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueDetail{}, err
 		}
@@ -1816,7 +1908,7 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if client, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueCommentResult{}, err
 		}
@@ -1828,7 +1920,7 @@ func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worke
 		// ID stays 0; the URL points at the work-item web page.
 		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueCommentResult{}, err
 		}
@@ -1850,7 +1942,7 @@ func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worke
 
 func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if _, ok, err := a.plane(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1861,7 +1953,7 @@ func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worke
 		// TODO(plane): track the Plane comment UUID to enable true updates.
 		return nil
 	}
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1876,7 +1968,7 @@ func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worke
 
 func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.CreatePullRequestResult{}, err
 		}
@@ -1897,7 +1989,7 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 }
 
 func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1930,7 +2022,7 @@ func hitlGitHubSettings(cfg *config.HITLGitHubConfig) worker.HITLGitHubSettings 
 }
 
 func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.CompareBranchesResult{}, err
 		}
@@ -1952,7 +2044,7 @@ func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.C
 
 func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
 	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1966,7 +2058,7 @@ func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input wo
 }
 
 func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input worker.UpdatePullRequestTitleInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1980,7 +2072,7 @@ func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input w
 }
 
 func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1998,11 +2090,11 @@ func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input 
 }
 
 func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input worker.PullRequestReviewersInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		labels := forgejoReviewerDiscoveryLabelsForRepo(a.config, input.Repo)
+		labels := forgejoReviewerDiscoveryLabelsForRepo(a.config, input.Repo, input.CWD)
 		if len(labels) > 0 {
 			if _, err := client.AddIssueLabels(ctx, input.PRNumber, labels); err != nil {
 				return err

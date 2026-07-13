@@ -1106,7 +1106,7 @@ func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testi
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM loops ORDER BY updated_at DESC, seq DESC") {
+		if strings.Contains(query, "SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
 			return errors.New("database is locked")
 		}
 		return nil
@@ -1123,7 +1123,92 @@ func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testi
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	errMap := body["error"].(map[string]any)
 	assertEqual(t, errMap["code"], "INTERNAL_ERROR")
-	assertEqual(t, errMap["message"], "list loops: database is locked")
+	assertEqual(t, errMap["message"], "list loops by repository and pull request: database is locked")
+}
+
+func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	for _, projectID := range []string{"github", "forgejo"} {
+		metadata := `{"repo":"acme/app"}`
+		if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, snapshot := range []storage.PullRequestSnapshotRecord{
+		{ID: "snapshot_github", ProjectID: "github", Repo: "acme/app", PRNumber: 42, HeadSHA: "github-head", CapturedAt: nowISO, CreatedAt: nowISO},
+		{ID: "snapshot_forgejo", ProjectID: "forgejo", Repo: "acme/app", PRNumber: 42, HeadSHA: "forgejo-head", CapturedAt: nowISO, CreatedAt: nowISO},
+	} {
+		if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), snapshot); err != nil {
+			t.Fatalf("PullRequestSnapshots.Upsert(%s) error = %v", snapshot.ProjectID, err)
+		}
+	}
+	repo := "acme/app"
+	prNumber := int64(42)
+	for index, loop := range []storage.LoopRecord{
+		{ID: "github_reviewer", ProjectID: "github", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed"},
+		{ID: "forgejo_reviewer", ProjectID: "forgejo", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running"},
+	} {
+		loop.Seq = int64(index + 1)
+		loop.CreatedAt = nowISO
+		loop.UpdatedAt = nowISO
+		if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
+	ambiguous := httptest.NewRecorder()
+	handler.ServeHTTP(ambiguous, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Fapp/42", nil))
+	if ambiguous.Code != http.StatusConflict {
+		t.Fatalf("ambiguous status = %d, want 409; body=%s", ambiguous.Code, ambiguous.Body.String())
+	}
+
+	qualified := httptest.NewRecorder()
+	handler.ServeHTTP(qualified, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/AcMe%2FApp/42?projectId=forgejo", nil))
+	if qualified.Code != http.StatusOK {
+		t.Fatalf("qualified status = %d, want 200; body=%s", qualified.Code, qualified.Body.String())
+	}
+	body := parseJSONMap(t, qualified.Body.Bytes())
+	data := body["data"].(map[string]any)
+	if data["projectId"] != "forgejo" || data["headSha"] != "forgejo-head" {
+		t.Fatalf("qualified data = %#v, want Forgejo snapshot", data)
+	}
+	if data["reviewer"] != "running" {
+		t.Fatalf("qualified reviewer = %#v, want only Forgejo loop state", data["reviewer"])
+	}
+}
+
+func TestHandlerPullRequestRouteCountsLoopOnlyProjectAsAmbiguous(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/app"}`
+	for _, projectID := range []string{"github", "forgejo"} {
+		if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{ID: "snapshot_github_only", ProjectID: "github", Repo: "acme/app", PRNumber: 42, HeadSHA: "github-head", CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	repo := "ACME/APP"
+	prNumber := int64(42)
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "forgejo_loop_only", Seq: 1, ProjectID: "forgejo", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
+	ambiguous := httptest.NewRecorder()
+	handler.ServeHTTP(ambiguous, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Fapp/42", nil))
+	if ambiguous.Code != http.StatusConflict {
+		t.Fatalf("ambiguous status = %d, want 409; body=%s", ambiguous.Code, ambiguous.Body.String())
+	}
+
+	qualified := httptest.NewRecorder()
+	handler.ServeHTTP(qualified, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Fapp/42?projectId=github", nil))
+	if qualified.Code != http.StatusOK {
+		t.Fatalf("qualified status = %d, want 200; body=%s", qualified.Code, qualified.Body.String())
+	}
 }
 
 func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *testing.T) {
@@ -1145,7 +1230,7 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *test
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM loops ORDER BY updated_at DESC, seq DESC") {
+		if strings.Contains(query, "SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
 			return errors.New("database is locked")
 		}
 		return nil
@@ -1162,7 +1247,7 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *test
 	body := parseJSONMap(t, recorder.Body.Bytes())
 	errMap := body["error"].(map[string]any)
 	assertEqual(t, errMap["code"], "INTERNAL_ERROR")
-	assertEqual(t, errMap["message"], "list loops: database is locked")
+	assertEqual(t, errMap["message"], "list loops by repository and pull request: database is locked")
 }
 
 func TestReadAgentOutputLogReadsTailToPreserveCompletionMarker(t *testing.T) {
@@ -3844,12 +3929,12 @@ func TestHandlerWorkerCreateUsesOnlyNewestMatchingPlannerLoop(t *testing.T) {
 	}
 	assertEqual(t, queueItem.TargetType, "issue")
 	assertEqual(t, queueItem.TargetID, "issue:acme/looper:77")
-	assertEqual(t, derefString(queueItem.LockKey), "issue:acme/looper:77")
+	assertEqual(t, derefString(queueItem.LockKey), storage.IssueLockKey("project_1", "acme/looper", 77))
 	assertEqual(t, queueItem.DedupeKey, "worker:project_1:acme/looper:77")
 	if queueItem.PRNumber != nil {
 		t.Fatalf("queueItem.PRNumber = %#v, want nil", queueItem.PRNumber)
 	}
-	if queueItem.LockKey == nil || *queueItem.LockKey != "issue:acme/looper:77" {
+	if queueItem.LockKey == nil || *queueItem.LockKey != storage.IssueLockKey("project_1", "acme/looper", 77) {
 		t.Fatalf("queueItem.LockKey = %#v, want issue lock key", queueItem.LockKey)
 	}
 	payload := parseJSONMap(t, []byte(*queueItem.PayloadJSON))

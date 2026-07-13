@@ -389,8 +389,8 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 				subcommands: []*cobra.Command{
 					newCommand(commandSpec{use: "list", short: "List pull requests", runE: runtime.pullRequestList}),
-					newCommand(commandSpec{use: "show", short: "Show a pull request", args: cobra.ExactArgs(1), runE: runtime.pullRequestShow}),
-					newCommand(commandSpec{use: "status", short: "Show pull request status", args: cobra.ExactArgs(1), runE: runtime.pullRequestStatus}),
+					newCommand(commandSpec{use: "show", short: "Show a pull request", args: cobra.ExactArgs(1), runE: runtime.pullRequestShow, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id")}}),
+					newCommand(commandSpec{use: "status", short: "Show pull request status", args: cobra.ExactArgs(1), runE: runtime.pullRequestStatus, localFlags: []flagSpec{stringFlag("project", "projectId", "Project id")}}),
 				},
 			}),
 			newCommand(commandSpec{

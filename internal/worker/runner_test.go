@@ -596,7 +596,7 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.TargetType != "pull_request" || queue.TargetID != "pr:acme/looper:101" || queue.LockKey == nil || *queue.LockKey != "pr:acme/looper:101" || queue.PRNumber == nil || *queue.PRNumber != 101 {
+	if queue == nil || queue.TargetType != "pull_request" || queue.TargetID != "pr:acme/looper:101" || queue.LockKey == nil || *queue.LockKey != storage.PullRequestLockKey("project_1", "acme/looper", 101) || queue.PRNumber == nil || *queue.PRNumber != 101 {
 		t.Fatalf("queue = %#v, want retargeted queue item", queue)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
@@ -1540,7 +1540,7 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	if err != nil {
 		t.Fatalf("Queue.GetByID() after run error = %v", err)
 	}
-	if updatedQueue == nil || updatedQueue.TargetType != "pull_request" || updatedQueue.TargetID != "pr:acme/looper:101" || updatedQueue.LockKey == nil || *updatedQueue.LockKey != "pr:acme/looper:101" {
+	if updatedQueue == nil || updatedQueue.TargetType != "pull_request" || updatedQueue.TargetID != "pr:acme/looper:101" || updatedQueue.LockKey == nil || *updatedQueue.LockKey != storage.PullRequestLockKey("project_1", "acme/looper", 101) {
 		t.Fatalf("queue = %#v, want retargeted queue item with persisted PR lock key", updatedQueue)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), "loop_worker_1")
@@ -1554,7 +1554,7 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	if err != nil {
 		t.Fatalf("parseCheckpoint(latestRun) error = %v", err)
 	}
-	if latestCheckpoint.ClaimedLockKey != "pr:acme/looper:101" {
+	if latestCheckpoint.ClaimedLockKey != storage.PullRequestLockKey("project_1", "acme/looper", 101) {
 		t.Fatalf("checkpoint.ClaimedLockKey = %q, want pr:acme/looper:101", latestCheckpoint.ClaimedLockKey)
 	}
 	issueLock, err := fixture.repos.Locks.Get(context.Background(), issueTarget)

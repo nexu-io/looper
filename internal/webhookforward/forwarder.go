@@ -363,6 +363,9 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		if project.Archived {
 			continue
 		}
+		if configured, ok := configuredProjectByID(cfg, project.ID); ok && config.ResolvedProjectProviderKind(cfg, configured) == config.ProviderKindForgejo {
+			continue
+		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		if !strings.EqualFold(repo, routed.repo) {
 			continue
@@ -423,6 +426,15 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		f.cond.Signal()
 	}
 	return matched, nil
+}
+
+func configuredProjectByID(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return project, true
+		}
+	}
+	return config.ProjectRefConfig{}, false
 }
 
 func (f *forwarder) worker() {

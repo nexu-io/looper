@@ -4757,7 +4757,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	}
 	nowISO := r.nowISO()
 	targetID := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
-	lockKey := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
+	lockKey := storage.PullRequestLockKey(input.ProjectID, input.Repo, input.PRNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: availableAt, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -6011,10 +6011,10 @@ func reviewRequestsKnownAbsent(requested []string, currentLogin string) bool {
 }
 
 func buildPullRequestLockKey(item storage.QueueItemRecord) string {
-	if item.Repo == nil || item.PRNumber == nil {
+	if item.ProjectID == nil || item.Repo == nil || item.PRNumber == nil {
 		return ""
 	}
-	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
+	return storage.PullRequestLockKey(*item.ProjectID, *item.Repo, *item.PRNumber)
 }
 
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {

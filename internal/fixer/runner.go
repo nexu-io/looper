@@ -1540,7 +1540,7 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 	if manualFollowupLoop == nil && !policy.IncludeDrafts && pr.IsDraft {
 		return false
 	}
-	if r.hasActivePRLock(ctx, repo, pr.Number) {
+	if r.hasActivePRLock(ctx, projectID, repo, pr.Number) {
 		var (
 			loop *storage.LoopRecord
 			err  error
@@ -4568,7 +4568,7 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 		if isManualFixerLoop(loop) && !isManualFixerFollowupCandidate(loop) {
 			continue
 		}
-		if r.hasActivePRLock(ctx, repo, *loop.PRNumber) {
+		if r.hasActivePRLock(ctx, project.ID, repo, *loop.PRNumber) {
 			continue
 		}
 		metadata := parseJSONObject(loop.MetadataJSON)
@@ -4781,7 +4781,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	}
 	nowISO := r.nowISO()
 	targetID := buildPullRequestTargetID(input.Repo, input.PRNumber)
-	lockKey := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
+	lockKey := storage.PullRequestLockKey(input.ProjectID, input.Repo, input.PRNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
 	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: availableAt, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -5649,16 +5649,19 @@ func (r *Runner) appendEvent(ctx context.Context, input eventInput) {
 	_ = eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: optionalString(input.projectID), LoopID: optionalString(input.loopID), RunID: optionalString(input.runID), EntityType: optionalString(input.entityType), EntityID: optionalString(input.entityID), ActorType: optionalString("system"), ActorID: optionalString("fixer-loop"), ActorDisplayName: optionalString("fixer-loop"), Payload: input.payload, CreatedAt: r.now()})
 }
 
-func (r *Runner) hasActivePRLock(ctx context.Context, repo string, prNumber int64) bool {
-	lock, err := r.repos.Locks.Get(ctx, fmt.Sprintf("pr:%s:%d", repo, prNumber))
-	if err != nil || lock == nil {
-		return false
+func (r *Runner) hasActivePRLock(ctx context.Context, projectID, repo string, prNumber int64) bool {
+	keys := []string{storage.PullRequestLockKey(projectID, repo, prNumber), fmt.Sprintf("pr:%s:%d", repo, prNumber)}
+	for _, key := range keys {
+		lock, err := r.repos.Locks.Get(ctx, key)
+		if err != nil || lock == nil {
+			continue
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
+		if err == nil && expiresAt.After(r.now()) {
+			return true
+		}
 	}
-	expiresAt, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
-	if err != nil {
-		return false
-	}
-	return expiresAt.After(r.now())
+	return false
 }
 
 func (r *Runner) nowISO() string { return eventlog.FormatJavaScriptISOString(r.now()) }
@@ -7940,10 +7943,10 @@ func nilIfEmpty(value string) any {
 }
 
 func buildPullRequestLockKey(item storage.QueueItemRecord) string {
-	if item.Repo == nil || item.PRNumber == nil {
+	if item.ProjectID == nil || item.Repo == nil || item.PRNumber == nil {
 		return ""
 	}
-	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
+	return storage.PullRequestLockKey(*item.ProjectID, *item.Repo, *item.PRNumber)
 }
 
 // reRequestReviewersAfterFix re-requests the human reviewers who left a review

@@ -72,6 +72,76 @@ func TestPlannerGitHubAdapterForgejoCreatePullRequestAndLabels(t *testing.T) {
 	}
 }
 
+func TestPlannerAdapterRoutesSameRepoSlugByProjectPath(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+
+	serverFor := func(title string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/app/issues" {
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 1, "title": title, "state": "open"}})
+		}))
+	}
+	first := serverFor("first")
+	defer first.Close()
+	second := serverFor("second")
+	defer second.Close()
+
+	root := t.TempDir()
+	firstPath := filepath.Join(root, "first")
+	secondPath := filepath.Join(root, "second")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-one", Kind: config.ProviderKindForgejo, BaseURL: first.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")},
+			{ID: "forgejo-two", Kind: config.ProviderKindForgejo, BaseURL: second.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "one", Provider: "forgejo-one", Repo: "acme/app", RepoPath: firstPath},
+			{ID: "two", Provider: "forgejo-two", Repo: "acme/app", RepoPath: secondPath},
+		},
+	}
+	adapter := plannerGitHubAdapter{config: &cfg}
+	for _, testCase := range []struct {
+		cwd  string
+		want string
+	}{{cwd: firstPath, want: "first"}, {cwd: secondPath, want: "second"}} {
+		issues, err := adapter.ListOpenIssues(context.Background(), planner.ListOpenIssuesInput{Repo: "acme/app", CWD: testCase.cwd})
+		if err != nil {
+			t.Fatalf("ListOpenIssues(%s) error = %v", testCase.want, err)
+		}
+		if len(issues) != 1 || issues[0].Title != testCase.want {
+			t.Fatalf("ListOpenIssues(%s) = %#v", testCase.want, issues)
+		}
+	}
+
+	if _, _, err := forgejoClientForRepo(&cfg, "acme/app"); err == nil || !strings.Contains(err.Error(), "multiple projects") {
+		t.Fatalf("forgejoClientForRepo() error = %v, want ambiguous bare-repo rejection", err)
+	}
+}
+
+func TestForgeRoutingRejectsOverlappingWorktreeRoots(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	outerRoot := filepath.Join(root, "worktrees")
+	innerRoot := filepath.Join(outerRoot, "nested")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-one", Kind: config.ProviderKindForgejo},
+			{ID: "forgejo-two", Kind: config.ProviderKindForgejo},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "outer", Provider: "forgejo-one", Repo: "acme/outer", RepoPath: filepath.Join(root, "outer"), WorktreeRoot: &outerRoot},
+			{ID: "inner", Provider: "forgejo-two", Repo: "acme/inner", RepoPath: filepath.Join(root, "inner"), WorktreeRoot: &innerRoot},
+		},
+	}
+	_, _, ok, err := forgejoProjectProviderForCWD(&cfg, filepath.Join(innerRoot, "feature"))
+	if err == nil || !strings.Contains(err.Error(), "matches multiple projects") {
+		t.Fatalf("forgejoProjectProviderForCWD() = ok %v, error %v; want ambiguous root rejection", ok, err)
+	}
+}
+
 func TestWorkerGitHubAdapterForgejoCreatePullRequestQueuesReviewerDiscoveryLabel(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var createdBody map[string]any

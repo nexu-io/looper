@@ -221,6 +221,17 @@ func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
 		writeEnvelope(t, w, pkgapi.Success("req_prs", map[string]any{"items": []map[string]any{{
+			"projectId":      "github",
+			"repo":           "acme/looper",
+			"prNumber":       42,
+			"title":          "Fix queue visibility",
+			"mergeability":   "blocked",
+			"blockingReason": "checks",
+			"reviewState":    "APPROVED",
+			"checksSummary":  "FAILURE",
+			"reviewer":       "completed",
+		}, {
+			"projectId":      "forgejo",
 			"repo":           "acme/looper",
 			"prNumber":       42,
 			"title":          "Fix queue visibility",
@@ -238,10 +249,41 @@ func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([pr list]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	for _, want := range []string{"mergeability", "blocker", "blocked", "checks"} {
+	for _, want := range []string{"project", "github", "forgejo", "mergeability", "blocker", "blocked", "checks"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout, want)
 		}
+	}
+}
+
+func TestPullRequestShowAndStatusPassProjectSelection(t *testing.T) {
+	t.Parallel()
+
+	for _, command := range []string{"show", "status"} {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				wantPath := "/api/v1/pull-requests/acme%2Flooper/42"
+				if command == "status" {
+					wantPath += "/status"
+				}
+				if got := r.URL.EscapedPath(); got != wantPath {
+					t.Fatalf("request path = %q, want %q", got, wantPath)
+				}
+				if got := r.URL.Query().Get("projectId"); got != "forgejo" {
+					t.Fatalf("projectId = %q, want forgejo", got)
+				}
+				writeEnvelope(t, w, pkgapi.Success("req_pr", map[string]any{"projectId": "forgejo", "repo": "acme/looper", "prNumber": 42, "reviewState": "OPEN"}))
+			}))
+			defer server.Close()
+
+			configPath := writeCLIConfig(t, server.URL, "")
+			exitCode, _, stderr := runApp(t, "pr", command, "acme/looper#42", "--project", "forgejo", "--config", configPath)
+			if exitCode != 0 {
+				t.Fatalf("Run([pr %s]) exit code = %d, want 0; stderr=%q", command, exitCode, stderr)
+			}
+		})
 	}
 }
 
