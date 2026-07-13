@@ -124,6 +124,51 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 }
 
+func TestRunDefaultSchedulerTickUsesCapturedCatalogProjectBindings(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-catalog-binding.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	forgejoMetadata := `{"provider":"forgejo-main","repo":"forgejo/new"}`
+	for _, record := range []storage.ProjectRecord{
+		{ID: "rebound", Name: "Rebound", RepoPath: filepath.Join(workingDir, "rebound"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "new", Name: "New", RepoPath: filepath.Join(workingDir, "new"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Projects.Upsert(context.Background(), record); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", record.ID, err)
+		}
+	}
+
+	captured := config.Config{
+		Projects:  []config.ProjectRefConfig{{ID: "rebound", Repo: "github/old"}},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+	}
+	plannerRunner := &stubPlannerScheduler{}
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		Config:                  &captured,
+		Planner:                 plannerRunner,
+		Coordinator:             coordinatorRunner,
+		CoordinatorEnabled:      func(string) bool { return true },
+		PlannerDiscoveryEnabled: boolPtr(true),
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+
+	if len(plannerRunner.discoverCalls) != 1 || plannerRunner.discoverCalls[0].ProjectID != "rebound" || plannerRunner.discoverCalls[0].Repo != "github/old" {
+		t.Fatalf("planner discover calls = %#v, want only captured binding github/old", plannerRunner.discoverCalls)
+	}
+	if len(coordinatorRunner.discoverCalls) != 1 || coordinatorRunner.discoverCalls[0].ProjectID != "rebound" || coordinatorRunner.discoverCalls[0].Repo != "github/old" {
+		t.Fatalf("coordinator discover calls = %#v, want captured GitHub binding only", coordinatorRunner.discoverCalls)
+	}
+}
+
 func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	t.Parallel()
 
@@ -487,6 +532,7 @@ func TestRunDefaultSchedulerTickLogsClaimPhasesAndSlowLanes(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Scheduler.SlowLaneWarnThresholdMS = 1
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Repo: "nexu-io/looper"}}
 
 	plannerRunner := &sleepingPlannerScheduler{delay: 5 * time.Millisecond}
 	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{

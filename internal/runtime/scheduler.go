@@ -2611,10 +2611,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		providerKind := config.ProviderKindGitHub
-		if input.Config != nil {
-			providerKind = runtimeProjectProviderKind(*input.Config, project.ID)
-		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
+		if input.Config != nil {
+			binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+			if !ok {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
+				}
+				continue
+			}
+			providerKind = config.ResolvedProjectProviderKind(*input.Config, binding)
+			repo = strings.TrimSpace(binding.Repo)
+		}
 		var snapshot *githubinfra.DiscoverySnapshot
 		if providerKind == config.ProviderKindGitHub {
 			snapshot = projectSnapshot(project.ID)

@@ -844,12 +844,20 @@ func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 }
 
 func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return config.ResolvedProjectProviderKind(cfg, project)
-		}
+	project, ok := runtimeProjectBinding(cfg, projectID)
+	if ok {
+		return config.ResolvedProjectProviderKind(cfg, project)
 	}
 	return config.ProviderKindGitHub
+}
+
+func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return project, true
+		}
+	}
+	return config.ProjectRefConfig{}, false
 }
 
 func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
