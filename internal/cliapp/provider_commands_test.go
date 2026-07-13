@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestParseBootstrapRemote(t *testing.T) {
@@ -26,6 +27,23 @@ func TestParseBootstrapRemote(t *testing.T) {
 		if remote.Host != "code.example.com" || remote.Repo != "acme/looper" {
 			t.Fatalf("parseBootstrapRemote(%q) = %#v", value, remote)
 		}
+	}
+}
+
+func TestParseBootstrapRemoteAllowsConfiguredForgejoBasePath(t *testing.T) {
+	t.Parallel()
+	remote, err := parseBootstrapRemote("https://code.example.com/forge/acme/looper.git")
+	if err != nil {
+		t.Fatalf("parseBootstrapRemote() error = %v", err)
+	}
+	if remote.Repo != "acme/looper" || remote.Path != "forge/acme/looper" {
+		t.Fatalf("remote = %#v", remote)
+	}
+	if !forgejoRemoteMatchesBaseURL(remote, "https://code.example.com/forge") {
+		t.Fatal("remote should match its configured Forgejo base path")
+	}
+	if forgejoRemoteMatchesBaseURL(remote, "https://code.example.com/other") {
+		t.Fatal("remote should not match a different Forgejo base path")
 	}
 }
 
@@ -144,6 +162,93 @@ func TestEnsureBootstrapConfigCreatesForgejoBinding(t *testing.T) {
 	}
 	if len(loaded.Projects) != 1 || loaded.Projects[0].Provider != "forgejo" || loaded.Projects[0].Repo != "acme/looper" {
 		t.Fatalf("projects = %#v", loaded.Projects)
+	}
+}
+
+func TestEnsureBootstrapConfigPreservesForgejoBindingWhenAppending(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	projectPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := config.MarshalConfigFile(configPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{}), nil)
+	created, projectAdded, err := runtime.ensureBootstrapConfig(configPath, root, bootstrapConfigPlan{
+		Provider: bootstrapProviderForgejo, ProjectPath: projectPath, Repo: "acme/looper",
+		ForgejoProviderID: "forgejo", ForgejoURL: "https://code.example.com", ForgejoTokenEnv: "FORGEJO_TOKEN",
+	})
+	if err != nil {
+		t.Fatalf("ensureBootstrapConfig() error = %v", err)
+	}
+	if created || !projectAdded {
+		t.Fatalf("created=%v projectAdded=%v", created, projectAdded)
+	}
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: root, Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Config.Projects) != 1 || loaded.Config.Projects[0].Provider != "forgejo" || loaded.Config.Projects[0].Repo != "acme/looper" {
+		t.Fatalf("projects = %#v", loaded.Config.Projects)
+	}
+}
+
+func TestProviderRemoveRejectsAPIManagedProjectBinding(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	dbPath := filepath.Join(root, "looper.sqlite")
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Providers = append(cfg.Providers, config.ProviderConfig{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: stringPtr("FORGEJO_TOKEN")})
+	raw, err := config.MarshalConfigFile(configPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"provider":"forgejo-main","repo":"acme/looper","source":"api"}`
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := storage.NewRepositories(coordinator.DB()).Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "api-project", Name: "API Project", RepoPath: filepath.Join(root, "repo"), MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, LookPath: configLookPathForTests()})
+	exitCode := app.Run(context.Background(), []string{"provider", "remove", "forgejo-main", "--force", "--config", configPath})
+	if exitCode == 0 || !strings.Contains(stderr.String(), `provider "forgejo-main" is bound to project "api-project"`) {
+		t.Fatalf("provider remove exit=%d stderr=%q", exitCode, stderr.String())
+	}
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: root, Args: []string{"--config", configPath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Config.Providers) != 1 || loaded.Config.Providers[0].ID != "forgejo-main" {
+		t.Fatalf("providers = %#v", loaded.Config.Providers)
 	}
 }
 

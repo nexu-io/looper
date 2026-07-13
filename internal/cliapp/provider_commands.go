@@ -3,6 +3,7 @@ package cliapp
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -98,7 +100,7 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	if forgejoURL == "" {
 		matches := make([]string, 0)
 		for _, provider := range loaded.Config.Providers {
-			if provider.Kind == config.ProviderKindForgejo && forgejoRemoteMatchesBaseURL(remote.Host, provider.BaseURL) {
+			if provider.Kind == config.ProviderKindForgejo && forgejoRemoteMatchesBaseURL(remote, provider.BaseURL) {
 				matches = append(matches, provider.ID)
 			}
 		}
@@ -115,7 +117,7 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	if err != nil {
 		return "", "", err
 	}
-	if !forgejoRemoteMatchesBaseURL(remote.Host, baseURL) {
+	if !forgejoRemoteMatchesBaseURL(remote, baseURL) {
 		return "", "", fmt.Errorf("origin host %q does not match --forgejo-url %q", remote.Host, baseURL)
 	}
 	tokenEnv := strings.TrimSpace(getStringFlag(cmd, "forgejo-token-env"))
@@ -246,6 +248,13 @@ func (r *commandRuntime) providerRemove(cmd *cobra.Command, args []string) error
 	if index < 0 {
 		return fmt.Errorf("provider %q not found", id)
 	}
+	runtimeProjectID, err := runtimeProjectBoundToProvider(cmd.Context(), loaded.Config.Storage.DBPath, id)
+	if err != nil {
+		return err
+	}
+	if runtimeProjectID != "" {
+		return fmt.Errorf("provider %q is bound to project %q; remove or rebind the project first", id, runtimeProjectID)
+	}
 	if !getBoolFlag(cmd, "force") {
 		confirmed, err := promptBootstrapBool(bufio.NewReader(cmd.InOrStdin()), cmd.OutOrStdout(), fmt.Sprintf("Remove provider %s", id), false)
 		if err != nil {
@@ -263,6 +272,39 @@ func (r *commandRuntime) providerRemove(cmd *cobra.Command, args []string) error
 		return err
 	}
 	return writeProviderResult(cmd, providerOutput{ID: id, ConfigPath: loaded.Metadata.ConfigPath, RestartRequired: true}, "Provider removed")
+}
+
+func runtimeProjectBoundToProvider(ctx context.Context, dbPath, providerID string) (string, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("check runtime project database: %w", err)
+	}
+	db, err := storage.OpenSQLiteDB(ctx, dbPath)
+	if err != nil {
+		return "", fmt.Errorf("open runtime project database: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	projects, err := storage.NewRepositories(db).Projects.List(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, project := range projects {
+		if project.Archived || project.MetadataJSON == nil {
+			continue
+		}
+		var metadata struct {
+			Provider string `json:"provider"`
+		}
+		if err := json.Unmarshal([]byte(*project.MetadataJSON), &metadata); err != nil {
+			return "", fmt.Errorf("decode project %q metadata: %w", project.ID, err)
+		}
+		if strings.TrimSpace(metadata.Provider) == providerID {
+			return project.ID, nil
+		}
+	}
+	return "", nil
 }
 
 func partialProviders(loaded config.LoadedFileConfig) []config.PartialProviderConfig {

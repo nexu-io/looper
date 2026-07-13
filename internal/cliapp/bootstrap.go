@@ -446,7 +446,7 @@ func (r *commandRuntime) resolveForgejoBootstrapPlan(ctx context.Context, plan *
 	if err != nil {
 		return nil, err
 	}
-	if !forgejoRemoteMatchesBaseURL(remote.Host, baseURL) {
+	if !forgejoRemoteMatchesBaseURL(remote, baseURL) {
 		return nil, fmt.Errorf("origin host %q does not match --forgejo-url %q; pass the URL for that remote or correct origin", remote.Host, baseURL)
 	}
 	if remote.Repo == "" {
@@ -477,6 +477,7 @@ func (r *commandRuntime) resolveForgejoBootstrapPlan(ctx context.Context, plan *
 
 type bootstrapOriginRemote struct {
 	Host string
+	Path string
 	Repo string
 }
 
@@ -512,11 +513,12 @@ func parseBootstrapRemote(value string) (bootstrapOriginRemote, error) {
 		}
 		host, path = parsed.Hostname(), parsed.Path
 	}
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if host == "" || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return bootstrapOriginRemote{}, fmt.Errorf("git origin must identify exactly owner/repo")
+	remotePath := strings.Trim(path, "/")
+	parts := strings.Split(remotePath, "/")
+	if host == "" || len(parts) < 2 || parts[len(parts)-2] == "" || parts[len(parts)-1] == "" {
+		return bootstrapOriginRemote{}, fmt.Errorf("git origin must identify owner/repo")
 	}
-	return bootstrapOriginRemote{Host: strings.ToLower(host), Repo: parts[0] + "/" + parts[1]}, nil
+	return bootstrapOriginRemote{Host: strings.ToLower(host), Path: remotePath, Repo: parts[len(parts)-2] + "/" + parts[len(parts)-1]}, nil
 }
 
 func validateForgejoBaseURL(value string) (string, error) {
@@ -528,14 +530,21 @@ func validateForgejoBaseURL(value string) (string, error) {
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-func forgejoRemoteMatchesBaseURL(remoteHost, baseURL string) bool {
+func forgejoRemoteMatchesBaseURL(remote bootstrapOriginRemote, baseURL string) bool {
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
 		return false
 	}
-	remoteHost = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(remoteHost)), "ssh.")
+	remoteHost := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(remote.Host)), "ssh.")
 	providerHost := strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
-	return strings.TrimPrefix(remoteHost, "www.") == providerHost
+	if strings.TrimPrefix(remoteHost, "www.") != providerHost {
+		return false
+	}
+	basePath := strings.Trim(strings.TrimSpace(parsed.Path), "/")
+	if basePath == "" {
+		return len(strings.Split(remote.Path, "/")) == 2
+	}
+	return strings.HasPrefix(remote.Path, basePath+"/") && len(strings.Split(strings.TrimPrefix(remote.Path, basePath+"/"), "/")) == 2
 }
 
 // detectBootstrapOriginRepo best-effort resolves owner/repo from the git origin
@@ -933,12 +942,21 @@ func partialProjectFromConfig(project config.ProjectRefConfig) config.PartialPro
 	return config.PartialProjectRefConfig{
 		ID:           project.ID,
 		Name:         project.Name,
+		Provider:     stringPtrIfSet(project.Provider),
+		Repo:         stringPtrIfSet(project.Repo),
 		RepoPath:     project.RepoPath,
 		Path:         project.Path,
 		BaseBranch:   project.BaseBranch,
 		WorktreeRoot: project.WorktreeRoot,
 		Roles:        project.Roles,
 	}
+}
+
+func stringPtrIfSet(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return stringPtr(value)
 }
 
 func writeBootstrapPartialConfig(path string, partial config.PartialConfig) error {
