@@ -16,6 +16,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -130,6 +131,7 @@ type PullRequestDetail struct {
 	Body        string
 	URL         string
 	State       string
+	Labels      []string
 	HeadRefName string
 	BaseRefName string
 }
@@ -443,6 +445,10 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+type holdSkipError struct{ summary string }
+
+func (e *holdSkipError) Error() string { return e.summary }
+
 func (e *loopError) Error() string { return e.message }
 
 type transientFailure interface{ Temporary() bool }
@@ -528,6 +534,10 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
+		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !shouldClaimIssue(issue, login, policy) {
 			result.Skipped++
 			continue
@@ -656,6 +666,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
+	if !plannerQueueItemIsManual(queueItem) {
+		if held, summary, err := r.plannerHoldSummary(ctx, *project, queueItem, *loop); err != nil {
+			return ProcessResult{}, err
+		} else if held {
+			return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, summary)
+		}
+	}
 	claimedLockKey := ""
 	if resumedRun.StartStep != stepDiscoverIssues {
 		claimedLockKey = checkpoint.ClaimedLockKey
@@ -696,6 +713,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
 		if err != nil {
+			var holdErr *holdSkipError
+			if errors.As(err, &holdErr) {
+				return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
+			}
 			failure := r.classifyFailureWithBoundary(err, plannerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
@@ -961,6 +982,13 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
+		if !plannerQueueItemIsManual(input.QueueItem) {
+			if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
+		}
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
 		if err != nil {
 			return checkpoint, err
@@ -986,6 +1014,13 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				kind = FailureRetryableTransient
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
+		}
+		if !plannerQueueItemIsManual(input.QueueItem) {
+			if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
@@ -1031,6 +1066,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	if plannerQueueItemIsManual(input.QueueItem) {
+		// Phase 2 applies only to automatic planner lanes.
+	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if !r.allowAutoPush {
 		message := fmt.Sprintf("Auto push disabled; manual publish required for planner %s", input.Loop.ID)
 		checkpoint.SkipReason = message
@@ -1070,6 +1112,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
 	}
+	if plannerQueueItemIsManual(input.QueueItem) {
+		// Phase 2 applies only to automatic planner lanes.
+	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if checkpoint.Publish.PullRequest == nil {
 		if checkpoint.Lifecycle != nil && checkpoint.Lifecycle.PRNumber > 0 {
 			adopted, err := r.validatedLifecyclePullRequest(ctx, input, *issue, *worktree, checkpoint.Lifecycle)
@@ -1077,6 +1126,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			if adopted != nil {
+				if held, summary, err := r.plannerAdoptionHoldSummary(ctx, input.Project, checkpoint, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+					return checkpoint, err
+				} else if held {
+					return checkpoint, &holdSkipError{summary: summary}
+				}
 				if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, true); err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
@@ -1105,6 +1159,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if adopted != nil {
+			if held, summary, err := r.plannerAdoptionHoldSummary(ctx, input.Project, checkpoint, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
 			if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, false); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
@@ -1147,6 +1206,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if pr == nil || pr.Number == 0 {
 		return checkpoint, &loopError{message: "Planner publish requires a pull request number", kind: FailureRetryableAfterResume}
 	}
+	if plannerQueueItemIsManual(input.QueueItem) {
+		// Phase 2 applies only to automatic planner lanes.
+	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if !stringInSlice(specpr.ReviewingLabel, checkpoint.Publish.LabelsAdded) {
 		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1173,6 +1239,104 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) plannerHoldSummary(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord) (bool, string, error) {
+	if r.github == nil {
+		return false, "", nil
+	}
+	repo := firstNonEmpty(derefString(queueItem.Repo), derefString(loop.Repo))
+	issueNumber := parseIssueNumberFromTargetID(derefString(loop.TargetID))
+	if issueNumber == 0 {
+		issueNumber = parseIssueNumberFromTargetID(queueItem.TargetID)
+	}
+	if repo == "" || issueNumber == 0 {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if !domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return false, "", nil
+	}
+	return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, issueNumber), nil
+}
+
+func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project storage.ProjectRecord, checkpoint plannerCheckpoint) (bool, string, error) {
+	if r.github == nil {
+		return false, "", nil
+	}
+	if checkpoint.Issue == nil {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: checkpoint.Issue.Repo, IssueNumber: checkpoint.Issue.IssueNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber), nil
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number == 0 {
+		return false, "", nil
+	}
+	prDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, prDetail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Publish.PullRequest.Number), nil
+	}
+	return false, "", nil
+}
+
+func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, queueItem storage.QueueItemRecord) (bool, string, error) {
+	if plannerQueueItemIsManual(queueItem) || r.github == nil || repo == "" || prNumber == 0 {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, prNumber), nil
+	}
+	return false, "", nil
+}
+
+func (r *Runner) plannerAdoptionHoldSummary(ctx context.Context, project storage.ProjectRecord, checkpoint plannerCheckpoint, repo string, prNumber int64, queueItem storage.QueueItemRecord) (bool, string, error) {
+	if plannerQueueItemIsManual(queueItem) {
+		return false, "", nil
+	}
+	if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, project, checkpoint); err != nil || held {
+		return held, summary, err
+	}
+	return r.plannerAdoptedPullRequestHoldSummary(ctx, project, repo, prNumber, queueItem)
+}
+
+func (r *Runner) finishHeldPlannerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint plannerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
 }
 
 func plannerWorktreeRoot(project storage.ProjectRecord) (string, error) {
@@ -1804,6 +1968,10 @@ func includesLogin(values []string, target string) bool {
 func isManualPlannerQueue(payload map[string]any) bool {
 	manual, ok := payload["manual"].(bool)
 	return ok && manual
+}
+
+func plannerQueueItemIsManual(queueItem storage.QueueItemRecord) bool {
+	return isManualPlannerQueue(parseJSONObject(queueItem.PayloadJSON))
 }
 
 func shouldClaimIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {

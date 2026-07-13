@@ -11,6 +11,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
 )
 
@@ -2113,6 +2114,14 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
 			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -2124,8 +2133,8 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Summary.Created != 2 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=2 updated=1 skipped=1 failed=0", result.Summary)
+	if result.Summary.Created != 6 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=6 updated=1 skipped=1 failed=0", result.Summary)
 	}
 
 	log := strings.Join(runner.calls, "\n")
@@ -2134,6 +2143,10 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 		"label edit looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review",
 		"label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation",
 		"label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention",
+		"label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR",
+		"label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR",
+		"label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR",
+		"label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR",
 	} {
 		if !strings.Contains(log, needle) {
 			t.Fatalf("gh log missing %q\n%s", needle, log)
@@ -2157,6 +2170,14 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo github.example.com/acme/looper --color d93f0b --description Looper requires manual intervention":
 			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold --repo github.example.com/acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:worker --repo github.example.com/acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:fixer --repo github.example.com/acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:reviewer --repo github.example.com/acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -2168,8 +2189,8 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 4 {
-		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=4", result)
+	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 8 {
+		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=8", result)
 	}
 }
 
@@ -2190,8 +2211,8 @@ func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels(dry run) error = %v", err)
 	}
-	if result.Summary.Created != 4 || len(runner.calls) != 1 {
-		t.Fatalf("dry run result = %#v, calls = %#v; want four planned creates and only label list", result.Summary, runner.calls)
+	if result.Summary.Created != 8 || len(runner.calls) != 1 {
+		t.Fatalf("dry run result = %#v, calls = %#v; want eight planned creates and only label list", result.Summary, runner.calls)
 	}
 }
 
@@ -2204,11 +2225,19 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 		case "label list --repo acme/looper --limit 1000 --json name,color,description":
 			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
 		case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
-			result := shell.Result{ExitCode: 1, Stderr: "permission denied"}
-			return result, &shell.CommandExecutionError{Message: "gh exited with code 1: permission denied", Result: result}
+			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+			result := shell.Result{ExitCode: 1, Stderr: "permission denied"}
+			return result, &shell.CommandExecutionError{Message: "gh exited with code 1: permission denied", Result: result}
+		case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
 			return shell.Result{Stdout: "{}"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
@@ -2221,10 +2250,16 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 	if err == nil {
 		t.Fatalf("InitializeLabels() error = nil, want failure")
 	}
-	if result.Summary.Failed != 1 || result.Summary.Created != 2 || result.Summary.Skipped != 1 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=2 skipped=1 failed=1", result.Summary)
+	if result.Summary.Failed != 1 || result.Summary.Created != 6 || result.Summary.Skipped != 1 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=6 skipped=1 failed=1", result.Summary)
 	}
-	if got := result.Labels[1].Error; !strings.Contains(got, "permission denied") {
+	got := ""
+	for _, label := range result.Labels {
+		if label.Name == domain.HoldLabelWorker {
+			got = label.Error
+		}
+	}
+	if !strings.Contains(got, "permission denied") {
 		t.Fatalf("failed label error = %q, want stderr details", got)
 	}
 }

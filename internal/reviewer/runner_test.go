@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
@@ -54,6 +55,163 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	}
 	if queue == nil || queue.Status != "queued" || queue.DedupeKey != "reviewer:project_1:"+result.CreatedLoopIDs[0]+":acme/looper:42" {
 		t.Fatalf("queue = %#v, want queued reviewer item", queue)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsReviewerHoldLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped == 0 {
+		t.Fatalf("result = %#v, want held PR skipped", result)
+	}
+}
+
+func TestDiscoverPullRequestsAllowsManualReviewerFollowUpWhenHeld(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", labels: []string{domain.HoldLabelReviewer}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"manual":true}`
+	loop := storage.LoopRecord{ID: "loop_manual_follow_hold_allowed", Seq: 6, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].LoopID == nil || *result.QueueItems[0].LoopID != loop.ID {
+		t.Fatalf("result = %#v, want manual held follow-up queued", result)
+	}
+}
+
+func TestRunPublishStepSkipsWhenReviewerHoldApplied(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123", Event: ReviewEventComment}}})
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("runPublishStep() error = %v, want hold skip", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("checkpoint = %#v, want unchanged checkpoint before hold handling", checkpoint)
+	}
+}
+
+func TestProcessClaimedItemSkipsHeldFreshAutomaticReviewerBeforeStepExecution(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_runtime_hold", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_reviewer_runtime_hold"
+	lockKey := loopTarget
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_runtime_hold", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:runtime-hold", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_runtime_hold", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", LockKey: &lockKey})
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "currently held") {
+		t.Fatalf("result = %#v, want held skipped result", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none", agent.starts)
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want none", github.issueCommentCalls)
+	}
+}
+
+func TestProcessClaimedItemSkipsHeldRoutedReviewerBeforeRoutingDrift(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_routed_hold", Seq: 4, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_reviewer_routed_hold"
+	lockKey := loopTarget
+	queue := storage.QueueItemRecord{ID: "queue_reviewer_routed_hold", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:routed-runtime-hold", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	autoDiscovery := true
+	cfg := &config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
+	github := &fakeGitHubGateway{currentLogin: "reviewer", author: "author", labels: []string{domain.HoldLabelReviewer}, reviewRequests: []string{}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: cfg})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "currently held") {
+		t.Fatalf("result = %#v, want held skipped result", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none", agent.starts)
+	}
+}
+
+func TestProcessClaimedItemSkipsHeldFreshAutomaticReviewerBeforeRoutedRevalidation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_fresh_hold", Seq: 3, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_reviewer_fresh_hold"
+	lockKey := loopTarget
+	queue := storage.QueueItemRecord{ID: "queue_reviewer_fresh_hold", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:fresh-runtime-hold", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "currently held") {
+		t.Fatalf("result = %#v, want held skipped result", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none", agent.starts)
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want none", github.issueCommentCalls)
 	}
 }
 
@@ -411,6 +569,102 @@ func TestRevalidateRoutedReviewerClaimTreatsLoginRefreshFailureAsTransient(t *te
 	}
 	if github.currentLoginCalls != 1 {
 		t.Fatalf("GetCurrentUserLogin calls = %d, want 1", github.currentLoginCalls)
+	}
+}
+
+func TestRevalidateRoutedReviewerClaimBypassesHoldForManualLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	metadata := `{"manual":true,"followUpdates":true}`
+	loopID := "loop_manual_routed_hold"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 7, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	autoDiscovery := true
+	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: "/tmp/repo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	if err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{LoopID: &loopID, Repo: &repo, PRNumber: &prNumber}); err != nil {
+		t.Fatalf("revalidateRoutedReviewerClaim() error = %v", err)
+	}
+}
+
+func TestProcessClaimedItemHeldManualRoutedReviewerLoopBypassesHoldAndRoutingGate(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := "pr:acme/looper:42"
+	metadata := `{"manual":true,"followUpdates":true}`
+	loopID := "loop_manual_routed_process_hold"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 10, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	lockKey := loopTarget
+	queue := storage.QueueItemRecord{ID: "queue_manual_routed_process_hold", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:manual-routed-process-hold", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	autoDiscovery := true
+	cfg := &config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}, hasConflicts: true}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: cfg})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "conflicted") || strings.Contains(result.Summary, "currently held") {
+		t.Fatalf("result = %#v, want conflicted skip without hold skip", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none", agent.starts)
+	}
+}
+
+func TestProcessClaimedQueueItemRoutedRevalidationFailureDoesNotLeaveRunningRun(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_routed_revalidate_fail", Seq: 5, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_reviewer_routed_revalidate_fail"
+	lockKey := loopTarget
+	queue := storage.QueueItemRecord{ID: "queue_reviewer_routed_revalidate_fail", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:routed-revalidate-fail", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	autoDiscovery := true
+	requireReviewRequest := false
+	enableSelfReview := true
+	cfg := &config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery, Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}}}}}
+	github := &fakeGitHubGateway{author: "reviewer", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: cfg})
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), queue)
+	if err == nil || !strings.Contains(err.Error(), "gh auth failed") {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v, want routed revalidation failure", err)
+	}
+	if result != nil {
+		t.Fatalf("result = %#v, want nil on claim setup failure", result)
+	}
+	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	for _, run := range runs {
+		if run.Status == "running" {
+			t.Fatalf("runs = %#v, want no running run", runs)
+		}
 	}
 }
 
@@ -1223,6 +1477,29 @@ func TestDiscoverPullRequestsAllowsAutomaticFollowUpWhenCurrentUserIsRequested(t
 	}
 	if len(result.QueueItems) != 1 {
 		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
+	}
+}
+
+func TestDiscoverPullRequestsSkipsFollowUpLoopWhenReviewerHoldAppliedLive(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"bob"}, currentLogin: "bob", labels: []string{domain.HoldLabelReviewer}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true}`
+	loop := storage.LoopRecord{ID: "loop_follow_hold", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || result.Skipped == 0 {
+		t.Fatalf("result = %#v, want held follow-up PR skipped", result)
 	}
 }
 
@@ -2378,6 +2655,33 @@ func TestDiscoverPullRequestAllowsManualFollowUpAfterSkippedAutomaticLoopForSame
 	}
 	if result.QueueItems[0].LoopID == nil || *result.QueueItems[0].LoopID != "loop_manual_targeted_follow" {
 		t.Fatalf("queue loopID = %#v, want manual follow-up loop", result.QueueItems[0].LoopID)
+	}
+}
+
+func TestDiscoverPullRequestAllowsManualFollowUpAfterSkippingHeldAutomaticLoopForSamePR(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", labels: []string{domain.HoldLabelReviewer}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	automaticMetadata := `{"followUpdates":true}`
+	manualMetadata := `{"followUpdates":true,"manual":true}`
+	for _, loop := range []storage.LoopRecord{
+		{ID: "loop_auto_targeted_follow_hold", Seq: 8, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &automaticMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "loop_manual_targeted_follow_hold", Seq: 9, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &manualMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequest() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].LoopID == nil || *result.QueueItems[0].LoopID != "loop_manual_targeted_follow_hold" {
+		t.Fatalf("result = %#v, want held automatic skipped and manual follow-up queued", result)
 	}
 }
 
@@ -4273,6 +4577,47 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 	}
 }
 
+func TestProcessClaimedItemSkipsLinkedIssueLabelRemovalWhenReviewerHoldApplied(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		author:              "octocat",
+		currentLogin:        "reviewer",
+		labels:              []string{"looper:worker-ready"},
+		reviewMarkerMissing: true,
+		reviewRequests:      []string{"reviewer"},
+		viewBody:            "Implements feature.\n\nCloses #358",
+		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", domain.HoldLabelReviewer}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
+		"ship app change": {Verdict: criteria.VerdictPass, Justification: "present in diff", Evidence: []criteria.Evidence{{FilePath: "app.go", StartLine: 1, EndLine: 1}}},
+		"add tests":       {Verdict: criteria.VerdictFail, Justification: "no test change in diff"},
+	}}})
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queue item", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !strings.Contains(result.Summary, "currently held") {
+		t.Fatalf("result = %#v, want held linked issue skip", result)
+	}
+	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventComment) {
+		t.Fatalf("submitReviewCalls = %#v, want criteria failure review before held side effects", github.submitReviewCalls)
+	}
+	if len(github.removeIssueLabelCalls) != 0 {
+		t.Fatalf("removeIssueLabelCalls = %#v, want no held issue mutation", github.removeIssueLabelCalls)
+	}
+}
+
 func TestProcessClaimedItemFallsBackWhenLinkedIssueLookupIsUnavailable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -4813,6 +5158,78 @@ func TestProcessClaimedItemRefreshesReviewStateBeforeSpecReadyTransition(t *test
 	}
 	if len(github.addLabelCalls) != 1 || github.addLabelCalls[0].Labels[0] != specpr.ReadyLabel {
 		t.Fatalf("addLabelCalls = %#v, want spec-ready add after refresh", github.addLabelCalls)
+	}
+}
+
+func TestApplyVerifiedReviewSideEffectsPreservesCheckedHeadForSpecTransition(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		labels:                 []string{specpr.ReviewingLabel},
+		reviewDecision:         "APPROVED",
+		changeHeadOnSecondView: true,
+	}
+	runner := New(Options{
+		DB:           fixture.coordinator.DB(),
+		Repos:        fixture.repos,
+		GitHub:       github,
+		Logger:       fixture.logger,
+		Now:          fixture.now,
+		ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove},
+	})
+	input := stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"},
+		Loop:     storage.LoopRecord{ProjectID: "project_1", Type: "reviewer"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+	}
+	checkpoint := reviewerCheckpoint{
+		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}},
+	}
+	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}}
+
+	err := runner.applyVerifiedReviewSideEffects(context.Background(), input, checkpoint, detail, ReviewMarkerResult{Found: true, Outcome: "clean", Event: ReviewEventApprove})
+	if err == nil || !contains(err.Error(), "PR head changed before spec-ready transition: expected abc123, got new-head") {
+		t.Fatalf("applyVerifiedReviewSideEffects() error = %v, want head drift failure", err)
+	}
+	if len(github.removeLabelCalls) != 0 || len(github.addLabelCalls) != 0 {
+		t.Fatalf("label calls = remove:%#v add:%#v, want none after head drift", github.removeLabelCalls, github.addLabelCalls)
+	}
+}
+
+func TestApplyCleanNoopReviewSideEffectsPreservesCheckedHeadForSpecTransition(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		labels:                 []string{specpr.ReviewingLabel},
+		reviewDecision:         "APPROVED",
+		changeHeadOnSecondView: true,
+	}
+	runner := New(Options{
+		DB:           fixture.coordinator.DB(),
+		Repos:        fixture.repos,
+		GitHub:       github,
+		Logger:       fixture.logger,
+		Now:          fixture.now,
+		ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove},
+	})
+	input := stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"},
+		Loop:     storage.LoopRecord{ProjectID: "project_1", Type: "reviewer"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+	}
+	checkpoint := reviewerCheckpoint{
+		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}},
+	}
+	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}}
+
+	err := runner.applyCleanNoopReviewSideEffects(context.Background(), input, checkpoint, detail)
+	if err == nil || !contains(err.Error(), "PR head changed before spec-ready transition: expected abc123, got new-head") {
+		t.Fatalf("applyCleanNoopReviewSideEffects() error = %v, want head drift failure", err)
+	}
+	if len(github.removeLabelCalls) != 0 || len(github.addLabelCalls) != 0 {
+		t.Fatalf("label calls = remove:%#v add:%#v, want none after head drift", github.removeLabelCalls, github.addLabelCalls)
 	}
 }
 
@@ -6035,6 +6452,38 @@ func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
 	persistedCheckpoint := parseCheckpoint(persistedRun.CheckpointJSON)
 	if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.Path != git.worktreePath {
 		t.Fatalf("persisted checkpoint worktree = %#v, want recreated worktree path", persistedCheckpoint.Worktree)
+	}
+}
+
+func TestRunReviewStepRechecksHoldBeforeAgentStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	_, err = runner.runReviewStep(context.Background(), stepInput{
+		Project:  *project,
+		Loop:     storage.LoopRecord{ID: "loop_hold_before_agent", Type: "reviewer"},
+		Run:      storage.RunRecord{ID: "run_hold_before_agent"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", Labels: []string{}},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runReviewStep() error = %v, want hold skip", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none", agent.starts)
 	}
 }
 

@@ -140,3 +140,32 @@ func TestAssertStepBelongsToLoopType(t *testing.T) {
 		t.Fatal("AssertStepBelongsToLoopType(planner, execute) error = nil, want failure")
 	}
 }
+
+func TestIsAutoLaneHeld(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		loopType LoopType
+		labels   []string
+		want     bool
+	}{
+		{name: "global blocks planner", loopType: LoopTypePlanner, labels: []string{HoldLabelGlobal}, want: true},
+		{name: "planner ignores worker hold", loopType: LoopTypePlanner, labels: []string{HoldLabelWorker}, want: false},
+		{name: "worker blocked by worker hold", loopType: LoopTypeWorker, labels: []string{HoldLabelWorker}, want: true},
+		{name: "worker blocked by global hold", loopType: LoopTypeWorker, labels: []string{HoldLabelGlobal}, want: true},
+		{name: "reviewer blocked by reviewer hold", loopType: LoopTypeReviewer, labels: []string{HoldLabelReviewer}, want: true},
+		{name: "fixer blocked by fixer hold", loopType: LoopTypeFixer, labels: []string{HoldLabelFixer}, want: true},
+		{name: "no prefix matching", loopType: LoopTypeWorker, labels: []string{"looper:hold:worker:extra"}, want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsAutoLaneHeld(tt.loopType, tt.labels); got != tt.want {
+				t.Fatalf("IsAutoLaneHeld(%s, %#v) = %v, want %v", tt.loopType, tt.labels, got, tt.want)
+			}
+		})
+	}
+}

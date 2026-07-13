@@ -2,6 +2,7 @@ package cliapp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,9 +13,11 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/outboundguard"
+	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -41,6 +44,10 @@ type reviewSubmitDiagnosticFields struct {
 	Error       string
 	Extra       map[string]any
 	RedactPaths bool
+}
+
+type reviewSubmitPullRequestViewer interface {
+	ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 }
 
 func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
@@ -93,14 +100,17 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		writeReviewSubmitDiagnosticEntry(cmd.ErrOrStderr(), event, fields)
 	}
 	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run, ReviewSubmitDiagnostic: diagnosticWriter})
-	metadata, err := gh.GetPullRequestHeadAndAuthor(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
-		return fmt.Errorf("validate expected PR head commit: %w", err)
+		return fmt.Errorf("refresh pull request before review submit: %w", err)
 	}
-	if err := validateExpectedHeadCommit(commitID, metadata.HeadSHA); err != nil {
+	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, metadata.Author); err != nil {
+	if err := r.validateReviewerReviewSubmitHold(cmd, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), detail.Labels); err != nil {
+		return err
+	}
+	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
 		// Always redact paths on pre-gate validation diagnostics: a malformed
 		// marker or APPROVE-with-comments path never reaches SubmitReview's
 		// content guard, and path may itself be secret-shaped.
@@ -109,7 +119,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		})
 		return err
 	}
-	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gh, repo, prNumber, event, metadata.Author, cwd)
+	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gh, repo, prNumber, event, detail.Author, cwd)
 	if err != nil {
 		return err
 	}
@@ -117,6 +127,9 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	var anchors *diffanchor.Index
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
+			if err := r.validateLatestReviewerReviewSubmitHold(cmd, gh, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+				return err
+			}
 			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
 		return fmt.Errorf("fetch PR diff for anchor validation: %w", err)
@@ -127,6 +140,9 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+	}
+	if err := r.validateLatestReviewerReviewSubmitHold(cmd, gh, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+		return err
 	}
 	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
 		return wrapReviewSubmitError(cmd, repo, prNumber, submissionEvent, commitID, payload, "submit validated PR review", err)
@@ -329,6 +345,134 @@ func validateExpectedHeadCommit(expected string, actual string) error {
 		return fmt.Errorf("review submit expected head commit %s but PR head is %s; refresh the review before submitting", expected, actual)
 	}
 	return nil
+}
+
+func (r *commandRuntime) validateReviewerReviewSubmitHold(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, manual bool, runID string, labels []string) error {
+	if !domain.IsAutoLaneHeld(domain.LoopTypeReviewer, labels) {
+		return nil
+	}
+	if manual {
+		db, err := storage.OpenSQLiteDB(cmd.Context(), cfg.Storage.DBPath)
+		if err != nil {
+			return fmt.Errorf("validate held manual reviewer run: %w", err)
+		}
+		defer func() { _ = db.Close() }()
+		trusted, err := trustedManualReviewerRun(cmd.Context(), storage.NewRepositories(db), repo, prNumber, runID)
+		if err != nil {
+			return err
+		}
+		if trusted {
+			return nil
+		}
+	}
+	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
+}
+
+func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, manual bool, runID string, cwd string) error {
+	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return fmt.Errorf("refresh pull request hold labels before review submit: %w", err)
+	}
+	return r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels)
+}
+
+func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (bool, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return false, nil
+	}
+	if repos == nil || repos.Runs == nil || repos.Loops == nil {
+		return false, fmt.Errorf("validate held manual reviewer run: storage is not configured")
+	}
+	run, err := repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("validate held manual reviewer run: %w", err)
+	}
+	if run == nil {
+		return false, nil
+	}
+	if run.Status != string(domain.RunStatusRunning) {
+		return false, nil
+	}
+	loop, err := repos.Loops.GetByID(ctx, run.LoopID)
+	if err != nil {
+		return false, fmt.Errorf("validate held manual reviewer loop: %w", err)
+	}
+	loopRepo := ""
+	if loop != nil && loop.Repo != nil {
+		loopRepo = *loop.Repo
+	}
+	if loop == nil || loop.Type != string(domain.LoopTypeReviewer) || !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
+		return false, nil
+	}
+	if loop.Status != string(domain.LoopStatusRunning) {
+		return false, nil
+	}
+	currentRun, err := currentRunningReviewerRun(ctx, repos, repo, prNumber)
+	if err != nil {
+		return false, err
+	}
+	if currentRun == nil || currentRun.ID != run.ID {
+		return false, nil
+	}
+	manualValue, _ := parseReviewSubmitJSONObject(loop.MetadataJSON)["manual"].(bool)
+	return manualValue, nil
+}
+
+func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
+	loops, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusRunning)})
+	if err != nil {
+		return nil, fmt.Errorf("validate held manual reviewer loops: %w", err)
+	}
+	loopIDs := make([]string, 0, len(loops))
+	for _, loop := range loops {
+		loopRepo := ""
+		if loop.Repo != nil {
+			loopRepo = *loop.Repo
+		}
+		if loop.Type == string(domain.LoopTypeReviewer) && strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) && loop.PRNumber != nil && *loop.PRNumber == prNumber {
+			loopIDs = append(loopIDs, loop.ID)
+		}
+	}
+	if len(loopIDs) == 0 {
+		return nil, nil
+	}
+	runs, err := repos.Runs.ListLatestByLoopIDs(ctx, loopIDs)
+	if err != nil {
+		return nil, fmt.Errorf("validate held manual reviewer runs: %w", err)
+	}
+	var current *storage.RunRecord
+	for i := range runs {
+		if runs[i].Status != string(domain.RunStatusRunning) {
+			continue
+		}
+		if current == nil || reviewerRunNewer(runs[i], *current) {
+			run := runs[i]
+			current = &run
+		}
+	}
+	return current, nil
+}
+
+func reviewerRunNewer(candidate, current storage.RunRecord) bool {
+	if candidate.StartedAt != current.StartedAt {
+		return candidate.StartedAt > current.StartedAt
+	}
+	if candidate.CreatedAt != current.CreatedAt {
+		return candidate.CreatedAt > current.CreatedAt
+	}
+	return candidate.ID > current.ID
+}
+
+func parseReviewSubmitJSONObject(value *string) map[string]any {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return map[string]any{}
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(*value), &parsed); err != nil || parsed == nil {
+		return map[string]any{}
+	}
+	return parsed
 }
 
 func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {

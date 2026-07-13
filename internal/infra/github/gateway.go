@@ -16,6 +16,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/outboundguard"
@@ -3539,6 +3540,8 @@ func resolveLabelColor(label string) string {
 		return "0e8a16"
 	case specpr.NeedsHumanLabel:
 		return "d93f0b"
+	case domain.HoldLabelGlobal, domain.HoldLabelWorker, domain.HoldLabelFixer, domain.HoldLabelReviewer:
+		return "b60205"
 	default:
 		return "5319e7"
 	}
@@ -3554,6 +3557,14 @@ func resolveLabelDescription(label string) string {
 		return "Spec PR is ready for implementation"
 	case specpr.NeedsHumanLabel:
 		return "Looper requires manual intervention"
+	case domain.HoldLabelGlobal:
+		return "Block all automatic Looper activity for this issue or PR"
+	case domain.HoldLabelWorker:
+		return "Block automatic worker activity for this issue or PR"
+	case domain.HoldLabelFixer:
+		return "Block automatic fixer activity for this issue or PR"
+	case domain.HoldLabelReviewer:
+		return "Block automatic reviewer activity for this issue or PR"
 	default:
 		return "Managed by looper"
 	}
@@ -3565,6 +3576,10 @@ func StandardLooperLabels() []LabelDefinition {
 		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
 		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
 		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},
+		{Name: domain.HoldLabelGlobal, Color: resolveLabelColor(domain.HoldLabelGlobal), Description: resolveLabelDescription(domain.HoldLabelGlobal)},
+		{Name: domain.HoldLabelWorker, Color: resolveLabelColor(domain.HoldLabelWorker), Description: resolveLabelDescription(domain.HoldLabelWorker)},
+		{Name: domain.HoldLabelFixer, Color: resolveLabelColor(domain.HoldLabelFixer), Description: resolveLabelDescription(domain.HoldLabelFixer)},
+		{Name: domain.HoldLabelReviewer, Color: resolveLabelColor(domain.HoldLabelReviewer), Description: resolveLabelDescription(domain.HoldLabelReviewer)},
 	}
 }
 

@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
@@ -792,7 +793,7 @@ func TestReviewerLoopMetadataJSONRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	existing := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_iterations_per_pr","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
 	target := domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}
 
-	metadataJSON, err := reviewerLoopMetadataJSON(&existing, cfg.Roles.Reviewer.Behavior, target, "2026-04-11T12:00:00.000Z")
+	metadataJSON, err := reviewerLoopMetadataJSON(&existing, cfg.Roles.Reviewer.Behavior, target, "2026-04-11T12:00:00.000Z", false)
 	if err != nil {
 		t.Fatalf("reviewerLoopMetadataJSON() error = %v", err)
 	}
@@ -3065,6 +3066,211 @@ func TestHandlerWorkerCreateIgnoresSnapshotForProjectReactivatedToDifferentRepo(
 	}
 }
 
+func writeFakeGHHoldValidationScript(t *testing.T, labels []string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "gh")
+	encodedLabels := make([]string, 0, len(labels))
+	for _, label := range labels {
+		encodedLabels = append(encodedLabels, fmt.Sprintf(`{"name":%q}`, label))
+	}
+	labelJSON := "[" + strings.Join(encodedLabels, ",") + "]"
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '{"number":42,"title":"PR","body":"","url":"https://example/pr/42","state":"OPEN","isDraft":false,"reviewDecision":"","labels":%s,"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"base123","author":{"login":"octocat"},"reviewRequests":[],"mergeStateStatus":"CLEAN","reviews":[]}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "repos/acme/looper/issues/77" ]; then
+  printf '{"number":77,"title":"Issue","body":"","html_url":"https://example/issues/77","state":"open","labels":%s}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "--paginate" ] && [ "$3" = "--slurp" ]; then
+  printf '[]'
+  exit 0
+fi
+exit 1
+`, labelJSON, labelJSON)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	}
+	return path
+}
+
+func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	repoPath := filepath.Join(fixture.rootDir, "repo-hold")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	metadata := `{"repo":"acme/looper"}`
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	for _, tc := range []struct{ name, path, body string }{
+		{name: "planner", path: "/api/v1/planners", body: `{"projectId":"project_1","issueNumber":77}`},
+		{name: "reviewer", path: "/api/v1/loops", body: `{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`},
+		{name: "fixer", path: "/api/v1/loops", body: `{"projectId":"project_1","type":"fixer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`},
+		{name: "worker issue", path: "/api/v1/workers", body: `{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("content-type", "application/json")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "--force") {
+				t.Fatalf("body = %s, want --force guidance", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandlerPlannerCreateForceBypassesHold(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	repoPath := filepath.Join(fixture.rootDir, "repo-force-planner")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	metadata := `{"repo":"acme/looper"}`
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77,"force":true}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlerWorkerCreateRejectsHeldRequestedIssueEvenWhenPlannerPRExists(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	repoPath := filepath.Join(fixture.rootDir, "repo-worker-held-issue")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	metadata := `{"repo":"acme/looper"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelWorker}))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "--force") {
+		t.Fatalf("body = %s, want --force guidance", rec.Body.String())
+	}
+}
+
+func TestHandlerCreateManualLoopForceBypassesHoldButStillConflicts(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	repoPath := filepath.Join(fixture.rootDir, "repo-force")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	metadata := `{"repo":"acme/looper"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_existing_conflict", Seq: 100, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlerCreateReviewerLoopForcePersistsManualMetadata(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	repoPath := filepath.Join(fixture.rootDir, "repo-force-reviewer")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	metadata := `{"repo":"acme/looper"}`
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	data := parseJSONMap(t, rec.Body.Bytes())["data"].(map[string]any)
+	loopID := data["id"].(string)
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.MetadataJSON == nil {
+		t.Fatalf("loop = %#v, want stored metadata", loop)
+	}
+	loopMetadata := parseJSONObject(loop.MetadataJSON)
+	assertEqual(t, loopMetadata["manual"], true)
+}
+
+func TestHandlerCreateManualHoldValidationSkipsWhenRepoPathOrGHPathMissing(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		repoPath string
+		ghPath   *string
+	}{
+		{name: "missing repo path", repoPath: filepath.Join(t.TempDir(), "missing"), ghPath: stringPtr("/usr/bin/gh")},
+		{name: "missing gh path", repoPath: t.TempDir(), ghPath: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newTestFixture(t)
+			seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+			metadata := `{"repo":"acme/looper"}`
+			if tc.repoPath != "" {
+				if !strings.Contains(tc.name, "missing repo path") {
+					if err := os.MkdirAll(tc.repoPath, 0o755); err != nil {
+						t.Fatalf("MkdirAll(%s) error = %v", tc.repoPath, err)
+					}
+				}
+			}
+			if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: tc.repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			fixture.config.Tools.GHPath = tc.ghPath
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`)))
+			req.Header.Set("content-type", "application/json")
+			rec := httptest.NewRecorder()
+			NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestHandlerWorkerCreateRejectsRepoMismatchForExplicitProject(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
@@ -4302,6 +4508,186 @@ func TestHandlerWorkersCreateReusesDuplicateIssueWorkers(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWorker(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	completedAt := fixture.now.Add(-time.Minute).UTC().Format(javaScriptISOString)
+	targetID := "issue:acme/looper:77"
+	metadataJSON := `{"worker":{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}}`
+	payloadJSON := `{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}`
+	checkpointJSON := `{"work":{"title":"Held issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true},"skipReason":"held"}`
+	projectID := "project_1"
+	loopID := "loop_existing_held_issue_worker"
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           loopID,
+		Seq:          1,
+		ProjectID:    projectID,
+		Type:         "worker",
+		TargetType:   "issue",
+		TargetID:     &targetID,
+		Repo:         stringPtr("acme/looper"),
+		Status:       "idle",
+		MetadataJSON: &metadataJSON,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_existing_held_issue_worker) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_existing_held_issue_worker",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "worker",
+		TargetType:  "issue",
+		TargetID:    targetID,
+		Repo:        stringPtr("acme/looper"),
+		DedupeKey:   "worker:project_1:acme/looper:77",
+		Priority:    storage.QueuePriorityWorker,
+		Status:      "completed",
+		AvailableAt: completedAt,
+		Attempts:    1,
+		MaxAttempts: 3,
+		LockKey:     &targetID,
+		PayloadJSON: &payloadJSON,
+		FinishedAt:  &completedAt,
+		CreatedAt:   completedAt,
+		UpdatedAt:   completedAt,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_existing_held_issue_worker) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_existing_held_issue_worker",
+		LoopID:         loopID,
+		Status:         "success",
+		CheckpointJSON: &checkpointJSON,
+		StartedAt:      completedAt,
+		EndedAt:        &completedAt,
+		CreatedAt:      completedAt,
+		UpdatedAt:      completedAt,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_existing_held_issue_worker) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main","force":true}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], loopID)
+	assertEqual(t, data["reused"], true)
+
+	queueItem, err := fixture.runtime.Services().Repositories.Queue.FindActiveByDedupe(context.Background(), "worker:project_1:acme/looper:77")
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByDedupe() error = %v", err)
+	}
+	if queueItem == nil || queueItem.PayloadJSON == nil {
+		t.Fatalf("active queue item = %#v, want forced reused worker payload", queueItem)
+	}
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	if payload["autoDiscovered"] == true {
+		t.Fatalf("payload = %#v, want forced reused worker to bypass auto-discovered hold checks", payload)
+	}
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	workerMeta, _ := metadata["worker"].(map[string]any)
+	if workerMeta["autoDiscovered"] == true {
+		t.Fatalf("metadata = %#v, want forced reused worker metadata to bypass auto-discovered hold checks", metadata)
+	}
+	run, err := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_existing_held_issue_worker")
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	checkpoint := parseJSONObject(run.CheckpointJSON)
+	work, _ := checkpoint["work"].(map[string]any)
+	if work["autoDiscovered"] == true {
+		t.Fatalf("checkpoint = %#v, want forced reused worker checkpoint to bypass auto-discovered hold checks", checkpoint)
+	}
+}
+
+func TestHandlerWorkersCreateForceRejectsRunningReusableIssueWorker(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	targetID := "issue:acme/looper:77"
+	metadataJSON := `{"worker":{"title":"Running issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}}`
+	checkpointJSON := `{"work":{"title":"Running issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":77,"autoDiscovered":true}}`
+	loopID := "loop_running_issue_worker"
+
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:           loopID,
+		Seq:          1,
+		ProjectID:    "project_1",
+		Type:         "worker",
+		TargetType:   "issue",
+		TargetID:     &targetID,
+		Repo:         stringPtr("acme/looper"),
+		Status:       "running",
+		MetadataJSON: &metadataJSON,
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_running_issue_worker) error = %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:             "run_running_issue_worker",
+		LoopID:         loopID,
+		Status:         "running",
+		CheckpointJSON: &checkpointJSON,
+		StartedAt:      nowISO,
+		CreatedAt:      nowISO,
+		UpdatedAt:      nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(run_running_issue_worker) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main","force":true}`)))
+	req.Header.Set("x-request-id", "fixture-request-id")
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	apiErr := body["error"].(map[string]any)
+	assertEqual(t, apiErr["code"], string(pkgapi.ErrorCodeLoopConflict))
+	if !strings.Contains(apiErr["message"].(string), "Cannot force reuse running worker loop") {
+		t.Fatalf("message = %q, want running reuse rejection", apiErr["message"])
+	}
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	metadata := parseJSONObject(loop.MetadataJSON)
+	workerMeta, _ := metadata["worker"].(map[string]any)
+	if workerMeta["autoDiscovered"] != true {
+		t.Fatalf("metadata = %#v, want running loop metadata unchanged", metadata)
+	}
+	run, err := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_running_issue_worker")
+	if err != nil {
+		t.Fatalf("Runs.GetByID() error = %v", err)
+	}
+	checkpoint := parseJSONObject(run.CheckpointJSON)
+	work, _ := checkpoint["work"].(map[string]any)
+	if work["autoDiscovered"] != true {
+		t.Fatalf("checkpoint = %#v, want running run checkpoint unchanged", checkpoint)
 	}
 }
 

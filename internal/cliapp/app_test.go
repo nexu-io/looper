@@ -213,6 +213,37 @@ func TestFixCreateAcceptsLoopFlag(t *testing.T) {
 	}
 }
 
+func TestFixCreateIncludesForceFlag(t *testing.T) {
+	t.Parallel()
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_fix_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "queued"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "fix", "123", "--project", "project_1", "--force", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([fix 123 --force]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+}
+
 func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
 	t.Parallel()
 
@@ -424,7 +455,7 @@ func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("Run(labels init --dry-run) stderr = %q, want empty string", stderr.String())
 	}
-	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:spec-ready", "Summary: created=3 updated=0 skipped=1 failed=0"} {
+	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:hold", "created looper:hold:reviewer", "Summary: created=7 updated=0 skipped=1 failed=0"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout.String(), want)
 		}
@@ -498,6 +529,14 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 				return commandExecutionResult{Stdout: "{}"}, nil
 			case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
 				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
 			default:
 				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
 				return commandExecutionResult{}, nil
@@ -512,7 +551,7 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 	if !strings.Contains(stdout.String(), "failed looper:spec-reviewing: gh exited with code 1: GraphQL: Resource not accessible by integration") {
 		t.Fatalf("stdout = %q, want failed label with gh stderr", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "Summary: created=2 updated=0 skipped=1 failed=1") {
+	if !strings.Contains(stdout.String(), "Summary: created=6 updated=0 skipped=1 failed=1") {
 		t.Fatalf("stdout = %q, want failed summary", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {
@@ -4233,6 +4272,33 @@ func TestReviewRepairPostsReviewerRepairRequest(t *testing.T) {
 	}
 }
 
+func TestReviewCreateIncludesForceFlag(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repos/looper", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "running"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "review", "123", "--project", "project_1", "--force", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([review 123 --force]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+}
+
 func TestWorkCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 	t.Parallel()
 
@@ -4367,6 +4433,31 @@ func TestWorkCreateIssuePrintsReusedWorkerMessage(t *testing.T) {
 	}
 }
 
+func TestWorkCreateIssueIncludesForceFlag(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/workers":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_worker", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "status": "queued", "issueNumber": 54, "title": "Implement issue #54", "baseBranch": "main"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "work", "--issue", "54", "--project", "project_1", "--force", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([work --issue 54 --force]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+}
+
 func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 	t.Parallel()
 
@@ -4393,6 +4484,9 @@ func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 			if got, want := body["issueNumber"], float64(54); got != want {
 				t.Fatalf("body.issueNumber = %#v, want %#v", got, want)
 			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
 			writeEnvelope(t, w, pkgapi.Success("req_planner", map[string]any{"id": "planner_1", "projectId": "project_1", "issueNumber": 54, "status": "queued"}))
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)
@@ -4411,7 +4505,7 @@ func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 		},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"plan", "--issue", "54", "--config", configPath})
+	exitCode := app.Run(context.Background(), []string{"plan", "--issue", "54", "--force", "--config", configPath})
 	if exitCode != 0 {
 		t.Fatalf("Run([plan --issue 54]) exit code = %d, want 0", exitCode)
 	}

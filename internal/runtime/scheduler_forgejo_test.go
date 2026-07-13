@@ -35,6 +35,14 @@ func TestPlannerGitHubAdapterForgejoCreatePullRequestAndLabels(t *testing.T) {
 				t.Fatalf("decode labels body: %v", err)
 			}
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "name": "looper:spec-reviewing"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/101":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 101, "title": "Spec: add forgejo", "body": "Body", "state": "open",
+				"html_url": serverURL(r) + "/acme/looper/pulls/101",
+				"head":     map[string]any{"ref": "feature", "sha": "abc"},
+				"base":     map[string]any{"ref": "main", "sha": "def"},
+				"labels":   []map[string]any{{"id": 1, "name": "looper:hold"}},
+			})
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -66,6 +74,13 @@ func TestPlannerGitHubAdapterForgejoCreatePullRequestAndLabels(t *testing.T) {
 	}
 	if len(labelBody["labels"]) != 1 || labelBody["labels"][0] != "looper:spec-reviewing" {
 		t.Fatalf("label body = %#v, want reviewing label", labelBody)
+	}
+	detail, err := adapter.ViewPullRequest(context.Background(), planner.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 101, CWD: repoPath})
+	if err != nil {
+		t.Fatalf("ViewPullRequest() error = %v", err)
+	}
+	if len(detail.Labels) != 1 || detail.Labels[0] != "looper:hold" {
+		t.Fatalf("detail.Labels = %#v, want Forgejo PR labels", detail.Labels)
 	}
 	if body, _ := createdBody["body"].(string); !strings.Contains(body, "Body") {
 		t.Fatalf("create PR body = %q, want stamped body content", body)

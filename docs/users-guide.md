@@ -404,6 +404,10 @@ These are the most important labels right now:
 | `looper:spec-reviewing` | PR | This PR is in the spec review phase |
 | `looper:spec-ready` | PR | The spec is approved and ready for worker |
 | `looper:needs-human` | PR | Reserved for manual intervention cases |
+| `looper:hold` | issue or PR | Block all automatic Looper activity on that item |
+| `looper:hold:worker` | issue or PR | Block automatic worker activity on that item |
+| `looper:hold:fixer` | issue or PR | Block automatic fixer activity on that item |
+| `looper:hold:reviewer` | issue or PR | Block automatic reviewer activity on that item |
 
 Treat these as stage signals, not just descriptive labels.
 
@@ -431,7 +435,30 @@ Reviewer automatically pays attention to:
 
 The `looper:spec-reviewing` label is a phase marker; automatic review still requires a review request unless the loop was explicitly started locally.
 
-## 12. Common GitHub / PR commands
+## 12. Hold labels
+
+Looper's official hold labels are:
+
+- `looper:hold`
+- `looper:hold:worker`
+- `looper:hold:fixer`
+- `looper:hold:reviewer`
+
+Semantics:
+
+- `looper:hold` blocks all automatic Looper activity for the labeled issue or PR.
+- `looper:hold:worker` blocks only automatic worker activity.
+- `looper:hold:fixer` blocks only automatic fixer activity.
+- `looper:hold:reviewer` blocks only automatic reviewer activity.
+- planner is special: only `looper:hold` blocks planner.
+- there is no issue/PR inheritance.
+- Looper never adds or removes hold labels.
+- removing a hold takes effect on the next normal scan.
+- only explicit manual `looper work/review/fix --force` or API create requests with `force=true` can bypass hold.
+
+Create-time CLI/API hold validation is best-effort only when the local project repo path or configured `gh` path is unavailable. If those are present but remote `gh` inspection fails, creation fails fast. Automatic discovery and runtime checks still use live remote labels as authority whenever Looper can fetch them.
+
+## 13. Common GitHub / PR commands
 
 Inspect PRs:
 
@@ -455,7 +482,7 @@ Start fixer for an existing PR:
 looper loop start --type fixer --pr owner/repo#42
 ```
 
-## 12. How to inspect current activity
+## 14. How to inspect current activity
 
 ```bash
 looper ps
@@ -474,7 +501,7 @@ Typical usage:
 - `looper stop <id>`: stop an active loop
 - `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
 
-## 13. Minimal end-to-end example
+## 15. Minimal end-to-end example
 
 ### Option A: start from an issue
 
@@ -545,7 +572,7 @@ looper takeover stop --all           # stop every takeover
 
 `takeover list` / `stop` are backed by a local index at `~/.looper/takeovers.json`; stopping closes the underlying loops by id (so it works even while they are idle/waiting between commits).
 
-## 14. Quick decision guide
+## 16. Quick decision guide
 
 - You have an issue but no spec yet: use `planner`
 - You have a PR that needs review: use `reviewer`
@@ -559,7 +586,7 @@ As a rule of thumb:
 - use `--project` when you are outside the repo, or when Looper cannot infer the project uniquely
 - for `plan`, prefer passing `--project`
 
-## 15. Authentication
+## 17. Authentication
 
 Looper uses `gh` for GitHub access, so `gh auth status` should succeed before you start planner / reviewer / fixer / worker workflows.
 
@@ -574,7 +601,7 @@ looper status
 
 This is separate from GitHub authentication.
 
-## 16. Webhook delivery status
+## 18. Webhook delivery status
 
 When webhook mode is enabled, `looper webhook status --json` reports the active delivery mode.
 
@@ -610,7 +637,7 @@ looper webhook delete owner/repo --confirm
 - `rotate` changes the per-repo HMAC secret and updates the existing hook by id.
 - `delete --confirm` is the only command that removes a Looper-managed tunnel hook from GitHub.
 
-## 17. One important clarification
+## 19. One important clarification
 
 In the current implementation, "automatic triggering" is closer to:
 

@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
@@ -654,6 +655,10 @@ type loopError struct {
 	interrupted bool
 }
 
+type holdSkipError struct{ summary string }
+
+func (e *holdSkipError) Error() string { return e.summary }
+
 func (e *loopError) Error() string { return e.message }
 
 func New(options Options) *Runner {
@@ -825,6 +830,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range openPRs {
 		pr = resolveAuthor(pr)
+		if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -846,6 +855,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range specPRs {
 		pr = resolveAuthor(pr)
+		if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
 			result.Skipped++
 			continue
@@ -879,6 +892,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		detail, viewErr := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
 		if viewErr != nil {
+			result.Skipped++
+			continue
+		}
+		if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
 			result.Skipped++
 			continue
 		}
@@ -925,14 +942,21 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		}
 		currentLogin = normalizeLogin(currentLogin)
 	}
-	pr := summaryFromDetail(detail)
 	result := DiscoveryResult{}
 	existingLoops, err := r.findReviewerLoopsByPR(ctx, project.ID, input.Repo, input.PRNumber)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	if len(existingLoops) > 0 {
+		manualLoopSeen := false
 		for _, loop := range existingLoops {
+			if isManualReviewerLoop(loop) {
+				manualLoopSeen = true
+			}
+			if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+				result.Skipped++
+				continue
+			}
 			queuedBefore := len(result.QueueItems)
 			if err := r.discoverExistingReviewerLoop(ctx, *project, input.Repo, policy, &currentLogin, loop, detail, &result); err != nil {
 				return DiscoveryResult{}, err
@@ -941,6 +965,14 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 				return result, nil
 			}
 		}
+		if manualLoopSeen {
+			return result, nil
+		}
+		return result, nil
+	}
+	pr := summaryFromDetail(detail)
+	if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+		result.Skipped++
 		return result, nil
 	}
 	if !prEligibleForDiscoveryPreclaim(pr, currentLogin, policy) {
@@ -1450,6 +1482,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
+		var holdErr *holdSkipError
+		if errors.As(err, &holdErr) {
+			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
+		}
 		return ProcessResult{}, err
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
@@ -1511,6 +1547,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
+			var holdErr *holdSkipError
+			if errors.As(err, &holdErr) {
+				return r.finishHeldReviewerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
+			}
 			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
 			failure := r.classifyFailureForProjectAndBoundary(project.ID, err, reviewerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
@@ -1655,9 +1695,18 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) || r.github == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return nil
 	}
+	if queueItem.LoopID != nil {
+		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
+		if err == nil && loop != nil && isManualReviewerLoop(*loop) {
+			return nil
+		}
+	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, CWD: project.RepoPath})
 	if err != nil {
 		return err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", *queueItem.Repo, *queueItem.PRNumber)}
 	}
 	decision := routedReviewerClaimDecision(policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	if !decision.Allowed && policy.EnableSelfReview && decision.Reason == "local GitHub identity is not requested for review" {
@@ -1805,6 +1854,9 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, nil
 	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, checkpoint.Detail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	currentLogin := ""
 	ensureCurrentLogin := func() error {
 		if currentLogin != "" {
@@ -1876,7 +1928,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Detail.HeadSHA)
-	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+	if !isManualReviewerLoop(input.Loop) && networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -2231,6 +2283,9 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
 				continue
 			}
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			body := r.buildThreadResolutionReply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
 			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
@@ -2248,6 +2303,9 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			if latestThread == nil {
 				skippedReason = "candidate_no_longer_eligible"
 				continue
+			}
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			if !hasObjectiveThreadResolutionAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
@@ -2660,6 +2718,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
+	if freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath}); err != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+	} else {
+		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
+		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		}
+	}
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
@@ -2820,6 +2886,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 			return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 		}
+		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		}
 		if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
@@ -2834,6 +2903,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 				return checkpoint, nil
 			}
+		}
+		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
@@ -2898,12 +2970,18 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 		return markReviewerRunStale(checkpoint, reason), nil
 	}
 	checkpoint.Detail = checkpointDetailFromDetail(detail)
 	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
 		return next, err
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
 	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
@@ -2997,6 +3075,31 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint reviewerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
 }
 
 func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (bool, reviewerCheckpoint, error) {
@@ -3215,6 +3318,13 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 	if !marker.Found {
 		return &loopError{message: "Cannot apply review side effects without a verified review marker", kind: FailureRetryableAfterResume}
 	}
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying review side effects: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	outcome := strings.ToLower(strings.TrimSpace(marker.Outcome))
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
 	switch outcome {
@@ -3238,6 +3348,13 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 }
 
 func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) error {
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying clean review side effects: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
@@ -3271,6 +3388,9 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
 	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
 	if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
 		return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
 	}
@@ -3288,6 +3408,17 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 		}
 	}
 	return nil
+}
+
+func (r *Runner) reviewerPublishFreshDetailForMutation(ctx context.Context, input stepInput, action string) (PullRequestDetail, error) {
+	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return PullRequestDetail{}, &loopError{message: fmt.Sprintf("Failed to refresh pull request before %s: %v", action, err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+		return PullRequestDetail{}, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	return freshDetail, nil
 }
 
 type linkedIssueReference struct {
@@ -3376,6 +3507,9 @@ func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepIn
 		return nil, err
 	}
 	if decision.Reason == "" {
+		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "enabling auto-merge"); err != nil {
+			return nil, err
+		}
 		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, HeadSHA: pending.HeadSHA, CWD: input.Project.RepoPath}); err != nil && !isAlreadyEnabledAutoMergeError(err) {
 			return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -3393,7 +3527,17 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	if err != nil {
 		return nil, err
 	}
-	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(issue.Labels), CWD: input.Project.RepoPath}); err != nil {
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "applying criteria failure side effects"); err != nil {
+		return nil, err
+	}
+	freshIssue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, CWD: input.Project.RepoPath})
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("Failed to refresh linked issue before applying criteria failure side effects: %v", err), kind: FailureRetryableAfterResume}
+	}
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshIssue.Labels) {
+		return nil, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
+	}
+	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels), CWD: input.Project.RepoPath}); err != nil {
 		return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {
@@ -3486,6 +3630,9 @@ func (r *Runner) submitOrReuseReview(ctx context.Context, input stepInput, detai
 	if selfApprovalFallback {
 		submitEvent = ReviewEventComment
 	}
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "submitting review"); err != nil {
+		return ReviewMarkerResult{}, err
+	}
 	if err := r.github.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(submitEvent), Body: body, CommitID: pending.HeadSHA, Disclosure: r.disclosure, CWD: input.Project.RepoPath}); err != nil {
 		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -3514,6 +3661,9 @@ func appendReviewMarker(body string, marker string, outcome string) string {
 func (r *Runner) postStampedPRCommentIfMissing(ctx context.Context, input stepInput, detail PullRequestDetail, marker string, visible string) error {
 	if stampedCommentAlreadyPosted(detail.IssueComments, marker) {
 		return nil
+	}
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "posting PR comment"); err != nil {
+		return err
 	}
 	body := stampIssueComment(r.disclosure, visible+"\n\n"+marker, "reviewer")
 	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
@@ -3550,10 +3700,16 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	}
 	body = stampIssueComment(r.disclosure, body, "reviewer")
 	if existingComment.ID != 0 {
+		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "updating comment-only review"); err != nil {
+			return err
+		}
 		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
 			return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		return nil
+	}
+	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "creating comment-only review"); err != nil {
+		return err
 	}
 	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -6154,14 +6310,18 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
 	specLabelInstruction := "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after it validates a matching APPROVED clean review marker for the current head."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
-	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+	reviewerModeFlag := ""
+	if manual {
+		reviewerModeFlag = fmt.Sprintf(" --reviewer-manual --reviewer-run-id %s", runID)
+	}
+	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" && !(autoMergeEnabled && phase != "spec") {
-		cleanInstruction = fmt.Sprintf("For no-actionable-finding results when the clean review policy is APPROVE, submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment: `%s review submit %s#%d --event APPROVE --commit-id %s %s`. The APPROVE review body must not be empty or disclosure-only: the visible body must start with `%s`, briefly summarize what changed or what you verified, and include a warm, friendly, encouraging acknowledgement of the author's work. Then include exactly one clean review marker and any required Looper disclosure. Do not use a bare LGTM or marker/disclosure-only body; the wrapper rejects clean APPROVE reviews that do not start with an @mention or lack enough human-written summary text. If the authenticated GitHub user authored the pull request, the wrapper will downgrade the submission to a COMMENT because GitHub rejects self-approval. After Looper validates the matching APPROVED clean review marker, or the self-authored clean COMMENT fallback, the runner will reconcile the clean-signal +1 reaction and any eligible spec label transition.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, cleanReviewAuthorMention)
+		cleanInstruction = fmt.Sprintf("For no-actionable-finding results when the clean review policy is APPROVE, submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment: `%s review submit %s#%d --event APPROVE --commit-id %s%s %s`. The APPROVE review body must not be empty or disclosure-only: the visible body must start with `%s`, briefly summarize what changed or what you verified, and include a warm, friendly, encouraging acknowledgement of the author's work. Then include exactly one clean review marker and any required Looper disclosure. Do not use a bare LGTM or marker/disclosure-only body; the wrapper rejects clean APPROVE reviews that do not start with an @mention or lack enough human-written summary text. If the authenticated GitHub user authored the pull request, the wrapper will downgrade the submission to a COMMENT because GitHub rejects self-approval. After Looper validates the matching APPROVED clean review marker, or the self-authored clean COMMENT fallback, the runner will reconcile the clean-signal +1 reaction and any eligible spec label transition.", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, cleanReviewAuthorMention)
 		specLabelInstruction = "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after a new matching APPROVED clean review is validated for this head, or when idempotency finds an existing matching APPROVED clean review for this head."
 	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
 		blockingInstruction = "If the review has blocking findings, submit REQUEST_CHANGES with outcome=blocking. If findings are non-blocking, submit COMMENT with outcome=non_blocking. Never submit REQUEST_CHANGES for non-blocking findings."
-		actionableReviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s %s` for non-blocking findings or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), policyFlags)
+		actionableReviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s` for non-blocking findings or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s%s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	}
 	existingMarkerEventInstruction := "Idempotency outcome matching is strict: only treat an existing `outcome=clean` marker as satisfied when it is on a COMMENTED review if clean policy is COMMENT, or on an APPROVED review if clean policy is APPROVE. A COMMENTED `outcome=clean` marker is also valid when the authenticated GitHub user authored the pull request and the trusted wrapper downgraded self-approval. Only treat an existing `outcome=blocking` marker as satisfied when it is on a CHANGES_REQUESTED review if blocking policy is REQUEST_CHANGES. Treat `outcome=non_blocking` or legacy `outcome=actionable` markers as satisfied only when they are on a COMMENTED review. Ignore matching markers on disallowed review states and publish the correct review for this run instead."
 	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."

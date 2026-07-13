@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -904,6 +905,22 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+type holdSkipError struct{ summary string }
+
+func (e *holdSkipError) Error() string { return e.summary }
+
+type labelMismatchSkipError struct{ summary string }
+
+func (e *labelMismatchSkipError) Error() string { return e.summary }
+
+type runtimeSkipKind string
+
+const (
+	runtimeSkipNone          runtimeSkipKind = ""
+	runtimeSkipHold          runtimeSkipKind = "hold"
+	runtimeSkipLabelMismatch runtimeSkipKind = "label_mismatch"
+)
+
 func (e *loopError) Error() string { return e.message }
 
 func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
@@ -1320,6 +1337,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		appendDiscoveryQueueItem(&result.QueueItems, item)
 	}
 	for _, pr := range openPRs {
+		manualFollowupLoop := manualFixerFollowupLoopFromCandidates(loopsByPR[pr.Number])
+		if manualFollowupLoop == nil && domain.IsAutoLaneHeld(domain.LoopTypeFixer, pr.Labels) {
+			result.Skipped++
+			continue
+		}
 
 		if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy, loopsByPR) {
 			result.Skipped++
@@ -1383,6 +1405,10 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	pr := PullRequestSummary{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, Author: detail.Author}
 	result := DiscoveryResult{}
+	if manualFixerFollowupLoopFromCandidates(loopsByPR[input.PRNumber]) == nil && domain.IsAutoLaneHeld(domain.LoopTypeFixer, pr.Labels) {
+		result.Skipped++
+		return result, nil
+	}
 	if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy, loopsByPR) {
 		if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 			if err := r.pauseFixerLoopForLabelMismatch(ctx, project.ID, input.Repo, input.PRNumber); err != nil {
@@ -1440,6 +1466,11 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 	}
 	result := DiscoveryResult{}
 	for _, pr := range openPRs {
+		manualFollowupLoop := manualFixerFollowupLoopFromCandidates(loopsByPR[pr.Number])
+		if manualFollowupLoop == nil && domain.IsAutoLaneHeld(domain.LoopTypeFixer, pr.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy, loopsByPR) {
 			result.Skipped++
 			continue
@@ -1573,6 +1604,10 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	loop, err := r.findFixerLoopByPR(ctx, project.ID, repo, detail.Number)
 	if err != nil {
 		return err
+	}
+	if (loop == nil || !isManualFixerFollowupCandidate(*loop)) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+		result.Skipped++
+		return nil
 	}
 	if loop != nil && isManualFixerLoop(*loop) && !fixerFollowUpdatesEnabled(*loop) {
 		result.Skipped++
@@ -1874,30 +1909,35 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
-	if reason, err := r.pullRequestLabelAuthoritySkipReason(ctx, *loop, project.ID, project.RepoPath, queueItem, *queueItem.Repo, *queueItem.PRNumber); err != nil {
-		return ProcessResult{}, err
-	} else if reason != "" {
-		checkpoint.SkipReason = reason
-		if _, err := r.completeRun(ctx, run, "success", reason, "", checkpoint); err != nil {
+	if resumedRun.Resumed && resumedRun.StartStep != stepDiscoverPR || (!resumedRun.Resumed && resumedRun.StartStep == stepDiscoverPR && len(prQueryLabels(r.discoveryPolicyForProject(project.ID).Labels)) > 0) {
+		if reason, kind, err := r.pullRequestLabelAuthoritySkipReason(ctx, *loop, project.ID, project.RepoPath, queueItem, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
+		} else if reason != "" {
+			if kind == runtimeSkipHold {
+				return r.finishHeldFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, reason)
+			}
+			checkpoint.SkipReason = reason
+			if _, err := r.completeRun(ctx, run, "success", reason, "", checkpoint); err != nil {
+				return ProcessResult{}, err
+			}
+			r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": reason}})
+			if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+				return ProcessResult{}, err
+			}
+			pausedLoop, err := r.markLoopPausedForLabelMismatch(ctx, *loop)
+			if err != nil {
+				return ProcessResult{}, err
+			}
+			if _, err := r.updateLoop(ctx, pausedLoop, func(updated *storage.LoopRecord) {
+				updated.Status = "paused"
+				updated.LastRunAt = stringPtr(r.nowISO())
+				updated.NextRunAt = nil
+			}); err != nil {
+				return ProcessResult{}, err
+			}
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 		}
-		r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": reason}})
-		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-			return ProcessResult{}, err
-		}
-		pausedLoop, err := r.markLoopPausedForLabelMismatch(ctx, *loop)
-		if err != nil {
-			return ProcessResult{}, err
-		}
-		if _, err := r.updateLoop(ctx, pausedLoop, func(updated *storage.LoopRecord) {
-			updated.Status = "paused"
-			updated.LastRunAt = stringPtr(r.nowISO())
-			updated.NextRunAt = nil
-		}); err != nil {
-			return ProcessResult{}, err
-		}
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
-		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
 	checkpoint.RunStartedAt = r.nowISO()
 	checkpoint.RunStartedRunID = run.ID
@@ -1927,6 +1967,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.logInfo("fixer step started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(step)})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
+			var holdErr *holdSkipError
+			if errors.As(err, &holdErr) {
+				return r.finishHeldFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
+			}
+			var labelMismatchErr *labelMismatchSkipError
+			if errors.As(err, &labelMismatchErr) {
+				return r.finishLabelMismatchFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, labelMismatchErr.summary)
+			}
 			failure := r.classifyFailureWithBoundary(err, fixerFailureBoundaryForStep(step))
 			latest := checkpoint
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
@@ -2169,6 +2217,13 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
+	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	policy := r.discoveryPolicyForProject(input.Project.ID)
+	if !isManualFixerLoop(input.Loop) && len(prQueryLabels(policy.Labels)) > 0 && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		return checkpoint, &labelMismatchSkipError{summary: fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", input.Repo, input.PRNumber)}
+	}
 	checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
@@ -2201,25 +2256,95 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storag
 	return fmt.Sprintf("Skipped fixer run for %s#%d because PR author %q does not match fixer owner %q", repo, prNumber, strings.TrimSpace(author), strings.TrimSpace(currentUser)), nil
 }
 
-func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, loop storage.LoopRecord, projectID, cwd string, queueItem storage.QueueItemRecord, repo string, prNumber int64) (string, error) {
+func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, loop storage.LoopRecord, projectID, cwd string, queueItem storage.QueueItemRecord, repo string, prNumber int64) (string, runtimeSkipKind, error) {
 	if isManualFixerLoop(loop) {
-		return "", nil
+		return "", runtimeSkipNone, nil
 	}
 	policy := r.discoveryPolicyForProject(projectID)
-	if !queueItemRequiresLabelAuthority(queueItem) {
-		return "", nil
-	}
-	if len(prQueryLabels(policy.Labels)) == 0 {
-		return "", nil
-	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
-		return "", err
+		return "", runtimeSkipNone, err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+		return fmt.Sprintf("Fixer stopped because %s#%d is currently held", repo, prNumber), runtimeSkipHold, nil
+	}
+	if len(prQueryLabels(policy.Labels)) == 0 {
+		return "", runtimeSkipNone, nil
 	}
 	if labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
-		return "", nil
+		return "", runtimeSkipNone, nil
 	}
-	return fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", repo, prNumber), nil
+	return fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", repo, prNumber), runtimeSkipLabelMismatch, nil
+}
+
+func (r *Runner) fixerHoldSummary(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, prNumber int64) (bool, string, error) {
+	if r.github == nil {
+		return false, "", nil
+	}
+	if isManualFixerLoop(loop) {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if !domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+		return false, "", nil
+	}
+	return true, fmt.Sprintf("Fixer stopped because %s#%d is currently held", repo, prNumber), nil
+}
+
+func (r *Runner) finishHeldFixerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
+}
+
+func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
+		return ProcessResult{}, err
+	}
+	pausedLoop, err := r.markLoopPausedForLabelMismatch(ctx, loop)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, pausedLoop, func(updated *storage.LoopRecord) {
+		updated.Status = "paused"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
 }
 
 func (r *Runner) runClaimPRStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -2411,6 +2536,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, err
 		}
 	}
+	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	// Autonomous conflict resolution (risky fixes on): merge the base into the
 	// worktree so the agent has the conflict markers to resolve, instead of punting
 	// the conflict to a human. A merge that fails for a non-conflict reason falls
@@ -2432,6 +2562,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
+	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown"))})
 	if err != nil {
 		return checkpoint, err
@@ -2445,6 +2580,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err != nil {
 		return checkpoint, err
 	}
+	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if !strings.EqualFold(result.Status, "completed") {
 		checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
@@ -2456,6 +2596,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	}
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
+	}
+	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
 	}
 	// If the agent judged one or more CHANGES_REQUESTED reviews unreasonable it
 	// wrote a dismiss sentinel — dismiss those reviews (best-effort).
@@ -2588,6 +2733,11 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
+	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA}); err != nil {
 		message := err.Error()
 		eventType := "fixer.push.retryable"
@@ -2597,9 +2747,6 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		r.appendEvent(ctx, eventInput{eventType: eventType, projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "message": message}})
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
-	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
-	// re-reviewed promptly instead of waiting for the coordinator lane.
-	r.reRequestReviewersAfterFix(ctx, input)
 	finalHeadSHA := checkpoint.ReconcileCommits.FinalHeadSHA
 	if finalHeadSHA == "" {
 		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: FailureRetryableAfterResume}
@@ -2645,6 +2792,14 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	checkpoint.Lifecycle.PRNumber = input.PRNumber
 	checkpoint.Lifecycle.PRAdopted = true
 	checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback
+	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
+	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
+	// re-reviewed promptly instead of waiting for the coordinator lane.
+	r.reRequestReviewersAfterFix(ctx, input)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -2760,6 +2915,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return checkpoint, err
+	}
+	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, liveDetail.Labels) {
+		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	// Ancestor guard: if we previously pushed a fix commit, make sure the
 	// live PR head still descends from it. If a collaborator force-pushed or
@@ -4609,6 +4767,10 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 			continue
 		}
 		if (!isManualFixerLoop(loop) && !policy.IncludeDrafts && detail.IsDraft) || normalizePRState(detail.State) != "open" {
+			seenTargets[targetKey] = struct{}{}
+			continue
+		}
+		if !isManualFixerFollowupCandidate(loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
@@ -7975,6 +8137,13 @@ func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput
 		reviewers = append(reviewers, author)
 	}
 	if len(reviewers) == 0 {
+		return
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return
+	}
+	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
 		return
 	}
 	if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: reviewers, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {
