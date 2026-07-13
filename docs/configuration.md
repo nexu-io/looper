@@ -221,7 +221,7 @@ Grok Build support is fresh-run only. Daemon native resume and interactive takeo
 Looper supports three provider kinds:
 
 - `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
-- `forgejo` — REST-backed MVP for planner, worker, summary-comment reviewer/fixer flows, plus manual/direct native-review-comment fixer runs. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
+- `forgejo` — REST-backed support for planner, worker, and summary-comment reviewer/fixer flows. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
 - `plane` — a **task-source** provider: issues (work-items) are read from a [Plane](https://plane.so) project, while pull requests, diffs, and reviews stay on the project's GitHub code repo. Use this to let Looper consume Plane work-items directly as its issue source without creating a redundant GitHub issue. See [Plane provider + Feishu HITL setup](plane-provider.md) for the full guide, including the one-command `looper bootstrap --provider plane …` flow.
 
 Forgejo provider example:
@@ -252,10 +252,10 @@ Forgejo rules:
 - Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, or persisted by `looper project add --provider <id>`; the repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
-- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and summary-comment publish, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.
+- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and summary-comment publish, fixer auto-discovers Reviewer Summary work, and coordinator/auto-merge/GitHub-style thread resolution stay disabled.
 - Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
 
-Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Reviewer writes the top-level Reviewer Summary comment that Fixer treats as one repair-work source. For manual/direct Forgejo fixer runs, Looper also reads native unresolved Forgejo PR review comments by default, repairs them with a separate `forgejo_review_comment` contract, and resolves only comments explicitly confirmed as `fixed` after validation, push, and a post-push re-read. Reviewer Summary items remain separate from native comments and still produce a top-level Fixer Summary comment.
+Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Reviewer writes the top-level Reviewer Summary comment that Fixer treats as its automatic repair-work source. Forgejo's latest public REST API exposes native review-comment resolver state but does not expose a resolve mutation, so native comments do not authorize automatic Fixer runs. Explicit manual Fixer runs retain native-comment inspection and fail with manual-intervention status when the provider cannot resolve the comment. Reviewer Summary items remain separate from native comments and produce a top-level Fixer Summary comment.
 
 ### Plane task-source provider
 
@@ -895,7 +895,7 @@ Forgejo provider profile differences:
 - planner discovers labeled issues through the Forgejo REST provider
 - worker discovers only issues already assigned to the current Forgejo user and does not claim work by adding itself as assignee
 - reviewer discovers by configured labels and publishes a top-level Reviewer Summary comment; it does not use review requests or native PR review events
-- fixer auto-discovery still follows Reviewer Summary items only, while manual/direct Forgejo fixer runs also consume unresolved native Forgejo review comments and may resolve those native comments after validation + push + post-push verification
+- fixer auto-discovery follows open Reviewer Summary items only; labels select candidate PRs but never invent repair items
 - coordinator, auto-merge, review-thread resolution, routed network mode, and webhook modes are unsupported for Forgejo in the MVP and fail fast if explicitly enabled
 
 Common fields:

@@ -1549,6 +1549,10 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: roles.Fixer.AutoDiscovery, IncludeDrafts: roles.Fixer.Triggers.IncludeDrafts, AuthorFilter: roles.Fixer.Triggers.AuthorFilter, Labels: append([]string(nil), roles.Fixer.Triggers.Labels...), LabelMode: roles.Fixer.Triggers.LabelMode}
 }
 
+func (r *Runner) isForgejoProject(projectID string) bool {
+	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
+}
+
 func defaultDiscoveryLimit(limit int) int {
 	if limit <= 0 {
 		return 30
@@ -1613,11 +1617,31 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
-	allFixItems := collectFixItems(detail)
+	detail, err = r.prepareForgejoDiscoveryDetail(ctx, project, detail)
+	if err != nil {
+		return err
+	}
+	var allFixItems []FixItem
+	if r.isForgejoProject(project.ID) {
+		allFixItems, err = collectFixItemsFromCheckpointForStep(fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)})
+		if err != nil {
+			return err
+		}
+	} else {
+		allFixItems = collectFixItems(detail)
+	}
 	if len(allFixItems) == 0 {
 		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
 			return err
 		}
+		result.Skipped++
+		return nil
+	}
+	actionableFixItems, err := r.unsatisfiedForgejoDiscoveryItems(project.ID, detail, allFixItems)
+	if err != nil {
+		return err
+	}
+	if len(actionableFixItems) == 0 {
 		result.Skipped++
 		return nil
 	}
@@ -1670,6 +1694,72 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	}
 	appendDiscoveryQueueItem(&result.QueueItems, queueItem)
 	return nil
+}
+
+func pullRequestCheckpointDetail(detail PullRequestDetail) *checkpointDetail {
+	return &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
+}
+
+func (r *Runner) prepareForgejoDiscoveryDetail(ctx context.Context, project storage.ProjectRecord, detail PullRequestDetail) (PullRequestDetail, error) {
+	if !r.isForgejoProject(project.ID) {
+		return detail, nil
+	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return detail, err
+	}
+	sanitizeForgejoSummaryAuthority(&detail, currentUser)
+	checkpoint := fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)}
+	if _, _, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
+		return detail, err
+	}
+	return detail, nil
+}
+
+func sanitizeForgejoSummaryAuthority(detail *PullRequestDetail, currentUser string) {
+	if detail == nil {
+		return
+	}
+	trusted := make([]map[string]any, 0, len(detail.IssueComments))
+	for _, comment := range detail.IssueComments {
+		body, _ := stringFromAny(comment["body"])
+		carriesSummary := strings.Contains(body, "<!-- "+forge.ReviewerSummaryMarker) || strings.Contains(body, "<!-- "+forge.FixerSummaryMarker)
+		if carriesSummary && !sameGitHubLogin(issueCommentAuthorLogin(comment), currentUser) {
+			continue
+		}
+		trusted = append(trusted, comment)
+	}
+	detail.IssueComments = trusted
+}
+
+func (r *Runner) unsatisfiedForgejoDiscoveryItems(projectID string, detail PullRequestDetail, items []FixItem) ([]FixItem, error) {
+	if !r.isForgejoProject(projectID) {
+		return items, nil
+	}
+	checkpointDetail := pullRequestCheckpointDetail(detail)
+	reviewerSummary, hasReviewerSummary, err := reviewerSummaryFromCheckpointDetail(checkpointDetail)
+	if err != nil {
+		return nil, err
+	}
+	consumedSummary := false
+	if hasReviewerSummary {
+		comments := forgeCommentsFromCheckpointDetail(checkpointDetail)
+		if containsForgeSummaryMarker(comments, forge.FixerSummaryMarker) {
+			_, fixerSummary, parseErr := forge.ParseUniqueFixerSummaryComment(comments)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			consumedSummary = fixerSummary.ConsumedReviewRoundID == reviewerSummary.ReviewRoundID && strings.TrimSpace(fixerSummary.ObservedHeadSHA) == strings.TrimSpace(detail.HeadSHA)
+		}
+	}
+	result := make([]FixItem, 0, len(items))
+	for _, item := range items {
+		if item.Source == "forgejo-reviewer-summary" && consumedSummary {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result, nil
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -2408,16 +2498,19 @@ func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input st
 	if checkpoint == nil || checkpoint.Detail == nil {
 		return nil
 	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return err
+	}
+	detail := PullRequestDetail{IssueComments: cloneObjectSlice(checkpoint.Detail.IssueComments)}
+	sanitizeForgejoSummaryAuthority(&detail, currentUser)
+	checkpoint.Detail.IssueComments = detail.IssueComments
 	nativeComments, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return classifyForgejoNativeDiscoveryError(err)
 	}
 	if len(nativeComments) == 0 {
 		return nil
-	}
-	currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-	if err != nil {
-		return err
 	}
 	nativeComments = actionableNativeReviewComments(nativeComments, currentUser)
 	comments := make([]map[string]any, 0, len(nativeComments)+len(checkpoint.Detail.Comments))
@@ -3267,6 +3360,10 @@ func classifyForgejoNativeDiscoveryError(err error) error {
 }
 
 func isForgejoNativeResolveUnsupported(err error) bool {
+	return isForgejoNativeCapabilityUnsupported(err)
+}
+
+func isForgejoNativeCapabilityUnsupported(err error) bool {
 	var httpErr *forge.ForgejoHTTPError
 	return errors.As(err, &httpErr) && (httpErr.StatusCode == 404 || httpErr.StatusCode == 405)
 }

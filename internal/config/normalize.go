@@ -445,9 +445,6 @@ func ApplyForgejoProjectProfile(project *ProjectRefConfig) {
 	if roles.Fixer == nil {
 		roles.Fixer = &PartialFixerRoleConfig{}
 	}
-	if roles.Fixer.AutoDiscovery == nil {
-		roles.Fixer.AutoDiscovery = boolPtr(false)
-	}
 	if roles.Coordinator == nil {
 		roles.Coordinator = &PartialCoordinatorRoleConfig{}
 	}

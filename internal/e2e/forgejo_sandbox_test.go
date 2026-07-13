@@ -136,7 +136,7 @@ func TestForgejoSandboxFixerResolvesReviewThread(t *testing.T) {
 
 	fixerHome := harness.NewTempHome(t)
 	fixerCfg := forgejoFixerSandboxConfig(t, bins, fixerHome, repo, harness.NewFakeAgent(t, bins), harness.MustFreePort(t), sb, "commit")
-	fixerRun := runForgejoSandboxLoop(t, bins, fixerHome, sb, fixerCfg, map[string]any{"projectId": "project_1", "type": "fixer", "targetType": "pull_request", "repo": sb.Repo, "prNumber": pr.Number}, 90*time.Second)
+	fixerRun := runForgejoSandboxDiscoveredFixer(t, bins, fixerHome, sb, fixerCfg, 90*time.Second)
 	if fixerRun.Status != "success" {
 		t.Fatalf("fixer status = %s, want success (pr=%s error=%q checkpoint=%s)", fixerRun.Status, pr.URL, stringValue(fixerRun.ErrorMessage), stringValue(fixerRun.CheckpointJSON))
 	}
@@ -394,6 +394,7 @@ func forgejoReviewerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, hom
 	cfg.Roles.Reviewer.Discovery.Triggers.LabelMode = config.LabelModeAll
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	cfg.Roles.Fixer.AutoDiscovery = false
 	return cfg
 }
 
@@ -402,6 +403,9 @@ func forgejoFixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home h
 	cfg := forgejoWorkerSandboxConfig(tb, bins, home, repo, fakeAgent, port, sb, agentMode)
 	cfg.Defaults.OpenPRStrategy = config.OpenPRStrategyManual
 	cfg.Defaults.AllowRiskyFixes = true
+	cfg.Scheduler.PollIntervalSeconds = 10
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = false
+	cfg.Roles.Fixer.AutoDiscovery = true
 	cfg.Roles.Fixer.Triggers.AuthorFilter = config.FixerAuthorFilterAny
 	return cfg
 }
@@ -522,6 +526,32 @@ func runForgejoSandboxLoop(tb testing.TB, bins harness.BuiltBinaries, home harne
 	}
 	client.post(tb, "/api/v1/loops", payload, &created)
 	return waitForRunTerminal(tb, client, created.ID, timeout)
+}
+
+func runForgejoSandboxDiscoveredFixer(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, sb forgejoSandboxConfig, cfg config.Config, timeout time.Duration) runView {
+	tb.Helper()
+	harness.WriteConfig(tb, home.ConfigPath, cfg, nil)
+	proc := harness.StartLooperd(tb, bins, home, home.ConfigPath, forgejoSandboxEnvMap(sb), cfg.Server.Host, cfg.Server.Port)
+	defer proc.Stop(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := proc.WaitForReady(ctx); err != nil {
+		tb.Fatalf("wait for ready: %v", err)
+	}
+	client := newAPIClient(proc.BaseURL())
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var loops loopsListResponse
+		client.get(tb, "/api/v1/loops", &loops)
+		for _, loop := range loops.Items {
+			if loop.ProjectID == "project_1" {
+				return waitForRunTerminal(tb, client, loop.ID, time.Until(deadline))
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	tb.Fatal("timed out waiting for automatically discovered Forgejo fixer loop")
+	panic("unreachable")
 }
 
 func listForgejoSandboxPRComments(tb testing.TB, sb forgejoSandboxConfig, prNumber int64) []forge.Comment {

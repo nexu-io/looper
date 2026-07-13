@@ -330,8 +330,8 @@ func TestMinimalForgejoProviderConfigAppliesSafeProjectProfile(t *testing.T) {
 	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
 		t.Fatalf("forgejo reviewer requireReviewRequest = true, want false")
 	}
-	if roles.Fixer.AutoDiscovery {
-		t.Fatalf("forgejo fixer autoDiscovery = true, want false")
+	if !roles.Fixer.AutoDiscovery {
+		t.Fatalf("forgejo fixer autoDiscovery = false, want true")
 	}
 	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment || roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
 		t.Fatalf("forgejo review events = %#v, want comment-only", roles.Reviewer.Behavior.ReviewEvents)
@@ -435,8 +435,8 @@ func TestMixedGitHubAndForgejoProjectsKeepGlobalDefaultsAndApplyForgejoOverrides
 	if forgejoRoles.Reviewer.Discovery.Triggers.RequireReviewRequest {
 		t.Fatalf("forgejo reviewer requireReviewRequest = true, want false")
 	}
-	if forgejoRoles.Fixer.AutoDiscovery {
-		t.Fatalf("forgejo fixer autoDiscovery = true, want false")
+	if !forgejoRoles.Fixer.AutoDiscovery {
+		t.Fatalf("forgejo fixer autoDiscovery = false, want true")
 	}
 	if forgejoRoles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment || forgejoRoles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
 		t.Fatalf("forgejo review events = %#v, want comment-only", forgejoRoles.Reviewer.Behavior.ReviewEvents)
@@ -502,7 +502,6 @@ func TestForgejoProjectRejectsUnsupportedRoleCapabilityOptIns(t *testing.T) {
 	}
 	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.autoMerge.enabled", "must be false for forgejo projects")
 	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.threadResolution.enabled", "must be false for forgejo projects")
-	assertValidationIssue(t, validationErr, "projects[0].roles.fixer.autoDiscovery", "must be false for forgejo projects")
 }
 
 func TestForgejoProviderConfigRequiresRepoAndRejectsDuplicateBareRepos(t *testing.T) {

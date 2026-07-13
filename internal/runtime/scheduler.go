@@ -1343,19 +1343,29 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 		if err != nil {
 			return nil, err
 		}
+		limit := input.Limit
 		if strings.TrimSpace(input.Author) != "" {
-			return nil, fmt.Errorf("forgejo fixer does not support author-filter discovery")
+			// Forgejo's pull listing surface does not provide a reliable author
+			// filter. Fetch the matching label set before applying the limit so a
+			// busy repository cannot hide current-user PRs behind other authors.
+			limit = 0
 		}
-		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: input.Limit, Labels: appendLabels(input.Label, input.Labels)})
+		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: limit, Labels: appendLabels(input.Label, input.Labels)})
 		if err != nil {
 			return nil, err
 		}
 		result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
+			if strings.TrimSpace(input.Author) != "" && !strings.EqualFold(strings.TrimSpace(pr.User.Login), strings.TrimSpace(input.Author)) {
+				continue
+			}
 			if input.BaseRefName != "" && pr.Base.Name != input.BaseRefName {
 				continue
 			}
 			result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Author: pr.User.Login})
+			if input.Limit > 0 && len(result) >= input.Limit {
+				break
+			}
 		}
 		return result, nil
 	}
@@ -2008,6 +2018,10 @@ func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input wor
 // source, but the code + PRs live on the bound GitHub repo).
 func providerHasGitHubPullRequests(kind config.ProviderKind) bool {
 	return kind == config.ProviderKindGitHub || kind == config.ProviderKindPlane
+}
+
+func providerSupportsFixerDiscovery(kind config.ProviderKind) bool {
+	return providerHasGitHubPullRequests(kind) || kind == config.ProviderKindForgejo
 }
 
 // hitlGitHubSettings maps the HITL GitHub config into the worker's settings.
@@ -2765,7 +2779,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			if !providerHasGitHubPullRequests(providerKind) {
+			if !providerSupportsFixerDiscovery(providerKind) {
 				if input.Logger != nil {
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
