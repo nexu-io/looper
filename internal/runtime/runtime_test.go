@@ -100,6 +100,40 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
+func TestGitHubExternalPoliciesIncludesPlaneCodeRepos(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	workspace := "acme"
+	projectID := "project-id"
+	tokenEnv := "PLANE_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{
+		ID:        "plane-main",
+		Kind:      config.ProviderKindPlane,
+		BaseURL:   "https://plane.example.test",
+		TokenEnv:  &tokenEnv,
+		Workspace: &workspace,
+		ProjectID: &projectID,
+	}}
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID:                  "plane-project",
+		Name:                "Plane Project",
+		Provider:            "plane-main",
+		RepoPath:            "/repos/looper",
+		Repo:                "acme/looper",
+		GitHubWriteProvider: "external",
+		GitHubReadFallback:  "external",
+	}}
+
+	policies := githubExternalPolicies(cfg)
+	if got := policies["acme/looper"]; got.WriteProvider != "external" || got.ReadFallback != "external" {
+		t.Fatalf("githubExternalPolicies() = %#v, want external plane policy", policies)
+	}
+}
+
 func TestRuntimeStartForgejoOnlyDoesNotRequireGitHubGateway(t *testing.T) {
 	t.Parallel()
 

@@ -355,6 +355,15 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 				projectRepos[repo] = index
 			}
 		}
+		if !isValidExternalGitHubProviderValue(project.GitHubWriteProvider) {
+			issues = append(issues, ValidationIssue{Path: prefix + ".githubWriteProvider", Message: "must be omitted or external"})
+		}
+		if !isValidExternalGitHubProviderValue(project.GitHubReadFallback) {
+			issues = append(issues, ValidationIssue{Path: prefix + ".githubReadFallback", Message: "must be omitted or external"})
+		}
+		if (strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "external") || strings.EqualFold(strings.TrimSpace(project.GitHubReadFallback), "external")) && isNilOrEmptyString(config.Tools.GitHubWritePath) {
+			issues = append(issues, ValidationIssue{Path: "tools.githubWritePath", Message: "is required when a GitHub project uses external write or read fallback"})
+		}
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
 		}
@@ -454,6 +463,11 @@ func isValidNetworkMode(mode NetworkMode) bool {
 
 func isValidProviderKind(kind ProviderKind) bool {
 	return kind == ProviderKindGitHub || kind == ProviderKindForgejo || kind == ProviderKindPlane
+}
+
+func isValidExternalGitHubProviderValue(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	return normalized == "" || normalized == "external"
 }
 
 func isAbsoluteHTTPURL(value string) bool {

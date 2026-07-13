@@ -136,6 +136,29 @@ Forgejo MVP role limits:
 - fixer consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment; it does not resolve native review threads
 - coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
 
+GitHub projects can opt into an external, `gh`-compatible write command:
+
+```toml
+[tools]
+githubWritePath = "/usr/local/bin/github-write"
+
+[[projects]]
+id = "open-design"
+name = "Open Design"
+repoPath = "/absolute/path/to/open-design"
+repo = "nexu-io/open-design"
+githubWriteProvider = "external"
+githubReadFallback = "external"
+```
+
+- `githubWriteProvider = "external"` sends supported GitHub PR writes through `tools.githubWritePath gh ...` and uses `tools.githubWritePath gh pr push` for Looper-managed PR branch updates.
+- `githubReadFallback = "external"` keeps `gh` as the primary read path and tries `tools.githubWritePath gh ...` after supported `gh pr` or `gh issue` read commands fail.
+- `tools.githubWritePath` must be explicit; Looper does not auto-detect a default external write command.
+- Omit both fields for the legacy `gh` and local git push behavior.
+- Forgejo projects ignore these GitHub-only fields.
+
+Skills and custom instructions can define the organization-specific command behind `tools.githubWritePath`, but daemon-owned writes still need this config hook because prompts cannot reliably intercept Looper's internal push and PR metadata operations.
+
 ## Role model guidance
 
 All role-specific config lives under `roles.<role>`.
@@ -281,6 +304,7 @@ enabled = true
 [tools]
 gitPath = "/usr/bin/git"
 ghPath = "/opt/homebrew/bin/gh"
+githubWritePath = "/usr/local/bin/github-write"
 osascriptPath = "/usr/bin/osascript"
 
 [[providers]]

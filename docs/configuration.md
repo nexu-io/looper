@@ -245,6 +245,29 @@ Forgejo rules:
 
 Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Reviewer writes the top-level Reviewer Summary comment that Fixer treats as one repair-work source. For manual/direct Forgejo fixer runs, Looper also reads native unresolved Forgejo PR review comments by default, repairs them with a separate `forgejo_review_comment` contract, and resolves only comments explicitly confirmed as `fixed` after validation, push, and a post-push re-read. Reviewer Summary items remain separate from native comments and still produce a top-level Fixer Summary comment.
 
+GitHub projects can opt into an external, `gh`-compatible write command while keeping the legacy `gh` read path:
+
+```toml
+[tools]
+githubWritePath = "/usr/local/bin/github-write"
+
+[[projects]]
+id = "open-design"
+name = "Open Design"
+repoPath = "/absolute/path/to/open-design"
+repo = "nexu-io/open-design"
+githubWriteProvider = "external"
+githubReadFallback = "external"
+```
+
+- `githubWriteProvider = "external"` rewrites supported GitHub PR writes through `tools.githubWritePath gh ...` and uses `tools.githubWritePath gh pr push` instead of direct `git push` for Looper-managed PR branches.
+- `githubReadFallback = "external"` keeps `gh` as the primary read path and tries `tools.githubWritePath gh ...` only after a supported `gh pr` or `gh issue` read command fails.
+- `tools.githubWritePath` must point to a command that accepts the `gh` subcommand prefix used above. Looper does not infer a default external command.
+- Omit both fields to keep the legacy `gh` and local git push behavior.
+- Forgejo projects ignore these GitHub-only fields.
+
+Skills or custom instructions can tell agents which organization-specific command to configure as `tools.githubWritePath`, but Looper still needs this provider hook for write operations performed directly by the daemon, such as branch pushes and PR metadata updates.
+
 ### Plane task-source provider
 
 `plane` splits the task source from the code forge: Planner/Worker read work-items from Plane (filtered by a trigger label), while pull requests are opened and reviewed on the project's GitHub `repo`. Plane rules:

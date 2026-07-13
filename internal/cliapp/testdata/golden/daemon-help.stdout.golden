@@ -24,6 +24,7 @@ Global Flags:
   --fixer-agent-timeout-seconds <seconds> Fixer agent execution timeout
   --gh-path <path>            GitHub CLI path
   --git-path <path>           Git binary path
+  --github-write-path <path>  External GitHub write command path
   --host <host>               Server host
   --instructions-enabled <bool> Enable custom instructions
   --json                      Emit JSON output

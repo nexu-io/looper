@@ -795,14 +795,14 @@ func TestDaemonStartNormalizesForwardedRelativeConfigPathArgs(t *testing.T) {
 		Sleep: func(duration time.Duration) {},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", "./looper.json", "--db-path=./looper.sqlite", "--log-dir", "./logs", "--git-path", "./git", "--gh-path=./gh", "--osascript-path", "./osascript", "--host", "127.0.0.1"})
+	exitCode := app.Run(context.Background(), []string{"daemon", "start", "--config", "./looper.json", "--db-path=./looper.sqlite", "--log-dir", "./logs", "--git-path", "./git", "--gh-path=./gh", "--github-write-path=./github-write", "--osascript-path", "./osascript", "--host", "127.0.0.1"})
 	if exitCode != 0 {
 		t.Fatalf("Run([daemon start]) exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
 	if spawnedCWD != daemonWorkingDir {
 		t.Fatalf("spawned.cwd = %q, want %q", spawnedCWD, daemonWorkingDir)
 	}
-	want := []string{"--config", filepath.Join(callerDir, "looper.json"), "--db-path=" + filepath.Join(callerDir, "looper.sqlite"), "--log-dir", filepath.Join(callerDir, "logs"), "--git-path", filepath.Join(callerDir, "git"), "--gh-path=" + filepath.Join(callerDir, "gh"), "--osascript-path", filepath.Join(callerDir, "osascript"), "--host", "127.0.0.1"}
+	want := []string{"--config", filepath.Join(callerDir, "looper.json"), "--db-path=" + filepath.Join(callerDir, "looper.sqlite"), "--log-dir", filepath.Join(callerDir, "logs"), "--git-path", filepath.Join(callerDir, "git"), "--gh-path=" + filepath.Join(callerDir, "gh"), "--github-write-path=" + filepath.Join(callerDir, "github-write"), "--osascript-path", filepath.Join(callerDir, "osascript"), "--host", "127.0.0.1"}
 	if got := strings.Join(spawnedArgs, "\n"); got != strings.Join(want, "\n") {
 		t.Fatalf("spawned.args = %#v, want %#v", spawnedArgs, want)
 	}

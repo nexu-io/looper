@@ -377,13 +377,14 @@ func (r *commandRuntime) daemonSpawnCallerCWD(args []string, env []string) (stri
 }
 
 var forwardedConfigPathFlagNames = map[string]struct{}{
-	"config":         {},
-	"db-path":        {},
-	"log-dir":        {},
-	"git-path":       {},
-	"gh-path":        {},
-	"looper-path":    {},
-	"osascript-path": {},
+	"config":            {},
+	"db-path":           {},
+	"log-dir":           {},
+	"git-path":          {},
+	"gh-path":           {},
+	"github-write-path": {},
+	"looper-path":       {},
+	"osascript-path":    {},
 }
 
 var daemonSpawnPathEnvNames = map[string]struct{}{

@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
@@ -568,6 +569,42 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: roles.Planner.AutoDiscovery, Labels: append([]string(nil), roles.Planner.Triggers.Labels...), LabelMode: roles.Planner.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Planner.Triggers.RequireAssigneeCurrentUser}
 }
 
+func (r *Runner) projectUsesExternalGitHubWrites(projectID string) bool {
+	if r == nil || r.projectRoleConfig == nil {
+		return false
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID == projectID {
+			return strings.EqualFold(strings.TrimSpace(project.GitHubWriteProvider), "external")
+		}
+	}
+	return false
+}
+
+func (r *Runner) pushPlannerBranch(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, worktreeRoot, worktreePath, branch, baseBranch string) error {
+	if !r.projectUsesExternalGitHubWrites(project.ID) {
+		return r.git.Push(ctx, PushInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, Branch: branch, ProtectedBranches: []string{baseBranch}})
+	}
+	githubWritePath := strings.TrimSpace(derefString(r.customInstructions.Tools.GitHubWritePath))
+	if githubWritePath == "" {
+		return errors.New("tools.githubWritePath is required when githubWriteProvider is external")
+	}
+	args := []string{"gh", "pr", "push", "--repo", repo}
+	if prNumber > 0 {
+		args = append(args, strconv.FormatInt(prNumber, 10))
+	}
+	result, err := shell.Run(ctx, shell.Options{
+		Command: githubWritePath,
+		Args:    args,
+		CWD:     worktreePath,
+		Timeout: 5 * time.Minute,
+	})
+	if err != nil {
+		return &shell.CommandExecutionError{Message: strings.TrimSpace(firstNonEmpty(result.Stderr, result.Stdout, err.Error())), Result: result}
+	}
+	return nil
+}
+
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
 	if r.repos == nil || r.repos.Queue == nil {
 		return nil, fmt.Errorf("planner queue repository is not configured")
@@ -1059,7 +1096,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		if rootErr != nil {
 			return checkpoint, rootErr
 		}
-		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: []string{worktree.BaseBranch}}); err != nil {
+		prNumber := int64(0)
+		if checkpoint.Lifecycle != nil {
+			prNumber = checkpoint.Lifecycle.PRNumber
+		}
+		if err := r.pushPlannerBranch(ctx, input.Project, issue.Repo, prNumber, worktreeRoot, worktree.Path, worktree.Branch, worktree.BaseBranch); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		checkpoint.Publish.Pushed = true
@@ -1133,6 +1174,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		}
 		checkpoint.Publish.PullRequest = &checkpointPullRequest{Number: pr.Number, URL: pr.URL, Body: body}
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+		checkpoint.Publish.Pushed = true
+		checkpoint.Lifecycle.Pushed = true
 		checkpoint.Lifecycle.PRNumber = pr.Number
 		checkpoint.Lifecycle.PRURL = pr.URL
 		checkpoint.Lifecycle.Actions.PR = lifecycle.ActionSourceFallback

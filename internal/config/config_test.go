@@ -2397,9 +2397,11 @@ func TestLoadFileAutoDetectsMissingToolPathsAfterApplyingOverrides(t *testing.T)
 
 func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 	configuredGitPath := "/configured/git"
+	configuredGitHubWritePath := "/configured/github-write"
 
 	result := DetectToolPaths(ToolPathsConfig{
-		GitPath: &configuredGitPath,
+		GitPath:         &configuredGitPath,
+		GitHubWritePath: &configuredGitHubWritePath,
 	}, fakeLookPath(map[string]string{}))
 
 	if result.Paths.GitPath == nil || *result.Paths.GitPath != configuredGitPath {
@@ -2410,12 +2412,20 @@ func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 		t.Fatalf("DetectToolPaths().Paths.GHPath = %v, want nil", result.Paths.GHPath)
 	}
 
+	if result.Paths.GitHubWritePath == nil || *result.Paths.GitHubWritePath != configuredGitHubWritePath {
+		t.Fatalf("DetectToolPaths().Paths.GitHubWritePath = %v, want %q", result.Paths.GitHubWritePath, configuredGitHubWritePath)
+	}
+
 	if got := result.Detection["gitPath"]; got != ToolDetectionStatusConfigured {
 		t.Fatalf("DetectToolPaths().Detection[gitPath] = %q, want %q", got, ToolDetectionStatusConfigured)
 	}
 
 	if got := result.Detection["ghPath"]; got != ToolDetectionStatusMissing {
 		t.Fatalf("DetectToolPaths().Detection[ghPath] = %q, want %q", got, ToolDetectionStatusMissing)
+	}
+
+	if got := result.Detection["githubWritePath"]; got != ToolDetectionStatusConfigured {
+		t.Fatalf("DetectToolPaths().Detection[githubWritePath] = %q, want %q", got, ToolDetectionStatusConfigured)
 	}
 
 	if got := result.Detection["osascriptPath"]; got != ToolDetectionStatusMissing {
@@ -2434,7 +2444,7 @@ func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
 		"daemon": {"logDir": %q, "workingDirectory": %q},
 		"storage": {"dbPath": %q},
 		"notifications": {"osascript": {"enabled": true, "throttleWindowSeconds": 60}},
-		"tools": {"gitPath": "/file/git", "ghPath": "/file/gh"},
+		"tools": {"gitPath": "/file/git", "ghPath": "/file/gh", "githubWritePath": "/file/github-write"},
 		"defaults": {"allowAutoCommit": false}
 	}`, logDir, cwd, dbPath)
 	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
@@ -2447,6 +2457,7 @@ func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
 			"--config", configPath,
 			"--port", "7000",
 			"--git-path", "/cli/git",
+			"--github-write-path", "/cli/github-write",
 			"--allow-auto-commit", "false",
 			"--allow-auto-push", "false",
 		},
@@ -2457,6 +2468,7 @@ func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
 			"LOOPER_OSASCRIPT_ENABLED":    "false",
 			"LOOPER_IN_APP_NOTIFICATIONS": "false",
 			"LOOPER_GH_PATH":              "/env/gh",
+			"LOOPER_GITHUB_WRITE_PATH":    "/env/github-write",
 			"LOOPER_ALLOW_AUTO_COMMIT":    "true",
 			"LOOPER_ALLOW_AUTO_APPROVE":   "true",
 			"LOOPER_WORKING_DIRECTORY":    filepath.Join(cwd, "env-workspace"),
@@ -2493,6 +2505,10 @@ func TestLoadFileAppliesFileEnvAndCLIOverridesInPriorityOrder(t *testing.T) {
 
 	if loaded.Config.Tools.GHPath == nil || *loaded.Config.Tools.GHPath != "/env/gh" {
 		t.Fatalf("LoadFile().Config.Tools.GHPath = %v, want %q", loaded.Config.Tools.GHPath, "/env/gh")
+	}
+
+	if loaded.Config.Tools.GitHubWritePath == nil || *loaded.Config.Tools.GitHubWritePath != "/cli/github-write" {
+		t.Fatalf("LoadFile().Config.Tools.GitHubWritePath = %v, want %q", loaded.Config.Tools.GitHubWritePath, "/cli/github-write")
 	}
 
 	if loaded.Config.Tools.OsascriptPath == nil || *loaded.Config.Tools.OsascriptPath != "/env/osascript" {
@@ -3069,6 +3085,64 @@ func TestValidateAllowsLegacyProjectIDsForUpgradeCompatibility(t *testing.T) {
 	if err := Validate(config); err != nil {
 		t.Fatalf("Validate() error = %v, want nil", err)
 	}
+}
+
+func TestValidateGitHubExternalWriteProviderRequiresExplicitCommand(t *testing.T) {
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	config.Projects = []ProjectRefConfig{{
+		ID:                  "demo",
+		Name:                "Demo",
+		RepoPath:            "/repos/demo",
+		Repo:                "acme/demo",
+		GitHubWriteProvider: "external",
+	}}
+
+	err = Validate(config)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "tools.githubWritePath", "is required when a GitHub project uses external write or read fallback")
+
+	path := "/usr/local/bin/github-write"
+	config.Tools.GitHubWritePath = &path
+	if err := Validate(config); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+func TestValidateGitHubExternalWriteProviderRejectsUnknownValues(t *testing.T) {
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	path := "/usr/local/bin/github-write"
+	config.Tools.GitHubWritePath = &path
+	config.Projects = []ProjectRefConfig{{
+		ID:                  "demo",
+		Name:                "Demo",
+		RepoPath:            "/repos/demo",
+		Repo:                "acme/demo",
+		GitHubWriteProvider: "custom",
+		GitHubReadFallback:  "custom",
+	}}
+
+	err = Validate(config)
+	if err == nil {
+		t.Fatal("Validate() error = nil, want validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].githubWriteProvider", "must be omitted or external")
+	assertValidationIssue(t, validationErr, "projects[0].githubReadFallback", "must be omitted or external")
 }
 
 func TestValidateDaemonSupervisionConfig(t *testing.T) {

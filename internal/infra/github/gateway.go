@@ -44,6 +44,8 @@ var ErrDiffTooLarge = errors.New("github pull request diff is too large")
 
 type Options struct {
 	GHPath                 string
+	GitHubWritePath        string
+	ExternalGitHubPolicies map[string]ExternalGitHubPolicy
 	CWD                    string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
@@ -51,8 +53,15 @@ type Options struct {
 	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
+type ExternalGitHubPolicy struct {
+	WriteProvider string
+	ReadFallback  string
+}
+
 type Gateway struct {
 	ghPath                 string
+	githubWritePath        string
+	externalGitHubPolicies map[string]ExternalGitHubPolicy
 	cwd                    string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
@@ -656,6 +665,7 @@ func New(options Options) *Gateway {
 	if ghPath == "" {
 		ghPath = "gh"
 	}
+	githubWritePath := strings.TrimSpace(options.GitHubWritePath)
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -664,7 +674,7 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
+	return &Gateway{ghPath: ghPath, githubWritePath: githubWritePath, externalGitHubPolicies: normalizeExternalGitHubPolicies(options.ExternalGitHubPolicies), cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -2517,6 +2527,14 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 	if len(input.Labels) == 0 {
 		return nil
 	}
+	if g.externalGitHubWriteEnabled(input.Repo) {
+		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+		for _, label := range input.Labels {
+			args = append(args, "--add-label", label)
+		}
+		_, err := g.runExternalGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		return err
+	}
 	if err := g.ensureLabelsExist(ctx, input.Repo, input.Labels, input.CWD); err != nil {
 		return err
 	}
@@ -2531,6 +2549,14 @@ func (g *Gateway) AddPullRequestLabels(ctx context.Context, input PullRequestLab
 func (g *Gateway) RemovePullRequestLabels(ctx context.Context, input PullRequestLabelsInput) error {
 	if len(input.Labels) == 0 {
 		return nil
+	}
+	if g.externalGitHubWriteEnabled(input.Repo) {
+		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+		for _, label := range input.Labels {
+			args = append(args, "--remove-label", label)
+		}
+		_, err := g.runExternalGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		return err
 	}
 	for _, label := range input.Labels {
 		_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/labels/%s", input.Repo, input.PRNumber, encodeURIComponent(label)), "--method", "DELETE")
@@ -2548,6 +2574,14 @@ func (g *Gateway) RemovePullRequestLabels(ctx context.Context, input PullRequest
 func (g *Gateway) AddPullRequestReviewers(ctx context.Context, input PullRequestReviewersInput) error {
 	if len(input.Reviewers) == 0 {
 		return nil
+	}
+	if g.externalGitHubWriteEnabled(input.Repo) {
+		args := []string{"pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+		for _, reviewer := range input.Reviewers {
+			args = append(args, "--add-reviewer", reviewer)
+		}
+		_, err := g.runExternalGh(ctx, input.CWD, "", defaultGhCommandTimeout, args...)
+		return err
 	}
 	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", input.Repo, input.PRNumber), "--method", "POST"}
 	for _, reviewer := range input.Reviewers {
@@ -3223,11 +3257,213 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 }
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
+	repo := ghRepoArg(args)
+	if g.externalGitHubWriteEnabled(repo) && externalWritableGhArgs(args) {
+		return g.runExternalGh(ctx, cwd, stdin, timeout, args...)
+	}
 	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+	if err != nil && g.externalGitHubReadFallbackEnabled(repo) && externalReadableGhArgs(args) {
+		fallbackResult, fallbackErr := g.runExternalGh(ctx, cwd, stdin, timeout, args...)
+		if fallbackErr == nil {
+			return fallbackResult, nil
+		}
+	}
 	if err != nil && isTransientGitHubMessage(strings.Join([]string{err.Error(), result.Stdout, result.Stderr}, "\n")) {
 		return result, &TransientError{Err: err}
 	}
 	return result, err
+}
+
+func (g *Gateway) runExternalGh(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
+	if strings.TrimSpace(g.githubWritePath) == "" {
+		return shell.Result{}, fmt.Errorf("tools.githubWritePath is required when a GitHub external write provider is enabled")
+	}
+	externalArgs := append([]string{"gh"}, args...)
+	return g.ghRun(ctx, shell.Options{Command: g.githubWritePath, Args: externalArgs, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+}
+
+func normalizeExternalGitHubPolicies(input map[string]ExternalGitHubPolicy) map[string]ExternalGitHubPolicy {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make(map[string]ExternalGitHubPolicy, len(input))
+	for repo, policy := range input {
+		key := strings.ToLower(strings.TrimSpace(repo))
+		if key == "" {
+			continue
+		}
+		out[key] = ExternalGitHubPolicy{WriteProvider: strings.ToLower(strings.TrimSpace(policy.WriteProvider)), ReadFallback: strings.ToLower(strings.TrimSpace(policy.ReadFallback))}
+	}
+	return out
+}
+
+func (g *Gateway) externalGitHubWriteEnabled(repo string) bool {
+	if repo == "" {
+		return false
+	}
+	return g.externalGitHubPolicies[strings.ToLower(repo)].WriteProvider == "external"
+}
+
+func (g *Gateway) externalGitHubReadFallbackEnabled(repo string) bool {
+	if repo == "" {
+		return false
+	}
+	return g.externalGitHubPolicies[strings.ToLower(repo)].ReadFallback == "external"
+}
+
+func ghRepoArg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--repo" || arg == "-R" {
+			if i+1 < len(args) {
+				return strings.TrimSpace(args[i+1])
+			}
+			return ""
+		}
+		if strings.HasPrefix(arg, "--repo=") {
+			return strings.TrimSpace(strings.TrimPrefix(arg, "--repo="))
+		}
+		if strings.HasPrefix(arg, "-R=") {
+			return strings.TrimSpace(strings.TrimPrefix(arg, "-R="))
+		}
+	}
+	if repo := ghAPIRepoArg(args); repo != "" {
+		return repo
+	}
+	if repo := ghGraphQLRepoArg(args); repo != "" {
+		return repo
+	}
+	return ""
+}
+
+func externalWritableGhArgs(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	if args[0] == "pr" {
+		switch args[1] {
+		case "create", "comment", "review", "edit":
+			return true
+		default:
+			return false
+		}
+	}
+	if args[0] == "api" {
+		if len(args) >= 2 && args[1] == "graphql" {
+			return ghGraphQLMutationArg(args)
+		}
+		return ghAPIWriteMethod(args) && ghAPIRepoArg(args) != ""
+	}
+	return false
+}
+
+func externalReadableGhArgs(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	if args[0] == "pr" {
+		return args[1] == "view" || args[1] == "list" || args[1] == "checks"
+	}
+	if args[0] == "issue" {
+		return args[1] == "view" || args[1] == "list"
+	}
+	return false
+}
+
+func ghAPIRepoArg(args []string) string {
+	if len(args) < 2 || args[0] != "api" {
+		return ""
+	}
+	endpoint := ""
+	for _, arg := range args[1:] {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if arg == "graphql" {
+			return ""
+		}
+		endpoint = strings.Trim(arg, "/")
+		break
+	}
+	parts := strings.Split(endpoint, "/")
+	if len(parts) < 3 || parts[0] != "repos" {
+		return ""
+	}
+	owner := strings.TrimSpace(parts[1])
+	repo := strings.TrimSpace(parts[2])
+	if owner == "" || repo == "" {
+		return ""
+	}
+	return owner + "/" + repo
+}
+
+func ghAPIWriteMethod(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		value := ""
+		if arg == "--method" || arg == "-X" {
+			if i+1 < len(args) {
+				value = args[i+1]
+			}
+		} else if strings.HasPrefix(arg, "--method=") {
+			value = strings.TrimPrefix(arg, "--method=")
+		} else if strings.HasPrefix(arg, "-X=") {
+			value = strings.TrimPrefix(arg, "-X=")
+		}
+		switch strings.ToUpper(strings.TrimSpace(value)) {
+		case "POST", "PUT", "PATCH", "DELETE":
+			return true
+		}
+	}
+	return false
+}
+
+func ghGraphQLRepoArg(args []string) string {
+	if len(args) < 2 || args[0] != "api" || args[1] != "graphql" {
+		return ""
+	}
+	values := map[string]string{}
+	for i := 2; i < len(args); i++ {
+		arg := args[i]
+		if (arg == "-F" || arg == "-f") && i+1 < len(args) {
+			recordGhFieldArg(values, args[i+1])
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-F=") || strings.HasPrefix(arg, "-f=") {
+			recordGhFieldArg(values, strings.TrimPrefix(strings.TrimPrefix(arg, "-F="), "-f="))
+		}
+	}
+	owner := firstNonEmpty(values["owner"], values["repositoryOwner"])
+	repo := firstNonEmpty(values["name"], values["repo"], values["repositoryName"])
+	if owner == "" || repo == "" {
+		return ""
+	}
+	return owner + "/" + repo
+}
+
+func recordGhFieldArg(values map[string]string, arg string) {
+	key, value, ok := strings.Cut(arg, "=")
+	if !ok {
+		return
+	}
+	values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+}
+
+func ghGraphQLMutationArg(args []string) bool {
+	for i := 2; i < len(args); i++ {
+		arg := args[i]
+		value := ""
+		if (arg == "-F" || arg == "-f") && i+1 < len(args) {
+			value = args[i+1]
+		} else if strings.HasPrefix(arg, "-F=") || strings.HasPrefix(arg, "-f=") {
+			value = strings.TrimPrefix(strings.TrimPrefix(arg, "-F="), "-f=")
+		}
+		if key, query, ok := strings.Cut(value, "="); ok && strings.TrimSpace(key) == "query" {
+			return strings.Contains(strings.ToLower(query), "mutation")
+		}
+	}
+	return false
 }
 
 func isDiffTooLargeError(err error) bool {

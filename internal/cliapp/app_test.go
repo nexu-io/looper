@@ -525,6 +525,7 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 		"--daemon-mode <mode>",
 		"--git-path <path>",
 		"--gh-path <path>",
+		"--github-write-path <path>",
 		"--osascript-path <path>",
 	} {
 		if !strings.Contains(stdout, syntax) {

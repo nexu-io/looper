@@ -908,6 +908,37 @@ func TestSubmitReviewUsesAPIForTopLevelReviewWithCommitID(t *testing.T) {
 	}
 }
 
+func TestSubmitReviewUsesExternalCommandForAPIWrites(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if options.Command != "odc" {
+			t.Fatalf("command = %q, want odc", options.Command)
+		}
+		args := strings.Join(options.Args, " ")
+		if args != "gh api repos/acme/looper/pulls/42/reviews --method POST --input - --include" {
+			t.Fatalf("unexpected external args: %q", args)
+		}
+		runner.stdin = options.Stdin
+		return shell.Result{Stdout: "{}"}, nil
+	}
+	gateway := New(Options{
+		GHPath:          "gh",
+		GitHubWritePath: "odc",
+		ExternalGitHubPolicies: map[string]ExternalGitHubPolicy{
+			"acme/looper": {WriteProvider: "external"},
+		},
+		CWD:   t.TempDir(),
+		GHRun: runner.run,
+	})
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "app.go: Looks good", CommitID: "abc123"}); err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+	if !strings.Contains(runner.stdin, `"commit_id":"abc123"`) {
+		t.Fatalf("review stdin = %s, want commit_id", runner.stdin)
+	}
+}
+
 func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -2482,16 +2513,18 @@ func TestGatewayListsReviewRequestedPullRequestsThroughSearch(t *testing.T) {
 }
 
 type fakeGHRunner struct {
-	t       *testing.T
-	calls   []string
-	stdin   string
-	respond func(options shell.Options) (shell.Result, error)
+	t        *testing.T
+	calls    []string
+	commands []string
+	stdin    string
+	respond  func(options shell.Options) (shell.Result, error)
 }
 
 func (f *fakeGHRunner) run(_ context.Context, options shell.Options) (shell.Result, error) {
 	f.t.Helper()
 	args := strings.Join(options.Args, " ")
 	f.calls = append(f.calls, args)
+	f.commands = append(f.commands, options.Command)
 	if f.respond == nil {
 		f.t.Fatalf("fakeGHRunner missing responder for args: %q", args)
 	}

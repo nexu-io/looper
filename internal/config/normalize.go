@@ -794,6 +794,10 @@ func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfi
 		config.GHPath = stringPtr(*partial.GHPath)
 	}
 
+	if partial.GitHubWritePath != nil {
+		config.GitHubWritePath = stringPtr(*partial.GitHubWritePath)
+	}
+
 	if partial.LooperPath != nil {
 		config.LooperPath = stringPtr(*partial.LooperPath)
 	}
@@ -1457,18 +1461,20 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 	cloned := make([]PartialProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = PartialProjectRefConfig{
-			ID:           project.ID,
-			Name:         project.Name,
-			Provider:     cloneStringPtr(project.Provider),
-			Repo:         cloneStringPtr(project.Repo),
-			RepoPath:     project.RepoPath,
-			Path:         project.Path,
-			BaseBranch:   cloneStringPtr(project.BaseBranch),
-			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
-			Network:      clonePartialProjectNetworkConfig(project.Network),
-			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
-			Instructions: cloneStringMap(project.Instructions),
-			Roles:        clonePartialRoleConfigs(project.Roles),
+			ID:                  project.ID,
+			Name:                project.Name,
+			Provider:            cloneStringPtr(project.Provider),
+			Repo:                cloneStringPtr(project.Repo),
+			GitHubWriteProvider: cloneStringPtr(project.GitHubWriteProvider),
+			GitHubReadFallback:  cloneStringPtr(project.GitHubReadFallback),
+			RepoPath:            project.RepoPath,
+			Path:                project.Path,
+			BaseBranch:          cloneStringPtr(project.BaseBranch),
+			WorktreeRoot:        cloneStringPtr(project.WorktreeRoot),
+			Network:             clonePartialProjectNetworkConfig(project.Network),
+			Webhook:             clonePartialProjectWebhookConfig(project.Webhook),
+			Instructions:        cloneStringMap(project.Instructions),
+			Roles:               clonePartialRoleConfigs(project.Roles),
 		}
 	}
 	return cloned
@@ -1545,6 +1551,12 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		}
 		if project.Repo != nil {
 			cloned[index].Repo = strings.TrimSpace(*project.Repo)
+		}
+		if project.GitHubWriteProvider != nil {
+			cloned[index].GitHubWriteProvider = strings.TrimSpace(*project.GitHubWriteProvider)
+		}
+		if project.GitHubReadFallback != nil {
+			cloned[index].GitHubReadFallback = strings.TrimSpace(*project.GitHubReadFallback)
 		}
 		if project.Network != nil && project.Network.Mode != nil {
 			cloned[index].Network.Mode = *project.Network.Mode

@@ -652,6 +652,13 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureToolPathsConfig(&parsed.overrides).GHPath = stringPtr(value)
 			index = nextIndex
+		case matchesFlag(arg, "--github-write-path"):
+			value, nextIndex, err := takeValue(index, "--github-write-path")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			ensureToolPathsConfig(&parsed.overrides).GitHubWritePath = stringPtr(value)
+			index = nextIndex
 		case matchesFlag(arg, "--looper-path"):
 			value, nextIndex, err := takeValue(index, "--looper-path")
 			if err != nil {
@@ -1210,6 +1217,9 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 	}
 	if value, ok := lookupEnv("LOOPER_GH_PATH"); ok {
 		ensureToolPathsConfig(&overrides).GHPath = stringPtr(value)
+	}
+	if value, ok := lookupEnv("LOOPER_GITHUB_WRITE_PATH"); ok {
+		ensureToolPathsConfig(&overrides).GitHubWritePath = stringPtr(value)
 	}
 	if value, ok := lookupEnv("LOOPER_LOOPER_PATH"); ok {
 		ensureToolPathsConfig(&overrides).LooperPath = stringPtr(value)
