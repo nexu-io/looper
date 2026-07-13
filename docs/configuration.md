@@ -42,10 +42,11 @@ For runtime deployment details — container image, required environment variabl
 
 ## Webhook delivery modes
 
-`webhook.enabled=true` supports two delivery modes:
+`webhook.enabled=true` supports three delivery modes:
 
 - `gh-forward` (default): Looper starts `gh webhook forward` against each configured repo and receives deliveries on the daemon API route `/webhook/forward`.
 - `tunnel`: Looper creates an ordinary GitHub repository webhook per repo and expects the user to run a tunnel to `127.0.0.1:<webhook.listenPort>`.
+- `synclo-inbox`: Looper polls an existing synclo webhook inbox and forwards unacked GitHub deliveries into the same local webhook queue used by the other modes.
 
 Tunnel-mode example:
 
@@ -69,6 +70,26 @@ repoPath = "/Users/me/src/private"
 [projects.webhook]
 mode = "gh-forward"
 ```
+
+Synclo inbox example:
+
+```toml
+[webhook]
+enabled = true
+mode = "synclo-inbox"
+fallbackPollIntervalSeconds = 300
+
+[webhook.synclo]
+baseUrl = "https://dashboard.nexu.space"
+consumer = "looper-my-node"
+secretEnv = "SYNC_HMAC_SECRET"
+limit = 100
+pollIntervalSeconds = 5
+```
+
+The `consumer` value is the synclo cursor identity. Keep it stable across daemon restarts and config edits; changing it creates a new consumer and may replay the inbox retention window. `secretEnv` names the environment variable that holds the shared synclo HMAC secret. Looper signs `GET /webhook/pending` with `HMAC(secret, "GET " + requestURI)` and signs `POST /webhook/ack` with `HMAC(secret, rawBody)`.
+
+Synclo inbox delivery is a latency path, not the workflow authority. Looper still keeps GitHub polling enabled as correctness fallback and drift recovery when webhook delivery is missed or delayed.
 
 Rules:
 

@@ -87,6 +87,13 @@ func DefaultConfig(cwd string) (Config, error) {
 			ListenPort:                  0,
 			PublicBaseURL:               "",
 			FallbackPollIntervalSeconds: 300,
+			Synclo: SyncloWebhookConfig{
+				BaseURL:             "",
+				Consumer:            "",
+				SecretEnv:           "SYNC_HMAC_SECRET",
+				Limit:               100,
+				PollIntervalSeconds: 5,
+			},
 		},
 		Network: NetworkConfig{},
 		Agent: AgentConfig{

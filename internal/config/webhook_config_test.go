@@ -24,6 +24,9 @@ func TestDefaultConfigDisablesWebhookMode(t *testing.T) {
 	if cfg.Webhook.PublicBaseURL != "" {
 		t.Fatalf("DefaultConfig().Webhook.PublicBaseURL = %q, want empty", cfg.Webhook.PublicBaseURL)
 	}
+	if cfg.Webhook.Synclo.SecretEnv != "SYNC_HMAC_SECRET" || cfg.Webhook.Synclo.Limit != 100 || cfg.Webhook.Synclo.PollIntervalSeconds != 5 {
+		t.Fatalf("DefaultConfig().Webhook.Synclo = %#v, want default secret env, limit, and poll interval", cfg.Webhook.Synclo)
+	}
 }
 
 func TestValidateRejectsWebhookFallbackBelowMinimum(t *testing.T) {
@@ -80,6 +83,30 @@ func TestValidateRequiresTunnelSettingsForGlobalTunnelMode(t *testing.T) {
 	}
 	if len(validationErr.Issues) != 2 {
 		t.Fatalf("Validate() issues = %#v, want tunnel listen/public issues", validationErr.Issues)
+	}
+}
+
+func TestValidateRequiresSyncloSettingsForGlobalSyncloMode(t *testing.T) {
+	t.Parallel()
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.Mode = WebhookModeSyncloInbox
+	err = Validate(cfg)
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+	if len(validationErr.Issues) != 2 {
+		t.Fatalf("Validate() issues = %#v, want baseUrl and consumer issues", validationErr.Issues)
+	}
+
+	cfg.Webhook.Synclo.BaseURL = "https://dashboard.nexu.space"
+	cfg.Webhook.Synclo.Consumer = "looper-node"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() with synclo settings error = %v, want nil", err)
 	}
 }
 

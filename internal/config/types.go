@@ -159,18 +159,28 @@ type SchedulerConfig struct {
 }
 
 type WebhookConfig struct {
-	Enabled                     bool        `json:"enabled"`
-	Mode                        WebhookMode `json:"mode"`
-	ListenPort                  int         `json:"listenPort"`
-	PublicBaseURL               string      `json:"publicBaseUrl"`
-	FallbackPollIntervalSeconds int         `json:"fallbackPollIntervalSeconds"`
+	Enabled                     bool                `json:"enabled"`
+	Mode                        WebhookMode         `json:"mode"`
+	ListenPort                  int                 `json:"listenPort"`
+	PublicBaseURL               string              `json:"publicBaseUrl"`
+	FallbackPollIntervalSeconds int                 `json:"fallbackPollIntervalSeconds"`
+	Synclo                      SyncloWebhookConfig `json:"synclo"`
+}
+
+type SyncloWebhookConfig struct {
+	BaseURL             string `json:"baseUrl"`
+	Consumer            string `json:"consumer"`
+	SecretEnv           string `json:"secretEnv"`
+	Limit               int    `json:"limit"`
+	PollIntervalSeconds int    `json:"pollIntervalSeconds"`
 }
 
 type WebhookMode string
 
 const (
-	WebhookModeGHForward WebhookMode = "gh-forward"
-	WebhookModeTunnel    WebhookMode = "tunnel"
+	WebhookModeGHForward   WebhookMode = "gh-forward"
+	WebhookModeTunnel      WebhookMode = "tunnel"
+	WebhookModeSyncloInbox WebhookMode = "synclo-inbox"
 )
 
 type ProviderKind string
@@ -701,11 +711,20 @@ type PartialSchedulerConfig struct {
 }
 
 type PartialWebhookConfig struct {
-	Enabled                     *bool        `json:"enabled,omitempty"`
-	Mode                        *WebhookMode `json:"mode,omitempty"`
-	ListenPort                  *int         `json:"listenPort,omitempty"`
-	PublicBaseURL               *string      `json:"publicBaseUrl,omitempty"`
-	FallbackPollIntervalSeconds *int         `json:"fallbackPollIntervalSeconds,omitempty"`
+	Enabled                     *bool                       `json:"enabled,omitempty"`
+	Mode                        *WebhookMode                `json:"mode,omitempty"`
+	ListenPort                  *int                        `json:"listenPort,omitempty"`
+	PublicBaseURL               *string                     `json:"publicBaseUrl,omitempty"`
+	FallbackPollIntervalSeconds *int                        `json:"fallbackPollIntervalSeconds,omitempty"`
+	Synclo                      *PartialSyncloWebhookConfig `json:"synclo,omitempty"`
+}
+
+type PartialSyncloWebhookConfig struct {
+	BaseURL             *string `json:"baseUrl,omitempty"`
+	Consumer            *string `json:"consumer,omitempty"`
+	SecretEnv           *string `json:"secretEnv,omitempty"`
+	Limit               *int    `json:"limit,omitempty"`
+	PollIntervalSeconds *int    `json:"pollIntervalSeconds,omitempty"`
 }
 
 type PartialAgentConfig struct {

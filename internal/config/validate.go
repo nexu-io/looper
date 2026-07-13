@@ -99,10 +99,13 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "webhook.fallbackPollIntervalSeconds", Message: "must be an integer >= 60"})
 	}
 	if !isValidWebhookMode(config.Webhook.Mode) {
-		issues = append(issues, ValidationIssue{Path: "webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
+		issues = append(issues, ValidationIssue{Path: "webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s", WebhookModeGHForward, WebhookModeTunnel, WebhookModeSyncloInbox)})
 	}
 	if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, nil) {
 		validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
+	}
+	if config.Webhook.Enabled && webhookModeUsesSyncloInbox(config) {
+		validateSyncloWebhookConfig(config.Webhook.Synclo, "webhook.synclo", &issues)
 	}
 
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
@@ -365,7 +368,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: "must be off for forgejo projects; routed network mode is not supported"})
 		}
 		if !isValidWebhookModeOrEmpty(project.Webhook.Mode) {
-			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
+			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s", WebhookModeGHForward, WebhookModeTunnel, WebhookModeSyncloInbox)})
 		}
 		if !isValidNetworkMode(project.Network.Mode) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: fmt.Sprintf("must be one of: %s, %s", NetworkModeOff, NetworkModeRouted)})
@@ -549,6 +552,36 @@ func webhookModeRequiresTunnelConfig(config Config, project *ProjectRefConfig) b
 		mode = project.Webhook.Mode
 	}
 	return mode == WebhookModeTunnel
+}
+
+func webhookModeUsesSyncloInbox(config Config) bool {
+	if config.Webhook.Mode == WebhookModeSyncloInbox {
+		return true
+	}
+	for _, project := range config.Projects {
+		if project.Webhook.Mode == WebhookModeSyncloInbox {
+			return true
+		}
+	}
+	return false
+}
+
+func validateSyncloWebhookConfig(config SyncloWebhookConfig, prefix string, issues *[]ValidationIssue) {
+	if strings.TrimSpace(config.BaseURL) == "" {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be non-empty when webhook.mode is synclo-inbox"})
+	}
+	if strings.TrimSpace(config.Consumer) == "" {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".consumer", Message: "must be a stable non-empty consumer name when webhook.mode is synclo-inbox"})
+	}
+	if strings.TrimSpace(config.SecretEnv) == "" {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".secretEnv", Message: "must name an environment variable containing the synclo HMAC secret"})
+	}
+	if config.Limit < 1 || config.Limit > 200 {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".limit", Message: "must be an integer between 1 and 200"})
+	}
+	if config.PollIntervalSeconds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".pollIntervalSeconds", Message: "must be a positive integer"})
+	}
 }
 
 func validateAgentTimeouts(timeouts AgentTimeoutConfig, path string, issues *[]ValidationIssue) {
@@ -890,7 +923,7 @@ func isValidAddSnapshotMode(mode AddSnapshotMode) bool {
 
 func isValidWebhookMode(mode WebhookMode) bool {
 	switch mode {
-	case WebhookModeGHForward, WebhookModeTunnel:
+	case WebhookModeGHForward, WebhookModeTunnel, WebhookModeSyncloInbox:
 		return true
 	default:
 		return false

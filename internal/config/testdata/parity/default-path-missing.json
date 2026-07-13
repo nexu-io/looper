@@ -42,7 +42,14 @@
         "fallbackPollIntervalSeconds": 300,
         "listenPort": 0,
         "mode": "gh-forward",
-        "publicBaseUrl": ""
+        "publicBaseUrl": "",
+        "synclo": {
+          "baseUrl": "",
+          "consumer": "",
+          "limit": 100,
+          "pollIntervalSeconds": 5,
+          "secretEnv": "SYNC_HMAC_SECRET"
+        }
       },
       "network": {
         "enrolled": false,

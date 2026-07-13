@@ -610,6 +610,10 @@ looper webhook delete owner/repo --confirm
 - `rotate` changes the per-repo HMAC secret and updates the existing hook by id.
 - `delete --confirm` is the only command that removes a Looper-managed tunnel hook from GitHub.
 
+In `synclo-inbox` mode Looper polls a shared synclo webhook inbox and feeds deliveries into the same local webhook queue. Configure a stable `webhook.synclo.consumer`; changing the consumer name creates a new synclo cursor and can replay recent retained events. The HMAC secret is read from the environment variable named by `webhook.synclo.secretEnv`.
+
+Synclo inbox mode reduces the need for low-latency GitHub discovery polling, but it does not make GitHub polling disappear. Polling remains the correctness fallback for missed webhook deliveries, stale state, and workflows that are still discovery-driven.
+
 ## 17. One important clarification
 
 In the current implementation, "automatic triggering" is closer to:

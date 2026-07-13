@@ -561,6 +561,28 @@ func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
 	if partial.FallbackPollIntervalSeconds != nil {
 		config.FallbackPollIntervalSeconds = *partial.FallbackPollIntervalSeconds
 	}
+
+	if partial.Synclo != nil {
+		mergeSyncloWebhookConfig(&config.Synclo, *partial.Synclo)
+	}
+}
+
+func mergeSyncloWebhookConfig(config *SyncloWebhookConfig, partial PartialSyncloWebhookConfig) {
+	if partial.BaseURL != nil {
+		config.BaseURL = *partial.BaseURL
+	}
+	if partial.Consumer != nil {
+		config.Consumer = *partial.Consumer
+	}
+	if partial.SecretEnv != nil {
+		config.SecretEnv = *partial.SecretEnv
+	}
+	if partial.Limit != nil {
+		config.Limit = *partial.Limit
+	}
+	if partial.PollIntervalSeconds != nil {
+		config.PollIntervalSeconds = *partial.PollIntervalSeconds
+	}
 }
 
 func mergeNetworkConfig(config *NetworkConfig, partial PartialNetworkConfig) {

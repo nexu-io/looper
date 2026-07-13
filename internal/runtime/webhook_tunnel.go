@@ -564,6 +564,18 @@ func wModeNeedsTunnel(cfg config.Config) bool {
 	return false
 }
 
+func wModeNeedsSyncloInbox(cfg config.Config) bool {
+	if cfg.Webhook.Mode == config.WebhookModeSyncloInbox {
+		return true
+	}
+	for _, project := range cfg.Projects {
+		if project.Webhook.Mode == config.WebhookModeSyncloInbox {
+			return true
+		}
+	}
+	return false
+}
+
 func configuredTunnelProjectIDs(cfg config.Config) []string {
 	ids := make([]string, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {

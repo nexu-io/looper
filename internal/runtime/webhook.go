@@ -48,6 +48,21 @@ type WebhookStatus struct {
 	RecentOutcomes              []WebhookRecentOutcome  `json:"recentOutcomes"`
 	Forwarders                  []WebhookForwarderState `json:"forwarders"`
 	TunnelHooks                 []WebhookTunnelState    `json:"tunnelHooks"`
+	SyncloInbox                 WebhookSyncloInboxState `json:"syncloInbox"`
+}
+
+type WebhookSyncloInboxState struct {
+	Enabled        bool   `json:"enabled"`
+	Running        bool   `json:"running"`
+	BaseURL        string `json:"baseUrl,omitempty"`
+	Consumer       string `json:"consumer,omitempty"`
+	Limit          int    `json:"limit,omitempty"`
+	LastPollAt     string `json:"lastPollAt,omitempty"`
+	LastAckAt      string `json:"lastAckAt,omitempty"`
+	LastError      string `json:"lastError,omitempty"`
+	PendingFetched int    `json:"pendingFetched"`
+	Forwarded      int    `json:"forwarded"`
+	Acked          int    `json:"acked"`
 }
 
 type WebhookTunnelState struct {
@@ -122,6 +137,8 @@ type webhookRuntime struct {
 	forwarder          func() WebhookForwarder
 	tunnelServer       *webhookTunnelServer
 	bootstrapDone      bool
+	syncloStarted      bool
+	syncloStopCh       chan struct{}
 }
 
 func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() time.Time) *webhookRuntime {
@@ -143,6 +160,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		RecentOutcomes:              []WebhookRecentOutcome{},
 		Forwarders:                  []WebhookForwarderState{},
 		TunnelHooks:                 []WebhookTunnelState{},
+		SyncloInbox:                 WebhookSyncloInboxState{Enabled: cfg.Webhook.Enabled && wModeNeedsSyncloInbox(cfg), BaseURL: strings.TrimRight(strings.TrimSpace(cfg.Webhook.Synclo.BaseURL), "/"), Consumer: strings.TrimSpace(cfg.Webhook.Synclo.Consumer), Limit: cfg.Webhook.Synclo.Limit},
 	}
 	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, allowedTunnelRepos: map[string]struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
 	if !cfg.Webhook.Enabled {
@@ -290,6 +308,7 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 	w.clearTransientReconcileDegradedReasons()
 	forwarderRepoSet := map[string]struct{}{}
 	tunnelRepoSet := map[string]struct{}{}
+	syncloRepoSet := map[string]struct{}{}
 	for _, project := range projects {
 		if project.Archived {
 			continue
@@ -301,6 +320,8 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 		switch w.webhookModeForProject(project.ID) {
 		case config.WebhookModeTunnel:
 			tunnelRepoSet[repo] = struct{}{}
+		case config.WebhookModeSyncloInbox:
+			syncloRepoSet[repo] = struct{}{}
 		default:
 			forwarderRepoSet[repo] = struct{}{}
 		}
@@ -311,12 +332,25 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 			delete(tunnelRepoSet, repo)
 			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and tunnel", repo))
 		}
+		if _, ok := syncloRepoSet[repo]; ok {
+			delete(forwarderRepoSet, repo)
+			delete(syncloRepoSet, repo)
+			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and synclo-inbox", repo))
+		}
+	}
+	for repo := range tunnelRepoSet {
+		if _, ok := syncloRepoSet[repo]; ok {
+			delete(tunnelRepoSet, repo)
+			delete(syncloRepoSet, repo)
+			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both tunnel and synclo-inbox", repo))
+		}
 	}
 	if err := w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet); err != nil {
 		return err
 	}
+	w.reconcileSyncloInbox(syncloRepoSet)
 	launchRepos := w.reconcileForwarders(forwarderRepoSet)
-	if len(forwarderRepoSet)+len(tunnelRepoSet) == 0 {
+	if len(forwarderRepoSet)+len(tunnelRepoSet)+len(syncloRepoSet) == 0 {
 		w.addDegradedReason(noConfiguredWebhookReposReason)
 		return nil
 	}
