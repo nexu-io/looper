@@ -1347,11 +1347,11 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 		if effectiveLimit <= 0 {
 			effectiveLimit = 30
 		}
-		limit := input.Limit
-		if strings.TrimSpace(input.Author) != "" {
+		limit := effectiveLimit
+		if strings.TrimSpace(input.Author) != "" || strings.TrimSpace(input.BaseRefName) != "" {
 			// Forgejo's pull listing surface does not provide a reliable author
-			// filter. Fetch the matching label set before applying the limit so a
-			// busy repository cannot hide current-user PRs behind other authors.
+			// or base filter. Fetch the matching label set before applying the limit
+			// so a busy repository cannot hide matching PRs behind other results.
 			limit = 0
 		}
 		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: limit, Labels: appendLabels(input.Label, input.Labels)})
