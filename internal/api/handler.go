@@ -886,6 +886,9 @@ type configDaemonResponse struct {
 
 func (h *Handler) buildConfigResponse() configResponse {
 	cfg := h.context.Config
+	if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+		cfg = runtimeConfig.Config()
+	}
 
 	return configResponse{
 		Server: configServerResponse{
@@ -1593,8 +1596,6 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	_ = h.refreshWebhookForwarders()
-
 	return serializeProject(removed, h.context.Config, h.context.Config.Defaults.BaseBranch), nil
 }
 
@@ -5771,8 +5772,6 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 			return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
-	_ = h.refreshWebhookForwarders()
-
 	return createProjectResponse{
 		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
 		DiscoveredPullRequests: result.DiscoveredPullRequests,
@@ -5781,16 +5780,6 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		CapturedSnapshots:      result.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
-}
-
-func (h *Handler) refreshWebhookForwarders() error {
-	if refresher, ok := any(h.context.Runtime).(interface{ RefreshWebhookForwarders() error }); ok {
-		return refresher.RefreshWebhookForwarders()
-	}
-	if refresher, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
-		refresher.ReconcileWebhookForwarders()
-	}
-	return nil
 }
 
 func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultBaseBranch string) projectResponse {

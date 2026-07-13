@@ -37,6 +37,12 @@ Also make sure:
 
 Forgejo projects need a configured `[[providers]]` entry (`kind = "forgejo"`, `baseUrl`, `tokenEnv`) first. `looper project add` detects a matching Forgejo origin as a hint, but requires `--provider` to confirm the binding; `--repo` may be omitted when it can be read from the origin. The binding is persisted immediately and becomes active after restarting `looperd`. See [configuration](configuration.md#provider-support).
 
+### Grok Build (xAI)
+
+For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `grok` executable. Authenticate the daemon with `grok login --device-auth` or by providing `XAI_API_KEY` in its environment—never commit an API-key value. Looper defaults to `--always-approve --sandbox off` so Grok can update Git metadata outside a linked worktree; configure `--sandbox` explicitly if a stricter profile works with your repository layout.
+
+Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive `looper resume` takeover. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
+
 ## 1a. Local-only vs Routed projects
 
 Looper supports two project modes:
@@ -527,7 +533,7 @@ looper takeover owner/repo#42 --merge   # also auto-merge once approved + green
 3. starts a continuous reviewer loop and fixer loop on the target PR (skip the fixer with `--no-fix`);
 4. with `--merge`, sets `roles.reviewer.autoMerge.enabled` for the project so the reviewer enables GitHub auto-merge once the PR is approved and checks are green.
 
-Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
+Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `grok` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
 
 Manage and stop takeovers:
 

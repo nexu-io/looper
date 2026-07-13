@@ -596,6 +596,43 @@ func containsRequest(requests []recordedRequest, method string, path string, bod
 
 func stringPtr(value string) *string { return &value }
 
+func TestForgejoPublicationMethodsRejectUnsafeContentBeforeRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	client, err := NewForgejoClient(RepositoryRef{ProviderID: "forgejo-test", Kind: ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token", WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	unsafe := "SERVICE_TOKEN=secret-value"
+	operations := []func() error{
+		func() error {
+			_, err := client.CreatePullRequest(context.Background(), CreatePullRequestInput{Title: "Feature", Body: unsafe, Head: "feature", Base: "main"})
+			return err
+		},
+		func() error {
+			_, err := client.UpdatePullRequest(context.Background(), UpdatePullRequestInput{Number: 1, Title: &unsafe, Body: &unsafe})
+			return err
+		},
+		func() error {
+			_, err := client.CreateIssueComment(context.Background(), CreateCommentInput{IssueNumber: 1, Body: unsafe})
+			return err
+		},
+		func() error {
+			_, err := client.UpdateIssueComment(context.Background(), UpdateCommentInput{CommentID: 1, Body: unsafe})
+			return err
+		},
+	}
+	for _, operation := range operations {
+		if err := operation(); err == nil || !strings.Contains(err.Error(), "outbound content safety gate") {
+			t.Fatalf("publication error = %v, want content safety rejection", err)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("publication methods made %d HTTP requests after content safety failures", requests)
+	}
+}
+
 func TestSanitizeForgejoErrorBodyDefaults(t *testing.T) {
 	t.Parallel()
 	if got := sanitizeForgejoErrorBody(nil, "token"); got != http.StatusText(http.StatusInternalServerError) {

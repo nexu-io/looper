@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/outboundguard"
 )
 
 const defaultForgejoTimeout = 30 * time.Second
@@ -338,6 +339,12 @@ func (forgejo *ForgejoClient) PullRequestDiff(ctx context.Context, number int64)
 }
 
 func (forgejo *ForgejoClient) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (PullRequest, error) {
+	if err := outboundguard.Validate(
+		outboundguard.Field{Name: "pull request title", Text: input.Title},
+		outboundguard.Field{Name: "pull request body", Text: input.Body},
+	); err != nil {
+		return PullRequest{}, err
+	}
 	payload := map[string]string{"title": input.Title, "body": input.Body, "head": input.Head, "base": input.Base}
 	var output forgejoPullRequest
 	if err := forgejo.do(ctx, http.MethodPost, forgejo.repoPath("pulls"), nil, payload, &output); err != nil {
@@ -347,6 +354,16 @@ func (forgejo *ForgejoClient) CreatePullRequest(ctx context.Context, input Creat
 }
 
 func (forgejo *ForgejoClient) UpdatePullRequest(ctx context.Context, input UpdatePullRequestInput) (PullRequest, error) {
+	fields := make([]outboundguard.Field, 0, 2)
+	if input.Title != nil {
+		fields = append(fields, outboundguard.Field{Name: "pull request title", Text: *input.Title})
+	}
+	if input.Body != nil {
+		fields = append(fields, outboundguard.Field{Name: "pull request body", Text: *input.Body})
+	}
+	if err := outboundguard.Validate(fields...); err != nil {
+		return PullRequest{}, err
+	}
 	payload := map[string]string{}
 	if input.Title != nil {
 		payload["title"] = *input.Title
@@ -382,6 +399,9 @@ func (forgejo *ForgejoClient) RemoveIssueAssignees(ctx context.Context, issueNum
 }
 
 func (forgejo *ForgejoClient) CreateIssueComment(ctx context.Context, input CreateCommentInput) (Comment, error) {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return Comment{}, err
+	}
 	var output forgejoComment
 	if err := forgejo.do(ctx, http.MethodPost, forgejo.repoPath("issues", strconv.FormatInt(input.IssueNumber, 10), "comments"), nil, map[string]string{"body": input.Body}, &output); err != nil {
 		return Comment{}, err
@@ -402,6 +422,9 @@ func (forgejo *ForgejoClient) ListIssueComments(ctx context.Context, issueNumber
 }
 
 func (forgejo *ForgejoClient) UpdateIssueComment(ctx context.Context, input UpdateCommentInput) (Comment, error) {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return Comment{}, err
+	}
 	var output forgejoComment
 	if err := forgejo.do(ctx, http.MethodPatch, forgejo.repoPath("issues", "comments", strconv.FormatInt(input.CommentID, 10)), nil, map[string]string{"body": input.Body}, &output); err != nil {
 		return Comment{}, err

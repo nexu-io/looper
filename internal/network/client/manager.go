@@ -57,6 +57,21 @@ func NewManager(statePath string, cfg config.Config, repos *storage.Repositories
 	return &Manager{statePath: statePath, config: cfg, repos: repos, gh: gh, client: &http.Client{Timeout: 10 * time.Second}, now: time.Now, done: make(chan struct{})}
 }
 
+func (m *Manager) UpdateConfig(cfg config.Config) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.config = cfg
+	m.mu.Unlock()
+}
+
+func (m *Manager) configSnapshot() config.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config
+}
+
 func (m *Manager) Start(parent context.Context) error {
 	if m.started {
 		return nil
@@ -77,9 +92,10 @@ func (m *Manager) Start(parent context.Context) error {
 	m.mu.Lock()
 	m.status = Status{Configured: true, NetworkID: state.NetworkID, NodeID: state.NodeID, NodeName: state.NodeName, GitHub: state.GitHub}
 	m.mu.Unlock()
-	routed, _ := countProjectModes(m.config)
+	cfg := m.configSnapshot()
+	routed, _ := countProjectModes(cfg)
 	if routed == 0 {
-		_, local := countProjectModes(m.config)
+		_, local := countProjectModes(cfg)
 		m.mu.Lock()
 		m.status.RoutedProjects = routed
 		m.status.LocalProjects = local
@@ -124,8 +140,9 @@ func (m *Manager) Status() Status {
 
 func (m *Manager) tick(ctx context.Context, state LocalState) {
 	current, _ := m.currentGitHubIdentity(ctx)
-	routed, local := countProjectModes(m.config)
-	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(m.config), CoordinatorEligible: routed > 0 && m.config.Roles.Coordinator.Enabled, RoutedProjects: routed, RoutedProjectIDs: routedProjectIDs(m.config), ReviewerProjects: reviewerProjectCapabilities(m.config), LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
+	cfg := m.configSnapshot()
+	routed, local := countProjectModes(cfg)
+	capabilities := protocol.NodeCapabilities{Roles: supportedRoles(cfg), CoordinatorEligible: routed > 0 && cfg.Roles.Coordinator.Enabled, RoutedProjects: routed, RoutedProjectIDs: routedProjectIDs(cfg), ReviewerProjects: reviewerProjectCapabilities(cfg), LocalProjects: local, DynamicLoad: m.dynamicLoad(ctx)}
 	drift, reason := identityDrift(state.GitHub, current)
 	capabilities.IdentityDrift = drift
 	capabilities.DriftReason = reason

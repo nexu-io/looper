@@ -28,6 +28,7 @@ import (
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/webhookforward"
@@ -2101,7 +2102,33 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+	if source == nil {
+		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
+		return defaultSchedulerHandlers{tick: fail, claim: fail}
+	}
+	claimMu := &sync.Mutex{}
+	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
+	buildSnapshot := func() defaultSchedulerHandlers {
+		return buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
+	}
+	handlers := defaultSchedulerHandlers{
+		tick: func(ctx context.Context, services Services) error {
+			return buildSnapshot().tick(ctx, services)
+		},
+		claim: func(ctx context.Context, services Services) error {
+			return buildSnapshot().claim(ctx, services)
+		},
+		webhook: initial.webhook,
+	}
+	return handlers
+}
+
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+	return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
+}
+
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2412,7 +2439,9 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			})
 		},
 	})
-	claimMu := &sync.Mutex{}
+	if claimMu == nil {
+		claimMu = &sync.Mutex{}
+	}
 
 	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
@@ -2445,22 +2474,26 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		}
 	}
 
-	return defaultSchedulerHandlers{
+	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
 			return runDefaultSchedulerTick(ctx, inputForServices(services))
 		},
 		claim: func(ctx context.Context, services Services) error {
 			return runIndependentClaimPass(ctx, inputForServices(services))
 		},
-		webhook: webhookforward.New(webhookforward.Options{
-			Repos:    repos,
-			Config:   cfg,
-			Reviewer: reviewerRunner,
-			Fixer:    fixerRunner,
-			Logger:   logger,
-			Now:      now,
-		}),
 	}
+	if includeWebhook {
+		handlers.webhook = webhookforward.New(webhookforward.Options{
+			Repos:        repos,
+			Config:       cfg,
+			ConfigSource: configSource,
+			Reviewer:     reviewerRunner,
+			Fixer:        fixerRunner,
+			Logger:       logger,
+			Now:          now,
+		})
+	}
+	return handlers
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {

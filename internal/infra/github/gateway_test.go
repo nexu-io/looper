@@ -733,6 +733,145 @@ func TestSubmitReviewRejectsQualityFlagsBeforePublishing(t *testing.T) {
 	}
 }
 
+func TestSubmitReviewRejectsEnvironmentDumpBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	body := "Database transaction feedback.\nHOME=/Users/reviewer\nPATH=/usr/bin\nSHELL=/bin/zsh\nLANG=en_US.UTF-8\nTERM=xterm-256color"
+
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: body, CommitID: "abc123"})
+	if err == nil || !strings.Contains(err.Error(), "environment-dump-shaped block") {
+		t.Fatalf("SubmitReview() error = %v, want environment dump rejection", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+}
+
+func TestSubmitReviewRejectsCredentialAssignmentInInlineCommentBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{
+		Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Please address the inline finding.", CommitID: "abc123",
+		Comments: []ReviewComment{{Body: "The command printed this:\nOPENAI_API_KEY=sk-sensitive", Path: "app.go", Line: 1, Side: "RIGHT"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential-shaped environment assignment") {
+		t.Fatalf("SubmitReview() error = %v, want credential assignment rejection", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+}
+
+func TestSubmitReviewRejectsCredentialInCommentPathAfterNormalization(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	var events []reviewSubmitDiagnosticEvent
+	gateway := New(Options{
+		GHPath: "gh", GHRun: runner.run,
+		ReviewSubmitDiagnostic: func(event string, fields map[string]any) {
+			events = append(events, reviewSubmitDiagnosticEvent{Name: event, Fields: fields})
+		},
+	})
+	anchors := diffanchor.Index{Ranges: []diffanchor.Range{{Path: "app.go", Side: "RIGHT", Start: 1, End: 1}}}
+	secretPath := "SERVICE_TOKEN=secret-value"
+
+	// Secret lives only in Path; body is safe. Without post-normalize / path
+	// guarding, FallbackBody would publish "Location: SERVICE_TOKEN=secret-value ...".
+	err := gateway.SubmitReview(context.Background(), SubmitReviewInput{
+		Repo: "acme/looper", PRNumber: 42, Event: "COMMENT", Body: "Please address the findings.", CommitID: "abc123",
+		Comments: []ReviewComment{{Body: "Null check is missing here.", Path: secretPath, Line: 99, Side: "RIGHT"}},
+		Anchors:  &anchors,
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential-shaped environment assignment") {
+		t.Fatalf("SubmitReview() error = %v, want credential assignment rejection for path", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("SubmitReview() made gh calls after content safety failure: %#v", runner.calls)
+	}
+	if len(events) != 1 || events[0].Name != "github_review_submit_validation_failed" {
+		t.Fatalf("diagnostic events = %#v, want one validation failure", events)
+	}
+	// Diagnostics must not echo the rejected path (no-echo contract).
+	if encoded := fmt.Sprintf("%#v", events[0].Fields); strings.Contains(encoded, secretPath) {
+		t.Fatalf("diagnostic fields echoed rejected path: %s", encoded)
+	}
+	request, _ := events[0].Fields["request"].(map[string]any)
+	payload, _ := request["payload"].(map[string]any)
+	comments, _ := payload["comments"].([]map[string]any)
+	if len(comments) != 1 {
+		t.Fatalf("diagnostic comments = %#v, want one sanitized comment", comments)
+	}
+	if _, hasPath := comments[0]["path"]; hasPath {
+		t.Fatalf("diagnostic comment still has raw path: %#v", comments[0])
+	}
+	if comments[0]["path_present"] != true {
+		t.Fatalf("diagnostic comment = %#v, want path_present=true", comments[0])
+	}
+}
+
+func TestOutboundPublicationMethodsRejectUnsafeContentBeforePublishing(t *testing.T) {
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		t.Fatalf("unexpected gh call: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	unsafe := "SERVICE_TOKEN=secret-value"
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "create issue comment", run: func() error {
+			_, err := gateway.CreateIssueComment(context.Background(), IssueCommentInput{Repo: "acme/looper", IssueNumber: 1, Body: unsafe})
+			return err
+		}},
+		{name: "update issue comment", run: func() error {
+			return gateway.UpdateIssueComment(context.Background(), UpdateIssueCommentInput{Repo: "acme/looper", CommentID: 1, Body: unsafe})
+		}},
+		{name: "review thread reply", run: func() error {
+			return gateway.AddReviewThreadReply(context.Background(), AddReviewThreadReplyInput{ThreadID: "thread-1", Body: unsafe})
+		}},
+		{name: "pull request comment", run: func() error {
+			return gateway.AddPullRequestComment(context.Background(), PullRequestCommentInput{Repo: "acme/looper", PRNumber: 1, Body: unsafe})
+		}},
+		{name: "create pull request", run: func() error {
+			_, err := gateway.CreatePullRequest(context.Background(), CreatePullRequestInput{Repo: "acme/looper", HeadBranch: "feature", BaseBranch: "main", Title: "Feature", Body: unsafe})
+			return err
+		}},
+		{name: "update pull request title", run: func() error {
+			return gateway.UpdatePullRequestTitle(context.Background(), UpdatePullRequestTitleInput{Repo: "acme/looper", PRNumber: 1, Title: unsafe})
+		}},
+		{name: "update pull request body", run: func() error {
+			return gateway.UpdatePullRequestBody(context.Background(), UpdatePullRequestBodyInput{Repo: "acme/looper", PRNumber: 1, Body: unsafe})
+		}},
+		{name: "dismiss review", run: func() error {
+			return gateway.DismissReview(context.Background(), DismissReviewInput{Repo: "acme/looper", PRNumber: 1, ReviewID: 1, Message: unsafe})
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); err == nil || !strings.Contains(err.Error(), "outbound content safety gate") {
+				t.Fatalf("publication error = %v, want content safety rejection", err)
+			}
+		})
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("publication methods made gh calls after content safety failures: %#v", runner.calls)
+	}
+}
+
 func TestSubmitReviewAllowsCleanOutcomeWithoutLocation(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -2412,8 +2551,9 @@ func TestSubmitReviewLogsValidationFailureDiagnostics(t *testing.T) {
 		t.Fatalf("body marker = %#v, want marker fields", marker)
 	}
 	comments, _ := payload["comments"].([]map[string]any)
-	if len(comments) != 1 || comments[0]["path"] != "app.go" || comments[0]["line"] != int64(1) || comments[0]["side"] != "RIGHT" {
-		t.Fatalf("payload comments = %#v, want inline anchor summary", comments)
+	// validation_failed diagnostics always redact paths (path may be secret-shaped).
+	if len(comments) != 1 || comments[0]["path_present"] != true || comments[0]["path"] != nil || comments[0]["line"] != int64(1) || comments[0]["side"] != "RIGHT" {
+		t.Fatalf("payload comments = %#v, want redacted path_present + line/side", comments)
 	}
 }
 

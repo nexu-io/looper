@@ -106,7 +106,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
-		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI)})
+		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild)})
 	}
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
 
@@ -818,7 +818,7 @@ func isNilOrEmptyString(value *string) bool {
 
 func isValidAgentVendor(vendor AgentVendor) bool {
 	switch vendor {
-	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI:
+	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild:
 		return true
 	default:
 		return false

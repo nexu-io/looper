@@ -56,6 +56,36 @@ func TestForwardDedupesDeliveriesWithinTTLAndExpiresAfterAnHour(t *testing.T) {
 	}
 }
 
+func TestForwardCapturesCurrentProjectCatalog(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	cfg := testConfig(t)
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = false
+	source := &mutableConfigSource{cfg: cfg}
+	reviewerRunner := newFakeTargetedRunner(nil)
+	forwarder := New(Options{Repos: repos, Config: cfg, ConfigSource: source, Reviewer: reviewerRunner, MaxConcurrent: 1, QueueCapacity: 8})
+	defer forwarder.Close()
+
+	first, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "before", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 42)})
+	if err != nil {
+		t.Fatalf("first Forward() error = %v", err)
+	}
+	if first.Status != "ignored" {
+		t.Fatalf("first status = %q, want ignored", first.Status)
+	}
+
+	cfg.Roles.Reviewer.Discovery.AutoDiscovery = true
+	source.Store(cfg)
+	second, err := forwarder.Forward(context.Background(), DeliveryRequest{DeliveryID: "after", EventType: "pull_request", Payload: pullRequestPayload("review_requested", "acme/looper", 42)})
+	if err != nil {
+		t.Fatalf("second Forward() error = %v", err)
+	}
+	if second.Status != "accepted" {
+		t.Fatalf("second status = %q, want accepted", second.Status)
+	}
+	reviewerRunner.waitForCalls(t, 1)
+}
+
 func TestForwardIgnoresUnsupportedAndIssueComments(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
@@ -554,6 +584,23 @@ func testConfig(t *testing.T) config.Config {
 	cfg.Roles.Reviewer.Discovery.AutoDiscovery = true
 	cfg.Roles.Fixer.AutoDiscovery = true
 	return cfg
+}
+
+type mutableConfigSource struct {
+	mu  sync.RWMutex
+	cfg config.Config
+}
+
+func (s *mutableConfigSource) Snapshot() config.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+func (s *mutableConfigSource) Store(cfg config.Config) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
 }
 
 func newTestRepositories(t *testing.T) *storage.Repositories {

@@ -439,7 +439,7 @@ func TestScenarioWorkerNoDiffBranchDoesNotCreatePullRequest(t *testing.T) {
 	fakeAgent := harness.NewFakeAgent(t, bins)
 	fakeGH := harness.NewFakeGH(t, bins, loadGHSchemaFixture(t))
 	fakeGH.WriteState(t, harness.GHState{CurrentUserLogin: "looper"})
-	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git", fakeGH.Path)
+	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git", fakeGH.Path, fakeGH.EnvMap())
 	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
@@ -507,7 +507,7 @@ func TestScenarioResumedFixerStopsWhenPullRequestCloses(t *testing.T) {
 			},
 		},
 	})
-	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git", fakeGH.Path)
+	vendor, command, agentEnv := fakeAgent.AgentConfig("success-no-diff", "git", fakeGH.Path, fakeGH.EnvMap())
 	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},
@@ -570,7 +570,7 @@ func TestScenarioResumedFixerStopsWhenPullRequestCloses(t *testing.T) {
 
 func fixerConfigWithFakeTools(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeGH harness.FakeGH, fakeAgent harness.FakeAgent, port int, agentMode string) config.Config {
 	tb.Helper()
-	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", fakeGH.Path)
+	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", fakeGH.Path, fakeGH.EnvMap())
 	cfg := harness.DefaultConfig(tb, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: fakeGH.Path, Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},

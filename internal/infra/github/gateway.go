@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1152,6 +1153,9 @@ func (g *Gateway) AddIssueReaction(ctx context.Context, input CreateIssueReactio
 }
 
 func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return IssueCommentResult{}, err
+	}
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--method", "POST", "-f", "body=" + input.Body}
 	if hostname != "" {
@@ -1169,6 +1173,9 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 }
 
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return err
+	}
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", fmt.Sprintf("repos/%s/issues/comments/%d", repo, input.CommentID), "--method", "PATCH", "-f", "body=" + input.Body}
 	if hostname != "" {
@@ -1736,6 +1743,9 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 }
 
 func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThreadReplyInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "review thread reply body", Text: input.Body}); err != nil {
+		return err
+	}
 	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
 		"mutation($threadId: ID!, $body: String!) {",
 		"  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {",
@@ -1791,14 +1801,27 @@ func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDi
 
 func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) error {
 	request := g.reviewSubmitRequest(input)
+	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
+		// Always redact paths on validation_failed: pre-publish diagnostics must
+		// not echo secret-shaped path fields even when the rejection reason is
+		// not path-related (and for content-safety rejections of the path itself).
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
+		return err
+	}
 	if marker, ok := findReviewIdempotencyMarker(input.Body, ""); ok && marker.Outcome == "clean" && len(input.Comments) > 0 {
 		err := fmt.Errorf("clean review marker cannot be submitted with review comments")
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	var flags []reviewQualityFlag
 	var processing reviewCommentProcessing
 	input.Body, input.Comments, flags, processing = normalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
+	// Re-validate after normalization: FallbackBody / retarget prefixes embed agent path
+	// into the top-level review body, which was not present in the pre-normalize fields.
+	if err := validateReviewOutboundContent(input.Body, input.Comments); err != nil {
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
+		return err
+	}
 	request = g.reviewSubmitRequest(input)
 	request["comment_processing"] = map[string]any{
 		"original_count":   processing.OriginalCount,
@@ -1810,12 +1833,12 @@ func (g *Gateway) SubmitReview(ctx context.Context, input SubmitReviewInput) err
 	}
 	gateApplies, err := reviewQualityGateApplies(input.Event, input.Body)
 	if err != nil {
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error()})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error()})
 		return err
 	}
 	if gateApplies && len(flags) > 0 {
 		err := fmt.Errorf("review quality gate failed: %s", formatReviewQualityFlags(flags))
-		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": request, "error": err.Error(), "quality_flags": reviewQualityFlagsSummary(flags)})
+		g.emitReviewSubmitDiagnostic("github_review_submit_validation_failed", map[string]any{"request": redactReviewSubmitRequestPaths(request), "error": err.Error(), "quality_flags": reviewQualityFlagsSummary(flags)})
 		return err
 	}
 	comments := input.Comments[:0]
@@ -1909,6 +1932,27 @@ func (g *Gateway) emitReviewSubmitDiagnostic(event string, fields map[string]any
 	}
 }
 
+// validateReviewOutboundContent checks review body, inline comment bodies, and
+// anchor paths. Paths are included because normalizeReviewAnchors can embed
+// them into the published top-level body via FallbackBody / retarget prefixes,
+// and kept comments publish path on the GitHub review API.
+func validateReviewOutboundContent(body string, comments []ReviewComment) error {
+	fields := []outboundguard.Field{{Name: "review body", Text: body}}
+	for i, comment := range comments {
+		fields = append(fields, outboundguard.Field{
+			Name: fmt.Sprintf("inline review comment %d", i+1),
+			Text: comment.Body,
+		})
+		if path := strings.TrimSpace(comment.Path); path != "" {
+			fields = append(fields, outboundguard.Field{
+				Name: fmt.Sprintf("inline review comment %d path", i+1),
+				Text: path,
+			})
+		}
+	}
+	return outboundguard.Validate(fields...)
+}
+
 func (g *Gateway) reviewSubmitRequest(input SubmitReviewInput) map[string]any {
 	endpoint := fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber)
 	request := map[string]any{
@@ -1934,15 +1978,137 @@ func reviewSubmitBodyMarkerSummary(body string) map[string]any {
 }
 
 func reviewSubmitCommentsSummary(comments []ReviewComment) []map[string]any {
+	return reviewSubmitCommentsSummaryWithPaths(comments, true)
+}
+
+func reviewSubmitCommentsSummaryWithPaths(comments []ReviewComment, includePaths bool) []map[string]any {
 	summary := make([]map[string]any, 0, len(comments))
 	for idx, comment := range comments {
 		entry := map[string]any{"index": reviewCommentDiagnosticIndex(comment, idx)}
 		for key, value := range reviewCommentAnchorMap(comment) {
+			if key == "path" && !includePaths {
+				if strings.TrimSpace(comment.Path) != "" {
+					entry["path_present"] = true
+				}
+				continue
+			}
 			entry[key] = value
 		}
 		summary = append(summary, entry)
 	}
 	return summary
+}
+
+// redactReviewSubmitRequestPaths returns a diagnostic-safe request summary for
+// validation_failed events. Raw comment paths and nested processing anchors are
+// replaced with path_present so secret-shaped path values cannot leak into
+// logs/stderr while publication is rejected.
+func redactReviewSubmitRequestPaths(request map[string]any) map[string]any {
+	if request == nil {
+		return nil
+	}
+	sanitized := make(map[string]any, len(request))
+	for key, value := range request {
+		sanitized[key] = value
+	}
+	if payload, ok := sanitized["payload"].(map[string]any); ok {
+		payloadCopy := make(map[string]any, len(payload))
+		for key, value := range payload {
+			payloadCopy[key] = value
+		}
+		payloadCopy["comments"] = redactDiagnosticCommentList(payloadCopy["comments"])
+		sanitized["payload"] = payloadCopy
+	}
+	if processing, ok := sanitized["comment_processing"].(map[string]any); ok {
+		processingCopy := make(map[string]any, len(processing))
+		for key, value := range processing {
+			processingCopy[key] = value
+		}
+		processingCopy["comments"] = redactDiagnosticProcessingCommentList(processingCopy["comments"])
+		sanitized["comment_processing"] = processingCopy
+	}
+	return sanitized
+}
+
+func redactDiagnosticCommentList(raw any) any {
+	switch comments := raw.(type) {
+	case []map[string]any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, entry := range comments {
+			redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	case []any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, rawEntry := range comments {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			redacted = append(redacted, redactReviewCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	default:
+		return raw
+	}
+}
+
+func redactDiagnosticProcessingCommentList(raw any) any {
+	switch comments := raw.(type) {
+	case []map[string]any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, entry := range comments {
+			redacted = append(redacted, redactProcessingCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	case []any:
+		redacted := make([]map[string]any, 0, len(comments))
+		for _, rawEntry := range comments {
+			entry, ok := rawEntry.(map[string]any)
+			if !ok {
+				continue
+			}
+			redacted = append(redacted, redactProcessingCommentDiagnosticEntry(entry))
+		}
+		return redacted
+	default:
+		return raw
+	}
+}
+
+func redactReviewCommentDiagnosticEntry(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	out := make(map[string]any, len(entry))
+	for key, value := range entry {
+		if key == "path" {
+			if path, ok := value.(string); ok && strings.TrimSpace(path) != "" {
+				out["path_present"] = true
+			}
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func redactProcessingCommentDiagnosticEntry(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	out := make(map[string]any, len(entry))
+	for key, value := range entry {
+		switch key {
+		case "original_anchor", "final_anchor":
+			if anchor, ok := value.(map[string]any); ok {
+				out[key] = redactReviewCommentDiagnosticEntry(anchor)
+				continue
+			}
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func reviewCommentDiagnosticIndex(comment ReviewComment, fallback int) int {
@@ -2052,6 +2218,9 @@ func containsVisibleInlineReviewDisclosure(body string) bool {
 }
 
 func (g *Gateway) AddPullRequestComment(ctx context.Context, input PullRequestCommentInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request comment body", Text: input.Body}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "comment", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--body", input.Body)
 	return err
 }
@@ -2473,6 +2642,9 @@ func (g *Gateway) DismissReview(ctx context.Context, input DismissReviewInput) e
 	if message == "" {
 		message = "Dismissed by looper."
 	}
+	if err := outboundguard.Validate(outboundguard.Field{Name: "review dismissal message", Text: message}); err != nil {
+		return err
+	}
 	args := []string{"api", fmt.Sprintf("repos/%s/pulls/%d/reviews/%d/dismissals", repo, input.PRNumber, input.ReviewID), "--method", "PUT", "-f", "message=" + message, "-f", "event=DISMISS"}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
@@ -2482,6 +2654,12 @@ func (g *Gateway) DismissReview(ctx context.Context, input DismissReviewInput) e
 }
 
 func (g *Gateway) CreatePullRequest(ctx context.Context, input CreatePullRequestInput) (CreatePullRequestResult, error) {
+	if err := outboundguard.Validate(
+		outboundguard.Field{Name: "pull request title", Text: input.Title},
+		outboundguard.Field{Name: "pull request body", Text: input.Body},
+	); err != nil {
+		return CreatePullRequestResult{}, err
+	}
 	args := []string{"pr", "create", "--repo", input.Repo, "--head", input.HeadBranch, "--base", input.BaseBranch, "--title", input.Title, "--body", input.Body}
 	if input.Draft {
 		args = append(args, "--draft")
@@ -2521,11 +2699,17 @@ func (g *Gateway) CompareBranches(ctx context.Context, input CompareBranchesInpu
 }
 
 func (g *Gateway) UpdatePullRequestTitle(ctx context.Context, input UpdatePullRequestTitleInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request title", Text: input.Title}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--title", input.Title)
 	return err
 }
 
 func (g *Gateway) UpdatePullRequestBody(ctx context.Context, input UpdatePullRequestBodyInput) error {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "pull request body", Text: input.Body}); err != nil {
+		return err
+	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "edit", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--body", input.Body)
 	return err
 }

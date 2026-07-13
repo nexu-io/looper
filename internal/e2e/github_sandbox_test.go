@@ -120,7 +120,7 @@ func TestGitHubSandboxFixerResolvesReviewThread(t *testing.T) {
 	})
 	defer cleanupSandboxPR(t, sb, pr.Number, pr.HeadBranch)
 
-	cfg := fixerSandboxConfig(t, bins, home, repo, fakeAgent, port, "commit")
+	cfg := fixerSandboxConfig(t, bins, home, repo, fakeAgent, port, "commit", sb)
 	harness.WriteConfig(t, home.ConfigPath, cfg, nil)
 	proc := harness.StartLooperd(t, bins, home, home.ConfigPath, sandboxEnvMap(sb), cfg.Server.Host, cfg.Server.Port)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -200,7 +200,7 @@ func TestGitHubSandboxNoDiffPathsDoNotOpenOrResolve(t *testing.T) {
 			}
 		})
 		defer cleanupSandboxPR(t, sb, pr.Number, pr.HeadBranch)
-		cfg := fixerSandboxConfig(t, bins, home, repo, fakeAgent, port, "success-no-diff")
+		cfg := fixerSandboxConfig(t, bins, home, repo, fakeAgent, port, "success-no-diff", sb)
 		harness.WriteConfig(t, home.ConfigPath, cfg, nil)
 		proc := harness.StartLooperd(t, bins, home, home.ConfigPath, sandboxEnvMap(sb), cfg.Server.Host, cfg.Server.Port)
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -348,7 +348,7 @@ func workerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness
 	return cfg
 }
 
-func fixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, agentMode string) config.Config {
+func fixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, agentMode string, sb sandboxConfig) config.Config {
 	tb.Helper()
 	// The fixer's resolve-comments drift guard requires the agent's reply to
 	// carry a `threadCommentsObserved` snapshot; a "fixed" decision without one
@@ -357,7 +357,12 @@ func fixerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.
 	// the same real `gh` the daemon uses. Before #513 the fake agent defaulted
 	// to `gh` on PATH; that fallback was removed, which silently regressed this
 	// live sandbox test into a deterministic thread-drift failure.
-	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", "gh")
+	//
+	// After #530, agent subprocesses no longer inherit ambient credentials from
+	// the daemon. GH_TOKEN must be supplied explicitly through agent.env so the
+	// fake agent can authenticate `gh api graphql` while building the observed
+	// thread snapshot (otherwise gh exits 4 and the repair step panics).
+	vendor, command, agentEnv := fakeAgent.AgentConfig(agentMode, "git", "gh", sandboxEnvMap(sb))
 	cfg := harness.DefaultConfig(tb, home, harness.ConfigOptions{
 		Port:              port,
 		ToolPaths:         harness.TestToolPaths{Git: "git", GH: "gh", Looper: bins.LooperPath, Osascript: bins.FakeOsascriptPath},

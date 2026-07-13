@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/bootstrap"
@@ -25,8 +26,6 @@ const legacyProjectIDPrefix = "legacy-id-"
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
 
-// DetectedRepo is the result of inspecting a local checkout's origin remote.
-// Provider is empty for the legacy GitHub default path.
 type DetectedRepo struct {
 	Repo     string
 	Provider string
@@ -78,10 +77,12 @@ type CapturePullRequestSnapshotInput struct {
 }
 
 type Service struct {
+	mutationMu                 sync.Mutex
 	DB                         *sql.DB
 	Repos                      *storage.Repositories
 	Logger                     bootstrap.Logger
 	Config                     config.Config
+	ConfigSource               ConfigSource
 	Now                        func() time.Time
 	DetectRepo                 DetectRepoFunc
 	GetRepositorySettings      GetRepositorySettingsFunc
@@ -90,6 +91,7 @@ type Service struct {
 	ListOpenPullRequests       ListOpenPullRequestsFunc
 	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
 	AsyncSnapshotQueueEnabled  func() bool
+	PublishProjects            func([]config.ProjectRefConfig)
 }
 
 type AddInput struct {
@@ -141,10 +143,15 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return AddResult{}, fmt.Errorf("projects repository is not configured")
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
 	existing, err := s.Repos.Projects.GetByID(ctx, input.ID)
 	if err != nil {
 		return AddResult{}, err
+	}
+	if existing != nil && metadataString(parseMetadata(existing.MetadataJSON), "source") == "config" {
+		return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
 	}
 	if existing != nil && !existing.Archived && input.IDSource != "derived" {
 		return AddResult{}, ProjectIDCollisionError{ProjectID: input.ID}
@@ -173,6 +180,7 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		}
 	}
 
+	cfg := s.currentConfig()
 	repo := input.Repo
 	provider := normalizeOptionalProvider(input.Provider)
 	warnings := []string{}
@@ -190,15 +198,15 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 			}
 		}
 	}
-	if err := s.validateExplicitProvider(provider); err != nil {
+	if err := validateExplicitProvider(cfg, provider); err != nil {
 		return AddResult{}, err
 	}
 	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
 		return AddResult{}, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
 	}
 
-	if !isForgejoProvider(s.Config, provider) {
-		if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, s.Config); err != nil {
+	if !isForgejoProvider(cfg, provider) {
+		if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
 			return AddResult{}, err
 		}
 	}
@@ -258,27 +266,28 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if existing != nil {
 		record.CreatedAt = existing.CreatedAt
 	}
+	nextProjects, err := s.materializeCandidate(ctx, &record, "")
+	if err != nil {
+		return AddResult{}, ProjectValidationError{Message: err.Error()}
+	}
 	if err := s.Repos.Projects.Upsert(ctx, record); err != nil {
 		return AddResult{}, err
 	}
-
-	if provider != nil {
-		warnings = append(warnings, "Provider binding saved; restart looperd before this project can be scheduled.")
+	if s.PublishProjects != nil {
+		s.PublishProjects(nextProjects)
 	}
 
 	discoveredWorktrees, err := s.discoverWorktrees(ctx, record, nowISO, &warnings)
 	if err != nil {
 		return AddResult{}, err
 	}
-	// GitHub PR snapshot discovery is GitHub-only; Forgejo projects skip it.
 	var discoveredPullRequests, pendingSnapshots, capturedSnapshots int
-	if !isForgejoProvider(s.Config, provider) {
+	if !isForgejoProvider(cfg, provider) {
 		discoveredPullRequests, pendingSnapshots, capturedSnapshots, err = s.discoverPullRequests(ctx, record, repo, snapshotModeOrDefault(input.SnapshotMode), &warnings)
 		if err != nil {
 			return AddResult{}, err
 		}
 	}
-
 	return AddResult{
 		Project:                record,
 		Repo:                   repo,
@@ -319,6 +328,8 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
 	trimmed := strings.TrimSpace(identifier)
 	if trimmed == "" {
@@ -338,6 +349,10 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 
 	nowISO := currentISO(s.Now)
 	cancelReason := "project archived"
+	nextProjects, err := s.materializeCandidate(ctx, nil, project.ID)
+	if err != nil {
+		return storage.ProjectRecord{}, err
+	}
 	archived, err := storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (bool, error) {
 		repos := storage.NewRepositories(tx)
 		archived, err := repos.Projects.Archive(ctx, project.ID, nowISO)
@@ -363,6 +378,9 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 	}
 	project.Archived = true
 	project.UpdatedAt = nowISO
+	if s.PublishProjects != nil {
+		s.PublishProjects(nextProjects)
+	}
 
 	return *project, nil
 }
@@ -401,13 +419,32 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return fmt.Errorf("projects repository is not configured")
 	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 
 	nowISO := currentISO(func() time.Time { return now })
+	cancelReason := "project archived"
+	existingProjects, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	desiredIDs := make(map[string]struct{}, len(cfg.Projects))
+	existingByID := make(map[string]*storage.ProjectRecord, len(existingProjects))
+	for index := range existingProjects {
+		existingByID[existingProjects[index].ID] = &existingProjects[index]
+	}
+	desiredRecords := make([]storage.ProjectRecord, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {
-		existing, err := s.Repos.Projects.GetByID(ctx, project.ID)
-		if err != nil {
-			return err
+		desiredIDs[project.ID] = struct{}{}
+		if existing := existingByID[project.ID]; existing != nil {
+			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source == "api" {
+				return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project", project.ID)}
+			}
 		}
+	}
+
+	for _, project := range cfg.Projects {
+		existing := existingByID[project.ID]
 
 		repo, err := s.detectConfiguredProjectRepo(ctx, existing, project)
 		if err != nil {
@@ -442,19 +479,55 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 			CreatedAt:    createdAt,
 			UpdatedAt:    nowISO,
 		}
-		if err := s.Repos.Projects.Upsert(ctx, record); err != nil {
-			return err
-		}
+		desiredRecords = append(desiredRecords, record)
 	}
 
-	return nil
+	applyImport := func(repos *storage.Repositories) error {
+		for _, record := range desiredRecords {
+			if err := repos.Projects.Upsert(ctx, record); err != nil {
+				return err
+			}
+		}
+		for index := range existingProjects {
+			existing := existingProjects[index]
+			if existing.Archived {
+				continue
+			}
+			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source != "config" {
+				continue
+			}
+			if _, configured := desiredIDs[existing.ID]; configured {
+				continue
+			}
+			if _, err := repos.Loops.TerminateByProject(ctx, existing.ID, nowISO); err != nil {
+				return err
+			}
+			if _, err := repos.Queue.CancelByProject(ctx, existing.ID, nowISO, &cancelReason); err != nil {
+				return err
+			}
+			if _, err := repos.Projects.Archive(ctx, existing.ID, nowISO); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if s.DB == nil {
+		return applyImport(s.Repos)
+	}
+	_, err = storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (struct{}, error) {
+		if err := applyImport(storage.NewRepositories(tx)); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *storage.ProjectRecord, project config.ProjectRefConfig) (*string, error) {
 	if repo := strings.TrimSpace(project.Repo); repo != "" {
 		return &repo, nil
 	}
-	if config.ResolvedProjectProviderKind(s.Config, project) != config.ProviderKindGitHub {
+	if config.ResolvedProjectProviderKind(s.currentConfig(), project) != config.ProviderKindGitHub {
 		if existing != nil && existing.RepoPath == project.RepoPath {
 			return stringMetadataPtr(existing.MetadataJSON, "repo"), nil
 		}
@@ -591,6 +664,33 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 		}
 		repoRaw = encoded
 	}
+	setProjectMetadata := func(key string, value any, keep bool) error {
+		if !keep {
+			delete(extras, key)
+			return nil
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		extras[key] = encoded
+		return nil
+	}
+	if err := setProjectMetadata("provider", strings.TrimSpace(project.Provider), strings.TrimSpace(project.Provider) != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("path", strings.TrimSpace(project.Path), strings.TrimSpace(project.Path) != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("network", project.Network, project.Network.Mode != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("webhook", project.Webhook, project.Webhook.Mode != ""); err != nil {
+		return "", err
+	}
+	if err := setProjectMetadata("roles", project.Roles, project.Roles != nil); err != nil {
+		return "", err
+	}
 
 	entries := make([]orderedJSONEntry, 0, len(extras)+3)
 	extraKeys := make([]string, 0, len(extras))
@@ -678,12 +778,12 @@ func normalizeOptionalProvider(value *string) *string {
 	return &trimmed
 }
 
-func (s *Service) validateExplicitProvider(provider *string) error {
+func validateExplicitProvider(cfg config.Config, provider *string) error {
 	if provider == nil {
 		return nil
 	}
 	providerID := strings.TrimSpace(*provider)
-	for _, configured := range s.Config.Providers {
+	for _, configured := range cfg.Providers {
 		if configured.ID == providerID {
 			if configured.Kind != config.ProviderKindForgejo {
 				return ProjectValidationError{Message: fmt.Sprintf("provider %q has kind %q; project add currently supports provider bindings only for Forgejo", providerID, configured.Kind)}
@@ -705,11 +805,6 @@ func isForgejoProvider(cfg config.Config, provider *string) bool {
 		}
 	}
 	return false
-}
-
-// ProviderFromMetadata returns the optional provider id stored on an API project.
-func ProviderFromMetadata(metadataJSON *string) string {
-	return strings.TrimSpace(stringValue(stringMetadataPtr(metadataJSON, "provider")))
 }
 
 type orderedJSONEntry struct {
@@ -939,10 +1034,45 @@ func (s *Service) enqueuePullRequestSnapshot(ctx context.Context, project storag
 }
 
 func (s *Service) snapshotRetryMaxAttempts() int64 {
-	if s.Config.Scheduler.RetryMaxAttempts == 0 {
+	cfg := s.currentConfig()
+	if cfg.Scheduler.RetryMaxAttempts == 0 {
 		return -1
 	}
-	return int64(s.Config.Scheduler.RetryMaxAttempts)
+	return int64(cfg.Scheduler.RetryMaxAttempts)
+}
+
+func (s *Service) currentConfig() config.Config {
+	if s != nil && s.ConfigSource != nil {
+		return s.ConfigSource.Snapshot()
+	}
+	if s == nil {
+		return config.Config{}
+	}
+	return s.Config
+}
+
+func (s *Service) materializeCandidate(ctx context.Context, replacement *storage.ProjectRecord, archiveID string) ([]config.ProjectRefConfig, error) {
+	if s == nil || s.Repos == nil || s.Repos.Projects == nil {
+		return nil, fmt.Errorf("projects repository is not configured")
+	}
+	records, err := s.Repos.Projects.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	replaced := false
+	for index := range records {
+		if replacement != nil && records[index].ID == replacement.ID {
+			records[index] = *replacement
+			replaced = true
+		}
+		if records[index].ID == archiveID {
+			records[index].Archived = true
+		}
+	}
+	if replacement != nil && !replaced {
+		records = append(records, *replacement)
+	}
+	return MaterializeCatalog(s.currentConfig(), records)
 }
 
 func snapshotModeOrDefault(mode SnapshotMode) SnapshotMode {

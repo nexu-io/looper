@@ -247,7 +247,10 @@ func mustOutput(command string, args ...string) string {
 	cmd := exec.Command(command, args...)
 	output, err := cmd.Output()
 	if err != nil {
-		panic(err)
+		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+			panic(fmt.Errorf("%s %v: %w\nstderr: %s", command, args, err, strings.TrimSpace(string(exitErr.Stderr))))
+		}
+		panic(fmt.Errorf("%s %v: %w", command, args, err))
 	}
 	return string(output)
 }

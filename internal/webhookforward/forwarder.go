@@ -94,9 +94,14 @@ type TargetedFixer interface {
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 }
 
+type ConfigSource interface {
+	Snapshot() config.Config
+}
+
 type Options struct {
 	Repos              *storage.Repositories
 	Config             config.Config
+	ConfigSource       ConfigSource
 	Reviewer           TargetedReviewer
 	Fixer              TargetedFixer
 	Logger             bootstrap.Logger
@@ -195,6 +200,7 @@ type checkRunEnvelope struct {
 type forwarder struct {
 	repos              *storage.Repositories
 	cfg                config.Config
+	configSource       ConfigSource
 	reviewer           TargetedReviewer
 	fixer              TargetedFixer
 	logger             bootstrap.Logger
@@ -245,6 +251,7 @@ func New(options Options) Forwarder {
 	f := &forwarder{
 		repos:              options.Repos,
 		cfg:                options.Config,
+		configSource:       options.ConfigSource,
 		reviewer:           options.Reviewer,
 		fixer:              options.Fixer,
 		logger:             options.Logger,
@@ -348,6 +355,10 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	candidates := make([]candidate, 0, len(projects))
 	newQueueEntries := 0
 	matched := 0
+	cfg := f.cfg
+	if f.configSource != nil {
+		cfg = f.configSource.Snapshot()
+	}
 	for _, project := range projects {
 		if project.Archived {
 			continue
@@ -356,7 +367,7 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 		if !strings.EqualFold(repo, routed.repo) {
 			continue
 		}
-		lanes := enabledLanesForProject(f.cfg, project.ID, routed.lanes)
+		lanes := enabledLanesForProject(cfg, project.ID, routed.lanes)
 		if len(lanes) == 0 {
 			continue
 		}

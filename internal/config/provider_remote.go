@@ -5,44 +5,6 @@ import (
 	"strings"
 )
 
-// UpsertRuntimeProjectBinding restores a persisted API project binding into the
-// startup config before scheduler and webhook consumers are constructed. It is
-// intentionally not used after startup; API changes take effect after restart.
-//
-// Config-file projects keep authority: an existing config entry with the same
-// id is left unchanged.
-func UpsertRuntimeProjectBinding(cfg *Config, projectID, name, providerID, repo, repoPath string) {
-	if cfg == nil {
-		return
-	}
-	projectID = strings.TrimSpace(projectID)
-	providerID = strings.TrimSpace(providerID)
-	repo = strings.TrimSpace(repo)
-	repoPath = strings.TrimSpace(repoPath)
-	if projectID == "" || providerID == "" || repo == "" || repoPath == "" {
-		return
-	}
-	for _, existing := range cfg.Projects {
-		if existing.ID == projectID {
-			return
-		}
-	}
-	if name = strings.TrimSpace(name); name == "" {
-		name = projectID
-	}
-	project := ProjectRefConfig{
-		ID:       projectID,
-		Name:     name,
-		Provider: providerID,
-		Repo:     repo,
-		RepoPath: repoPath,
-	}
-	if resolvedProjectProviderKind(*cfg, project) == ProviderKindForgejo {
-		applyForgejoProjectProfile(&project)
-	}
-	cfg.Projects = append(cfg.Projects, project)
-}
-
 // MatchForgejoProviderByRemoteHost finds a configured forgejo provider whose
 // baseUrl host is compatible with a git remote host.
 //

@@ -165,6 +165,18 @@ Looper's frozen canonical top-level config roots are:
 | `providers` | forge provider definitions such as GitHub or Forgejo hosts and credentials |
 | `projects` | per-project metadata and supported project-scoped overrides |
 
+### Project authority and import
+
+`[[projects]]` is a declarative startup import, not a second runtime project store. During daemon startup Looper validates and transactionally imports configured projects into SQLite, then builds the runtime Project Catalog exclusively from active database records. Scheduler, Webhook, Network, and Roles all capture that same Catalog.
+
+- Removing a config-managed project from `[[projects]]` archives its SQLite record on the next startup.
+- Config import never removes API-managed projects.
+- Reusing an API-managed project ID in `[[projects]]` fails startup instead of transferring ownership implicitly.
+- CLI/API add and remove operations publish one atomic Catalog replacement after the database commit; already-started work keeps its captured snapshot, while new work observes the new Catalog.
+- A project referencing a missing Provider fails validation; it never falls back to GitHub.
+
+See [ADR-0012](adr/0012-sqlite-project-authority.md) for the Authority and lifecycle decision.
+
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
 
 Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths or legacy JSON defaults.
@@ -188,6 +200,21 @@ id = "looper"
 name = "Looper"
 repoPath = "/absolute/path/to/repo"
 ```
+
+## Grok Build (xAI)
+
+Use `grok-build` as the `agent.vendor` identifier. Looper invokes the xAI Grok Build executable as `grok`:
+
+```toml
+[agent]
+vendor = "grok-build"
+```
+
+Authenticate the daemon safely with `grok login --device-auth`, or make `XAI_API_KEY` available in the daemon environment. Do not put API-key values in committed config files or examples.
+
+For fresh unattended runs, Looper supplies `--always-approve` and `--sandbox off` so Grok can update Git metadata outside a linked worktree. Configured agent arguments override these defaults; in particular, operators can select a stricter `--sandbox` when the repository layout permits it, `--permission-mode` may prompt or fail unattended runs, non-`plain` `--output-format` can prevent direct `__LOOPER_RESULT__=` completion-marker parsing, and configured `-p` or `--single` replaces Looper's generated task prompt.
+
+Grok Build support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt, and Looper never uses Grok Build's ambient `--continue`.
 
 ## Provider support
 
@@ -494,6 +521,11 @@ reasoning = "medium"
 
 [agent.env]
 OPENAI_API_KEY = "replace-me"
+
+# Agent subprocesses inherit only execution-safe host variables (for example,
+# PATH, HOME, locale, temporary/configuration directories, certificate paths,
+# SSH_AUTH_SOCK, and LOOPER_CONFIG so trusted wrappers resolve the same config).
+# Add required credentials or tool-specific variables here.
 
 [agent.nativeResume]
 enabled = true

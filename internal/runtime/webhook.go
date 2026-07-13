@@ -157,6 +157,27 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 	return rt
 }
 
+func (w *webhookRuntime) updateConfig(cfg config.Config) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	w.cfg.Projects = append([]config.ProjectRefConfig(nil), cfg.Projects...)
+	w.status.ConfiguredTunnelProjectIDs = configuredTunnelProjectIDs(cfg)
+	w.mu.Unlock()
+}
+
+func (w *webhookRuntime) configSnapshot() config.Config {
+	if w == nil {
+		return config.Config{}
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	cfg := w.cfg
+	cfg.Projects = append([]config.ProjectRefConfig(nil), w.cfg.Projects...)
+	return cfg
+}
+
 func (w *webhookRuntime) RecordDelivery(eventType, deliveryID string) {
 	if w == nil {
 		return
@@ -264,6 +285,7 @@ func (w *webhookRuntime) canLaunchForwarders() bool {
 }
 
 func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
+	cfg := w.configSnapshot()
 	if w == nil || !w.status.Enabled {
 		return nil
 	}
@@ -294,7 +316,7 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 		if project.Archived {
 			continue
 		}
-		if runtimeProjectProviderKind(w.cfg, project.ID) == config.ProviderKindForgejo {
+		if runtimeProjectProviderKind(cfg, project.ID) == config.ProviderKindForgejo {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)

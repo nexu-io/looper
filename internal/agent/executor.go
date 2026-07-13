@@ -47,6 +47,37 @@ var unsafeAgentEnvKeys = []string{
 	"GIT_SHALLOW_FILE",
 }
 
+var inheritedAgentEnvKeys = []string{
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"LANG",
+	"TERM",
+	"COLORTERM",
+	"NO_COLOR",
+	"FORCE_COLOR",
+	"XDG_CONFIG_HOME",
+	"XDG_CACHE_HOME",
+	"XDG_DATA_HOME",
+	"XDG_STATE_HOME",
+	"SSH_AUTH_SOCK",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"NODE_EXTRA_CA_CERTS",
+	"GIT_SSL_CAINFO",
+	"CODEX_HOME",
+	"CLAUDE_CONFIG_DIR",
+	"OPENCODE_CONFIG_DIR",
+	// Config path selector for trusted wrappers (looper review submit, etc.)
+	// that load via LOOPER_CONFIG when --config is not passed.
+	"LOOPER_CONFIG",
+}
+
 type ExecutorConfig struct {
 	Vendor              config.AgentVendor
 	Model               *string
@@ -1297,6 +1328,8 @@ func resolveCommand(cfg ExecutorConfig) string {
 		return "claude"
 	case config.AgentVendorCursorCLI:
 		return "agent"
+	case config.AgentVendorGrokBuild:
+		return "grok"
 	default:
 		return string(cfg.Vendor)
 	}
@@ -1313,6 +1346,8 @@ func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []s
 		return resolveOpenCodeArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	case config.AgentVendorCursorCLI:
 		return resolveCursorArgs(cfg, resolvedArgs, prompt)
+	case config.AgentVendorGrokBuild:
+		return resolveGrokArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	default:
 		return append([]string{}, resolvedArgs...)
 	}
@@ -1365,6 +1400,29 @@ func resolveCursorArgs(cfg ExecutorConfig, args []string, prompt string) []strin
 		return resolved
 	}
 	return append(resolved, "--print", prompt)
+}
+
+func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"-m", "--model"})
+	if !hasAnyFlag(resolved, []string{"-p", "--single"}) {
+		resolved = append(resolved, "-p", prompt)
+	}
+	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--cwd"}) {
+		resolved = append(resolved, "--cwd", workingDirectory)
+	}
+	if !hasAnyFlag(resolved, []string{"--output-format"}) {
+		resolved = append(resolved, "--output-format", "plain")
+	}
+	if !hasAnyFlag(resolved, []string{"--always-approve", "--yolo", "--dangerously-skip-permissions", "--permission-mode"}) {
+		resolved = append(resolved, "--always-approve")
+	}
+	if !hasAnyFlag(resolved, []string{"--sandbox"}) {
+		resolved = append(resolved, "--sandbox", "off")
+	}
+	if !hasAnyFlag(resolved, []string{"--no-auto-update"}) {
+		resolved = append(resolved, "--no-auto-update")
+	}
+	return resolved
 }
 
 func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
@@ -1421,7 +1479,18 @@ func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args [
 }
 
 func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {
-	envMap := envSliceToMap(os.Environ())
+	inherited := envSliceToMap(os.Environ())
+	envMap := make(map[string]string, len(inheritedAgentEnvKeys))
+	for _, key := range inheritedAgentEnvKeys {
+		if value, ok := inherited[key]; ok {
+			envMap[key] = value
+		}
+	}
+	for key, value := range inherited {
+		if strings.HasPrefix(key, "LC_") {
+			envMap[key] = value
+		}
+	}
 	for _, source := range envSources {
 		maps.Copy(envMap, source)
 	}

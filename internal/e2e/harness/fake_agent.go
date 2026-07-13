@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,7 +36,7 @@ func NewFakeAgent(tb testing.TB, bins BuiltBinaries) FakeAgent {
 	return FakeAgent{Path: bins.FakeAgentPath, ArtifactDir: artifactDir, StatePath: statePath}
 }
 
-func (f FakeAgent) AgentConfig(mode string, gitPath string, ghPath string) (*config.AgentVendor, string, map[string]string) {
+func (f FakeAgent) AgentConfig(mode string, gitPath string, ghPath string, extraEnv ...map[string]string) (*config.AgentVendor, string, map[string]string) {
 	vendor := config.AgentVendorCodex
 	env := map[string]string{
 		envFakeAgentMode:        mode,
@@ -47,6 +48,9 @@ func (f FakeAgent) AgentConfig(mode string, gitPath string, ghPath string) (*con
 	}
 	if ghPath != "" {
 		env[envFakeAgentGHPath] = ghPath
+	}
+	for _, source := range extraEnv {
+		maps.Copy(env, source)
 	}
 	return &vendor, f.Path, env
 }
