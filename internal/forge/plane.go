@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/outboundguard"
 )
 
 const (
@@ -328,6 +329,9 @@ func (plane *PlaneClient) AddIssueAssignees(ctx context.Context, issueNumber int
 // are UUIDs and cannot be represented in looper's int64 Comment.ID, so the
 // returned Comment.ID is 0 and HTMLURL points at the work-item web page.
 func (plane *PlaneClient) CreateIssueComment(ctx context.Context, input CreateCommentInput) (Comment, error) {
+	if err := outboundguard.Validate(outboundguard.Field{Name: "issue comment body", Text: input.Body}); err != nil {
+		return Comment{}, err
+	}
 	item, err := plane.resolveWorkItem(ctx, input.IssueNumber)
 	if err != nil {
 		return Comment{}, err

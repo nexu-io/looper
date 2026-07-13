@@ -24,32 +24,32 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 	if command != "claude" {
 		t.Fatalf("claude command = %q, want claude", command)
 	}
-	if len(args) < 4 || args[0] != "--model" || args[2] != "--print" {
-		t.Fatalf("claude args = %#v, want --model <model> --print <prompt>", args)
+	if got, want := strings.Join(args, " "), "--model gpt-5 --print hello --dangerously-skip-permissions"; got != want {
+		t.Fatalf("claude args = %q, want %q", got, want)
 	}
 
 	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex, Model: &model}, workDir, "hello")
 	if command != "codex" {
 		t.Fatalf("codex command = %q, want codex", command)
 	}
-	if len(args) < 4 || args[0] != "exec" || args[1] != "--model" || args[len(args)-1] != "hello" {
-		t.Fatalf("codex args = %#v, want exec --model <model> <prompt>", args)
+	if got, want := strings.Join(args, " "), "exec --model gpt-5 hello"; got != want {
+		t.Fatalf("codex args = %q, want %q", got, want)
 	}
 
 	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorOpenCode, Model: &model}, workDir, "hello")
 	if command != "opencode" {
 		t.Fatalf("opencode command = %q, want opencode", command)
 	}
-	if len(args) < 6 || args[0] != "run" || args[1] != "--model" || args[3] != "--dir" || args[4] != workDir || args[len(args)-1] != "hello" {
-		t.Fatalf("opencode args = %#v, want run --model <model> --dir <cwd> <prompt>", args)
+	if got, want := strings.Join(args, " "), "run --model gpt-5 --dir "+workDir+" hello"; got != want {
+		t.Fatalf("opencode args = %q, want %q", got, want)
 	}
 
 	command, args = ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorCursorCLI, Model: &model}, workDir, "hello")
 	if command != "agent" {
 		t.Fatalf("cursor command = %q, want agent", command)
 	}
-	if len(args) < 4 || args[0] != "--model" || args[2] != "--print" {
-		t.Fatalf("cursor args = %#v, want --model <model> --print <prompt>", args)
+	if got, want := strings.Join(args, " "), "--model gpt-5 --print hello"; got != want {
+		t.Fatalf("cursor args = %q, want %q", got, want)
 	}
 }
 
@@ -140,13 +140,18 @@ func TestResolveSpawnWithNativeResumeDoesNotDuplicateEqualsFlags(t *testing.T) {
 	}
 }
 
-func TestBuildCommandEnvSanitizesInheritedCWDAndGitOverrides(t *testing.T) {
+func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *testing.T) {
 	t.Setenv("PWD", "/Users/mrc/Projects/looper")
 	t.Setenv("OLDPWD", "/Users/mrc")
 	t.Setenv("GIT_DIR", "/tmp/unsafe-git-dir")
 	t.Setenv("GIT_WORK_TREE", "/tmp/unsafe-git-worktree")
 	t.Setenv("GIT_PREFIX", "unsafe-prefix")
-	t.Setenv("KEEP_ME", "1")
+	t.Setenv("PATH", "/safe/bin")
+	t.Setenv("LANG", "en_US.UTF-8")
+	t.Setenv("LC_ALL", "C.UTF-8")
+	t.Setenv("LOOPER_CONFIG", "/custom/looper/config.toml")
+	t.Setenv("UNRELATED_API_KEY", "must-not-reach-agent")
+	t.Setenv("KEEP_ME", "must-not-reach-agent")
 
 	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{"CONFIG_ONLY": "true", "PWD": "/tmp/config-override", "GIT_DIR": "/tmp/config-git-dir"}, map[string]string{"INPUT_ONLY": "yes", "OLDPWD": "/tmp/input-oldpwd"}))
 
@@ -158,8 +163,22 @@ func TestBuildCommandEnvSanitizesInheritedCWDAndGitOverrides(t *testing.T) {
 			t.Fatalf("%s present in sanitized env, want removed", key)
 		}
 	}
-	if got := env["KEEP_ME"]; got != "1" {
-		t.Fatalf("KEEP_ME = %q, want inherited value", got)
+	for _, key := range []string{"KEEP_ME", "UNRELATED_API_KEY"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("%s present in agent env, want ambient value excluded", key)
+		}
+	}
+	if got := env["PATH"]; got != "/safe/bin" {
+		t.Fatalf("PATH = %q, want inherited safe value", got)
+	}
+	if got := env["LANG"]; got != "en_US.UTF-8" {
+		t.Fatalf("LANG = %q, want inherited safe value", got)
+	}
+	if got := env["LC_ALL"]; got != "C.UTF-8" {
+		t.Fatalf("LC_ALL = %q, want inherited locale value", got)
+	}
+	if got := env["LOOPER_CONFIG"]; got != "/custom/looper/config.toml" {
+		t.Fatalf("LOOPER_CONFIG = %q, want custom path for review-submit wrappers", got)
 	}
 	if got := env["CONFIG_ONLY"]; got != "true" {
 		t.Fatalf("CONFIG_ONLY = %q, want true", got)

@@ -1,6 +1,6 @@
 ---
 name: looper
-description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, or cursor-cli; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
+description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, cursor-cli, or Grok Build; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
 ---
 
 # Looper
@@ -87,6 +87,7 @@ Auto-detect installed agent CLIs in parallel before asking:
 | `codex` | `command -v codex` |
 | `opencode` | `command -v opencode` |
 | `cursor-cli` | `command -v agent` |
+| `grok-build` | `command -v grok` |
 
 Use the `question` tool to let the user pick one. List detected vendors first, marked `(installed)`, with undetected ones appended as `(not installed — needs setup)`. If multiple are installed, do not impose an opinionated default — present them in detection order and let the user choose.
 
@@ -94,7 +95,9 @@ If none are installed, ask the user which one they want to install before contin
 
 After the user picks a vendor, verify it is authenticated (run the vendor's own status command, e.g. `claude --version` followed by a quick auth check, or `agent status`). If the vendor CLI exits with an auth error, surface it and ask the user to log in via the vendor's own flow before continuing.
 
-Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). **Do not** store agent credentials in the Looper config file (commonly `~/.looper/config.toml`, with some existing installs still using `~/.looper/config.json`).
+Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). For xAI Grok Build (`agent.vendor = "grok-build"`, executable `grok`), use `grok login --device-auth` or provide `XAI_API_KEY` in the daemon environment. **Do not** store agent credentials or API-key values in the Looper config file (commonly `~/.looper/config.toml`, with some existing installs still using `~/.looper/config.json`).
+
+Grok Build fresh runs default to `--always-approve` and `--sandbox off` so the agent can update Git metadata outside a linked worktree. Configured arguments override defaults: operators can select a stricter sandbox when the repository layout permits it; `--permission-mode` may prompt or fail unattended runs; non-`plain` output can prevent direct completion-marker parsing; and `-p`/`--single` replaces Looper's generated task prompt. Daemon native resume and interactive `looper resume` takeover are unsupported for Grok Build; retries use a fresh checkpoint prompt, and Looper never uses ambient `--continue`.
 
 ### Step 2 — Pick the first project to watch
 

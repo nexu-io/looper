@@ -7,6 +7,7 @@ const (
 	AgentVendorCodex      AgentVendor = "codex"
 	AgentVendorOpenCode   AgentVendor = "opencode"
 	AgentVendorCursorCLI  AgentVendor = "cursor-cli"
+	AgentVendorGrokBuild  AgentVendor = "grok-build"
 )
 
 type LogLevel string

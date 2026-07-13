@@ -13,6 +13,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -363,6 +364,45 @@ func TestEffectiveReviewSubmitEventDoesNotFetchUserForComment(t *testing.T) {
 	}
 }
 
+func TestWrapReviewSubmitErrorSurfacesContentSafetyRecoveryGuidance(t *testing.T) {
+	t.Parallel()
+	cmd := &cobra.Command{}
+	stderr := &bytes.Buffer{}
+	cmd.SetErr(stderr)
+	secretPath := "SERVICE_TOKEN=secret-value"
+	payload := reviewSubmitPayload{
+		Body:     "Please address the findings.",
+		Comments: []reviewSubmitComment{{Body: "Null check missing", Path: secretPath, Line: 1, Side: "RIGHT"}},
+	}
+	err := wrapReviewSubmitError(cmd, "acme/looper", 42, "COMMENT", "abc123", payload, "submit validated PR review", outboundguard.Validate(outboundguard.Field{Name: "inline review comment 1 path", Text: secretPath}))
+	if err == nil {
+		t.Fatal("wrapReviewSubmitError() error = nil, want content safety rejection")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"blocked by content safety gate",
+		"outbound content safety gate rejected inline review comment 1 path",
+		"credential-shaped",
+		outboundguard.RecoveryGuidance,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error = %q, want substring %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, secretPath) {
+		t.Fatalf("error %q echoed rejected path", msg)
+	}
+	if strings.Contains(stderr.String(), secretPath) {
+		t.Fatalf("stderr diagnostic echoed rejected path: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "github_review_submit_validation_failed") {
+		t.Fatalf("stderr = %q, want validation diagnostic", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"path_present":true`) {
+		t.Fatalf("stderr = %q, want path_present without raw path", stderr.String())
+	}
+}
+
 func TestWriteReviewSubmitDiagnosticWritesStructuredJSON(t *testing.T) {
 	t.Parallel()
 	stderr := &bytes.Buffer{}
@@ -435,6 +475,30 @@ func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
 	}
 	if gh.calls[0].Repo != "acme/looper" || gh.calls[0].PRNumber != 42 || gh.calls[0].CWD != "/repo" {
 		t.Fatalf("ViewPullRequest call = %#v, want requested PR and cwd", gh.calls[0])
+	}
+}
+
+// Pre-gate validation (malformed marker / APPROVE-with-comments) never reaches
+// SubmitReview's content guard, so diagnostics must redact paths — a path may
+// itself be secret-shaped (SERVICE_TOKEN=...).
+func TestPreGateValidationDiagnosticRedactsSecretShapedPaths(t *testing.T) {
+	t.Parallel()
+	stderr := &bytes.Buffer{}
+	secretPath := "SERVICE_TOKEN=secret-value"
+	payload := reviewSubmitPayload{
+		Body:     "missing marker",
+		Comments: []reviewSubmitComment{{Body: "note", Path: secretPath, Line: 1, Side: "RIGHT"}},
+	}
+	writeReviewSubmitDiagnostic(stderr, "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+		Repo: "acme/looper", PRNumber: 42, Event: "APPROVE", CommitID: "abc123", Payload: payload,
+		Error: "APPROVE reviews require clean outcome without inline comments", RedactPaths: true,
+	})
+	out := stderr.String()
+	if strings.Contains(out, secretPath) {
+		t.Fatalf("stderr diagnostic echoed secret-shaped path: %s", out)
+	}
+	if !strings.Contains(out, `"path_present":true`) {
+		t.Fatalf("stderr = %q, want path_present without raw path", out)
 	}
 }
 

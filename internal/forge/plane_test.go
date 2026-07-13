@@ -151,3 +151,20 @@ func TestPlaneCapabilitiesAndKind(t *testing.T) {
 		t.Fatalf("Repository() = %+v, want code repo acme/looper and kind plane", ref)
 	}
 }
+
+func TestPlaneCreateIssueCommentRejectsUnsafeContentBeforeRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	client, err := NewPlaneClient(RepositoryRef{ProviderID: "plane-test", Kind: ProviderKindPlane, BaseURL: server.URL, Repo: "acme/looper"}, "acme", "proj-123", "token", WithPlaneHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewPlaneClient() error = %v", err)
+	}
+	_, err = client.CreateIssueComment(context.Background(), CreateCommentInput{IssueNumber: 1, Body: "SERVICE_TOKEN=secret-value"})
+	if err == nil || !strings.Contains(err.Error(), "outbound content safety gate") {
+		t.Fatalf("CreateIssueComment() error = %v, want content safety rejection", err)
+	}
+	if requests != 0 {
+		t.Fatalf("CreateIssueComment() made %d HTTP requests after content safety failure", requests)
+	}
+}
