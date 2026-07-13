@@ -244,6 +244,8 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		profile := config.ProjectRefConfig{}
 		config.ApplyForgejoProjectProfile(&profile)
 		metadata["roles"] = profile.Roles
+	} else {
+		delete(metadata, "roles")
 	}
 	if input.WorktreeRoot != nil {
 		metadata["worktreeRoot"] = *input.WorktreeRoot

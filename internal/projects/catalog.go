@@ -134,6 +134,14 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		if err := decodeMetadataValue(metadata, "roles", &project.Roles); err != nil {
 			return nil, fmt.Errorf("decode project %q role policy: %w", project.ID, err)
 		}
+		if config.ResolvedProjectProviderKind(global, project) == config.ProviderKindForgejo {
+			config.ApplyForgejoProjectProfile(&project)
+			effectiveConfig := global
+			effectiveConfig.Projects = append(append([]config.ProjectRefConfig(nil), projects...), project)
+			if err := config.ValidateForgejoRoleCapabilities(config.ProjectRoleConfigs(effectiveConfig, project.ID), fmt.Sprintf("projects[%q]", project.ID)); err != nil {
+				return nil, err
+			}
+		}
 		projects = append(projects, project)
 	}
 	return projects, nil

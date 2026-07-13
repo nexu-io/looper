@@ -187,6 +187,32 @@ func TestMaterializeCatalogRejectsDuplicateActiveRepoBindings(t *testing.T) {
 	}
 }
 
+func TestMaterializeCatalogAppliesAndValidatesForgejoRoleProfile(t *testing.T) {
+	t.Parallel()
+
+	global, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	global.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}
+	metadata := `{"provider":"forgejo-main","repo":"core/odcrew","source":"api"}`
+	got, err := MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &metadata}})
+	if err != nil {
+		t.Fatalf("MaterializeCatalog() error = %v", err)
+	}
+	global.Projects = got
+	triggers := config.ProjectRoleConfigs(global, "odcrew").Reviewer.Discovery.Triggers
+	if triggers.RequireReviewRequest || len(triggers.Labels) != 1 || triggers.Labels[0] != "looper:review" {
+		t.Fatalf("materialized reviewer triggers = %#v, want Forgejo label/comment-only profile", triggers)
+	}
+
+	incompatibleMetadata := `{"provider":"forgejo-main","repo":"core/odcrew","roles":{"reviewer":{"discovery":{"triggers":{"requireReviewRequest":true}}}},"source":"api"}`
+	_, err = MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &incompatibleMetadata}})
+	if err == nil || !strings.Contains(err.Error(), "requireReviewRequest") {
+		t.Fatalf("MaterializeCatalog() error = %v, want incompatible Forgejo role rejection", err)
+	}
+}
+
 func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	t.Parallel()
 

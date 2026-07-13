@@ -144,3 +144,44 @@ func TestServiceAddProjectRejectsDuplicateActiveRepoBeforeUpsert(t *testing.T) {
 		t.Fatalf("stored = %#v, published = %v; want rejection before upsert and publish", stored, published)
 	}
 }
+
+func TestServiceAddProjectClearsForgejoRolesWhenProviderIsRemoved(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "LOOPER_FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
+	catalog := NewCatalog(cfg)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Config: cfg, ConfigSource: catalog, Now: time.Now, PublishProjects: catalog.Publish}
+	repo := "core/odcrew"
+	provider := "forgejo-main"
+	input := AddInput{ID: "odcrew", IDSource: "derived", Name: "ODCrew", RepoPath: "/tmp/odcrew", Repo: &repo, Provider: &provider}
+	if _, err := service.AddProject(context.Background(), input); err != nil {
+		t.Fatalf("AddProject(Forgejo) error = %v", err)
+	}
+
+	input.Provider = nil
+	if _, err := service.AddProject(context.Background(), input); err != nil {
+		t.Fatalf("AddProject(GitHub) error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "odcrew")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	metadata := parseMetadata(stored.MetadataJSON)
+	if _, ok := metadata["roles"]; ok {
+		t.Fatalf("stored metadata = %v, want provider-owned roles removed", metadata)
+	}
+	snapshot := catalog.Snapshot()
+	if len(snapshot.Projects) != 1 || snapshot.Projects[0].Provider != "" {
+		t.Fatalf("catalog projects = %#v, want GitHub-default binding", snapshot.Projects)
+	}
+	if !config.ProjectRoleConfigs(snapshot, "odcrew").Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatal("GitHub reviewer requireReviewRequest = false, want global GitHub default")
+	}
+}

@@ -488,6 +488,18 @@ func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[
 	}
 }
 
+// ValidateForgejoRoleCapabilities rejects role settings that require GitHub-only
+// APIs. Callers should apply the Forgejo project profile before validating so
+// omitted project settings receive provider-compatible defaults.
+func ValidateForgejoRoleCapabilities(roles RoleConfigs, prefix string) error {
+	issues := make([]ValidationIssue, 0)
+	validateForgejoRoleCapabilities(roles, prefix, &issues)
+	if len(issues) == 0 {
+		return nil
+	}
+	return &ConfigValidationError{Issues: issues}
+}
+
 func normalizeNetworkMode(mode NetworkMode) NetworkMode {
 	switch strings.TrimSpace(string(mode)) {
 	case "", string(NetworkModeOff):
