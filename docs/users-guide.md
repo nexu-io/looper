@@ -37,6 +37,8 @@ Also make sure:
 
 Forgejo projects need a configured `[[providers]]` entry (`kind = "forgejo"`, `baseUrl`, `tokenEnv`) first. `looper project add` detects a matching Forgejo origin as a hint, but requires `--provider` to confirm the binding; `--repo` may be omitted only when it can be read from an origin matching that provider. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
 
+`looper status` probes each configured Forgejo provider with bounded, read-only requests. Human and JSON output distinguish endpoint reachability, token authentication, current identity, server version, per-project read/write access, and configured versus observed capabilities. An unavailable OpenAPI contract is reported as `unknown`, never as supported. Status output omits provider URLs, token environment names, tokens, and raw network errors.
+
 ### Grok Build (xAI)
 
 For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `grok` executable. Authenticate the daemon with `grok login --device-auth` or by providing `XAI_API_KEY` in its environment—never commit an API-key value. Looper defaults to `--always-approve --sandbox off` so Grok can update Git metadata outside a linked worktree; configure `--sandbox` explicitly if a stricter profile works with your repository layout.

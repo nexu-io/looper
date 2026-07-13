@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 )
@@ -53,6 +54,36 @@ type statusOutput struct {
 		GH        bool `json:"gh"`
 		Osascript bool `json:"osascript"`
 	} `json:"tools"`
+	Providers []statusProviderOutput `json:"providers"`
+}
+
+type statusProviderOutput struct {
+	ProviderID     string `json:"providerId"`
+	Kind           string `json:"kind"`
+	Reachability   string `json:"reachability"`
+	Authentication string `json:"authentication"`
+	Identity       *struct {
+		Login string `json:"login"`
+	} `json:"identity"`
+	Version      string                            `json:"version"`
+	VersionState string                            `json:"versionState"`
+	Capabilities map[string]statusCapabilityOutput `json:"capabilities"`
+	Projects     []statusProviderProjectOutput     `json:"projects"`
+}
+
+type statusCapabilityOutput struct {
+	Configured      string `json:"configured"`
+	ConfiguredScope string `json:"configuredScope"`
+	Observed        string `json:"observed"`
+	Effective       string `json:"effective"`
+	Degraded        bool   `json:"degraded"`
+	Reason          string `json:"reason"`
+}
+
+type statusProviderProjectOutput struct {
+	ProjectID  string `json:"projectId"`
+	Repository string `json:"repository"`
+	Access     string `json:"access"`
 }
 
 type statusAgentOutput struct {
@@ -319,6 +350,41 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	printSection(w, "Storage", [][2]any{{"dbPath", data.Storage.DBPath}, {"schemaVersion", data.Storage.SchemaVersion}, {"healthy", data.Storage.Healthy}, {"pendingMigrations", joinOrNone(data.Storage.PendingMigrations)}})
 	fmt.Fprintln(w)
 	printSection(w, "Scheduler", [][2]any{{"healthy", data.Scheduler.Healthy}, {"queuedItems", data.Scheduler.QueuedItems}, {"runningItems", data.Scheduler.RunningItems}})
+	if len(data.Providers) > 0 {
+		fmt.Fprintln(w)
+		providerRows := make([]tableRow, 0, len(data.Providers))
+		for _, provider := range data.Providers {
+			identity := "none"
+			if provider.Identity != nil && strings.TrimSpace(provider.Identity.Login) != "" {
+				identity = provider.Identity.Login
+			}
+			providerRows = append(providerRows, tableRow{"provider": provider.ProviderID, "kind": provider.Kind, "endpoint": provider.Reachability, "auth": provider.Authentication, "identity": identity, "version": firstNonEmptyStatus(provider.Version, provider.VersionState)})
+		}
+		printTable(w, []string{"provider", "kind", "endpoint", "auth", "identity", "version"}, providerRows)
+		projectRows := make([]tableRow, 0)
+		for _, provider := range data.Providers {
+			for _, project := range provider.Projects {
+				projectRows = append(projectRows, tableRow{"provider": provider.ProviderID, "project": project.ProjectID, "repository": project.Repository, "access": project.Access})
+			}
+		}
+		if len(projectRows) > 0 {
+			fmt.Fprintln(w)
+			printTable(w, []string{"provider", "project", "repository", "access"}, projectRows)
+		}
+		capabilityRows := make([]tableRow, 0)
+		for _, provider := range data.Providers {
+			for name, capability := range provider.Capabilities {
+				capabilityRows = append(capabilityRows, tableRow{"provider": provider.ProviderID, "capability": name, "configured": capability.Configured, "scope": firstNonEmptyStatus(capability.ConfiguredScope, "n/a"), "observed": capability.Observed, "effective": capability.Effective, "degraded": capability.Degraded})
+			}
+		}
+		if len(capabilityRows) > 0 {
+			sort.Slice(capabilityRows, func(i, j int) bool {
+				return fmt.Sprint(capabilityRows[i]["provider"], capabilityRows[i]["capability"]) < fmt.Sprint(capabilityRows[j]["provider"], capabilityRows[j]["capability"])
+			})
+			fmt.Fprintln(w)
+			printTable(w, []string{"provider", "capability", "configured", "scope", "observed", "effective", "degraded"}, capabilityRows)
+		}
+	}
 	if data.Agent != nil {
 		fmt.Fprintln(w)
 		printSection(w, "Agent", [][2]any{{"vendor", data.Agent.Vendor}, {"model", data.Agent.Model}, {"nativeResumeEnabled", data.Agent.NativeResumeEnabled}, {"plannerIdleTimeoutSeconds", data.Agent.Timeouts.Planner.IdleTimeoutSeconds}, {"plannerMaxRuntimeSeconds", data.Agent.Timeouts.Planner.MaxRuntimeSeconds}, {"workerIdleTimeoutSeconds", data.Agent.Timeouts.Worker.IdleTimeoutSeconds}, {"workerMaxRuntimeSeconds", data.Agent.Timeouts.Worker.MaxRuntimeSeconds}, {"reviewerIdleTimeoutSeconds", data.Agent.Timeouts.Reviewer.IdleTimeoutSeconds}, {"reviewerMaxRuntimeSeconds", data.Agent.Timeouts.Reviewer.MaxRuntimeSeconds}, {"fixerIdleTimeoutSeconds", data.Agent.Timeouts.Fixer.IdleTimeoutSeconds}, {"fixerMaxRuntimeSeconds", data.Agent.Timeouts.Fixer.MaxRuntimeSeconds}})
@@ -332,6 +398,15 @@ func writeHumanStatus(w io.Writer, payload json.RawMessage) error {
 	fmt.Fprintln(w)
 	printSection(w, "Notifications", [][2]any{{"inAppEnabled", data.Notifications.InAppEnabled}, {"osascriptEnabled", data.Notifications.OsascriptEnabled}})
 	return nil
+}
+
+func firstNonEmptyStatus(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return "unknown"
 }
 
 func writeHumanProjectList(w io.Writer, payload json.RawMessage) error {

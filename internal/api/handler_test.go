@@ -676,6 +676,49 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, reviewer["stopped"], float64(1))
 }
 
+func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {
+	t.Setenv("FORGEJO_STATUS_TOKEN", "status-secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/version":
+			_, _ = w.Write([]byte(`{"version":"15.0.4"}`))
+		case "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/comments/{id}/resolve":{"post":{}}}}`))
+		case "/api/v1/user":
+			_, _ = w.Write([]byte(`{"id":7,"login":"forge-bot"}`))
+		case "/api/v1/repos/acme/looper":
+			_, _ = w.Write([]byte(`{"permissions":{"pull":true,"push":true}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	rt, cfg := startTestRuntime(t)
+	tokenEnv := "FORGEJO_STATUS_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: &tokenEnv}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project-forgejo", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: t.TempDir()}}
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "status-secret") || strings.Contains(body, server.URL) || strings.Contains(body, tokenEnv) {
+		t.Fatalf("status body leaked provider configuration: %s", body)
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	providers := data["providers"].([]any)
+	if len(providers) != 1 {
+		t.Fatalf("providers = %#v", providers)
+	}
+	provider := providers[0].(map[string]any)
+	assertEqual(t, provider["providerId"], "forgejo-main")
+	assertEqual(t, provider["authentication"], "valid")
+	projects := provider["projects"].([]any)
+	assertEqual(t, projects[0].(map[string]any)["access"], "writable")
+}
+
 func TestHandlerVersionSuccessContainsExpectedFields(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)

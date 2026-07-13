@@ -1526,6 +1526,17 @@ func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input 
 	return nil, nil
 }
 
+func (a fixerGitHubAdapter) ProbeNativeReviewCommentResolution(ctx context.Context, input fixer.ListNativeReviewCommentsInput) (forge.ProbeState, error) {
+	_, provider, ok, err := forgejoProjectProviderForCWD(a.config, input.CWD)
+	if err != nil {
+		return forge.ProbeStateUnknown, err
+	}
+	if !ok {
+		return forge.ProbeStateSupported, nil
+	}
+	return forge.ProbeForgejoReviewCommentResolution(ctx, provider, input.Repo)
+}
+
 func (a fixerGitHubAdapter) ResolveNativeReviewComment(ctx context.Context, input fixer.ResolveNativeReviewCommentInput) error {
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {

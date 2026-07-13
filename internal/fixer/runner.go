@@ -337,6 +337,7 @@ type GitHubGateway interface {
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
 	AddReviewThreadReply(context.Context, AddReviewThreadReplyInput) error
 	ListNativeReviewComments(context.Context, ListNativeReviewCommentsInput) ([]NativeReviewComment, error)
+	ProbeNativeReviewCommentResolution(context.Context, ListNativeReviewCommentsInput) (forge.ProbeState, error)
 	ResolveNativeReviewComment(context.Context, ResolveNativeReviewCommentInput) error
 	CompareCommits(context.Context, CompareCommitsInput) (CompareCommitsResult, error)
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
@@ -2390,6 +2391,12 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
+	if hasForgejoNativeReviewComments(fixItems) {
+		state, probeErr := r.github.ProbeNativeReviewCommentResolution(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+		if probeErr != nil || state != forge.ProbeStateSupported {
+			return checkpoint, &loopError{message: fmt.Sprintf("Forgejo native review comment resolution is %s; manual intervention required", firstNonEmpty(string(state), "unknown")), kind: FailureManualIntervention}
+		}
+	}
 	for _, item := range fixItems {
 		if item.Type == "comment" && item.Source == NativeReviewCommentSource && !item.ResolverPresent {
 			return checkpoint, &loopError{message: fmt.Sprintf("Forgejo native review comment resolution is unsupported for comment %d; manual intervention required", item.ProviderCommentID), kind: FailureManualIntervention}
@@ -2402,6 +2409,15 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	checkpoint.SkipReason = ""
 	return checkpoint, nil
+}
+
+func hasForgejoNativeReviewComments(items []FixItem) bool {
+	for _, item := range items {
+		if item.Type == "comment" && item.Source == NativeReviewCommentSource {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint) error {

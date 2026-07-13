@@ -6158,6 +6158,10 @@ func (f *fakeGitHubGateway) ListNativeReviewComments(ctx context.Context, _ List
 	return append([]NativeReviewComment(nil), f.nativeComments...), nil
 }
 
+func (f *fakeGitHubGateway) ProbeNativeReviewCommentResolution(context.Context, ListNativeReviewCommentsInput) (forge.ProbeState, error) {
+	return forge.ProbeStateSupported, nil
+}
+
 func (f *fakeGitHubGateway) ResolveNativeReviewComment(_ context.Context, input ResolveNativeReviewCommentInput) error {
 	f.resolveNativeCalls = append(f.resolveNativeCalls, input)
 	return f.resolveNativeErr
