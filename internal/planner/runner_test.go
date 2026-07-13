@@ -876,6 +876,25 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	}
 }
 
+func TestPlannerAdoptionHoldSummaryRechecksIssueBeforeAdoptedPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Labels: []string{domain.HoldLabelGlobal}}}
+	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := plannerCheckpoint{Issue: &checkpointIssue{Repo: "acme/looper", IssueNumber: 42}}
+
+	held, summary, err := runner.plannerAdoptionHoldSummary(context.Background(), storage.ProjectRecord{RepoPath: t.TempDir()}, checkpoint, "acme/looper", 101, storage.QueueItemRecord{})
+	if err != nil {
+		t.Fatalf("plannerAdoptionHoldSummary() error = %v", err)
+	}
+	if !held || !strings.Contains(summary, "acme/looper#42") {
+		t.Fatalf("held, summary = %v, %q, want newly held source issue", held, summary)
+	}
+	if len(github.listOpenPRCalls) != 0 {
+		t.Fatalf("listOpenPRCalls = %#v, want no further PR work after issue hold", github.listOpenPRCalls)
+	}
+}
+
 func TestProcessClaimedItemUsesConfiguredPlannerPolicyLabels(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

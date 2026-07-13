@@ -1923,7 +1923,8 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err != nil {
 		return checkpoint, err
 	}
-	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+	holdWork, retargetedToPullRequest := workerHoldInputForTarget(work, input.Loop, input.QueueItem)
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
@@ -1979,7 +1980,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			checkpoint.markLifecycleAgentPullRequest(branch, work.BaseBranch, pr)
 		}
 	}
-	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
@@ -2042,7 +2043,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		prURL := stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])
 		checkpoint.PullRequest = &checkpointPullPR{Number: work.PRNumber, URL: prURL}
 		checkpoint.markLifecyclePushAndPR(firstNonEmpty(work.Branch, worktree.Branch), work.BaseBranch, work.PRNumber, prURL, true, false)
-		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 			return checkpoint, err
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}
@@ -2113,7 +2114,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, 0, "", true, false)
-	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, work); err != nil {
+	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}

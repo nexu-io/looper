@@ -1119,7 +1119,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			if adopted != nil {
-				if held, summary, err := r.plannerAdoptedPullRequestHoldSummary(ctx, input.Project, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+				if held, summary, err := r.plannerAdoptionHoldSummary(ctx, input.Project, checkpoint, issue.Repo, adopted.Number, input.QueueItem); err != nil {
 					return checkpoint, err
 				} else if held {
 					return checkpoint, &holdSkipError{summary: summary}
@@ -1152,7 +1152,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if adopted != nil {
-			if held, summary, err := r.plannerAdoptedPullRequestHoldSummary(ctx, input.Project, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+			if held, summary, err := r.plannerAdoptionHoldSummary(ctx, input.Project, checkpoint, issue.Repo, adopted.Number, input.QueueItem); err != nil {
 				return checkpoint, err
 			} else if held {
 				return checkpoint, &holdSkipError{summary: summary}
@@ -1295,6 +1295,16 @@ func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, proje
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, prNumber), nil
 	}
 	return false, "", nil
+}
+
+func (r *Runner) plannerAdoptionHoldSummary(ctx context.Context, project storage.ProjectRecord, checkpoint plannerCheckpoint, repo string, prNumber int64, queueItem storage.QueueItemRecord) (bool, string, error) {
+	if plannerQueueItemIsManual(queueItem) {
+		return false, "", nil
+	}
+	if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, project, checkpoint); err != nil || held {
+		return held, summary, err
+	}
+	return r.plannerAdoptedPullRequestHoldSummary(ctx, project, repo, prNumber, queueItem)
 }
 
 func (r *Runner) finishHeldPlannerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint plannerCheckpoint, summary string) (ProcessResult, error) {

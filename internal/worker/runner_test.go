@@ -275,6 +275,46 @@ func TestRunOpenPRStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
 	}
 }
 
+func TestRunOpenPRStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(46)
+	prNumber := int64(101)
+	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	github := &fakeGitHubGateway{
+		issueDetail: IssueDetail{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		prDetail:    PullRequestDetail{Number: prNumber, State: "open", Labels: []string{}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, OpenPRStrategy: config.OpenPRStrategyManual})
+	loop := storage.LoopRecord{ID: "loop_worker_pr_open_hold", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber}
+	queue := storage.QueueItemRecord{ID: "queue_worker_pr_open_hold", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_pr_open_hold", LoopID: "loop_worker_1", Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runOpenPRStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:      loop,
+		QueueItem: queue,
+		Run:       storage.RunRecord{ID: "run_worker_pr_open_hold"},
+		Checkpoint: workerCheckpoint{
+			Work:       &workerInput{Repo: repo, BaseBranch: "main", IssueNumber: issueNumber, PRNumber: prNumber, AutoDiscovered: true},
+			Worktree:   &checkpointWorktree{Path: t.TempDir(), Branch: "worker/46", BaseBranch: "main"},
+			Validation: &ValidationResult{Passed: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	if !strings.Contains(checkpoint.SkipReason, "PR opening is manual") {
+		t.Fatalf("checkpoint.SkipReason = %q, want manual opening result", checkpoint.SkipReason)
+	}
+	if len(github.viewPRCalls) != 2 {
+		t.Fatalf("viewPRCalls = %#v, want both open-pr hold checks to target PR", github.viewPRCalls)
+	}
+}
+
 func TestDiscoverIssuesRoutedProjectRequiresCurrentNodeTargetLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
