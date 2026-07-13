@@ -391,6 +391,7 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	defer s.mutationMu.Unlock()
 
 	nowISO := currentISO(func() time.Time { return now })
+	cancelReason := "project archived"
 	existingProjects, err := s.Repos.Projects.List(ctx)
 	if err != nil {
 		return err
@@ -465,6 +466,12 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 			}
 			if _, configured := desiredIDs[existing.ID]; configured {
 				continue
+			}
+			if _, err := repos.Loops.TerminateByProject(ctx, existing.ID, nowISO); err != nil {
+				return err
+			}
+			if _, err := repos.Queue.CancelByProject(ctx, existing.ID, nowISO, &cancelReason); err != nil {
+				return err
 			}
 			if _, err := repos.Projects.Archive(ctx, existing.ID, nowISO); err != nil {
 				return err

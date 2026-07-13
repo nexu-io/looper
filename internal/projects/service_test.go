@@ -748,6 +748,13 @@ func TestServiceSyncConfiguredArchivesConfigProjectsRemovedFromConfig(t *testing
 			t.Fatalf("Projects.Upsert(%s) error = %v", project.ID, err)
 		}
 	}
+	targetID := "pr:nexu-io/removed:531"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_removed", Seq: 1, ProjectID: "removed", Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Status: string(domain.LoopStatusQueued), CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_removed", ProjectID: stringPointer("removed"), LoopID: stringPointer("loop_removed"), Type: "reviewer", TargetType: "pull_request", TargetID: targetID, DedupeKey: "reviewer:removed:loop_removed", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: createdAt, MaxAttempts: 3, CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
 
 	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -765,6 +772,20 @@ func TestServiceSyncConfiguredArchivesConfigProjectsRemovedFromConfig(t *testing
 	}
 	if removed == nil || !removed.Archived || removed.UpdatedAt != currentISO(func() time.Time { return now }) {
 		t.Fatalf("removed = %#v, want archived config project at import time", removed)
+	}
+	removedLoop, err := repos.Loops.GetByID(context.Background(), "loop_removed")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if removedLoop == nil || removedLoop.Status != string(domain.LoopStatusTerminated) {
+		t.Fatalf("removed loop = %#v, want terminated", removedLoop)
+	}
+	removedQueue, err := repos.Queue.GetByID(context.Background(), "queue_removed")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if removedQueue == nil || removedQueue.Status != "cancelled" || removedQueue.LastError == nil || *removedQueue.LastError != "project archived" {
+		t.Fatalf("removed queue = %#v, want cancelled with archive reason", removedQueue)
 	}
 	apiProject, err := repos.Projects.GetByID(context.Background(), "api-project")
 	if err != nil {
