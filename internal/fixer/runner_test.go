@@ -5774,7 +5774,8 @@ func TestRunRepairStepSkipsWhenFixerHoldAppliedBeforeAgentStart(t *testing.T) {
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", Labels: []string{domain.HoldLabelFixer}}}}
 	agent := &fakeAgentExecutor{}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
 	_, err := runner.runRepairStep(context.Background(), stepInput{
 		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
@@ -5783,7 +5784,7 @@ func TestRunRepairStepSkipsWhenFixerHoldAppliedBeforeAgentStart(t *testing.T) {
 		PRNumber: 42,
 		Checkpoint: fixerCheckpoint{
 			Detail:       &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main", HeadSHA: "head-1"},
-			FixItems:     []FixItem{{ID: "fix-1", Summary: "repair disclosure"}},
+			FixItems:     []FixItem{{ID: "fix-1", Type: "conflict", Summary: "merge conflict"}},
 			Worktree:     &checkpointWorktree{Path: worktreePath, Branch: "feature/fix-42", HeadSHA: "head-1"},
 			FixItemsHash: "hash-1",
 		},
@@ -5791,6 +5792,9 @@ func TestRunRepairStepSkipsWhenFixerHoldAppliedBeforeAgentStart(t *testing.T) {
 	var holdErr *holdSkipError
 	if !errors.As(err, &holdErr) {
 		t.Fatalf("runRepairStep() error = %v, want hold skip", err)
+	}
+	if len(git.mergeBaseCalls) != 0 {
+		t.Fatalf("len(git.mergeBaseCalls) = %d, want no conflict merge", len(git.mergeBaseCalls))
 	}
 	if len(agent.starts) != 0 {
 		t.Fatalf("len(agent.starts) = %d, want no agent start", len(agent.starts))
