@@ -73,7 +73,7 @@ func hostFromBaseURL(baseURL string) string {
 func normalizeRemoteHost(host string) string {
 	host = strings.ToLower(strings.TrimSpace(host))
 	// Strip optional trailing port from host:port forms that did not come from url.Parse.
-	if i := strings.LastIndex(host, ":"); i > 0 && !strings.Contains(host, "]") {
+	if i := strings.LastIndex(host, ":"); i > 0 && strings.Count(host, ":") == 1 {
 		// Only strip if the suffix looks like a port.
 		port := host[i+1:]
 		if port != "" && isAllDigits(port) {

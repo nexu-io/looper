@@ -39,3 +39,27 @@ func TestMatchForgejoProviderByRemoteHostAmbiguous(t *testing.T) {
 		t.Fatal("ambiguous providers should not match")
 	}
 }
+
+func TestMatchForgejoProviderByRemoteHostPreservesBareIPv6(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		Providers: []ProviderConfig{
+			{ID: "forgejo-one", Kind: ProviderKindForgejo, BaseURL: "https://[2001:db8::1]"},
+			{ID: "forgejo-two", Kind: ProviderKindForgejo, BaseURL: "https://[2001:db8::2]"},
+		},
+	}
+
+	for _, tc := range []struct {
+		host       string
+		providerID string
+	}{
+		{host: "2001:db8::1", providerID: "forgejo-one"},
+		{host: "2001:db8::2", providerID: "forgejo-two"},
+	} {
+		provider, ok := MatchForgejoProviderByRemoteHost(cfg, tc.host)
+		if !ok || provider.ID != tc.providerID {
+			t.Fatalf("MatchForgejoProviderByRemoteHost(%q) = (%q, %v), want %q", tc.host, provider.ID, ok, tc.providerID)
+		}
+	}
+}
