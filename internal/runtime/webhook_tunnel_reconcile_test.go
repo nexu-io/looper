@@ -236,7 +236,10 @@ func TestWebhookRuntimeReconcileConflictedRepoMarksTunnelHookOrphaned(t *testing
 		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
 	}
 	cfg.Webhook.Mode = config.WebhookModeTunnel
-	cfg.Projects = []config.ProjectRefConfig{{ID: "forward", Webhook: config.ProjectWebhookConfig{Mode: config.WebhookModeGHForward}}}
+	cfg.Projects = []config.ProjectRefConfig{
+		{ID: "tunnel", Repo: "acme/looper"},
+		{ID: "forward", Repo: "acme/looper", Webhook: config.ProjectWebhookConfig{Mode: config.WebhookModeGHForward}},
+	}
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.bootstrapDone = true
 

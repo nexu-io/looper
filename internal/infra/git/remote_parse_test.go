@@ -17,6 +17,8 @@ func TestParseRemoteRepoFromURL(t *testing.T) {
 		{url: "ssh://git@ssh.code.powerformer.net:2222/core/odcrew.git", wantHost: "ssh.code.powerformer.net", wantRepo: "core/odcrew"},
 		{url: "https://code.powerformer.net/core/odcrew.git", wantHost: "code.powerformer.net", wantRepo: "core/odcrew"},
 		{url: "git@code.powerformer.net:core/odcrew.git", wantHost: "code.powerformer.net", wantRepo: "core/odcrew"},
+		{url: "forgejo@code.powerformer.net:core/odcrew.git", wantHost: "code.powerformer.net", wantRepo: "core/odcrew"},
+		{url: "forgejo@[2001:db8::1]:core/odcrew.git", wantHost: "2001:db8::1", wantRepo: "core/odcrew"},
 		{url: "", wantHost: "", wantRepo: ""},
 		{url: "not-a-remote", wantHost: "", wantRepo: ""},
 	}

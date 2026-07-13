@@ -202,7 +202,11 @@ func (w *webhookRuntime) Start(repos *storage.Repositories) error {
 }
 
 func (w *webhookRuntime) Bootstrap(ctx context.Context, repos *storage.Repositories) {
-	if w == nil || !w.status.Enabled || repos == nil || repos.WebhookForwarders == nil || repos.Projects == nil {
+	w.bootstrap(ctx, repos, w.configSnapshot())
+}
+
+func (w *webhookRuntime) bootstrap(ctx context.Context, repos *storage.Repositories, cfg config.Config) {
+	if w == nil || !w.status.Enabled || repos == nil || repos.WebhookForwarders == nil {
 		return
 	}
 	w.bootstrapMu.Lock()
@@ -222,12 +226,7 @@ func (w *webhookRuntime) Bootstrap(ctx context.Context, repos *storage.Repositor
 		w.mu.Unlock()
 		return
 	}
-	projects, err := repos.Projects.List(ctx)
-	if err != nil {
-		w.addDegradedReason(fmt.Sprintf("webhook forwarder bootstrap is incomplete: list projects: %v", err))
-		return
-	}
-	desiredRepos := w.configuredWebhookReposForMode(projects, config.WebhookModeGHForward)
+	desiredRepos := configuredWebhookReposForMode(cfg, config.WebhookModeGHForward)
 	desired := map[string]struct{}{}
 	for _, repo := range desiredRepos {
 		desired[repo] = struct{}{}
@@ -286,6 +285,10 @@ func (w *webhookRuntime) canLaunchForwarders() bool {
 
 func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 	cfg := w.configSnapshot()
+	return w.reconcileSnapshot(repos, cfg)
+}
+
+func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg config.Config) error {
 	if w == nil || !w.status.Enabled {
 		return nil
 	}
@@ -293,42 +296,24 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 		w.syncForwarderStore(repos.WebhookForwarders)
 	}
 	if repos != nil && repos.WebhookForwarders != nil && !w.bootstrapCompleted() {
-		w.Bootstrap(context.Background(), repos)
+		w.bootstrap(context.Background(), repos, cfg)
 		if !w.bootstrapCompleted() {
 			w.scheduleReconcileRetry(repos)
 			return nil
 		}
 	}
-	if repos == nil || repos.Projects == nil {
+	if repos == nil {
 		w.addDegradedReason("project repositories are unavailable")
-		return nil
-	}
-	projects, err := repos.Projects.List(context.Background())
-	if err != nil {
-		w.addDegradedReason(fmt.Sprintf("list configured projects: %v", err))
-		w.scheduleReconcileRetry(repos)
 		return nil
 	}
 	w.clearTransientReconcileDegradedReasons()
 	forwarderRepoSet := map[string]struct{}{}
 	tunnelRepoSet := map[string]struct{}{}
-	for _, project := range projects {
-		if project.Archived {
-			continue
-		}
-		if runtimeProjectProviderKind(cfg, project.ID) == config.ProviderKindForgejo {
-			continue
-		}
-		repo := repoFromProjectMetadata(project.MetadataJSON)
-		if repo == "" {
-			continue
-		}
-		switch w.webhookModeForProject(project.ID) {
-		case config.WebhookModeTunnel:
-			tunnelRepoSet[repo] = struct{}{}
-		default:
-			forwarderRepoSet[repo] = struct{}{}
-		}
+	for _, repo := range configuredWebhookReposForMode(cfg, config.WebhookModeGHForward) {
+		forwarderRepoSet[repo] = struct{}{}
+	}
+	for _, repo := range configuredWebhookReposForMode(cfg, config.WebhookModeTunnel) {
+		tunnelRepoSet[repo] = struct{}{}
 	}
 	for repo := range forwarderRepoSet {
 		if _, ok := tunnelRepoSet[repo]; ok {

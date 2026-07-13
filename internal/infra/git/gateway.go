@@ -1194,7 +1194,8 @@ func parseGitHubRepoFromRemoteURL(remoteURL string) string {
 }
 
 // parseRemoteRepoFromURL extracts host and owner/name from common git remote URL forms:
-//   - git@host:owner/repo.git
+//   - user@host:owner/repo.git
+//   - user@[ipv6]:owner/repo.git
 //   - ssh://git@host/owner/repo.git
 //   - https://host/owner/repo.git
 //   - http://host/owner/repo.git
@@ -1216,12 +1217,12 @@ func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
 		return "", ""
 	}
 
-	pattern := regexp.MustCompile(`^(?:git@)?(?P<host>[^/:]+):(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`)
+	pattern := regexp.MustCompile(`^(?:[^@/:]+@)?(?P<host>\[[^]]+\]|[^/:]+):(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`)
 	match := pattern.FindStringSubmatch(remoteURL)
 	if match == nil {
 		return "", ""
 	}
-	host = strings.ToLower(strings.TrimSpace(match[pattern.SubexpIndex("host")]))
+	host = strings.ToLower(strings.Trim(strings.TrimSpace(match[pattern.SubexpIndex("host")]), "[]"))
 	repo = strings.TrimSuffix(strings.TrimSpace(match[pattern.SubexpIndex("repo")]), ".git")
 	if host != "" && isOwnerNameRepo(repo) {
 		return host, repo
