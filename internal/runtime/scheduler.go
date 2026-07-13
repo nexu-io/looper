@@ -1343,6 +1343,10 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 		if err != nil {
 			return nil, err
 		}
+		effectiveLimit := input.Limit
+		if effectiveLimit <= 0 {
+			effectiveLimit = 30
+		}
 		limit := input.Limit
 		if strings.TrimSpace(input.Author) != "" {
 			// Forgejo's pull listing surface does not provide a reliable author
@@ -1354,7 +1358,7 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 		if err != nil {
 			return nil, err
 		}
-		result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
+		result := make([]fixer.PullRequestSummary, 0, min(len(pullRequests), effectiveLimit))
 		for _, pr := range pullRequests {
 			if strings.TrimSpace(input.Author) != "" && !strings.EqualFold(strings.TrimSpace(pr.User.Login), strings.TrimSpace(input.Author)) {
 				continue
@@ -1363,7 +1367,7 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 				continue
 			}
 			result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Author: pr.User.Login})
-			if input.Limit > 0 && len(result) >= input.Limit {
+			if len(result) >= effectiveLimit {
 				break
 			}
 		}

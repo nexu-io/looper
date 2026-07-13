@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -611,10 +612,11 @@ func TestFixerGitHubAdapterForgejoFiltersAuthorBeforeLimit(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"number": 1, "state": "open", "user": map[string]any{"login": "other"}, "head": map[string]any{"ref": "one", "sha": "head-1"}, "base": map[string]any{"ref": "main", "sha": "base"}},
-			{"number": 2, "state": "open", "user": map[string]any{"login": "Looper"}, "head": map[string]any{"ref": "two", "sha": "head-2"}, "base": map[string]any{"ref": "main", "sha": "base"}},
-		})
+		pulls := []map[string]any{{"number": 1, "state": "open", "user": map[string]any{"login": "other"}, "head": map[string]any{"ref": "one", "sha": "head-1"}, "base": map[string]any{"ref": "main", "sha": "base"}}}
+		for number := 2; number <= 36; number++ {
+			pulls = append(pulls, map[string]any{"number": number, "state": "open", "user": map[string]any{"login": "Looper"}, "head": map[string]any{"ref": fmt.Sprintf("pr-%d", number), "sha": fmt.Sprintf("head-%d", number)}, "base": map[string]any{"ref": "main", "sha": "base"}})
+		}
+		_ = json.NewEncoder(w).Encode(pulls)
 	}))
 	defer server.Close()
 
@@ -631,6 +633,14 @@ func TestFixerGitHubAdapterForgejoFiltersAuthorBeforeLimit(t *testing.T) {
 	}
 	if len(prs) != 1 || prs[0].Number != 2 {
 		t.Fatalf("pull requests = %#v, want matching author after provider result filtering", prs)
+	}
+
+	prs, err = adapter.ListOpenPullRequests(context.Background(), fixer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Author: "looper"})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests(default limit) error = %v", err)
+	}
+	if len(prs) != 30 || prs[0].Number != 2 || prs[29].Number != 31 {
+		t.Fatalf("pull requests = %#v, want first 30 matching authors at the default limit", prs)
 	}
 }
 

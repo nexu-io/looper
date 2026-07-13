@@ -125,6 +125,11 @@ func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	detail := forgejoDiscoveryDetail(t, "head-1", 1)
+	untrusted := cloneObjectSlice(detail.IssueComments)[0]
+	untrusted["id"] = int64(2)
+	untrusted["author"] = map[string]any{"login": "mallory"}
+	detail.IssueComments = append(detail.IssueComments, untrusted)
 	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{
 		{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true},
 		{ProviderCommentID: 102, Body: "Unsupported", Author: "bob", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: false},
@@ -134,12 +139,12 @@ func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
 	if err != nil || project == nil {
 		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
 	}
-	checkpoint, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: *project, Loop: storage.LoopRecord{ProjectID: "project_1"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
+	checkpoint, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: *project, Loop: storage.LoopRecord{ProjectID: "project_1"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)}})
 	if err != nil {
 		t.Fatalf("runCollectFixesStep() error = %v", err)
 	}
-	if len(checkpoint.FixItems) != 0 {
-		t.Fatalf("FixItems = %#v, automatic Forgejo collect must remain summary-only", checkpoint.FixItems)
+	if len(checkpoint.FixItems) != 1 || checkpoint.FixItems[0].ID != "R-001" {
+		t.Fatalf("FixItems = %#v, want only the trusted reviewer summary item", checkpoint.FixItems)
 	}
 }
 

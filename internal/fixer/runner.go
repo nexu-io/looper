@@ -1732,6 +1732,20 @@ func sanitizeForgejoSummaryAuthority(detail *PullRequestDetail, currentUser stri
 	detail.IssueComments = trusted
 }
 
+func (r *Runner) sanitizeForgejoCheckpointSummaryAuthority(ctx context.Context, project storage.ProjectRecord, detail *checkpointDetail) error {
+	if !r.isForgejoProject(project.ID) || detail == nil {
+		return nil
+	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return err
+	}
+	prDetail := PullRequestDetail{IssueComments: cloneObjectSlice(detail.IssueComments)}
+	sanitizeForgejoSummaryAuthority(&prDetail, currentUser)
+	detail.IssueComments = prDetail.IssueComments
+	return nil
+}
+
 func (r *Runner) unsatisfiedForgejoDiscoveryItems(projectID string, detail PullRequestDetail, items []FixItem) ([]FixItem, error) {
 	if !r.isForgejoProject(projectID) {
 		return items, nil
@@ -2463,6 +2477,9 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	checkpoint := input.Checkpoint
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
+	}
+	if err := r.sanitizeForgejoCheckpointSummaryAuthority(ctx, input.Project, checkpoint.Detail); err != nil {
+		return checkpoint, err
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if (!policy.IncludeDrafts && checkpoint.Detail.IsDraft) || normalizePRState(checkpoint.Detail.State) != "open" {
@@ -3370,6 +3387,9 @@ func isForgejoNativeCapabilityUnsupported(err error) bool {
 
 func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	if err := r.sanitizeForgejoCheckpointSummaryAuthority(ctx, input.Project, checkpoint.Detail); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
 	reviewerSummary, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
@@ -3390,6 +3410,10 @@ func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput
 		return checkpoint, &loopError{message: "forgejo fixer summary requires push step to complete", kind: FailureRetryableAfterResume}
 	}
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
