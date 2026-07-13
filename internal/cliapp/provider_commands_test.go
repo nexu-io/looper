@@ -47,6 +47,26 @@ func TestParseBootstrapRemoteAllowsConfiguredForgejoBasePath(t *testing.T) {
 	}
 }
 
+func TestForgejoRemoteMatchesBaseURLPort(t *testing.T) {
+	t.Parallel()
+	remote, err := parseBootstrapRemote("https://ssh.code.example.com:3000/acme/looper.git")
+	if err != nil {
+		t.Fatalf("parseBootstrapRemote() error = %v", err)
+	}
+	if remote.Host != "ssh.code.example.com:3000" {
+		t.Fatalf("remote host = %q, want host and port", remote.Host)
+	}
+	if !forgejoRemoteMatchesBaseURL(remote, "https://code.example.com:3000") {
+		t.Fatal("remote should match the same host and port with the ssh host alias")
+	}
+	if forgejoRemoteMatchesBaseURL(remote, "https://code.example.com:8443") {
+		t.Fatal("remote should not match the same host on a different port")
+	}
+	if forgejoRemoteMatchesBaseURL(remote, "https://code.example.com") {
+		t.Fatal("remote with an explicit port should not match a provider without one")
+	}
+}
+
 func TestResolveForgejoBootstrapPlanValidatesIdentityAndRepo(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "test-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

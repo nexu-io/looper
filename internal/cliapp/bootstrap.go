@@ -511,7 +511,7 @@ func parseBootstrapRemote(value string) (bootstrapOriginRemote, error) {
 		if err != nil || parsed.Hostname() == "" {
 			return bootstrapOriginRemote{}, fmt.Errorf("unsupported git origin URL")
 		}
-		host, path = parsed.Hostname(), parsed.Path
+		host, path = parsed.Host, parsed.Path
 	}
 	remotePath := strings.Trim(path, "/")
 	parts := strings.Split(remotePath, "/")
@@ -535,9 +535,13 @@ func forgejoRemoteMatchesBaseURL(remote bootstrapOriginRemote, baseURL string) b
 	if err != nil {
 		return false
 	}
-	remoteHost := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(remote.Host)), "ssh.")
+	remoteURL, err := url.Parse("//" + strings.TrimSpace(remote.Host))
+	if err != nil || remoteURL.Hostname() == "" {
+		return false
+	}
+	remoteHost := strings.TrimPrefix(strings.ToLower(remoteURL.Hostname()), "ssh.")
 	providerHost := strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
-	if strings.TrimPrefix(remoteHost, "www.") != providerHost {
+	if strings.TrimPrefix(remoteHost, "www.") != providerHost || remoteURL.Port() != parsed.Port() {
 		return false
 	}
 	basePath := strings.Trim(strings.TrimSpace(parsed.Path), "/")
