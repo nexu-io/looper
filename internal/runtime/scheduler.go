@@ -2580,15 +2580,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		appendErr(err)
 	}
 
-	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
-	recordClaim(claimedCount, availableSlots, err)
-
-	projectsList, err := input.Repos.Projects.List(ctx)
+	projectsList, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil {
 		appendErr(err)
 		retErr = errors.Join(errs...)
 		return retErr
 	}
+	if !catalogCurrent {
+		return nil
+	}
+
+	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
+	recordClaim(claimedCount, availableSlots, err)
 	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
 	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
 	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
@@ -2784,8 +2787,35 @@ func (s *schedulerClaimStats) record(claimedCount, availableSlots int) {
 }
 
 func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInput) error {
-	_, _, err := executeClaimPhase(ctx, "claim_pump", input, nil, false)
+	_, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
+	if err != nil || !catalogCurrent {
+		return err
+	}
+	_, _, err = executeClaimPhase(ctx, "claim_pump", input, nil, false)
 	return err
+}
+
+func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSchedulerTickInput) ([]storage.ProjectRecord, bool, error) {
+	projectsList, err := input.Repos.Projects.List(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if input.Config == nil {
+		return projectsList, true, nil
+	}
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+		if !ok || !catalogBindingMatchesProject(binding, project) {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler deferred pass until project catalog catches up", map[string]any{"projectId": project.ID})
+			}
+			return projectsList, false, nil
+		}
+	}
+	return projectsList, true, nil
 }
 
 func executeClaimPhase(ctx context.Context, phase string, input defaultSchedulerTickInput, discoveredRunnableIDs map[string]struct{}, alwaysLog bool) (int, int, error) {
@@ -3117,6 +3147,18 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 	}
 	repo, _ := metadata["repo"].(string)
 	return strings.TrimSpace(repo)
+}
+
+func catalogBindingMatchesProject(binding config.ProjectRefConfig, project storage.ProjectRecord) bool {
+	metadata := map[string]any{}
+	if project.MetadataJSON != nil && strings.TrimSpace(*project.MetadataJSON) != "" {
+		if err := json.Unmarshal([]byte(*project.MetadataJSON), &metadata); err != nil {
+			return false
+		}
+	}
+	provider, _ := metadata["provider"].(string)
+	return strings.TrimSpace(binding.Provider) == strings.TrimSpace(provider) &&
+		strings.TrimSpace(binding.Repo) == repoFromProjectMetadata(project.MetadataJSON)
 }
 
 func wrapSchedulerError(action, projectID, repo string, err error) error {

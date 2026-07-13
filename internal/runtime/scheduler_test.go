@@ -124,7 +124,7 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 }
 
-func TestRunDefaultSchedulerTickUsesCapturedCatalogProjectBindings(t *testing.T) {
+func TestRunDefaultSchedulerTickDefersStaleCatalogBeforeClaimAndDiscovery(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -134,13 +134,19 @@ func TestRunDefaultSchedulerTickUsesCapturedCatalogProjectBindings(t *testing.T)
 	nowISO := formatJavaScriptISOString(now)
 	baseBranch := "main"
 	forgejoMetadata := `{"provider":"forgejo-main","repo":"forgejo/new"}`
-	for _, record := range []storage.ProjectRecord{
-		{ID: "rebound", Name: "Rebound", RepoPath: filepath.Join(workingDir, "rebound"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
-		{ID: "new", Name: "New", RepoPath: filepath.Join(workingDir, "new"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
-	} {
-		if err := repos.Projects.Upsert(context.Background(), record); err != nil {
-			t.Fatalf("Projects.Upsert(%s) error = %v", record.ID, err)
-		}
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "rebound", Name: "Rebound", RepoPath: filepath.Join(workingDir, "rebound"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	projectTarget := "project:rebound"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_rebound", Seq: 1, ProjectID: "rebound", Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("forgejo/new"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "rebound"
+	loopID := "loop_rebound"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_rebound", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("forgejo/new"), DedupeKey: "worker:loop_rebound", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
 	captured := config.Config{
@@ -149,23 +155,37 @@ func TestRunDefaultSchedulerTickUsesCapturedCatalogProjectBindings(t *testing.T)
 	}
 	plannerRunner := &stubPlannerScheduler{}
 	coordinatorRunner := &stubCoordinatorScheduler{}
-	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+	workerRunner := &stubWorkerScheduler{}
+	input := defaultSchedulerTickInput{
 		Repos:                   repos,
 		Now:                     func() time.Time { return now },
+		MaxConcurrentRuns:       1,
 		Config:                  &captured,
 		Planner:                 plannerRunner,
 		Coordinator:             coordinatorRunner,
+		Worker:                  workerRunner,
 		CoordinatorEnabled:      func(string) bool { return true },
 		PlannerDiscoveryEnabled: boolPtr(true),
-	}); err != nil {
+	}
+	if err := runDefaultSchedulerTick(context.Background(), input); err != nil {
 		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
 	}
-
-	if len(plannerRunner.discoverCalls) != 1 || plannerRunner.discoverCalls[0].ProjectID != "rebound" || plannerRunner.discoverCalls[0].Repo != "github/old" {
-		t.Fatalf("planner discover calls = %#v, want only captured binding github/old", plannerRunner.discoverCalls)
+	if err := runIndependentClaimPass(context.Background(), input); err != nil {
+		t.Fatalf("runIndependentClaimPass() error = %v", err)
 	}
-	if len(coordinatorRunner.discoverCalls) != 1 || coordinatorRunner.discoverCalls[0].ProjectID != "rebound" || coordinatorRunner.discoverCalls[0].Repo != "github/old" {
-		t.Fatalf("coordinator discover calls = %#v, want captured GitHub binding only", coordinatorRunner.discoverCalls)
+
+	if len(plannerRunner.discoverCalls) != 0 {
+		t.Fatalf("planner discover calls = %#v, want stale catalog pass deferred", plannerRunner.discoverCalls)
+	}
+	if len(coordinatorRunner.discoverCalls) != 0 || workerRunner.processItemCount() != 0 {
+		t.Fatalf("coordinator calls = %#v, worker processed items = %#v; want no stale dispatch", coordinatorRunner.discoverCalls, workerRunner.processedItems)
+	}
+	queued, err := repos.Queue.GetByID(context.Background(), "queue_rebound")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queued == nil || queued.Status != "queued" {
+		t.Fatalf("queue item = %#v, want unclaimed until catalog publication", queued)
 	}
 }
 
