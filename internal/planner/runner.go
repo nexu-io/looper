@@ -1015,6 +1015,13 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
+		if !plannerQueueItemIsManual(input.QueueItem) {
+			if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
+		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {

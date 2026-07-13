@@ -706,6 +706,42 @@ func TestRunWriteSpecStepRechecksPlannerHoldBeforeStartingAgent(t *testing.T) {
 	}
 }
 
+func TestRunWriteSpecStepRechecksPlannerHoldAfterAgentCompletion(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_held_after_agent"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetails: []IssueDetail{{Number: 42}, {Number: 42, Labels: []string{domain.HoldLabelGlobal}}}}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HasUncommittedChanges: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now})
+
+	_, err = runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    loopResult.record, Run: storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{Issue: issue, Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"}},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runWriteSpecStep() error = %v, want holdSkipError", err)
+	}
+	if len(git.inspectCalls) != 0 || len(git.commitCalls) != 0 {
+		t.Fatalf("git reconciliation calls = inspect %d, commit %d; want none", len(git.inspectCalls), len(git.commitCalls))
+	}
+}
+
 func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -1795,6 +1795,11 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
+		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
+			return checkpoint, err
+		} else if held {
+			return checkpoint, &holdSkipError{summary: summary}
+		}
 		// HITL (gated): the resumed turn completed without asking again, so the human
 		// answer that seeded it has been acted on. Flip it to "consumed" now — after
 		// the turn, never before — so a failed/timed-out turn re-reads the answer on

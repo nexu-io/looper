@@ -1193,6 +1193,42 @@ func TestRunExecuteStepSkipsWhenWorkerHoldAppliedBeforeAgentStart(t *testing.T) 
 	}
 }
 
+func TestRunExecuteStepRechecksWorkerHoldAfterAgentCompletion(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{prDetailResponses: []PullRequestDetail{{Number: 42}, {Number: 42, Labels: []string{domain.HoldLabelWorker}}}}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HasUncommittedChanges: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_execute_hold_after_agent", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", PRNumber: 42, BaseBranch: "main", ExecutionMode: "push-existing", AutoDiscovered: true},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runExecuteStep() error = %v, want holdSkipError", err)
+	}
+	if len(git.inspectCalls) != 0 || len(git.commitCalls) != 0 {
+		t.Fatalf("git reconciliation calls = inspect %d, commit %d; want none", len(git.inspectCalls), len(git.commitCalls))
+	}
+}
+
 func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
