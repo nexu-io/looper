@@ -252,7 +252,7 @@ func TestHandlerFeishuThreadReplyDeliversTypedAnswer(t *testing.T) {
 	h := setupAwaitingCardLoop(t, cfg, rt, "project_thread", "loop_thread", 91)
 	services := rt.Services()
 	// The gateway would have recorded this when it created the thread root.
-	if err := services.Repositories.FeishuThreads.Upsert(context.Background(), "om_root_91", "loop_thread", "oc_group", "2026-04-11T12:00:00.000Z"); err != nil {
+	if err := services.Repositories.FeishuThreads.Upsert(context.Background(), "om_root_91", "loop_thread", "", "oc_group", "2026-04-11T12:00:00.000Z"); err != nil {
 		t.Fatalf("FeishuThreads.Upsert() error = %v", err)
 	}
 

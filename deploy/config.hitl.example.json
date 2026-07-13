@@ -68,6 +68,9 @@
       "repo": "OWNER/REPO",
       "repoPath": "/ABSOLUTE/PATH/TO/LOCAL/CLONE",
       "roles": {
+        "planner": {
+          "autoDiscovery": false
+        },
         "worker": {
           "autoDiscovery": true,
           "triggers": {
@@ -75,7 +78,7 @@
               "looper:plan"
             ],
             "labelMode": "all",
-            "requireAssigneeCurrentUser": false
+            "requireAssigneeCurrentUser": true
           }
         }
       }

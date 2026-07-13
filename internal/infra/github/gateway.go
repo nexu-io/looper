@@ -3533,6 +3533,8 @@ func resolveLabelColor(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case "looper:plan":
 		return "5319e7"
+	case "looper:auto":
+		return "0052cc"
 	case specpr.ReviewingLabel:
 		return "1d76db"
 	case specpr.ReadyLabel:
@@ -3548,6 +3550,8 @@ func resolveLabelDescription(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case "looper:plan":
 		return "Picked up automatically by planner"
+	case "looper:auto":
+		return "Run fully autonomously: plan → implement"
 	case specpr.ReviewingLabel:
 		return "Spec PR is under review"
 	case specpr.ReadyLabel:
@@ -3562,6 +3566,7 @@ func resolveLabelDescription(label string) string {
 func StandardLooperLabels() []LabelDefinition {
 	return []LabelDefinition{
 		{Name: "looper:plan", Color: resolveLabelColor("looper:plan"), Description: resolveLabelDescription("looper:plan")},
+		{Name: "looper:auto", Color: resolveLabelColor("looper:auto"), Description: resolveLabelDescription("looper:auto")},
 		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
 		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
 		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},

@@ -337,18 +337,45 @@ func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel
 type FeishuThreadsRepository struct{ q sqliteQuerier }
 
 // Upsert records that rootMessageID is the thread root for loopID in chatID.
-func (r *FeishuThreadsRepository) Upsert(ctx context.Context, rootMessageID, loopID, chatID, createdAt string) error {
+// taskKey is the stable task identity (issue:repo:N) the anchor is shared under;
+// "" means the loop has no source issue and is keyed per-loop. On a repeat call
+// for an existing root (a new loop joining the same task's card) loop_id is
+// refreshed so a thread reply routes to the currently-active loop.
+func (r *FeishuThreadsRepository) Upsert(ctx context.Context, rootMessageID, loopID, taskKey, chatID, createdAt string) error {
+	var taskKeyArg any
+	if strings.TrimSpace(taskKey) != "" {
+		taskKeyArg = taskKey
+	}
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO feishu_threads (root_message_id, loop_id, chat_id, created_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO feishu_threads (root_message_id, loop_id, task_key, chat_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(root_message_id) DO UPDATE SET
 			loop_id=excluded.loop_id,
+			task_key=excluded.task_key,
 			chat_id=excluded.chat_id
-	`, rootMessageID, loopID, chatID, createdAt)
+	`, rootMessageID, loopID, taskKeyArg, chatID, createdAt)
 	if err != nil {
 		return fmt.Errorf("upsert feishu thread: %w", err)
 	}
 	return nil
+}
+
+// RootByTask returns the most recent thread root for a task identity (issue:repo:N),
+// or "" when none or when taskKey is empty. This is how the planner/worker/... loops
+// spawned for one work item resolve to the SAME anchor card.
+func (r *FeishuThreadsRepository) RootByTask(ctx context.Context, taskKey string) (string, error) {
+	if strings.TrimSpace(taskKey) == "" {
+		return "", nil
+	}
+	var rootMessageID string
+	err := r.q.QueryRowContext(ctx, `SELECT root_message_id FROM feishu_threads WHERE task_key = ? ORDER BY created_at DESC LIMIT 1`, taskKey).Scan(&rootMessageID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu thread root by task: %w", err)
+	}
+	return rootMessageID, nil
 }
 
 // RootByLoop returns the most recent thread root for a loop, or "" when none.
@@ -548,6 +575,24 @@ func (r *LoopsRepository) GetBySeq(ctx context.Context, seq int64) (*LoopRecord,
 		return nil, fmt.Errorf("get loop by seq: %w", err)
 	}
 
+	return &record, nil
+}
+
+// GetByTargetID returns the most recently updated loop with the given target id
+// (e.g. pr:owner/repo:8), or nil when none. Used to resolve a PR back to the
+// worker loop that opened it, so a snapshot event can refresh that task's card.
+func (r *LoopsRepository) GetByTargetID(ctx context.Context, targetID string) (*LoopRecord, error) {
+	if strings.TrimSpace(targetID) == "" {
+		return nil, nil
+	}
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM loops WHERE target_id = ? ORDER BY updated_at DESC LIMIT 1`, targetID)
+	record, err := scanLoop(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get loop by target id: %w", err)
+	}
 	return &record, nil
 }
 

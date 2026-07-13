@@ -382,7 +382,7 @@ func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("Run(labels init --dry-run) stderr = %q, want empty string", stderr.String())
 	}
-	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:spec-ready", "Summary: created=3 updated=0 skipped=1 failed=0"} {
+	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:auto", "created looper:spec-reviewing", "created looper:spec-ready", "Summary: created=4 updated=0 skipped=1 failed=0"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout.String(), want)
 		}
@@ -450,6 +450,8 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 				return commandExecutionResult{}, nil
 			case "label list --repo acme/looper --limit 1000 --json name,color,description":
 				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			case "label create looper:auto --repo acme/looper --color 0052cc --description Run fully autonomously: plan → implement":
+				return commandExecutionResult{Stdout: "{}"}, nil
 			case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
 				return commandExecutionResult{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by integration"}, nil
 			case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
@@ -470,7 +472,7 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 	if !strings.Contains(stdout.String(), "failed looper:spec-reviewing: gh exited with code 1: GraphQL: Resource not accessible by integration") {
 		t.Fatalf("stdout = %q, want failed label with gh stderr", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "Summary: created=2 updated=0 skipped=1 failed=1") {
+	if !strings.Contains(stdout.String(), "Summary: created=3 updated=0 skipped=1 failed=1") {
 		t.Fatalf("stdout = %q, want failed summary", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {

@@ -416,6 +416,11 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if got := feishuPhaseFromTail([]string{"✅ git push -u origin feat/x"}); got != "正在推送分支" {
 		t.Fatalf("feishuPhaseFromTail(push) = %q; want 正在推送分支", got)
 	}
+	// An UNRECOGNISED command must never leak onto the human-scannable anchor as a
+	// raw shell line (P2: e.g. `tmpdir=$(mktemp -d …`) — it becomes a generic phase.
+	if got := feishuPhaseFromTail([]string{"✅ tmpdir=$(mktemp -d /private/tmp/looper.XXXX)"}); got != "正在处理…" || strings.Contains(got, "mktemp") {
+		t.Fatalf("feishuPhaseFromTail(unknown) = %q; want generic phase, no raw command", got)
+	}
 	// feishuAnchorBrief falls back to the phase when no summary is in metadata, and
 	// the live feed card carries the raw feed for the in-thread surface.
 	if brief := feishuAnchorBrief(nil, []string{"✅ gh pr create --fill"}); brief != "🔧 正在开 PR" {
@@ -468,19 +473,130 @@ func TestLiveStatusHelpers(t *testing.T) {
 }
 
 func TestFeishuLoopStatusStyle(t *testing.T) {
-	cases := map[string]struct{ template, contains string }{
-		"awaiting_human": {"orange", "等你定夺"},
-		"completed":      {"green", "已完成"},
-		"failed":         {"red", "需要处理"},
-		"abandoned":      {"red", "需要处理"},
-		"running":        {"blue", "处理中"},
-		"":               {"blue", "处理中"},
+	cases := []struct {
+		status   string
+		hasPR    bool
+		template string
+		contains string
+	}{
+		{"awaiting_human", false, "orange", "等你定夺"},
+		{"completed", true, "turquoise", "待合并"}, // delivered a PR, not merged
+		{"completed", false, "green", "已完成"},    // no PR (e.g. a no-diff run)
+		{"merged", false, "green", "已合并"},
+		{"failed", false, "red", "需要处理"},
+		{"abandoned", false, "red", "需要处理"},
+		{"running", false, "blue", "处理中"},
+		{"", false, "blue", "处理中"},
 	}
-	for status, want := range cases {
-		gotT, gotL := feishuLoopStatusStyle(status)
+	for _, want := range cases {
+		gotT, gotL := feishuLoopStatusStyle(want.status, want.hasPR)
 		if gotT != want.template || !strings.Contains(gotL, want.contains) {
-			t.Fatalf("feishuLoopStatusStyle(%q) = (%q, %q); want template %q label~%q", status, gotT, gotL, want.template, want.contains)
+			t.Fatalf("feishuLoopStatusStyle(%q, %v) = (%q, %q); want template %q label~%q", want.status, want.hasPR, gotT, gotL, want.template, want.contains)
 		}
+	}
+}
+
+func TestPRCardStateFromSnapshotMapsReviewCycle(t *testing.T) {
+	cases := []struct {
+		name       string
+		review     string
+		checks     string
+		unresolved int64
+		want       prCardState
+	}{
+		{"failing CI wins", "APPROVED", "success, failure", 0, prCardStateChecksFailed},
+		{"changes requested", "CHANGES_REQUESTED", "success", 0, prCardStateChangesRequested},
+		{"CI still running", "REVIEW_REQUIRED", "success, pending", 0, prCardStateChecksRunning},
+		{"approved + green", "APPROVED", "success, success", 0, prCardStateApproved},
+		{"awaiting review", "REVIEW_REQUIRED", "success", 2, prCardStateReviewPending},
+		{"no decision yet", "", "", 0, prCardStateReviewPending},
+		{"in_progress running", "", "in_progress", 0, prCardStateChecksRunning},
+	}
+	for _, tc := range cases {
+		got, ok := prCardStateFromSnapshot(tc.review, tc.checks, tc.unresolved)
+		if !ok || got != tc.want {
+			t.Fatalf("%s: prCardStateFromSnapshot(%q,%q,%d) = %q,%v; want %q", tc.name, tc.review, tc.checks, tc.unresolved, got, ok, tc.want)
+		}
+	}
+}
+
+func TestPRCardStateStyleTitles(t *testing.T) {
+	cases := []struct {
+		state    prCardState
+		template string
+		contains string
+	}{
+		{prCardStateChecksFailed, "red", "CI 失败"},
+		{prCardStateChangesRequested, "orange", "待修改"},
+		{prCardStateChecksRunning, "blue", "CI 检查中"},
+		{prCardStateApproved, "turquoise", "待合并"},
+		{prCardStateReviewPending, "blue", "待 review"},
+	}
+	for _, tc := range cases {
+		gotT, gotL := prCardStateStyle(tc.state, "8")
+		if gotT != tc.template || !strings.Contains(gotL, tc.contains) || !strings.Contains(gotL, "PR #8") {
+			t.Fatalf("prCardStateStyle(%q) = (%q,%q); want template %q label~%q with PR #8", tc.state, gotT, gotL, tc.template, tc.contains)
+		}
+	}
+}
+
+func TestPRNumberFromTargetOrURL(t *testing.T) {
+	cases := []struct {
+		target string
+		prURL  string
+		want   int64
+	}{
+		{"pr:owner/repo:8", "", 8},
+		{"issue:owner/repo:3", "https://github.com/owner/repo/pull/12", 12},
+		{"", "https://github.com/owner/repo/pull/45", 45},
+		{"project:abc", "", 0},
+	}
+	for _, tc := range cases {
+		if got := prNumberFromTargetOrURL(tc.target, tc.prURL); got != tc.want {
+			t.Fatalf("prNumberFromTargetOrURL(%q,%q) = %d, want %d", tc.target, tc.prURL, got, tc.want)
+		}
+	}
+}
+
+func TestLoopIssueNumberReadsBothMetadataShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		meta string
+		want int64
+	}{
+		{"planner top-level", `{"loopType":"planner","issueNumber":42}`, 42},
+		{"worker nested", `{"worker":{"issueNumber":7,"issueUrl":"https://x/issues/7"}}`, 7},
+		{"numeric string", `{"issueNumber":"13"}`, 13},
+		{"none", `{"repo":"owner/repo"}`, 0},
+		{"empty", ``, 0},
+	}
+	for _, tc := range cases {
+		meta := tc.meta
+		if got := loopIssueNumber(&meta); got != tc.want {
+			t.Fatalf("%s: loopIssueNumber = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestLoopTaskKeyFromRecordCollapsesSiblingLoops(t *testing.T) {
+	repo := "owner/repo"
+	plannerMeta := `{"loopType":"planner","issueNumber":9}`
+	workerMeta := `{"worker":{"issueNumber":9}}`
+	planner := &storage.LoopRecord{Repo: &repo, MetadataJSON: &plannerMeta}
+	worker := &storage.LoopRecord{Repo: &repo, MetadataJSON: &workerMeta}
+	// Planner and worker for the same issue must derive the SAME task key → one card.
+	if pk, wk := loopTaskKeyFromRecord(planner), loopTaskKeyFromRecord(worker); pk != "issue:owner/repo:9" || pk != wk {
+		t.Fatalf("task keys planner=%q worker=%q; want both issue:owner/repo:9", pk, wk)
+	}
+	// No issue number → no task key (falls back to per-loop keying).
+	noIssueMeta := `{"repo":"owner/repo"}`
+	if k := loopTaskKeyFromRecord(&storage.LoopRecord{Repo: &repo, MetadataJSON: &noIssueMeta}); k != "" {
+		t.Fatalf("task key for issue-less loop = %q, want empty", k)
+	}
+	// No repo → no task key.
+	onlyIssueMeta := `{"issueNumber":5}`
+	if k := loopTaskKeyFromRecord(&storage.LoopRecord{MetadataJSON: &onlyIssueMeta}); k != "" {
+		t.Fatalf("task key without repo = %q, want empty", k)
 	}
 }
 

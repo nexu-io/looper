@@ -1091,8 +1091,112 @@ func (r *Runtime) executeSchedulerClaimPass(ctx context.Context) {
 	}
 }
 
+// releaseExpiredLocks releases every lock past its TTL and records a recovery
+// event for each. Shared by startup recovery and the sleep/wake reconcile so a
+// laptop that suspended mid-run doesn't stay wedged behind a dead owner's lock.
+func (r *Runtime) releaseExpiredLocks(ctx context.Context, repositories *storage.Repositories, nowISO string) (released int64, eventsWritten int64, err error) {
+	expiredLocks, err := repositories.Locks.ListExpired(ctx, nowISO)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, lock := range expiredLocks {
+		if err := repositories.Locks.Release(ctx, lock.Key); err != nil {
+			return released, eventsWritten, err
+		}
+		released++
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.lock_released",
+			EntityType: stringPtr("lock"),
+			EntityID:   stringPtr(lock.Key),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"owner":       lock.Owner,
+				"expiredAt":   lock.ExpiresAt,
+				"recoveredAt": nowISO,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return released, eventsWritten, err
+		}
+		eventsWritten++
+	}
+	return released, eventsWritten, nil
+}
+
+// wakeReconcileThreshold: a gap between 1s claim passes this much larger than the
+// tick means the host suspended (laptop closed) rather than merely idled — the cue
+// to run recovery so work resumes on wake. periodicReconcileInterval bounds how
+// often the live reconcile runs even without a wake or a full queue, so a wedged
+// run doesn't wait for availableSlots==0.
+const (
+	wakeReconcileThreshold    = 90 * time.Second
+	periodicReconcileInterval = 5 * time.Minute
+)
+
+// shouldWakeReconcile decides, from the time since the last claim pass and since
+// the last reconcile, whether to run the wake/periodic reconcile and why. A gap
+// far larger than the 1s tick means a suspend/resume; otherwise a periodic sweep.
+func shouldWakeReconcile(sinceLastPass, sinceLastReconcile time.Duration) (bool, string) {
+	switch {
+	case sinceLastPass > wakeReconcileThreshold:
+		return true, "wall_clock_jump"
+	case sinceLastReconcile >= periodicReconcileInterval:
+		return true, "periodic"
+	default:
+		return false, ""
+	}
+}
+
+// runWakeReconcile is the lightweight recovery run on sleep/wake (and periodically):
+// release expired locks + reconcile stale running runs (which also repairs the
+// queue). Unlike startup recovery it does NOT force-interrupt live runs — after a
+// suspend the agent subprocesses are usually still alive — it only touches what is
+// provably dead (expired locks, superseded / heartbeat-dead runs).
+func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
+	r.mu.RLock()
+	repositories := r.services.Repositories
+	now := r.now
+	logger := r.logger
+	r.mu.RUnlock()
+	if repositories == nil {
+		return
+	}
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	released, _, err := r.releaseExpiredLocks(ctx, repositories, nowISO)
+	if err != nil && logger != nil {
+		logger.Warn("wake reconcile: release expired locks failed", map[string]any{"error": err.Error(), "reason": reason})
+	}
+	stale, err := r.reconcileLiveStaleRunningRuns(ctx)
+	if err != nil && logger != nil {
+		logger.Warn("wake reconcile: stale-run reconcile failed", map[string]any{"error": err.Error(), "reason": reason})
+	}
+	if logger != nil && (released > 0 || stale.InterruptedRuns > 0 || stale.LoopsRequeued > 0) {
+		logger.Info("wake reconcile recovered work", map[string]any{"reason": reason, "locksReleased": released, "runsInterrupted": stale.InterruptedRuns, "loopsRequeued": stale.LoopsRequeued})
+	}
+}
+
 func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struct{}, wakeCh <-chan struct{}) {
 	const claimPumpInterval = time.Second
+	nowFn := r.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	lastPass := nowFn()
+	lastReconcile := lastPass
+	// maybeReconcile detects a suspend/resume (or a periodic due time) before each
+	// claim pass and runs the wake reconcile so a laptop that was closed mid-run
+	// resumes its work rather than waiting for a full queue.
+	maybeReconcile := func() {
+		now := nowFn()
+		if run, reason := shouldWakeReconcile(now.Sub(lastPass), now.Sub(lastReconcile)); run {
+			r.runWakeReconcile(ctx, reason)
+			lastReconcile = now
+		}
+		lastPass = now
+	}
 	r.executeSchedulerClaimPass(ctx)
 	ticker := time.NewTicker(claimPumpInterval)
 	defer ticker.Stop()
@@ -1101,8 +1205,10 @@ func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struc
 		case <-stopCh:
 			return
 		case <-wakeCh:
+			maybeReconcile()
 			r.executeSchedulerClaimPass(ctx)
 		case <-ticker.C:
+			maybeReconcile()
 			r.executeSchedulerClaimPass(ctx)
 		}
 	}
@@ -1177,31 +1283,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 	}
 
-	expiredLocks, err := repositories.Locks.ListExpired(ctx, nowISO)
+	releasedLocks, lockEvents, err := r.releaseExpiredLocks(ctx, repositories, nowISO)
 	if err != nil {
 		return RecoverySummary{}, err
 	}
-	for _, lock := range expiredLocks {
-		if err := repositories.Locks.Release(ctx, lock.Key); err != nil {
-			return RecoverySummary{}, err
-		}
-		summary.ExpiredLocksReleased += 1
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-			ID:         newRuntimeEventID(),
-			EventType:  "looperd.recovery.lock_released",
-			EntityType: stringPtr("lock"),
-			EntityID:   stringPtr(lock.Key),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"owner":       lock.Owner,
-				"expiredAt":   lock.ExpiresAt,
-				"recoveredAt": nowISO,
-			}),
-			CreatedAt: nowISO,
-		}); err != nil {
-			return RecoverySummary{}, err
-		}
-		eventsWritten += 1
-	}
+	summary.ExpiredLocksReleased += releasedLocks
+	eventsWritten += lockEvents
 
 	staleSummary, err := r.reconcileStaleRunningRunsWithMode(ctx, repositories, now, staleRunReconcileModeStartup)
 	if err != nil {

@@ -95,6 +95,20 @@ type Gateway struct {
 	// outer anchor card stays a human-scannable brief. Keyed by loop id → message id;
 	// posted on first activity, patched in place thereafter.
 	liveFeeds map[string]string
+	// rootLocks serialises ensureFeishuThreadRoot per loop. Anchor creation is a
+	// check-then-act (look up the root, else POST a new card, then persist); two
+	// concurrent callers for one loop — e.g. the progress ticker and an ask —
+	// would otherwise each POST a duplicate anchor before either persisted. The
+	// per-loop lock lets the first caller claim (post + persist) before the second
+	// re-checks, so exactly one anchor is created.
+	rootMu    sync.Mutex
+	rootLocks map[string]*sync.Mutex
+	// closedFollowup remembers which finished tasks already got the one "task is
+	// done, continue on the issue/PR or open a new one" reply (§F option B), so a
+	// stream of follow-up messages in the thread gets a single honest ack, not a
+	// silent drop and not a spammed one.
+	closedFollowupMu sync.Mutex
+	closedFollowup   map[string]struct{}
 }
 
 type askCardState struct {
@@ -951,12 +965,47 @@ func (g *Gateway) postFeishuAppMessage(ctx context.Context, token, chatID, rootM
 // thread under, creating it (a plain-text "开始处理" header) on first use. Returns
 // "" when loopID is empty or the root can't be created — callers then post
 // top-level, so threading degrades gracefully rather than dropping messages.
+// lockRoot returns an unlock func for a per-loop mutex, so ensureFeishuThreadRoot
+// runs its check-then-create atomically for a given loop (see rootLocks).
+func (g *Gateway) lockRoot(loopID string) func() {
+	g.rootMu.Lock()
+	if g.rootLocks == nil {
+		g.rootLocks = make(map[string]*sync.Mutex)
+	}
+	lk := g.rootLocks[loopID]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		g.rootLocks[loopID] = lk
+	}
+	g.rootMu.Unlock()
+	lk.Lock()
+	return lk.Unlock
+}
+
 func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loopID string) string {
 	loopID = strings.TrimSpace(loopID)
 	if loopID == "" || g.repositories == nil || g.repositories.FeishuThreads == nil {
 		return ""
 	}
-	if root, err := g.repositories.FeishuThreads.RootByLoop(ctx, loopID); err == nil && root != "" {
+	// Task identity: the planner/worker/... loops spawned for one work item share
+	// ONE anchor card, keyed by their originating issue (issue:repo:N). Loops with
+	// no source issue (PR-triggered, project-level, issue-less bug) fall back to
+	// per-loop keying, exactly as before.
+	taskKey := g.loopTaskKey(ctx, loopID)
+	// Claim before post: serialise anchor creation for this TASK (or loop when
+	// task-less) so a concurrent caller can't POST a second card between our lookup
+	// and Upsert.
+	lockKey := taskKey
+	if lockKey == "" {
+		lockKey = loopID
+	}
+	defer g.lockRoot(lockKey)()
+	if root := g.resolveThreadRoot(ctx, loopID, taskKey); root != "" {
+		// A new loop joining an existing task's card: re-point reply-routing (and
+		// re-key a pre-upgrade per-loop card) at the currently-active loop.
+		if taskKey != "" {
+			_ = g.repositories.FeishuThreads.Upsert(ctx, root, loopID, taskKey, chatID, eventlog.FormatJavaScriptISOString(g.now()))
+		}
 		return root
 	}
 	// The thread anchor is the first thing a human sees, so render it as a compact
@@ -978,8 +1027,106 @@ func (g *Gateway) ensureFeishuThreadRoot(ctx context.Context, token, chatID, loo
 	}
 	// Persisted (not just in-memory) so the inbound callback can reverse-map a
 	// thread reply back to this loop, and so it survives a daemon restart.
-	_ = g.repositories.FeishuThreads.Upsert(ctx, msgID, loopID, chatID, eventlog.FormatJavaScriptISOString(g.now()))
+	_ = g.repositories.FeishuThreads.Upsert(ctx, msgID, loopID, taskKey, chatID, eventlog.FormatJavaScriptISOString(g.now()))
 	return msgID
+}
+
+// loopTaskKey derives a loop's task identity (issue:repo:N) from its metadata, so
+// sibling loops (planner spec, worker impl, fixer, ...) for one work item resolve
+// to the same anchor card. Returns "" when the loop has no source issue.
+func (g *Gateway) loopTaskKey(ctx context.Context, loopID string) string {
+	if g.repositories == nil || g.repositories.Loops == nil {
+		return ""
+	}
+	loop, err := g.repositories.Loops.GetByID(ctx, strings.TrimSpace(loopID))
+	if err != nil || loop == nil {
+		return ""
+	}
+	return loopTaskKeyFromRecord(loop)
+}
+
+// loopTaskKeyFromRecord builds issue:repo:N from a loop, or "" when there's no
+// originating issue (or no repo) to anchor the task on.
+func loopTaskKeyFromRecord(loop *storage.LoopRecord) string {
+	if loop == nil || loop.Repo == nil {
+		return ""
+	}
+	repo := strings.TrimSpace(*loop.Repo)
+	if repo == "" {
+		return ""
+	}
+	n := loopIssueNumber(loop.MetadataJSON)
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("issue:%s:%d", repo, n)
+}
+
+// loopIssueNumber reads the originating issue number from either metadata shape:
+// planner loops store issueNumber at the top level; worker loops nest it under
+// $.worker.issueNumber.
+func loopIssueNumber(metadataJSON *string) int64 {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return 0
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return 0
+	}
+	if n := jsonNumberToInt64(meta["issueNumber"]); n > 0 {
+		return n
+	}
+	if w, ok := meta["worker"].(map[string]any); ok {
+		if n := jsonNumberToInt64(w["issueNumber"]); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// jsonNumberToInt64 coerces a value decoded from JSON (float64, json.Number, or a
+// numeric string) to int64; 0 when it isn't a positive-representable number.
+func jsonNumberToInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	case string:
+		i, _ := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+		return i
+	}
+	return 0
+}
+
+// resolveThreadRoot finds the anchor card root for a loop: by task identity when
+// the loop has a source issue (so sibling loops share one card), else by loop id.
+// The loop-id fallback also lets a pre-upgrade per-loop card be adopted (and then
+// re-keyed) by the first task-aware loop.
+func (g *Gateway) resolveThreadRoot(ctx context.Context, loopID, taskKey string) string {
+	if g.repositories == nil || g.repositories.FeishuThreads == nil {
+		return ""
+	}
+	if taskKey != "" {
+		if root, err := g.repositories.FeishuThreads.RootByTask(ctx, taskKey); err == nil && root != "" {
+			return root
+		}
+	}
+	if root, err := g.repositories.FeishuThreads.RootByLoop(ctx, strings.TrimSpace(loopID)); err == nil {
+		return root
+	}
+	return ""
+}
+
+// threadRootForLoop resolves a loop's anchor card root (task-keyed when possible),
+// for the header/live-feed refreshers that already hold only a loop id.
+func (g *Gateway) threadRootForLoop(ctx context.Context, loopID string) string {
+	return g.resolveThreadRoot(ctx, loopID, g.loopTaskKey(ctx, loopID))
 }
 
 // feishuThreadHeaderText builds a loop thread's plain-text root header, e.g.
@@ -1106,7 +1253,23 @@ func (g *Gateway) feishuThreadHeaderCard(ctx context.Context, loopID string) (st
 	if !feishuLoopStatusTerminal(loop.Status) {
 		elements = append(elements, map[string]any{"tag": "note", "elements": []any{map[string]any{"tag": "lark_md", "content": "💻 本地接管:`looper resume " + strconv.FormatInt(loop.Seq, 10) + "`"}}})
 	}
-	template, label := feishuLoopStatusStyle(loop.Status)
+	// hasPR drives the "已交付 · 待合并" vs "已完成" wording. Derive it from a
+	// reliable signal: a completed worker loop's target flips to its PR
+	// (pr:repo:N), and/or the metadata carries a prUrl. (loopWorkerString only
+	// reads $.worker.*, but prUrl is stored at the top level, so it alone is not
+	// reliable here.)
+	hasPR := prURL != "" || strings.HasPrefix(strings.TrimSpace(target), "pr:")
+	template, label := feishuLoopStatusStyle(loop.Status, hasPR)
+	// §A: once the worker has DELIVERED (completed) and a PR exists, mirror the PR's
+	// real review-cycle state (👀 待 review / 🔄 CI 检查中 / ✋ 待修改 / ❌ CI 失败 /
+	// ✅ 待合并) from its latest snapshot, refining the generic "待合并" wording so the
+	// title precisely reflects where the PR is. While the agent is still running the
+	// "处理中" status stays; merged/failed terminals are left untouched.
+	if hasPR && feishuLoopAwaitingMerge(loop.Status) {
+		if t, l, ok := g.prCardStyleFromSnapshot(ctx, repo, target, prURL); ok {
+			template, label = t, l
+		}
+	}
 	cardObj := map[string]any{
 		"config":   map[string]any{"wide_screen_mode": true},
 		"header":   map[string]any{"template": template, "title": map[string]any{"tag": "plain_text", "content": label}},
@@ -1133,17 +1296,194 @@ func feishuLoopStatusTerminal(status string) bool {
 // feishuLoopStatusStyle maps a loop status to the thread-header card's colour +
 // label, so the anchor card visibly reflects where the task is: processing (blue)
 // → awaiting a human (orange) → done (green) → needs attention (red).
-func feishuLoopStatusStyle(status string) (template, label string) {
+func feishuLoopStatusStyle(status string, hasPR bool) (template, label string) {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "awaiting_human":
 		return "orange", "⏸ Looper 等你定夺"
-	case "completed", "done", "merged":
+	case "merged":
+		return "green", "🎉 已合并"
+	case "completed", "done":
+		// The worker's job ends at OPENING the PR — "completed" means delivered,
+		// NOT merged (review / CI / merge still to come). Only say 已完成 when
+		// there's no PR at all (e.g. a no-diff run).
+		if hasPR {
+			return "turquoise", "✅ 已交付 · 待合并"
+		}
 		return "green", "✅ Looper 已完成"
 	case "failed", "abandoned", "error":
 		return "red", "⚠️ Looper 需要处理"
 	default:
 		return "blue", "🔧 Looper 处理中"
 	}
+}
+
+// feishuLoopAwaitingMerge reports whether a loop has delivered a PR and is now
+// waiting on the review/merge cycle — the window where the anchor card should
+// mirror the PR's real state (§A) instead of the generic "已交付" wording.
+func feishuLoopAwaitingMerge(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "done":
+		return true
+	default:
+		return false
+	}
+}
+
+// prCardState is the review-cycle state a delivered task's PR is in, derived from
+// its latest snapshot so the anchor card mirrors the PR's real status (plan §A).
+type prCardState string
+
+const (
+	prCardStateChecksFailed     prCardState = "checks_failed"
+	prCardStateChangesRequested prCardState = "changes_requested"
+	prCardStateChecksRunning    prCardState = "checks_running"
+	prCardStateApproved         prCardState = "approved"
+	prCardStateReviewPending    prCardState = "review_pending"
+)
+
+type checkRollup int
+
+const (
+	checkNone checkRollup = iota
+	checkRunning
+	checkFailed
+	checkPassed
+)
+
+// classifyChecks rolls a snapshot's ChecksSummary (a comma-joined list of CI
+// conclusions/states) into a single verdict: any failure wins, then anything
+// still running, else all-passed.
+func classifyChecks(summary string) checkRollup {
+	summary = strings.ToLower(strings.TrimSpace(summary))
+	if summary == "" {
+		return checkNone
+	}
+	anyFailed, anyRunning, any := false, false, false
+	for _, state := range strings.Split(summary, ",") {
+		state = strings.TrimSpace(state)
+		if state == "" {
+			continue
+		}
+		any = true
+		switch {
+		case containsAnySubstring(state, "fail", "error", "cancel", "timed_out", "timedout", "action_required", "stale", "startup_failure"):
+			anyFailed = true
+		case containsAnySubstring(state, "pending", "progress", "queued", "waiting", "expected", "requested", "running"):
+			anyRunning = true
+		}
+	}
+	switch {
+	case !any:
+		return checkNone
+	case anyFailed:
+		return checkFailed
+	case anyRunning:
+		return checkRunning
+	default:
+		return checkPassed
+	}
+}
+
+func containsAnySubstring(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// prCardStateFromSnapshot derives the review-cycle state from a snapshot's
+// first-class fields. Precedence mirrors what blocks a merge: failing CI first,
+// then requested changes, then CI still running, then approved (ready to merge),
+// else still awaiting review. Returns ("", false) when there's nothing to show.
+func prCardStateFromSnapshot(reviewState, checksSummary string, unresolved int64) (prCardState, bool) {
+	review := strings.ToUpper(strings.TrimSpace(reviewState))
+	checks := classifyChecks(checksSummary)
+	switch {
+	case checks == checkFailed:
+		return prCardStateChecksFailed, true
+	case review == "CHANGES_REQUESTED":
+		return prCardStateChangesRequested, true
+	case checks == checkRunning:
+		return prCardStateChecksRunning, true
+	case review == "APPROVED":
+		return prCardStateApproved, true
+	default:
+		return prCardStateReviewPending, true
+	}
+}
+
+// prCardStateStyle maps a PR review-cycle state to the card header's colour +
+// label (plan §A's title table). "已合并" is intentionally not produced here — it
+// is a terminal driven by merge detection, not a review snapshot.
+func prCardStateStyle(state prCardState, prNumber string) (template, label string) {
+	suffix := ""
+	if strings.TrimSpace(prNumber) != "" {
+		suffix = " · PR #" + strings.TrimSpace(prNumber)
+	}
+	switch state {
+	case prCardStateChecksFailed:
+		return "red", "❌ CI 失败" + suffix
+	case prCardStateChangesRequested:
+		return "orange", "✋ 待修改" + suffix
+	case prCardStateChecksRunning:
+		return "blue", "🔄 CI 检查中" + suffix
+	case prCardStateApproved:
+		return "turquoise", "✅ 待合并" + suffix
+	default:
+		return "blue", "👀 待 review" + suffix
+	}
+}
+
+// prNumberFromTargetOrURL extracts a PR number from a loop target (pr:owner/repo:N)
+// or, failing that, the trailing number of a PR URL (.../pull/N).
+func prNumberFromTargetOrURL(target, prURL string) int64 {
+	if t := strings.TrimSpace(target); strings.HasPrefix(t, "pr:") {
+		if i := strings.LastIndex(t, ":"); i >= 0 {
+			if n := jsonNumberToInt64(t[i+1:]); n > 0 {
+				return n
+			}
+		}
+	}
+	if n := urlTrailingNumber(prURL); n != "" {
+		return jsonNumberToInt64(n)
+	}
+	return 0
+}
+
+// prCardStyleFromSnapshot resolves the PR-state card style for a delivered loop by
+// reading the latest snapshot of the PR it opened. Best-effort: ("", "", false)
+// when there's no PR number, no snapshot, or the repos aren't wired.
+func (g *Gateway) prCardStyleFromSnapshot(ctx context.Context, repo, target, prURL string) (string, string, bool) {
+	if g.repositories == nil || g.repositories.PullRequestSnapshots == nil {
+		return "", "", false
+	}
+	repo = strings.TrimSpace(repo)
+	prNum := prNumberFromTargetOrURL(target, prURL)
+	if repo == "" || prNum <= 0 {
+		return "", "", false
+	}
+	snap, err := g.repositories.PullRequestSnapshots.GetLatest(ctx, repo, prNum)
+	if err != nil || snap == nil {
+		return "", "", false
+	}
+	review, checks, unresolved := "", "", int64(0)
+	if snap.ReviewState != nil {
+		review = *snap.ReviewState
+	}
+	if snap.ChecksSummary != nil {
+		checks = *snap.ChecksSummary
+	}
+	if snap.UnresolvedThreadCount != nil {
+		unresolved = *snap.UnresolvedThreadCount
+	}
+	state, ok := prCardStateFromSnapshot(review, checks, unresolved)
+	if !ok {
+		return "", "", false
+	}
+	t, l := prCardStateStyle(state, strconv.FormatInt(prNum, 10))
+	return t, l, true
 }
 
 // liveTailEntry is the most recent agent-activity snapshot for one loop.
@@ -1201,8 +1541,8 @@ func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID strin
 	if loopID == "" || len(tail) == 0 || g.repositories == nil || g.repositories.FeishuThreads == nil {
 		return
 	}
-	root, err := g.repositories.FeishuThreads.RootByLoop(ctx, loopID)
-	if err != nil || strings.TrimSpace(root) == "" {
+	root := g.threadRootForLoop(ctx, loopID)
+	if strings.TrimSpace(root) == "" {
 		return // anchor not posted yet — nothing to thread under
 	}
 	cardJSON, ok := feishuLiveFeedCard(tail, elapsedSec)
@@ -1253,8 +1593,8 @@ func (g *Gateway) updateFeishuThreadHeader(ctx context.Context, token, loopID st
 	if g.repositories == nil || g.repositories.FeishuThreads == nil {
 		return
 	}
-	root, err := g.repositories.FeishuThreads.RootByLoop(ctx, strings.TrimSpace(loopID))
-	if err != nil || strings.TrimSpace(root) == "" {
+	root := g.threadRootForLoop(ctx, loopID)
+	if strings.TrimSpace(root) == "" {
 		return
 	}
 	cardJSON, ok := g.feishuThreadHeaderCard(ctx, loopID)
@@ -1262,6 +1602,49 @@ func (g *Gateway) updateFeishuThreadHeader(ctx context.Context, token, loopID st
 		return
 	}
 	_ = g.patchFeishuAppCard(ctx, token, root, cardJSON)
+}
+
+// PostTaskClosedFollowup posts a single honest reply in a finished task's thread
+// when a human keeps talking to it (§F option B / P5): rather than silently
+// swallowing the message on a loop that will never run again, it says the task is
+// done and where to continue. At most once per loop. App-mode + best-effort.
+func (g *Gateway) PostTaskClosedFollowup(ctx context.Context, loopID string) error {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" || !strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+		return nil
+	}
+	g.closedFollowupMu.Lock()
+	if g.closedFollowup == nil {
+		g.closedFollowup = map[string]struct{}{}
+	}
+	if _, done := g.closedFollowup[loopID]; done {
+		g.closedFollowupMu.Unlock()
+		return nil
+	}
+	g.closedFollowup[loopID] = struct{}{}
+	g.closedFollowupMu.Unlock()
+
+	cfg := g.config.Webhook
+	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
+	appSecret := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppSecretEnv)))
+	if appID == "" || appSecret == "" {
+		return nil
+	}
+	token, err := g.feishuTenantToken(ctx, appID, appSecret)
+	if err != nil {
+		return err
+	}
+	root := g.threadRootForLoop(ctx, loopID)
+	chatID := strings.TrimSpace(cfg.ChatID)
+	if strings.TrimSpace(root) == "" || chatID == "" {
+		return nil
+	}
+	raw, err := json.Marshal(map[string]string{"text": "✅ 本任务已完成。如需继续,请在对应的 issue / PR 上留言,或新建一个任务 —— 这个话题不再自动接管了。"})
+	if err != nil {
+		return err
+	}
+	_, err = g.postFeishuAppMessage(ctx, token, chatID, root, "text", string(raw))
+	return err
 }
 
 // patchFeishuAppCard updates an already-sent interactive card in place.
@@ -1384,10 +1767,10 @@ func feishuPhaseFromTail(tail []string) string {
 	case strings.HasPrefix(lower, "rg ") || strings.HasPrefix(lower, "grep ") || strings.HasPrefix(lower, "ls ") || strings.HasPrefix(lower, "cat ") || strings.HasPrefix(lower, "find ") || strings.Contains(lower, "git status") || strings.Contains(lower, "git log") || strings.Contains(lower, "git diff"):
 		return "正在阅读代码"
 	default:
-		if len(line) > 60 {
-			line = line[:60] + "…"
-		}
-		return line
+		// Never surface a raw shell command on the human-scannable anchor — an
+		// unrecognised command becomes a generic phase; the raw feed lives inside
+		// the thread (feishuLiveFeedCard), not here.
+		return "正在处理…"
 	}
 }
 

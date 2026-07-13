@@ -297,6 +297,9 @@ type ToolPathsConfig struct {
 	GHPath        *string `json:"ghPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	// PlanePath is the `plane` CLI used to read/write Plane spec documents (§8.2).
+	// Optional; auto-detected on PATH when unset.
+	PlanePath *string `json:"planePath,omitempty"`
 }
 
 type ToolDetectionStatus string
@@ -464,6 +467,11 @@ type ReviewerRoleTriggersConfig struct {
 type ReviewerSpecReviewConfig struct {
 	IncludeReviewingLabel bool   `json:"includeReviewingLabel"`
 	ReviewingLabel        string `json:"reviewingLabel"`
+	// RequireHumanApproval gates the spec-ready transition on a human APPROVE review
+	// (plan §8.6): when true, a clean automated spec review does NOT self-approve to
+	// spec-ready — the reviewer adds looper:needs-human and holds until a person
+	// approves the spec PR. Default false keeps today's auto-approve behaviour.
+	RequireHumanApproval bool `json:"requireHumanApproval"`
 }
 
 type ReviewerRoleDiscoveryConfig struct {
@@ -574,6 +582,18 @@ type ProjectRefConfig struct {
 	Network      ProjectNetworkConfig `json:"network,omitempty"`
 	Webhook      ProjectWebhookConfig `json:"webhook,omitempty"`
 	Roles        *PartialRoleConfigs  `json:"roles,omitempty"`
+	ProductOwner *ProductOwnerConfig  `json:"productOwner,omitempty"`
+}
+
+// ProductOwnerConfig names the person who owns the product spec for a project — who
+// looper @-mentions in the task thread when a feature arrives without one (plan §8.3).
+type ProductOwnerConfig struct {
+	// FeishuOpenID is the product owner's Feishu open_id (ou_...), @-mentioned in the
+	// thread to ask for a product spec.
+	FeishuOpenID string `json:"feishuOpenId,omitempty"`
+	// PlaneID is the product owner's Plane member UUID, for operations that act on
+	// their behalf in Plane. Optional.
+	PlaneID string `json:"planeId,omitempty"`
 }
 
 type ProjectWebhookConfig struct {
@@ -593,6 +613,7 @@ type PartialProjectRefConfig struct {
 	Webhook      *PartialProjectWebhookConfig `json:"webhook,omitempty"`
 	Instructions map[string]string            `json:"instructions,omitempty"`
 	Roles        *PartialRoleConfigs          `json:"roles,omitempty"`
+	ProductOwner *ProductOwnerConfig          `json:"productOwner,omitempty"`
 }
 
 type PartialProjectNetworkConfig struct {
@@ -789,6 +810,7 @@ type PartialToolPathsConfig struct {
 	GHPath        *string `json:"ghPath,omitempty"`
 	LooperPath    *string `json:"looperPath,omitempty"`
 	OsascriptPath *string `json:"osascriptPath,omitempty"`
+	PlanePath     *string `json:"planePath,omitempty"`
 }
 
 type PartialDaemonConfig struct {
@@ -949,6 +971,7 @@ type PartialReviewerRoleTriggersConfig struct {
 type PartialReviewerSpecReviewConfig struct {
 	IncludeReviewingLabel *bool   `json:"includeReviewingLabel,omitempty"`
 	ReviewingLabel        *string `json:"reviewingLabel,omitempty"`
+	RequireHumanApproval  *bool   `json:"requireHumanApproval,omitempty"`
 }
 
 type PartialReviewerRoleDiscoveryConfig struct {

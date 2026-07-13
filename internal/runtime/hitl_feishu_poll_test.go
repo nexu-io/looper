@@ -44,6 +44,43 @@ func TestPollFeishuHITLInboxOnce(t *testing.T) {
 	}
 }
 
+func TestPollFeishuHITLInboxOnceAcksFinishedTaskInsteadOfQueuing(t *testing.T) {
+	// om_root_done -> loop-done (a finished task); om_root_live -> loop-live (still running).
+	rootToLoop := map[string]string{"om_root_done": "loop-done", "om_root_live": "loop-live"}
+	done := map[string]bool{"loop-done": true}
+	var enqueued, acked []string
+	deps := feishuHITLPollDeps{
+		loopByRoot:     func(_ contextType, root string) string { return rootToLoop[root] },
+		enqueueMessage: func(_ contextType, loopID, text string) error { enqueued = append(enqueued, loopID); return nil },
+		loopDone:       func(_ contextType, loopID string) bool { return done[loopID] },
+		notifyClosed:   func(_ contextType, loopID string) error { acked = append(acked, loopID); return nil },
+	}
+	events := []feishuInboxEvent{
+		{ID: 20, Kind: "message", RootID: "om_root_done", Text: "还能再改改吗?"}, // finished -> ack once, don't queue
+		{ID: 21, Kind: "message", RootID: "om_root_live", Text: "用 redis"}, // live -> queue as normal
+	}
+	pollFeishuHITLInboxOnce(context.Background(), events, deps)
+	if len(acked) != 1 || acked[0] != "loop-done" {
+		t.Fatalf("acked = %v, want [loop-done]", acked)
+	}
+	if len(enqueued) != 1 || enqueued[0] != "loop-live" {
+		t.Fatalf("enqueued = %v, want only the live loop [loop-live]", enqueued)
+	}
+}
+
+func TestLoopFinishedForFollowup(t *testing.T) {
+	for _, s := range []string{"completed", "done", "merged", "DONE"} {
+		if !loopFinishedForFollowup(s) {
+			t.Fatalf("loopFinishedForFollowup(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"running", "failed", "abandoned", "awaiting_human", ""} {
+		if loopFinishedForFollowup(s) {
+			t.Fatalf("loopFinishedForFollowup(%q) = true, want false", s)
+		}
+	}
+}
+
 func mustCardAction(id int64, seq, answer string) feishuInboxEvent {
 	e := feishuInboxEvent{ID: id, Kind: "card_action"}
 	e.Value.LoopSeq = seq

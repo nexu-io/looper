@@ -4484,3 +4484,25 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 	}
 	t.Fatal("condition not satisfied before timeout")
 }
+
+func TestShouldWakeReconcile(t *testing.T) {
+	cases := []struct {
+		name              string
+		sinceLastPass     time.Duration
+		sinceLastReconile time.Duration
+		wantRun           bool
+		wantReason        string
+	}{
+		{"normal 1s tick", time.Second, 30 * time.Second, false, ""},
+		{"suspend/resume jump", 10 * time.Minute, 10 * time.Minute, true, "wall_clock_jump"},
+		{"just over wake threshold", wakeReconcileThreshold + time.Second, time.Minute, true, "wall_clock_jump"},
+		{"periodic due", 2 * time.Second, periodicReconcileInterval, true, "periodic"},
+		{"periodic not yet", 2 * time.Second, periodicReconcileInterval - time.Second, false, ""},
+	}
+	for _, tc := range cases {
+		run, reason := shouldWakeReconcile(tc.sinceLastPass, tc.sinceLastReconile)
+		if run != tc.wantRun || reason != tc.wantReason {
+			t.Fatalf("%s: shouldWakeReconcile(%v,%v) = (%v,%q); want (%v,%q)", tc.name, tc.sinceLastPass, tc.sinceLastReconile, run, reason, tc.wantRun, tc.wantReason)
+		}
+	}
+}

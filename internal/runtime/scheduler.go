@@ -101,6 +101,12 @@ type defaultSchedulerTickInput struct {
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
+	// OnPullRequestSnapshot, when set, is called after a PR snapshot is captured, so
+	// the task's anchor card can re-render with the PR's fresh review-cycle state (§A).
+	OnPullRequestSnapshot func(ctx context.Context, repo string, prNumber int64)
+	// PostTaskClosedFollowup, when set, posts the one "task is done, continue on the
+	// issue/PR" reply for a finished loop that a human keeps messaging (§F option B).
+	PostTaskClosedFollowup func(ctx context.Context, loopID string) error
 }
 
 type defaultSchedulerHandlers struct {
@@ -2135,6 +2141,23 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		}
 		notificationGateway.RefreshThreadHeader(ctx, loopID, nil, 0)
 	}
+	// refreshTaskCardForPR re-renders the anchor card of the task whose worker opened
+	// this PR, so a freshly-captured snapshot advances the card through the review
+	// cycle (§A: 👀 待 review → 🔄 CI 检查中 → ✋ 待修改 / ❌ CI 失败 → ✅ 待合并). Resolves
+	// the PR → its worker loop (target pr:repo:N) → that loop's task-card. App-mode only.
+	refreshTaskCardForPR := func(ctx context.Context, repo string, prNumber int64) {
+		if repo = strings.TrimSpace(repo); repo == "" || prNumber <= 0 {
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") || repos == nil || repos.Loops == nil {
+			return
+		}
+		loop, err := repos.Loops.GetByTargetID(ctx, fmt.Sprintf("pr:%s:%d", repo, prNumber))
+		if err != nil || loop == nil {
+			return
+		}
+		notificationGateway.RefreshThreadHeader(ctx, loop.ID, nil, 0)
+	}
 	notifyAgentExecutionStarted := func(ctx context.Context, input agentExecutionNotificationInput) error {
 		notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
 			ID:         input.ExecutionID,
@@ -2442,6 +2465,8 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			OnPullRequestSnapshot:    refreshTaskCardForPR,
+			PostTaskClosedFollowup:   notificationGateway.PostTaskClosedFollowup,
 		}
 	}
 
@@ -3032,6 +3057,11 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	}
 	if err := input.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
+	}
+	// A fresh snapshot means the PR's review state may have moved — refresh the
+	// task's anchor card so its header mirrors it (§A). Best-effort; app-mode only.
+	if input.OnPullRequestSnapshot != nil {
+		input.OnPullRequestSnapshot(ctx, *item.Repo, *item.PRNumber)
 	}
 	if err := input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC())); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {

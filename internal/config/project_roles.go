@@ -25,6 +25,17 @@ func ProjectProviderKind(cfg Config, projectID string) ProviderKind {
 	return resolvedProjectProviderKind(cfg, *project)
 }
 
+// ProjectProductOwner resolves a project's product owner (plan §8.3) — who to
+// @-mention when a feature lands without a product spec. Unknown ids return an
+// empty owner (no one to ping).
+func ProjectProductOwner(cfg Config, projectID string) ProductOwnerConfig {
+	project := findConfiguredProject(cfg.Projects, projectID)
+	if project == nil || project.ProductOwner == nil {
+		return ProductOwnerConfig{}
+	}
+	return *project.ProductOwner
+}
+
 func ProjectRoleAutoDiscoveryEnabled(cfg Config, projectID, role string) bool {
 	roles := ProjectRoleConfigs(cfg, projectID)
 	switch role {

@@ -322,7 +322,8 @@
             },
             "specReview": {
               "includeReviewingLabel": true,
-              "reviewingLabel": "looper:spec-reviewing"
+              "reviewingLabel": "looper:spec-reviewing",
+              "requireHumanApproval": false
             }
           }
         },
@@ -372,7 +373,8 @@
         "gitPath": "configured",
         "ghPath": "configured",
         "looperPath": "detected",
-        "osascriptPath": "configured"
+        "osascriptPath": "configured",
+        "planePath": "missing"
       }
     }
   }

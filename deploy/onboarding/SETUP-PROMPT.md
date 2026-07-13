@@ -23,7 +23,13 @@
    - looper 数据/日志放哪(默认 `~/.looper`)。
 3. **写我的配置**:把 `config.hitl.example.json` 复制到 `~/.looper/config.json`,把所有 `REPLACE_...` / `/ABSOLUTE/...` / `OWNER/REPO` 占位符替换成上面的值。改完把最终配置**给我看一遍**确认(它没有 secret,可以直接展示)。
 4. **加载共享 secret**:`source` 这个包里的 `hitl.env`。**不要**把 secret 的值打印出来,也**不要**抄进配置文件(配置里只放变量名)。
-5. **启动 looperd**:`source <包路径>/hitl.env && looperd --config ~/.looper/config.json`(后台跑,或按 `GUIDE-hitl-setup.md` 装成常驻守护进程)。确认活着:`looper --config ~/.looper/config.json status`。
+5. **装成常驻服务并启动**(这样合盖 / 重启 / 崩了都会自动拉起 —— 别用 `nohup` 裸后台):
+   ```sh
+   source <包路径>/hitl.env      # 让密钥进当前 shell,下一步会烤进服务配置
+   looper daemon install
+   looper daemon start --config ~/.looper/config.json --daemon-restart-policy on-failure
+   ```
+   确认活着:`looper daemon status --config ~/.looper/config.json`。(密钥来自上面 source 的 `hitl.env`,会被写进 launchd 服务,重启后仍在。)
 6. **冒烟**(先问我):在我的仓库建一个带 `looper:plan` 标签的小 issue,确认 looper 接住、并在(有歧义时)往我的飞书群发一张决策卡 @我。
 
 ## 护栏

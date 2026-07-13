@@ -44,7 +44,13 @@ type feishuHITLPollDeps struct {
 	// anytime), to be drained on the loop's next turn rather than treated as a final
 	// answer.
 	enqueueMessage func(ctx contextType, loopID, text string) error
-	logWarn        func(msg string, fields map[string]any)
+	// loopDone reports whether a loop has finished its work (completed / merged), so
+	// a further thread reply is a post-completion follow-up rather than a live turn.
+	loopDone func(ctx contextType, loopID string) bool
+	// notifyClosed posts the one "task is done, continue on the issue/PR" reply for a
+	// finished loop (§F option B). Best-effort.
+	notifyClosed func(ctx contextType, loopID string) error
+	logWarn      func(msg string, fields map[string]any)
 }
 
 // pollFeishuHITLInboxOnce delivers the answers among a batch of inbox events that
@@ -52,6 +58,19 @@ type feishuHITLPollDeps struct {
 // replies) or loop seq (card-action clicks). Returns the highest event id seen so
 // the caller can advance its cursor. Idempotent: an event whose loop is no longer
 // awaiting is a no-op in deliverAnswer.
+// loopFinishedForFollowup reports whether a loop has finished its work such that a
+// further thread reply is a post-completion follow-up (§F). Only the "done well"
+// states qualify — failed/abandoned loops may still be retried or acted on, so
+// they keep queuing messages.
+func loopFinishedForFollowup(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "done", "merged":
+		return true
+	default:
+		return false
+	}
+}
+
 func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps feishuHITLPollDeps) (delivered int, maxID int64) {
 	for _, e := range events {
 		if e.ID > maxID {
@@ -71,6 +90,17 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 				continue
 			}
 			loopID = deps.loopByRoot(ctx, root)
+			// §F option B (P5): the task already finished — a further reply gets one
+			// honest ack instead of being silently queued to a loop that never runs
+			// again.
+			if strings.TrimSpace(loopID) != "" && deps.loopDone != nil && deps.loopDone(ctx, loopID) {
+				if deps.notifyClosed != nil {
+					if err := deps.notifyClosed(ctx, loopID); err != nil && deps.logWarn != nil {
+						deps.logWarn("hitl feishu poll: closed-task followup failed", map[string]any{"loopId": loopID, "error": err.Error()})
+					}
+				}
+				continue
+			}
 			value = text
 			deliver = deps.enqueueMessage
 		case "card_action":
@@ -172,6 +202,19 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
 			return enqueueHumanMessageToLoop(ctx, input.Repos, nowISO, loopID, text)
+		},
+		loopDone: func(ctx contextType, loopID string) bool {
+			loop, err := input.Repos.Loops.GetByID(ctx, loopID)
+			if err != nil || loop == nil {
+				return false
+			}
+			return loopFinishedForFollowup(loop.Status)
+		},
+		notifyClosed: func(ctx contextType, loopID string) error {
+			if input.PostTaskClosedFollowup == nil {
+				return nil
+			}
+			return input.PostTaskClosedFollowup(ctx, loopID)
 		},
 	}
 	if input.Logger != nil {

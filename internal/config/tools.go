@@ -19,6 +19,7 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 		GHPath:        cloneStringPtr(configured.GHPath),
 		LooperPath:    cloneStringPtr(configured.LooperPath),
 		OsascriptPath: cloneStringPtr(configured.OsascriptPath),
+		PlanePath:     cloneStringPtr(configured.PlanePath),
 	}
 
 	detection := map[string]ToolDetectionStatus{
@@ -26,6 +27,7 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 		"ghPath":        toolDetectionStatusFor(paths.GHPath),
 		"looperPath":    toolDetectionStatusFor(paths.LooperPath),
 		"osascriptPath": toolDetectionStatusFor(paths.OsascriptPath),
+		"planePath":     toolDetectionStatusFor(paths.PlanePath),
 	}
 
 	candidates := []struct {
@@ -37,6 +39,7 @@ func DetectToolPaths(configured ToolPathsConfig, lookPath LookPathFunc) ToolDete
 		{key: "ghPath", executable: "gh", target: &paths.GHPath},
 		{key: "looperPath", executable: "looper", target: &paths.LooperPath},
 		{key: "osascriptPath", executable: "osascript", target: &paths.OsascriptPath},
+		{key: "planePath", executable: "plane", target: &paths.PlanePath},
 	}
 
 	for _, candidate := range candidates {

@@ -38,10 +38,17 @@ A teammate joining the shared Feishu setup needs exactly two files:
    ```sh
    cp deploy/config.hitl.example.json ~/.looper/config.json
    $EDITOR ~/.looper/config.json          # replace the REPLACE_/ABSOLUTE_ placeholders
-   looperd --config ~/.looper/config.json
+   source ~/.looper/hitl.env              # secrets into this shell (baked into the service next)
+   looper daemon install
+   looper daemon start --config ~/.looper/config.json --daemon-restart-policy on-failure
    ```
 The env file carries the shared **secret values**; the config carries the
-**feature switches + per-person settings**. You need both.
+**feature switches + per-person settings**. You need both. Installing it as a
+managed daemon (`looper daemon start`) — instead of `looperd &` — means it
+**auto-starts on login and restarts on crash**, so a closed laptop doesn't lose
+in-flight work: on wake the daemon comes back and resumes from its checkpoints.
+The `LOOPER_*` secrets you `source`d are captured into the launchd service, so
+they persist across reboots.
 
 ## 0. Prerequisites
 - A coding agent configured (`agent.vendor` = `codex` / `claude-code` / …).

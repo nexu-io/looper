@@ -249,6 +249,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	validateCoordinatorRoleConfig(config.Roles.Coordinator, "roles.coordinator", &issues)
 	validateIssueRoleTriggers(config.Roles.Planner.Triggers, "roles.planner.triggers", &issues)
 	validateIssueRoleTriggers(config.Roles.Worker.Triggers, "roles.worker.triggers", &issues)
+	validateNoIssueRoleTriggerLabelOverlap(config.Roles.Planner, config.Roles.Worker, &issues)
 	validateReviewerRoleTriggers(config.Roles.Reviewer.Discovery.Triggers, "roles.reviewer.discovery.triggers", &issues)
 	validateFixerRoleTriggers(config.Roles.Fixer.Triggers, "roles.fixer.triggers", &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
@@ -386,6 +387,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
+		validateProductOwner(project.ProductOwner, prefix+".productOwner", &issues)
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
 		}
@@ -1047,6 +1049,58 @@ func validateDistinctLabels(labels []labelPathValue, issues *[]ValidationIssue) 
 			continue
 		}
 		seen[trimmed] = label.Path
+	}
+}
+
+// validateNoIssueRoleTriggerLabelOverlap flags the P4 misconfiguration where the
+// worker shares a trigger label with the planner, so a single issue fires BOTH
+// roles at once (one need → two PRs). It deliberately exempts the Plane
+// single-label lifecycle, where the planner and worker share one label on purpose
+// and route by assignee UUID rather than the current GitHub user — signalled by
+// RequireAssigneeCurrentUser being false on both roles (see applyPlaneBootstrapPlan).
+func validateNoIssueRoleTriggerLabelOverlap(planner PlannerRoleConfig, worker WorkerRoleConfig, issues *[]ValidationIssue) {
+	// Plane lifecycle: both roles keyed off one label, routed by assignee UUID, not
+	// the GitHub current-user filter. That shared label is intended, not a bug.
+	if !planner.Triggers.RequireAssigneeCurrentUser && !worker.Triggers.RequireAssigneeCurrentUser {
+		return
+	}
+	plannerLabels := map[string]struct{}{}
+	for _, label := range planner.Triggers.Labels {
+		if trimmed := strings.TrimSpace(label); trimmed != "" {
+			plannerLabels[trimmed] = struct{}{}
+		}
+	}
+	for index, label := range worker.Triggers.Labels {
+		trimmed := strings.TrimSpace(label)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := plannerLabels[trimmed]; ok {
+			*issues = append(*issues, ValidationIssue{
+				Path:    fmt.Sprintf("roles.worker.triggers.labels[%d]", index),
+				Message: fmt.Sprintf("overlaps roles.planner.triggers.labels: %q would trigger both the planner and the worker for one issue", trimmed),
+			})
+		}
+	}
+}
+
+// validateProductOwner checks the optional per-project product owner (plan §8.3):
+// when set, the Feishu open_id must be trimmed and shaped like an open_id (ou_…),
+// so an @-mention doesn't silently resolve to nobody.
+func validateProductOwner(owner *ProductOwnerConfig, path string, issues *[]ValidationIssue) {
+	if owner == nil {
+		return
+	}
+	openID := owner.FeishuOpenID
+	if openID == "" {
+		return
+	}
+	if strings.TrimSpace(openID) != openID {
+		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must not contain leading or trailing whitespace"})
+		return
+	}
+	if !strings.HasPrefix(openID, "ou_") {
+		*issues = append(*issues, ValidationIssue{Path: path + ".feishuOpenId", Message: "must be a Feishu open_id (starts with ou_)"})
 	}
 }
 

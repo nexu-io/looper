@@ -1313,6 +1313,9 @@ func mergeReviewerSpecReviewConfig(config *ReviewerSpecReviewConfig, partial Par
 	if partial.ReviewingLabel != nil {
 		config.ReviewingLabel = *partial.ReviewingLabel
 	}
+	if partial.RequireHumanApproval != nil {
+		config.RequireHumanApproval = *partial.RequireHumanApproval
+	}
 }
 
 func mergeFixerRoleTriggersConfig(config *FixerRoleTriggersConfig, partial PartialFixerRoleTriggersConfig) {
@@ -1469,9 +1472,18 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
+			ProductOwner: cloneProductOwner(project.ProductOwner),
 		}
 	}
 	return cloned
+}
+
+func cloneProductOwner(owner *ProductOwnerConfig) *ProductOwnerConfig {
+	if owner == nil {
+		return nil
+	}
+	cloned := *owner
+	return &cloned
 }
 
 func clonePartialProjectNetworkConfig(config *PartialProjectNetworkConfig) *PartialProjectNetworkConfig {
@@ -1552,6 +1564,7 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		if project.Webhook != nil && project.Webhook.Mode != nil {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode
 		}
+		cloned[index].ProductOwner = cloneProductOwner(project.ProductOwner)
 
 		if project.BaseBranch != nil {
 			cloned[index].BaseBranch = stringPtr(*project.BaseBranch)

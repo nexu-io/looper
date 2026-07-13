@@ -33,8 +33,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0018_feishu_threads",
-              "latestAppliedId": "0018_feishu_threads",
+              "latestAvailableId": "0019_feishu_threads_task_key",
+              "latestAppliedId": "0019_feishu_threads_task_key",
               "pendingCount": 0
             }
           }
@@ -80,7 +80,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0018_feishu_threads",
+            "schemaVersion": "0019_feishu_threads_task_key",
             "pendingMigrations": [],
             "healthy": true
           },
@@ -435,7 +435,8 @@
                 },
                 "specReview": {
                   "includeReviewingLabel": true,
-                  "reviewingLabel": "looper:spec-reviewing"
+                  "reviewingLabel": "looper:spec-reviewing",
+                  "requireHumanApproval": false
                 }
               }
             },
