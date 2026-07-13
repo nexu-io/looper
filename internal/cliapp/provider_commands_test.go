@@ -19,7 +19,13 @@ import (
 
 func TestParseBootstrapRemote(t *testing.T) {
 	t.Parallel()
-	for _, value := range []string{"git@code.example.com:acme/looper.git", "ssh://git@code.example.com/acme/looper.git", "https://code.example.com/acme/looper.git"} {
+	for _, value := range []string{
+		"git@code.example.com:acme/looper.git",
+		"forgejo@code.example.com:acme/looper.git",
+		"code.example.com:acme/looper.git",
+		"ssh://git@code.example.com/acme/looper.git",
+		"https://code.example.com/acme/looper.git",
+	} {
 		remote, err := parseBootstrapRemote(value)
 		if err != nil {
 			t.Fatalf("parseBootstrapRemote(%q) error = %v", value, err)

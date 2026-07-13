@@ -481,6 +481,8 @@ type bootstrapOriginRemote struct {
 	Repo string
 }
 
+var bootstrapSCPRemotePattern = regexp.MustCompile(`^(?:[^@/:]+@)?(\[[^]]+\]|[^/:]+):(.+)$`)
+
 func (r *commandRuntime) detectBootstrapOriginRemote(ctx context.Context, projectPath string) (bootstrapOriginRemote, error) {
 	gitPath, err := r.lookPath()("git")
 	if err != nil || strings.TrimSpace(gitPath) == "" {
@@ -503,9 +505,8 @@ func parseBootstrapRemote(value string) (bootstrapOriginRemote, error) {
 		return bootstrapOriginRemote{}, fmt.Errorf("git origin is empty")
 	}
 	var host, path string
-	if strings.HasPrefix(trimmed, "git@") && !strings.Contains(trimmed, "://") {
-		after := strings.TrimPrefix(trimmed, "git@")
-		host, path, _ = strings.Cut(after, ":")
+	if match := bootstrapSCPRemotePattern.FindStringSubmatch(trimmed); !strings.Contains(trimmed, "://") && match != nil {
+		host, path = match[1], match[2]
 	} else {
 		parsed, err := url.Parse(trimmed)
 		if err != nil || parsed.Hostname() == "" {
