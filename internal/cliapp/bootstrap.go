@@ -551,6 +551,9 @@ func forgejoRemoteMatchesBaseURL(remote bootstrapOriginRemote, baseURL string) b
 	if remote.Scheme != "ssh" && remoteURL.Port() != parsed.Port() {
 		return false
 	}
+	if remote.Scheme == "ssh" {
+		return len(strings.Split(remote.Path, "/")) == 2
+	}
 	basePath := strings.Trim(strings.TrimSpace(parsed.Path), "/")
 	if basePath == "" {
 		return len(strings.Split(remote.Path, "/")) == 2

@@ -77,8 +77,19 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	providerID := strings.TrimSpace(getStringFlag(cmd, "provider"))
 	repo := strings.TrimSpace(getStringFlag(cmd, "repo"))
 	forgejoURL := strings.TrimSpace(getStringFlag(cmd, "forgejo-url"))
-	if forgejoURL == "" && providerID != "forgejo" {
-		return providerID, repo, nil
+	if forgejoURL == "" {
+		if providerID != "forgejo" {
+			return providerID, repo, nil
+		}
+		loaded, err := r.loadConfigForEdit()
+		if err != nil {
+			return "", "", err
+		}
+		for _, provider := range loaded.Config.Providers {
+			if provider.ID == providerID {
+				return providerID, repo, nil
+			}
+		}
 	}
 	absPath, err := absolutePathIfSet(repoPath)
 	if err != nil || absPath == "" {

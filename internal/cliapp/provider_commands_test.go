@@ -87,6 +87,62 @@ func TestForgejoRemoteMatchesBaseURLIgnoresSSHPort(t *testing.T) {
 	}
 }
 
+func TestForgejoRemoteMatchesBaseURLAllowsSSHWithHTTPBasePath(t *testing.T) {
+	t.Parallel()
+	for _, origin := range []string{
+		"git@code.example.com:acme/looper.git",
+		"ssh://git@code.example.com/acme/looper.git",
+	} {
+		remote, err := parseBootstrapRemote(origin)
+		if err != nil {
+			t.Fatalf("parseBootstrapRemote(%q) error = %v", origin, err)
+		}
+		if !forgejoRemoteMatchesBaseURL(remote, "https://code.example.com/forge") {
+			t.Errorf("remote %q should match Forgejo served under an HTTP base path", origin)
+		}
+	}
+}
+
+func TestPrepareProjectAddProviderAcceptsExplicitForgejoID(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Providers = append(cfg.Providers, config.ProviderConfig{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: stringPtr("FORGEJO_TOKEN")})
+	raw, err := config.MarshalConfigFile(configPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := newCommandRuntime(New(Deps{LookPath: configLookPathForTests()}), []string{"--config", configPath})
+	cmd := newCommand(commandSpec{
+		use: "test",
+		localFlags: []flagSpec{
+			stringFlag("provider", "id", ""),
+			stringFlag("repo", "owner/name", ""),
+			stringFlag("forgejo-url", "url", ""),
+		},
+	})
+	if err := cmd.Flags().Set("provider", "forgejo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("repo", "acme/looper"); err != nil {
+		t.Fatal(err)
+	}
+
+	provider, repo, err := runtime.prepareProjectAddProvider(cmd, "")
+	if err != nil {
+		t.Fatalf("prepareProjectAddProvider() error = %v", err)
+	}
+	if provider != "forgejo" || repo != "acme/looper" {
+		t.Fatalf("prepareProjectAddProvider() = (%q, %q), want (%q, %q)", provider, repo, "forgejo", "acme/looper")
+	}
+}
+
 func TestBootstrapNextStepsForForgejoRestart(t *testing.T) {
 	t.Parallel()
 	plan := bootstrapConfigPlan{Provider: bootstrapProviderForgejo, ProjectPath: "/repo", ForgejoTokenEnv: "FORGEJO_TOKEN"}
