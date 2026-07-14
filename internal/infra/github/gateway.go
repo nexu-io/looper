@@ -1814,6 +1814,9 @@ func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput)
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
 	result, err := g.runGhWithTimeout(ctx, input.CWD, "", prDiffGhCommandTimeout, "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
+	if result.StdoutTruncated {
+		return "", ErrDiffTooLarge
+	}
 	if err != nil {
 		if isDiffTooLargeError(err) {
 			return "", ErrDiffTooLarge

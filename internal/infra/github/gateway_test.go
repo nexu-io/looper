@@ -2108,32 +2108,49 @@ func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
 
 func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	t.Parallel()
-	runner := &fakeGHRunner{t: t}
-	runner.respond = func(options shell.Options) (shell.Result, error) {
-		args := strings.Join(options.Args, " ")
-		switch {
-		case strings.HasPrefix(args, "pr view"):
-			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
-		case strings.Contains(args, "reviewThreads"):
-			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
-		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
-			return shell.Result{}, nil
-		case strings.HasPrefix(args, "pr diff"):
-			result := shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"}
-			return result, &shell.CommandExecutionError{Message: result.Stderr, Result: result}
-		default:
-			t.Fatalf("unexpected gh args: %q", args)
-			return shell.Result{}, nil
-		}
-	}
-	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	for _, tc := range []struct {
+		name       string
+		diffResult shell.Result
+		diffErr    error
+	}{
+		{
+			name:       "GitHub rejects oversized diff",
+			diffResult: shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"},
+			diffErr:    &shell.CommandExecutionError{Message: "HTTP 406: diff exceeded maximum number of lines too_large"},
+		},
+		{
+			name:       "shell capture truncates diff",
+			diffResult: shell.Result{Stdout: strings.Repeat("x", 256*1024), StdoutTruncated: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeGHRunner{t: t}
+			runner.respond = func(options shell.Options) (shell.Result, error) {
+				args := strings.Join(options.Args, " ")
+				switch {
+				case strings.HasPrefix(args, "pr view"):
+					return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
+				case strings.Contains(args, "reviewThreads"):
+					return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
+				case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+					return shell.Result{}, nil
+				case strings.HasPrefix(args, "pr diff"):
+					return tc.diffResult, tc.diffErr
+				default:
+					t.Fatalf("unexpected gh args: %q", args)
+					return shell.Result{}, nil
+				}
+			}
+			gateway := New(Options{GHPath: "gh", GHRun: runner.run})
 
-	snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
-	if err != nil {
-		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
-	}
-	if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"github_too_large"`) {
-		t.Fatalf("PayloadJSON = %v, want truncated marker", snapshot.PayloadJSON)
+			snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+			if err != nil {
+				t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
+			}
+			if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"github_too_large"`) {
+				t.Fatalf("PayloadJSON = %v, want truncated marker", snapshot.PayloadJSON)
+			}
+		})
 	}
 }
 
