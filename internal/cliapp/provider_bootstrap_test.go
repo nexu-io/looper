@@ -32,6 +32,63 @@ func TestBootstrapNextStepsForForgejoRestart(t *testing.T) {
 	}
 }
 
+func TestRejectMixedForgejoAuthFlags(t *testing.T) {
+	t.Parallel()
+	const conflict = "choose one authentication strategy"
+	cases := []struct {
+		name      string
+		authFlag  string
+		tokenEnv  string
+		teaLogin  string
+		wantError bool
+	}{
+		{name: "tea auth with both credentials", authFlag: "tea", tokenEnv: "FORGEJO_TOKEN", teaLogin: "work", wantError: true},
+		{name: "token-env auth with both credentials", authFlag: "token-env", tokenEnv: "FORGEJO_TOKEN", teaLogin: "work", wantError: true},
+		{name: "both credentials without auth", tokenEnv: "FORGEJO_TOKEN", teaLogin: "work", wantError: true},
+		{name: "tea auth with token env only", authFlag: "tea", tokenEnv: "FORGEJO_TOKEN", wantError: true},
+		{name: "token-env auth with tea login only", authFlag: "token-env", teaLogin: "work", wantError: true},
+		{name: "tea auth alone", authFlag: "tea", teaLogin: "work", wantError: false},
+		{name: "token-env auth alone", authFlag: "token-env", tokenEnv: "FORGEJO_TOKEN", wantError: false},
+		{name: "empty", wantError: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := rejectMixedForgejoAuthFlags(tc.authFlag, tc.tokenEnv, tc.teaLogin)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), conflict) {
+					t.Fatalf("rejectMixedForgejoAuthFlags() = %v, want error containing %q", err, conflict)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("rejectMixedForgejoAuthFlags() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestResolveForgejoBootstrapAuthRejectsMixedFlags(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "test-token")
+	_, _, _, err := resolveForgejoBootstrapAuth(context.Background(), bootstrapOptions{
+		ForgejoAuth:     string(config.ProviderAuthTea),
+		ForgejoTokenEnv: "FORGEJO_TOKEN",
+		ForgejoTeaLogin: "work",
+	}, "https://code.example.com")
+	if err == nil || !strings.Contains(err.Error(), "choose one authentication strategy") {
+		t.Fatalf("resolveForgejoBootstrapAuth() error = %v, want mixed-strategy conflict", err)
+	}
+
+	_, _, _, err = resolveForgejoBootstrapAuth(context.Background(), bootstrapOptions{
+		ForgejoAuth:     string(config.ProviderAuthTokenEnv),
+		ForgejoTokenEnv: "FORGEJO_TOKEN",
+		ForgejoTeaLogin: "work",
+	}, "https://code.example.com")
+	if err == nil || !strings.Contains(err.Error(), "choose one authentication strategy") {
+		t.Fatalf("resolveForgejoBootstrapAuth(token-env) error = %v, want mixed-strategy conflict", err)
+	}
+}
+
 func TestResolveForgejoBootstrapPlanValidatesIdentityAndRepo(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "test-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

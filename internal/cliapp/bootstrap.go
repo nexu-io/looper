@@ -61,6 +61,8 @@ type bootstrapOptions struct {
 	FeishuWebhookEnv  string
 	ForgejoURL        string
 	ForgejoTokenEnv   string
+	ForgejoAuth       string
+	ForgejoTeaLogin   string
 	ForgejoProviderID string
 }
 
@@ -81,6 +83,8 @@ type bootstrapConfigPlan struct {
 	FeishuWebhookEnv  string
 	ForgejoURL        string
 	ForgejoTokenEnv   string
+	ForgejoAuth       config.ProviderAuthMode
+	ForgejoTeaLogin   string
 	ForgejoProviderID string
 	Repo              string
 	Identity          string
@@ -116,6 +120,8 @@ func (r *commandRuntime) bootstrap(cmd *cobra.Command, args []string) error {
 		FeishuWebhookEnv:  strings.TrimSpace(getStringFlag(cmd, "feishu-webhook-env")),
 		ForgejoURL:        strings.TrimSpace(getStringFlag(cmd, "forgejo-url")),
 		ForgejoTokenEnv:   strings.TrimSpace(getStringFlag(cmd, "forgejo-token-env")),
+		ForgejoAuth:       strings.TrimSpace(getStringFlag(cmd, "auth")),
+		ForgejoTeaLogin:   strings.TrimSpace(getStringFlag(cmd, "tea-login")),
 		ForgejoProviderID: strings.TrimSpace(getStringFlag(cmd, "forgejo-provider-id")),
 	}
 
@@ -428,13 +434,9 @@ func (r *commandRuntime) resolveForgejoBootstrapPlan(ctx context.Context, plan *
 	if err != nil {
 		return nil, err
 	}
-	tokenEnv := strings.TrimSpace(opts.ForgejoTokenEnv)
-	if !environmentNamePattern.MatchString(tokenEnv) {
-		return nil, fmt.Errorf("--forgejo-token-env must name a valid environment variable")
-	}
-	token := os.Getenv(tokenEnv)
-	if strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("environment variable %s is not set; export the Forgejo token and rerun bootstrap", tokenEnv)
+	auth, tokenEnv, teaLogin, err := resolveForgejoBootstrapAuth(ctx, opts, baseURL)
+	if err != nil {
+		return nil, err
 	}
 	providerID := strings.TrimSpace(opts.ForgejoProviderID)
 	if providerID == "" {
@@ -453,7 +455,7 @@ func (r *commandRuntime) resolveForgejoBootstrapPlan(ctx context.Context, plan *
 	if remote.Repo == "" {
 		return nil, fmt.Errorf("could not detect owner/repo from origin for %s", plan.ProjectPath)
 	}
-	provider := config.ProviderConfig{ID: providerID, Kind: config.ProviderKindForgejo, BaseURL: baseURL, TokenEnv: stringPtr(tokenEnv)}
+	provider := forgejoProviderConfig(providerID, baseURL, auth, tokenEnv, teaLogin)
 	client, err := forge.NewForgejoClientFromConfig(provider, remote.Repo, forge.WithHTTPClient(r.app.deps.HTTPClient))
 	if err != nil {
 		return nil, err
@@ -469,11 +471,54 @@ func (r *commandRuntime) resolveForgejoBootstrapPlan(ctx context.Context, plan *
 		return nil, fmt.Errorf("validate Forgejo repository %s: %w", remote.Repo, err)
 	}
 	plan.ForgejoURL = baseURL
+	plan.ForgejoAuth = auth
 	plan.ForgejoTokenEnv = tokenEnv
+	plan.ForgejoTeaLogin = teaLogin
 	plan.ForgejoProviderID = providerID
 	plan.Repo = remote.Repo
 	plan.Identity = identity.Login
+	if auth == config.ProviderAuthTea {
+		return []string{fmt.Sprintf("forgejo provider: tea login %q (no tokenEnv required)", teaLogin)}, nil
+	}
 	return []string{fmt.Sprintf("forgejo provider: export %s before starting looperd", tokenEnv)}, nil
+}
+
+func resolveForgejoBootstrapAuth(ctx context.Context, opts bootstrapOptions, baseURL string) (config.ProviderAuthMode, string, string, error) {
+	authFlag := strings.TrimSpace(opts.ForgejoAuth)
+	tokenEnv := strings.TrimSpace(opts.ForgejoTokenEnv)
+	teaLogin := strings.TrimSpace(opts.ForgejoTeaLogin)
+	// Fail closed on mixed strategies before any branch can silently drop a credential.
+	if err := rejectMixedForgejoAuthFlags(authFlag, tokenEnv, teaLogin); err != nil {
+		return "", "", "", err
+	}
+	switch {
+	case authFlag == string(config.ProviderAuthTea) || (authFlag == "" && teaLogin != "" && tokenEnv == ""):
+		if teaLogin == "" {
+			return "", "", "", fmt.Errorf("--tea-login is required when auth is tea (bootstrap is non-interactive for multi-login hosts; pass the login explicitly)")
+		}
+		provider := config.ProviderConfig{
+			ID: "probe", Kind: config.ProviderKindForgejo, BaseURL: baseURL,
+			Auth: config.ProviderAuthTea, TeaLogin: stringPtr(teaLogin),
+		}
+		if _, _, err := forge.ValidateTeaLoginForProvider(ctx, provider, nil, nil); err != nil {
+			return "", "", "", err
+		}
+		return config.ProviderAuthTea, "", teaLogin, nil
+	case authFlag == string(config.ProviderAuthTokenEnv) || (authFlag == "" && tokenEnv != "" && teaLogin == ""):
+		if !environmentNamePattern.MatchString(tokenEnv) {
+			return "", "", "", fmt.Errorf("--forgejo-token-env must name a valid environment variable")
+		}
+		if strings.TrimSpace(os.Getenv(tokenEnv)) == "" {
+			return "", "", "", fmt.Errorf("environment variable %s is not set; export the Forgejo token and rerun bootstrap", tokenEnv)
+		}
+		return config.ProviderAuthTokenEnv, tokenEnv, "", nil
+	case authFlag == "" && tokenEnv == "" && teaLogin == "":
+		return "", "", "", fmt.Errorf("provide --auth tea --tea-login <name> or --forgejo-token-env <ENV>")
+	case authFlag != "" && authFlag != string(config.ProviderAuthTea) && authFlag != string(config.ProviderAuthTokenEnv):
+		return "", "", "", fmt.Errorf("--auth must be %q or %q", config.ProviderAuthTea, config.ProviderAuthTokenEnv)
+	default:
+		return "", "", "", fmt.Errorf("choose one authentication strategy: --auth tea --tea-login <name> or --auth token-env --forgejo-token-env <ENV>")
+	}
 }
 
 type bootstrapOriginRemote struct {
@@ -814,7 +859,8 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 		for _, provider := range normalized.Providers {
 			if provider.ID == plan.ForgejoProviderID {
 				providerExists = true
-				if provider.Kind != config.ProviderKindForgejo || !forgejoBaseURLsMatch(provider.BaseURL, plan.ForgejoURL) || provider.TokenEnv == nil || *provider.TokenEnv != plan.ForgejoTokenEnv {
+				candidate := forgejoProviderConfig(plan.ForgejoProviderID, plan.ForgejoURL, plan.ForgejoAuth, plan.ForgejoTokenEnv, plan.ForgejoTeaLogin)
+				if !forgejoProvidersEquivalent(provider, candidate) {
 					return false, false, fmt.Errorf("provider id %q already exists with different settings; choose a different --forgejo-provider-id", plan.ForgejoProviderID)
 				}
 				break
@@ -834,8 +880,7 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 			if partial.Providers != nil {
 				providers = append(providers, (*partial.Providers)...)
 			}
-			kind := config.ProviderKindForgejo
-			providers = append(providers, config.PartialProviderConfig{ID: plan.ForgejoProviderID, Kind: &kind, BaseURL: stringPtr(plan.ForgejoURL), TokenEnv: stringPtr(plan.ForgejoTokenEnv)})
+			providers = append(providers, partialForgejoProvider(plan.ForgejoProviderID, plan.ForgejoURL, plan.ForgejoAuth, plan.ForgejoTokenEnv, plan.ForgejoTeaLogin))
 			partial.Providers = &providers
 		}
 	} else if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
@@ -903,10 +948,7 @@ func applyBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
 }
 
 func applyForgejoBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
-	cfg.Providers = append(cfg.Providers, config.ProviderConfig{
-		ID: plan.ForgejoProviderID, Kind: config.ProviderKindForgejo,
-		BaseURL: plan.ForgejoURL, TokenEnv: stringPtr(plan.ForgejoTokenEnv),
-	})
+	cfg.Providers = append(cfg.Providers, forgejoProviderConfig(plan.ForgejoProviderID, plan.ForgejoURL, plan.ForgejoAuth, plan.ForgejoTokenEnv, plan.ForgejoTeaLogin))
 	project := buildBootstrapProject(plan.ProjectPath, cfg.Defaults.BaseBranch)
 	project.Provider = plan.ForgejoProviderID
 	project.Repo = plan.Repo
@@ -1327,7 +1369,11 @@ func bootstrapNextStepsForPlan(plan bootstrapConfigPlan, restartRequired bool) [
 		if restartRequired {
 			steps = append([]string{"looper daemon restart"}, steps...)
 		}
-		steps = append([]string{fmt.Sprintf("export %s=<forgejo-token>", plan.ForgejoTokenEnv)}, steps...)
+		if plan.ForgejoAuth == config.ProviderAuthTea {
+			steps = append([]string{fmt.Sprintf("ensure tea login %q remains valid", plan.ForgejoTeaLogin)}, steps...)
+		} else if plan.ForgejoTokenEnv != "" {
+			steps = append([]string{fmt.Sprintf("export %s=<forgejo-token>", plan.ForgejoTokenEnv)}, steps...)
+		}
 	}
 	return steps
 }

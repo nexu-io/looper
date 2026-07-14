@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -18,14 +19,16 @@ import (
 )
 
 type providerOutput struct {
-	ID              string              `json:"id"`
-	Kind            config.ProviderKind `json:"kind"`
-	BaseURL         string              `json:"baseUrl,omitempty"`
-	TokenEnv        string              `json:"tokenEnv,omitempty"`
-	Identity        string              `json:"identity,omitempty"`
-	Repo            string              `json:"repo,omitempty"`
-	ConfigPath      string              `json:"configPath,omitempty"`
-	RestartRequired bool                `json:"restartRequired,omitempty"`
+	ID              string                  `json:"id"`
+	Kind            config.ProviderKind     `json:"kind"`
+	BaseURL         string                  `json:"baseUrl,omitempty"`
+	Auth            config.ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv        string                  `json:"tokenEnv,omitempty"`
+	TeaLogin        string                  `json:"teaLogin,omitempty"`
+	Identity        string                  `json:"identity,omitempty"`
+	Repo            string                  `json:"repo,omitempty"`
+	ConfigPath      string                  `json:"configPath,omitempty"`
+	RestartRequired bool                    `json:"restartRequired,omitempty"`
 }
 
 func (r *commandRuntime) providerAdd(cmd *cobra.Command, _ []string) error {
@@ -33,12 +36,9 @@ func (r *commandRuntime) providerAdd(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	tokenEnv := strings.TrimSpace(getStringFlag(cmd, "forgejo-token-env"))
-	if !environmentNamePattern.MatchString(tokenEnv) {
-		return fmt.Errorf("--forgejo-token-env must name a valid environment variable")
-	}
-	if strings.TrimSpace(os.Getenv(tokenEnv)) == "" {
-		return fmt.Errorf("environment variable %s is not set", tokenEnv)
+	auth, tokenEnv, teaLogin, err := r.resolveForgejoAuthFlags(cmd, baseURL)
+	if err != nil {
+		return err
 	}
 	id := strings.TrimSpace(getStringFlag(cmd, "id"))
 	if id == "" {
@@ -47,7 +47,7 @@ func (r *commandRuntime) providerAdd(cmd *cobra.Command, _ []string) error {
 	if deriveBootstrapProjectID(id) != id {
 		return fmt.Errorf("--id must contain only lowercase letters, numbers, and hyphens")
 	}
-	provider := config.ProviderConfig{ID: id, Kind: config.ProviderKindForgejo, BaseURL: baseURL, TokenEnv: stringPtr(tokenEnv)}
+	provider := forgejoProviderConfig(id, baseURL, auth, tokenEnv, teaLogin)
 	identity, err := r.testForgejoIdentity(cmd.Context(), provider)
 	if err != nil {
 		return err
@@ -64,13 +64,158 @@ func (r *commandRuntime) providerAdd(cmd *cobra.Command, _ []string) error {
 	}
 	providers := append([]config.PartialProviderConfig(nil), partialProviders(loaded)...)
 	kind := config.ProviderKindForgejo
-	providers = append(providers, config.PartialProviderConfig{ID: id, Kind: &kind, BaseURL: stringPtr(baseURL), TokenEnv: stringPtr(tokenEnv)})
+	providers = append(providers, partialForgejoProvider(id, baseURL, auth, tokenEnv, teaLogin))
 	partial := loaded.Partial
 	partial.Providers = &providers
 	if err := r.writeConfigFile(loaded.Metadata.ConfigPath, partial); err != nil {
 		return err
 	}
-	return writeProviderResult(cmd, providerOutput{ID: id, Kind: kind, BaseURL: baseURL, TokenEnv: tokenEnv, Identity: identity, ConfigPath: loaded.Metadata.ConfigPath, RestartRequired: true}, "Provider added")
+	return writeProviderResult(cmd, providerOutput{
+		ID: id, Kind: kind, BaseURL: baseURL, Auth: auth, TokenEnv: tokenEnv, TeaLogin: teaLogin,
+		Identity: identity, ConfigPath: loaded.Metadata.ConfigPath, RestartRequired: true,
+	}, "Provider added")
+}
+
+// resolveForgejoAuthFlags selects token-env or tea auth from CLI flags.
+// Tea logins matching the base URL may be discovered, but an explicit
+// --tea-login (or interactive confirmation) is required before persisting.
+func (r *commandRuntime) resolveForgejoAuthFlags(cmd *cobra.Command, baseURL string) (config.ProviderAuthMode, string, string, error) {
+	authFlag := strings.TrimSpace(getStringFlag(cmd, "auth"))
+	tokenEnv := strings.TrimSpace(getStringFlag(cmd, "forgejo-token-env"))
+	teaLogin := strings.TrimSpace(getStringFlag(cmd, "tea-login"))
+
+	// Fail closed on mixed strategies before any branch can silently drop a credential.
+	if err := rejectMixedForgejoAuthFlags(authFlag, tokenEnv, teaLogin); err != nil {
+		return "", "", "", err
+	}
+
+	switch {
+	case authFlag == string(config.ProviderAuthTea) || (authFlag == "" && teaLogin != "" && tokenEnv == ""):
+		selected, err := r.resolveExplicitTeaLogin(cmd, baseURL, teaLogin)
+		if err != nil {
+			return "", "", "", err
+		}
+		return config.ProviderAuthTea, "", selected, nil
+	case authFlag == string(config.ProviderAuthTokenEnv) || (authFlag == "" && tokenEnv != "" && teaLogin == ""):
+		if !environmentNamePattern.MatchString(tokenEnv) {
+			return "", "", "", fmt.Errorf("--forgejo-token-env must name a valid environment variable")
+		}
+		if strings.TrimSpace(os.Getenv(tokenEnv)) == "" {
+			return "", "", "", fmt.Errorf("environment variable %s is not set", tokenEnv)
+		}
+		return config.ProviderAuthTokenEnv, tokenEnv, "", nil
+	case authFlag == "" && tokenEnv == "" && teaLogin == "":
+		// Discover matching tea logins and require explicit selection.
+		matches, listErr := forge.MatchingTeaLogins(cmd.Context(), baseURL, "", nil)
+		if listErr == nil && len(matches) > 0 {
+			selected, err := r.confirmTeaLoginSelection(cmd, baseURL, matches, "")
+			if err != nil {
+				return "", "", "", err
+			}
+			return config.ProviderAuthTea, "", selected, nil
+		}
+		return "", "", "", fmt.Errorf("provide --auth tea --tea-login <name> or --auth token-env --forgejo-token-env <ENV>")
+	case authFlag != "" && authFlag != string(config.ProviderAuthTea) && authFlag != string(config.ProviderAuthTokenEnv):
+		return "", "", "", fmt.Errorf("--auth must be %q or %q", config.ProviderAuthTea, config.ProviderAuthTokenEnv)
+	default:
+		return "", "", "", fmt.Errorf("choose one authentication strategy: --auth tea --tea-login <name> or --auth token-env --forgejo-token-env <ENV>")
+	}
+}
+
+// rejectMixedForgejoAuthFlags returns the documented conflict error when CLI
+// flags request both tea and token-env credentials (or an auth mode that
+// contradicts the other credential flag). Config validation rejects the same
+// dual-credential shape when written by hand.
+func rejectMixedForgejoAuthFlags(authFlag, tokenEnv, teaLogin string) error {
+	mixedCredentials := tokenEnv != "" && teaLogin != ""
+	teaModeWithTokenEnv := authFlag == string(config.ProviderAuthTea) && tokenEnv != ""
+	tokenModeWithTeaLogin := authFlag == string(config.ProviderAuthTokenEnv) && teaLogin != ""
+	if mixedCredentials || teaModeWithTokenEnv || tokenModeWithTeaLogin {
+		return fmt.Errorf("choose one authentication strategy: --auth tea --tea-login <name> or --auth token-env --forgejo-token-env <ENV>")
+	}
+	return nil
+}
+
+func (r *commandRuntime) resolveExplicitTeaLogin(cmd *cobra.Command, baseURL, teaLogin string) (string, error) {
+	matches, err := forge.MatchingTeaLogins(cmd.Context(), baseURL, "", nil)
+	if err != nil {
+		var teaErr *forge.TeaAuthError
+		if errors.As(err, &teaErr) && teaErr.Code == forge.TeaErrorMissing {
+			return "", fmt.Errorf("%w", err)
+		}
+		// Fall through to ValidateTeaLoginForProvider for precise errors when tea is present.
+	}
+	if teaLogin == "" {
+		return r.confirmTeaLoginSelection(cmd, baseURL, matches, "")
+	}
+	// Explicit login still requires host match via ValidateTeaLoginForProvider.
+	provider := config.ProviderConfig{
+		ID: "probe", Kind: config.ProviderKindForgejo, BaseURL: baseURL,
+		Auth: config.ProviderAuthTea, TeaLogin: stringPtr(teaLogin),
+	}
+	if _, _, err := forge.ValidateTeaLoginForProvider(cmd.Context(), provider, nil, nil); err != nil {
+		return "", err
+	}
+	// When multiple matching logins exist and the user passed an explicit name that
+	// matches the host, accept it without re-prompting (explicit confirmation).
+	return teaLogin, nil
+}
+
+func (r *commandRuntime) confirmTeaLoginSelection(cmd *cobra.Command, baseURL string, matches []forge.TeaLogin, preferred string) (string, error) {
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no tea logins match base URL %s; run tea login add or pass --tea-login", baseURL)
+	}
+	if preferred != "" {
+		for _, login := range matches {
+			if login.Name == preferred {
+				return preferred, nil
+			}
+		}
+		return "", fmt.Errorf("tea login %q does not match base URL %s", preferred, baseURL)
+	}
+	if len(matches) == 1 {
+		name := matches[0].Name
+		if getBoolFlag(cmd, "yes") {
+			return name, nil
+		}
+		confirmed, err := promptBootstrapBool(bufio.NewReader(cmd.InOrStdin()), cmd.OutOrStdout(), fmt.Sprintf("Use tea login %q for %s", name, baseURL), true)
+		if err != nil {
+			return "", err
+		}
+		if !confirmed {
+			return "", fmt.Errorf("tea login selection cancelled; pass --tea-login explicitly")
+		}
+		return name, nil
+	}
+	names := make([]string, 0, len(matches))
+	for _, login := range matches {
+		names = append(names, login.Name)
+	}
+	return "", fmt.Errorf("multiple tea logins match %s (%s); pass --tea-login explicitly", baseURL, strings.Join(names, ", "))
+}
+
+func forgejoProviderConfig(id, baseURL string, auth config.ProviderAuthMode, tokenEnv, teaLogin string) config.ProviderConfig {
+	provider := config.ProviderConfig{ID: id, Kind: config.ProviderKindForgejo, BaseURL: baseURL, Auth: auth}
+	switch auth {
+	case config.ProviderAuthTea:
+		provider.TeaLogin = stringPtr(teaLogin)
+	default:
+		provider.TokenEnv = stringPtr(tokenEnv)
+	}
+	return provider
+}
+
+func partialForgejoProvider(id, baseURL string, auth config.ProviderAuthMode, tokenEnv, teaLogin string) config.PartialProviderConfig {
+	kind := config.ProviderKindForgejo
+	authCopy := auth
+	partial := config.PartialProviderConfig{ID: id, Kind: &kind, BaseURL: stringPtr(baseURL), Auth: &authCopy}
+	switch auth {
+	case config.ProviderAuthTea:
+		partial.TeaLogin = stringPtr(teaLogin)
+	default:
+		partial.TokenEnv = stringPtr(tokenEnv)
+	}
+	return partial
 }
 
 func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath string) (string, string, error) {
@@ -133,7 +278,7 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 			return matches[0], repo, nil
 		}
 		if len(matches) == 0 {
-			return "", "", fmt.Errorf("no Forgejo provider matches origin host %q; pass --forgejo-url and --forgejo-token-env to create one", remote.Host)
+			return "", "", fmt.Errorf("no Forgejo provider matches origin host %q; pass --forgejo-url with --auth tea --tea-login or --forgejo-token-env to create one", remote.Host)
 		}
 		return "", "", fmt.Errorf("multiple Forgejo providers match origin host %q (%s); pass an explicit provider id", remote.Host, strings.Join(matches, ", "))
 	}
@@ -145,9 +290,9 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	if !forgejoRemoteMatchesBaseURL(remote, baseURL) {
 		return "", "", fmt.Errorf("origin host %q does not match --forgejo-url %q", remote.Host, baseURL)
 	}
-	tokenEnv := strings.TrimSpace(getStringFlag(cmd, "forgejo-token-env"))
-	if !environmentNamePattern.MatchString(tokenEnv) || strings.TrimSpace(os.Getenv(tokenEnv)) == "" {
-		return "", "", fmt.Errorf("--forgejo-token-env must name a set environment variable")
+	auth, tokenEnv, teaLogin, err := r.resolveForgejoAuthFlags(cmd, baseURL)
+	if err != nil {
+		return "", "", err
 	}
 	if providerID == "" {
 		providerID = forgejoProviderID(baseURL)
@@ -155,7 +300,7 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	if deriveBootstrapProjectID(providerID) != providerID {
 		return "", "", fmt.Errorf("--provider must contain only lowercase letters, numbers, and hyphens when creating a Forgejo provider")
 	}
-	provider := config.ProviderConfig{ID: providerID, Kind: config.ProviderKindForgejo, BaseURL: baseURL, TokenEnv: stringPtr(tokenEnv)}
+	provider := forgejoProviderConfig(providerID, baseURL, auth, tokenEnv, teaLogin)
 	client, err := forge.NewForgejoClientFromConfig(provider, repo, forge.WithHTTPClient(r.app.deps.HTTPClient))
 	if err != nil {
 		return "", "", err
@@ -168,15 +313,14 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	}
 	for _, existing := range loaded.Config.Providers {
 		if existing.ID == providerID {
-			if existing.Kind == provider.Kind && forgejoBaseURLsMatch(existing.BaseURL, provider.BaseURL) && dereferenceString(existing.TokenEnv) == tokenEnv {
+			if forgejoProvidersEquivalent(existing, provider) {
 				return providerID, repo, nil
 			}
 			return "", "", fmt.Errorf("provider id %q already exists with different settings", providerID)
 		}
 	}
 	providers := partialProviders(loaded)
-	kind := config.ProviderKindForgejo
-	providers = append(providers, config.PartialProviderConfig{ID: providerID, Kind: &kind, BaseURL: stringPtr(baseURL), TokenEnv: stringPtr(tokenEnv)})
+	providers = append(providers, partialForgejoProvider(providerID, baseURL, auth, tokenEnv, teaLogin))
 	partial := loaded.Partial
 	partial.Providers = &providers
 	if err := r.writeConfigFile(loaded.Metadata.ConfigPath, partial); err != nil {
@@ -188,6 +332,17 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	return providerID, repo, nil
 }
 
+func forgejoProvidersEquivalent(existing, candidate config.ProviderConfig) bool {
+	if existing.Kind != candidate.Kind || !forgejoBaseURLsMatch(existing.BaseURL, candidate.BaseURL) {
+		return false
+	}
+	if config.EffectiveProviderAuth(existing) != config.EffectiveProviderAuth(candidate) {
+		return false
+	}
+	return dereferenceString(existing.TokenEnv) == dereferenceString(candidate.TokenEnv) &&
+		dereferenceString(existing.TeaLogin) == dereferenceString(candidate.TeaLogin)
+}
+
 func (r *commandRuntime) providerList(cmd *cobra.Command, _ []string) error {
 	loaded, err := r.loadConfigForEdit()
 	if err != nil {
@@ -195,9 +350,15 @@ func (r *commandRuntime) providerList(cmd *cobra.Command, _ []string) error {
 	}
 	items := make([]providerOutput, 0, len(loaded.Config.Providers))
 	for _, provider := range loaded.Config.Providers {
-		item := providerOutput{ID: provider.ID, Kind: provider.Kind, BaseURL: provider.BaseURL, ConfigPath: loaded.Metadata.ConfigPath}
+		item := providerOutput{
+			ID: provider.ID, Kind: provider.Kind, BaseURL: provider.BaseURL,
+			Auth: config.EffectiveProviderAuth(provider), ConfigPath: loaded.Metadata.ConfigPath,
+		}
 		if provider.TokenEnv != nil {
 			item.TokenEnv = *provider.TokenEnv
+		}
+		if provider.TeaLogin != nil {
+			item.TeaLogin = *provider.TeaLogin
 		}
 		items = append(items, item)
 	}
@@ -207,9 +368,13 @@ func (r *commandRuntime) providerList(cmd *cobra.Command, _ []string) error {
 	}
 	rows := make([]tableRow, 0, len(items))
 	for _, item := range items {
-		rows = append(rows, tableRow{"id": item.ID, "kind": item.Kind, "baseUrl": item.BaseURL, "tokenEnv": item.TokenEnv})
+		credential := item.TokenEnv
+		if item.Auth == config.ProviderAuthTea {
+			credential = item.TeaLogin
+		}
+		rows = append(rows, tableRow{"id": item.ID, "kind": item.Kind, "baseUrl": item.BaseURL, "auth": string(item.Auth), "credential": credential})
 	}
-	printTable(cmd.OutOrStdout(), []string{"id", "kind", "baseUrl", "tokenEnv"}, rows)
+	printTable(cmd.OutOrStdout(), []string{"id", "kind", "baseUrl", "auth", "credential"}, rows)
 	return nil
 }
 
@@ -255,7 +420,12 @@ func (r *commandRuntime) providerTest(cmd *cobra.Command, args []string) error {
 	if err := client.CheckRepository(cmd.Context()); err != nil {
 		return fmt.Errorf("validate Forgejo repository %s: %w", repo, err)
 	}
-	return writeProviderResult(cmd, providerOutput{ID: provider.ID, Kind: provider.Kind, BaseURL: provider.BaseURL, TokenEnv: dereferenceString(provider.TokenEnv), Identity: identity.Login, Repo: repo, ConfigPath: loaded.Metadata.ConfigPath}, "Provider test passed")
+	return writeProviderResult(cmd, providerOutput{
+		ID: provider.ID, Kind: provider.Kind, BaseURL: provider.BaseURL,
+		Auth: config.EffectiveProviderAuth(provider), TokenEnv: dereferenceString(provider.TokenEnv),
+		TeaLogin: dereferenceString(provider.TeaLogin), Identity: identity.Login, Repo: repo,
+		ConfigPath: loaded.Metadata.ConfigPath,
+	}, "Provider test passed")
 }
 
 func (r *commandRuntime) providerRemove(cmd *cobra.Command, args []string) error {
@@ -353,7 +523,16 @@ func partialProviders(loaded config.LoadedFileConfig) []config.PartialProviderCo
 	providers := make([]config.PartialProviderConfig, 0, len(loaded.Config.Providers))
 	for _, provider := range loaded.Config.Providers {
 		kind := provider.Kind
-		providers = append(providers, config.PartialProviderConfig{ID: provider.ID, Kind: &kind, BaseURL: stringPtr(provider.BaseURL), GHPath: provider.GHPath, TokenEnv: provider.TokenEnv, Workspace: provider.Workspace, ProjectID: provider.ProjectID})
+		partial := config.PartialProviderConfig{
+			ID: provider.ID, Kind: &kind, BaseURL: stringPtr(provider.BaseURL), GHPath: provider.GHPath,
+			TokenEnv: provider.TokenEnv, TeaLogin: provider.TeaLogin, TeaPath: provider.TeaPath,
+			Workspace: provider.Workspace, ProjectID: provider.ProjectID,
+		}
+		if provider.Auth != "" {
+			auth := provider.Auth
+			partial.Auth = &auth
+		}
+		providers = append(providers, partial)
 	}
 	return providers
 }

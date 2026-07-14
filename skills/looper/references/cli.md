@@ -51,7 +51,7 @@ Before bootstrap:
 - Confirm the target repo path is absolute and points to a Git repository.
 - Confirm the intended `agent.vendor` (for example `opencode`).
 - For GitHub projects, check `gh auth status` and ensure `git`/`gh` resolve in the environment that will run `looperd`.
-- For Forgejo-only configs, ensure `git` resolves and the configured provider `tokenEnv` is exported in the daemon environment; `gh` is not required.
+- For Forgejo-only configs, ensure `git` resolves and either the provider `tokenEnv` is exported or the configured `teaLogin` works for the daemon user; `gh` is not required.
 - If a required `git` or `gh` binary is missing, ask before installing it. On macOS with Homebrew, the usual repair is `brew install git gh`; otherwise use the user's OS/package manager.
 - Ask before using `--yes`; bootstrap may create config, install or reuse the managed daemon, register a project, and start the daemon.
 - If `~/.looper/config.json` already exists, inspect targeted fields first and avoid overwriting user configuration.
@@ -229,6 +229,12 @@ looper project add /absolute/path/to/repo \
   --provider forgejo-main \
   --forgejo-url https://code.example.com \
   --forgejo-token-env FORGEJO_TOKEN
+
+# Or reuse an explicit tea login (no tokenEnv):
+# looper project add /absolute/path/to/repo \
+#   --provider forgejo-main \
+#   --forgejo-url https://code.example.com \
+#   --auth tea --tea-login powerformer-code
 ```
 
 Daemon lifecycle commands:

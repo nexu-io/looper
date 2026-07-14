@@ -267,7 +267,7 @@ If `looper ps` shows stale `running` work with no live agent after sleep/wake, r
 - Canonical default path: `~/.looper/config.toml`
 - Supported formats: `.toml`, `.yaml`, `.yml`, `.json`
 - Config source selection precedence: `--config` → `LOOPER_CONFIG` → default-path discovery
-- Provider support: legacy GitHub projects keep working through `gh`; Forgejo projects require an explicit provider, `baseUrl`, `tokenEnv`, and `repo`
+- Provider support: legacy GitHub projects keep working through `gh`; Forgejo projects require an explicit provider, `baseUrl`, `repo`, and either `tokenEnv` (`auth=token-env`) or `teaLogin` (`auth=tea`)
 - All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path
 - `agent.vendor` is required to run loops (no default)
