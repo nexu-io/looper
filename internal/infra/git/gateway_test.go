@@ -1135,19 +1135,23 @@ func TestGatewayDiscardWorktreeChangesResetsDirtySubmodules(t *testing.T) {
 
 	// Build a bare submodule remote, commit it into the feature branch, then
 	// create a managed worktree from that branch so discard runs under safety.
+	// Pin bare HEAD to main: CI often has init.defaultBranch=master, so a push of
+	// only main leaves HEAD on an unborn branch and `submodule add` fails with
+	// "You are on a branch yet to be born".
 	subRemote := filepath.Join(fixture.rootDir, "submodule.git")
 	subWork := filepath.Join(fixture.rootDir, "submodule-work")
 	mustMkdirAll(t, subRemote)
-	runGit(t, fixture.rootDir, "init", "--bare", subRemote)
+	runGit(t, fixture.rootDir, "init", "--bare", "-b", "main", subRemote)
 	runGit(t, fixture.rootDir, "clone", subRemote, subWork)
 	configureRepo(t, subWork)
 	writeFile(t, filepath.Join(subWork, "module.txt"), "module-v1\n")
 	runGit(t, subWork, "add", "module.txt")
 	runGit(t, subWork, "commit", "-m", "submodule init")
 	runGit(t, subWork, "push", "origin", "HEAD:main")
+	runGit(t, subRemote, "symbolic-ref", "HEAD", "refs/heads/main")
 
 	runGit(t, fixture.repoPath, "checkout", "feature/fixer")
-	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", subRemote, "vendor")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", "-b", "main", subRemote, "vendor")
 	runGit(t, fixture.repoPath, "commit", "-m", "add vendor submodule")
 	runGit(t, fixture.repoPath, "push", "origin", "feature/fixer")
 	runGit(t, fixture.repoPath, "checkout", "main")
