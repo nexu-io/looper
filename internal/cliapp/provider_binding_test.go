@@ -46,6 +46,70 @@ func TestEnsureBootstrapConfigRejectsExistingProjectWithoutForgejoBinding(t *tes
 	}
 }
 
+func TestPrepareProjectAddProviderPreservesExplicitForgejoIDWithURL(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "test-token")
+	httpClient := newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/api/v1/user":
+			return jsonResponse(t, http.StatusOK, `{"login":"alice","id":7}`), nil
+		case "/api/v1/repos/acme/looper":
+			return jsonResponse(t, http.StatusOK, `{"full_name":"acme/looper"}`), nil
+		default:
+			t.Fatalf("unexpected path %q", req.URL.Path)
+			return nil, nil
+		}
+	})
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Providers = append(cfg.Providers, config.ProviderConfig{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: stringPtr("FORGEJO_TOKEN")})
+	raw, err := config.MarshalConfigFile(configPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := newCommandRuntime(New(Deps{
+		HTTPClient: httpClient,
+		LookPath:   func(string) (string, error) { return "/usr/bin/git", nil },
+		RunCommand: func(context.Context, string, []string, time.Duration) (commandExecutionResult, error) {
+			return commandExecutionResult{ExitCode: 0, Stdout: "https://code.example.com/acme/looper.git"}, nil
+		},
+	}), []string{"--config", configPath})
+	cmd := newCommand(commandSpec{
+		use: "test",
+		localFlags: []flagSpec{
+			stringFlag("provider", "id", ""),
+			stringFlag("repo", "owner/name", ""),
+			stringFlag("forgejo-url", "url", ""),
+			stringFlag("forgejo-token-env", "name", ""),
+		},
+	})
+	cmd.SetContext(context.Background())
+	for name, value := range map[string]string{
+		"provider":          "forgejo",
+		"forgejo-url":       "https://code.example.com",
+		"forgejo-token-env": "FORGEJO_TOKEN",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	provider, repo, err := runtime.prepareProjectAddProvider(cmd, root)
+	if err != nil {
+		t.Fatalf("prepareProjectAddProvider() error = %v", err)
+	}
+	if provider != "forgejo" || repo != "acme/looper" {
+		t.Fatalf("prepareProjectAddProvider() = (%q, %q), want (%q, %q)", provider, repo, "forgejo", "acme/looper")
+	}
+}
+
 func TestProviderTestUsesAPIManagedProjectBinding(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch req.URL.Path {

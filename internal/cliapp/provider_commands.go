@@ -149,7 +149,7 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	if !environmentNamePattern.MatchString(tokenEnv) || strings.TrimSpace(os.Getenv(tokenEnv)) == "" {
 		return "", "", fmt.Errorf("--forgejo-token-env must name a set environment variable")
 	}
-	if providerID == "" || providerID == "forgejo" {
+	if providerID == "" {
 		providerID = forgejoProviderID(baseURL)
 	}
 	if deriveBootstrapProjectID(providerID) != providerID {
