@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -119,6 +120,14 @@ func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, h
 		return nil, err
 	}
 
+	// Path-only diffs for the post-rename path emit a pure new-file patch unless the
+	// pre-rename path is also selected. Expand rename/copy partners so the local
+	// authority matches a complete PR rename diff (LEFT ranges + real RIGHT hunks).
+	paths, err := g.expandReviewAnchorPathsForRenames(ctx, cwd, baseSHA, headSHA, paths)
+	if err != nil {
+		return nil, err
+	}
+
 	// Three-dot range matches GitHub PR diff semantics (merge-base(base, head)...head).
 	// Use --literal-pathspecs so comments[].path values that look like Git pathspec
 	// magic (e.g. ":(foo).txt") are treated as literal filenames, not magic.
@@ -135,6 +144,104 @@ func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, h
 	}
 	parsed := diffanchor.Parse(result.Stdout)
 	return &parsed, nil
+}
+
+// expandReviewAnchorPathsForRenames adds rename/copy partner paths for any comment
+// path involved in a base...head rename or copy. Without both sides of the pair in
+// the pathspec, `git diff base...head -- new/path` is a pure add and is not a
+// complete authority for LEFT (or non-added RIGHT) anchors on renamed files.
+func (g *Gateway) expandReviewAnchorPathsForRenames(ctx context.Context, cwd, baseSHA, headSHA string, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return paths, nil
+	}
+	// Whole-tree name-status is one line per path (not file content). Rename
+	// detection must not be path-limited: `git diff --name-status -M -- new/path`
+	// reports A for renames when the old path is omitted from the pathspec.
+	result, err := g.runGitForReviewAnchors(ctx, cwd,
+		"--literal-pathspecs", "diff", "--name-status", "-M", "--no-ext-diff", "--no-color", baseSHA+"..."+headSHA,
+	)
+	if result.StdoutTruncated {
+		return nil, ErrLocalCaptureTruncated
+	}
+	if err != nil {
+		return nil, err
+	}
+	expanded := expandPathsWithRenamePartners(paths, result.Stdout)
+	return expanded, nil
+}
+
+// expandPathsWithRenamePartners returns unique sorted paths including both sides of
+// any rename (R*) or copy (C*) row from `git diff --name-status` that touches a
+// requested path.
+func expandPathsWithRenamePartners(paths []string, nameStatus string) []string {
+	wanted := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		wanted[path] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return uniqueReviewAnchorPaths(paths)
+	}
+	for _, line := range strings.Split(nameStatus, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		_, oldPath, newPath, ok := parseNameStatusRenameOrCopy(line)
+		if !ok {
+			continue
+		}
+		if _, hitOld := wanted[oldPath]; hitOld {
+			wanted[newPath] = struct{}{}
+		}
+		if _, hitNew := wanted[newPath]; hitNew {
+			wanted[oldPath] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(wanted))
+	for path := range wanted {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// parseNameStatusRenameOrCopy parses a git --name-status rename/copy row.
+// Forms: "R100\told\tnew", "C075\told\tnew". Paths may be C-style quoted.
+func parseNameStatusRenameOrCopy(line string) (status, oldPath, newPath string, ok bool) {
+	fields := strings.Split(line, "\t")
+	if len(fields) < 3 {
+		return "", "", "", false
+	}
+	status = strings.TrimSpace(fields[0])
+	if status == "" {
+		return "", "", "", false
+	}
+	code := status[0]
+	if code != 'R' && code != 'C' {
+		return "", "", "", false
+	}
+	oldPath = unquoteGitNameStatusPath(fields[1])
+	newPath = unquoteGitNameStatusPath(fields[2])
+	if oldPath == "" || newPath == "" {
+		return "", "", "", false
+	}
+	return status, oldPath, newPath, true
+}
+
+func unquoteGitNameStatusPath(path string) string {
+	path = strings.TrimSpace(path)
+	if len(path) < 2 || path[0] != '"' || path[len(path)-1] != '"' {
+		return path
+	}
+	unquoted, err := strconv.Unquote(path)
+	if err != nil {
+		return path
+	}
+	return unquoted
 }
 
 func (g *Gateway) verifyLocalCommitObject(ctx context.Context, cwd, sha string) error {

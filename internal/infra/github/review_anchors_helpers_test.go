@@ -91,6 +91,64 @@ func seedDeletedLineRepo(t *testing.T, repo string) (baseSHA, headSHA string, de
 	return baseSHA, headSHA, deletedLine
 }
 
+// seedRenamedFileRepo creates a base→head rename with a deleted line, an added
+// line, and distant unchanged content so path-only post-rename diffs diverge
+// from complete rename authority (pure add vs rename hunks).
+func seedRenamedFileRepo(t *testing.T, repo string) (baseSHA, headSHA, newPath string, leftDeletedLine, rightAddedLine, distantUnchangedLine int64) {
+	t.Helper()
+	runGitRepo(t, repo, "init")
+	runGitRepo(t, repo, "config", "user.email", "test@example.com")
+	runGitRepo(t, repo, "config", "user.name", "Test")
+
+	oldPath := "pkg/old_name.go"
+	newPath = "pkg/new_name.go"
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatalf("mkdir pkg: %v", err)
+	}
+	// Distant unchanged lines stay outside the default 3-line context hunk when
+	// only the middle of the file changes. A pure new-file path-only diff would
+	// incorrectly mark every RIGHT line as added and omit LEFT ranges.
+	var baseBody strings.Builder
+	baseBody.WriteString("package pkg\n\n")
+	for i := 1; i <= 20; i++ {
+		baseBody.WriteString(fmt.Sprintf("func Unchanged%02d() {}\n", i))
+	}
+	baseBody.WriteString("func DeleteMe() {}\n")
+	for i := 21; i <= 40; i++ {
+		baseBody.WriteString(fmt.Sprintf("func Unchanged%02d() {}\n", i))
+	}
+	if err := os.WriteFile(filepath.Join(repo, oldPath), []byte(baseBody.String()), 0o644); err != nil {
+		t.Fatalf("write base renamed file: %v", err)
+	}
+	runGitRepo(t, repo, "add", ".")
+	runGitRepo(t, repo, "commit", "-m", "base")
+	baseSHA = strings.TrimSpace(runGitRepoOutput(t, repo, "rev-parse", "HEAD"))
+
+	runGitRepo(t, repo, "mv", oldPath, newPath)
+	var headBody strings.Builder
+	headBody.WriteString("package pkg\n\n")
+	for i := 1; i <= 20; i++ {
+		headBody.WriteString(fmt.Sprintf("func Unchanged%02d() {}\n", i))
+	}
+	headBody.WriteString("func Added() {}\n")
+	for i := 21; i <= 40; i++ {
+		headBody.WriteString(fmt.Sprintf("func Unchanged%02d() {}\n", i))
+	}
+	if err := os.WriteFile(filepath.Join(repo, newPath), []byte(headBody.String()), 0o644); err != nil {
+		t.Fatalf("write head renamed file: %v", err)
+	}
+	runGitRepo(t, repo, "add", ".")
+	runGitRepo(t, repo, "commit", "-m", "rename and edit")
+	headSHA = strings.TrimSpace(runGitRepoOutput(t, repo, "rev-parse", "HEAD"))
+
+	// package + blank + 20 unchanged + DeleteMe/Added at line 23.
+	leftDeletedLine = 23
+	rightAddedLine = 23
+	// First unchanged function is line 3; outside rename hunk context.
+	distantUnchangedLine = 3
+	return baseSHA, headSHA, newPath, leftDeletedLine, rightAddedLine, distantUnchangedLine
+}
+
 // seedPathspecMagicFilenameRepo creates a commit pair for a legal filename that
 // Git would parse as pathspec magic without --literal-pathspecs (e.g. ":(foo).txt").
 func seedPathspecMagicFilenameRepo(t *testing.T, repo string) (baseSHA, headSHA, magicPath string, targetLine int64) {

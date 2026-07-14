@@ -95,13 +95,76 @@ func TestBuildReviewAnchorIndexTreatsPathspecMagicFilenamesLiterally(t *testing.
 	}
 }
 
+func TestBuildReviewAnchorIndexPreservesRenameDiffAuthority(t *testing.T) {
+	t.Parallel()
+
+	repo := t.TempDir()
+	baseSHA, headSHA, newPath, leftLine, rightLine, distantLine := seedRenamedFileRepo(t, repo)
+	gateway := New(Options{GHPath: "gh", GitPath: "git", CWD: repo})
+
+	// Submit only the post-rename path (what agents/GitHub comments use). Without
+	// expanding the pre-rename partner, local path authority would be a pure add.
+	index, source, err := gateway.BuildReviewAnchorIndex(context.Background(), BuildReviewAnchorIndexInput{
+		CWD:     repo,
+		BaseSHA: baseSHA,
+		HeadSHA: headSHA,
+		Paths:   []string{newPath},
+		RemoteDiff: func(context.Context) (string, error) {
+			return "", ErrLocalCaptureTruncated
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildReviewAnchorIndex() error = %v", err)
+	}
+	if source != ReviewAnchorAuthorityLocalPathDiff {
+		t.Fatalf("source = %q, want %q", source, ReviewAnchorAuthorityLocalPathDiff)
+	}
+	if index == nil {
+		t.Fatal("index is nil")
+	}
+	if !index.Validate(diffanchor.Anchor{Path: newPath, Line: leftLine, Side: diffanchor.SideLeft}).Valid {
+		t.Fatalf("LEFT deleted line %d on renamed file should be valid: %#v", leftLine, index)
+	}
+	if !index.Validate(diffanchor.Anchor{Path: newPath, Line: rightLine, Side: diffanchor.SideRight}).Valid {
+		t.Fatalf("RIGHT added line %d on renamed file should be valid: %#v", rightLine, index)
+	}
+	// Distant unchanged line is outside the rename hunk; pure new-file authority
+	// would incorrectly allow it because every RIGHT line would look added.
+	if index.Validate(diffanchor.Anchor{Path: newPath, Line: distantLine, Side: diffanchor.SideRight}).Valid {
+		t.Fatalf("distant unchanged RIGHT line %d should be outside complete rename authority: %#v", distantLine, index)
+	}
+}
+
+func TestExpandPathsWithRenamePartners(t *testing.T) {
+	t.Parallel()
+
+	nameStatus := strings.Join([]string{
+		"M\tkeep.go",
+		"R100\told/a.go\tnew/a.go",
+		"C075\tsrc/copy.go\tdst/copy.go",
+		`R080	"old path.txt"	"new path.txt"`,
+		"A\tonly-new.go",
+	}, "\n")
+
+	got := expandPathsWithRenamePartners([]string{"new/a.go", "src/copy.go", "new path.txt", "keep.go"}, nameStatus)
+	want := []string{"dst/copy.go", "keep.go", "new path.txt", "new/a.go", "old path.txt", "old/a.go", "src/copy.go"}
+	if len(got) != len(want) {
+		t.Fatalf("expandPathsWithRenamePartners() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expandPathsWithRenamePartners() = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestBuildLocalPathAnchorIndexPassesLiteralPathspecs(t *testing.T) {
 	t.Parallel()
 
 	baseSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	headSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	magicPath := ":(foo).txt"
-	var sawDiffArgs []string
+	var sawContentDiffArgs []string
 	gateway := New(Options{
 		GHPath:  "gh",
 		GitPath: "git",
@@ -116,7 +179,12 @@ func TestBuildLocalPathAnchorIndexPassesLiteralPathspecs(t *testing.T) {
 				}
 				return shell.Result{Stdout: sha + "\n"}, nil
 			}
-			sawDiffArgs = append([]string(nil), options.Args...)
+			// Rename expansion uses name-status without pathspecs.
+			joined := strings.Join(options.Args, "\x00")
+			if strings.Contains(joined, "--name-status") {
+				return shell.Result{Stdout: ""}, nil
+			}
+			sawContentDiffArgs = append([]string(nil), options.Args...)
 			return shell.Result{
 				Stdout: "diff --git a/:(foo).txt b/:(foo).txt\n@@ -1 +1,2 @@\n line1\n+line2\n",
 			}, nil
@@ -126,11 +194,11 @@ func TestBuildLocalPathAnchorIndexPassesLiteralPathspecs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildLocalPathAnchorIndex() error = %v", err)
 	}
-	if len(sawDiffArgs) == 0 || sawDiffArgs[0] != "--literal-pathspecs" {
-		t.Fatalf("diff argv = %v, want leading --literal-pathspecs", sawDiffArgs)
+	if len(sawContentDiffArgs) == 0 || sawContentDiffArgs[0] != "--literal-pathspecs" {
+		t.Fatalf("diff argv = %v, want leading --literal-pathspecs", sawContentDiffArgs)
 	}
-	if !strings.Contains(strings.Join(sawDiffArgs, "\x00"), magicPath) {
-		t.Fatalf("diff argv = %v, want magic path %q", sawDiffArgs, magicPath)
+	if !strings.Contains(strings.Join(sawContentDiffArgs, "\x00"), magicPath) {
+		t.Fatalf("diff argv = %v, want magic path %q", sawContentDiffArgs, magicPath)
 	}
 }
 
