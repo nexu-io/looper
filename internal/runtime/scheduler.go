@@ -1089,10 +1089,6 @@ func findForgejoReviewMarker(comments []forge.Comment, input reviewer.VerifyRevi
 
 func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input reviewer.VerifyReviewMarkerInput) reviewer.ReviewMarkerResult {
 	expectedAuthor := strings.ToLower(strings.TrimSpace(input.AuthorLogin))
-	allowed := map[reviewer.ReviewEvent]bool{}
-	for _, event := range input.AllowedReviewEvents {
-		allowed[event] = true
-	}
 	var newest reviewer.ReviewMarkerResult
 	for _, review := range reviews {
 		marker, ok := findRuntimeReviewIdempotencyMarker(review.Body, input.Marker)
@@ -1103,14 +1099,8 @@ func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input revi
 		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
 			continue
 		}
-		event := reviewer.ReviewEventComment
-		switch review.State {
-		case "APPROVED":
-			event = reviewer.ReviewEventApprove
-		case "CHANGES_REQUESTED":
-			event = reviewer.ReviewEventRequestChanges
-		}
-		if len(allowed) > 0 && !allowed[event] && !(event == reviewer.ReviewEventComment && marker.Outcome == "clean" && input.AllowCleanComment) {
+		event := forgejoReviewEventFromState(review.State)
+		if !forgejoNativeReviewMarkerEventAllowed(marker.Outcome, event, input.AllowedReviewEvents, input.AllowCleanComment) {
 			continue
 		}
 		inlineBodies := make([]string, 0, len(review.Comments))
@@ -1120,6 +1110,65 @@ func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input revi
 		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: marker.Outcome, Event: event, AuthorLogin: author, Body: review.Body, InlineCommentBodies: inlineBodies}
 	}
 	return newest
+}
+
+// forgejoReviewEventFromState maps Forgejo review states onto Looper review events.
+// States are expected after forge.normalizeForgejoReviewState (APPROVED/COMMENTED/CHANGES_REQUESTED).
+func forgejoReviewEventFromState(state string) reviewer.ReviewEvent {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED":
+		return reviewer.ReviewEventApprove
+	case "CHANGES_REQUESTED", "REQUEST_CHANGES":
+		return reviewer.ReviewEventRequestChanges
+	case "COMMENTED", "COMMENT":
+		return reviewer.ReviewEventComment
+	default:
+		return ""
+	}
+}
+
+// forgejoNativeReviewMarkerEventAllowed mirrors github.reviewMarkerEventAllowedForOutcome so
+// outcome=clean requires APPROVE when that event is allowed, outcome=blocking requires
+// REQUEST_CHANGES when allowed, and COMMENT only matches non-blocking/actionable (or the
+// explicit clean-comment self-approval fallback).
+func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent, allowCleanComment bool) bool {
+	if event == "" {
+		return false
+	}
+	if len(allowed) == 0 {
+		return true
+	}
+	if !forgejoReviewEventAllowed(event, allowed) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean":
+		if allowCleanComment && event == reviewer.ReviewEventComment {
+			return true
+		}
+		if forgejoReviewEventAllowed(reviewer.ReviewEventApprove, allowed) {
+			return event == reviewer.ReviewEventApprove
+		}
+		return event == reviewer.ReviewEventComment
+	case "blocking":
+		if forgejoReviewEventAllowed(reviewer.ReviewEventRequestChanges, allowed) {
+			return event == reviewer.ReviewEventRequestChanges
+		}
+		return event == reviewer.ReviewEventComment
+	case "non_blocking", "actionable":
+		return event == reviewer.ReviewEventComment
+	default:
+		return false
+	}
+}
+
+func forgejoReviewEventAllowed(event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent) bool {
+	for _, candidate := range allowed {
+		if candidate == event {
+			return true
+		}
+	}
+	return false
 }
 
 type runtimeReviewIdempotencyMarker struct {

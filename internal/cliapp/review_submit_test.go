@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/forge"
@@ -80,6 +81,63 @@ func TestForgejoReviewSubmitGatewayReusesMatchingNativeReviewMarker(t *testing.T
 	}
 	if publishCalls != 1 {
 		t.Fatalf("publish calls = %d, want one native review", publishCalls)
+	}
+}
+
+func TestForgejoReviewSubmitGatewayNormalizesInvalidAnchorsBeforePublish(t *testing.T) {
+	t.Parallel()
+	var published map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+			if err := json.NewDecoder(r.Body).Decode(&published); err != nil {
+				t.Fatalf("decode review payload: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9, "state": "COMMENT", "body": published["body"], "commit_id": "head", "user": map[string]any{"login": "reviewer"}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	diff := "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+	anchors := diffanchor.Parse(diff)
+	gateway := forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(config.Config{})}
+	err = gateway.SubmitReview(context.Background(), githubinfra.SubmitReviewInput{
+		PRNumber: 42,
+		Event:    "COMMENT",
+		Body:     "Needs work\n<!-- looper:review id=reviewer:loop:head head=head outcome=non_blocking -->",
+		CommitID: "head",
+		Comments: []githubinfra.ReviewComment{
+			{Body: "Valid inline", Path: "app.go", Line: 1, Side: "RIGHT"},
+			{Body: "Invalid inline", Path: "missing.go", Line: 99, Side: "RIGHT"},
+		},
+		Anchors: &anchors,
+	})
+	if err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+	if published == nil {
+		t.Fatal("expected Forgejo review payload")
+	}
+	comments, _ := published["comments"].([]any)
+	if len(comments) != 1 {
+		t.Fatalf("published comments = %#v, want only the valid anchor", published["comments"])
+	}
+	valid, _ := comments[0].(map[string]any)
+	if path, _ := valid["path"].(string); path != "app.go" {
+		t.Fatalf("valid comment path = %#v, want app.go", valid)
+	}
+	body, _ := published["body"].(string)
+	if !strings.Contains(body, "Invalid inline") || !strings.Contains(body, "missing.go") {
+		t.Fatalf("body = %q, want downgraded invalid anchor preserved at top level", body)
 	}
 }
 

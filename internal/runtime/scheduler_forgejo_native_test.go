@@ -11,9 +11,63 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/reviewer"
 )
+
+func TestFindForgejoNativeReviewMarkerEnforcesOutcomeSpecificEvents(t *testing.T) {
+	t.Parallel()
+
+	markerBody := func(outcome string) string {
+		return "review body\n<!-- looper:review id=reviewer:loop:head head=head outcome=" + outcome + " -->"
+	}
+	reviews := []forge.PullRequestReview{
+		{ID: 1, State: "COMMENTED", Body: markerBody("clean"), User: forge.Identity{Login: "reviewer"}},
+		{ID: 2, State: "COMMENTED", Body: markerBody("blocking"), User: forge.Identity{Login: "reviewer"}},
+		{ID: 3, State: "APPROVED", Body: markerBody("clean"), User: forge.Identity{Login: "reviewer"}},
+		{ID: 4, State: "CHANGES_REQUESTED", Body: markerBody("blocking"), User: forge.Identity{Login: "reviewer"}},
+		{ID: 5, State: "COMMENTED", Body: markerBody("non_blocking"), User: forge.Identity{Login: "reviewer"}},
+	}
+	// Policy-derived allowed set always includes COMMENT for non-blocking outcomes.
+	allowed := []reviewer.ReviewEvent{reviewer.ReviewEventComment, reviewer.ReviewEventApprove, reviewer.ReviewEventRequestChanges}
+
+	clean := findForgejoNativeReviewMarker(reviews, reviewer.VerifyReviewMarkerInput{
+		Marker: "looper:review id=reviewer:loop:head head=head outcome=clean", AllowedReviewEvents: allowed, AuthorLogin: "reviewer",
+	})
+	if !clean.Found || clean.Event != reviewer.ReviewEventApprove || clean.Outcome != "clean" {
+		t.Fatalf("clean marker = %#v, want APPROVED outcome=clean (not COMMENTED)", clean)
+	}
+
+	blocking := findForgejoNativeReviewMarker(reviews, reviewer.VerifyReviewMarkerInput{
+		Marker: "looper:review id=reviewer:loop:head head=head outcome=blocking", AllowedReviewEvents: allowed, AuthorLogin: "reviewer",
+	})
+	if !blocking.Found || blocking.Event != reviewer.ReviewEventRequestChanges || blocking.Outcome != "blocking" {
+		t.Fatalf("blocking marker = %#v, want CHANGES_REQUESTED outcome=blocking (not COMMENTED)", blocking)
+	}
+
+	nonBlocking := findForgejoNativeReviewMarker(reviews, reviewer.VerifyReviewMarkerInput{
+		Marker: "looper:review id=reviewer:loop:head head=head outcome=non_blocking", AllowedReviewEvents: allowed, AuthorLogin: "reviewer",
+	})
+	if !nonBlocking.Found || nonBlocking.Event != reviewer.ReviewEventComment || nonBlocking.Outcome != "non_blocking" {
+		t.Fatalf("non_blocking marker = %#v, want COMMENTED outcome=non_blocking", nonBlocking)
+	}
+
+	// Self-approval fallback: clean on COMMENT is accepted only when AllowCleanComment is set.
+	cleanCommentOnly := []forge.PullRequestReview{{ID: 10, State: "COMMENTED", Body: markerBody("clean"), User: forge.Identity{Login: "reviewer"}}}
+	rejected := findForgejoNativeReviewMarker(cleanCommentOnly, reviewer.VerifyReviewMarkerInput{
+		Marker: "looper:review id=reviewer:loop:head head=head outcome=clean", AllowedReviewEvents: allowed, AuthorLogin: "reviewer",
+	})
+	if rejected.Found {
+		t.Fatalf("clean COMMENT without AllowCleanComment = %#v, want not found", rejected)
+	}
+	accepted := findForgejoNativeReviewMarker(cleanCommentOnly, reviewer.VerifyReviewMarkerInput{
+		Marker: "looper:review id=reviewer:loop:head head=head outcome=clean", AllowedReviewEvents: allowed, AuthorLogin: "reviewer", AllowCleanComment: true,
+	})
+	if !accepted.Found || accepted.Event != reviewer.ReviewEventComment {
+		t.Fatalf("clean COMMENT with AllowCleanComment = %#v, want found COMMENT", accepted)
+	}
+}
 
 func TestReviewerForgejoAdapterNativeDiscoveryContextPublishAndRetry(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")

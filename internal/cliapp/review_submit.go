@@ -141,6 +141,9 @@ func (gateway forgejoReviewSubmitGateway) SubmitReview(ctx context.Context, inpu
 			}
 		}
 	}
+	// Match the GitHub gateway contract: retarget/downgrade invalid anchors using the
+	// live diff index so a bad path/line does not fail the whole native review submit.
+	input.Body, input.Comments = githubinfra.NormalizeReviewAnchors(input.Body, input.Comments, input.Anchors)
 	comments := make([]forge.PullRequestReviewCommentInput, 0, len(input.Comments))
 	for _, comment := range input.Comments {
 		comments = append(comments, forge.PullRequestReviewCommentInput{Body: gateway.stamper.ReviewComment(comment.Body, "reviewer"), Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})

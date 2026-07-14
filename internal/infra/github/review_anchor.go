@@ -23,6 +23,14 @@ type reviewCommentProcessing struct {
 	Comments        []map[string]any
 }
 
+// NormalizeReviewAnchors validates and normalizes inline review anchors against a parsed
+// diff index. Invalid anchors are retargeted when a nearby safe hunk exists; otherwise they
+// are downgraded into the top-level review body. Shared by GitHub and Forgejo submit paths.
+func NormalizeReviewAnchors(body string, comments []ReviewComment, anchors *diffanchor.Index) (string, []ReviewComment) {
+	body, comments, _, _ = normalizeReviewAnchors(body, comments, anchors)
+	return body, comments
+}
+
 func normalizeReviewAnchors(body string, comments []ReviewComment, anchors *diffanchor.Index) (string, []ReviewComment, []reviewQualityFlag, reviewCommentProcessing) {
 	flags := []reviewQualityFlag{}
 	processing := reviewCommentProcessing{OriginalCount: len(comments), Comments: make([]map[string]any, 0, len(comments))}
