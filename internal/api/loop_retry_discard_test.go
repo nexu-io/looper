@@ -1028,6 +1028,174 @@ func TestHandlerLoopCreateSharesTargetLockWithDiscard(t *testing.T) {
 	}
 }
 
+// TestHandlerLoopRetrySharesTargetLockAcrossLoops ensures a regular (non-discard)
+// retry for a different failed loop on the same PR target takes the shared target
+// mutex, so it cannot create an active queue item between another request's
+// discard preflight and git reset.
+func TestHandlerLoopRetrySharesTargetLockAcrossLoops(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_target_lock_across"
+
+	// Loop A owns the shared PR target key; hold its target lock as discard would.
+	// Both loops stay failed (non-conflicting) so B's requeue is only gated by the lock.
+	fixtureA := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_retry_target_lock_a",
+		LoopSeq:   3128,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-target-lock-a",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	markLoopFailed(t, services.Repositories, fixtureA.LoopID, nowISO)
+	// Loop B: second failed fixer for the same PR (non-conflicting while failed).
+	seedSecondFailedFixerSamePR(t, services.Repositories, projectID, "loop_retry_target_lock_b", 3129, nowISO)
+
+	target := mustLoopTargetFromFixture(t, services.Repositories, fixtureA.LoopID)
+	unlockTarget := h.lockLoopTarget(projectID, domain.LoopTypeFixer, target)
+
+	started := make(chan struct{})
+	finished := make(chan int, 1)
+	go func() {
+		close(started)
+		// Regular retry (no discard) of the *other* loop must wait on target lock.
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3129/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+		req.Header.Set("content-type", "application/json")
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		finished <- recorder.Code
+	}()
+
+	<-started
+	select {
+	case code := <-finished:
+		unlockTarget()
+		t.Fatalf("regular retry completed while same-target lock held: status=%d", code)
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked — expected.
+	}
+
+	unlockTarget()
+
+	select {
+	case code := <-finished:
+		if code != http.StatusOK {
+			t.Fatalf("regular retry status after target lock release = %d, want 200", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("regular retry did not complete after target lock release")
+	}
+
+	// Dirty worktree for loop A must remain: only the lock was held, no discard.
+	if got := readTestFile(t, filepath.Join(fixtureA.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after blocked regular retry = %q, want preserved", got)
+	}
+}
+
+// TestHandlerLoopStartSharesTargetLockAcrossLoops ensures /start for a different
+// failed loop on the same PR target takes the shared target mutex with discard.
+func TestHandlerLoopStartSharesTargetLockAcrossLoops(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_start_target_lock_across"
+
+	fixtureA := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_start_target_lock_a",
+		LoopSeq:   3130,
+		LoopType:  "fixer",
+		Branch:    "feature/start-target-lock-a",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	markLoopFailed(t, services.Repositories, fixtureA.LoopID, nowISO)
+	seedSecondFailedFixerSamePR(t, services.Repositories, projectID, "loop_start_target_lock_b", 3131, nowISO)
+
+	target := mustLoopTargetFromFixture(t, services.Repositories, fixtureA.LoopID)
+	unlockTarget := h.lockLoopTarget(projectID, domain.LoopTypeFixer, target)
+
+	started := make(chan struct{})
+	finished := make(chan int, 1)
+	go func() {
+		close(started)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3131/start", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		finished <- recorder.Code
+	}()
+
+	<-started
+	select {
+	case code := <-finished:
+		unlockTarget()
+		t.Fatalf("start completed while same-target lock held: status=%d", code)
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked — expected.
+	}
+
+	unlockTarget()
+
+	select {
+	case code := <-finished:
+		if code != http.StatusOK {
+			t.Fatalf("start status after target lock release = %d, want 200", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("start did not complete after target lock release")
+	}
+
+	if got := readTestFile(t, filepath.Join(fixtureA.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after blocked start = %q, want preserved", got)
+	}
+}
+
+func markLoopFailed(t *testing.T, repos *storage.Repositories, loopID, nowISO string) {
+	t.Helper()
+	loop, err := repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID(%s) = %#v, %v", loopID, loop, err)
+	}
+	loop.Status = "failed"
+	loop.UpdatedAt = nowISO
+	if err := repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert(failed %s) error = %v", loopID, err)
+	}
+}
+
+// seedSecondFailedFixerSamePR inserts another failed fixer loop for PR #42 so
+// two non-conflicting failed loops share one target key (fixture hardcodes 42).
+func seedSecondFailedFixerSamePR(t *testing.T, repos *storage.Repositories, projectID, loopID string, seq int64, nowISO string) {
+	t.Helper()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	prTarget := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: seq, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
+		Status: "failed", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+	}
+	failedQueueID := "queue_" + loopID
+	lastErrorKind := "manual_intervention"
+	lastError := "prior failure"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: failedQueueID, ProjectID: &projectID, LoopID: &loopID, Type: "fixer",
+		TargetType: "pull_request", TargetID: prTarget, Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: "fixer:" + loopID, Priority: storage.QueuePriorityFixer,
+		Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3,
+		LastError: &lastError, LastErrorKind: &lastErrorKind,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(%s) error = %v", failedQueueID, err)
+	}
+}
+
 func mustLoopTargetFromFixture(t *testing.T, repos *storage.Repositories, loopID string) domain.LoopTarget {
 	t.Helper()
 	loop, err := repos.Loops.GetByID(context.Background(), loopID)

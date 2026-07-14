@@ -160,10 +160,11 @@ func (h *Handler) lockLoopRetry(loopID string) func() {
 }
 
 // lockLoopTarget acquires a mutex keyed by project+loopType+target so discard
-// retry and same-target active loop creation cannot race. Concurrent project-
-// scoped workers are exempt (assertUniqueActiveLoopCompat allows them).
+// retry, same-target requeue (regular retry / start), and active loop creation
+// cannot race. Concurrent project-scoped workers are exempt
+// (assertUniqueActiveLoopCompat allows them).
 // Call order with lockLoopRetry: take the per-loop lock first, then the target
-// lock, to avoid deadlocks with start/reuse paths that only take the loop lock.
+// lock, so retry/start/reuse paths share a consistent order with discard.
 func (h *Handler) lockLoopTarget(projectID string, loopType domain.LoopType, target domain.LoopTarget) func() {
 	if loopType == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeProject {
 		return func() {}
@@ -4611,14 +4612,36 @@ func (h *Handler) resolveLoop(ctx context.Context, selector string) (storage.Loo
 
 func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status domain.LoopStatus) (loopResponse, error) {
 	// Running requeues from the latest failed/cancelled/manual_intervention item
-	// and can start replacement work. Share the per-loop retry lock so this cannot
-	// race discard+retry between preflight and destructive git reset.
+	// and can start replacement work. Share the per-loop retry lock and the
+	// same-target lock so this cannot race discard+retry between preflight and
+	// destructive git reset — including when the requeued loop is a *different*
+	// failed loop for the same PR/issue target.
 	if status == domain.LoopStatusRunning {
 		unlock := h.lockLoopRetry(loopID)
 		defer unlock()
 	}
 
 	services := h.context.Runtime.Services()
+	if status == domain.LoopStatusRunning {
+		if services.Repositories == nil || services.Coordinator == nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+		}
+		// Resolve target outside the TX so we can hold the target mutex for the
+		// whole requeue window (same key as discard+retry / loop create).
+		preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if preflightLoop != nil {
+			target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+			if targetErr != nil {
+				return loopResponse{}, targetErr
+			}
+			unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+			defer unlockTarget()
+		}
+	}
+
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
@@ -5134,7 +5157,29 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	defer unlock()
 
 	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+
+	// Always resolve the loop target and hold the same-target lock for the whole
+	// retry window — not only when discarding. Regular retry and /start for a
+	// *different* failed loop on this target would otherwise create an active
+	// queue item after discard preflight and before git reset, then the discard
+	// TX would conflict after the worktree was already wiped.
+	preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if preflightLoop == nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+	}
+	target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+	if targetErr != nil {
+		return retryLoopResponse{}, targetErr
+	}
+	unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+	defer unlockTarget()
 
 	// Opt-in discard runs before requeue so git mutation stays outside the
 	// queue transaction. Every non-mutating retry blocker must pass first so a
@@ -5142,16 +5187,6 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	// without creating a replacement queue item.
 	var worktreeDiscard *worktreeDiscardResult
 	if discardWorktreeChanges {
-		if services.Repositories == nil || services.Coordinator == nil {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
-		}
-		preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-		}
-		if preflightLoop == nil {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-		}
 		// Runtime HITL poll requeues awaiting_human loops without the API lock
 		// (hitl_github_poll / Feishu helpers). Refuse discard so a poll-delivered
 		// answer cannot requeue between preflight and git reset, wiping the
@@ -5163,16 +5198,6 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 				message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
 			}
 		}
-		// Hold the same-target create lock for the whole discard+requeue window
-		// so a concurrent POST /loops (or worker) create for this target cannot
-		// pass assertUniqueActiveLoopCompat after preflight and leave a wiped
-		// worktree when the retry TX conflicts.
-		target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
-		if targetErr != nil {
-			return retryLoopResponse{}, targetErr
-		}
-		unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
-		defer unlockTarget()
 
 		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *preflightLoop, nowISO); err != nil {
 			var typed apiError
