@@ -601,10 +601,11 @@ func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeOnUniqueLoopConflict(t *te
 }
 
 // TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop ensures discard+retry
-// refuses when a different loop type already holds a conflicting-active status
-// on the same PR. Same-type uniqueness alone would allow a failed fixer discard
-// to git reset/clean under a queued/running/human_takeover reviewer or worker
-// that shares the managed PR worktree.
+// refuses when a different loop type already holds a worktree-owning status on
+// the same PR. Same-type uniqueness alone would allow a failed fixer discard to
+// git reset/clean under a queued/running/waiting/human_takeover reviewer or
+// worker that shares the managed PR worktree. waiting is intentionally outside
+// IsConflictingActiveLoopStatus but still pins the checkout.
 func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -613,6 +614,7 @@ func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
 	}{
 		{name: "queued_reviewer", siblingType: "reviewer", siblingStatus: "queued"},
 		{name: "running_worker", siblingType: "worker", siblingStatus: "running"},
+		{name: "waiting_reviewer", siblingType: "reviewer", siblingStatus: "waiting"},
 		{name: "human_takeover_reviewer", siblingType: "reviewer", siblingStatus: "human_takeover"},
 	}
 	for _, tc := range cases {
