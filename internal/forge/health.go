@@ -39,11 +39,15 @@ const (
 type AuthenticationState string
 
 const (
-	AuthenticationValid        AuthenticationState = "valid"
-	AuthenticationInvalid      AuthenticationState = "invalid"
-	AuthenticationForbidden    AuthenticationState = "forbidden"
-	AuthenticationMissingToken AuthenticationState = "missing_token"
-	AuthenticationUnknown      AuthenticationState = "unknown"
+	AuthenticationValid                AuthenticationState = "valid"
+	AuthenticationInvalid              AuthenticationState = "invalid"
+	AuthenticationForbidden            AuthenticationState = "forbidden"
+	AuthenticationMissingToken         AuthenticationState = "missing_token"
+	AuthenticationTeaMissing           AuthenticationState = "tea_missing"
+	AuthenticationTeaLoginMissing      AuthenticationState = "tea_login_missing"
+	AuthenticationTeaLoginHostMismatch AuthenticationState = "tea_login_host_mismatch"
+	AuthenticationTeaAuthFailed        AuthenticationState = "tea_auth_failed"
+	AuthenticationUnknown              AuthenticationState = "unknown"
 )
 
 type AccessState string
@@ -95,8 +99,15 @@ type ForgejoProbeProject struct {
 
 // ProbeForgejoProvider performs bounded, read-only requests. The returned
 // structure deliberately contains no endpoint, token environment name, token,
-// or raw error text so status output remains safe to share.
+// tea token material, or raw error text so status output remains safe to share.
 func ProbeForgejoProvider(ctx context.Context, provider config.ProviderConfig, projects []ForgejoProbeProject, options ...ForgejoOption) ForgejoProviderHealth {
+	if config.EffectiveProviderAuth(provider) == config.ProviderAuthTea {
+		return probeForgejoProviderTea(ctx, provider, projects, options...)
+	}
+	return probeForgejoProviderTokenEnv(ctx, provider, projects, options...)
+}
+
+func probeForgejoProviderTokenEnv(ctx context.Context, provider config.ProviderConfig, projects []ForgejoProbeProject, options ...ForgejoOption) ForgejoProviderHealth {
 	health := ForgejoProviderHealth{
 		ProviderID:     provider.ID,
 		Kind:           ProviderKindForgejo,
@@ -201,9 +212,185 @@ func ProbeForgejoProvider(ctx context.Context, provider config.ProviderConfig, p
 	return health
 }
 
+func probeForgejoProviderTea(ctx context.Context, provider config.ProviderConfig, projects []ForgejoProbeProject, options ...ForgejoOption) ForgejoProviderHealth {
+	health := ForgejoProviderHealth{
+		ProviderID:     provider.ID,
+		Kind:           ProviderKindForgejo,
+		Reachability:   ReachabilityUnreachable,
+		Authentication: AuthenticationUnknown,
+		VersionState:   ProbeStateUnknown,
+		Capabilities:   forgejoCapabilityReports(nil),
+		Projects:       make([]ForgejoProjectHealth, 0, len(projects)),
+	}
+	for _, project := range projects {
+		health.Projects = append(health.Projects, unknownForgejoProjectHealth(project, health.Capabilities))
+	}
+
+	baseURL, err := parseForgejoBaseURL(provider.BaseURL)
+	if err != nil {
+		return health
+	}
+
+	probeClient := &ForgejoClient{}
+	for _, option := range options {
+		if option != nil {
+			option(probeClient)
+		}
+	}
+	runner := probeClient.teaRunner
+	if runner == nil {
+		runner = defaultTeaRunner{}
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, defaultForgejoProbeTimeout)
+	defer cancel()
+
+	// Unauthenticated version probe for reachability (no token).
+	httpClient := &http.Client{Timeout: defaultForgejoProbeTimeout}
+	if probeClient.httpClient != nil {
+		httpClient = probeClient.httpClient
+		if httpClient.Timeout == 0 || httpClient.Timeout > defaultForgejoProbeTimeout {
+			httpClient.Timeout = defaultForgejoProbeTimeout
+		}
+	}
+	versionResponse, versionErr := forgejoProbeGET(probeCtx, httpClient, forgejoProbeURL(baseURL, "api/v1/version"), "", maxForgejoResponseBodyBytes)
+	if versionErr == nil || versionResponse.statusCode > 0 {
+		health.Reachability = ReachabilityReachable
+	}
+	if versionErr == nil {
+		var version struct {
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(versionResponse.body, &version) == nil && strings.TrimSpace(version.Version) != "" {
+			health.Version = strings.TrimSpace(version.Version)
+			health.VersionState = ProbeStateSupported
+		}
+	} else if versionResponse.statusCode == http.StatusNotFound || versionResponse.statusCode == http.StatusMethodNotAllowed {
+		health.VersionState = ProbeStateUnsupported
+	}
+
+	teaPath, _, validateErr := ValidateTeaLoginForProvider(probeCtx, provider, runner, probeClient.lookPath)
+	if validateErr != nil {
+		health.Authentication = authenticationStateFromTeaError(validateErr)
+		health.Projects = rebuildForgejoProjectHealth(projects, health.Capabilities)
+		return health
+	}
+
+	openAPITransport := newTeaTransport(teaPath, strings.TrimSpace(*provider.TeaLogin), baseURL, defaultForgejoProbeTimeout, runner)
+	// swagger.v1.json lives at the server root, not under /api/v1; pass absolute URL.
+	if openAPIResponse, openAPIErr := openAPITransport.doRaw(probeCtx, http.MethodGet, forgejoProbeURL(baseURL, "swagger.v1.json"), nil, nil); openAPIErr == nil {
+		health.Reachability = ReachabilityReachable
+		if paths := decodeForgejoOpenAPIPaths(openAPIResponse.body); paths != nil {
+			health.Capabilities = forgejoCapabilityReports(paths)
+		}
+	}
+
+	userTransport := newTeaTransport(teaPath, strings.TrimSpace(*provider.TeaLogin), baseURL, defaultForgejoProbeTimeout, runner)
+	userResponse, userErr := userTransport.doRaw(probeCtx, http.MethodGet, "user", nil, nil)
+	if userErr != nil {
+		health.Authentication = authenticationStateFromTeaError(userErr)
+		if httpErr, ok := userErr.(*ForgejoHTTPError); ok {
+			health.StatusCode = httpErr.StatusCode
+			switch httpErr.StatusCode {
+			case http.StatusUnauthorized:
+				health.Authentication = AuthenticationInvalid
+			case http.StatusForbidden:
+				health.Authentication = AuthenticationForbidden
+			}
+		}
+		health.Projects = rebuildForgejoProjectHealth(projects, health.Capabilities)
+		return health
+	}
+	health.Reachability = ReachabilityReachable
+	var user forgejoUser
+	if err := json.Unmarshal(userResponse.body, &user); err != nil || strings.TrimSpace(user.Login) == "" {
+		health.Authentication = AuthenticationUnknown
+		health.Projects = rebuildForgejoProjectHealth(projects, health.Capabilities)
+		return health
+	}
+	health.Authentication = AuthenticationValid
+	health.Identity = &Identity{Login: user.Login, ID: user.ID}
+
+	health.Projects = make([]ForgejoProjectHealth, 0, len(projects))
+	for _, project := range projects {
+		health.Projects = append(health.Projects, probeForgejoProjectTea(probeCtx, userTransport, project, health.Capabilities))
+	}
+	return health
+}
+
+func authenticationStateFromTeaError(err error) AuthenticationState {
+	var teaErr *TeaAuthError
+	if errors.As(err, &teaErr) {
+		switch teaErr.Code {
+		case TeaErrorMissing:
+			return AuthenticationTeaMissing
+		case TeaErrorLoginMissing:
+			return AuthenticationTeaLoginMissing
+		case TeaErrorLoginHostMismatch:
+			return AuthenticationTeaLoginHostMismatch
+		case TeaErrorAuthFailed:
+			return AuthenticationTeaAuthFailed
+		}
+	}
+	var httpErr *ForgejoHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusUnauthorized:
+			return AuthenticationInvalid
+		case http.StatusForbidden:
+			return AuthenticationForbidden
+		}
+	}
+	return AuthenticationUnknown
+}
+
+func probeForgejoProjectTea(ctx context.Context, transport *teaTransport, project ForgejoProbeProject, capabilities map[string]CapabilityReport) ForgejoProjectHealth {
+	health := unknownForgejoProjectHealth(project, capabilities)
+	repoPath := "repos/" + strings.Trim(strings.TrimSpace(project.Repo), "/")
+	response, err := transport.doRaw(ctx, http.MethodGet, repoPath, nil, nil)
+	if err != nil {
+		if httpErr, ok := err.(*ForgejoHTTPError); ok {
+			health.StatusCode = httpErr.StatusCode
+			if httpErr.StatusCode == http.StatusForbidden || httpErr.StatusCode == http.StatusNotFound {
+				health.Access = AccessInsufficient
+				readable := false
+				health.Readable = &readable
+			}
+		}
+		return health
+	}
+	var repository struct {
+		Permissions struct {
+			Pull  bool `json:"pull"`
+			Push  bool `json:"push"`
+			Admin bool `json:"admin"`
+		} `json:"permissions"`
+	}
+	if json.Unmarshal(response.body, &repository) != nil {
+		return health
+	}
+	readable := true
+	writable := repository.Permissions.Push || repository.Permissions.Admin
+	health.Readable = &readable
+	health.Writable = &writable
+	if writable {
+		health.Access = AccessWritable
+	} else {
+		health.Access = AccessReadOnly
+		health.Capabilities = restrictForgejoWriteCapabilities(capabilities, ProbeStateUnsupported, "repository is not writable")
+	}
+	return health
+}
+
 func ProbeForgejoReviewCommentResolution(ctx context.Context, provider config.ProviderConfig, repo string, options ...ForgejoOption) (ProbeState, error) {
 	health := ProbeForgejoProvider(ctx, provider, []ForgejoProbeProject{{Repo: repo}}, options...)
-	if health.Authentication == AuthenticationMissingToken || health.Authentication == AuthenticationInvalid || health.Authentication == AuthenticationForbidden {
+	if health.Authentication == AuthenticationMissingToken ||
+		health.Authentication == AuthenticationInvalid ||
+		health.Authentication == AuthenticationForbidden ||
+		health.Authentication == AuthenticationTeaMissing ||
+		health.Authentication == AuthenticationTeaLoginMissing ||
+		health.Authentication == AuthenticationTeaLoginHostMismatch ||
+		health.Authentication == AuthenticationTeaAuthFailed {
 		return ProbeStateUnknown, fmt.Errorf("forgejo capability probe authentication = %s", health.Authentication)
 	}
 	report := health.Capabilities["reviewCommentResolve"]

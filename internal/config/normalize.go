@@ -95,7 +95,18 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		providers := cloneProviderConfigs(*normalized.Providers)
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
-			partials[i] = PartialProviderConfig{ID: provider.ID, Kind: &provider.Kind, BaseURL: &provider.BaseURL, GHPath: provider.GHPath, TokenEnv: provider.TokenEnv, Workspace: provider.Workspace, ProjectID: provider.ProjectID}
+			partials[i] = PartialProviderConfig{
+				ID:        provider.ID,
+				Kind:      &provider.Kind,
+				BaseURL:   &provider.BaseURL,
+				GHPath:    provider.GHPath,
+				Auth:      providerAuthModePtr(provider.Auth),
+				TokenEnv:  provider.TokenEnv,
+				TeaLogin:  provider.TeaLogin,
+				TeaPath:   provider.TeaPath,
+				Workspace: provider.Workspace,
+				ProjectID: provider.ProjectID,
+			}
 		}
 		normalized.Providers = &partials
 	}
@@ -462,11 +473,18 @@ func ApplyForgejoProjectProfile(project *ProjectRefConfig) {
 func normalizeProviderConfig(provider *ProviderConfig) {
 	provider.ID = strings.TrimSpace(provider.ID)
 	provider.BaseURL = normalizeBaseURL(provider.BaseURL)
+	provider.Auth = ProviderAuthMode(strings.TrimSpace(string(provider.Auth)))
 	if provider.GHPath != nil {
 		provider.GHPath = stringPtr(strings.TrimSpace(*provider.GHPath))
 	}
 	if provider.TokenEnv != nil {
 		provider.TokenEnv = stringPtr(strings.TrimSpace(*provider.TokenEnv))
+	}
+	if provider.TeaLogin != nil {
+		provider.TeaLogin = stringPtr(strings.TrimSpace(*provider.TeaLogin))
+	}
+	if provider.TeaPath != nil {
+		provider.TeaPath = stringPtr(strings.TrimSpace(*provider.TeaPath))
 	}
 	if provider.Workspace != nil {
 		provider.Workspace = stringPtr(strings.TrimSpace(*provider.Workspace))
@@ -474,6 +492,34 @@ func normalizeProviderConfig(provider *ProviderConfig) {
 	if provider.ProjectID != nil {
 		provider.ProjectID = stringPtr(strings.TrimSpace(*provider.ProjectID))
 	}
+}
+
+// EffectiveProviderAuth resolves the authentication strategy for a provider.
+// Explicit auth wins; otherwise teaLogin alone implies tea, tokenEnv alone
+// implies token-env. Both set without auth is invalid and left empty for
+// validation to reject.
+func EffectiveProviderAuth(provider ProviderConfig) ProviderAuthMode {
+	if provider.Auth != "" {
+		return provider.Auth
+	}
+	hasTea := provider.TeaLogin != nil && strings.TrimSpace(*provider.TeaLogin) != ""
+	hasToken := provider.TokenEnv != nil && strings.TrimSpace(*provider.TokenEnv) != ""
+	switch {
+	case hasTea && !hasToken:
+		return ProviderAuthTea
+	case hasToken && !hasTea:
+		return ProviderAuthTokenEnv
+	default:
+		return ""
+	}
+}
+
+func providerAuthModePtr(value ProviderAuthMode) *ProviderAuthMode {
+	if value == "" {
+		return nil
+	}
+	cloned := value
+	return &cloned
 }
 
 func normalizeBaseURL(value string) string {
@@ -1452,7 +1498,10 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 			providers[i].Kind = cloneProviderKindPtr(providers[i].Kind)
 			providers[i].BaseURL = cloneStringPtr(providers[i].BaseURL)
 			providers[i].GHPath = cloneStringPtr(providers[i].GHPath)
+			providers[i].Auth = cloneProviderAuthModePtr(providers[i].Auth)
 			providers[i].TokenEnv = cloneStringPtr(providers[i].TokenEnv)
+			providers[i].TeaLogin = cloneStringPtr(providers[i].TeaLogin)
+			providers[i].TeaPath = cloneStringPtr(providers[i].TeaPath)
 			providers[i].Workspace = cloneStringPtr(providers[i].Workspace)
 			providers[i].ProjectID = cloneStringPtr(providers[i].ProjectID)
 		}
@@ -1599,8 +1648,13 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			Kind:      kind,
 			GHPath:    cloneStringPtr(provider.GHPath),
 			TokenEnv:  cloneStringPtr(provider.TokenEnv),
+			TeaLogin:  cloneStringPtr(provider.TeaLogin),
+			TeaPath:   cloneStringPtr(provider.TeaPath),
 			Workspace: cloneStringPtr(provider.Workspace),
 			ProjectID: cloneStringPtr(provider.ProjectID),
+		}
+		if provider.Auth != nil {
+			cloned[index].Auth = *provider.Auth
 		}
 		if provider.BaseURL != nil {
 			cloned[index].BaseURL = normalizeBaseURL(*provider.BaseURL)
@@ -1608,6 +1662,14 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 		normalizeProviderConfig(&cloned[index])
 	}
 	return cloned
+}
+
+func cloneProviderAuthModePtr(value *ProviderAuthMode) *ProviderAuthMode {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneProjectNetworkConfig(config *ProjectNetworkConfig) *ProjectNetworkConfig {

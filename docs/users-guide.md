@@ -32,10 +32,10 @@ Also make sure:
 - `looperd` is running
 - your local repo can `git fetch` and `git push`
 - GitHub projects: `gh` is authenticated with the target GitHub account
-- Forgejo projects: the configured provider `tokenEnv` is exported in the daemon environment
+- Forgejo projects: for `token-env` auth, the configured provider `tokenEnv` is exported in the daemon environment; for `tea` auth, the selected tea login must already be available to the daemon user
 - `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
 
-Forgejo projects can be onboarded with `looper bootstrap --provider forgejo`, managed with `looper provider add|list|test|remove`, or added to a running installation with `looper project add --forgejo-url ... --forgejo-token-env ...`. For configured providers, pass the provider id explicitly; `--provider forgejo` selects it only when the origin has one unambiguous match. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
+Forgejo projects can be onboarded with `looper bootstrap --provider forgejo`, managed with `looper provider add|list|test|remove`, or added to a running installation with `looper project add --forgejo-url ...` plus either `--forgejo-token-env` or `--auth tea --tea-login`. Tea-backed providers reuse an explicit `tea` login for the provider host and do not require a second token environment variable. For configured providers, pass the provider id explicitly; `--provider forgejo` selects it only when the origin has one unambiguous match. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
 
 `looper status` probes each configured Forgejo provider with bounded, read-only requests. Human and JSON output distinguish endpoint reachability, token authentication, current identity, server version, per-project read/write access, and configured versus observed capabilities. An unavailable OpenAPI contract is reported as `unknown`, never as supported. Status output omits provider URLs, token environment names, tokens, and raw network errors.
 

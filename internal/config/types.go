@@ -184,12 +184,29 @@ const (
 	ProviderKindPlane ProviderKind = "plane"
 )
 
+// ProviderAuthMode selects how a forgejo provider authenticates API calls.
+// token-env uses a native HTTP client with a token from the named environment
+// variable. tea reuses an explicitly selected tea CLI login as transport and
+// never extracts or stores the underlying token.
+type ProviderAuthMode string
+
+const (
+	ProviderAuthTokenEnv ProviderAuthMode = "token-env"
+	ProviderAuthTea      ProviderAuthMode = "tea"
+)
+
 type ProviderConfig struct {
-	ID       string       `json:"id"`
-	Kind     ProviderKind `json:"kind"`
-	BaseURL  string       `json:"baseUrl,omitempty"`
-	GHPath   *string      `json:"ghPath,omitempty"`
-	TokenEnv *string      `json:"tokenEnv,omitempty"`
+	ID       string           `json:"id"`
+	Kind     ProviderKind     `json:"kind"`
+	BaseURL  string           `json:"baseUrl,omitempty"`
+	GHPath   *string          `json:"ghPath,omitempty"`
+	Auth     ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv *string          `json:"tokenEnv,omitempty"`
+	// TeaLogin is the explicit tea CLI login name used when Auth is "tea".
+	// Required for tea-backed Forgejo providers; never inferred from tea's default.
+	TeaLogin *string `json:"teaLogin,omitempty"`
+	// TeaPath optionally overrides the tea executable path (otherwise PATH lookup).
+	TeaPath *string `json:"teaPath,omitempty"`
 	// Workspace and ProjectID identify the Plane project a plane provider reads
 	// its work-items from. Ignored for github/forgejo providers.
 	Workspace *string `json:"workspace,omitempty"`
@@ -604,13 +621,16 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID        string        `json:"id"`
-	Kind      *ProviderKind `json:"kind,omitempty"`
-	BaseURL   *string       `json:"baseUrl,omitempty"`
-	GHPath    *string       `json:"ghPath,omitempty"`
-	TokenEnv  *string       `json:"tokenEnv,omitempty"`
-	Workspace *string       `json:"workspace,omitempty"`
-	ProjectID *string       `json:"projectId,omitempty"`
+	ID        string            `json:"id"`
+	Kind      *ProviderKind     `json:"kind,omitempty"`
+	BaseURL   *string           `json:"baseUrl,omitempty"`
+	GHPath    *string           `json:"ghPath,omitempty"`
+	Auth      *ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv  *string           `json:"tokenEnv,omitempty"`
+	TeaLogin  *string           `json:"teaLogin,omitempty"`
+	TeaPath   *string           `json:"teaPath,omitempty"`
+	Workspace *string           `json:"workspace,omitempty"`
+	ProjectID *string           `json:"projectId,omitempty"`
 }
 
 type Config struct {

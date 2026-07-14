@@ -25,6 +25,9 @@ type ForgejoClient struct {
 	token      string
 	httpClient *http.Client
 	repo       RepositoryRef
+	tea        *teaTransport
+	teaRunner  TeaCommandRunner
+	lookPath   func(string) (string, error)
 }
 
 type ForgejoOption func(*ForgejoClient)
@@ -40,8 +43,32 @@ func WithHTTPClient(client *http.Client) ForgejoOption {
 func WithTimeout(timeout time.Duration) ForgejoOption {
 	return func(forgejo *ForgejoClient) {
 		if timeout > 0 {
-			forgejo.httpClient.Timeout = timeout
+			if forgejo.httpClient == nil {
+				forgejo.httpClient = &http.Client{Timeout: timeout}
+			} else {
+				forgejo.httpClient.Timeout = timeout
+			}
+			if forgejo.tea != nil {
+				forgejo.tea.timeout = timeout
+			}
 		}
+	}
+}
+
+// WithTeaRunner injects a tea CLI runner (tests and advanced wiring).
+func WithTeaRunner(runner TeaCommandRunner) ForgejoOption {
+	return func(forgejo *ForgejoClient) {
+		forgejo.teaRunner = runner
+		if forgejo.tea != nil {
+			forgejo.tea.runner = runner
+		}
+	}
+}
+
+// WithLookPath injects executable lookup used when resolving tea from PATH.
+func WithLookPath(lookPath func(string) (string, error)) ForgejoOption {
+	return func(forgejo *ForgejoClient) {
+		forgejo.lookPath = lookPath
 	}
 }
 
@@ -84,18 +111,81 @@ func NewForgejoClient(ref RepositoryRef, token string, options ...ForgejoOption)
 	return client, nil
 }
 
+// NewForgejoClientFromConfig builds a Forgejo client for token-env or tea auth.
+// Tea-backed mode validates the explicit login against the provider base URL and
+// routes API calls through `tea api --login <login>` without reading tokens.
 func NewForgejoClientFromConfig(provider config.ProviderConfig, repo string, options ...ForgejoOption) (*ForgejoClient, error) {
 	if provider.Kind != config.ProviderKindForgejo {
 		return nil, fmt.Errorf("forgejo client: provider %q kind = %q, want forgejo", provider.ID, provider.Kind)
 	}
-	if provider.TokenEnv == nil || strings.TrimSpace(*provider.TokenEnv) == "" {
-		return nil, fmt.Errorf("forgejo client: provider %q tokenEnv is required", provider.ID)
+	auth := config.EffectiveProviderAuth(provider)
+	switch auth {
+	case config.ProviderAuthTea:
+		return newForgejoClientFromTea(provider, repo, options...)
+	case config.ProviderAuthTokenEnv:
+		if provider.TokenEnv == nil || strings.TrimSpace(*provider.TokenEnv) == "" {
+			return nil, fmt.Errorf("forgejo client: provider %q tokenEnv is required", provider.ID)
+		}
+		token := os.Getenv(strings.TrimSpace(*provider.TokenEnv))
+		if strings.TrimSpace(token) == "" {
+			return nil, fmt.Errorf("forgejo client: environment variable %s is required", strings.TrimSpace(*provider.TokenEnv))
+		}
+		return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, options...)
+	default:
+		if provider.TokenEnv != nil && strings.TrimSpace(*provider.TokenEnv) != "" {
+			// Backward-compatible path for callers that predate auth field.
+			token := os.Getenv(strings.TrimSpace(*provider.TokenEnv))
+			if strings.TrimSpace(token) == "" {
+				return nil, fmt.Errorf("forgejo client: environment variable %s is required", strings.TrimSpace(*provider.TokenEnv))
+			}
+			return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, options...)
+		}
+		return nil, fmt.Errorf("forgejo client: provider %q requires auth=token-env with tokenEnv or auth=tea with teaLogin", provider.ID)
 	}
-	token := os.Getenv(strings.TrimSpace(*provider.TokenEnv))
-	if strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("forgejo client: environment variable %s is required", strings.TrimSpace(*provider.TokenEnv))
+}
+
+func newForgejoClientFromTea(provider config.ProviderConfig, repo string, options ...ForgejoOption) (*ForgejoClient, error) {
+	baseURL, err := parseForgejoBaseURL(provider.BaseURL)
+	if err != nil {
+		return nil, err
 	}
-	return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, options...)
+	if strings.TrimSpace(provider.ID) == "" {
+		return nil, fmt.Errorf("forgejo client: provider id is required")
+	}
+	if strings.TrimSpace(repo) == "" {
+		return nil, fmt.Errorf("forgejo client: repo is required")
+	}
+	client := &ForgejoClient{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: defaultForgejoTimeout},
+		repo: RepositoryRef{
+			ProviderID: strings.TrimSpace(provider.ID),
+			Kind:       ProviderKindForgejo,
+			BaseURL:    strings.TrimRight(baseURL.String(), "/"),
+			Repo:       strings.Trim(strings.TrimSpace(repo), "/"),
+		},
+	}
+	for _, option := range options {
+		if option != nil {
+			option(client)
+		}
+	}
+	runner := client.teaRunner
+	if runner == nil {
+		runner = defaultTeaRunner{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), teaLoginsListTimeout)
+	defer cancel()
+	teaPath, login, err := ValidateTeaLoginForProvider(ctx, provider, runner, client.lookPath)
+	if err != nil {
+		return nil, err
+	}
+	timeout := defaultForgejoTimeout
+	if client.httpClient != nil && client.httpClient.Timeout > 0 {
+		timeout = client.httpClient.Timeout
+	}
+	client.tea = newTeaTransport(teaPath, login.Name, baseURL, timeout, runner)
+	return client, nil
 }
 
 func (forgejo *ForgejoClient) Kind() ProviderKind { return ProviderKindForgejo }
@@ -559,6 +649,9 @@ func (forgejo *ForgejoClient) do(ctx context.Context, method string, path string
 }
 
 func (forgejo *ForgejoClient) doRaw(ctx context.Context, method string, path string, query url.Values, payload any) (rawResponse, error) {
+	if forgejo.tea != nil {
+		return forgejo.tea.doRaw(ctx, method, path, query, payload)
+	}
 	apiURL, err := forgejo.apiURL(path)
 	if err != nil {
 		return rawResponse{}, err

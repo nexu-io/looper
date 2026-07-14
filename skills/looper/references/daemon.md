@@ -41,7 +41,7 @@ Check these before changing config:
 
 1. `git` is installed and resolvable.
 2. For GitHub projects, `gh` is installed, resolvable, and authenticated for the target repositories.
-3. For Forgejo projects, the configured provider `tokenEnv` is present in the daemon environment.
+3. For Forgejo projects, either the configured provider `tokenEnv` is present in the daemon environment (`token-env` auth), or the explicit `teaLogin` is available to the daemon user (`tea` auth).
 4. `~/.looper/` and configured storage/log/backup/worktree paths are writable.
 5. `~/.looper/config.toml` or the selected config file is valid and passes Looper validation.
 6. If notifications enable osascript, `osascript` resolves.

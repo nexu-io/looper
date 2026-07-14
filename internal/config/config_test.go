@@ -504,6 +504,47 @@ func TestForgejoProjectRejectsUnsupportedRoleCapabilityOptIns(t *testing.T) {
 	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.threadResolution.enabled", "must be false for forgejo projects")
 }
 
+func TestForgejoProviderAuthTeaAllowsMissingTokenEnv(t *testing.T) {
+	auth := ProviderAuthTea
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{
+			ID: "fj", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://forgejo.example.test"),
+			Auth: &auth, TeaLogin: stringPtr("powerformer-code"),
+		}},
+		Projects: &[]PartialProjectRefConfig{
+			{ID: "one", Name: "One", Provider: stringPtr("fj"), Repo: stringPtr("owner/repo"), RepoPath: "/tmp/one"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v, want tea auth without tokenEnv accepted", err)
+	}
+	if EffectiveProviderAuth(cfg.Providers[0]) != ProviderAuthTea {
+		t.Fatalf("EffectiveProviderAuth() = %q, want tea", EffectiveProviderAuth(cfg.Providers[0]))
+	}
+}
+
+func TestForgejoProviderAuthRejectsBothTokenEnvAndTeaLoginWithoutAuth(t *testing.T) {
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{
+			ID: "fj", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://forgejo.example.test"),
+			TokenEnv: stringPtr("FORGEJO_TOKEN"), TeaLogin: stringPtr("powerformer-code"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want auth ambiguity error")
+	}
+	if !strings.Contains(err.Error(), "auth") {
+		t.Fatalf("ValidateWithOptions() error = %v, want auth field required", err)
+	}
+}
+
 func TestForgejoProviderConfigRequiresRepoAndRejectsDuplicateBareRepos(t *testing.T) {
 	cfg, err := Normalize(t.TempDir(), PartialConfig{
 		Providers: &[]PartialProviderConfig{{ID: "fj", Kind: providerKindPtr(ProviderKindForgejo), BaseURL: stringPtr("https://forgejo.example.test"), TokenEnv: stringPtr("FORGEJO_TOKEN")}},

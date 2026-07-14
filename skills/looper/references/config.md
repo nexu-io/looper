@@ -97,9 +97,9 @@ repoPath = "/absolute/path/to/repo"
 Provider kinds:
 
 - `github` — legacy default, backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior.
-- `forgejo` — REST-backed MVP. Forgejo-only configs do not require `gh` when `git`, the provider config, and token environment are valid.
+- `forgejo` — REST-backed MVP. Forgejo-only configs do not require `gh` when `git` and the provider auth are valid (`token-env` or `tea`).
 
-Minimal Forgejo project:
+Minimal Forgejo project (token-env):
 
 ```toml
 [agent]
@@ -109,7 +109,12 @@ vendor = "opencode"
 id = "forgejo-main"
 kind = "forgejo"
 baseUrl = "https://code.example.com"
+auth = "token-env"
 tokenEnv = "LOOPER_FORGEJO_TOKEN"
+
+# Or reuse an explicit tea login (no tokenEnv):
+# auth = "tea"
+# teaLogin = "powerformer-code"
 
 [[projects]]
 id = "example"
@@ -122,7 +127,7 @@ repo = "acme/example"
 Forgejo validation notes:
 
 - `baseUrl` must be an absolute `http(s)` URL.
-- `tokenEnv` must name an environment variable available to `looperd`; do not write token values into config.
+- Choose `auth = "token-env"` with `tokenEnv`, or `auth = "tea"` with explicit `teaLogin` matching `baseUrl`. Never rely on tea's default login when multiple identities exist. Do not write token values into config.
 - Forgejo projects require a `provider` and repo. Configure them in `[[projects]]`, or persist and activate them immediately with `looper project add --provider <id>`; the repo may be detected only from an origin matching that provider.
 - Duplicate `repo` values are rejected case-insensitively, even across providers.
 - Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
@@ -464,7 +469,7 @@ looperd \
 - storage, log, working-directory, and worktree paths must be writable
 - required tool paths must resolve
 - `gh` must resolve for GitHub projects; Forgejo-only configs do not require `gh`
-- Forgejo providers require `baseUrl` and `tokenEnv`; the named token environment variable must be present for runtime API calls
+- Forgejo providers require `baseUrl` and either `tokenEnv` (`token-env` auth) or `teaLogin` (`tea` auth); token-env needs the named env var at runtime, tea needs a matching login for the daemon user
 - `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
 
 ## Safety notes

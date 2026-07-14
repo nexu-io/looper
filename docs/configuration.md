@@ -228,25 +228,49 @@ Forgejo provider example:
 
 For a new installation, bootstrap validates the origin, current Forgejo identity, and repository access before writing the provider and project binding:
 
+Token-env bootstrap (headless / CI):
+
 ```bash
 export FORGEJO_TOKEN=<forgejo-token>
 looper bootstrap --provider forgejo \
   --project-path /absolute/path/to/example \
   --forgejo-url https://code.example.com \
+  --auth token-env \
   --forgejo-token-env FORGEJO_TOKEN
 ```
 
-Existing installations can manage providers with `looper provider add|list|test|remove`. The commands persist only the token environment-variable name and report when `looperd` must be restarted.
+Tea-backed bootstrap (reuse an existing `tea` login; no second token env):
+
+```bash
+tea login list
+looper bootstrap --provider forgejo \
+  --project-path /absolute/path/to/example \
+  --forgejo-url https://code.example.com \
+  --auth tea \
+  --tea-login powerformer-code
+```
+
+Existing installations can manage providers with `looper provider add|list|test|remove`. The commands persist auth strategy and credential *references* (`tokenEnv` name or `teaLogin`) and report when `looperd` must be restarted. Looper never reads tea's config file for tokens and never stores raw tokens.
 
 ```toml
 [agent]
 vendor = "opencode"
 
+# Headless: token from environment
 [[providers]]
 id = "forgejo-main"
 kind = "forgejo"
 baseUrl = "https://code.example.com"
+auth = "token-env"
 tokenEnv = "LOOPER_FORGEJO_TOKEN"
+
+# Interactive workstation: explicit tea login (must match baseUrl)
+# [[providers]]
+# id = "forgejo-main"
+# kind = "forgejo"
+# baseUrl = "https://code.example.com"
+# auth = "tea"
+# teaLogin = "powerformer-code"
 
 [[projects]]
 id = "example"
@@ -260,8 +284,13 @@ Forgejo rules:
 
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`, `forgejo`, or `plane`; `gitea` is not a supported provider kind yet.
-- Forgejo providers require an absolute `http(s)` `baseUrl` and a non-empty `tokenEnv`. The token value is read from the daemon environment and is never stored in project metadata.
-- Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, persisted by `looper project add --provider <id>`, or created with `--forgejo-url` plus `--forgejo-token-env`. The repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
+- Forgejo providers require an absolute `http(s)` `baseUrl` and an authentication strategy:
+  - `auth = "token-env"` with non-empty `tokenEnv` (token value from the daemon environment; never stored in config)
+  - `auth = "tea"` with an explicit `teaLogin` whose tea login URL matches `baseUrl` (never inferred from tea's default login when multiple identities exist)
+- When `auth` is omitted, a lone `tokenEnv` implies `token-env` and a lone `teaLogin` implies `tea`. Setting both without `auth` is a validation error.
+- Tea-backed API calls use `tea api --login <teaLogin>`; Looper never parses tea credential storage or copies the token into config, logs, argv, event payloads, or environment variables.
+- Actionable tea auth failures surface as `tea_missing`, `tea_login_missing`, `tea_login_host_mismatch`, or `tea_auth_failed` (and never fall through to GitHub).
+- Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, persisted by `looper project add --provider <id>`, or created with `--forgejo-url` plus either `--forgejo-token-env` or `--auth tea --tea-login`. The repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
 - Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and summary-comment publish, fixer auto-discovers Reviewer Summary work, and coordinator/auto-merge/GitHub-style thread resolution stay disabled.
