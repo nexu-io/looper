@@ -1,0 +1,199 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/nexu-io/looper/internal/diffanchor"
+	"github.com/nexu-io/looper/internal/infra/shell"
+)
+
+// Authority for inline review anchors is the complete base/head PR diff for the
+// exact SHAs under review — not a bounded shell prefix of `gh pr diff`, and not
+// the agent's requested line numbers by themselves.
+const (
+	reviewPathDiffMaxCapturedBytes = 32 * 1024 * 1024
+	reviewPathDiffCommandTimeout   = 180 * time.Second
+
+	ReviewAnchorAuthorityLocalPathDiff = "local_path_diff"
+	ReviewAnchorAuthorityRemotePRDiff  = "remote_pr_diff"
+)
+
+// BuildReviewAnchorIndexInput selects the complete base/head authority used to
+// validate inline review comment anchors.
+type BuildReviewAnchorIndexInput struct {
+	CWD     string
+	BaseSHA string
+	HeadSHA string
+	Paths   []string
+	// RemoteDiff is an optional fallback that must return a complete, untruncated
+	// PR diff. Local capture truncation and true GitHub oversized responses must
+	// surface as ErrLocalCaptureTruncated / ErrDiffTooLarge so they are not
+	// parsed as complete authority.
+	RemoteDiff func(context.Context) (string, error)
+}
+
+// BuildReviewAnchorIndex builds an authoritative diffanchor.Index for the
+// comment paths. It prefers a path-targeted local base...head git diff after
+// verifying local objects match the refreshed PR SHAs, and only falls back to a
+// complete remote PR diff when that remote payload is fully available.
+func (g *Gateway) BuildReviewAnchorIndex(ctx context.Context, input BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error) {
+	paths := uniqueReviewAnchorPaths(input.Paths)
+	if len(paths) == 0 {
+		return nil, "", nil
+	}
+	baseSHA := strings.TrimSpace(input.BaseSHA)
+	headSHA := strings.TrimSpace(input.HeadSHA)
+	if baseSHA == "" || headSHA == "" {
+		return nil, "", fmt.Errorf("%w: missing base or head SHA", ErrAnchorValidationUnavailable)
+	}
+
+	localIndex, localErr := g.buildLocalPathAnchorIndex(ctx, input.CWD, baseSHA, headSHA, paths)
+	if localErr == nil {
+		return localIndex, ReviewAnchorAuthorityLocalPathDiff, nil
+	}
+
+	if input.RemoteDiff == nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrAnchorValidationUnavailable, localErr)
+	}
+	remoteDiff, remoteErr := input.RemoteDiff(ctx)
+	if remoteErr == nil {
+		// Only complete remote payloads may be parsed into an authoritative index.
+		parsed := diffanchor.Parse(remoteDiff)
+		return &parsed, ReviewAnchorAuthorityRemotePRDiff, nil
+	}
+	if errors.Is(remoteErr, ErrLocalCaptureTruncated) || errors.Is(remoteErr, ErrDiffTooLarge) {
+		return nil, "", fmt.Errorf("%w: remote PR diff unavailable (%s); local path authority failed: %v", ErrAnchorValidationUnavailable, remoteDiffAuthorityReason(remoteErr), localErr)
+	}
+	return nil, "", fmt.Errorf("%w: remote PR diff failed: %v; local path authority failed: %v", ErrAnchorValidationUnavailable, remoteErr, localErr)
+}
+
+func remoteDiffAuthorityReason(err error) string {
+	switch {
+	case errors.Is(err, ErrLocalCaptureTruncated):
+		return DiffTruncationReasonLocalCapture
+	case errors.Is(err, ErrDiffTooLarge):
+		return DiffTruncationReasonGitHubTooLarge
+	default:
+		return AnchorValidationUnavailableReason
+	}
+}
+
+func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, headSHA string, paths []string) (*diffanchor.Index, error) {
+	if err := g.verifyLocalCommitObject(ctx, cwd, baseSHA); err != nil {
+		return nil, err
+	}
+	if err := g.verifyLocalCommitObject(ctx, cwd, headSHA); err != nil {
+		return nil, err
+	}
+
+	// Three-dot range matches GitHub PR diff semantics (merge-base(base, head)...head).
+	args := make([]string, 0, 6+len(paths))
+	args = append(args, "diff", "--no-ext-diff", "--no-color", baseSHA+"..."+headSHA, "--")
+	args = append(args, paths...)
+	result, err := g.runGitForReviewAnchors(ctx, cwd, args...)
+	if result.StdoutTruncated {
+		// Incomplete path-targeted output is never authoritative.
+		return nil, ErrLocalCaptureTruncated
+	}
+	if err != nil {
+		return nil, err
+	}
+	parsed := diffanchor.Parse(result.Stdout)
+	return &parsed, nil
+}
+
+func (g *Gateway) verifyLocalCommitObject(ctx context.Context, cwd, sha string) error {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return fmt.Errorf("%w: empty commit SHA", ErrReviewBaseHeadMismatch)
+	}
+	result, err := g.runGitForReviewAnchors(ctx, cwd, "rev-parse", "--verify", sha+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("%w: commit %s is not available locally: %v", ErrReviewBaseHeadMismatch, sha, err)
+	}
+	got := strings.TrimSpace(result.Stdout)
+	if got == "" {
+		return fmt.Errorf("%w: commit %s resolved empty locally", ErrReviewBaseHeadMismatch, sha)
+	}
+	if !commitSHAsMatch(sha, got) {
+		return fmt.Errorf("%w: expected %s, local object is %s", ErrReviewBaseHeadMismatch, sha, got)
+	}
+	return nil
+}
+
+func commitSHAsMatch(expected, actual string) bool {
+	expected = strings.ToLower(strings.TrimSpace(expected))
+	actual = strings.ToLower(strings.TrimSpace(actual))
+	if expected == "" || actual == "" {
+		return false
+	}
+	if expected == actual {
+		return true
+	}
+	// Allow abbreviated expected SHAs when they uniquely prefix the resolved object.
+	if len(expected) >= 7 && len(expected) < len(actual) && strings.HasPrefix(actual, expected) {
+		return true
+	}
+	if len(actual) >= 7 && len(actual) < len(expected) && strings.HasPrefix(expected, actual) {
+		return true
+	}
+	return false
+}
+
+func (g *Gateway) runGitForReviewAnchors(ctx context.Context, cwd string, args ...string) (shell.Result, error) {
+	gitRun := g.gitRun
+	if gitRun == nil {
+		gitRun = shell.Run
+	}
+	gitPath := strings.TrimSpace(g.gitPath)
+	if gitPath == "" {
+		gitPath = "git"
+	}
+	result, err := gitRun(ctx, shell.Options{
+		Command:          gitPath,
+		Args:             args,
+		CWD:              valueOr(strings.TrimSpace(cwd), g.cwd),
+		Timeout:          reviewPathDiffCommandTimeout,
+		MaxCapturedBytes: reviewPathDiffMaxCapturedBytes,
+	})
+	if err == nil {
+		return result, nil
+	}
+	var commandErr *shell.CommandExecutionError
+	if errors.As(err, &commandErr) {
+		message := strings.TrimSpace(commandErr.Result.Stderr)
+		if message == "" {
+			message = strings.TrimSpace(commandErr.Result.Stdout)
+		}
+		if message == "" {
+			message = commandErr.Error()
+		}
+		formatted := *commandErr
+		formatted.Message = message
+		return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), &formatted)
+	}
+	return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+}
+
+func uniqueReviewAnchorPaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}

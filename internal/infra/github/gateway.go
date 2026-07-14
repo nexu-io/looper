@@ -42,19 +42,43 @@ var (
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 
-var ErrDiffTooLarge = errors.New("github pull request diff is too large")
+var (
+	// ErrDiffTooLarge is returned when GitHub itself refuses a PR diff as oversized
+	// (for example HTTP 406 too_large / 20k-line limit).
+	ErrDiffTooLarge = errors.New("github pull request diff is too large")
+	// ErrLocalCaptureTruncated is returned when Looper's local shell buffer truncated
+	// otherwise-available command output. This is not a GitHub oversized-diff response.
+	ErrLocalCaptureTruncated = errors.New("local shell capture truncated PR diff output")
+	// ErrAnchorValidationUnavailable is returned when review submit cannot establish a
+	// complete base/head diff authority for inline comment anchors.
+	ErrAnchorValidationUnavailable = errors.New("pull request diff anchor validation authority is unavailable")
+	// ErrReviewBaseHeadMismatch is returned when local git objects do not match the
+	// refreshed PR base/head SHAs required for path-targeted anchor authority.
+	ErrReviewBaseHeadMismatch = errors.New("local repository base/head does not match refreshed PR metadata")
+)
+
+// Diagnostic / snapshot reason codes for diff capture and anchor authority.
+const (
+	DiffTruncationReasonLocalCapture   = "local_capture_truncated"
+	DiffTruncationReasonGitHubTooLarge = "github_diff_too_large"
+	AnchorOutsideCompleteDiffReason    = "anchor_outside_complete_diff"
+	AnchorValidationUnavailableReason  = "anchor_validation_unavailable"
+)
 
 type Options struct {
 	GHPath                 string
+	GitPath                string
 	CWD                    string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
 	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
+	GitRun                 func(context.Context, shell.Options) (shell.Result, error)
 	ReviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
 type Gateway struct {
 	ghPath                 string
+	gitPath                string
 	cwd                    string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
@@ -63,6 +87,7 @@ type Gateway struct {
 	discoveryReviewPRCache map[string]discoveryPullRequestListCacheEntry
 	discoveryIssueCache    map[string]discoveryIssueListCacheEntry
 	ghRun                  func(context.Context, shell.Options) (shell.Result, error)
+	gitRun                 func(context.Context, shell.Options) (shell.Result, error)
 	reviewSubmitDiagnostic func(event string, fields map[string]any)
 }
 
@@ -658,6 +683,10 @@ func New(options Options) *Gateway {
 	if ghPath == "" {
 		ghPath = "gh"
 	}
+	gitPath := strings.TrimSpace(options.GitPath)
+	if gitPath == "" {
+		gitPath = "git"
+	}
 	now := options.Now
 	if now == nil {
 		now = time.Now
@@ -666,7 +695,23 @@ func New(options Options) *Gateway {
 	if ghRun == nil {
 		ghRun = shell.Run
 	}
-	return &Gateway{ghPath: ghPath, cwd: options.CWD, now: now, discoveryCacheTTL: options.DiscoveryCacheTTL, discoveryPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{}, discoveryIssueCache: map[string]discoveryIssueListCacheEntry{}, ghRun: ghRun, reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic}
+	gitRun := options.GitRun
+	if gitRun == nil {
+		gitRun = shell.Run
+	}
+	return &Gateway{
+		ghPath:                 ghPath,
+		gitPath:                gitPath,
+		cwd:                    options.CWD,
+		now:                    now,
+		discoveryCacheTTL:      options.DiscoveryCacheTTL,
+		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
+		discoveryReviewPRCache: map[string]discoveryPullRequestListCacheEntry{},
+		discoveryIssueCache:    map[string]discoveryIssueListCacheEntry{},
+		ghRun:                  ghRun,
+		gitRun:                 gitRun,
+		reviewSubmitDiagnostic: options.ReviewSubmitDiagnostic,
+	}
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1814,8 +1859,10 @@ func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput)
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
 	result, err := g.runGhWithTimeout(ctx, input.CWD, "", prDiffGhCommandTimeout, "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
+	// Never treat a truncated local capture as a complete diff authority, and never
+	// collapse it into GitHub's true oversized-diff signal.
 	if result.StdoutTruncated {
-		return "", ErrDiffTooLarge
+		return "", ErrLocalCaptureTruncated
 	}
 	if err != nil {
 		if isDiffTooLargeError(err) {
@@ -2905,7 +2952,7 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	}
 	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		if !errors.Is(err, ErrDiffTooLarge) {
+		if !errors.Is(err, ErrDiffTooLarge) && !errors.Is(err, ErrLocalCaptureTruncated) {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
 	}
@@ -2916,7 +2963,11 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	payloadMap := map[string]any{"detail": detail, "diff": diff}
 	if errors.Is(err, ErrDiffTooLarge) {
 		payloadMap["diffTruncated"] = true
-		payloadMap["diffTruncationReason"] = "github_too_large"
+		payloadMap["diffTruncationReason"] = DiffTruncationReasonGitHubTooLarge
+	}
+	if errors.Is(err, ErrLocalCaptureTruncated) {
+		payloadMap["diffTruncated"] = true
+		payloadMap["diffTruncationReason"] = DiffTruncationReasonLocalCapture
 	}
 	payload, err := json.Marshal(payloadMap)
 	if err != nil {

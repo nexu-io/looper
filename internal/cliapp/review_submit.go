@@ -95,11 +95,22 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("determine current working directory: %w", err)
 	}
+	gitPath := "git"
+	if loaded.Config.Tools.GitPath != nil && strings.TrimSpace(*loaded.Config.Tools.GitPath) != "" {
+		gitPath = strings.TrimSpace(*loaded.Config.Tools.GitPath)
+	}
 
 	diagnosticWriter := func(event string, fields map[string]any) {
 		writeReviewSubmitDiagnosticEntry(cmd.ErrOrStderr(), event, fields)
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: *loaded.Config.Tools.GHPath, CWD: cwd, GHRun: shell.Run, ReviewSubmitDiagnostic: diagnosticWriter})
+	gh := githubinfra.New(githubinfra.Options{
+		GHPath:                 *loaded.Config.Tools.GHPath,
+		GitPath:                gitPath,
+		CWD:                    cwd,
+		GHRun:                  shell.Run,
+		GitRun:                 shell.Run,
+		ReviewSubmitDiagnostic: diagnosticWriter,
+	})
 	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		return fmt.Errorf("refresh pull request before review submit: %w", err)
@@ -123,8 +134,11 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	diff, err := gh.GetPullRequestDiff(cmd.Context(), githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-	var anchors *diffanchor.Index
+
+	// Authority for whether an inline review comment is valid is the complete
+	// diff between the exact PR base and submitted head SHAs — not a bounded
+	// prefix of `gh pr diff` and not the agent-provided line alone.
+	anchors, err := resolveReviewSubmitAnchors(cmd.Context(), gh, repo, prNumber, cwd, detail, payload.Comments)
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
 			if err := r.validateLatestReviewerReviewSubmitHold(cmd, gh, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
@@ -132,22 +146,59 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 			}
 			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
-		return fmt.Errorf("fetch PR diff for anchor validation: %w", err)
+		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+			Repo: repo, PRNumber: prNumber, Event: submissionEvent, CommitID: commitID, Payload: payload, Error: err.Error(),
+			Extra: map[string]any{"reason": githubinfra.AnchorValidationUnavailableReason},
+		})
+		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", err)
 	}
-	parsedAnchors := diffanchor.Parse(diff)
-	anchors = &parsedAnchors
 
 	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	if err := r.validateLatestReviewerReviewSubmitHold(cmd, gh, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+	// Fail closed on base/head drift between anchor resolution and mutation.
+	if err := r.validateLatestReviewerReviewSubmitPublication(cmd, gh, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
 		return err
 	}
 	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
 		return wrapReviewSubmitError(cmd, repo, prNumber, submissionEvent, commitID, payload, "submit validated PR review", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+// resolveReviewSubmitAnchors establishes complete base/head anchor authority.
+// For actionable inline comments it prefers path-targeted local diffs and never
+// treats a truncated remote capture as authoritative. Body-only reviews may
+// still proceed when only GitHub oversized / local capture limits block a full
+// remote diff.
+func resolveReviewSubmitAnchors(ctx context.Context, gh *githubinfra.Gateway, repo string, prNumber int64, cwd string, detail githubinfra.PullRequestDetail, comments []reviewSubmitComment) (*diffanchor.Index, error) {
+	if len(comments) == 0 {
+		diff, err := gh.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		if err != nil {
+			return nil, err
+		}
+		parsed := diffanchor.Parse(diff)
+		return &parsed, nil
+	}
+
+	paths := make([]string, 0, len(comments))
+	for _, comment := range comments {
+		paths = append(paths, comment.Path)
+	}
+	anchors, _, err := gh.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{
+		CWD:     cwd,
+		BaseSHA: detail.BaseSHA,
+		HeadSHA: detail.HeadSHA,
+		Paths:   paths,
+		RemoteDiff: func(ctx context.Context) (string, error) {
+			return gh.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return anchors, nil
 }
 
 // wrapReviewSubmitError keeps content-safety rejections actionable for agents
@@ -376,6 +427,33 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Comma
 	return r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels)
 }
 
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) error {
+	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return fmt.Errorf("refresh pull request before review publish: %w", err)
+	}
+	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+		return err
+	}
+	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
+		return err
+	}
+	return r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels)
+}
+
+func validateExpectedBaseCommit(expected string, actual string) error {
+	expected = strings.TrimSpace(expected)
+	actual = strings.TrimSpace(actual)
+	if expected == "" || actual == "" {
+		// Some fixtures omit base; only enforce when both sides are known.
+		return nil
+	}
+	if !strings.EqualFold(expected, actual) {
+		return fmt.Errorf("review submit expected base commit %s but PR base is %s; refresh the review before submitting", expected, actual)
+	}
+	return nil
+}
+
 func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (bool, error) {
 	runID = strings.TrimSpace(runID)
 	if runID == "" {
@@ -476,7 +554,12 @@ func parseReviewSubmitJSONObject(value *string) map[string]any {
 }
 
 func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {
-	return errors.Is(err, githubinfra.ErrDiffTooLarge) && len(comments) == 0
+	if len(comments) != 0 {
+		// Actionable inline comments must not silently become body-only when
+		// anchor authority is unavailable; fail closed for retry instead.
+		return false
+	}
+	return errors.Is(err, githubinfra.ErrDiffTooLarge) || errors.Is(err, githubinfra.ErrLocalCaptureTruncated)
 }
 
 func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh *githubinfra.Gateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {

@@ -215,7 +215,9 @@ func (idx Index) Validate(anchor Anchor) ValidationResult {
 	if idx.contains(anchor.Path, anchor.Side, startLine, anchor.Line) {
 		return ValidationResult{Valid: true}
 	}
-	return ValidationResult{Valid: false, Reason: "inline anchor is outside the PR diff anchorable ranges", LocationText: fallbackLocation(anchor)}
+	// Reason code is part of the review-submit diagnostic contract: only comments
+	// proven unanchorable against a complete base/head authority use this value.
+	return ValidationResult{Valid: false, Reason: "anchor_outside_complete_diff", LocationText: fallbackLocation(anchor)}
 }
 
 func (idx Index) contains(path, side string, start, end int64) bool {

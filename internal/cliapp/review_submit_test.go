@@ -27,11 +27,33 @@ func TestCanSubmitWithoutAnchorValidationOnlyAllowsLargeDiffTopLevelReviews(t *t
 	if !canSubmitWithoutAnchorValidation(githubinfra.ErrDiffTooLarge, nil) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = false, want true for large diff top-level review")
 	}
+	if !canSubmitWithoutAnchorValidation(githubinfra.ErrLocalCaptureTruncated, nil) {
+		t.Fatalf("canSubmitWithoutAnchorValidation() = false, want true for local capture truncation top-level review")
+	}
 	if canSubmitWithoutAnchorValidation(githubinfra.ErrDiffTooLarge, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false when inline comments need validation")
 	}
+	if canSubmitWithoutAnchorValidation(githubinfra.ErrLocalCaptureTruncated, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
+		t.Fatalf("canSubmitWithoutAnchorValidation(local truncation with comments) = true, want false")
+	}
+	if canSubmitWithoutAnchorValidation(githubinfra.ErrAnchorValidationUnavailable, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
+		t.Fatalf("canSubmitWithoutAnchorValidation(unavailable with comments) = true, want false fail-closed")
+	}
 	if canSubmitWithoutAnchorValidation(errors.New("network failed"), nil) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false for generic diff errors")
+	}
+}
+
+func TestValidateExpectedBaseCommit(t *testing.T) {
+	t.Parallel()
+	if err := validateExpectedBaseCommit("abc123", "ABC123"); err != nil {
+		t.Fatalf("validateExpectedBaseCommit() error = %v", err)
+	}
+	if err := validateExpectedBaseCommit("", "abc123"); err != nil {
+		t.Fatalf("validateExpectedBaseCommit(empty expected) error = %v, want nil", err)
+	}
+	if err := validateExpectedBaseCommit("abc123", "def456"); err == nil || !strings.Contains(err.Error(), "expected base commit") {
+		t.Fatalf("validateExpectedBaseCommit(mismatch) error = %v, want base drift failure", err)
 	}
 }
 
