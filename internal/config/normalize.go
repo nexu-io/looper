@@ -411,24 +411,8 @@ func ApplyForgejoProjectProfile(project *ProjectRefConfig) {
 	if roles.Reviewer.Discovery.Triggers == nil {
 		roles.Reviewer.Discovery.Triggers = &PartialReviewerRoleTriggersConfig{}
 	}
-	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest == nil {
-		roles.Reviewer.Discovery.Triggers.RequireReviewRequest = boolPtr(false)
-	}
-	if roles.Reviewer.Discovery.Triggers.Labels == nil {
-		labels := []string{"looper:review"}
-		roles.Reviewer.Discovery.Triggers.Labels = &labels
-	}
 	if roles.Reviewer.Behavior == nil {
 		roles.Reviewer.Behavior = &PartialReviewerConfig{}
-	}
-	if roles.Reviewer.Behavior.ReviewEvents == nil {
-		roles.Reviewer.Behavior.ReviewEvents = &PartialReviewerReviewEventsConfig{}
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Clean == nil {
-		roles.Reviewer.Behavior.ReviewEvents.Clean = reviewerReviewEventPtr(ReviewerReviewEventComment)
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Blocking == nil {
-		roles.Reviewer.Behavior.ReviewEvents.Blocking = reviewerReviewEventPtr(ReviewerReviewEventComment)
 	}
 	if roles.Reviewer.Behavior.ThreadResolution == nil {
 		roles.Reviewer.Behavior.ThreadResolution = &PartialReviewerThreadResolutionConfig{}

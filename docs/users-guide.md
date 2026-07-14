@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, summary-comment reviewer flows, and the manual/direct native-review-comment fixer path.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer requests/reviews, summary-comment compatibility, and the manual/direct native-review-comment fixer path.
 
 ## 1. Prerequisites
 
@@ -104,9 +104,9 @@ If no project matches the current directory, or multiple projects match, pass `-
 Forgejo MVP role support:
 
 - Planner and Worker are supported over the Forgejo REST API.
-- Reviewer is supported through a top-level Reviewer Summary PR comment. The machine-readable summary is the authority for Forgejo Fixer input.
+- Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level Reviewer Summary compatibility protocol.
 - Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
-- Coordinator, auto-merge, native Forgejo reviewer publishing, review requests, routed network mode, and webhook modes are GitHub-only for now.
+- Coordinator, auto-merge, routed network mode, and webhook modes remain unsupported for Forgejo.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow
@@ -274,7 +274,7 @@ For the default review-requested path, Looper asks GitHub for PRs requested from
 
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
-For Forgejo projects, reviewer auto-discovery uses labels instead of review requests. The provider profile defaults normal PR discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Forgejo reviewer publishes a top-level Reviewer Summary comment and does not create native `APPROVE` or `REQUEST_CHANGES` reviews. Forgejo fixer still consumes `open` Reviewer Summary items and publishes a Fixer Summary comment, but manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments by default and may resolve those native comments after validation, push, and post-push verification.
+For Forgejo projects, reviewer auto-discovery defaults to review requests. Configured labels can be used independently or combined with review requests; combined results are deduplicated deterministically. Reviewer publishes native `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews according to configuration and preserves Looper disclosure/idempotency markers. Self-authored PRs are skipped by default; when self-review is enabled, an attempted clean approval is explicitly downgraded to `COMMENT`. Set reviewer `publishMode` to `summary_comment` to keep the legacy Reviewer Summary/Fixer Summary workflow.
 
 ### What happens after reviewer finishes
 

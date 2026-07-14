@@ -219,17 +219,17 @@ func TestMaterializeCatalogAppliesAndValidatesForgejoRoleProfile(t *testing.T) {
 	}
 	global.Projects = got
 	triggers := config.ProjectRoleConfigs(global, "odcrew").Reviewer.Discovery.Triggers
-	if triggers.RequireReviewRequest || len(triggers.Labels) != 1 || triggers.Labels[0] != "looper:review" {
-		t.Fatalf("materialized reviewer triggers = %#v, want Forgejo label/comment-only profile", triggers)
+	if !triggers.RequireReviewRequest || len(triggers.Labels) != 0 {
+		t.Fatalf("materialized reviewer triggers = %#v, want native Forgejo review-request profile", triggers)
 	}
 	coordinator := config.ProjectRoleConfigs(global, "odcrew").Coordinator
 	if coordinator.Enabled || coordinator.Dependencies.Enabled {
 		t.Fatalf("materialized coordinator = %#v, want Forgejo coordinator and dependency gates disabled", coordinator)
 	}
 
-	incompatibleMetadata := `{"provider":"forgejo-main","repo":"core/odcrew","roles":{"reviewer":{"discovery":{"triggers":{"requireReviewRequest":true}}}},"source":"api"}`
+	incompatibleMetadata := `{"provider":"forgejo-main","repo":"core/odcrew","roles":{"reviewer":{"autoMerge":{"enabled":true}}},"source":"api"}`
 	_, err = MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &incompatibleMetadata}})
-	if err == nil || !strings.Contains(err.Error(), "requireReviewRequest") {
+	if err == nil || !strings.Contains(err.Error(), "autoMerge.enabled") {
 		t.Fatalf("MaterializeCatalog() error = %v, want incompatible Forgejo role rejection", err)
 	}
 }

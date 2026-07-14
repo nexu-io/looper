@@ -483,6 +483,7 @@ type DiscoveryPolicy struct {
 	LabelMode                 config.LabelMode
 	IncludeSpecReviewingLabel bool
 	SpecReviewingLabel        string
+	MatchAnyTrigger           bool
 	RoutedClaimPolicy         networkpolicy.ProjectPolicy
 }
 
@@ -1093,7 +1094,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		result.Skipped++
 		return nil
 	}
-	requireReviewRequest := requireReviewRequestForLoop(loop, policy.RequireReviewRequest, detail.HeadSHA)
+	requireReviewRequest := requireReviewRequestForLoop(loop, reviewRequestRequiredForCandidate(policy, detail.Labels), detail.HeadSHA)
 	allowThreadResolutionFollowUp := false
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) {
 		allowThreadResolutionFollowUp = r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin)
@@ -1102,7 +1103,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 			return nil
 		}
 	}
-	if !isManualReviewerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !isManualReviewerLoop(loop) && !policy.MatchAnyTrigger && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		result.Skipped++
 		return nil
 	}
@@ -1138,6 +1139,20 @@ func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd
 
 func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context, repo, cwd string, limit int, policy DiscoveryPolicy, currentLogin string) ([]PullRequestSummary, error) {
 	labels := prQueryLabels(policy.Labels)
+	if policy.MatchAnyTrigger && policy.RequireReviewRequest && strings.TrimSpace(currentLogin) != "" && len(labels) > 0 && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
+		labelPolicy := policy
+		labelPolicy.RequireReviewRequest = false
+		labelPolicy.MatchAnyTrigger = false
+		labelPulls, err := r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, labelPolicy, currentLogin)
+		if err != nil {
+			return nil, err
+		}
+		requestedPulls, err := r.github.ListReviewRequestedPullRequests(ctx, ListReviewRequestedPullRequestsInput{Repo: repo, CWD: cwd, Limit: defaultDiscoveryLimit(limit), Reviewer: currentLogin})
+		if err != nil {
+			return nil, err
+		}
+		return dedupePullRequestSummaries(append(labelPulls, requestedPulls...), defaultDiscoveryLimit(limit)), nil
+	}
 	if policy.RequireReviewRequest && strings.TrimSpace(currentLogin) != "" && len(labels) == 0 && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		return r.github.ListReviewRequestedPullRequests(ctx, ListReviewRequestedPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Reviewer: currentLogin})
 	}
@@ -1176,6 +1191,22 @@ func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context,
 	return result, nil
 }
 
+func dedupePullRequestSummaries(pulls []PullRequestSummary, limit int) []PullRequestSummary {
+	result := make([]PullRequestSummary, 0, len(pulls))
+	seen := map[int64]struct{}{}
+	for _, pull := range pulls {
+		if _, exists := seen[pull.Number]; exists {
+			continue
+		}
+		seen[pull.Number] = struct{}{}
+		result = append(result, pull)
+		if limit > 0 && len(result) >= limit {
+			break
+		}
+	}
+	return result
+}
+
 func defaultDiscoveryLimit(limit int) int {
 	if limit <= 0 {
 		return 30
@@ -1210,10 +1241,10 @@ func prEligibleForDiscoveryPreclaim(pr PullRequestSummary, currentLogin string, 
 	if isSelfAuthoredPR(pr.Author, currentLogin, policy) {
 		return false
 	}
-	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireReviewRequest && reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && reviewRequestRequiredForCandidate(policy, pr.Labels) && reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 		return false
 	}
-	if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+	if !policy.MatchAnyTrigger && !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 		return false
 	}
 	return true
@@ -1224,7 +1255,28 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	labels := append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...)
+	matchAnyTrigger := r.forgejoProject(projectID) && roles.Reviewer.Discovery.Triggers.RequireReviewRequest && len(prQueryLabels(labels)) > 0
+	return DiscoveryPolicy{AutoDiscovery: roles.Reviewer.Discovery.AutoDiscovery, IncludeDrafts: roles.Reviewer.Discovery.Triggers.IncludeDrafts, RequireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, EnableSelfReview: roles.Reviewer.Discovery.Triggers.EnableSelfReview, Labels: labels, LabelMode: roles.Reviewer.Discovery.Triggers.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+}
+
+func (r *Runner) forgejoProject(projectID string) bool {
+	if r.projectRoleConfig == nil {
+		return false
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if strings.TrimSpace(project.ID) == strings.TrimSpace(projectID) {
+			return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo
+		}
+	}
+	return false
+}
+
+func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) bool {
+	if !policy.RequireReviewRequest {
+		return false
+	}
+	return !(policy.MatchAnyTrigger && len(prQueryLabels(policy.Labels)) > 0 && labelsMatch(labels, policy.Labels, policy.LabelMode))
 }
 
 func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.ReviewerAutoMergeConfig {
@@ -1304,7 +1356,7 @@ func (r *Runner) forgejoCommentOnlyPublishForProject(projectID string) bool {
 		if strings.TrimSpace(project.ID) != projectID {
 			continue
 		}
-		return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo
+		return config.ResolvedProjectProviderKind(*r.projectRoleConfig, project) == config.ProviderKindForgejo && config.ProjectRoleConfigs(*r.projectRoleConfig, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 	}
 	return false
 }
@@ -1927,7 +1979,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.SkipKind = "already_published_head"
 		return checkpoint, nil
 	}
-	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Detail.HeadSHA)
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Detail.HeadSHA)
 	if !isManualReviewerLoop(input.Loop) && networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
 		if err != nil {
@@ -2705,7 +2757,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	executionID := eventlog.NewEventID("agent")
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, checkpoint.Snapshot.HeadSHA)
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Snapshot.HeadSHA)
 	reviewRequestBypassReason := ""
 	if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
 		reviewRequestBypassReason = "follow_up_new_head"
@@ -2893,7 +2945,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		policy := r.discoveryPolicyForProject(input.Project.ID)
-		requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+		requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
 		if requireReviewRequest {
 			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 			if err != nil {
@@ -3006,7 +3058,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	requireReviewRequest := requireReviewRequestForLoop(input.Loop, policy.RequireReviewRequest, pending.HeadSHA)
+	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
 	if requireReviewRequest && !markerResult.Found {
 		staleReason, reviewedReason, login := r.detectMarkerMissingRecovery(ctx, input, checkpoint, pending.HeadSHA, !isManualReviewerLoop(input.Loop))
 		if staleReason != "" {
@@ -6248,6 +6300,16 @@ func reviewerAgentSideGitHubFetchContract() string {
 	}, "\n")
 }
 
+func reviewerProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
+	projectID = strings.TrimSpace(projectID)
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.ID) == projectID {
+			return config.ResolvedProjectProviderKind(cfg, project)
+		}
+	}
+	return config.ProviderKindGitHub
+}
+
 func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
@@ -6256,7 +6318,12 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	publishInstruction := "For actionable findings, you must publish the GitHub review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, follow the clean-result publishing instructions for this run. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you after the agent exits."
+	forgejoNative := reviewerProjectProviderKind(instructionConfig, projectID) == config.ProviderKindForgejo && !commentOnlyPublish
+	forgeName := "GitHub"
+	if forgejoNative {
+		forgeName = "Forgejo"
+	}
+	publishInstruction := fmt.Sprintf("For actionable findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, follow the clean-result publishing instructions for this run. Do not return review JSON for looper to parse; looper will not parse review content or post forge comments for you after the agent exits.", forgeName)
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
@@ -6267,6 +6334,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`. Do not invent feedback."
 	}
 	fetchContract := reviewerAgentSideGitHubFetchContract()
+	if forgejoNative {
+		fetchContract = "Provider-supplied Forgejo review context: Looper fetched the native PR metadata, review decision/history, requested reviewers, and diff before invoking you. Use the prepared local worktree plus this supplied context; Forgejo-only runs do not require `gh`. Publish only through the trusted Looper review-submit wrapper."
+	}
 	if commentOnlyPublish {
 		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata and diff in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
 		outcomeInstruction = "If there are actionable findings, finish successfully with a concise markdown summary and set the final `__LOOPER_RESULT__` JSON fields to include: `summary` (same human summary), `outcome` (`non_blocking` or `blocking`), and `findings` (an array of actionable issues only). Each finding object MUST contain `title`, `body`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no actionable findings, set `outcome` to `clean`, keep `findings` empty, and start `summary` with `No actionable findings`. Do not include terminal logs, extra JSON payloads, or publishing commands."
@@ -6324,7 +6394,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		actionableReviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s` for non-blocking findings or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s%s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	}
 	existingMarkerEventInstruction := "Idempotency outcome matching is strict: only treat an existing `outcome=clean` marker as satisfied when it is on a COMMENTED review if clean policy is COMMENT, or on an APPROVED review if clean policy is APPROVE. A COMMENTED `outcome=clean` marker is also valid when the authenticated GitHub user authored the pull request and the trusted wrapper downgraded self-approval. Only treat an existing `outcome=blocking` marker as satisfied when it is on a CHANGES_REQUESTED review if blocking policy is REQUEST_CHANGES. Treat `outcome=non_blocking` or legacy `outcome=actionable` markers as satisfied only when they are on a COMMENTED review. Ignore matching markers on disallowed review states and publish the correct review for this run instead."
-	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
+	reviewRequestInstruction := fmt.Sprintf("Before posting, confirm the current %s user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`.", forgeName)
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
 	} else if !requireReviewRequest && reviewRequestBypassReason == "follow_up_new_head" {
@@ -6347,26 +6417,36 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
+	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
+	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
+	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor."
+	if forgejoNative {
+		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
+		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), and `body`; the wrapper maps validated anchors to Forgejo positions.", looperCLICommand)
+		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
+		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
+		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors; downgrade unanchorable feedback to a top-level review-body item with an exact file/section/symbol reference."
+	}
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 		submitPayloadInstruction = ""
 	}
 	parts = append(parts,
-		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead.",
+		idempotencyInstruction,
 		existingMarkerEventInstruction,
 		githubOperationContract,
 		"Review pass contract: complete one full review pass before publishing. Collect PR metadata, changed-file list, live diffs, prior unresolved feedback, and necessary surrounding context; then scan every changed file/range in scope. Do not stop after the first issue. If a blocking issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass.",
 		"Finding accumulator contract: accumulate candidate findings internally before publishing. For each candidate, track location, severity, evidence, why it matters, and a suggested fix. Before submitting, deduplicate, merge same-root-cause findings, group repeated patterns into systemic comments with representative examples, and prefer fewer deep comments over many shallow ones. If there are more than 15 blocking findings or more than 25 total comments, avoid comment flooding by publishing grouped systemic blockers instead of many repetitive inline comments.",
 		"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
 		"Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed blocking findings are included, repeated patterns are consolidated, non-blocking/nit feedback is not escalated, every published finding has concrete evidence and a suggested fix, and the review outcome matches the highest published severity.",
-		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
+		freshnessInstruction,
 		reviewRequestInstruction,
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you have actionable findings but do not have concrete actionable prose yet, exit non-zero instead of posting logs. For a clean APPROVE review, write the required author mention, change/verification summary, and warm acknowledgement; never use an LGTM, empty, or disclosure-only clean body as a fallback.",
 		"Shell payload safety contract: never build review JSON inside a double-quoted shell string because Markdown backticks and dollar expressions can execute or expand. Serialize the payload with a JSON-aware tool or pass a literal single-quoted heredoc to the trusted review-submit wrapper.",
 		"Content safety recovery contract: if `looper review submit` fails with an outbound content safety gate rejection, rewrite the rejected body/comments/paths in plain prose without secret-shaped env assignments, credential URLs, env dumps, or high-entropy tokens, then resubmit in the same session; do not exit non-zero solely because of that rejection, and never paste the rejected value into logs, prompts, or the next payload.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|non_blocking|blocking -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
-		"Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor.",
+		anchorInstruction,
 		"Do not add or remove the PR main-conversation +1 reaction yourself. After Looper validates the resulting review marker or accepted clean no-op outcome for this run, the runner will reconcile clean-signal reactions automatically.",
 		specLabelInstruction,
 		cleanInstruction,

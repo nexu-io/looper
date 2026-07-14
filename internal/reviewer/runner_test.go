@@ -7190,6 +7190,36 @@ func TestDiscoverPullRequestsUsesReviewRequestedQueryWhenReviewRequestRequired(t
 	}
 }
 
+func TestListOpenPullRequestsForDiscoveryCombinesForgejoLabelsAndReviewRequests(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{
+		currentLogin: "reviewer",
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"needs-review": {
+				{Number: 42, State: "OPEN", Labels: []string{"needs-review"}},
+				{Number: 43, State: "OPEN", Labels: []string{"needs-review"}},
+			},
+		},
+		reviewRequestedPullRequests: []PullRequestSummary{
+			{Number: 43, State: "OPEN", ReviewRequests: []string{"reviewer"}},
+			{Number: 44, State: "OPEN", ReviewRequests: []string{"reviewer"}},
+		},
+	}
+	runner := New(Options{GitHub: github})
+	policy := DiscoveryPolicy{RequireReviewRequest: true, Labels: []string{"needs-review"}, LabelMode: config.LabelModeAll, MatchAnyTrigger: true}
+
+	pulls, err := runner.listOpenPullRequestsForDiscoveryWithPolicy(context.Background(), "acme/looper", "/tmp/repo", 30, policy, "reviewer")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscoveryWithPolicy() error = %v", err)
+	}
+	if len(pulls) != 3 || pulls[0].Number != 42 || pulls[1].Number != 43 || pulls[2].Number != 44 {
+		t.Fatalf("pulls = %#v, want deterministic deduplicated union [42, 43, 44]", pulls)
+	}
+	if len(github.listCalls) != 1 || len(github.listReviewRequestedCalls) != 1 {
+		t.Fatalf("label calls = %#v, review-request calls = %#v, want one of each", github.listCalls, github.listReviewRequestedCalls)
+	}
+}
+
 func TestDiscoverPullRequestsSuppressesConflictedLastFilterSkipFromReviewRequestedQuery(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -8844,6 +8874,7 @@ func TestProcessClaimedItemForgejoProjectInfersCommentOnlyForCleanNoop(t *testin
 	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -8889,6 +8920,7 @@ func TestProcessClaimedItemCommentOnlyApprovePolicyPublishesCleanNoopWithoutMark
 	cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
 	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventApprove
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {

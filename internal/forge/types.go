@@ -78,7 +78,7 @@ func StaticCapabilities(kind ProviderKind) (Capabilities, bool) {
 	case ProviderKindGitHub:
 		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: true, Webhooks: true, ReviewCommentResolution: ReviewCommentResolutionNative, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionNative, WorkerClaim: WorkerClaimAssignSelf, Webhook: WebhookNative}, true
 	case ProviderKindForgejo:
-		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: false, ReviewRequests: false, AutoMerge: false, Webhooks: false, ReviewCommentResolution: ReviewCommentResolutionManualOnly, Dependencies: false, ReviewDiscovery: ReviewDiscoveryLabel, ReviewPublish: ReviewPublishCommentOnly, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
+		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: false, Webhooks: false, ReviewCommentResolution: ReviewCommentResolutionManualOnly, Dependencies: false, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
 	case ProviderKindPlane:
 		// Plane is a task-source: it owns issues/labels/comments/assignees but
 		// has no pull requests, diffs, or native reviews (those are delegated to

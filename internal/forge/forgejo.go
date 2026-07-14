@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -21,10 +22,13 @@ const defaultForgejoTimeout = 30 * time.Second
 const maxForgejoResponseBodyBytes = 1 << 20
 
 type ForgejoClient struct {
-	baseURL    *url.URL
-	token      string
-	httpClient *http.Client
-	repo       RepositoryRef
+	baseURL         *url.URL
+	token           string
+	httpClient      *http.Client
+	repo            RepositoryRef
+	capabilityMu    sync.Mutex
+	capabilityPaths map[string]map[string]json.RawMessage
+	capabilityState ProbeState
 }
 
 type ForgejoOption func(*ForgejoClient)
@@ -158,6 +162,26 @@ type CreateCommentInput struct {
 	Body        string
 }
 
+type CreatePullRequestReviewInput struct {
+	Number   int64
+	Body     string
+	Event    string
+	CommitID string
+	Comments []PullRequestReviewCommentInput
+}
+
+type PullRequestReviewCommentInput struct {
+	Body        string `json:"body"`
+	Path        string `json:"path,omitempty"`
+	Line        int64  `json:"-"`
+	Side        string `json:"-"`
+	StartLine   int64  `json:"-"`
+	StartSide   string `json:"-"`
+	OldPosition int64  `json:"old_position,omitempty"`
+	NewPosition int64  `json:"new_position,omitempty"`
+	ExtraLines  int64  `json:"extra_lines_count,omitempty"`
+}
+
 type UpdateCommentInput struct {
 	CommentID int64
 	Body      string
@@ -188,6 +212,7 @@ type PullRequest struct {
 	Base      BranchRef
 	Labels    []Label
 	Assignees []Identity
+	Reviewers []Identity
 }
 
 type BranchRef struct {
@@ -222,6 +247,25 @@ type PullRequestReviewComment struct {
 	DiffHunk            string
 	PullRequestReviewID int64
 	Resolver            ForgejoReviewCommentResolverField
+}
+
+type PullRequestReview struct {
+	ID       int64
+	State    string
+	Body     string
+	CommitID string
+	HTMLURL  string
+	User     Identity
+	Comments []PullRequestReviewComment
+}
+
+type UnsupportedCapabilityError struct {
+	Capability string
+	State      ProbeState
+}
+
+func (err *UnsupportedCapabilityError) Error() string {
+	return fmt.Sprintf("forgejo provider capability %s is %s", err.Capability, err.State)
 }
 
 type ForgejoReviewCommentResolverField struct {
@@ -302,6 +346,54 @@ func (forgejo *ForgejoClient) ListOpenPullRequests(ctx context.Context, input Li
 		}
 	}
 	return pulls, nil
+}
+
+func (forgejo *ForgejoClient) AddPullRequestReviewers(ctx context.Context, number int64, reviewers []string) error {
+	if len(reviewers) == 0 {
+		return nil
+	}
+	if err := forgejo.requireCapability(ctx, "reviewRequests", http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/requested_reviewers"); err != nil {
+		return err
+	}
+	return forgejo.do(ctx, http.MethodPost, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "requested_reviewers"), nil, map[string][]string{"reviewers": reviewers}, nil)
+}
+
+func (forgejo *ForgejoClient) ListPullRequestReviewers(ctx context.Context, number int64) ([]Identity, error) {
+	if err := forgejo.requireCapability(ctx, "reviewRequests", http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/requested_reviewers"); err != nil {
+		return nil, err
+	}
+	pull, err := forgejo.ViewPullRequest(ctx, number)
+	if err != nil {
+		return nil, err
+	}
+	return pull.Reviewers, nil
+}
+
+func (forgejo *ForgejoClient) ListReviewRequestedPullRequests(ctx context.Context, reviewer string, limit int) ([]PullRequest, error) {
+	reviewer = strings.TrimSpace(reviewer)
+	if reviewer == "" {
+		return nil, fmt.Errorf("forgejo review-request discovery requires reviewer login")
+	}
+	if err := forgejo.requireCapability(ctx, "reviewRequests", http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/requested_reviewers"); err != nil {
+		return nil, err
+	}
+	pulls, err := forgejo.ListOpenPullRequests(ctx, ListPullRequestsInput{State: "open"})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]PullRequest, 0)
+	for _, pull := range pulls {
+		for _, user := range pull.Reviewers {
+			if strings.EqualFold(strings.TrimSpace(user.Login), reviewer) {
+				result = append(result, pull)
+				break
+			}
+		}
+		if limit > 0 && len(result) >= limit {
+			break
+		}
+	}
+	return result, nil
 }
 
 func (forgejo *ForgejoClient) ViewPullRequest(ctx context.Context, number int64) (PullRequest, error) {
@@ -448,6 +540,103 @@ func (forgejo *ForgejoClient) ListPullRequestReviewComments(ctx context.Context,
 		}
 	}
 	return comments, nil
+}
+
+func (forgejo *ForgejoClient) ListPullRequestReviews(ctx context.Context, number int64) ([]PullRequestReview, error) {
+	if err := forgejo.requireCapability(ctx, "nativeReviews", http.MethodGet, "/repos/{owner}/{repo}/pulls/{index}/reviews"); err != nil {
+		return nil, err
+	}
+	var output []forgejoPullRequestReview
+	if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews"), nil, 0, &output); err != nil {
+		return nil, err
+	}
+	reviews := make([]PullRequestReview, 0, len(output))
+	for _, review := range output {
+		converted := convertPullRequestReview(review)
+		if len(converted.Comments) == 0 {
+			var comments []forgejoPullRequestReviewComment
+			if err := forgejo.getPaged(ctx, forgejo.repoPath("pulls", strconv.FormatInt(number, 10), "reviews", strconv.FormatInt(review.ID, 10), "comments"), nil, 0, &comments); err != nil {
+				return nil, err
+			}
+			for _, comment := range comments {
+				converted.Comments = append(converted.Comments, convertPullRequestReviewComment(comment))
+			}
+		}
+		reviews = append(reviews, converted)
+	}
+	return reviews, nil
+}
+
+func (forgejo *ForgejoClient) CreatePullRequestReview(ctx context.Context, input CreatePullRequestReviewInput) (PullRequestReview, error) {
+	if err := forgejo.requireCapability(ctx, "nativeReviews", http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/reviews"); err != nil {
+		return PullRequestReview{}, err
+	}
+	fields := []outboundguard.Field{{Name: "review body", Text: input.Body}}
+	for index, comment := range input.Comments {
+		fields = append(fields, outboundguard.Field{Name: fmt.Sprintf("inline review comment %d", index+1), Text: comment.Body})
+		if strings.TrimSpace(comment.Path) != "" {
+			fields = append(fields, outboundguard.Field{Name: fmt.Sprintf("inline review comment %d path", index+1), Text: comment.Path})
+		}
+	}
+	if err := outboundguard.Validate(fields...); err != nil {
+		return PullRequestReview{}, err
+	}
+	payload := map[string]any{"body": input.Body, "event": normalizeForgejoReviewEvent(input.Event)}
+	if strings.TrimSpace(input.CommitID) != "" {
+		payload["commit_id"] = strings.TrimSpace(input.CommitID)
+	}
+	if len(input.Comments) > 0 {
+		comments := append([]PullRequestReviewCommentInput(nil), input.Comments...)
+		for index := range comments {
+			position := comments[index].Line
+			if comments[index].StartLine > 0 && comments[index].StartLine <= comments[index].Line {
+				position = comments[index].StartLine
+				comments[index].ExtraLines = comments[index].Line - comments[index].StartLine
+			}
+			if strings.EqualFold(strings.TrimSpace(comments[index].Side), "LEFT") {
+				comments[index].OldPosition = position
+			} else {
+				comments[index].NewPosition = position
+			}
+		}
+		payload["comments"] = comments
+	}
+	var output forgejoPullRequestReview
+	if err := forgejo.do(ctx, http.MethodPost, forgejo.repoPath("pulls", strconv.FormatInt(input.Number, 10), "reviews"), nil, payload, &output); err != nil {
+		return PullRequestReview{}, err
+	}
+	return convertPullRequestReview(output), nil
+}
+
+func (forgejo *ForgejoClient) requireCapability(ctx context.Context, name, method, path string) error {
+	forgejo.capabilityMu.Lock()
+	defer forgejo.capabilityMu.Unlock()
+	if forgejo.capabilityState != "" {
+		state := forgejo.capabilityState
+		if state == ProbeStateSupported {
+			state = forgejoOpenAPISupport(forgejo.capabilityPaths, method, path)
+		}
+		if state != ProbeStateSupported {
+			return &UnsupportedCapabilityError{Capability: name, State: state}
+		}
+		return nil
+	}
+	response, err := forgejoProbeGET(ctx, forgejo.httpClient, forgejoProbeURL(forgejo.baseURL, "swagger.v1.json"), forgejo.token, maxForgejoOpenAPIBytes)
+	if err != nil {
+		state := ProbeStateUnknown
+		if response.statusCode == http.StatusNotFound || response.statusCode == http.StatusMethodNotAllowed {
+			state = ProbeStateUnsupported
+		}
+		forgejo.capabilityState = state
+		return &UnsupportedCapabilityError{Capability: name, State: state}
+	}
+	forgejo.capabilityPaths = decodeForgejoOpenAPIPaths(response.body)
+	forgejo.capabilityState = ProbeStateSupported
+	state := forgejoOpenAPISupport(forgejo.capabilityPaths, method, path)
+	if state != ProbeStateSupported {
+		return &UnsupportedCapabilityError{Capability: name, State: state}
+	}
+	return nil
 }
 
 func (forgejo *ForgejoClient) ResolvePullRequestReviewComment(ctx context.Context, number int64, commentID int64) error {
@@ -658,6 +847,7 @@ type forgejoPullRequest struct {
 	Base      forgejoBranch  `json:"base"`
 	Labels    []forgejoLabel `json:"labels"`
 	Assignees []forgejoUser  `json:"assignees"`
+	Reviewers []forgejoUser  `json:"requested_reviewers"`
 }
 
 type forgejoBranch struct {
@@ -717,7 +907,13 @@ type forgejoPullRequestReviewComment struct {
 }
 
 type forgejoPullRequestReview struct {
-	ID int64 `json:"id"`
+	ID       int64                             `json:"id"`
+	State    string                            `json:"state"`
+	Body     string                            `json:"body"`
+	CommitID string                            `json:"commit_id"`
+	HTMLURL  string                            `json:"html_url"`
+	User     forgejoUser                       `json:"user"`
+	Comments []forgejoPullRequestReviewComment `json:"comments"`
 }
 
 func convertIssue(input forgejoIssue) Issue {
@@ -725,7 +921,37 @@ func convertIssue(input forgejoIssue) Issue {
 }
 
 func convertPullRequest(input forgejoPullRequest) PullRequest {
-	return PullRequest{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, IsDraft: input.Draft, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
+	return PullRequest{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, IsDraft: input.Draft, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Head: convertBranch(input.Head), Base: convertBranch(input.Base), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees), Reviewers: convertUsers(input.Reviewers)}
+}
+
+func convertPullRequestReview(input forgejoPullRequestReview) PullRequestReview {
+	comments := make([]PullRequestReviewComment, 0, len(input.Comments))
+	for _, comment := range input.Comments {
+		comments = append(comments, convertPullRequestReviewComment(comment))
+	}
+	return PullRequestReview{ID: input.ID, State: normalizeForgejoReviewState(input.State), Body: input.Body, CommitID: input.CommitID, HTMLURL: input.HTMLURL, User: convertUser(input.User), Comments: comments}
+}
+
+func normalizeForgejoReviewEvent(event string) string {
+	switch strings.ToUpper(strings.TrimSpace(event)) {
+	case "COMMENTED":
+		return "COMMENT"
+	case "CHANGES_REQUESTED":
+		return "REQUEST_CHANGES"
+	default:
+		return strings.ToUpper(strings.TrimSpace(event))
+	}
+}
+
+func normalizeForgejoReviewState(state string) string {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "COMMENT":
+		return "COMMENTED"
+	case "REQUEST_CHANGES":
+		return "CHANGES_REQUESTED"
+	default:
+		return strings.ToUpper(strings.TrimSpace(state))
+	}
 }
 
 func convertComment(input forgejoComment) Comment {

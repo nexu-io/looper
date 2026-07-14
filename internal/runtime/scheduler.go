@@ -235,50 +235,6 @@ func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderCon
 	return config.ProviderConfig{}, false, nil
 }
 
-func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string) []string {
-	if cfg == nil {
-		return nil
-	}
-	repo = strings.TrimSpace(repo)
-	if strings.TrimSpace(cwd) != "" {
-		for _, project := range cfg.Projects {
-			if cwdBelongsToProject(project, cwd) {
-				return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
-			}
-		}
-	}
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return nil
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		return forgejoReviewerDiscoveryLabelsForProject(*cfg, *matched)
-	}
-	return nil
-}
-
-func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
-	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
-		return nil
-	}
-	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
-	result := make([]string, 0, len(labels))
-	for _, label := range labels {
-		label = strings.TrimSpace(label)
-		if label != "" {
-			result = append(result, label)
-		}
-	}
-	return result
-}
-
 func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
 	if cfg == nil {
 		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
@@ -460,6 +416,54 @@ func forgeLabelNames(labels []forge.Label) []string {
 		}
 	}
 	return names
+}
+
+func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
+	requested := pr.Reviewers
+	reviews, err := client.ListPullRequestReviews(ctx, pr.Number)
+	if err != nil {
+		var capabilityErr *forge.UnsupportedCapabilityError
+		if !compatibilityFallback || !errors.As(err, &capabilityErr) {
+			return nil, nil, nil, "", err
+		}
+	}
+	objects := make([]map[string]any, 0, len(reviews))
+	latestStates := map[string]string{}
+	for _, review := range reviews {
+		objects = append(objects, map[string]any{
+			"id":     review.ID,
+			"author": map[string]any{"login": review.User.Login},
+			"body":   review.Body,
+			"state":  review.State,
+			"commit": map[string]any{"oid": review.CommitID},
+			"url":    review.HTMLURL,
+		})
+		if login := strings.ToLower(strings.TrimSpace(review.User.Login)); login != "" {
+			latestStates[login] = review.State
+		}
+	}
+	decision := ""
+	for _, state := range latestStates {
+		if state == "CHANGES_REQUESTED" {
+			decision = "CHANGES_REQUESTED"
+			break
+		}
+		if state == "APPROVED" {
+			decision = "APPROVED"
+		}
+	}
+	return forgeIdentityLogins(requested), forgeNetworkPolicyUsers(requested), objects, decision, nil
+}
+
+func forgejoSummaryCommentMode(cfg *config.Config, cwd string) bool {
+	if cfg == nil {
+		return false
+	}
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil || !matched || config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		return false
+	}
+	return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 }
 
 func appendLabels(label string, labels []string) []string {
@@ -741,11 +745,11 @@ func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input pl
 }
 
 func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input planner.PullRequestReviewersInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		return nil
+		return client.AddPullRequestReviewers(ctx, input.PRNumber, input.Reviewers)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -832,7 +836,11 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login})
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.CWD))
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -851,11 +859,23 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Context, input reviewer.ListReviewRequestedPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("forgejo reviewer does not support review-request discovery")
+		pullRequests, err := client.ListReviewRequestedPullRequests(ctx, input.Reviewer, input.Limit)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, false)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+		}
+		return result, nil
 	}
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
@@ -902,7 +922,11 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff, IssueComments: forgeCommentsToObjects(comments)}, nil
+		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.CWD))
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -915,6 +939,19 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return githubinfra.IssueDetail{}, err
+		}
+		return githubinfra.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: forgeLabelNames(issue.Labels), Assignees: forgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
+	}
+	if a.gateway == nil {
+		return githubinfra.IssueDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.ViewIssue(ctx, input)
 }
 
@@ -984,11 +1021,18 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 		if err != nil {
 			return reviewer.ReviewMarkerResult{}, err
 		}
-		comments, err := client.ListIssueComments(ctx, input.PRNumber)
+		if forgejoSummaryCommentMode(a.config, input.CWD) {
+			comments, err := client.ListIssueComments(ctx, input.PRNumber)
+			if err != nil {
+				return reviewer.ReviewMarkerResult{}, err
+			}
+			return findForgejoReviewMarker(comments, input), nil
+		}
+		reviews, err := client.ListPullRequestReviews(ctx, input.PRNumber)
 		if err != nil {
 			return reviewer.ReviewMarkerResult{}, err
 		}
-		return findForgejoReviewMarker(comments, input), nil
+		return findForgejoNativeReviewMarker(reviews, input), nil
 	}
 	if a.gateway == nil {
 		return reviewer.ReviewMarkerResult{}, fmt.Errorf("github gateway is not configured")
@@ -1026,6 +1070,41 @@ func findForgejoReviewMarker(comments []forge.Comment, input reviewer.VerifyRevi
 			continue
 		}
 		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: reviewer.ReviewEventComment, AuthorLogin: author, Body: comment.Body}
+	}
+	return newest
+}
+
+func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input reviewer.VerifyReviewMarkerInput) reviewer.ReviewMarkerResult {
+	expectedAuthor := strings.ToLower(strings.TrimSpace(input.AuthorLogin))
+	allowed := map[reviewer.ReviewEvent]bool{}
+	for _, event := range input.AllowedReviewEvents {
+		allowed[event] = true
+	}
+	var newest reviewer.ReviewMarkerResult
+	for _, review := range reviews {
+		marker, ok := findRuntimeReviewIdempotencyMarker(review.Body, input.Marker)
+		if !ok {
+			continue
+		}
+		author := strings.TrimSpace(review.User.Login)
+		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
+			continue
+		}
+		event := reviewer.ReviewEventComment
+		switch review.State {
+		case "APPROVED":
+			event = reviewer.ReviewEventApprove
+		case "CHANGES_REQUESTED":
+			event = reviewer.ReviewEventRequestChanges
+		}
+		if len(allowed) > 0 && !allowed[event] && !(event == reviewer.ReviewEventComment && marker.Outcome == "clean" && input.AllowCleanComment) {
+			continue
+		}
+		inlineBodies := make([]string, 0, len(review.Comments))
+		for _, comment := range review.Comments {
+			inlineBodies = append(inlineBodies, comment.Body)
+		}
+		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: marker.Outcome, Event: event, AuthorLogin: author, Body: review.Body, InlineCommentBodies: inlineBodies}
 	}
 	return newest
 }
@@ -1190,22 +1269,56 @@ func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input rev
 }
 
 func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		comments := make([]forge.PullRequestReviewCommentInput, 0, len(input.Comments))
+		for _, comment := range input.Comments {
+			comments = append(comments, forge.PullRequestReviewCommentInput{Body: a.stamper.ReviewComment(comment.Body, "reviewer"), Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+		}
+		body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
+		_, err = client.CreatePullRequestReview(ctx, forge.CreatePullRequestReviewInput{Number: input.PRNumber, Body: body, Event: input.Event, CommitID: input.CommitID, Comments: comments})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.SubmitReview(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("forgejo provider capability autoMerge is unsupported")
+	}
 	return a.gateway.EnableAutoMerge(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		return err
+	}
 	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		return err
+	}
 	return a.gateway.RemovePullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
 	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
@@ -1228,6 +1341,17 @@ func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, inpu
 }
 
 func (a reviewerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input githubinfra.IssueLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, label := range input.Labels {
+			if err := client.RemoveIssueLabel(ctx, input.IssueNumber, label); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	return a.gateway.RemoveIssueLabels(ctx, input)
 }
 
@@ -2105,13 +2229,7 @@ func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input 
 		if err != nil {
 			return err
 		}
-		labels := forgejoReviewerDiscoveryLabelsForRepo(a.config, input.Repo, input.CWD)
-		if len(labels) > 0 {
-			if _, err := client.AddIssueLabels(ctx, input.PRNumber, labels); err != nil {
-				return err
-			}
-		}
-		return nil
+		return client.AddPullRequestReviewers(ctx, input.PRNumber, input.Reviewers)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")

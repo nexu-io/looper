@@ -327,14 +327,14 @@ func TestMinimalForgejoProviderConfigAppliesSafeProjectProfile(t *testing.T) {
 		t.Fatalf("provider baseUrl = %q, want normalized host without trailing slash", got)
 	}
 	roles := ProjectRoleConfigs(loaded.Config, "demo")
-	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
-		t.Fatalf("forgejo reviewer requireReviewRequest = true, want false")
+	if !roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatalf("forgejo reviewer requireReviewRequest = false, want true")
 	}
 	if roles.Fixer.AutoDiscovery {
 		t.Fatalf("forgejo fixer autoDiscovery = true, want false")
 	}
-	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment || roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
-		t.Fatalf("forgejo review events = %#v, want comment-only", roles.Reviewer.Behavior.ReviewEvents)
+	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove || roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
+		t.Fatalf("forgejo review events = %#v, want native review defaults", roles.Reviewer.Behavior.ReviewEvents)
 	}
 }
 
@@ -372,7 +372,7 @@ func TestPlaneProviderConfigLoadsWorkspaceAndProjectID(t *testing.T) {
 	}
 }
 
-func TestForgejoExplicitUnsupportedProjectOptInFails(t *testing.T) {
+func TestForgejoExplicitReviewRequestOptInLoads(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
 	contents := `{
@@ -384,12 +384,12 @@ func TestForgejoExplicitUnsupportedProjectOptInFails(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
-	if err == nil {
-		t.Fatal("LoadFile() error = nil, want forgejo unsupported feature validation error")
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "requireReviewRequest") {
-		t.Fatalf("LoadFile() error = %v, want requireReviewRequest validation", err)
+	if !ProjectRoleConfigs(loaded.Config, "demo").Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatal("forgejo requireReviewRequest = false, want true")
 	}
 }
 
@@ -432,18 +432,18 @@ func TestMixedGitHubAndForgejoProjectsKeepGlobalDefaultsAndApplyForgejoOverrides
 	}
 
 	forgejoRoles := ProjectRoleConfigs(loaded.Config, "forgejo")
-	if forgejoRoles.Reviewer.Discovery.Triggers.RequireReviewRequest {
-		t.Fatalf("forgejo reviewer requireReviewRequest = true, want false")
+	if !forgejoRoles.Reviewer.Discovery.Triggers.RequireReviewRequest {
+		t.Fatalf("forgejo reviewer requireReviewRequest = false, want true")
 	}
 	if forgejoRoles.Fixer.AutoDiscovery {
 		t.Fatalf("forgejo fixer autoDiscovery = true, want false")
 	}
-	if forgejoRoles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment || forgejoRoles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
-		t.Fatalf("forgejo review events = %#v, want comment-only", forgejoRoles.Reviewer.Behavior.ReviewEvents)
+	if forgejoRoles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove || forgejoRoles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
+		t.Fatalf("forgejo review events = %#v, want native review defaults", forgejoRoles.Reviewer.Behavior.ReviewEvents)
 	}
 }
 
-func TestForgejoProjectRejectsProjectReviewEventOverrides(t *testing.T) {
+func TestForgejoProjectAcceptsNativeReviewEventOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
 	contents := `{
@@ -455,16 +455,14 @@ func TestForgejoProjectRejectsProjectReviewEventOverrides(t *testing.T) {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
-	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
-	if err == nil {
-		t.Fatal("LoadFile() error = nil, want forgejo project reviewEvents validation error")
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
 	}
-	var validationErr *ConfigValidationError
-	if !errors.As(err, &validationErr) {
-		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	roles := ProjectRoleConfigs(loaded.Config, "demo")
+	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove || roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventRequestChanges {
+		t.Fatalf("review events = %#v", roles.Reviewer.Behavior.ReviewEvents)
 	}
-	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.reviewEvents.clean", "must be COMMENT for forgejo projects")
-	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.reviewEvents.blocking", "must be COMMENT for forgejo projects")
 }
 
 func TestForgejoProjectRejectsUnsupportedRoleCapabilityOptIns(t *testing.T) {
@@ -3082,7 +3080,7 @@ func TestLoadFileReturnsConfigValidationErrorForUnsupportedConfig(t *testing.T) 
 	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.minPublishIntervalSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.scope", "must be one of: full_pr, changed_files, changed_ranges")
-	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.publishMode", "must be single_review")
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.publishMode", "must be single_review or summary_comment")
 	assertValidationIssue(t, validationErr, "notifications.osascript.soundForLevels", "contains unsupported value: ring")
 	assertValidationIssue(t, validationErr, "projects[0].id", "must not contain path separators, dot segments, or be an absolute path")
 }

@@ -194,8 +194,8 @@ func TestForgejoClientContract(t *testing.T) {
 	if got := client.Repository().BaseURL; got != server.URL+"/forge" {
 		t.Fatalf("Repository().BaseURL = %q, want %q", got, server.URL+"/forge")
 	}
-	if got := client.Capabilities().ReviewPublish; got != ReviewPublishCommentOnly {
-		t.Fatalf("Capabilities().ReviewPublish = %q, want %q", got, ReviewPublishCommentOnly)
+	if got := client.Capabilities().ReviewPublish; got != ReviewPublishNative {
+		t.Fatalf("Capabilities().ReviewPublish = %q, want %q", got, ReviewPublishNative)
 	}
 	if len(requests) == 0 || requests[0].Auth != "token super-secret" {
 		t.Fatalf("Authorization header = %#v, want token auth", requests)

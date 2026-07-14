@@ -221,7 +221,7 @@ Grok Build support is fresh-run only. Daemon native resume and interactive takeo
 Looper supports three provider kinds:
 
 - `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
-- `forgejo` — REST-backed MVP for planner, worker, summary-comment reviewer/fixer flows, plus manual/direct native-review-comment fixer runs. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
+- `forgejo` — REST-backed planner, worker, native reviewer-request/review flows, summary-comment compatibility, and manual/direct native-review-comment fixer runs. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
 - `plane` — a **task-source** provider: issues (work-items) are read from a [Plane](https://plane.so) project, while pull requests, diffs, and reviews stay on the project's GitHub code repo. Use this to let Looper consume Plane work-items directly as its issue source without creating a redundant GitHub issue. See [Plane provider + Feishu HITL setup](plane-provider.md) for the full guide, including the one-command `looper bootstrap --provider plane …` flow.
 
 Forgejo provider example:
@@ -252,11 +252,11 @@ Forgejo rules:
 - Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, or persisted by `looper project add --provider <id>`; the repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
-- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses label discovery and summary-comment publish, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.
+- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses native review-request discovery and native review publication, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.
 - Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
 - `looper status` reads the Forgejo version, identity, repository permissions, and OpenAPI document with a bounded timeout and no mutations. Capability output separates Looper's configured support from the server-observed contract; missing or disabled OpenAPI is `unknown`. The probe is fresh for each status request and is not persisted or used as a daemon startup gate.
 
-Forgejo reviewer discovery uses labels, not review requests. The current provider profile defaults implementation-review discovery to `looper:review`; spec PRs still use `looper:spec-reviewing` as the spec-review phase label. Reviewer writes the top-level Reviewer Summary comment that Fixer treats as one repair-work source. For manual/direct Forgejo fixer runs, Looper also reads native unresolved Forgejo PR review comments by default, repairs them with a separate `forgejo_review_comment` contract, and resolves only comments explicitly confirmed as `fixed` after validation, push, and a post-push re-read. Reviewer Summary items remain separate from native comments and still produce a top-level Fixer Summary comment.
+Forgejo reviewer discovery defaults to native review requests. Configured reviewer labels remain an optional source; when labels and review requests are both enabled, Forgejo uses their union with deterministic PR-number dedupe. Native clean and blocking outcomes follow `reviewEvents` (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`). Set `roles.reviewer.behavior.publishMode = "summary_comment"` and configure reviewer labels to retain the legacy top-level Reviewer Summary compatibility flow. Native operations require the corresponding endpoint in the Forgejo OpenAPI contract; older instances fail with a provider capability error instead of silently switching modes.
 
 ### Plane task-source provider
 
@@ -895,7 +895,7 @@ Forgejo provider profile differences:
 
 - planner discovers labeled issues through the Forgejo REST provider
 - worker discovers only issues already assigned to the current Forgejo user and does not claim work by adding itself as assignee
-- reviewer discovers by configured labels and publishes a top-level Reviewer Summary comment; it does not use review requests or native PR review events
+- reviewer defaults to native review requests and native PR review events; configured labels can be used alone or combined, and `publishMode = "summary_comment"` retains the legacy summary flow
 - fixer auto-discovery still follows Reviewer Summary items only, while manual/direct Forgejo fixer runs also consume unresolved native Forgejo review comments and may resolve those native comments after validation + push + post-push verification
 - coordinator, auto-merge, review-thread resolution, routed network mode, and webhook modes are unsupported for Forgejo in the MVP and fail fast if explicitly enabled
 
@@ -906,9 +906,9 @@ Common fields:
 - reviewer: `triggers.includeDrafts`, `triggers.requireReviewRequest`, `triggers.enableSelfReview`, `triggers.labels`, `triggers.labelMode`, `specReview.includeReviewingLabel`, `specReview.reviewingLabel`
 - fixer: `triggers.includeDrafts`, `triggers.authorFilter` (`current_user` or `any`), `triggers.labels`, `triggers.labelMode`
 
-Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
+Trigger fields are combined with logical AND except Forgejo reviewer labels plus native review requests, which are independent discovery sources and combine as a deduplicated union. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
 
-When reviewer `triggers.requireReviewRequest=true` and no reviewer label filter is configured, discovery queries GitHub directly for PRs review-requested from the current GitHub user. This avoids missing requested reviews that fall outside the generic open-PR discovery window. Reviewer label filters keep using the labeled open-PR query path and are still applied before queuing.
+When reviewer `triggers.requireReviewRequest=true` and no reviewer label filter is configured, discovery queries the forge for PRs review-requested from the current user. This avoids missing requested reviews that fall outside the generic open-PR discovery window. On Forgejo, label filters can instead be selected alone or combined with review-request discovery.
 
 For reviewer discovery, `triggers.enableSelfReview` defaults to `false`. When omitted or falsy, non-manual reviewer loops skip pull requests whose normalized PR author login matches the current authenticated GitHub login. Set it to `true` to allow those loops to review self-authored PRs.
 

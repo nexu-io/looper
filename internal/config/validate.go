@@ -211,8 +211,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if !isValidReviewerScope(config.Roles.Reviewer.Behavior.Scope) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.scope", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges)})
 	}
-	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
+	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview && config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSummaryComment {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s or %s", ReviewerPublishModeSingleReview, ReviewerPublishModeSummaryComment)})
 	}
 	if !isValidReviewerThreadResolutionMode(config.Roles.Reviewer.Behavior.ThreadResolution.Mode) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
@@ -391,6 +391,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if providerKind == ProviderKindForgejo {
 			validateForgejoRoleCapabilities(effectiveProjectRoles, prefix, &issues)
+		} else if effectiveProjectRoles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
+			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
 		}
 		if normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
 			validateRoutedProjectPrerequisites(config, effectiveProjectRoles, prefix, &issues)
@@ -465,15 +467,6 @@ func isAbsoluteHTTPURL(value string) bool {
 }
 
 func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.triggers.requireReviewRequest", Message: "must be false for forgejo projects"})
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.reviewEvents.clean", Message: "must be COMMENT for forgejo projects"})
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.reviewEvents.blocking", Message: "must be COMMENT for forgejo projects"})
-	}
 	if roles.Reviewer.AutoMerge.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false for forgejo projects"})
 	}

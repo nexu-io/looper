@@ -92,8 +92,8 @@ func TestServiceAddForgejoProjectActivatesProviderBinding(t *testing.T) {
 		t.Fatalf("catalog projects = %#v, want published Forgejo binding", snapshot.Projects)
 	}
 	triggers := snapshot.Projects[0].Roles.Reviewer.Discovery.Triggers
-	if triggers.RequireReviewRequest == nil || *triggers.RequireReviewRequest || triggers.Labels == nil || len(*triggers.Labels) != 1 || (*triggers.Labels)[0] != "looper:review" {
-		t.Fatalf("catalog reviewer triggers = %#v, want Forgejo label profile", triggers)
+	if triggers.RequireReviewRequest != nil || triggers.Labels != nil {
+		t.Fatalf("catalog reviewer triggers = %#v, want inherited native Forgejo review-request profile", triggers)
 	}
 }
 

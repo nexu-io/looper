@@ -48,7 +48,7 @@ func TestProbeForgejoProviderReportsHealthAccessAndCapabilities(t *testing.T) {
 		t.Fatalf("reviewCommentResolve = %#v", resolve)
 	}
 	nativeReview := health.Capabilities["nativeReviews"]
-	if nativeReview.Configured != ProbeStateUnsupported || nativeReview.Observed != ProbeStateSupported || nativeReview.Effective != ProbeStateUnsupported {
+	if nativeReview.Configured != ProbeStateSupported || nativeReview.Observed != ProbeStateSupported || nativeReview.Effective != ProbeStateSupported {
 		t.Fatalf("nativeReviews = %#v", nativeReview)
 	}
 	if len(health.Projects) != 1 || health.Projects[0].Access != AccessWritable {

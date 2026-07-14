@@ -157,35 +157,24 @@ func TestForgeRoutingRejectsOverlappingWorktreeRoots(t *testing.T) {
 	}
 }
 
-func TestWorkerGitHubAdapterForgejoCreatePullRequestQueuesReviewerDiscoveryLabel(t *testing.T) {
+func TestWorkerGitHubAdapterForgejoCreatePullRequestRequestsNativeReviewer(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var createdBody map[string]any
-	var labelBody map[string][]string
-	currentLabels := []map[string]any{}
+	var reviewerBody map[string][]string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
 			if err := json.NewDecoder(r.Body).Decode(&createdBody); err != nil {
 				t.Fatalf("decode create PR body: %v", err)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"number": 201, "html_url": serverURL(r) + "/acme/looper/pulls/201", "head": map[string]any{"ref": "worker-branch", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}, "labels": currentLabels})
-		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/201/labels":
-			if err := json.NewDecoder(r.Body).Decode(&labelBody); err != nil {
-				t.Fatalf("decode labels body: %v", err)
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": 201, "html_url": serverURL(r) + "/acme/looper/pulls/201", "head": map[string]any{"ref": "worker-branch", "sha": "abc"}, "base": map[string]any{"ref": "main", "sha": "def"}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/201/requested_reviewers":
+			if err := json.NewDecoder(r.Body).Decode(&reviewerBody); err != nil {
+				t.Fatalf("decode reviewers body: %v", err)
 			}
-			currentLabels = currentLabels[:0]
-			for i, label := range labelBody["labels"] {
-				currentLabels = append(currentLabels, map[string]any{"id": i + 1, "name": label})
-			}
-			_ = json.NewEncoder(w).Encode(currentLabels)
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{
-				"number": 201, "title": "Implement worker", "body": "Body", "state": "open",
-				"head":   map[string]any{"ref": "worker-branch", "sha": "abc"},
-				"base":   map[string]any{"ref": "main", "sha": "def"},
-				"user":   map[string]any{"login": "worker", "id": 1},
-				"labels": currentLabels,
-			}})
+			w.WriteHeader(http.StatusCreated)
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -219,16 +208,8 @@ func TestWorkerGitHubAdapterForgejoCreatePullRequestQueuesReviewerDiscoveryLabel
 	if createdBody["head"] != "worker-branch" || createdBody["base"] != "main" {
 		t.Fatalf("create body = %#v, want worker-branch->main", createdBody)
 	}
-	if got := labelBody["labels"]; len(got) != 1 || got[0] != "team-review" {
-		t.Fatalf("label body = %#v, want configured reviewer discovery label", labelBody)
-	}
-	reviewerAdapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
-	prs, err := reviewerAdapter.ListOpenPullRequests(context.Background(), reviewer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Labels: []string{"team-review"}})
-	if err != nil {
-		t.Fatalf("ListOpenPullRequests() error = %v", err)
-	}
-	if len(prs) != 1 || prs[0].Number != 201 {
-		t.Fatalf("prs = %#v, want worker-created PR rediscovered by reviewer label", prs)
+	if got := reviewerBody["reviewers"]; len(got) != 1 || got[0] != "reviewer" {
+		t.Fatalf("reviewer body = %#v, want native reviewer request", reviewerBody)
 	}
 }
 
@@ -241,6 +222,8 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	var comparePath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
 			listLabels = r.URL.Query().Get("labels")
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
@@ -293,6 +276,7 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 
 	repoPath := filepath.Join(t.TempDir(), "repo")
 	cfg := config.Config{
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
@@ -364,6 +348,7 @@ func TestReviewerGitHubAdapterForgejoThreadResolutionShortCircuits(t *testing.T)
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	repoPath := filepath.Join(t.TempDir(), "repo")
 	cfg := config.Config{
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}
@@ -410,6 +395,7 @@ func TestReviewerGitHubAdapterForgejoFindReviewMarkerUsesIssueComments(t *testin
 
 	repoPath := filepath.Join(t.TempDir(), "repo")
 	cfg := config.Config{
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
 		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
 		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
 	}

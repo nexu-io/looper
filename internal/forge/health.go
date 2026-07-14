@@ -370,7 +370,7 @@ func rebuildForgejoProjectHealth(projects []ForgejoProbeProject, capabilities ma
 func restrictForgejoWriteCapabilities(capabilities map[string]CapabilityReport, state ProbeState, reason string) map[string]CapabilityReport {
 	result := make(map[string]CapabilityReport, len(capabilities))
 	for name, report := range capabilities {
-		if report.Configured == ProbeStateSupported && (name == "reviewCommentResolve" || name == "merge" || name == "webhooks") && report.Effective == ProbeStateSupported {
+		if report.Configured == ProbeStateSupported && (name == "reviewRequests" || name == "nativeReviews" || name == "reviewCommentResolve" || name == "merge" || name == "webhooks") && report.Effective == ProbeStateSupported {
 			report.Effective = state
 			report.Degraded = true
 			report.Reason = reason

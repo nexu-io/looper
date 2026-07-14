@@ -82,7 +82,8 @@ const (
 type ReviewerPublishMode string
 
 const (
-	ReviewerPublishModeSingleReview ReviewerPublishMode = "single_review"
+	ReviewerPublishModeSingleReview   ReviewerPublishMode = "single_review"
+	ReviewerPublishModeSummaryComment ReviewerPublishMode = "summary_comment"
 )
 
 type ReviewerThreadResolutionMode string

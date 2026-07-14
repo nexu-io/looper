@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/outboundguard"
@@ -32,6 +36,50 @@ func TestCanSubmitWithoutAnchorValidationOnlyAllowsLargeDiffTopLevelReviews(t *t
 	}
 	if canSubmitWithoutAnchorValidation(errors.New("network failed"), nil) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false for generic diff errors")
+	}
+}
+
+func TestForgejoReviewSubmitGatewayReusesMatchingNativeReviewMarker(t *testing.T) {
+	t.Parallel()
+	marker := "<!-- looper:review id=reviewer:loop:head head=head outcome=blocking -->"
+	reviews := []map[string]any{}
+	publishCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+			_ = json.NewEncoder(w).Encode(reviews)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+			publishCalls++
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode review payload: %v", err)
+			}
+			review := map[string]any{"id": 9, "state": "REQUEST_CHANGES", "body": payload["body"], "commit_id": "head", "user": map[string]any{"login": "reviewer"}}
+			reviews = append(reviews, review)
+			_ = json.NewEncoder(w).Encode(review)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	gateway := forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(config.Config{})}
+	input := githubinfra.SubmitReviewInput{PRNumber: 42, Event: "REQUEST_CHANGES", Body: "Blocking issue\n\n" + marker, CommitID: "head"}
+	if err := gateway.SubmitReview(context.Background(), input); err != nil {
+		t.Fatalf("first SubmitReview() error = %v", err)
+	}
+	if err := gateway.SubmitReview(context.Background(), input); err != nil {
+		t.Fatalf("retry SubmitReview() error = %v", err)
+	}
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want one native review", publishCalls)
 	}
 }
 

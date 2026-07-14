@@ -25,6 +25,7 @@ const (
 	envForgejoBaseURL        = "LOOPER_E2E_FORGEJO_BASE_URL"
 	envForgejoSandboxRepo    = "LOOPER_E2E_FORGEJO_SANDBOX_REPO"
 	envForgejoToken          = "LOOPER_E2E_FORGEJO_TOKEN"
+	envForgejoReviewerToken  = "LOOPER_E2E_FORGEJO_REVIEWER_TOKEN"
 	forgejoSandboxLabelName  = "looper-e2e"
 )
 
@@ -109,6 +110,79 @@ func TestForgejoSandboxWorkerCreatesPullRequest(t *testing.T) {
 		t.Fatalf("pullRequest checkpoint missing for issue=%s pr=%s checkpoint=%#v", issue.URL, prURL, checkpoint)
 	}
 	proc.Stop(context.Background())
+}
+
+func TestForgejoSandboxNativeReviewRequestDiscoveryPublishAndRetry(t *testing.T) {
+	sb := requireForgejoSandboxConfig(t)
+	reviewerToken := strings.TrimSpace(os.Getenv(envForgejoReviewerToken))
+	if reviewerToken == "" {
+		t.Skipf("%s is required for a non-self-authored native review lifecycle", envForgejoReviewerToken)
+	}
+	reviewerClient, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo-sandbox-reviewer", Kind: forge.ProviderKindForgejo, BaseURL: sb.BaseURL, Repo: sb.Repo}, reviewerToken)
+	if err != nil {
+		t.Fatalf("create native reviewer client: %v", err)
+	}
+	reviewer, err := reviewerClient.CurrentUser(context.Background())
+	if err != nil {
+		t.Fatalf("lookup native reviewer identity: %v", err)
+	}
+	if strings.EqualFold(reviewer.Login, sb.CurrentUser.Login) {
+		t.Fatalf("%s must authenticate a user other than the PR author", envForgejoReviewerToken)
+	}
+	repo := ensureForgejoSandboxProjectRepo(t, sb)
+	pr := createForgejoSandboxPR(t, sb, repo, "native review lifecycle")
+	defer cleanupForgejoSandboxPR(t, sb, pr.Number, pr.HeadBranch)
+	ctx := context.Background()
+	if err := sb.Client.AddPullRequestReviewers(ctx, pr.Number, []string{reviewer.Login}); err != nil {
+		t.Fatalf("request native Forgejo reviewer: %v", err)
+	}
+	discovered, err := reviewerClient.ListReviewRequestedPullRequests(ctx, reviewer.Login, 100)
+	if err != nil {
+		t.Fatalf("discover native Forgejo review request: %v", err)
+	}
+	foundPR := false
+	for _, candidate := range discovered {
+		if candidate.Number == pr.Number {
+			foundPR = true
+			break
+		}
+	}
+	if !foundPR {
+		t.Fatalf("review-request discovery omitted PR %s", pr.URL)
+	}
+	marker := fmt.Sprintf("<!-- looper:review id=forgejo-sandbox:%s:%d head=%s outcome=non_blocking -->", sb.RunID, pr.Number, pr.HeadSHA)
+	reviews, err := reviewerClient.ListPullRequestReviews(ctx, pr.Number)
+	if err != nil {
+		t.Fatalf("list native Forgejo reviews before publish: %v", err)
+	}
+	if !forgejoSandboxReviewMarkerExists(reviews, marker) {
+		if _, err := reviewerClient.CreatePullRequestReview(ctx, forge.CreatePullRequestReviewInput{Number: pr.Number, Event: "COMMENT", CommitID: pr.HeadSHA, Body: "Looper sandbox native review\n\n" + marker}); err != nil {
+			t.Fatalf("publish native Forgejo review: %v", err)
+		}
+	}
+	// Retry follows the same marker-first contract and must not create another review.
+	reviews, err = reviewerClient.ListPullRequestReviews(ctx, pr.Number)
+	if err != nil {
+		t.Fatalf("list native Forgejo reviews after publish: %v", err)
+	}
+	count := 0
+	for _, review := range reviews {
+		if strings.Contains(review.Body, marker) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("native marker review count = %d, want 1 (pr=%s)", count, pr.URL)
+	}
+}
+
+func forgejoSandboxReviewMarkerExists(reviews []forge.PullRequestReview, marker string) bool {
+	for _, review := range reviews {
+		if strings.Contains(review.Body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestForgejoSandboxFixerResolvesReviewThread(t *testing.T) {
@@ -394,6 +468,7 @@ func forgejoReviewerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, hom
 	cfg.Roles.Reviewer.Discovery.Triggers.LabelMode = config.LabelModeAll
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
 	return cfg
 }
 
