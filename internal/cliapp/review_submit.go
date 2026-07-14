@@ -78,11 +78,12 @@ type forgejoReviewSubmitGateway struct {
 	labelMode            config.LabelMode
 }
 
-func (gateway forgejoReviewSubmitGateway) validateReviewRequest(ctx context.Context, prNumber int64, labels []string, manual bool) error {
-	// manual must be proven from trusted run metadata by the caller. The
-	// argv --reviewer-manual flag alone is never sufficient to skip the
+func (gateway forgejoReviewSubmitGateway) validateReviewRequest(ctx context.Context, prNumber int64, labels []string, bypass bool) error {
+	// bypass must be proven from trusted run/loop metadata by the caller
+	// (manual reviewer loop, or enabled follow-up on a new head). The argv
+	// --reviewer-manual flag alone is never sufficient to skip the
 	// requested-reviewer / label publish gate.
-	if manual || !gateway.requireReviewRequest || forgeReviewSubmitLabelsMatch(labels, gateway.labels, gateway.labelMode) {
+	if bypass || !gateway.requireReviewRequest || forgeReviewSubmitLabelsMatch(labels, gateway.labels, gateway.labelMode) {
 		return nil
 	}
 	identity, err := gateway.client.CurrentUser(ctx)
@@ -455,9 +456,10 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	// Manual publish bypass for Forgejo request/label gates is derived from
-	// trusted run/loop metadata, never from the agent-controlled argv flag alone.
-	manualBypass, err := r.trustedManualReviewSubmitBypass(cmd, loaded.Config, repo, prNumber)
+	// Review-request publish bypass for Forgejo is derived from trusted
+	// run/loop metadata (manual loop, or enabled follow-up on a new head),
+	// never from the agent-controlled argv --reviewer-manual flag alone.
+	requestBypass, err := r.trustedReviewRequestSubmitBypass(cmd, loaded.Config, repo, prNumber, commitID)
 	if err != nil {
 		return err
 	}
@@ -490,7 +492,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
-			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, manualBypass); err != nil {
+			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
 				return err
 			}
 			return submitReviewWithoutAnchorValidation(cmd, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
@@ -515,7 +517,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, manualBypass); err != nil {
+	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
 		return err
 	}
 	if err := gateway.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
@@ -524,35 +526,50 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
 }
 
-func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmitGateway, prNumber int64, labels []string, manual bool) error {
+func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmitGateway, prNumber int64, labels []string, bypass bool) error {
 	validator, ok := gateway.(interface {
 		validateReviewRequest(context.Context, int64, []string, bool) error
 	})
 	if !ok {
 		return nil
 	}
-	return validator.validateReviewRequest(ctx, prNumber, labels, manual)
+	return validator.validateReviewRequest(ctx, prNumber, labels, bypass)
 }
 
-// trustedManualReviewSubmitBypass reports whether Forgejo review-request /
-// label publish gates may be skipped because the current run is a trusted
-// manual reviewer loop. Authority is storage run/loop metadata for
-// --reviewer-run-id, never the argv --reviewer-manual flag alone.
-func (r *commandRuntime) trustedManualReviewSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64) (bool, error) {
-	runID := strings.TrimSpace(getStringFlag(cmd, "reviewer-run-id"))
-	if runID == "" {
-		return false, nil
-	}
+// trustedReviewRequestSubmitBypass reports whether Forgejo review-request /
+// label publish gates may be skipped. Authority is storage run/loop metadata,
+// never the argv --reviewer-manual flag alone.
+//
+// Bypass applies when:
+//   - the current trusted run is a manual reviewer loop (--reviewer-run-id), or
+//   - the current trusted reviewer loop is an enabled follow-up reviewing a head
+//     that differs from lastPublishedHeadSha (matching requireReviewRequestForLoop
+//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic follow-up
+//     runs do not pass --reviewer-run-id, so that path resolves the current
+//     running reviewer loop for the PR when the flag is absent.
+func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string) (bool, error) {
 	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
 	if dbPath == "" {
 		return false, nil
 	}
 	db, err := storage.OpenSQLiteDB(cmd.Context(), dbPath)
 	if err != nil {
-		return false, fmt.Errorf("validate trusted manual reviewer run: %w", err)
+		return false, fmt.Errorf("validate trusted review request bypass: %w", err)
 	}
 	defer func() { _ = db.Close() }()
-	return trustedManualReviewerRun(cmd.Context(), storage.NewRepositories(db), repo, prNumber, runID)
+	repos := storage.NewRepositories(db)
+	runID := strings.TrimSpace(getStringFlag(cmd, "reviewer-run-id"))
+	if runID != "" {
+		manual, err := trustedManualReviewerRun(cmd.Context(), repos, repo, prNumber, runID)
+		if err != nil {
+			return false, err
+		}
+		if manual {
+			return true, nil
+		}
+		return trustedFollowUpNewHeadReviewerRun(cmd.Context(), repos, repo, prNumber, runID, headSHA)
+	}
+	return trustedCurrentFollowUpNewHeadReviewerBypass(cmd.Context(), repos, repo, prNumber, headSHA)
 }
 
 // resolveReviewSubmitAnchors establishes complete base/head anchor authority.
@@ -866,46 +883,127 @@ func validateExpectedBaseCommit(expected string, actual string) error {
 }
 
 func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (bool, error) {
-	runID = strings.TrimSpace(runID)
-	if runID == "" {
+	loop, err := trustedCurrentReviewerLoopForRun(ctx, repos, repo, prNumber, runID)
+	if err != nil {
+		return false, err
+	}
+	if loop == nil {
 		return false, nil
 	}
+	manualValue, _ := parseReviewSubmitJSONObject(loop.MetadataJSON)["manual"].(bool)
+	return manualValue, nil
+}
+
+// trustedFollowUpNewHeadReviewerRun reports whether --reviewer-run-id is the
+// current running reviewer run for an enabled follow-up loop whose last
+// published head differs from the head being submitted.
+func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string, headSHA string) (bool, error) {
+	loop, err := trustedCurrentReviewerLoopForRun(ctx, repos, repo, prNumber, runID)
+	if err != nil {
+		return false, err
+	}
+	if loop == nil {
+		return false, nil
+	}
+	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
+}
+
+// trustedCurrentFollowUpNewHeadReviewerBypass honors the runner's
+// follow_up_new_head requireReviewRequest bypass when agents submit without
+// --reviewer-run-id (automatic reviewer prompts only pass that flag for manual
+// runs). Authority is the current running reviewer loop for the PR.
+func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, headSHA string) (bool, error) {
 	if repos == nil || repos.Runs == nil || repos.Loops == nil {
-		return false, fmt.Errorf("validate held manual reviewer run: storage is not configured")
+		return false, fmt.Errorf("validate follow-up review request bypass: storage is not configured")
+	}
+	currentRun, err := currentRunningReviewerRun(ctx, repos, repo, prNumber)
+	if err != nil {
+		return false, err
+	}
+	if currentRun == nil {
+		return false, nil
+	}
+	loop, err := repos.Loops.GetByID(ctx, currentRun.LoopID)
+	if err != nil {
+		return false, fmt.Errorf("validate follow-up review request bypass: %w", err)
+	}
+	if loop == nil || loop.Type != string(domain.LoopTypeReviewer) || loop.Status != string(domain.LoopStatusRunning) {
+		return false, nil
+	}
+	loopRepo := ""
+	if loop.Repo != nil {
+		loopRepo = *loop.Repo
+	}
+	if !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
+		return false, nil
+	}
+	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
+}
+
+// trustedCurrentReviewerLoopForRun returns the loop for runID only when that
+// run is the current running reviewer run for the given repo/PR.
+func trustedCurrentReviewerLoopForRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, nil
+	}
+	if repos == nil || repos.Runs == nil || repos.Loops == nil {
+		return nil, fmt.Errorf("validate held manual reviewer run: storage is not configured")
 	}
 	run, err := repos.Runs.GetByID(ctx, runID)
 	if err != nil {
-		return false, fmt.Errorf("validate held manual reviewer run: %w", err)
+		return nil, fmt.Errorf("validate held manual reviewer run: %w", err)
 	}
 	if run == nil {
-		return false, nil
+		return nil, nil
 	}
 	if run.Status != string(domain.RunStatusRunning) {
-		return false, nil
+		return nil, nil
 	}
 	loop, err := repos.Loops.GetByID(ctx, run.LoopID)
 	if err != nil {
-		return false, fmt.Errorf("validate held manual reviewer loop: %w", err)
+		return nil, fmt.Errorf("validate held manual reviewer loop: %w", err)
 	}
 	loopRepo := ""
 	if loop != nil && loop.Repo != nil {
 		loopRepo = *loop.Repo
 	}
 	if loop == nil || loop.Type != string(domain.LoopTypeReviewer) || !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
-		return false, nil
+		return nil, nil
 	}
 	if loop.Status != string(domain.LoopStatusRunning) {
-		return false, nil
+		return nil, nil
 	}
 	currentRun, err := currentRunningReviewerRun(ctx, repos, repo, prNumber)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if currentRun == nil || currentRun.ID != run.ID {
-		return false, nil
+		return nil, nil
 	}
-	manualValue, _ := parseReviewSubmitJSONObject(loop.MetadataJSON)["manual"].(bool)
-	return manualValue, nil
+	return loop, nil
+}
+
+// reviewSubmitFollowUpHasNewHead mirrors reviewer.reviewerFollowUpHasNewHead:
+// enabled follow-up loops may publish without a fresh review request when the
+// head being submitted differs from the last published review head.
+func reviewSubmitFollowUpHasNewHead(metadataJSON *string, headSHA string) bool {
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" {
+		return false
+	}
+	meta := parseReviewSubmitJSONObject(metadataJSON)
+	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
+		return false
+	}
+	if loopMeta, ok := meta["loop"].(map[string]any); ok {
+		if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
+			return false
+		}
+	}
+	lastPublished, _ := meta["lastPublishedHeadSha"].(string)
+	lastPublished = strings.TrimSpace(lastPublished)
+	return lastPublished != "" && lastPublished != headSHA
 }
 
 func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
