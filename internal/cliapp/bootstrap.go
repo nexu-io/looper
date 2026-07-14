@@ -235,7 +235,8 @@ func (r *commandRuntime) runBootstrap(ctx context.Context, cmd *cobra.Command, o
 
 	result.APIReachable = apiReachable
 	result.DaemonRunning = apiReachable
-	result.NextSteps = bootstrapNextStepsForPlan(planned)
+	restartRequired := planned.Provider == bootstrapProviderForgejo && projectAdded && !configCreated && apiReachable && !installed
+	result.NextSteps = bootstrapNextStepsForPlan(planned, restartRequired)
 	return result, nil
 }
 
@@ -476,9 +477,10 @@ func (r *commandRuntime) resolveForgejoBootstrapPlan(ctx context.Context, plan *
 }
 
 type bootstrapOriginRemote struct {
-	Host string
-	Path string
-	Repo string
+	Scheme string
+	Host   string
+	Path   string
+	Repo   string
 }
 
 var bootstrapSCPRemotePattern = regexp.MustCompile(`^(?:[^@/:]+@)?(\[[^]]+\]|[^/:]+):(.+)$`)
@@ -504,22 +506,23 @@ func parseBootstrapRemote(value string) (bootstrapOriginRemote, error) {
 	if trimmed == "" {
 		return bootstrapOriginRemote{}, fmt.Errorf("git origin is empty")
 	}
-	var host, path string
+	var scheme, host, path string
 	if match := bootstrapSCPRemotePattern.FindStringSubmatch(trimmed); !strings.Contains(trimmed, "://") && match != nil {
+		scheme = "ssh"
 		host, path = match[1], match[2]
 	} else {
 		parsed, err := url.Parse(trimmed)
 		if err != nil || parsed.Hostname() == "" {
 			return bootstrapOriginRemote{}, fmt.Errorf("unsupported git origin URL")
 		}
-		host, path = parsed.Host, parsed.Path
+		scheme, host, path = strings.ToLower(parsed.Scheme), parsed.Host, parsed.Path
 	}
 	remotePath := strings.Trim(path, "/")
 	parts := strings.Split(remotePath, "/")
 	if host == "" || len(parts) < 2 || parts[len(parts)-2] == "" || parts[len(parts)-1] == "" {
 		return bootstrapOriginRemote{}, fmt.Errorf("git origin must identify owner/repo")
 	}
-	return bootstrapOriginRemote{Host: strings.ToLower(host), Path: remotePath, Repo: parts[len(parts)-2] + "/" + parts[len(parts)-1]}, nil
+	return bootstrapOriginRemote{Scheme: scheme, Host: strings.ToLower(host), Path: remotePath, Repo: parts[len(parts)-2] + "/" + parts[len(parts)-1]}, nil
 }
 
 func validateForgejoBaseURL(value string) (string, error) {
@@ -542,7 +545,10 @@ func forgejoRemoteMatchesBaseURL(remote bootstrapOriginRemote, baseURL string) b
 	}
 	remoteHost := strings.TrimPrefix(strings.ToLower(remoteURL.Hostname()), "ssh.")
 	providerHost := strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
-	if strings.TrimPrefix(remoteHost, "www.") != providerHost || remoteURL.Port() != parsed.Port() {
+	if strings.TrimPrefix(remoteHost, "www.") != providerHost {
+		return false
+	}
+	if remote.Scheme != "ssh" && remoteURL.Port() != parsed.Port() {
 		return false
 	}
 	basePath := strings.Trim(strings.TrimSpace(parsed.Path), "/")
@@ -1277,9 +1283,12 @@ func bootstrapNextSteps(projectPath string) []string {
 	return steps
 }
 
-func bootstrapNextStepsForPlan(plan bootstrapConfigPlan) []string {
+func bootstrapNextStepsForPlan(plan bootstrapConfigPlan, restartRequired bool) []string {
 	steps := bootstrapNextSteps(plan.ProjectPath)
 	if plan.Provider == bootstrapProviderForgejo {
+		if restartRequired {
+			steps = append([]string{"looper daemon restart"}, steps...)
+		}
 		steps = append([]string{fmt.Sprintf("export %s=<forgejo-token>", plan.ForgejoTokenEnv)}, steps...)
 	}
 	return steps

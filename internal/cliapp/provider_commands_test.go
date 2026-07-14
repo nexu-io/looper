@@ -73,6 +73,36 @@ func TestForgejoRemoteMatchesBaseURLPort(t *testing.T) {
 	}
 }
 
+func TestForgejoRemoteMatchesBaseURLIgnoresSSHPort(t *testing.T) {
+	t.Parallel()
+	remote, err := parseBootstrapRemote("ssh://git@code.example.com:2222/acme/looper.git")
+	if err != nil {
+		t.Fatalf("parseBootstrapRemote() error = %v", err)
+	}
+	if !forgejoRemoteMatchesBaseURL(remote, "https://code.example.com") {
+		t.Fatal("remote SSH port should not be compared with the Forgejo HTTP port")
+	}
+	if forgejoRemoteMatchesBaseURL(remote, "https://other.example.com") {
+		t.Fatal("remote should not match a different Forgejo host")
+	}
+}
+
+func TestBootstrapNextStepsForForgejoRestart(t *testing.T) {
+	t.Parallel()
+	plan := bootstrapConfigPlan{Provider: bootstrapProviderForgejo, ProjectPath: "/repo", ForgejoTokenEnv: "FORGEJO_TOKEN"}
+
+	steps := bootstrapNextStepsForPlan(plan, true)
+	want := []string{"export FORGEJO_TOKEN=<forgejo-token>", "looper daemon restart", "looper status"}
+	if strings.Join(steps, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("bootstrapNextStepsForPlan() = %#v, want %#v", steps, want)
+	}
+
+	steps = bootstrapNextStepsForPlan(plan, false)
+	if strings.Contains(strings.Join(steps, "\n"), "looper daemon restart") {
+		t.Fatalf("bootstrapNextStepsForPlan() = %#v, did not expect restart", steps)
+	}
+}
+
 func TestResolveForgejoBootstrapPlanValidatesIdentityAndRepo(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "test-token")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
