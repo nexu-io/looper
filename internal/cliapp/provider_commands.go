@@ -236,6 +236,12 @@ func (r *commandRuntime) providerTest(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if repo == "" {
+		_, repo, err = runtimeProjectBindingForProvider(cmd.Context(), loaded.Config.Storage.DBPath, provider.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if repo == "" {
 		return fmt.Errorf("provider test requires --repo owner/name when no project is bound to %q", provider.ID)
 	}
 	client, err := forge.NewForgejoClientFromConfig(provider, repo, forge.WithHTTPClient(r.app.deps.HTTPClient))
@@ -273,7 +279,7 @@ func (r *commandRuntime) providerRemove(cmd *cobra.Command, args []string) error
 	if index < 0 {
 		return fmt.Errorf("provider %q not found", id)
 	}
-	runtimeProjectID, err := runtimeProjectBoundToProvider(cmd.Context(), loaded.Config.Storage.DBPath, id)
+	runtimeProjectID, _, err := runtimeProjectBindingForProvider(cmd.Context(), loaded.Config.Storage.DBPath, id)
 	if err != nil {
 		return err
 	}
@@ -299,37 +305,45 @@ func (r *commandRuntime) providerRemove(cmd *cobra.Command, args []string) error
 	return writeProviderResult(cmd, providerOutput{ID: id, ConfigPath: loaded.Metadata.ConfigPath, RestartRequired: true}, "Provider removed")
 }
 
-func runtimeProjectBoundToProvider(ctx context.Context, dbPath, providerID string) (string, error) {
+func runtimeProjectBindingForProvider(ctx context.Context, dbPath, providerID string) (string, string, error) {
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return "", "", nil
 		}
-		return "", fmt.Errorf("check runtime project database: %w", err)
+		return "", "", fmt.Errorf("check runtime project database: %w", err)
 	}
 	db, err := storage.OpenSQLiteDB(ctx, dbPath)
 	if err != nil {
-		return "", fmt.Errorf("open runtime project database: %w", err)
+		return "", "", fmt.Errorf("open runtime project database: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 	projects, err := storage.NewRepositories(db).Projects.List(ctx)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	boundProjectID := ""
 	for _, project := range projects {
 		if project.Archived || project.MetadataJSON == nil {
 			continue
 		}
 		var metadata struct {
 			Provider string `json:"provider"`
+			Repo     string `json:"repo"`
 		}
 		if err := json.Unmarshal([]byte(*project.MetadataJSON), &metadata); err != nil {
-			return "", fmt.Errorf("decode project %q metadata: %w", project.ID, err)
+			return "", "", fmt.Errorf("decode project %q metadata: %w", project.ID, err)
 		}
 		if strings.TrimSpace(metadata.Provider) == providerID {
-			return project.ID, nil
+			repo := strings.TrimSpace(metadata.Repo)
+			if repo != "" {
+				return project.ID, repo, nil
+			}
+			if boundProjectID == "" {
+				boundProjectID = project.ID
+			}
 		}
 	}
-	return "", nil
+	return boundProjectID, "", nil
 }
 
 func partialProviders(loaded config.LoadedFileConfig) []config.PartialProviderConfig {
