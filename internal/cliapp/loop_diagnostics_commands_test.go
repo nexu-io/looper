@@ -304,6 +304,32 @@ func TestDiagnoseLoopRunSelectorIgnoresLatestQueueKind(t *testing.T) {
 	}
 }
 
+func TestDiagnoseLoopRunSelectorIgnoresLoopMetadataLastFailure(t *testing.T) {
+	t.Parallel()
+
+	// Historical run succeeded (or has no error); loop metadata still carries a
+	// later run's lastFailure. Run-id diagnosis must not adopt that signal.
+	laterFailure := "dirty worktree: uncommitted changes from a later run"
+	metadata := loopDiagnosticMetadata{
+		Loop: &loopDiagnosticLoopMetadata{LastFailure: &laterFailure},
+	}
+	run := &storage.RunRecord{Status: "succeeded"}
+	queueMsg := "queue error from current hold"
+	queueKind := "manual_intervention"
+	queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &queueMsg, LastErrorKind: &queueKind}
+
+	got := diagnoseLoop(storage.LoopRecord{Status: "paused"}, run, queue, metadata, false)
+	if got.Source == "loopMetadata" || strings.Contains(got.Message, laterFailure) {
+		t.Fatalf("diagnosis = %#v, want no loop metadata lastFailure for run-id selector", got)
+	}
+	if got.Source == "queueItem" || strings.Contains(got.Message, queueMsg) {
+		t.Fatalf("diagnosis = %#v, want no latest queue error for run-id selector", got)
+	}
+	if got.Message != "" && got.Source != "run" {
+		t.Fatalf("diagnosis = %#v, want empty or run-only diagnosis for successful historical run", got)
+	}
+}
+
 func TestRecommendedActionForPausedIsNotAlwaysRetry(t *testing.T) {
 	t.Parallel()
 

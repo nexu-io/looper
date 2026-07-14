@@ -552,11 +552,15 @@ func diagnosticAgentOutput(agent storage.AgentExecutionRecord, now time.Time) lo
 
 func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storage.QueueItemRecord, metadata loopDiagnosticMetadata, associateQueue bool) loopDiagnosis {
 	state := loop.Status
+	// Run-id selectors diagnose only the selected run. Drop latest-queue and
+	// loop-level metadata signals (e.g. lastFailure from a later run).
 	var diagnosisQueue *storage.QueueItemRecord
+	diagnosisMetadata := loopDiagnosticMetadata{}
 	if associateQueue {
 		diagnosisQueue = queue
+		diagnosisMetadata = metadata
 	}
-	message, source := loopDiagnosticMessage(run, diagnosisQueue, metadata)
+	message, source := loopDiagnosticMessage(run, diagnosisQueue, diagnosisMetadata)
 	// FailureClass/Retryable come from the structured error kind + message.
 	// Queue status "manual_intervention" is an operator-hold signal, not the
 	// underlying failure class — keep them separate.
