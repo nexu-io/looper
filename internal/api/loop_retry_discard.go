@@ -392,8 +392,11 @@ func findProjectWorktreeByBranch(ctx context.Context, repos *storage.Repositorie
 }
 
 // worktreeBelongsToPR reports whether a worktree row is owned by the given PR.
-// True when the directory embeds pr-<N>, the branch is bare pr-<N> (push-existing),
-// or the path embeds no PR marker at all (legacy non-PR-named checkouts).
+// True only when ownership is proven: the directory embeds pr-<N>, or the branch
+// is bare pr-<N> (push-existing). Untagged paths are refused when prNumber is
+// known — RestoreWorktree can adopt a branch checkout without a pr-<N> path, and
+// accepting those would let two PRs that share a head branch name discard each
+// other's untagged worktree.
 func worktreeBelongsToPR(record storage.WorktreeRecord, prNumber int64) bool {
 	if prNumber <= 0 {
 		return true
@@ -404,11 +407,8 @@ func worktreeBelongsToPR(record storage.WorktreeRecord, prNumber int64) bool {
 	if strings.TrimSpace(record.Branch) == fmt.Sprintf("pr-%d", prNumber) {
 		return true
 	}
-	if embedded, ok := worktreePathEmbeddedPR(record.WorktreePath); ok && embedded != prNumber {
-		return false
-	}
-	// No conflicting PR marker in the path — accept (legacy / non-PR path shapes).
-	return !worktreePathHasPRMarker(record.WorktreePath)
+	// Known PR scope: untagged or differently-tagged paths cannot prove ownership.
+	return false
 }
 
 // findProjectWorktreeByPR finds the active managed worktree whose path embeds

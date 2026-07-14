@@ -941,6 +941,212 @@ func TestHandlerLoopRetryDiscardRejectsAwaitingHuman(t *testing.T) {
 	}
 }
 
+// TestHandlerHandbackRejectsDiscardWorktreeChanges ensures /handback never honors
+// discardWorktreeChanges: the worktree may hold the human's interactive edits.
+func TestHandlerHandbackRejectsDiscardWorktreeChanges(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_handback_reject_discard",
+		LoopID:    "loop_handback_reject_discard",
+		LoopSeq:   3132,
+		LoopType:  "fixer",
+		Branch:    "feature/handback-reject-discard",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("GetByID() = %#v, %v", loop, err)
+	}
+	loop.Status = "human_takeover"
+	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert(human_takeover) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3132/handback", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "discardWorktreeChanges is not allowed on handback") {
+		t.Fatalf("body = %s, want handback discard rejection", recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after handback discard reject = %q, want preserved", got)
+	}
+	loopAfter, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loopAfter == nil || loopAfter.Status != "human_takeover" {
+		t.Fatalf("loop after rejected handback = %#v, %v, want human_takeover", loopAfter, err)
+	}
+}
+
+// TestHandlerLoopRetryDiscardRejectsUntaggedPRWorktree ensures branch-only lookup
+// for a PR-scoped loop does not discard an untagged worktree row that cannot prove
+// pr-<N> ownership (shared head branch across PRs).
+func TestHandlerLoopRetryDiscardRejectsUntaggedPRWorktree(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_discard_untagged_pr"
+	branch := "feature/shared-untagged"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_retry_discard_untagged_pr",
+		LoopSeq:   3133,
+		LoopType:  "fixer",
+		Branch:    branch,
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// Retarget the stored row to an untagged path (RestoreWorktree-style adopt by
+	// branch under worktree root with no pr-<N> marker).
+	untaggedPath := filepath.Join(fixture.WorktreeRoot, "adopted-shared-head")
+	if err := os.MkdirAll(untaggedPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(untagged) error = %v", err)
+	}
+	runGitTest(t, fixture.RepoPath, "worktree", "add", "--force", untaggedPath, branch)
+	if err := os.WriteFile(filepath.Join(untaggedPath, "untagged-dirty.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(untagged dirty) error = %v", err)
+	}
+	existing, err := services.Repositories.Worktrees.GetByBranch(context.Background(), projectID, branch)
+	if err != nil || existing == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", existing, err)
+	}
+	existing.WorktreePath = untaggedPath
+	existing.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), *existing); err != nil {
+		t.Fatalf("Worktrees.Upsert(untagged path) error = %v", err)
+	}
+
+	// Branch-only checkpoint (dirty prepare): no worktree path/id, PR from detail.
+	detailOnly := fmt.Sprintf(`{"detail":{"headRefName":%q,"state":"OPEN","prNumber":42},"pause":{"reason":"dirty_worktree"}}`, branch)
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_" + fixture.LoopID, LoopID: fixture.LoopID, Status: "failed", CheckpointJSON: &detailOnly,
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(detail-only) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3133/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	discard := data["worktreeDiscard"].(map[string]any)
+	assertEqual(t, discard["discarded"], false)
+	assertEqual(t, discard["noOp"], true)
+
+	if got := readTestFile(t, filepath.Join(untaggedPath, "untagged-dirty.txt")); got != "keep me\n" {
+		t.Fatalf("untagged worktree was discarded: untagged-dirty.txt = %q", got)
+	}
+}
+
+// TestHandlerLoopRetryDiscardRechecksBeforeGitReset ensures a runtime-style
+// free-text message requeue (paused → queued + active queue) injected after the
+// first preflight and before git reset causes conflict without wiping the tree.
+func TestHandlerLoopRetryDiscardRechecksBeforeGitReset(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_recheck",
+		LoopID:    "loop_retry_discard_recheck",
+		LoopSeq:   3134,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-recheck",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// Simulate Feishu/GitHub enqueueHumanMessageToLoop: mark the loop queued and
+	// create an active queue item after the first discard preflight passes.
+	// Fixture rows are manual_intervention (not cancelled), so requeue-by-cancelled
+	// is a no-op — promote the latest row the same way a message-driven rearm would.
+	h.discardBeforeGitHook = func(loopID string) {
+		if loopID != fixture.LoopID {
+			return
+		}
+		loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+		if err != nil || loop == nil {
+			t.Errorf("hook GetByID() = %#v, %v", loop, err)
+			return
+		}
+		loop.Status = "queued"
+		loop.NextRunAt = &nowISO
+		loop.UpdatedAt = nowISO
+		if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+			t.Errorf("hook Loops.Upsert() error = %v", err)
+			return
+		}
+		latest, qerr := services.Repositories.Queue.GetLatestByLoopID(context.Background(), loopID)
+		if qerr != nil || latest == nil {
+			t.Errorf("hook GetLatestByLoopID() = %#v, %v", latest, qerr)
+			return
+		}
+		latest.Status = "queued"
+		latest.AvailableAt = nowISO
+		latest.UpdatedAt = nowISO
+		if uerr := services.Repositories.Queue.Upsert(context.Background(), *latest); uerr != nil {
+			t.Errorf("hook Queue.Upsert(active) error = %v", uerr)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3134/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "while queue item") {
+		t.Fatalf("body = %s, want active queue conflict from pre-git recheck", recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after recheck conflict = %q, want preserved", got)
+	}
+}
+
+// TestWorktreeBelongsToPRRejectsUntagged ensures PR-scoped ownership requires an
+// explicit pr-<N> path or bare pr-<N> branch — untagged paths do not qualify.
+func TestWorktreeBelongsToPRRejectsUntagged(t *testing.T) {
+	if worktreeBelongsToPR(storage.WorktreeRecord{
+		WorktreePath: "/tmp/worktrees/adopted-feature-foo",
+		Branch:       "feature/foo",
+	}, 42) {
+		t.Fatal("untagged path must not belong to PR 42")
+	}
+	if !worktreeBelongsToPR(storage.WorktreeRecord{
+		WorktreePath: "/tmp/worktrees/looper-fix-proj-pr-42",
+		Branch:       "feature/foo",
+	}, 42) {
+		t.Fatal("pr-42 path must belong to PR 42")
+	}
+	if worktreeBelongsToPR(storage.WorktreeRecord{
+		WorktreePath: "/tmp/worktrees/looper-fix-proj-pr-99",
+		Branch:       "feature/foo",
+	}, 42) {
+		t.Fatal("pr-99 path must not belong to PR 42")
+	}
+	if !worktreeBelongsToPR(storage.WorktreeRecord{
+		WorktreePath: "/tmp/worktrees/some-dir",
+		Branch:       "pr-42",
+	}, 42) {
+		t.Fatal("bare pr-42 branch must belong to PR 42")
+	}
+}
+
 // TestHandlerLoopCreateSharesTargetLockWithDiscard ensures POST /loops for the
 // same PR target takes the shared target mutex held by discard+retry, so create
 // cannot enqueue between preflight and git reset.

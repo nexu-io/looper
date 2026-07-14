@@ -109,6 +109,11 @@ type Handler struct {
 	// from creating a *different* active loop for the same target after discard
 	// preflight, which leaves a wiped worktree when the retry TX then conflicts.
 	loopTargetLocks sync.Map // project|type|targetKey -> *sync.Mutex
+	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
+	// and immediately before git reset/clean so tests can inject a runtime-style
+	// requeue race (Feishu/GitHub free-text message enqueue) without holding the
+	// API locks.
+	discardBeforeGitHook func(loopID string)
 }
 
 func NewHandler(context Context) *Handler {
@@ -3205,7 +3210,7 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
-		return h.retryLoop(r.Context(), r, loop.ID)
+		return h.retryLoop(r.Context(), r, loop.ID, false)
 	case "respond":
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
@@ -4822,6 +4827,19 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 // THAT session and sees their turns), clears any queue item that survived the
 // takeover race, then re-arms via the shared retry path.
 func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
+	// Reject discard before any handback mutation. retryLoop is shared with
+	// /retry, but handback must never wipe the human's interactive worktree edits
+	// even if an API client includes discardWorktreeChanges on the handback body.
+	if discardRequested, err := retryRequestRequestsDiscard(r); err != nil {
+		return nil, err
+	} else if discardRequested {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	}
+
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
@@ -4852,7 +4870,31 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 	if err != nil {
 		return nil, err
 	}
-	return h.retryLoop(ctx, r, loopID)
+	// Handback reuses retry re-arm; fromHandback also rejects discard if body is
+	// re-read after a client races another field in (defense in depth).
+	return h.retryLoop(ctx, r, loopID, true)
+}
+
+// retryRequestRequestsDiscard peeks at a retry/handback JSON body for
+// discardWorktreeChanges without consuming the request for a later retryLoop decode.
+func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
+	if r == nil || r.Body == nil {
+		return false, nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(strings.NewReader(string(raw)))
+	if err != nil {
+		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return false, nil
+	}
+	var body retryLoopRequest
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	}
+	return body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges, nil
 }
 
 type respondLoopRequest struct {
@@ -5122,7 +5164,10 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
 }
 
-func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {
+// retryLoop re-arms a loop for another scheduler pass. fromHandback is true when
+// invoked via /loops/{id}/handback so discardWorktreeChanges is rejected: that
+// path preserves human interactive edits in the worktree for the resumed session.
+func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string, fromHandback bool) (retryLoopResponse, error) {
 	var body retryLoopRequest
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -5149,6 +5194,13 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
 	}
 	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
+	if discardWorktreeChanges && fromHandback {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	}
 
 	// Serialize per-loop retry with start/requeue so discard cannot race another
 	// retry or /loops/{id}/start that enqueues replacement work between preflight
@@ -5206,6 +5258,38 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 			}
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
+
+		// Recheck immediately before git mutation. Feishu/GitHub free-text inbox
+		// can call enqueueHumanMessageToLoop for paused/waiting loops without
+		// these handler locks, requeueing cancelled work after the first preflight
+		// and before reset; without this second check the retry TX would conflict
+		// after the message-driven continuation's worktree was already wiped.
+		if h.discardBeforeGitHook != nil {
+			h.discardBeforeGitHook(loopID)
+		}
+		freshLoop, freshErr := services.Repositories.Loops.GetByID(ctx, loopID)
+		if freshErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: freshErr.Error()}
+		}
+		if freshLoop == nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if freshLoop.Status == string(domain.LoopStatusAwaitingHuman) {
+			return retryLoopResponse{}, apiError{
+				code:    pkgapi.ErrorCodeValidationFailed,
+				status:  http.StatusConflict,
+				message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
+			}
+		}
+		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *freshLoop, nowISO); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		preflightLoop = freshLoop
+
 		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
 		if discardErr != nil {
 			var typed apiError
