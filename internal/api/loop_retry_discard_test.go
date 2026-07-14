@@ -600,6 +600,114 @@ func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeOnUniqueLoopConflict(t *te
 	}
 }
 
+// TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop ensures discard+retry
+// refuses when a different loop type already holds a conflicting-active status
+// on the same PR. Same-type uniqueness alone would allow a failed fixer discard
+// to git reset/clean under a queued/running/human_takeover reviewer or worker
+// that shares the managed PR worktree.
+func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
+	cases := []struct {
+		name          string
+		siblingType   string
+		siblingStatus string
+	}{
+		{name: "queued_reviewer", siblingType: "reviewer", siblingStatus: "queued"},
+		{name: "running_worker", siblingType: "worker", siblingStatus: "running"},
+		{name: "human_takeover_reviewer", siblingType: "reviewer", siblingStatus: "human_takeover"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, cfg := startTestRuntime(t)
+			h := NewHandler(Context{Config: cfg, Runtime: rt})
+			services := rt.Services()
+			nowISO := "2026-04-11T12:00:00.000Z"
+			projectID := "project_retry_discard_sibling_" + tc.name
+
+			fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+				ProjectID: projectID,
+				LoopID:    "loop_retry_discard_sibling_" + tc.name,
+				LoopSeq:   3140,
+				LoopType:  "fixer",
+				Branch:    "feature/discard-sibling-" + tc.name,
+				NowISO:    nowISO,
+				Dirty:     true,
+			})
+
+			repo := "acme/looper"
+			prNumber := int64(42)
+			prTarget := "pr:acme/looper:42"
+			if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+				ID: "loop_sibling_" + tc.name, Seq: 3141, ProjectID: projectID,
+				Type: tc.siblingType, TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
+				Status: tc.siblingStatus, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}); err != nil {
+				t.Fatalf("Loops.Upsert(sibling) error = %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+fixture.LoopID+"/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), "shares the same PR worktree") {
+				t.Fatalf("body = %s, want sibling PR worktree conflict", recorder.Body.String())
+			}
+			if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+				t.Fatalf("dirty.txt after sibling conflict = %q, want preserved", got)
+			}
+			if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "README.md")); got != "dirty tracked\n" {
+				t.Fatalf("README.md after sibling conflict = %q, want preserved", got)
+			}
+			loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+			if err != nil || loop == nil || loop.Status != "paused" {
+				t.Fatalf("loop after sibling reject = %#v, %v, want paused", loop, err)
+			}
+		})
+	}
+}
+
+// TestHandlerLoopRetryDiscardAllowsFailedSiblingPRLoop documents that a
+// terminal/non-conflicting sibling on the same PR does not block discard.
+func TestHandlerLoopRetryDiscardAllowsFailedSiblingPRLoop(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_discard_failed_sibling"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_retry_discard_failed_sibling",
+		LoopSeq:   3142,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-failed-sibling",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	repo := "acme/looper"
+	prNumber := int64(42)
+	prTarget := "pr:acme/looper:42"
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_failed_sibling_reviewer", Seq: 3143, ProjectID: projectID,
+		Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
+		Status: "failed", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(failed sibling) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+fixture.LoopID+"/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dirty.txt still present after discard with failed sibling: %v", err)
+	}
+}
+
 // TestHandlerWorkersCreateReuseSharesRetryLockWithDiscard ensures POST /workers
 // issue-worker reuse takes the same per-loop mutex as discard+retry, so reuse
 // cannot enqueue between discard preflight and git reset (wiping the worktree

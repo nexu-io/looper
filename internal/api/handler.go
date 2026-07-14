@@ -5237,6 +5237,17 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			}
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
+		// Same-type uniqueness is not enough for discard: PR worktrees are shared
+		// across fixer/reviewer/worker. An already queued/running/human_takeover
+		// sibling is not held by the target mutex (that only serializes mutations),
+		// so refuse git reset/clean while any conflicting-active sibling owns the PR.
+		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *preflightLoop); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
 
 		// Recheck immediately before git mutation as defense in depth. Runtime
 		// free-text enqueue now shares LockLoopRequeue with this path, so the
@@ -5257,6 +5268,13 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, err
 		}
 		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *freshLoop, nowISO); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *freshLoop); err != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
 				return retryLoopResponse{}, typed
@@ -5758,6 +5776,60 @@ func rejectDiscardWhileParkedForHuman(status, loopID string) error {
 	default:
 		return nil
 	}
+}
+
+// assertDiscardSharedPRWorktreeClear refuses discard when another loop of any
+// type already holds a conflicting-active status on the same pull-request
+// target. assertUniqueActiveLoopCompat only conflicts same-type loops; managed
+// PR worktrees (looper-fix-<project>-pr-N) are shared across fixer/reviewer/
+// worker, so a sibling that is queued, running, or human_takeover would lose
+// its checkout to git reset/clean. Non-PR targets and non-discard retries are
+// unaffected.
+func (h *Handler) assertDiscardSharedPRWorktreeClear(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) error {
+	if loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+		return nil
+	}
+	existing, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	return assertNoActiveSiblingPRWorktreeLoops(existing, loop)
+}
+
+// assertNoActiveSiblingPRWorktreeLoops reports a conflict when any other
+// conflicting-active loop on the same project+PR key exists, regardless of
+// loop type. Used only for destructive discard preflight.
+func assertNoActiveSiblingPRWorktreeLoops(existing []storage.LoopRecord, candidate storage.LoopRecord) error {
+	if candidate.TargetType != string(domain.LoopTargetTypePullRequest) {
+		return nil
+	}
+	candidateKey := loopTargetKeyFromRecordCompat(candidate)
+	if candidateKey == "pull_request:" {
+		return nil
+	}
+	for _, loop := range existing {
+		if loop.ID == candidate.ID || loop.ProjectID != candidate.ProjectID {
+			continue
+		}
+		if loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+			continue
+		}
+		if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+			continue
+		}
+		if loopTargetKeyFromRecordCompat(loop) != candidateKey {
+			continue
+		}
+		return apiError{
+			code:   pkgapi.ErrorCodeLoopConflict,
+			status: http.StatusConflict,
+			message: fmt.Sprintf(
+				"Cannot discard worktree changes for loop %s while active %s loop %s shares the same PR worktree (%s)",
+				candidate.ID, loop.Type, loop.ID, candidateKey,
+			),
+		}
+	}
+	return nil
 }
 
 // assertLoopRetryPreconditions validates non-mutating retry blockers that must
