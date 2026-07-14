@@ -41,6 +41,37 @@ func TestCanSubmitWithoutAnchorValidationOnlyAllowsLargeDiffTopLevelReviews(t *t
 	}
 }
 
+func TestForgejoReviewSubmitGatewayMapsOversizedDiffToDiffTooLarge(t *testing.T) {
+	t.Parallel()
+
+	// 1 MiB + 1 matches Forgejo client's response body cap.
+	oversized := strings.Repeat("d", (1<<20)+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls/42.diff" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(oversized))
+	}))
+	defer server.Close()
+
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	gateway := forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(config.Config{})}
+	_, err = gateway.GetPullRequestDiff(context.Background(), githubinfra.GetPullRequestDiffInput{Repo: "acme/looper", PRNumber: 42})
+	if !errors.Is(err, githubinfra.ErrDiffTooLarge) {
+		t.Fatalf("GetPullRequestDiff() error = %v, want ErrDiffTooLarge", err)
+	}
+	if !canSubmitWithoutAnchorValidation(err, nil) {
+		t.Fatalf("canSubmitWithoutAnchorValidation() = false for Forgejo oversized top-level review")
+	}
+	if canSubmitWithoutAnchorValidation(err, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
+		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false when inline comments need anchors")
+	}
+}
+
 func TestForgejoReviewSubmitGatewayReusesMatchingNativeReviewMarker(t *testing.T) {
 	t.Parallel()
 	marker := "<!-- looper:review id=reviewer:loop:head head=head outcome=blocking -->"

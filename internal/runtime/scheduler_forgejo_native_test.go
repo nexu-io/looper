@@ -144,3 +144,46 @@ func TestReviewerForgejoAdapterNativeDiscoveryContextPublishAndRetry(t *testing.
 		t.Fatalf("publish calls = %d, want 1", publishCalls)
 	}
 }
+
+func TestListReviewRequestedPullRequestsSummaryCommentToleratesMissingNativeReviews(t *testing.T) {
+	// Instances may advertise requested reviewers without native review history.
+	// summary_comment mode must still discover and enqueue those PRs.
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			// Advertise review-request capability only; omit native reviews GET/POST.
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"number": 42, "title": "Review me", "state": "open",
+				"head":                map[string]any{"ref": "feature", "sha": "head-42"},
+				"base":                map[string]any{"ref": "main", "sha": "base"},
+				"user":                map[string]any{"login": "alice"},
+				"requested_reviewers": []map[string]any{{"id": 7, "login": "reviewer"}},
+			}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+
+	prs, err := adapter.ListReviewRequestedPullRequests(context.Background(), reviewer.ListReviewRequestedPullRequestsInput{Repo: "acme/looper", Reviewer: "reviewer", CWD: repoPath})
+	if err != nil {
+		t.Fatalf("ListReviewRequestedPullRequests() error = %v, want summary_comment compatibility fallback", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || len(prs[0].ReviewRequests) != 1 {
+		t.Fatalf("ListReviewRequestedPullRequests() = %#v, want discovered PR with review request", prs)
+	}
+	if len(prs[0].Reviews) != 0 || prs[0].ReviewDecision != "" {
+		t.Fatalf("review context = reviews=%#v decision=%q, want empty under summary_comment fallback", prs[0].Reviews, prs[0].ReviewDecision)
+	}
+}
