@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -183,16 +184,9 @@ func forgeReviewSubmitLabelNames(labels []forge.Label) []string {
 }
 
 func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
-	var matched *config.ProjectRefConfig
-	for index := range cfg.Projects {
-		project := &cfg.Projects[index]
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), strings.TrimSpace(repo)) {
-			continue
-		}
-		if matched != nil {
-			return nil, fmt.Errorf("review submit repository %s matches multiple configured projects", repo)
-		}
-		matched = project
+	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
+	if err != nil {
+		return nil, err
 	}
 	if matched != nil && config.ResolvedProjectProviderKind(cfg, *matched) == config.ProviderKindForgejo {
 		var provider *config.ProviderConfig
@@ -216,6 +210,63 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 		return nil, fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
 	}
 	return githubinfra.New(githubinfra.Options{GHPath: *cfg.Tools.GHPath, CWD: cwd, GHRun: shell.Run, ReviewSubmitDiagnostic: diagnostic}), nil
+}
+
+// reviewSubmitProjectForRepo selects the configured project for a review-submit
+// repository. When provider-qualified projects share the same owner/repo,
+// prefer the project whose registered checkout or worktree contains cwd before
+// treating the repository as ambiguous.
+func reviewSubmitProjectForRepo(cfg config.Config, repo, cwd string) (*config.ProjectRefConfig, error) {
+	repo = strings.TrimSpace(repo)
+	var matches []*config.ProjectRefConfig
+	for index := range cfg.Projects {
+		project := &cfg.Projects[index]
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		matches = append(matches, project)
+	}
+	switch len(matches) {
+	case 0:
+		return nil, nil
+	case 1:
+		return matches[0], nil
+	}
+	var cwdMatches []*config.ProjectRefConfig
+	for _, project := range matches {
+		if reviewSubmitCWDBelongsToProject(*project, cwd) {
+			cwdMatches = append(cwdMatches, project)
+		}
+	}
+	if len(cwdMatches) == 1 {
+		return cwdMatches[0], nil
+	}
+	return nil, fmt.Errorf("review submit repository %s matches multiple configured projects", repo)
+}
+
+func reviewSubmitCWDBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
+	cwd = filepath.Clean(strings.TrimSpace(cwd))
+	if cwd == "." || cwd == "" {
+		return false
+	}
+	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
+	if repoPath != "." && cwd == repoPath {
+		return true
+	}
+	worktreeRoot := ""
+	if project.WorktreeRoot != nil {
+		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
+	}
+	if worktreeRoot == "" {
+		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+		if err != nil {
+			return false
+		}
+		worktreeRoot = resolved
+	}
+	worktreeRoot = filepath.Clean(worktreeRoot)
+	relative, err := filepath.Rel(worktreeRoot, cwd)
+	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {

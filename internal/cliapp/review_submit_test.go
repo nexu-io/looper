@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -691,4 +692,93 @@ type reviewSubmitFakePRViewer struct {
 func (f *reviewSubmitFakePRViewer) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
 	f.calls = append(f.calls, input)
 	return f.detail, f.err
+}
+
+func TestReviewSubmitProjectForRepoPrefersCWDMatchAmongDuplicates(t *testing.T) {
+	t.Parallel()
+
+	githubRepo := filepath.Join(t.TempDir(), "github-checkout")
+	forgejoRepo := filepath.Join(t.TempDir(), "forgejo-checkout")
+	forgejoWorktreeRoot := filepath.Join(t.TempDir(), "forgejo-worktrees")
+	forgejoWorktree := filepath.Join(forgejoWorktreeRoot, "reviewer-wt")
+	for _, path := range []string{githubRepo, forgejoRepo, forgejoWorktree} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+	}
+
+	cfg := config.Config{
+		Projects: []config.ProjectRefConfig{
+			{ID: "github-acme", Name: "GitHub", Repo: "acme/looper", RepoPath: githubRepo, Provider: "github"},
+			{ID: "forgejo-acme", Name: "Forgejo", Repo: "acme/looper", RepoPath: forgejoRepo, Provider: "forgejo", WorktreeRoot: &forgejoWorktreeRoot},
+		},
+	}
+
+	matched, err := reviewSubmitProjectForRepo(cfg, "acme/looper", forgejoRepo)
+	if err != nil {
+		t.Fatalf("reviewSubmitProjectForRepo(repo path) error = %v", err)
+	}
+	if matched == nil || matched.ID != "forgejo-acme" {
+		t.Fatalf("reviewSubmitProjectForRepo(repo path) = %#v, want forgejo-acme", matched)
+	}
+
+	matched, err = reviewSubmitProjectForRepo(cfg, "acme/looper", forgejoWorktree)
+	if err != nil {
+		t.Fatalf("reviewSubmitProjectForRepo(worktree) error = %v", err)
+	}
+	if matched == nil || matched.ID != "forgejo-acme" {
+		t.Fatalf("reviewSubmitProjectForRepo(worktree) = %#v, want forgejo-acme", matched)
+	}
+
+	matched, err = reviewSubmitProjectForRepo(cfg, "acme/looper", githubRepo)
+	if err != nil {
+		t.Fatalf("reviewSubmitProjectForRepo(github path) error = %v", err)
+	}
+	if matched == nil || matched.ID != "github-acme" {
+		t.Fatalf("reviewSubmitProjectForRepo(github path) = %#v, want github-acme", matched)
+	}
+}
+
+func TestReviewSubmitProjectForRepoStillAmbiguousWithoutCWDMatch(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Projects: []config.ProjectRefConfig{
+			{ID: "github-acme", Name: "GitHub", Repo: "acme/looper", RepoPath: filepath.Join(t.TempDir(), "github"), Provider: "github"},
+			{ID: "forgejo-acme", Name: "Forgejo", Repo: "acme/looper", RepoPath: filepath.Join(t.TempDir(), "forgejo"), Provider: "forgejo"},
+		},
+	}
+	matched, err := reviewSubmitProjectForRepo(cfg, "acme/looper", filepath.Join(t.TempDir(), "unrelated"))
+	if err == nil || !strings.Contains(err.Error(), "matches multiple configured projects") {
+		t.Fatalf("reviewSubmitProjectForRepo() error = %v, matched = %#v; want multiple-project error", err, matched)
+	}
+}
+
+func TestReviewSubmitGatewayForConfigUsesCWDMatchedForgejoProject(t *testing.T) {
+	// t.Setenv is incompatible with t.Parallel.
+	tokenEnv := "LOOPER_TEST_FORGEJO_REVIEW_SUBMIT_TOKEN"
+	t.Setenv(tokenEnv, "test-token")
+	forgejoRepo := filepath.Join(t.TempDir(), "forgejo-checkout")
+	if err := os.MkdirAll(forgejoRepo, 0o755); err != nil {
+		t.Fatalf("mkdir forgejo checkout: %v", err)
+	}
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{
+			ID:       "forgejo",
+			Kind:     config.ProviderKindForgejo,
+			BaseURL:  "https://forgejo.example.test",
+			TokenEnv: &tokenEnv,
+		}},
+		Projects: []config.ProjectRefConfig{
+			{ID: "github-acme", Name: "GitHub", Repo: "acme/looper", RepoPath: filepath.Join(t.TempDir(), "github"), Provider: "github"},
+			{ID: "forgejo-acme", Name: "Forgejo", Repo: "acme/looper", RepoPath: forgejoRepo, Provider: "forgejo"},
+		},
+	}
+	gateway, err := reviewSubmitGatewayForConfig(cfg, "acme/looper", forgejoRepo, nil)
+	if err != nil {
+		t.Fatalf("reviewSubmitGatewayForConfig() error = %v", err)
+	}
+	if _, ok := gateway.(forgejoReviewSubmitGateway); !ok {
+		t.Fatalf("gateway type = %T, want forgejoReviewSubmitGateway", gateway)
+	}
 }
