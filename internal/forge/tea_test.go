@@ -105,6 +105,12 @@ func (r *recordingTeaRunner) callsSnapshot() []teaCall {
 	return out
 }
 
+// fakeTeaLookPath satisfies ResolveTeaPath without requiring a real tea binary.
+// Pair with WithTeaRunner so CI hosts without tea installed stay hermetic.
+func fakeTeaLookPath(string) (string, error) {
+	return "/usr/bin/fake-tea", nil
+}
+
 func TestNewForgejoClientFromConfigTeaUsesSelectedLogin(t *testing.T) {
 	runner := &recordingTeaRunner{
 		loginsJSON: mustJSON(t, []TeaLogin{
@@ -141,7 +147,7 @@ func TestNewForgejoClientFromConfigTeaUsesSelectedLogin(t *testing.T) {
 		ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
 		Auth: auth, TeaLogin: stringPtr("selected-login"),
 	}
-	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner))
+	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner), WithLookPath(fakeTeaLookPath))
 	if err != nil {
 		t.Fatalf("NewForgejoClientFromConfig() error = %v", err)
 	}
@@ -206,7 +212,7 @@ func TestNewForgejoClientFromConfigTeaLoginHostMismatch(t *testing.T) {
 		ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
 		Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
 	}
-	_, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner))
+	_, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner), WithLookPath(fakeTeaLookPath))
 	if err == nil {
 		t.Fatal("expected host mismatch error")
 	}
@@ -224,7 +230,7 @@ func TestNewForgejoClientFromConfigTeaLoginMissing(t *testing.T) {
 		ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
 		Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
 	}
-	_, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner))
+	_, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner), WithLookPath(fakeTeaLookPath))
 	var teaErr *TeaAuthError
 	if !errors.As(err, &teaErr) || teaErr.Code != TeaErrorLoginMissing {
 		t.Fatalf("error = %v, want tea_login_missing", err)
@@ -260,7 +266,7 @@ func TestTeaTransportAuthFailedAndRedaction(t *testing.T) {
 		ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
 		Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
 	}
-	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner))
+	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner), WithLookPath(fakeTeaLookPath))
 	if err != nil {
 		t.Fatalf("construct: %v", err)
 	}
@@ -287,7 +293,7 @@ func TestTeaTransportCancellation(t *testing.T) {
 		ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
 		Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
 	}
-	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner))
+	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner), WithLookPath(fakeTeaLookPath))
 	if err != nil {
 		t.Fatalf("construct: %v", err)
 	}
@@ -317,7 +323,7 @@ func TestTeaTransportHTTPStatusError(t *testing.T) {
 		ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
 		Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
 	}
-	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner))
+	client, err := NewForgejoClientFromConfig(provider, "acme/looper", WithTeaRunner(runner), WithLookPath(fakeTeaLookPath))
 	if err != nil {
 		t.Fatalf("construct: %v", err)
 	}
@@ -350,7 +356,7 @@ func TestProbeForgejoProviderTeaStates(t *testing.T) {
 		Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
 	}
 	// Force tea path via options; version probe may be unreachable but auth should still validate via tea.
-	health := ProbeForgejoProvider(context.Background(), provider, []ForgejoProbeProject{{ID: "p", Repo: "acme/looper"}}, WithTeaRunner(runner), WithTimeout(50*time.Millisecond))
+	health := ProbeForgejoProvider(context.Background(), provider, []ForgejoProbeProject{{ID: "p", Repo: "acme/looper"}}, WithTeaRunner(runner), WithLookPath(fakeTeaLookPath), WithTimeout(50*time.Millisecond))
 	if health.Authentication != AuthenticationValid {
 		t.Fatalf("authentication = %s, want valid (identity=%v)", health.Authentication, health.Identity)
 	}
