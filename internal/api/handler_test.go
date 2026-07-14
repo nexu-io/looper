@@ -562,6 +562,141 @@ func TestHandlerActiveRunsDefaultIncludesInterruptedManualResumeAndExcludesCompl
 	assertEqual(t, item["resumePolicy"], "manual_intervention")
 }
 
+// Regression for #561: looper close leaves the latest queue item as manual_intervention,
+// but the terminated loop must not remain in the default looper ps listing.
+func TestActiveRunsDefaultExcludesClosedLoopsWithManualInterventionQueue(t *testing.T) {
+	for _, closedStatus := range []string{"terminated", "completed", "stopped"} {
+		t.Run(closedStatus, func(t *testing.T) {
+			rt, cfg := startTestRuntime(t)
+			h := NewHandler(Context{Config: cfg, Runtime: rt})
+			services := rt.Services()
+			nowISO := "2026-04-11T12:00:00.000Z"
+			projectID := "project_closed_manual_" + closedStatus
+			loopID := "loop_closed_manual_" + closedStatus
+			targetID := "issue:acme/looper:55"
+			lastErrorKind := "non_retryable"
+			lastError := "nexu-io/looper#55 is a pull request, not an issue; worker issue targets must reference an open GitHub issue"
+
+			if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+				ID:         loopID,
+				Seq:        3083,
+				ProjectID:  projectID,
+				Type:       "worker",
+				TargetType: "issue",
+				TargetID:   &targetID,
+				Repo:       stringPtr("acme/looper"),
+				Status:     closedStatus,
+				CreatedAt:  nowISO,
+				UpdatedAt:  nowISO,
+			}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+				ID:        "run_closed_manual_" + closedStatus,
+				LoopID:    loopID,
+				Status:    "failed",
+				StartedAt: nowISO,
+				EndedAt:   &nowISO,
+				CreatedAt: nowISO,
+				UpdatedAt: nowISO,
+			}); err != nil {
+				t.Fatalf("Runs.Upsert() error = %v", err)
+			}
+			if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+				ID:            "queue_closed_manual_" + closedStatus,
+				ProjectID:     &projectID,
+				LoopID:        &loopID,
+				Type:          "worker",
+				TargetType:    "issue",
+				TargetID:      targetID,
+				Repo:          stringPtr("acme/looper"),
+				DedupeKey:     "worker:closed_manual:" + closedStatus,
+				Priority:      storage.QueuePriorityWorker,
+				Status:        "manual_intervention",
+				AvailableAt:   nowISO,
+				Attempts:      1,
+				MaxAttempts:   3,
+				LastError:     &lastError,
+				LastErrorKind: &lastErrorKind,
+				FinishedAt:    &nowISO,
+				CreatedAt:     nowISO,
+				UpdatedAt:     nowISO,
+			}); err != nil {
+				t.Fatalf("Queue.Upsert() error = %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			items := body["data"].(map[string]any)["items"].([]any)
+			if len(items) != 0 {
+				t.Fatalf("items len = %d, want 0 after close for status %s: %#v", len(items), closedStatus, items)
+			}
+		})
+	}
+}
+
+func TestActiveRunsAllSurfacesClosedLoopWithoutManualInterventionDisplayOverride(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_closed_all_manual"
+	loopID := "loop_closed_all_manual"
+	targetID := "issue:acme/looper:55"
+	lastErrorKind := "non_retryable"
+	lastError := "needs close"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 3084, ProjectID: projectID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: stringPtr("acme/looper"),
+		Status: "terminated", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_closed_all_manual", LoopID: loopID, Status: "failed", StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_closed_all_manual", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: targetID,
+		Repo: stringPtr("acme/looper"), DedupeKey: "worker:closed_all_manual", Priority: storage.QueuePriorityWorker,
+		Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
+		FinishedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active?all=true", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(items), items)
+	}
+	item := items[0].(map[string]any)
+	assertEqual(t, item["loopId"], loopID)
+	assertEqual(t, item["status"], "terminated")
+	assertEqual(t, item["loopStatus"], "terminated")
+	assertEqual(t, item["displayStatus"], "terminated")
+	assertEqual(t, item["lastFailureKind"], "non_retryable")
+	assertEqual(t, item["lastFailureReason"], "needs close")
+}
+
 func TestHandlerReviewerRepairInvokesContextAndTriggersScheduler(t *testing.T) {
 	t.Parallel()
 

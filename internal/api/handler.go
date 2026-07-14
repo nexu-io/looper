@@ -2564,8 +2564,15 @@ func (h *Handler) buildActiveRunViews(ctx context.Context, includeRunningLoopsWi
 		}
 		latestQueue := latestQueueByLoopID[loop.ID]
 		latestRun := latestRunsByLoopID[loop.ID]
-		if !includeInactiveLoops && !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
-			continue
+		if !includeInactiveLoops {
+			// Closed loops are not actionable even when their latest queue item
+			// remains manual_intervention after looper close (issue #561).
+			if isClosedLoopStatus(loop.Status) {
+				continue
+			}
+			if !isManualInterventionQueue(latestQueue) && !hasManualInterventionResumePolicy(latestRun) {
+				continue
+			}
 		}
 		target, ok, err := h.tryBuildActiveRunTarget(loop, projectNamesByID)
 		if err != nil {
@@ -2743,6 +2750,18 @@ func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 	return policy != nil && *policy == loops.ResumePolicyManualIntervention
 }
 
+// isClosedLoopStatus reports loop statuses that are fully finished and must not
+// appear in the default active-run listing (looper ps). Failed/interrupted loops
+// remain eligible when parked for manual intervention so operators can retry.
+func isClosedLoopStatus(status string) bool {
+	switch domain.LoopStatus(status) {
+	case domain.LoopStatusTerminated, domain.LoopStatusCompleted, domain.LoopStatusStopped:
+		return true
+	default:
+		return false
+	}
+}
+
 func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) {
 	if view.LoopStatus == "" {
 		view.LoopStatus = loop.Status
@@ -2753,7 +2772,9 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 		view.LastFailureReason = latestQueue.LastError
 	}
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
-	if isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention) {
+	// Do not override a closed loop's status with manual_intervention: the loop
+	// is no longer actionable even if the latest queue item still has that status.
+	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
 		view.DisplayStatus = "manual_intervention"
 	} else if isBackingOffQueue(latestQueue, now) {
 		view.DisplayStatus = "backing_off"
