@@ -487,6 +487,10 @@ func resolveForgejoBootstrapAuth(ctx context.Context, opts bootstrapOptions, bas
 	authFlag := strings.TrimSpace(opts.ForgejoAuth)
 	tokenEnv := strings.TrimSpace(opts.ForgejoTokenEnv)
 	teaLogin := strings.TrimSpace(opts.ForgejoTeaLogin)
+	// Fail closed on mixed strategies before any branch can silently drop a credential.
+	if err := rejectMixedForgejoAuthFlags(authFlag, tokenEnv, teaLogin); err != nil {
+		return "", "", "", err
+	}
 	switch {
 	case authFlag == string(config.ProviderAuthTea) || (authFlag == "" && teaLogin != "" && tokenEnv == ""):
 		if teaLogin == "" {

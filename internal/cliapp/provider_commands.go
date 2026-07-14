@@ -84,6 +84,11 @@ func (r *commandRuntime) resolveForgejoAuthFlags(cmd *cobra.Command, baseURL str
 	tokenEnv := strings.TrimSpace(getStringFlag(cmd, "forgejo-token-env"))
 	teaLogin := strings.TrimSpace(getStringFlag(cmd, "tea-login"))
 
+	// Fail closed on mixed strategies before any branch can silently drop a credential.
+	if err := rejectMixedForgejoAuthFlags(authFlag, tokenEnv, teaLogin); err != nil {
+		return "", "", "", err
+	}
+
 	switch {
 	case authFlag == string(config.ProviderAuthTea) || (authFlag == "" && teaLogin != "" && tokenEnv == ""):
 		selected, err := r.resolveExplicitTeaLogin(cmd, baseURL, teaLogin)
@@ -115,6 +120,20 @@ func (r *commandRuntime) resolveForgejoAuthFlags(cmd *cobra.Command, baseURL str
 	default:
 		return "", "", "", fmt.Errorf("choose one authentication strategy: --auth tea --tea-login <name> or --auth token-env --forgejo-token-env <ENV>")
 	}
+}
+
+// rejectMixedForgejoAuthFlags returns the documented conflict error when CLI
+// flags request both tea and token-env credentials (or an auth mode that
+// contradicts the other credential flag). Config validation rejects the same
+// dual-credential shape when written by hand.
+func rejectMixedForgejoAuthFlags(authFlag, tokenEnv, teaLogin string) error {
+	mixedCredentials := tokenEnv != "" && teaLogin != ""
+	teaModeWithTokenEnv := authFlag == string(config.ProviderAuthTea) && tokenEnv != ""
+	tokenModeWithTeaLogin := authFlag == string(config.ProviderAuthTokenEnv) && teaLogin != ""
+	if mixedCredentials || teaModeWithTokenEnv || tokenModeWithTeaLogin {
+		return fmt.Errorf("choose one authentication strategy: --auth tea --tea-login <name> or --auth token-env --forgejo-token-env <ENV>")
+	}
+	return nil
 }
 
 func (r *commandRuntime) resolveExplicitTeaLogin(cmd *cobra.Command, baseURL, teaLogin string) (string, error) {
