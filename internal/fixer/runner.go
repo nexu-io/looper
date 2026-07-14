@@ -3048,6 +3048,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, liveDetail.Labels) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
+	if err != nil {
+		return checkpoint, err
+	}
 	// Ancestor guard: if we previously pushed a fix commit, make sure the
 	// live PR head still descends from it. If a collaborator force-pushed or
 	// rebased and dropped our commit, replying and resolving threads would
@@ -3649,6 +3653,10 @@ func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepIn
 
 func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, evidence threadFixEvidence, item FixItem) (string, PullRequestDetail, error) {
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", PullRequestDetail{}, err
+	}
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
 	if err != nil {
 		return "", PullRequestDetail{}, err
 	}
