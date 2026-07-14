@@ -66,6 +66,74 @@ func TestBuildReviewAnchorIndexValidatesLeftDeletedLine(t *testing.T) {
 	}
 }
 
+func TestBuildReviewAnchorIndexTreatsPathspecMagicFilenamesLiterally(t *testing.T) {
+	t.Parallel()
+
+	repo := t.TempDir()
+	baseSHA, headSHA, magicPath, targetLine := seedPathspecMagicFilenameRepo(t, repo)
+	gateway := New(Options{GHPath: "gh", GitPath: "git", CWD: repo})
+
+	// Remote is unavailable so local path-targeted authority must succeed with
+	// literal pathspecs; without --literal-pathspecs git rejects ":(foo).txt".
+	index, source, err := gateway.BuildReviewAnchorIndex(context.Background(), BuildReviewAnchorIndexInput{
+		CWD:     repo,
+		BaseSHA: baseSHA,
+		HeadSHA: headSHA,
+		Paths:   []string{magicPath},
+		RemoteDiff: func(context.Context) (string, error) {
+			return "", ErrLocalCaptureTruncated
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildReviewAnchorIndex() error = %v, want success for pathspec-magic filename", err)
+	}
+	if source != ReviewAnchorAuthorityLocalPathDiff {
+		t.Fatalf("source = %q, want %q", source, ReviewAnchorAuthorityLocalPathDiff)
+	}
+	if index == nil || !index.Validate(diffanchor.Anchor{Path: magicPath, Line: targetLine, Side: diffanchor.SideRight}).Valid {
+		t.Fatalf("index did not validate RIGHT line %d on %q: %#v", targetLine, magicPath, index)
+	}
+}
+
+func TestBuildLocalPathAnchorIndexPassesLiteralPathspecs(t *testing.T) {
+	t.Parallel()
+
+	baseSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	headSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	magicPath := ":(foo).txt"
+	var sawDiffArgs []string
+	gateway := New(Options{
+		GHPath: "gh",
+		GitPath: "git",
+		GitRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			if len(options.Args) >= 1 && options.Args[0] == "rev-parse" {
+				sha := baseSHA
+				for _, arg := range options.Args {
+					if strings.HasPrefix(arg, headSHA) {
+						sha = headSHA
+						break
+					}
+				}
+				return shell.Result{Stdout: sha + "\n"}, nil
+			}
+			sawDiffArgs = append([]string(nil), options.Args...)
+			return shell.Result{
+				Stdout: "diff --git a/:(foo).txt b/:(foo).txt\n@@ -1 +1,2 @@\n line1\n+line2\n",
+			}, nil
+		},
+	})
+	_, err := gateway.buildLocalPathAnchorIndex(context.Background(), t.TempDir(), baseSHA, headSHA, []string{magicPath})
+	if err != nil {
+		t.Fatalf("buildLocalPathAnchorIndex() error = %v", err)
+	}
+	if len(sawDiffArgs) == 0 || sawDiffArgs[0] != "--literal-pathspecs" {
+		t.Fatalf("diff argv = %v, want leading --literal-pathspecs", sawDiffArgs)
+	}
+	if !strings.Contains(strings.Join(sawDiffArgs, "\x00"), magicPath) {
+		t.Fatalf("diff argv = %v, want magic path %q", sawDiffArgs, magicPath)
+	}
+}
+
 func TestBuildReviewAnchorIndexRejectsLocalBaseHeadMismatch(t *testing.T) {
 	t.Parallel()
 

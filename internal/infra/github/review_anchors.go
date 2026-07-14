@@ -120,8 +120,10 @@ func (g *Gateway) buildLocalPathAnchorIndex(ctx context.Context, cwd, baseSHA, h
 	}
 
 	// Three-dot range matches GitHub PR diff semantics (merge-base(base, head)...head).
-	args := make([]string, 0, 6+len(paths))
-	args = append(args, "diff", "--no-ext-diff", "--no-color", baseSHA+"..."+headSHA, "--")
+	// Use --literal-pathspecs so comments[].path values that look like Git pathspec
+	// magic (e.g. ":(foo).txt") are treated as literal filenames, not magic.
+	args := make([]string, 0, 7+len(paths))
+	args = append(args, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-color", baseSHA+"..."+headSHA, "--")
 	args = append(args, paths...)
 	result, err := g.runGitForReviewAnchors(ctx, cwd, args...)
 	if result.StdoutTruncated {

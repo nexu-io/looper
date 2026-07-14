@@ -91,6 +91,33 @@ func seedDeletedLineRepo(t *testing.T, repo string) (baseSHA, headSHA string, de
 	return baseSHA, headSHA, deletedLine
 }
 
+// seedPathspecMagicFilenameRepo creates a commit pair for a legal filename that
+// Git would parse as pathspec magic without --literal-pathspecs (e.g. ":(foo).txt").
+func seedPathspecMagicFilenameRepo(t *testing.T, repo string) (baseSHA, headSHA, magicPath string, targetLine int64) {
+	t.Helper()
+	runGitRepo(t, repo, "init")
+	runGitRepo(t, repo, "config", "user.email", "test@example.com")
+	runGitRepo(t, repo, "config", "user.name", "Test")
+
+	magicPath = ":(foo).txt"
+	if err := os.WriteFile(filepath.Join(repo, magicPath), []byte("line1\n"), 0o644); err != nil {
+		t.Fatalf("write base magic path: %v", err)
+	}
+	// Plain `git add .` can trip pathspec magic for ":(...)" names; force literal.
+	runGitRepo(t, repo, "--literal-pathspecs", "add", "--", magicPath)
+	runGitRepo(t, repo, "commit", "-m", "base")
+	baseSHA = strings.TrimSpace(runGitRepoOutput(t, repo, "rev-parse", "HEAD"))
+
+	if err := os.WriteFile(filepath.Join(repo, magicPath), []byte("line1\nline2-added\n"), 0o644); err != nil {
+		t.Fatalf("write head magic path: %v", err)
+	}
+	runGitRepo(t, repo, "--literal-pathspecs", "add", "--", magicPath)
+	runGitRepo(t, repo, "commit", "-m", "head")
+	headSHA = strings.TrimSpace(runGitRepoOutput(t, repo, "rev-parse", "HEAD"))
+	targetLine = 2
+	return baseSHA, headSHA, magicPath, targetLine
+}
+
 func runGitRepo(t *testing.T, repo string, args ...string) {
 	t.Helper()
 	_ = runGitRepoOutput(t, repo, args...)
