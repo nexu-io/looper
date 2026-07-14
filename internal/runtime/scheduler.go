@@ -215,18 +215,20 @@ func resolveTrustedLooperCLIPath(cfg config.Config) string {
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
 // `looper review submit` with provider tokens, bound exclusively to allowedPRRef
-// (owner/repo#N), allowedCwd (daemon-selected worktree), and the daemon-selected
-// review-events policy. Agents only receive the socket path (not tokens).
+// (owner/repo#N), allowedCwd (daemon-selected worktree), configPath (daemon-loaded
+// config file for LOOPER_CONFIG injection), and the daemon-selected review-events
+// policy. Agents only receive the socket path (not tokens).
 // cleanup stops the listener and must run when the agent execution ends.
-func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, policy forge.TrustedReviewProxyPolicy, logger bootstrap.Logger) (sockPath string, cleanup func()) {
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy forge.TrustedReviewProxyPolicy, logger bootstrap.Logger) (sockPath string, cleanup func()) {
 	noop := func() {}
 	realLooper = strings.TrimSpace(realLooper)
 	allowedPRRef = strings.TrimSpace(allowedPRRef)
 	allowedCwd = strings.TrimSpace(allowedCwd)
+	configPath = strings.TrimSpace(configPath)
 	if realLooper == "" || len(trustedEnv) == 0 || allowedPRRef == "" || allowedCwd == "" {
 		return "", noop
 	}
-	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, policy)
+	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, configPath, policy)
 	if err != nil {
 		if logger != nil {
 			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error(), "allowedPR": allowedPRRef})
@@ -1641,6 +1643,9 @@ type reviewerAgentExecutorAdapter struct {
 	executor   *agent.ConfiguredExecutor
 	realLooper string
 	trustedEnv map[string]string
+	// configPath is the daemon-loaded config file path injected as LOOPER_CONFIG
+	// into proxy children so review submit matches looperd's --config selection.
+	configPath string
 	logger     bootstrap.Logger
 	// config is used to gate trusted review-submit sockets on per-project
 	// publish mode (summary_comment must not mint a native review socket).
@@ -1817,7 +1822,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		allowedCwd = strings.TrimSpace(input.WorkingDirectory)
 		policy = reviewerAllowedReviewPolicy(input.Metadata)
 	}
-	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, policy, a.logger)
+	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, a.configPath, policy, a.logger)
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID:        input.ExecutionID,
 		ProjectID:          input.ProjectID,
@@ -2748,7 +2753,7 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -2756,10 +2761,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstra
 	claimMu := &sync.Mutex{}
 	// Trusted review proxies are minted per reviewer agent run (bound to that
 	// run's PR). Catalog snapshots only need claim mutex + config source reuse.
-	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
+	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
 	}
 	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
@@ -2774,10 +2779,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstra
 }
 
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
+	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2980,6 +2985,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 			executor:   agentExecutor,
 			realLooper: looperCLIPath,
 			trustedEnv: providerTrustedEnv(cfg),
+			configPath: strings.TrimSpace(configPath),
 			logger:     logger,
 			config:     &cfg,
 		},

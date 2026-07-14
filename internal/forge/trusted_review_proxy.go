@@ -69,11 +69,17 @@ type TrustedReviewProxyPolicy struct {
 // processes always use this CWD; request-supplied cwd is ignored so a
 // compromised agent cannot retarget provider-qualified project resolution.
 //
+// configPath is the daemon-loaded config file path (for example from --config).
+// When non-empty it is injected as LOOPER_CONFIG for the child so review submit
+// resolves the same provider/project/review policy as the daemon even when the
+// path was not present in the daemon process environment. Agent-supplied
+// --config remains rejected.
+//
 // policy is the daemon-selected effective review-events policy for the run
 // (including loop-metadata overrides). Agent argv may still include local
 // policy flags for the prompted command shape, but the proxy always rewrites
 // them to this bound policy before spawning the token-injected child.
-func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
+func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	noop := func() {}
 	if realLooper == "" {
@@ -87,6 +93,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	if err != nil {
 		return "", nil, fmt.Errorf("trusted review proxy allowed CWD: %w", err)
 	}
+	boundConfigPath := strings.TrimSpace(configPath)
 	boundPolicy, err := normalizeTrustedReviewProxyPolicy(policy)
 	if err != nil {
 		return "", nil, fmt.Errorf("trusted review proxy review policy: %w", err)
@@ -132,7 +139,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundPolicy)
+				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfigPath, boundPolicy)
 			}(conn)
 		}
 	}()
@@ -146,7 +153,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, policy TrustedReviewProxyPolicy) {
+func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy TrustedReviewProxyPolicy) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
@@ -169,7 +176,7 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 	// provider-qualified same-owner/repo checkouts is CWD-sensitive. The child
 	// always runs in the daemon-selected worktree bound at proxy start.
 	cmd.Dir = allowedCwd
-	cmd.Env = trustedReviewProxyChildEnv(trustedEnv)
+	cmd.Env = trustedReviewProxyChildEnv(trustedEnv, configPath)
 	cmd.Stdin = bytes.NewReader(req.Stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -406,9 +413,9 @@ func stripTrustedReviewProxyPolicyFlags(argv []string) []string {
 	return out
 }
 
-func trustedReviewProxyChildEnv(trustedEnv map[string]string) []string {
+func trustedReviewProxyChildEnv(trustedEnv map[string]string, configPath string) []string {
 	base := os.Environ()
-	envMap := make(map[string]string, len(base)+len(trustedEnv)+2)
+	envMap := make(map[string]string, len(base)+len(trustedEnv)+3)
 	for _, entry := range base {
 		key, value, ok := strings.Cut(entry, "=")
 		if !ok || key == "" {
@@ -421,6 +428,11 @@ func trustedReviewProxyChildEnv(trustedEnv map[string]string) []string {
 	delete(envMap, TrustedReviewSockEnv)
 	delete(envMap, TrustedEnvFileEnv)
 	envMap[trustedReviewProxySkipEnv] = "1"
+	// Daemon-loaded config path wins over ambient LOOPER_CONFIG so children use
+	// the same config as looperd when it was started with --config only.
+	if path := strings.TrimSpace(configPath); path != "" {
+		envMap["LOOPER_CONFIG"] = path
+	}
 	for key, value := range trustedEnv {
 		key = strings.TrimSpace(key)
 		if key == "" {

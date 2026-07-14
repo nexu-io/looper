@@ -81,7 +81,11 @@ type RecoveryOrphanAgentCleanup struct {
 }
 
 type Options struct {
-	Config                      config.Config
+	Config config.Config
+	// ConfigPath is the daemon-loaded config file path (from --config / LOOPER_CONFIG
+	// resolution). Passed into trusted review-submit proxy children as LOOPER_CONFIG
+	// so they load the same config when the daemon was started with --config only.
+	ConfigPath                  string
 	Logger                      bootstrap.Logger
 	Now                         func() time.Time
 	ShutdownTimeout             time.Duration
@@ -110,9 +114,10 @@ type WebhookForwarder interface {
 }
 
 type Runtime struct {
-	config config.Config
-	logger bootstrap.Logger
-	now    func() time.Time
+	config     config.Config
+	configPath string
+	logger     bootstrap.Logger
+	now        func() time.Time
 
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
@@ -203,6 +208,7 @@ func New(options Options) *Runtime {
 	projectCatalog := projects.NewCatalog(options.Config)
 	rt := &Runtime{
 		config:                      options.Config,
+		configPath:                  strings.TrimSpace(options.ConfigPath),
 		logger:                      options.Logger,
 		now:                         now,
 		openSQLiteCoordinator:       openSQLiteCoordinator,
@@ -647,7 +653,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks

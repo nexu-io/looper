@@ -123,6 +123,7 @@ type executionMatchesProcessFunc func(context.Context, storage.AgentExecutionRec
 func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
 	rt := looperdruntime.New(looperdruntime.Options{
 		Config:        deps.Config,
+		ConfigPath:    deps.Metadata.ConfigPath,
 		Logger:        deps.Logger,
 		DeferRecovery: true,
 	})
