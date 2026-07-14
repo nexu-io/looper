@@ -30,11 +30,12 @@ var (
 	// user:password@ or password-only :password@ in URL userinfo.
 	credentialURLRE = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^/@\s:]*:[^/@\s]+@`)
 	// High-confidence query credential params only (not short aliases like pass/pwd).
-	credentialQueryRE      = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s]*[?&](?:[^=&\s]*_)?(?:password|secret|client[_-]?secret|api[_-]?key|access[_-]?token|private[_-]?key)=[^\s&"'<>]+`)
-	privateKeyRE           = regexp.MustCompile(`(?i)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----`)
-	highEntropyCandidateRE = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
-	gitObjectIDRE          = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
-	uuidRE                 = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	credentialQueryRE        = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s]*[?&](?:[^=&\s]*_)?(?:password|secret|client[_-]?secret|api[_-]?key|access[_-]?token|private[_-]?key)=[^\s&"'<>]+`)
+	privateKeyRE             = regexp.MustCompile(`(?i)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----`)
+	highEntropyCandidateRE   = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
+	threadResolutionMarkerRE = regexp.MustCompile(`<!-- looper:thread-resolution thread=PRRT_[A-Za-z0-9_-]+ head=(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}) decision=(?:objectively_fixed|needs_human|not_fixed) -->`)
+	gitObjectIDRE            = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
+	uuidRE                   = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
 
 // sensitiveEnvNameKeywords are long, high-confidence segments only. Matched as
@@ -103,7 +104,11 @@ func unsafeText(text string) string {
 	if environmentAssignments >= environmentAssignmentLimit {
 		return "contains an environment-dump-shaped block"
 	}
-	for _, token := range highEntropyCandidateRE.FindAllString(text, -1) {
+	// Thread-resolution markers are Looper-owned audit metadata. Exclude only
+	// the exact syntax emitted by the reviewer; prose and malformed markers
+	// remain subject to the generic entropy scan.
+	entropyText := threadResolutionMarkerRE.ReplaceAllString(text, "")
+	for _, token := range highEntropyCandidateRE.FindAllString(entropyText, -1) {
 		if gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token) {
 			continue
 		}
