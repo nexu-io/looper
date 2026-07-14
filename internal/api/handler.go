@@ -97,22 +97,15 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
-	// loopRetryLocks serializes per-loop queue rearm paths that can race with
-	// discard+retry: explicit retry, start/unpause requeue via
-	// mutateLoopStatus(Running), and issue-worker reuse via POST /workers
-	// (resumeReusableWorkerLoopCompat). Without this, those paths can enqueue
-	// between discard preflight and git reset, then the retry transaction
-	// conflicts after the worktree for the newly queued item was already wiped.
-	loopRetryLocks sync.Map // loopID -> *sync.Mutex
 	// loopTargetLocks serializes same-target active loop creation against
-	// discard+retry. Per-loop locks alone cannot block POST /loops (or workers)
-	// from creating a *different* active loop for the same target after discard
-	// preflight, which leaves a wiped worktree when the retry TX then conflicts.
+	// discard+retry. Per-loop requeue locks alone cannot block POST /loops (or
+	// workers) from creating a *different* active loop for the same target after
+	// discard preflight, which leaves a wiped worktree when the retry TX then
+	// conflicts.
 	loopTargetLocks sync.Map // project|type|targetKey -> *sync.Mutex
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
-	// and immediately before git reset/clean so tests can inject a runtime-style
-	// requeue race (Feishu/GitHub free-text message enqueue) without holding the
-	// API locks.
+	// and immediately before git reset/clean so tests can inject a requeue race
+	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
 	discardBeforeGitHook func(loopID string)
 }
 
@@ -153,15 +146,15 @@ func NewHandler(context Context) *Handler {
 	}
 }
 
-// lockLoopRetry acquires a per-loop mutex shared by retryLoop, start/requeue
-// (mutateLoopStatus → Running), and issue-worker reuse (POST /workers) so
-// destructive discard cannot interleave with a concurrent requeue that creates
-// replacement work between preflight and git reset.
+// lockLoopRetry acquires the process-wide per-loop requeue mutex shared by
+// retryLoop, start/requeue (mutateLoopStatus → Running), issue-worker reuse
+// (POST /workers), and runtime HITL free-text / answer requeues
+// (looperdruntime.LockLoopRequeue). Without this shared exclusion, runtime
+// inbox delivery can requeue after discard preflight and before git reset,
+// wiping the worktree for the message-driven continuation when the retry TX
+// then conflicts.
 func (h *Handler) lockLoopRetry(loopID string) func() {
-	value, _ := h.loopRetryLocks.LoadOrStore(loopID, &sync.Mutex{})
-	mu := value.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	return looperdruntime.LockLoopRequeue(loopID)
 }
 
 // lockLoopTarget acquires a mutex keyed by project+loopType+target so discard
@@ -5259,11 +5252,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 
-		// Recheck immediately before git mutation. Feishu/GitHub free-text inbox
-		// can call enqueueHumanMessageToLoop for paused/waiting loops without
-		// these handler locks, requeueing cancelled work after the first preflight
-		// and before reset; without this second check the retry TX would conflict
-		// after the message-driven continuation's worktree was already wiped.
+		// Recheck immediately before git mutation as defense in depth. Runtime
+		// free-text enqueue now shares LockLoopRequeue with this path, so the
+		// common race is serialized; this snapshot still catches any unlocked
+		// requeue injected under discardBeforeGitHook in tests (or future
+		// callers that forget the shared guard).
 		if h.discardBeforeGitHook != nil {
 			h.discardBeforeGitHook(loopID)
 		}

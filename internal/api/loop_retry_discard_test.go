@@ -16,6 +16,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/domain"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -1049,6 +1050,39 @@ func TestHandlerLoopRetryDiscardRejectsUntaggedPRWorktree(t *testing.T) {
 
 	if got := readTestFile(t, filepath.Join(untaggedPath, "untagged-dirty.txt")); got != "keep me\n" {
 		t.Fatalf("untagged worktree was discarded: untagged-dirty.txt = %q", got)
+	}
+}
+
+// TestHandlerLockLoopRetryIsProcessWideRequeueGuard ensures API lockLoopRetry
+// is the same mutex runtime free-text enqueue takes (LockLoopRequeue), so
+// discard+retry serializes against inbox requeues rather than relying only on
+// a non-atomic pre-git recheck.
+func TestHandlerLockLoopRetryIsProcessWideRequeueGuard(t *testing.T) {
+	h := NewHandler(Context{})
+	const loopID = "loop_shared_requeue_guard"
+
+	unlock := h.lockLoopRetry(loopID)
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		close(started)
+		// Runtime enqueue takes this exact process-wide guard.
+		unlockRuntime := looperdruntime.LockLoopRequeue(loopID)
+		unlockRuntime()
+		close(finished)
+	}()
+	<-started
+	select {
+	case <-finished:
+		unlock()
+		t.Fatal("LockLoopRequeue completed while Handler.lockLoopRetry held — locks are not shared")
+	case <-time.After(150 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("LockLoopRequeue did not complete after Handler.lockLoopRetry release")
 	}
 }
 
