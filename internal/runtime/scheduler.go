@@ -214,10 +214,12 @@ func resolveTrustedLooperCLIPath(cfg config.Config) string {
 }
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
-// `looper review submit` with provider tokens, bound exclusively to allowedPRRef
-// (owner/repo#N), allowedCwd (daemon-selected worktree), configPath (daemon-loaded
-// config file for LOOPER_CONFIG injection), and the daemon-selected review-events
-// policy. Agents only receive the socket path (not tokens).
+// `looper review submit` with optional provider tokens, bound exclusively to
+// allowedPRRef (owner/repo#N), allowedCwd (daemon-selected worktree), configPath
+// (daemon-loaded config file for LOOPER_CONFIG injection), and the
+// daemon-selected review-events policy. Agents only receive the socket path
+// (not tokens). trustedEnv may be empty for tea-backed Forgejo providers: the
+// proxy still binds PR/CWD/policy/config so the agent cannot retarget submit.
 // cleanup stops the listener and must run when the agent execution ends.
 func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy forge.TrustedReviewProxyPolicy, logger bootstrap.Logger) (sockPath string, cleanup func()) {
 	noop := func() {}
@@ -225,7 +227,7 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	allowedPRRef = strings.TrimSpace(allowedPRRef)
 	allowedCwd = strings.TrimSpace(allowedCwd)
 	configPath = strings.TrimSpace(configPath)
-	if realLooper == "" || len(trustedEnv) == 0 || allowedPRRef == "" || allowedCwd == "" {
+	if realLooper == "" || allowedPRRef == "" || allowedCwd == "" {
 		return "", noop
 	}
 	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, configPath, policy)
@@ -1704,9 +1706,10 @@ func reviewerTrustedReviewEnv(sock string) map[string]string {
 // reviewerAllowsTrustedReviewProxy reports whether this reviewer agent start is
 // authorized to receive a live review-submit socket. Thread-resolution
 // classifiers share the reviewer adapter but must not receive publish capability.
-// Forgejo summary_comment publish mode must also not mint a socket: Looper posts
-// one top-level summary comment, and a prompt-injected agent must not be able to
-// call `looper review submit` with daemon-injected provider tokens.
+// Only native Forgejo review/publish runs need the socket: GitHub projects keep
+// the normal review-submit path (agent env credentials such as GH_TOKEN from
+// agent.env), and Forgejo summary_comment mode must not mint a socket because
+// Looper posts one top-level summary comment without native review submit.
 func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, metadata map[string]any) bool {
 	if metadata == nil {
 		return false
@@ -1718,15 +1721,13 @@ func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, meta
 	default:
 		return false
 	}
-	if reviewerSummaryCommentPublishMode(cfg, projectID) {
-		return false
-	}
-	return true
+	return reviewerNativeForgejoNeedsTrustedProxy(cfg, projectID)
 }
 
-// reviewerSummaryCommentPublishMode reports whether the selected project uses
-// Forgejo summary_comment publish mode (comment-only completion, no native review).
-func reviewerSummaryCommentPublishMode(cfg *config.Config, projectID string) bool {
+// reviewerNativeForgejoNeedsTrustedProxy reports whether the selected project is
+// a Forgejo project that publishes native reviews (not summary_comment). Only
+// those runs should receive LOOPER_TRUSTED_REVIEW_SOCK.
+func reviewerNativeForgejoNeedsTrustedProxy(cfg *config.Config, projectID string) bool {
 	if cfg == nil {
 		return false
 	}
@@ -1741,7 +1742,7 @@ func reviewerSummaryCommentPublishMode(cfg *config.Config, projectID string) boo
 		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
 			return false
 		}
-		return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
+		return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode != config.ReviewerPublishModeSummaryComment
 	}
 	return false
 }

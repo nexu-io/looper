@@ -57,9 +57,13 @@ type TrustedReviewProxyPolicy struct {
 }
 
 // StartTrustedReviewProxy listens on a private Unix socket and runs
-// `looper review submit` in a daemon-side child with provider tokens injected.
-// Agents receive only the socket path (via TrustedReviewSockEnv), never a
-// secret-bearing wrapper path or LOOPER_TRUSTED_ENV_FILE.
+// `looper review submit` in a daemon-side child with optional provider tokens
+// injected. Agents receive only the socket path (via TrustedReviewSockEnv),
+// never a secret-bearing wrapper path or LOOPER_TRUSTED_ENV_FILE.
+//
+// trustedEnv may be empty for tea-backed Forgejo providers that have no
+// tokenEnv. The proxy still binds PR/CWD/policy/config so agents cannot retarget
+// review submit; tea credentials resolve from the daemon process environment.
 //
 // allowedPRRef must be the daemon-selected pull request in owner/repo#N form.
 // The proxy rejects any review-submit argv that targets a different PR so a
@@ -81,7 +85,6 @@ type TrustedReviewProxyPolicy struct {
 // them to this bound policy before spawning the token-injected child.
 func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
-	noop := func() {}
 	if realLooper == "" {
 		return "", nil, fmt.Errorf("real looper path is required for trusted review proxy")
 	}
@@ -97,9 +100,6 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	boundPolicy, err := normalizeTrustedReviewProxyPolicy(policy)
 	if err != nil {
 		return "", nil, fmt.Errorf("trusted review proxy review policy: %w", err)
-	}
-	if len(trustedEnv) == 0 {
-		return "", noop, nil
 	}
 	if _, err := os.Stat(realLooper); err != nil {
 		return "", nil, fmt.Errorf("stat real looper path: %w", err)

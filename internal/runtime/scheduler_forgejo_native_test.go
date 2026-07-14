@@ -252,14 +252,13 @@ func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 	if reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": ""}) {
 		t.Fatal("empty phase allowed, want false")
 	}
-	if !reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "review"}) {
-		t.Fatal("review phase not allowed, want true")
+	// Without a Forgejo project config, review/publish phases must not mint a socket
+	// (mixed installs must keep GitHub on the normal review-submit path).
+	if reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "review"}) {
+		t.Fatal("nil config review phase allowed, want false")
 	}
-	if !reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "publish"}) {
-		t.Fatal("publish phase not allowed, want true")
-	}
-	if !reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "REVIEW"}) {
-		t.Fatal("REVIEW phase not allowed, want true")
+	if reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "publish"}) {
+		t.Fatal("nil config publish phase allowed, want false")
 	}
 
 	// summary_comment mode must never mint a review-submit socket even in review phase.
@@ -279,6 +278,30 @@ func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 	}
 	if !reviewerAllowsTrustedReviewProxy(nativeCfg, "forgejo-native", map[string]any{"phase": "review"}) {
 		t.Fatal("single_review Forgejo project not allowed, want true")
+	}
+	if !reviewerAllowsTrustedReviewProxy(nativeCfg, "forgejo-native", map[string]any{"phase": "publish"}) {
+		t.Fatal("publish phase on native Forgejo not allowed, want true")
+	}
+	if !reviewerAllowsTrustedReviewProxy(nativeCfg, "forgejo-native", map[string]any{"phase": "REVIEW"}) {
+		t.Fatal("REVIEW phase on native Forgejo not allowed, want true")
+	}
+	// GitHub projects in a mixed install must not receive the Forgejo review proxy.
+	githubCfg := &config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "gh", Kind: config.ProviderKindGitHub},
+			{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "github-demo", Name: "GitHub", Provider: "gh", Repo: "owner/repo", RepoPath: "/tmp/github"},
+			{ID: "forgejo-native", Name: "Forgejo", Provider: "fj", Repo: "owner/fj-repo", RepoPath: "/tmp/forgejo"},
+		},
+		Roles: config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSingleReview}}},
+	}
+	if reviewerAllowsTrustedReviewProxy(githubCfg, "github-demo", map[string]any{"phase": "review"}) {
+		t.Fatal("GitHub project allowed socket, want false")
+	}
+	if !reviewerAllowsTrustedReviewProxy(githubCfg, "forgejo-native", map[string]any{"phase": "review"}) {
+		t.Fatal("Forgejo project in mixed install not allowed, want true")
 	}
 }
 
@@ -307,13 +330,20 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 			Env:    map[string]string{"SHARED": "1"},
 		},
 	})
+	nativeCfg := &config.Config{
+		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "forgejo-native", Name: "Forgejo", Provider: "fj", Repo: "acme/looper", RepoPath: workDir}},
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSingleReview}}},
+	}
 	adapter := reviewerAgentExecutorAdapter{
 		executor:   executor,
 		realLooper: realLooper,
 		trustedEnv: map[string]string{"FORGEJO_TOKEN": "test-token"},
+		config:     nativeCfg,
 	}
 	execHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_trusted_sock",
+		ProjectID:        "forgejo-native",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
@@ -344,9 +374,85 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 		t.Fatalf("child env dump = %q, want sock=set", string(data))
 	}
 
+	// Tea-backed Forgejo (empty trustedEnv) must still mint the socket for
+	// PR/CWD/policy/config binding even though there are no token env vars.
+	teaAdapter := reviewerAgentExecutorAdapter{
+		executor:   executor,
+		realLooper: realLooper,
+		trustedEnv: nil,
+		config:     nativeCfg,
+	}
+	teaHandle, err := teaAdapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_tea_trusted_sock",
+		ProjectID:        "forgejo-native",
+		WorkingDirectory: workDir,
+		Prompt:           "review",
+		Timeout:          5 * time.Second,
+		Metadata: map[string]any{
+			"phase":               "review",
+			"repo":                "acme/looper",
+			"prNumber":            int64(42),
+			"cleanReviewEvent":    "APPROVE",
+			"blockingReviewEvent": "REQUEST_CHANGES",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start(tea) error = %v", err)
+	}
+	if _, err := teaHandle.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait(tea) error = %v", err)
+	}
+	data, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile after tea run error = %v", err)
+	}
+	if string(data) != "sock=set\n" {
+		t.Fatalf("tea child env dump = %q, want sock=set", string(data))
+	}
+
+	// GitHub projects must not receive the Forgejo review proxy socket.
+	githubCfg := &config.Config{
+		Providers: []config.ProviderConfig{{ID: "gh", Kind: config.ProviderKindGitHub}},
+		Projects:  []config.ProjectRefConfig{{ID: "github-demo", Name: "GitHub", Provider: "gh", Repo: "acme/looper", RepoPath: workDir}},
+	}
+	githubAdapter := reviewerAgentExecutorAdapter{
+		executor:   executor,
+		realLooper: realLooper,
+		trustedEnv: map[string]string{"FORGEJO_TOKEN": "test-token"},
+		config:     githubCfg,
+	}
+	githubHandle, err := githubAdapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_github_no_sock",
+		ProjectID:        "github-demo",
+		WorkingDirectory: workDir,
+		Prompt:           "review",
+		Timeout:          5 * time.Second,
+		Metadata: map[string]any{
+			"phase":               "review",
+			"repo":                "acme/looper",
+			"prNumber":            int64(42),
+			"cleanReviewEvent":    "APPROVE",
+			"blockingReviewEvent": "REQUEST_CHANGES",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start(github) error = %v", err)
+	}
+	if _, err := githubHandle.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait(github) error = %v", err)
+	}
+	data, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile after github run error = %v", err)
+	}
+	if string(data) != "sock=\n" {
+		t.Fatalf("github child env dump = %q, want empty sock", string(data))
+	}
+
 	// Thread-resolution classifiers must not receive review-publish capability.
 	threadHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_thread_resolution",
+		ProjectID:        "forgejo-native",
 		WorkingDirectory: workDir,
 		Prompt:           "classify",
 		Timeout:          5 * time.Second,
@@ -369,6 +475,7 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	// Without daemon-selected PR metadata, no review-publish capability is injected.
 	noPRHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_no_pr_meta",
+		ProjectID:        "forgejo-native",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,

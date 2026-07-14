@@ -99,6 +99,49 @@ func TestFormatTrustedReviewPRRef(t *testing.T) {
 	}
 }
 
+func TestStartTrustedReviewProxyAllowsEmptyTrustedEnv(t *testing.T) {
+	dir := t.TempDir()
+	realLooper := filepath.Join(dir, "real-looper")
+	outPath := filepath.Join(dir, "out.txt")
+	// Tea-backed providers have no tokenEnv; proxy still binds PR/CWD/config.
+	script := "#!/bin/sh\ntouch ./proxy-child-ran\nprintf 'sock=%s config=%s\\n' \"$LOOPER_TRUSTED_REVIEW_SOCK\" \"$LOOPER_CONFIG\" > \"" + outPath + "\"\n"
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+
+	daemonConfig := filepath.Join(dir, "daemon-config.json")
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, daemonConfig, testTrustedReviewPolicy())
+	if err != nil {
+		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	if strings.TrimSpace(sockPath) == "" {
+		t.Fatal("sockPath is empty for empty trustedEnv")
+	}
+
+	t.Setenv(TrustedReviewSockEnv, sockPath)
+	t.Setenv(trustedReviewProxySkipEnv, "")
+	t.Setenv("LOOPER_CONFIG", filepath.Join(dir, "ambient-config.json"))
+
+	if err := ProxyReviewSubmit([]string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, []byte(`{"body":"x"}`), filepath.Join(dir, "not-bound")); err != nil {
+		t.Fatalf("ProxyReviewSubmit() error = %v", err)
+	}
+	out, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("ReadFile(out) error = %v", err)
+	}
+	got := string(out)
+	if !strings.Contains(got, "config="+daemonConfig) {
+		t.Fatalf("proxy child output = %q, want injected LOOPER_CONFIG=%s", got, daemonConfig)
+	}
+	if strings.Contains(got, "sock="+sockPath) || strings.Contains(got, "sock=/") {
+		t.Fatalf("proxy child output = %q, want empty LOOPER_TRUSTED_REVIEW_SOCK in child", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "proxy-child-ran")); err != nil {
+		t.Fatalf("proxy child did not run in bound cwd %q: %v", dir, err)
+	}
+}
+
 func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 	dir := t.TempDir()
 	realLooper := filepath.Join(dir, "real-looper")
