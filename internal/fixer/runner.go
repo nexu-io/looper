@@ -1763,7 +1763,7 @@ func (r *Runner) unsatisfiedForgejoSummaryItems(projectID string, detail *checkp
 			if parseErr != nil {
 				return nil, parseErr
 			}
-			consumedSummary = fixerSummary.ConsumedReviewRoundID == reviewerSummary.ReviewRoundID && strings.TrimSpace(fixerSummary.ObservedHeadSHA) == strings.TrimSpace(detail.HeadSHA)
+			consumedSummary = forge.ValidateFixerResultsForReviewerSummary(reviewerSummary, fixerSummary) == nil && strings.TrimSpace(fixerSummary.ObservedHeadSHA) == strings.TrimSpace(detail.HeadSHA)
 		}
 	}
 	result := make([]FixItem, 0, len(items))

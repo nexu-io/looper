@@ -54,16 +54,22 @@ func TestForgejoAutoDiscoverySuppressesConsumedReviewerRoundUntilHeadChanges(t *
 		liveHead   string
 		fixedHead  string
 		result     forge.FixerItemResult
+		partial    bool
 		wantQueued int
 	}{
 		{name: "fixed same head", liveHead: "head-1", fixedHead: "head-1", result: forge.FixerItemResultFixed, wantQueued: 0},
 		{name: "declined same head", liveHead: "head-1", fixedHead: "head-1", result: forge.FixerItemResultDeclined, wantQueued: 0},
 		{name: "deferred same head", liveHead: "head-1", fixedHead: "head-1", result: forge.FixerItemResultDeferred, wantQueued: 0},
+		{name: "partial same head", liveHead: "head-1", fixedHead: "head-1", result: forge.FixerItemResultFixed, partial: true, wantQueued: 1},
 		{name: "changed head", liveHead: "head-2", fixedHead: "head-1", result: forge.FixerItemResultFixed, wantQueued: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newRunnerFixture(t)
-			detail := forgejoDiscoveryDetail(t, tc.liveHead, 3)
+			items := []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 3}}
+			if tc.partial {
+				items = append(items, forge.ReviewItem{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Fix rendering", Body: "Renderer must preserve results.", LastSeenRoundID: 3})
+			}
+			detail := forgejoDiscoveryDetailWithItems(t, tc.liveHead, 3, items)
 			fixerSummary := forge.NewFixerSummary(4, 3, []forge.FixerResult{{ReviewItemID: "R-001", Result: tc.result, Explanation: "Recorded the decision."}})
 			fixerSummary.ObservedHeadSHA = tc.fixedHead
 			marker, err := forge.RenderFixerSummary(fixerSummary)
@@ -154,15 +160,21 @@ func TestForgejoAutomaticCollectSkipsConsumedReviewerRound(t *testing.T) {
 		name      string
 		liveHead  string
 		fixedHead string
+		partial   bool
 		wantItems int
 	}{
 		{name: "same head", liveHead: "head-1", fixedHead: "head-1", wantItems: 0},
+		{name: "partial same head", liveHead: "head-1", fixedHead: "head-1", partial: true, wantItems: 2},
 		{name: "changed head", liveHead: "head-2", fixedHead: "head-1", wantItems: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newRunnerFixture(t)
 			cfg := forgejoFixerDiscoveryConfig(t, fixture)
-			detail := forgejoDiscoveryDetail(t, tc.liveHead, 3)
+			items := []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 3}}
+			if tc.partial {
+				items = append(items, forge.ReviewItem{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Fix rendering", Body: "Renderer must preserve results.", LastSeenRoundID: 3})
+			}
+			detail := forgejoDiscoveryDetailWithItems(t, tc.liveHead, 3, items)
 			fixerSummary := forge.NewFixerSummary(4, 3, []forge.FixerResult{{ReviewItemID: "R-001", Result: forge.FixerItemResultFixed, Explanation: "Recorded the decision."}})
 			fixerSummary.ObservedHeadSHA = tc.fixedHead
 			marker, err := forge.RenderFixerSummary(fixerSummary)
@@ -230,7 +242,12 @@ func TestForgejoAutoDiscoveryIgnoresUntrustedSummaryMarker(t *testing.T) {
 
 func forgejoDiscoveryDetail(t *testing.T, head string, reviewRound int) PullRequestDetail {
 	t.Helper()
-	summary := forge.NewReviewerSummary(reviewRound, []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: reviewRound}})
+	return forgejoDiscoveryDetailWithItems(t, head, reviewRound, []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: reviewRound}})
+}
+
+func forgejoDiscoveryDetailWithItems(t *testing.T, head string, reviewRound int, items []forge.ReviewItem) PullRequestDetail {
+	t.Helper()
+	summary := forge.NewReviewerSummary(reviewRound, items)
 	marker, err := forge.RenderReviewerSummary(summary)
 	if err != nil {
 		t.Fatalf("RenderReviewerSummary() error = %v", err)
