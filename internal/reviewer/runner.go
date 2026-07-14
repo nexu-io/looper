@@ -999,6 +999,17 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 }
 
 func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, pr PullRequestSummary, existing *storage.LoopRecord, allowThreadResolutionFollowUp bool, result *DiscoveryResult) error {
+	// Share the PR worktree target mutex with API discard+retry so discovery
+	// cannot create/requeue a reviewer for the same PR between discard
+	// preflight and git reset (managed worktree is shared across loop types).
+	// When an existing loop is known, take the per-loop lock first (API order).
+	if existing != nil && strings.TrimSpace(existing.ID) != "" {
+		unlock := loops.LockLoopRequeue(existing.ID)
+		defer unlock()
+	}
+	unlockTarget := loops.LockLoopTarget(loops.PullRequestTargetGuardKey(project.ID, repo, pr.Number))
+	defer unlockTarget()
+
 	loopResult, loopErr := r.ensureLoopForPullRequest(ctx, project, repo, pr.Number, existing)
 	if loopErr != nil {
 		return loopErr

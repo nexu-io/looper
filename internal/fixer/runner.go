@@ -1606,6 +1606,20 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 }
 
 func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, result *DiscoveryResult) error {
+	// Share the PR worktree target mutex with API discard+retry so fixer
+	// discovery cannot create/requeue for the same PR between discard
+	// preflight and git reset. Per-loop lock first when a loop already exists.
+	existingForLock, lockErr := r.findFixerLoopByPR(ctx, project.ID, repo, detail.Number)
+	if lockErr != nil {
+		return lockErr
+	}
+	if existingForLock != nil && strings.TrimSpace(existingForLock.ID) != "" {
+		unlock := loops.LockLoopRequeue(existingForLock.ID)
+		defer unlock()
+	}
+	unlockTarget := loops.LockLoopTarget(loops.PullRequestTargetGuardKey(project.ID, repo, detail.Number))
+	defer unlockTarget()
+
 	loop, err := r.findFixerLoopByPR(ctx, project.ID, repo, detail.Number)
 	if err != nil {
 		return err

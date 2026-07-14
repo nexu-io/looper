@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -302,4 +305,83 @@ func TestLoopTargetGuardKeyOmitsTypeForPullRequest(t *testing.T) {
 	if got := LoopTargetGuardKey("proj", "worker", "project", "project:proj"); got != "" {
 		t.Fatalf("project worker key = %q, want empty (concurrent workers)", got)
 	}
+}
+
+// TestDeferredReviewerRecoverySharesPRTargetLock ensures deferred recovery
+// requeue waits on the same PR target mutex discard+retry holds, so it cannot
+// activate a reviewer sibling between discard preflight and git reset.
+func TestDeferredReviewerRecoverySharesPRTargetLock(t *testing.T) {
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.StopOnApproved = true
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, filepath.Join(workingDir, "backups"))
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 14, 18, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	projectRepoPath := filepath.Join(workingDir, "repo")
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_deferred_target_lock", Name: "Deferred target lock", RepoPath: projectRepoPath, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	const loopID = "loop_deferred_target_lock"
+	seedFailedReviewerRecoveryLoop(t, repositories, "project_deferred_target_lock", loopID, 1, nowISO)
+
+	// seedFailedReviewerRecoveryLoop uses prNumber = 42+seq → 43.
+	key := LoopTargetGuardKey("project_deferred_target_lock", string(domain.LoopTypeFixer), string(domain.LoopTargetTypePullRequest), "pull_request:acme/looper:43")
+	unlockTarget := LockLoopTarget(key)
+
+	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: "other\n"}, nil
+	}})
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+
+	started := make(chan struct{})
+	done := make(chan struct {
+		n   int64
+		err error
+	}, 1)
+	go func() {
+		close(started)
+		n, err := rt.runDeferredReviewerRecovery(context.Background(), repositories, githubGateway, now)
+		done <- struct {
+			n   int64
+			err error
+		}{n, err}
+	}()
+	<-started
+	select {
+	case result := <-done:
+		unlockTarget()
+		t.Fatalf("runDeferredReviewerRecovery completed while PR target lock held: n=%d err=%v", result.n, result.err)
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked — expected.
+	}
+
+	loop, err := repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "failed" {
+		unlockTarget()
+		t.Fatalf("loop while target lock held = %#v, %v, want failed", loop, err)
+	}
+
+	unlockTarget()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("runDeferredReviewerRecovery after unlock error = %v", result.err)
+		}
+		if result.n != 1 {
+			t.Fatalf("runDeferredReviewerRecovery after unlock = %d, want 1", result.n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDeferredReviewerRecovery did not complete after PR target lock release")
+	}
+	assertLoopStatus(t, repositories, loopID, "queued")
 }

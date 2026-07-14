@@ -1381,23 +1381,13 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			continue
 		}
 		if shouldAutoRecoverFailedReviewerLoop(loop, latestRun, latestQueue, policy) {
-			failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
-			recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
+			// Share discard/retry exclusion with deferred recovery and discovery.
+			didRequeue, recoveredQueueItems, err := requeueFailedReviewerWithSharedGuards(ctx, repositories, loop, latestQueue, nowISO, policy, latestRun)
 			if err != nil {
 				return RecoverySummary{}, err
 			}
-			if recoveredQueueItems == 0 {
-				active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
-				if activeErr != nil {
-					return RecoverySummary{}, activeErr
-				}
-				if active == nil {
-					return RecoverySummary{}, fmt.Errorf("reviewer recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
-				}
-			}
-			requeuedLoop := autoRecoveredReviewerLoop(loop, nowISO)
-			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
-				return RecoverySummary{}, err
+			if !didRequeue {
+				continue
 			}
 			requeuedLoopIDs[loop.ID] = struct{}{}
 			summary.LoopsRequeued += 1
@@ -1676,23 +1666,15 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		if currentLoop == nil || !shouldAutoRecoverFailedReviewerLoop(*currentLoop, latestRun, latestQueue, policy) {
 			continue
 		}
-		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
-		recoveredQueueItems, err := requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
+		// Share discard/retry exclusion: recovery requeue of a PR reviewer must
+		// not interleave with operator discard of a sibling loop on the same
+		// managed worktree between preflight and git reset.
+		didRequeue, recoveredQueueItems, err := requeueFailedReviewerWithSharedGuards(ctx, repositories, *currentLoop, latestQueue, nowISO, policy, latestRun)
 		if err != nil {
 			return requeued, err
 		}
-		if recoveredQueueItems == 0 {
-			active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
-			if activeErr != nil {
-				return requeued, activeErr
-			}
-			if active == nil {
-				return requeued, fmt.Errorf("reviewer deferred recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
-			}
-		}
-		requeuedLoop := autoRecoveredReviewerLoop(*currentLoop, nowISO)
-		if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
-			return requeued, err
+		if !didRequeue {
+			continue
 		}
 		requeued += 1
 		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
@@ -2837,6 +2819,47 @@ func requeueFailedReviewerQueueItemForRecovery(ctx context.Context, repositories
 		return 0, nil
 	}
 	return repositories.Queue.RequeueFailedByID(ctx, loopID, latestQueue.ID, queuedAt)
+}
+
+// requeueFailedReviewerWithSharedGuards requeues a failed reviewer under the
+// same per-loop + same-target locks as API discard+retry, so deferred/startup
+// recovery cannot activate a PR worktree sibling between discard preflight and
+// git reset/clean. didRequeue is false when eligibility no longer holds under
+// the lock (no error).
+func requeueFailedReviewerWithSharedGuards(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, latestQueue *storage.QueueItemRecord, nowISO string, policy runtimeReviewerRecoveryPolicy, latestRun *storage.RunRecord) (didRequeue bool, recoveredQueueItems int64, err error) {
+	unlock := LockLoopRequeue(loop.ID)
+	defer unlock()
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(loop))
+	defer unlockTarget()
+
+	// Re-check eligibility under the lock: discard/retry may have already
+	// requeued or otherwise changed status while we waited.
+	current, err := repositories.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return false, 0, err
+	}
+	if current == nil || !shouldAutoRecoverFailedReviewerLoop(*current, latestRun, latestQueue, policy) {
+		return false, 0, nil
+	}
+	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), derefString(latestQueue.LastError))
+	recoveredQueueItems, err = requeueFailedReviewerQueueItemForRecovery(ctx, repositories, loop.ID, latestQueue, nowISO, policy, failureSummary)
+	if err != nil {
+		return false, 0, err
+	}
+	if recoveredQueueItems == 0 {
+		active, activeErr := repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
+		if activeErr != nil {
+			return false, 0, activeErr
+		}
+		if active == nil {
+			return false, 0, fmt.Errorf("reviewer recovery did not requeue failed queue item %s for loop %s", latestQueue.ID, loop.ID)
+		}
+	}
+	requeuedLoop := autoRecoveredReviewerLoop(*current, nowISO)
+	if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+		return false, 0, err
+	}
+	return true, recoveredQueueItems, nil
 }
 
 func isRuntimeRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bool {

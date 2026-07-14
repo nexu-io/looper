@@ -5310,6 +5310,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		if err := h.assertLoopRetryPreconditions(ctx, repos, *loop, nowISO); err != nil {
 			return retryResult{}, err
 		}
+		// When discard already mutated the worktree, re-check shared-PR siblings
+		// inside the TX so a concurrent runtime requeue/create that raced past
+		// preflight cannot leave both an active sibling and a successful retry.
+		if discardWorktreeChanges {
+			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
+				return retryResult{}, err
+			}
+		}
 
 		target, targetErr := loopTargetFromRecordCompat(*loop)
 		if targetErr != nil {
