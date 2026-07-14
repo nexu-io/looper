@@ -128,6 +128,39 @@ func TestProbeForgejoProviderTeaStates(t *testing.T) {
 	}
 }
 
+func TestListTeaLoginsAcceptsBooleanDefault(t *testing.T) {
+	// Real tea CLI emits default as a JSON boolean; decoding into string used to
+	// fail the whole list before login selection could run.
+	runner := &recordingTeaRunner{
+		loginsJSON: `[
+			{"name":"default-login","url":"https://code.example.com","user":"alice","default":true},
+			{"name":"selected-login","url":"https://code.example.com","user":"alice","default":false}
+		]`,
+	}
+	logins, err := ListTeaLogins(context.Background(), "/usr/bin/fake-tea", runner)
+	if err != nil {
+		t.Fatalf("ListTeaLogins() error = %v", err)
+	}
+	if len(logins) != 2 {
+		t.Fatalf("ListTeaLogins() len = %d, want 2", len(logins))
+	}
+	if !logins[0].Default || logins[1].Default {
+		t.Fatalf("Default flags = [%v, %v], want [true, false]", logins[0].Default, logins[1].Default)
+	}
+
+	provider := config.ProviderConfig{
+		ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com",
+		Auth: config.ProviderAuthTea, TeaLogin: stringPtr("selected-login"),
+	}
+	_, login, err := ValidateTeaLoginForProvider(context.Background(), provider, runner, fakeTeaLookPath)
+	if err != nil {
+		t.Fatalf("ValidateTeaLoginForProvider() error = %v", err)
+	}
+	if login.Name != "selected-login" {
+		t.Fatalf("selected login = %q, want selected-login", login.Name)
+	}
+}
+
 func TestMatchTeaLoginHostNormalizes(t *testing.T) {
 	if !MatchTeaLoginHost("https://Code.Example.com/", "https://code.example.com") {
 		t.Fatal("expected host match with case/path normalization")

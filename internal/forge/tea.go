@@ -52,12 +52,13 @@ const (
 
 // TeaLogin describes a tea CLI login entry from `tea logins list -o json`.
 // Tokens are never present in this output and must never be requested.
+// Default is a boolean in current tea versions (not a string).
 type TeaLogin struct {
 	Name    string `json:"name"`
 	URL     string `json:"url"`
 	SSHHost string `json:"ssh_host"`
 	User    string `json:"user"`
-	Default string `json:"default"`
+	Default bool   `json:"default"`
 }
 
 // TeaCommandRunner executes tea CLI invocations. Tests inject a fake runner.

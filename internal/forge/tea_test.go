@@ -113,9 +113,9 @@ func fakeTeaLookPath(string) (string, error) {
 func TestNewForgejoClientFromConfigTeaUsesSelectedLogin(t *testing.T) {
 	runner := &recordingTeaRunner{
 		loginsJSON: mustJSON(t, []TeaLogin{
-			{Name: "default-login", URL: "https://code.example.com", Default: "true"},
-			{Name: "selected-login", URL: "https://code.example.com", Default: "false"},
-			{Name: "other-host", URL: "https://other.example.com", Default: "false"},
+			{Name: "default-login", URL: "https://code.example.com", Default: true},
+			{Name: "selected-login", URL: "https://code.example.com", Default: false},
+			{Name: "other-host", URL: "https://other.example.com", Default: false},
 		}),
 		apiHandlers: map[string]teaAPIResponse{
 			"GET /user": {
