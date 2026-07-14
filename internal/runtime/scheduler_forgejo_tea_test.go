@@ -129,7 +129,8 @@ LOGIN_URL='` + loginURL + `'
 DEFAULT_LOGIN='` + defaultLogin + `'
 
 if [ "${1:-}" = "logins" ] && [ "${2:-}" = "list" ]; then
-  printf '%s\n' "[{\"name\":\"$DEFAULT_LOGIN\",\"url\":\"$LOGIN_URL\",\"user\":\"mrcfps\",\"default\":\"true\"},{\"name\":\"other-default\",\"url\":\"https://other.example.com\",\"user\":\"other\",\"default\":\"false\"}]"
+  # default must be a JSON boolean (not a string); matches current tea CLI output.
+  printf '%s\n' "[{\"name\":\"$DEFAULT_LOGIN\",\"url\":\"$LOGIN_URL\",\"user\":\"mrcfps\",\"default\":true},{\"name\":\"other-default\",\"url\":\"https://other.example.com\",\"user\":\"other\",\"default\":false}]"
   exit 0
 fi
 
