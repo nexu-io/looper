@@ -143,6 +143,45 @@ func TestPrepareProjectAddProviderAcceptsExplicitForgejoID(t *testing.T) {
 	}
 }
 
+func TestPrepareProjectAddProviderRejectsExplicitForgejoProviderWithMismatchedRemote(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Providers = append(cfg.Providers, config.ProviderConfig{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com:8443", TokenEnv: stringPtr("FORGEJO_TOKEN")})
+	raw, err := config.MarshalConfigFile(configPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := newCommandRuntime(New(Deps{
+		LookPath: func(string) (string, error) { return "/usr/bin/git", nil },
+		RunCommand: func(context.Context, string, []string, time.Duration) (commandExecutionResult, error) {
+			return commandExecutionResult{ExitCode: 0, Stdout: "https://code.example.com:3000/acme/looper.git"}, nil
+		},
+	}), []string{"--config", configPath})
+	cmd := newCommand(commandSpec{
+		use: "test",
+		localFlags: []flagSpec{
+			stringFlag("provider", "id", ""),
+			stringFlag("repo", "owner/name", ""),
+			stringFlag("forgejo-url", "url", ""),
+		},
+	})
+	if err := cmd.Flags().Set("provider", "forgejo-main"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = runtime.prepareProjectAddProvider(cmd, root)
+	if err == nil || !strings.Contains(err.Error(), `does not match provider "forgejo-main" base URL "https://code.example.com:8443"`) {
+		t.Fatalf("prepareProjectAddProvider() error = %v", err)
+	}
+}
+
 func TestBootstrapNextStepsForForgejoRestart(t *testing.T) {
 	t.Parallel()
 	plan := bootstrapConfigPlan{Provider: bootstrapProviderForgejo, ProjectPath: "/repo", ForgejoTokenEnv: "FORGEJO_TOKEN"}

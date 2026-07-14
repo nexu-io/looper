@@ -77,18 +77,26 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	providerID := strings.TrimSpace(getStringFlag(cmd, "provider"))
 	repo := strings.TrimSpace(getStringFlag(cmd, "repo"))
 	forgejoURL := strings.TrimSpace(getStringFlag(cmd, "forgejo-url"))
+	explicitForgejoBaseURL := ""
 	if forgejoURL == "" {
-		if providerID != "forgejo" {
-			return providerID, repo, nil
-		}
-		loaded, err := r.loadConfigForEdit()
-		if err != nil {
-			return "", "", err
-		}
-		for _, provider := range loaded.Config.Providers {
-			if provider.ID == providerID {
-				return providerID, repo, nil
+		if providerID != "" {
+			loaded, err := r.loadConfigForEdit()
+			if err != nil {
+				return "", "", err
 			}
+			for _, provider := range loaded.Config.Providers {
+				if provider.ID != providerID {
+					continue
+				}
+				if provider.Kind != config.ProviderKindForgejo || repo != "" {
+					return providerID, repo, nil
+				}
+				explicitForgejoBaseURL = provider.BaseURL
+				break
+			}
+		}
+		if explicitForgejoBaseURL == "" && providerID != "forgejo" {
+			return providerID, repo, nil
 		}
 	}
 	absPath, err := absolutePathIfSet(repoPath)
@@ -103,6 +111,12 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 		repo = remote.Repo
 	} else if repo != remote.Repo {
 		return "", "", fmt.Errorf("--repo %q does not match origin repo %q", repo, remote.Repo)
+	}
+	if explicitForgejoBaseURL != "" {
+		if !forgejoRemoteMatchesBaseURL(remote, explicitForgejoBaseURL) {
+			return "", "", fmt.Errorf("origin host %q does not match provider %q base URL %q", remote.Host, providerID, explicitForgejoBaseURL)
+		}
+		return providerID, repo, nil
 	}
 	loaded, err := r.loadConfigForEdit()
 	if err != nil {
