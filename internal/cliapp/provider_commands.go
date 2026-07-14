@@ -168,7 +168,7 @@ func (r *commandRuntime) prepareProjectAddProvider(cmd *cobra.Command, repoPath 
 	}
 	for _, existing := range loaded.Config.Providers {
 		if existing.ID == providerID {
-			if existing.Kind == provider.Kind && existing.BaseURL == provider.BaseURL && dereferenceString(existing.TokenEnv) == tokenEnv {
+			if existing.Kind == provider.Kind && forgejoBaseURLsMatch(existing.BaseURL, provider.BaseURL) && dereferenceString(existing.TokenEnv) == tokenEnv {
 				return providerID, repo, nil
 			}
 			return "", "", fmt.Errorf("provider id %q already exists with different settings", providerID)

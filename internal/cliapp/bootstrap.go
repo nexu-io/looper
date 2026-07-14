@@ -809,9 +809,6 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 	if err := config.Validate(normalized); err != nil {
 		return false, false, err
 	}
-	if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
-		return false, false, nil
-	}
 	if plan.Provider == bootstrapProviderForgejo {
 		providerExists := false
 		for _, provider := range normalized.Providers {
@@ -823,6 +820,15 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 				break
 			}
 		}
+		for _, project := range normalized.Projects {
+			if !samePath(project.RepoPath, plan.ProjectPath) {
+				continue
+			}
+			if project.Provider != plan.ForgejoProviderID || project.Repo != plan.Repo {
+				return false, false, fmt.Errorf("project %q already exists for %s but is not bound to Forgejo provider %q repository %q; remove or rebind the project first", project.ID, plan.ProjectPath, plan.ForgejoProviderID, plan.Repo)
+			}
+			return false, false, nil
+		}
 		if !providerExists {
 			providers := []config.PartialProviderConfig{}
 			if partial.Providers != nil {
@@ -832,6 +838,8 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 			providers = append(providers, config.PartialProviderConfig{ID: plan.ForgejoProviderID, Kind: &kind, BaseURL: stringPtr(plan.ForgejoURL), TokenEnv: stringPtr(plan.ForgejoTokenEnv)})
 			partial.Providers = &providers
 		}
+	} else if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
+		return false, false, nil
 	}
 	projects := []config.PartialProjectRefConfig{}
 	if partial.Projects != nil {

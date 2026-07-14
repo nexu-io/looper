@@ -203,6 +203,71 @@ func TestPrepareProjectAddProviderRejectsExplicitForgejoProviderWithMismatchedRe
 	}
 }
 
+func TestPrepareProjectAddProviderReusesProviderWithEquivalentBaseURL(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "test-token")
+	httpClient := newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/api/v1/user":
+			return jsonResponse(t, http.StatusOK, `{"login":"alice","id":7}`), nil
+		case "/api/v1/repos/acme/looper":
+			return jsonResponse(t, http.StatusOK, `{"full_name":"acme/looper"}`), nil
+		default:
+			t.Fatalf("unexpected path %q", req.URL.Path)
+			return nil, nil
+		}
+	})
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Providers = append(cfg.Providers, config.ProviderConfig{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "http://code.example.com", TokenEnv: stringPtr("FORGEJO_TOKEN")})
+	raw, err := config.MarshalConfigFile(configPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	equivalentURL := "http://CODE.example.com:80"
+	runtime := newCommandRuntime(New(Deps{
+		HTTPClient: httpClient,
+		LookPath:   func(string) (string, error) { return "/usr/bin/git", nil },
+		RunCommand: func(context.Context, string, []string, time.Duration) (commandExecutionResult, error) {
+			return commandExecutionResult{ExitCode: 0, Stdout: equivalentURL + "/acme/looper.git"}, nil
+		},
+	}), []string{"--config", configPath})
+	cmd := newCommand(commandSpec{
+		use: "test",
+		localFlags: []flagSpec{
+			stringFlag("provider", "id", ""),
+			stringFlag("repo", "owner/name", ""),
+			stringFlag("forgejo-url", "url", ""),
+			stringFlag("forgejo-token-env", "name", ""),
+		},
+	})
+	cmd.SetContext(context.Background())
+	for name, value := range map[string]string{
+		"provider":          "forgejo-main",
+		"forgejo-url":       equivalentURL,
+		"forgejo-token-env": "FORGEJO_TOKEN",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	provider, repo, err := runtime.prepareProjectAddProvider(cmd, root)
+	if err != nil {
+		t.Fatalf("prepareProjectAddProvider() error = %v", err)
+	}
+	if provider != "forgejo-main" || repo != "acme/looper" {
+		t.Fatalf("prepareProjectAddProvider() = (%q, %q), want (%q, %q)", provider, repo, "forgejo-main", "acme/looper")
+	}
+}
+
 func TestBootstrapNextStepsForForgejoRestart(t *testing.T) {
 	t.Parallel()
 	plan := bootstrapConfigPlan{Provider: bootstrapProviderForgejo, ProjectPath: "/repo", ForgejoTokenEnv: "FORGEJO_TOKEN"}
@@ -445,6 +510,36 @@ func TestEnsureBootstrapConfigRejectsConflictingForgejoProvider(t *testing.T) {
 		ForgejoProviderID: "forgejo", ForgejoURL: "https://code.example.com", ForgejoTokenEnv: "FORGEJO_TOKEN",
 	})
 	if err == nil || !strings.Contains(err.Error(), `provider id "forgejo" already exists with different settings`) {
+		t.Fatalf("ensureBootstrapConfig() error = %v", err)
+	}
+}
+
+func TestEnsureBootstrapConfigRejectsExistingProjectWithoutForgejoBinding(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	projectPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Projects = append(cfg.Projects, buildBootstrapProject(projectPath, "main"))
+	raw, err := config.MarshalConfigFile(configPath, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := newCommandRuntime(New(Deps{}), nil)
+	_, _, err = runtime.ensureBootstrapConfig(configPath, root, bootstrapConfigPlan{
+		Provider: bootstrapProviderForgejo, ProjectPath: projectPath, Repo: "acme/looper",
+		ForgejoProviderID: "forgejo", ForgejoURL: "https://code.example.com", ForgejoTokenEnv: "FORGEJO_TOKEN",
+	})
+	if err == nil || !strings.Contains(err.Error(), `is not bound to Forgejo provider "forgejo" repository "acme/looper"`) {
 		t.Fatalf("ensureBootstrapConfig() error = %v", err)
 	}
 }
