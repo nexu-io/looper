@@ -66,8 +66,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `[[{"id":14,"number":14,"title":"sub issue","url":"https://api.example.test/issues/14","html_url":"https://example.test/issues/14","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]]`}, nil
 		case args == "api --paginate --slurp repos/acme/looper/issues/8/comments":
 			return shell.Result{Stdout: `[[{"id":91,"body":"First human follow-up","html_url":"https://example.test/issues/8#issuecomment-91","created_at":"2026-05-03T13:00:00Z","updated_at":"2026-05-03T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]]`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[{"id":92,"body":"conversation notice","html_url":"https://example.test/issues/42#issuecomment-92","created_at":"2026-05-04T13:00:00Z","updated_at":"2026-05-04T13:00:00Z","user":{"login":"reviewer"},"author_association":"MEMBER"}]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{Stdout: `{"id":92,"body":"<!-- looper:fixer-round head=abc -->","html_url":"https://example.test/issues/42#issuecomment-92","updated_at":"2026-05-04T13:00:00Z","user":{"login":"reviewer"}}`}, nil
 		case args == "api repos/acme/looper/issues/8/comments --method POST -f body=Looper started":
 			return shell.Result{Stdout: `{"id":91,"html_url":"https://example.test/issues/8#issuecomment-91"}`}, nil
 		case args == "api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished":
@@ -285,8 +285,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	if len(detail.Comments) != 1 || detail.Comments[0]["id"] != "comment-1" || detail.Comments[0]["threadId"] != "thread-1" || detail.Comments[0]["state"] != "UNRESOLVED" || detail.Comments[0]["body"] != "Fix this" {
 		t.Fatalf("detail.Comments = %#v, want normalized review thread", detail.Comments)
 	}
-	if len(detail.IssueComments) != 1 || detail.IssueComments[0].Body != "conversation notice" {
-		t.Fatalf("detail.IssueComments = %#v, want PR conversation comments", detail.IssueComments)
+	if len(detail.IssueComments) != 1 || !strings.Contains(detail.IssueComments[0].Body, "looper:fixer-round") {
+		t.Fatalf("detail.IssueComments = %#v, want projected Looper automation comments", detail.IssueComments)
 	}
 	if login != "reviewer" {
 		t.Fatalf("login = %q, want reviewer", login)
@@ -381,8 +381,8 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 			}
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","createdAt":"2026-05-03T12:00:00Z","updatedAt":"2026-05-04T12:00:00Z","closedAt":"","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":[{"name":"ready"}],"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"comments":[{"id":"issue-comment-1","body":"conversation notice"}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		}
-		if args == "api --paginate --slurp repos/acme/looper/issues/42/comments" {
-			return shell.Result{Stdout: `[[]]`}, nil
+		if strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq ") {
+			return shell.Result{}, nil
 		}
 		if strings.Contains(args, "reviewThreads") {
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
@@ -437,10 +437,10 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 				t.Fatalf("reviewer profile fields = %q, want reviews, checks, and review requests", fields)
 			}
 			return shell.Result{Stdout: `{"number":44,"title":"Review me","body":"Body","url":"https://example.test/pull/44","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"login":"reviewer"}}],"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[]}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/43/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/44/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/43/comments --jq "):
+			return shell.Result{}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/44/comments --jq "):
+			return shell.Result{}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		default:
@@ -458,6 +458,67 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 	}
 	if _, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 44}); err != nil {
 		t.Fatalf("ViewPullRequestForReviewer() error = %v", err)
+	}
+}
+
+func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.T) {
+	t.Parallel()
+
+	rawHistory := strings.Repeat(`{"id":1,"body":"`+strings.Repeat("x", 1024)+`"}`, 300)
+	if len(rawHistory) <= 256*1024 {
+		t.Fatalf("fixture bytes = %d, want more than the generic shell cap", len(rawHistory))
+	}
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"state":"OPEN","headRefOid":"head-42"}`}, nil
+		case strings.Contains(args, "reviewThreads"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			if strings.Contains(args, "--slurp") {
+				t.Fatalf("comment command = %q, want page-wise projection without --slurp", args)
+			}
+			for _, required := range []string{"looper:forgejo-reviewer-summary", "looper:fixer-round", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+				if !strings.Contains(args, required) {
+					t.Fatalf("comment command = %q, want projection %q", args, required)
+				}
+			}
+			if options.MaxCapturedBytes != 0 {
+				t.Fatalf("MaxCapturedBytes = %d, want unchanged generic default", options.MaxCapturedBytes)
+			}
+			return shell.Result{Stdout: "{\"id\":101,\"body\":\"<!-- looper:forgejo-reviewer-summary payload -->\",\"user\":{\"login\":\"reviewer\"}}\n" +
+				"{\"id\":202,\"body\":\"<!-- looper:fixer-round head=head-42 -->\",\"html_url\":\"https://example.test/pull/42#issuecomment-202\",\"user\":{\"login\":\"looper\"}}\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestForFixer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
+	}
+	if len(detail.IssueComments) != 2 || detail.IssueComments[1].ID != 202 {
+		t.Fatalf("IssueComments = %#v, want projected marker comments from both pages", detail.IssueComments)
+	}
+}
+
+func TestGatewayReportsTruncatedOutputBeforeJSONParsing(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `[[{"id":1}`, StdoutTruncated: true}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	_, err := gateway.ListIssueComments(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 42})
+	if err == nil || !strings.Contains(err.Error(), "GitHub command output truncated: stdout after") {
+		t.Fatalf("ListIssueComments() error = %v, want explicit truncation error", err)
+	}
+	if strings.Contains(err.Error(), "Invalid gh JSON payload") {
+		t.Fatalf("ListIssueComments() error = %v, must report truncation before parsing", err)
 	}
 }
 
@@ -1254,8 +1315,8 @@ func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
 		switch {
 		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-2","isResolved":true,"comments":{"nodes":[{"id":"comment-2","body":"second page"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && !strings.Contains(args, "-F after="):
@@ -2016,8 +2077,8 @@ func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","headRefOid":"abc123","baseRefOid":"def456","author":{"login":"octocat"},"reviews":[{"state":"COMMENTED"}],"statusCheckRollup":[{"conclusion":"FAILURE"}]}`}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"comments":{"nodes":[{"id":"comment-1","body":"Fix this"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			return shell.Result{Stdout: "diff --git a/a.go b/a.go\n"}, nil
 		default:
@@ -2049,8 +2110,8 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","state":"OPEN","headRefOid":"abc123"}`}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
-		case args == "api --paginate --slurp repos/acme/looper/issues/42/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			result := shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"}
 			return result, &shell.CommandExecutionError{Message: result.Stderr, Result: result}

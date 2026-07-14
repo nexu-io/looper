@@ -4352,6 +4352,39 @@ func TestRunDiscoverPRStepLabelMismatchFinalizerPausesLoop(t *testing.T) {
 	}
 }
 
+func TestRunDiscoverPRStepAcceptsProjectedAutomationCommentsWithoutRetry(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "head-42",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-42",
+		IssueComments: []map[string]any{
+			{"id": float64(101), "body": "<!-- looper:forgejo-reviewer-summary payload -->"},
+			{"id": float64(202), "body": "<!-- looper:fixer-round head=head-42 -->"},
+		},
+	}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	checkpoint, err := runner.runDiscoverPRStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:     storage.LoopRecord{Type: "fixer"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+	})
+	if err != nil {
+		t.Fatalf("runDiscoverPRStep() error = %v, want discovery to continue without retry", err)
+	}
+	if checkpoint.ResumePolicy != "replay_step" || checkpoint.Detail == nil || len(checkpoint.Detail.IssueComments) != 2 {
+		t.Fatalf("checkpoint = %#v, want successful discovery with projected comments", checkpoint)
+	}
+	if github.viewIndex != 1 {
+		t.Fatalf("ViewPullRequest calls = %d, want one deterministic discovery attempt", github.viewIndex)
+	}
+}
+
 func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
