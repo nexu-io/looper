@@ -130,13 +130,20 @@ func (gateway forgejoReviewSubmitGateway) SubmitReview(ctx context.Context, inpu
 		if err != nil {
 			return err
 		}
+		identity, err := gateway.client.CurrentUser(ctx)
+		if err != nil {
+			return err
+		}
 		for _, review := range reviews {
 			candidateMatch := reviewSubmitMarkerRE.FindStringSubmatch(review.Body)
 			if len(candidateMatch) != 2 {
 				continue
 			}
 			candidate := parseReviewSubmitMarkerFields(candidateMatch[1])
-			if candidate["id"] == expected["id"] && candidate["head"] == expected["head"] && candidate["outcome"] == expected["outcome"] && forgeReviewSubmitStateMatchesEvent(review.State, input.Event) {
+			// Only reuse a marker published by the current authenticated account.
+			// Another identity may share id/head/outcome after token rotation or
+			// multi-instance reuse; later marker verification filters by login.
+			if candidate["id"] == expected["id"] && candidate["head"] == expected["head"] && candidate["outcome"] == expected["outcome"] && forgeReviewSubmitStateMatchesEvent(review.State, input.Event) && sameGitHubLogin(review.User.Login, identity.Login) {
 				return nil
 			}
 		}
@@ -288,10 +295,11 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	var anchors *diffanchor.Index
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
-			if err := r.validateLatestReviewerReviewSubmitHold(cmd, gateway, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+			freshLabels, err := r.validateLatestReviewerReviewSubmitHold(cmd, gateway, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+			if err != nil {
 				return err
 			}
-			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, detail.Labels, getBoolFlag(cmd, "reviewer-manual")); err != nil {
+			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, getBoolFlag(cmd, "reviewer-manual")); err != nil {
 				return err
 			}
 			return submitReviewWithoutAnchorValidation(cmd, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
@@ -305,10 +313,11 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	if err := r.validateLatestReviewerReviewSubmitHold(cmd, gateway, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+	freshLabels, err := r.validateLatestReviewerReviewSubmitHold(cmd, gateway, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+	if err != nil {
 		return err
 	}
-	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, detail.Labels, getBoolFlag(cmd, "reviewer-manual")); err != nil {
+	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, getBoolFlag(cmd, "reviewer-manual")); err != nil {
 		return err
 	}
 	if err := gateway.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
@@ -545,12 +554,17 @@ func (r *commandRuntime) validateReviewerReviewSubmitHold(cmd *cobra.Command, cf
 	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
 }
 
-func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, manual bool, runID string, cwd string) error {
+func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, manual bool, runID string, cwd string) ([]string, error) {
 	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
-		return fmt.Errorf("refresh pull request hold labels before review submit: %w", err)
+		return nil, fmt.Errorf("refresh pull request hold labels before review submit: %w", err)
 	}
-	return r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels)
+	if err := r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels); err != nil {
+		return nil, err
+	}
+	// Return the refreshed labels so Forgejo publish authority does not reuse
+	// the first PR snapshot (which can still list a trigger label removed mid-run).
+	return detail.Labels, nil
 }
 
 func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (bool, error) {

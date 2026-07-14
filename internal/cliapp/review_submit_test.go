@@ -49,6 +49,8 @@ func TestForgejoReviewSubmitGatewayReusesMatchingNativeReviewMarker(t *testing.T
 		switch {
 		case r.URL.Path == "/swagger.v1.json":
 			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "reviewer"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
 			_ = json.NewEncoder(w).Encode(reviews)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
@@ -84,6 +86,51 @@ func TestForgejoReviewSubmitGatewayReusesMatchingNativeReviewMarker(t *testing.T
 	}
 }
 
+func TestForgejoReviewSubmitGatewayDoesNotReuseOtherAuthorsMatchingMarker(t *testing.T) {
+	t.Parallel()
+	marker := "<!-- looper:review id=reviewer:loop:head head=head outcome=blocking -->"
+	reviews := []map[string]any{
+		{"id": 8, "state": "REQUEST_CHANGES", "body": "Blocking issue\n\n" + marker, "commit_id": "head", "user": map[string]any{"login": "other-bot"}},
+	}
+	publishCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "reviewer"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+			_ = json.NewEncoder(w).Encode(reviews)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+			publishCalls++
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode review payload: %v", err)
+			}
+			review := map[string]any{"id": 9, "state": "REQUEST_CHANGES", "body": payload["body"], "commit_id": "head", "user": map[string]any{"login": "reviewer"}}
+			reviews = append(reviews, review)
+			_ = json.NewEncoder(w).Encode(review)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	gateway := forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(config.Config{})}
+	input := githubinfra.SubmitReviewInput{PRNumber: 42, Event: "REQUEST_CHANGES", Body: "Blocking issue\n\n" + marker, CommitID: "head"}
+	if err := gateway.SubmitReview(context.Background(), input); err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want one native review for the current author", publishCalls)
+	}
+}
+
 func TestForgejoReviewSubmitGatewayNormalizesInvalidAnchorsBeforePublish(t *testing.T) {
 	t.Parallel()
 	var published map[string]any
@@ -91,6 +138,8 @@ func TestForgejoReviewSubmitGatewayNormalizesInvalidAnchorsBeforePublish(t *test
 		switch {
 		case r.URL.Path == "/swagger.v1.json":
 			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "reviewer"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
 			_ = json.NewEncoder(w).Encode([]any{})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
@@ -572,15 +621,27 @@ func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
 	cmd := &cobra.Command{}
 	gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{Number: 42, Labels: []string{domain.HoldLabelReviewer}}}
 
-	err := runtime.validateLatestReviewerReviewSubmitHold(cmd, gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
+	labels, err := runtime.validateLatestReviewerReviewSubmitHold(cmd, gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
 	if err == nil || !strings.Contains(err.Error(), "currently held") {
 		t.Fatalf("validateLatestReviewerReviewSubmitHold() error = %v, want held rejection", err)
+	}
+	if labels != nil {
+		t.Fatalf("labels = %#v, want nil on hold rejection", labels)
 	}
 	if len(gh.calls) != 1 {
 		t.Fatalf("ViewPullRequest calls = %#v, want one refresh", gh.calls)
 	}
 	if gh.calls[0].Repo != "acme/looper" || gh.calls[0].PRNumber != 42 || gh.calls[0].CWD != "/repo" {
 		t.Fatalf("ViewPullRequest call = %#v, want requested PR and cwd", gh.calls[0])
+	}
+
+	gh = &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{Number: 42, Labels: []string{"ready-for-review"}}}
+	labels, err = runtime.validateLatestReviewerReviewSubmitHold(cmd, gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
+	if err != nil {
+		t.Fatalf("validateLatestReviewerReviewSubmitHold(unheld) error = %v", err)
+	}
+	if len(labels) != 1 || labels[0] != "ready-for-review" {
+		t.Fatalf("labels = %#v, want refreshed PR labels for publish authority", labels)
 	}
 }
 
