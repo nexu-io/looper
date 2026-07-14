@@ -1744,7 +1744,7 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 }
 
 func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThreadReplyInput) error {
-	if err := outboundguard.Validate(outboundguard.Field{Name: "review thread reply body", Text: input.Body}); err != nil {
+	if err := outboundguard.ValidateReviewThreadReply(input.Body, input.ThreadID); err != nil {
 		return err
 	}
 	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{

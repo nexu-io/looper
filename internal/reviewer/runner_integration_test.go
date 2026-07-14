@@ -23,7 +23,7 @@ func TestThreadResolutionReplyPassesStampedGitHubPublicationBoundary(t *testing.
 	}
 	const (
 		repo     = "acme/looper"
-		threadID = "PRRT_kwDOSOgY8s6QeKwr"
+		threadID = "MDQ6UHVsbFJlcXVlc3RSZXZpZXdUaHJlYWQxMjM0NTY="
 		headSHA  = "0dd6a5019812fc422f9f20626530758ad67ad66e"
 	)
 	fakeGH.WriteState(t, harness.GHState{PullRequests: map[string]harness.GHPullRequest{

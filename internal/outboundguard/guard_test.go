@@ -74,30 +74,31 @@ func TestValidateAllowsCommonPublicationIdentifiers(t *testing.T) {
 	}
 }
 
-func TestValidateAllowsStrictLooperThreadResolutionMarker(t *testing.T) {
+func TestValidateReviewThreadReplyAllowsExactOpaqueThreadID(t *testing.T) {
 	t.Parallel()
-	body := "Looper checked this thread.\n<!-- looper:thread-resolution thread=PRRT_kwDOSOgY8s6QeKwr head=0dd6a5019812fc422f9f20626530758ad67ad66e decision=objectively_fixed -->"
-	if err := Validate(Field{Name: "review thread reply body", Text: body}); err != nil {
-		t.Fatalf("Validate() error = %v, want safe Looper marker", err)
+	for _, threadID := range []string{"PRRT_kwDOSOgY8s6QeKwr", "MDQ6UHVsbFJlcXVlc3RSZXZpZXdUaHJlYWQxMjM0NTY="} {
+		body := "Looper checked this thread.\n<!-- looper:thread-resolution thread=" + threadID + " head=0dd6a5019812fc422f9f20626530758ad67ad66e decision=objectively_fixed -->"
+		if err := ValidateReviewThreadReply(body, threadID); err != nil {
+			t.Errorf("ValidateReviewThreadReply(%q) error = %v, want safe opaque thread ID", threadID, err)
+		}
 	}
 }
 
-func TestValidateThreadResolutionMarkerDoesNotExemptUntrustedContent(t *testing.T) {
-	t.Parallel()
-	marker := "<!-- looper:thread-resolution thread=PRRT_kwDOSOgY8s6QeKwr head=0dd6a5019812fc422f9f20626530758ad67ad66e decision=objectively_fixed -->"
+func TestThreadIDExemptionIsScopedToMatchingReviewThreadReply(t *testing.T) {
+	threadID := "MDQ6UHVsbFJlcXVlc3RSZXZpZXdUaHJlYWQxMjM0NTY="
+	marker := "<!-- looper:thread-resolution thread=" + threadID + " head=0dd6a5019812fc422f9f20626530758ad67ad66e decision=objectively_fixed -->"
 	tests := []struct {
 		name string
-		body string
+		err  error
 	}{
-		{name: "high entropy prose", body: "Agent evidence q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/\n" + marker},
-		{name: "invalid thread id", body: strings.Replace(marker, "PRRT_", "THREAD_", 1)},
-		{name: "invalid head", body: strings.Replace(marker, "0dd6a5019812fc422f9f20626530758ad67ad66e", "q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/", 1)},
-		{name: "invalid decision", body: strings.Replace(marker, "objectively_fixed", "agent_approved", 1)},
+		{name: "generic publication", err: Validate(Field{Name: "pull request body", Text: marker})},
+		{name: "different active thread", err: ValidateReviewThreadReply(marker, "PRRT_kwDOSOgY8s6QeKwr")},
+		{name: "high entropy prose", err: ValidateReviewThreadReply("Agent evidence q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/\n"+marker, threadID)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := Validate(Field{Name: "review thread reply body", Text: tc.body}); err == nil || !strings.Contains(err.Error(), "high-entropy") {
-				t.Fatalf("Validate() error = %v, want high-entropy rejection", err)
+			if tc.err == nil || !strings.Contains(tc.err.Error(), "high-entropy") {
+				t.Fatalf("validation error = %v, want high-entropy rejection", tc.err)
 			}
 		})
 	}
