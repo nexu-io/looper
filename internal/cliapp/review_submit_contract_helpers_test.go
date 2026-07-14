@@ -95,8 +95,17 @@ case "$1" in
     ;;
 esac
 `, submitLog, baseSHA, headSHA, diffMode, filepath.Join(root, "gh-invocations.log"))
-	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake gh: %v", err)
+	// Write via temp + rename so the final path is never open for write when
+	// tests immediately exec it (avoids intermittent Linux ETXTBSY / "text file busy").
+	ghTmp := ghPath + ".tmp"
+	if err := os.WriteFile(ghTmp, []byte(script), 0o644); err != nil {
+		t.Fatalf("write fake gh tmp: %v", err)
+	}
+	if err := os.Chmod(ghTmp, 0o755); err != nil {
+		t.Fatalf("chmod fake gh: %v", err)
+	}
+	if err := os.Rename(ghTmp, ghPath); err != nil {
+		t.Fatalf("rename fake gh: %v", err)
 	}
 
 	configPayload := map[string]any{
