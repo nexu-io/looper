@@ -115,6 +115,21 @@ type CleanupWorktreeInput struct {
 	ProtectedBranches []string
 }
 
+// DiscardWorktreeChangesInput discards tracked and untracked local changes in a
+// managed worktree, leaving HEAD and the worktree directory itself intact.
+type DiscardWorktreeChangesInput struct {
+	RepoPath     string
+	WorktreeRoot string
+	WorktreePath string
+}
+
+// DiscardWorktreeChangesResult reports whether discard mutated the worktree.
+type DiscardWorktreeChangesResult struct {
+	WorktreePath string
+	WasDirty     bool
+	NoOp         bool
+}
+
 type PushInput struct {
 	RepoPath              string
 	WorktreeRoot          string
@@ -518,6 +533,49 @@ func (g *Gateway) WorktreeClean(ctx context.Context, worktreePath string) (bool,
 
 func (g *Gateway) IsWorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
 	return g.WorktreeClean(ctx, worktreePath)
+}
+
+// DiscardWorktreeChanges hard-resets tracked files and removes untracked files
+// in a managed worktree. It never deletes the worktree directory, remote
+// branches, or force-pushes.
+func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorktreeChangesInput) (DiscardWorktreeChangesResult, error) {
+	worktreePath := strings.TrimSpace(input.WorktreePath)
+	if worktreePath == "" {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("worktree path is required")
+	}
+	if err := g.validateMutationWorktree(worktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return DiscardWorktreeChangesResult{WorktreePath: worktreePath, NoOp: true}, nil
+		}
+		return DiscardWorktreeChangesResult{}, err
+	}
+
+	clean, err := g.WorktreeClean(ctx, worktreePath)
+	if err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if clean {
+		return DiscardWorktreeChangesResult{WorktreePath: worktreePath, WasDirty: false, NoOp: true}, nil
+	}
+
+	if err := g.runGit(ctx, worktreePath, nil, "reset", "--hard", "HEAD"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if err := g.runGit(ctx, worktreePath, nil, "clean", "-fd"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+
+	clean, err = g.WorktreeClean(ctx, worktreePath)
+	if err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if !clean {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("worktree still dirty after discard at %s", worktreePath)
+	}
+	return DiscardWorktreeChangesResult{WorktreePath: worktreePath, WasDirty: true, NoOp: false}, nil
 }
 
 func (g *Gateway) Push(ctx context.Context, input PushInput) error {

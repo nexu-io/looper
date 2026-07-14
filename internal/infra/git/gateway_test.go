@@ -1008,6 +1008,97 @@ func TestGatewayRemoteBranchExistsUsesFetchedTrackingRef(t *testing.T) {
 	}
 }
 
+func TestGatewayDiscardWorktreeChangesResetsTrackedAndUntracked(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	ctx := context.Background()
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/fixer",
+		BaseBranch:   "main",
+		PRNumber:     42,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	originalREADME := readFile(t, filepath.Join(worktree.WorktreePath, "README.md"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "dirty tracked\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "untracked.txt"), "dirty untracked\n")
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "untracked-dir"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "untracked-dir", "nested.txt"), "nested\n")
+
+	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
+	}
+	if result.NoOp || !result.WasDirty || result.WorktreePath != worktree.WorktreePath {
+		t.Fatalf("DiscardWorktreeChanges() = %#v, want dirty discard of managed path", result)
+	}
+	if got := readFile(t, filepath.Join(worktree.WorktreePath, "README.md")); got != originalREADME {
+		t.Fatalf("README.md after discard = %q, want %q", got, originalREADME)
+	}
+	if _, err := os.Stat(filepath.Join(worktree.WorktreePath, "untracked.txt")); !os.IsNotExist(err) {
+		t.Fatalf("untracked.txt still exists after discard: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(worktree.WorktreePath, "untracked-dir")); !os.IsNotExist(err) {
+		t.Fatalf("untracked-dir still exists after discard: %v", err)
+	}
+	if _, err := os.Stat(worktree.WorktreePath); err != nil {
+		t.Fatalf("worktree directory missing after discard: %v", err)
+	}
+	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil || !clean {
+		t.Fatalf("WorktreeClean() = %v, %v, want clean", clean, err)
+	}
+
+	// Second call is a no-op when already clean.
+	second, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorktreeChanges(clean) error = %v", err)
+	}
+	if !second.NoOp || second.WasDirty {
+		t.Fatalf("DiscardWorktreeChanges(clean) = %#v, want no-op", second)
+	}
+}
+
+func TestGatewayDiscardWorktreeChangesRejectsUnsafePaths(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	ctx := context.Background()
+	gateway := fixture.gateway()
+
+	if _, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: fixture.repoPath,
+	}); err == nil {
+		t.Fatal("DiscardWorktreeChanges(repoPath) error = nil, want safety rejection")
+	}
+
+	outside := filepath.Join(fixture.rootDir, "outside-wt")
+	mustMkdirAll(t, outside)
+	if _, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: outside,
+	}); err == nil {
+		t.Fatal("DiscardWorktreeChanges(outside) error = nil, want safety rejection")
+	}
+}
+
 func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *testing.T) {
 	t.Parallel()
 

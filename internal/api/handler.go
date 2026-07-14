@@ -1485,15 +1485,18 @@ type activeRunView struct {
 }
 
 type retryLoopRequest struct {
-	Mode          string `json:"mode"`
-	ResetAttempts *bool  `json:"resetAttempts"`
+	Mode                   string `json:"mode"`
+	ResetAttempts          *bool  `json:"resetAttempts"`
+	DiscardWorktreeChanges *bool  `json:"discardWorktreeChanges"`
 }
 
 type retryLoopResponse struct {
-	Loop          loopResponse `json:"loop"`
-	QueueItemID   *string      `json:"queueItemId,omitempty"`
-	Mode          string       `json:"mode"`
-	ResetAttempts bool         `json:"resetAttempts"`
+	Loop                   loopResponse           `json:"loop"`
+	QueueItemID            *string                `json:"queueItemId,omitempty"`
+	Mode                   string                 `json:"mode"`
+	ResetAttempts          bool                   `json:"resetAttempts"`
+	DiscardWorktreeChanges bool                   `json:"discardWorktreeChanges"`
+	WorktreeDiscard        *worktreeDiscardResult `json:"worktreeDiscard,omitempty"`
 }
 
 type activeRunTarget struct {
@@ -5029,9 +5032,65 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	if !resetAttempts {
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
 	}
+	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+
+	// Opt-in discard runs before requeue so git mutation stays outside the
+	// queue transaction. Active run/queue and terminal checks still apply.
+	var worktreeDiscard *worktreeDiscardResult
+	if discardWorktreeChanges {
+		if services.Repositories == nil || services.Coordinator == nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+		}
+		preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if preflightLoop == nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if strings.TrimSpace(preflightLoop.ProjectID) != "" {
+			if _, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, preflightLoop.ProjectID); err != nil {
+				return retryLoopResponse{}, err
+			}
+		}
+		if preflightLoop.Status == string(domain.LoopStatusStopped) || preflightLoop.Status == string(domain.LoopStatusTerminated) || preflightLoop.Status == string(domain.LoopStatusCompleted) {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", preflightLoop.Status, preflightLoop.ID)}
+		}
+		if preflightLoop.Type == string(domain.LoopTypeReviewer) {
+			if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(*preflightLoop); terminalMetadataStatus != "" {
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, preflightLoop.ID)}
+			}
+		}
+		runningRuns, err := services.Repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+		if err != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		for _, run := range runningRuns {
+			if run.LoopID == preflightLoop.ID {
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", preflightLoop.ID)}
+			}
+		}
+		activeQueue, err := services.Repositories.Queue.FindActiveByLoopID(ctx, preflightLoop.ID)
+		if err != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if activeQueue != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", preflightLoop.ID, activeQueue.ID)}
+		}
+		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
+		if discardErr != nil {
+			var typed apiError
+			if asAPIError(discardErr, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: discardErr.Error()}
+		}
+		worktreeDiscard = &discardResult
+	}
+
 	type retryResult struct {
 		loop        storage.LoopRecord
 		queueItemID *string
@@ -5165,7 +5224,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
-	return retryLoopResponse{Loop: serializeLoop(result.loop), QueueItemID: result.queueItemID, Mode: mode, ResetAttempts: resetAttempts}, nil
+	return retryLoopResponse{
+		Loop:                   serializeLoop(result.loop),
+		QueueItemID:            result.queueItemID,
+		Mode:                   mode,
+		ResetAttempts:          resetAttempts,
+		DiscardWorktreeChanges: discardWorktreeChanges,
+		WorktreeDiscard:        worktreeDiscard,
+	}, nil
 }
 
 func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRecord) (loopLogsResponse, error) {

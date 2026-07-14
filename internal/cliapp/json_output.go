@@ -307,14 +307,14 @@ func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
 		if getBoolFlag(cmd, "discard-worktree-changes") && !getBoolFlag(cmd, "confirm") {
 			return nil, fmt.Errorf("--discard-worktree-changes requires --confirm")
 		}
-		if getBoolFlag(cmd, "discard-worktree-changes") {
-			return nil, fmt.Errorf("--discard-worktree-changes is not supported yet; fix or reset the worktree manually, then retry without this flag")
-		}
 		mode := strings.TrimSpace(getStringFlag(cmd, "mode"))
 		if mode == "" {
 			mode = "auto"
 		}
 		body := map[string]any{"mode": mode, "resetAttempts": true}
+		if getBoolFlag(cmd, "discard-worktree-changes") {
+			body["discardWorktreeChanges"] = true
+		}
 		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
 	}, writeHumanLoopRetried)
 }

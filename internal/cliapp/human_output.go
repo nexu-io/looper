@@ -149,11 +149,20 @@ type loopOutput struct {
 	Status     string  `json:"status"`
 }
 
+type loopRetryWorktreeDiscardOutput struct {
+	WorktreePath *string `json:"worktreePath"`
+	Discarded    bool    `json:"discarded"`
+	NoOp         bool    `json:"noOp"`
+	Reason       string  `json:"reason"`
+}
+
 type loopRetryOutput struct {
-	Loop          loopOutput `json:"loop"`
-	QueueItemID   *string    `json:"queueItemId"`
-	Mode          string     `json:"mode"`
-	ResetAttempts bool       `json:"resetAttempts"`
+	Loop                   loopOutput                      `json:"loop"`
+	QueueItemID            *string                         `json:"queueItemId"`
+	Mode                   string                          `json:"mode"`
+	ResetAttempts          bool                            `json:"resetAttempts"`
+	DiscardWorktreeChanges bool                            `json:"discardWorktreeChanges"`
+	WorktreeDiscard        *loopRetryWorktreeDiscardOutput `json:"worktreeDiscard"`
 }
 
 type reviewRepairOutput struct {
@@ -508,7 +517,24 @@ func writeHumanLoopRetried(w io.Writer, payload json.RawMessage) error {
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return fmt.Errorf("decode loop retry response: %w", err)
 	}
-	printSection(w, "Loop retry queued", [][2]any{{"id", data.Loop.ID}, {"seq", data.Loop.Seq}, {"status", data.Loop.Status}, {"mode", data.Mode}, {"queueItem", formatScalar(data.QueueItemID)}})
+	fields := [][2]any{
+		{"id", data.Loop.ID},
+		{"seq", data.Loop.Seq},
+		{"status", data.Loop.Status},
+		{"mode", data.Mode},
+		{"queueItem", formatScalar(data.QueueItemID)},
+	}
+	if data.DiscardWorktreeChanges {
+		fields = append(fields, [2]any{"discardWorktreeChanges", true})
+		if data.WorktreeDiscard != nil {
+			fields = append(fields,
+				[2]any{"worktreePath", formatScalar(data.WorktreeDiscard.WorktreePath)},
+				[2]any{"worktreeDiscardNoOp", data.WorktreeDiscard.NoOp},
+				[2]any{"worktreeDiscardReason", data.WorktreeDiscard.Reason},
+			)
+		}
+	}
+	printSection(w, "Loop retry queued", fields)
 	return nil
 }
 
