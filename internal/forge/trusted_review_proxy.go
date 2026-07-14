@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,15 +37,33 @@ type trustedReviewProxyResponse struct {
 	Error    string `json:"error,omitempty"`
 }
 
+// FormatTrustedReviewPRRef builds the canonical owner/repo#N form used to bind
+// a review-submit proxy to a single pull request for one agent run.
+func FormatTrustedReviewPRRef(repo string, prNumber int64) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" || prNumber <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s#%d", repo, prNumber)
+}
+
 // StartTrustedReviewProxy listens on a private Unix socket and runs
 // `looper review submit` in a daemon-side child with provider tokens injected.
 // Agents receive only the socket path (via TrustedReviewSockEnv), never a
 // secret-bearing wrapper path or LOOPER_TRUSTED_ENV_FILE.
-func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string) (sockPath string, cleanup func(), err error) {
+//
+// allowedPRRef must be the daemon-selected pull request in owner/repo#N form.
+// The proxy rejects any review-submit argv that targets a different PR so a
+// prompt-injected agent cannot publish under tokens for another PR.
+func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef string) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	noop := func() {}
 	if realLooper == "" {
 		return "", nil, fmt.Errorf("real looper path is required for trusted review proxy")
+	}
+	normalizedAllowed, err := normalizeTrustedReviewPRRef(allowedPRRef)
+	if err != nil {
+		return "", nil, fmt.Errorf("trusted review proxy allowed PR: %w", err)
 	}
 	if len(trustedEnv) == 0 {
 		return "", noop, nil
@@ -87,7 +106,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string) (s
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handleTrustedReviewProxyConn(c, realLooper, trustedEnv)
+				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed)
 			}(conn)
 		}
 	}()
@@ -101,7 +120,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string) (s
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string) {
+func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef string) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
@@ -111,7 +130,7 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "decode trusted review proxy request: " + err.Error()})
 		return
 	}
-	if err := validateTrustedReviewProxyArgv(req.Argv); err != nil {
+	if err := validateTrustedReviewProxyArgv(req.Argv, allowedPRRef); err != nil {
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: err.Error()})
 		return
 	}
@@ -173,7 +192,7 @@ func trustedReviewProxyFlagName(arg string) string {
 	return strings.ToLower(arg)
 }
 
-func validateTrustedReviewProxyArgv(argv []string) error {
+func validateTrustedReviewProxyArgv(argv []string, allowedPRRef string) error {
 	// Reject config/tool/db overrides anywhere in argv first so a compromised
 	// agent cannot redirect the daemon-injected provider token via --config or
 	// tool/db path flags, even after `review submit`.
@@ -189,6 +208,8 @@ func validateTrustedReviewProxyArgv(argv []string) error {
 	// anything that is not a review-submit invocation so the proxy cannot be
 	// abused to run arbitrary looper subcommands with provider tokens.
 	seenReview := false
+	seenSubmit := false
+	prRef := ""
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
 		if !seenReview {
@@ -206,18 +227,77 @@ func validateTrustedReviewProxyArgv(argv []string) error {
 			}
 			return fmt.Errorf("trusted review proxy only allows `looper review submit`")
 		}
-		if arg == "submit" {
-			return nil
+		if !seenSubmit {
+			if arg == "submit" {
+				seenSubmit = true
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+					i++
+				}
+				continue
+			}
+			return fmt.Errorf("trusted review proxy only allows `looper review submit`")
 		}
+		// After `review submit`, collect the first positional as the PR target
+		// and skip flag values for subsequent options.
 		if strings.HasPrefix(arg, "-") {
 			if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
 				i++
 			}
 			continue
 		}
+		if prRef == "" {
+			prRef = arg
+			continue
+		}
+		// Extra positionals are not part of the allowed review-submit shape.
+		return fmt.Errorf("trusted review proxy only allows `looper review submit <repo>#<number> ...`")
+	}
+	if !seenReview || !seenSubmit {
 		return fmt.Errorf("trusted review proxy only allows `looper review submit`")
 	}
-	return fmt.Errorf("trusted review proxy only allows `looper review submit`")
+	if strings.TrimSpace(prRef) == "" {
+		return fmt.Errorf("trusted review proxy requires pull request target <repo>#<number>")
+	}
+	return matchTrustedReviewProxyPRRef(prRef, allowedPRRef)
+}
+
+func normalizeTrustedReviewPRRef(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("pull request reference is required")
+	}
+	parts := strings.Split(value, "#")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("pull request reference must be <repo>#<number>")
+	}
+	repo := strings.ToLower(strings.TrimSpace(parts[0]))
+	if repo == "" || !strings.Contains(repo, "/") {
+		return "", fmt.Errorf("pull request reference must be <repo>#<number>")
+	}
+	numberPart := strings.TrimSpace(parts[1])
+	n, err := strconv.ParseInt(numberPart, 10, 64)
+	if err != nil || n <= 0 {
+		return "", fmt.Errorf("pull request reference must be <repo>#<number>")
+	}
+	return fmt.Sprintf("%s#%d", repo, n), nil
+}
+
+func matchTrustedReviewProxyPRRef(got, allowed string) error {
+	normalizedGot, err := normalizeTrustedReviewPRRef(got)
+	if err != nil {
+		return fmt.Errorf("trusted review proxy PR target: %w", err)
+	}
+	normalizedAllowed, err := normalizeTrustedReviewPRRef(allowed)
+	if err != nil {
+		return fmt.Errorf("trusted review proxy allowed PR: %w", err)
+	}
+	if normalizedGot != normalizedAllowed {
+		return fmt.Errorf("trusted review proxy rejects PR target %q; bound to %s", strings.TrimSpace(got), normalizedAllowed)
+	}
+	return nil
 }
 
 func trustedReviewProxyChildEnv(trustedEnv map[string]string) []string {
@@ -261,12 +341,17 @@ func TrustedReviewSockConfigured() bool {
 // ProxyReviewSubmit forwards a review-submit invocation to the trusted proxy.
 // On success it writes the proxy stdout/stderr to the current process streams
 // and returns a process-style exit error when the proxied command failed.
+// The daemon-side listener enforces the per-run allowed PR binding; this client
+// only checks the command shape before dialing.
 func ProxyReviewSubmit(argv []string, stdin []byte, cwd string) error {
 	sockPath := strings.TrimSpace(os.Getenv(TrustedReviewSockEnv))
 	if sockPath == "" {
 		return fmt.Errorf("trusted review proxy socket is not configured")
 	}
-	if err := validateTrustedReviewProxyArgv(argv); err != nil {
+	// Client-side shape check only; PR binding is enforced on the daemon proxy
+	// where the allowed owner/repo#N is known. Pass empty allowed here so we do
+	// not require a second copy of the binding in the agent process.
+	if err := validateTrustedReviewProxyArgvShape(argv); err != nil {
 		return err
 	}
 
@@ -301,6 +386,62 @@ func ProxyReviewSubmit(argv []string, stdin []byte, cwd string) error {
 		return &proxyExitError{code: resp.ExitCode}
 	}
 	return nil
+}
+
+// validateTrustedReviewProxyArgvShape checks command shape without PR binding
+// so the agent-side client can fail fast on clearly invalid argv before dial.
+func validateTrustedReviewProxyArgvShape(argv []string) error {
+	// Reuse full validator with a synthetic allowed ref extracted from argv when
+	// present; if the PR target is missing/malformed the full validator still
+	// fails closed for shape. When present, self-match so binding is not enforced
+	// client-side (daemon holds the real binding).
+	prRef := extractTrustedReviewProxyPRRef(argv)
+	if prRef == "" {
+		return validateTrustedReviewProxyArgv(argv, "placeholder/repo#1")
+	}
+	return validateTrustedReviewProxyArgv(argv, prRef)
+}
+
+func extractTrustedReviewProxyPRRef(argv []string) string {
+	seenReview := false
+	seenSubmit := false
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if !seenReview {
+			if arg == "review" {
+				seenReview = true
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") && argv[i+1] != "review" {
+					i++
+				}
+				continue
+			}
+			return ""
+		}
+		if !seenSubmit {
+			if arg == "submit" {
+				seenSubmit = true
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+					i++
+				}
+				continue
+			}
+			return ""
+		}
+		if strings.HasPrefix(arg, "-") {
+			if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+				i++
+			}
+			continue
+		}
+		return arg
+	}
+	return ""
 }
 
 type proxyExitError struct {

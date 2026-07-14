@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -209,86 +208,30 @@ func providerTrustedEnv(cfg config.Config) map[string]string {
 // resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
 // Agents always receive the real configured looper path — never a secret-bearing
 // wrapper path. Provider tokens for `looper review submit` are supplied through
-// the daemon-side trusted review proxy socket (see installTrustedReviewProxy).
+// a per-run daemon-side trusted review proxy socket bound to the selected PR.
 func resolveTrustedLooperCLIPath(cfg config.Config) string {
 	return strings.TrimSpace(derefString(cfg.Tools.LooperPath))
 }
 
-// installTrustedReviewProxy starts a daemon-side Unix socket that runs
-// `looper review submit` with provider tokens. Agents only receive the socket
-// path (not tokens or a secret wrapper path). cleanup stops the listener.
-func installTrustedReviewProxy(cfg config.Config, logger bootstrap.Logger) (sockPath string, cleanup func()) {
+// mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
+// `looper review submit` with provider tokens, bound exclusively to allowedPRRef
+// (owner/repo#N). Agents only receive the socket path (not tokens). cleanup
+// stops the listener and must run when the agent execution ends.
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef string, logger bootstrap.Logger) (sockPath string, cleanup func()) {
 	noop := func() {}
-	realLooper := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
-	trusted := providerTrustedEnv(cfg)
-	if realLooper == "" || len(trusted) == 0 {
+	realLooper = strings.TrimSpace(realLooper)
+	allowedPRRef = strings.TrimSpace(allowedPRRef)
+	if realLooper == "" || len(trustedEnv) == 0 || allowedPRRef == "" {
 		return "", noop
 	}
-	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trusted)
+	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef)
 	if err != nil {
 		if logger != nil {
-			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error()})
+			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error(), "allowedPR": allowedPRRef})
 		}
 		return "", noop
 	}
 	return path, stop
-}
-
-// trustedReviewProxyKey identifies a proxy configuration so catalog-mode
-// snapshots can reuse one listener instead of leaking one per tick.
-func trustedReviewProxyKey(cfg config.Config) string {
-	realLooper := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
-	trusted := providerTrustedEnv(cfg)
-	if realLooper == "" || len(trusted) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(trusted))
-	for key := range trusted {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, 1+len(keys))
-	parts = append(parts, realLooper)
-	for _, key := range keys {
-		parts = append(parts, key+"="+trusted[key])
-	}
-	return strings.Join(parts, "\x00")
-}
-
-// trustedReviewProxyHolder owns a single reusable trusted review proxy across
-// catalog-mode per-tick handler rebuilds.
-type trustedReviewProxyHolder struct {
-	mu      sync.Mutex
-	key     string
-	sock    string
-	cleanup func()
-}
-
-func (h *trustedReviewProxyHolder) ensure(cfg config.Config, logger bootstrap.Logger) string {
-	if h == nil {
-		return ""
-	}
-	key := trustedReviewProxyKey(cfg)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if key == "" {
-		if h.cleanup != nil {
-			h.cleanup()
-			h.cleanup = nil
-		}
-		h.key, h.sock = "", ""
-		return ""
-	}
-	if key == h.key && h.sock != "" {
-		return h.sock
-	}
-	if h.cleanup != nil {
-		h.cleanup()
-		h.cleanup = nil
-	}
-	sock, cleanup := installTrustedReviewProxy(cfg, logger)
-	h.key, h.sock, h.cleanup = key, sock, cleanup
-	return sock
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
@@ -1642,10 +1585,27 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 }
 
 type reviewerAgentExecutorAdapter struct {
-	executor          *agent.ConfiguredExecutor
-	trustedReviewSock string
+	executor   *agent.ConfiguredExecutor
+	realLooper string
+	trustedEnv map[string]string
+	logger     bootstrap.Logger
 }
-type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
+type reviewerAgentExecutionAdapter struct {
+	execution agent.Execution
+	cleanup   func()
+	once      sync.Once
+}
+
+func (a *reviewerAgentExecutionAdapter) closeProxy() {
+	if a == nil {
+		return
+	}
+	a.once.Do(func() {
+		if a.cleanup != nil {
+			a.cleanup()
+		}
+	})
+}
 
 type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
 
@@ -1680,7 +1640,59 @@ func reviewerTrustedReviewEnv(sock string) map[string]string {
 	return map[string]string{forge.TrustedReviewSockEnv: sock}
 }
 
+// reviewerAllowedPRRef extracts the daemon-selected owner/repo#N from reviewer
+// agent metadata so the trusted review proxy can be bound to that PR only.
+func reviewerAllowedPRRef(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	repo, _ := metadata["repo"].(string)
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return ""
+	}
+	prNumber, ok := metadataInt64(metadata["prNumber"])
+	if !ok || prNumber <= 0 {
+		return ""
+	}
+	return forge.FormatTrustedReviewPRRef(repo, prNumber)
+}
+
+func metadataInt64(value any) (int64, bool) {
+	switch n := value.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case float64:
+		if n != float64(int64(n)) {
+			return 0, false
+		}
+		return int64(n), true
+	case float32:
+		if n != float32(int64(n)) {
+			return 0, false
+		}
+		return int64(n), true
+	case json.Number:
+		parsed, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
+	// Mint a per-run proxy bound to the daemon-selected PR. A shared unbound
+	// socket would let a prompt-injected agent retarget review submit to any
+	// configured Forgejo PR the bot is authorized to review.
+	allowedPR := reviewerAllowedPRRef(input.Metadata)
+	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, a.logger)
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID:        input.ExecutionID,
 		ProjectID:          input.ProjectID,
@@ -1693,15 +1705,17 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		HeartbeatTimeout:   input.HeartbeatTimeout,
 		Metadata:           input.Metadata,
 		IdempotencyKey:     input.IdempotencyKey,
-		Env:                reviewerTrustedReviewEnv(a.trustedReviewSock),
+		Env:                reviewerTrustedReviewEnv(sock),
 	})
 	if err != nil {
+		proxyCleanup()
 		return nil, err
 	}
-	return reviewerAgentExecutionAdapter{execution: execution}, nil
+	return &reviewerAgentExecutionAdapter{execution: execution, cleanup: proxyCleanup}, nil
 }
 
-func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
+func (a *reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
+	defer a.closeProxy()
 	result, err := a.execution.Wait(ctx)
 	if err != nil {
 		return reviewer.AgentResult{}, err
@@ -1709,7 +1723,8 @@ func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.Agent
 	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
 }
 
-func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
+func (a *reviewerAgentExecutionAdapter) Kill(reason string) error {
+	defer a.closeProxy()
 	return a.execution.Kill(reason)
 }
 
@@ -2614,14 +2629,12 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstra
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	claimMu := &sync.Mutex{}
-	// Own the trusted review proxy outside per-tick snapshots so catalog mode
-	// does not start a new Unix listener (and leak temp dirs) on every tick.
-	proxy := &trustedReviewProxyHolder{}
-	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source, "", false)
+	// Trusted review proxies are minted per reviewer agent run (bound to that
+	// run's PR). Catalog snapshots only need claim mutex + config source reuse.
+	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		sock := proxy.ensure(cfg, logger)
-		return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, sock, false)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
 	}
 	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
@@ -2636,10 +2649,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstra
 }
 
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, "", true)
+	return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, trustedReviewSock string, manageTrustedReviewProxy bool) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2758,14 +2771,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 	var workerRunner workerScheduler
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
-	if manageTrustedReviewProxy {
-		// Non-catalog single-shot builds own their proxy for this handler graph.
-		// Catalog mode passes manageTrustedReviewProxy=false and a shared sock.
-		trustedReviewSock, _ = installTrustedReviewProxy(cfg, logger)
-	}
 	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of the shared agent executor env so
 	// planner/worker/fixer cannot publish reviews. Inject only via the
-	// reviewer adapter below.
+	// reviewer adapter, which mints a per-run proxy bound to the selected PR.
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
 			Vendor:              *cfg.Agent.Vendor,
@@ -2844,8 +2852,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 		GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
 		Git:    reviewerGitAdapter{gateway: gitGateway},
 		AgentExecutor: reviewerAgentExecutorAdapter{
-			executor:          agentExecutor,
-			trustedReviewSock: trustedReviewSock,
+			executor:   agentExecutor,
+			realLooper: looperCLIPath,
+			trustedEnv: providerTrustedEnv(cfg),
+			logger:     logger,
 		},
 		Logger:           logger,
 		Now:              now,

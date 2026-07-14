@@ -9,32 +9,53 @@ import (
 
 func TestValidateTrustedReviewProxyArgv(t *testing.T) {
 	t.Parallel()
+	const allowed = "acme/looper#1"
 	tests := []struct {
 		name    string
 		argv    []string
+		allowed string
 		wantErr bool
 	}{
-		{name: "submit", argv: []string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, wantErr: false},
-		{name: "harmless global flags then submit", argv: []string{"--json", "review", "submit", "acme/looper#1"}, wantErr: false},
-		{name: "reject config override", argv: []string{"--config", "/tmp/cfg.json", "review", "submit", "acme/looper#1"}, wantErr: true},
-		{name: "reject config equals form", argv: []string{"--config=/tmp/cfg.json", "review", "submit", "acme/looper#1"}, wantErr: true},
-		{name: "reject config after submit", argv: []string{"review", "submit", "acme/looper#1", "--config", "/tmp/cfg.json"}, wantErr: true},
-		{name: "reject db-path override", argv: []string{"--db-path", "/tmp/evil.sqlite", "review", "submit", "acme/looper#1"}, wantErr: true},
-		{name: "reject looper-path override", argv: []string{"--looper-path", "/tmp/evil", "review", "submit", "acme/looper#1"}, wantErr: true},
-		{name: "reject status", argv: []string{"status"}, wantErr: true},
-		{name: "reject review without submit", argv: []string{"review", "repair"}, wantErr: true},
-		{name: "reject empty", argv: nil, wantErr: true},
+		{name: "submit", argv: []string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, allowed: allowed, wantErr: false},
+		{name: "case-insensitive repo", argv: []string{"review", "submit", "Acme/Looper#1", "--event", "COMMENT"}, allowed: allowed, wantErr: false},
+		{name: "harmless global flags then submit", argv: []string{"--json", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: false},
+		{name: "flags before PR target", argv: []string{"review", "submit", "--event", "COMMENT", "acme/looper#1"}, allowed: allowed, wantErr: false},
+		{name: "reject other PR", argv: []string{"review", "submit", "acme/looper#99", "--event", "COMMENT"}, allowed: allowed, wantErr: true},
+		{name: "reject other repo", argv: []string{"review", "submit", "evil/other#1", "--event", "COMMENT"}, allowed: allowed, wantErr: true},
+		{name: "reject missing PR", argv: []string{"review", "submit", "--event", "COMMENT"}, allowed: allowed, wantErr: true},
+		{name: "reject config override", argv: []string{"--config", "/tmp/cfg.json", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
+		{name: "reject config equals form", argv: []string{"--config=/tmp/cfg.json", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
+		{name: "reject config after submit", argv: []string{"review", "submit", "acme/looper#1", "--config", "/tmp/cfg.json"}, allowed: allowed, wantErr: true},
+		{name: "reject db-path override", argv: []string{"--db-path", "/tmp/evil.sqlite", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
+		{name: "reject looper-path override", argv: []string{"--looper-path", "/tmp/evil", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
+		{name: "reject status", argv: []string{"status"}, allowed: allowed, wantErr: true},
+		{name: "reject review without submit", argv: []string{"review", "repair"}, allowed: allowed, wantErr: true},
+		{name: "reject empty", argv: nil, allowed: allowed, wantErr: true},
+		{name: "reject empty allowed binding", argv: []string{"review", "submit", "acme/looper#1"}, allowed: "", wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateTrustedReviewProxyArgv(test.argv)
+			err := validateTrustedReviewProxyArgv(test.argv, test.allowed)
 			if test.wantErr && err == nil {
-				t.Fatalf("validateTrustedReviewProxyArgv(%v) = nil, want error", test.argv)
+				t.Fatalf("validateTrustedReviewProxyArgv(%v, %q) = nil, want error", test.argv, test.allowed)
 			}
 			if !test.wantErr && err != nil {
-				t.Fatalf("validateTrustedReviewProxyArgv(%v) error = %v", test.argv, err)
+				t.Fatalf("validateTrustedReviewProxyArgv(%v, %q) error = %v", test.argv, test.allowed, err)
 			}
 		})
+	}
+}
+
+func TestFormatTrustedReviewPRRef(t *testing.T) {
+	t.Parallel()
+	if got := FormatTrustedReviewPRRef(" acme/looper ", 42); got != "acme/looper#42" {
+		t.Fatalf("FormatTrustedReviewPRRef = %q, want acme/looper#42", got)
+	}
+	if got := FormatTrustedReviewPRRef("", 1); got != "" {
+		t.Fatalf("FormatTrustedReviewPRRef empty repo = %q, want empty", got)
+	}
+	if got := FormatTrustedReviewPRRef("acme/looper", 0); got != "" {
+		t.Fatalf("FormatTrustedReviewPRRef zero PR = %q, want empty", got)
 	}
 }
 
@@ -48,7 +69,7 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"})
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1")
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -75,6 +96,48 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 	}
 	if strings.Contains(got, "sock="+sockPath) || strings.Contains(got, "sock=/") {
 		t.Fatalf("proxy child output = %q, want empty LOOPER_TRUSTED_REVIEW_SOCK in child", got)
+	}
+}
+
+func TestStartTrustedReviewProxyRejectsUnboundPR(t *testing.T) {
+	dir := t.TempDir()
+	realLooper := filepath.Join(dir, "real-looper")
+	// Child should never run for a mismatched PR.
+	script := "#!/bin/sh\necho should-not-run\nexit 0\n"
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1")
+	if err != nil {
+		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	t.Setenv(TrustedReviewSockEnv, sockPath)
+	t.Setenv(trustedReviewProxySkipEnv, "")
+	t.Setenv("FORGEJO_TOKEN", "")
+
+	err = ProxyReviewSubmit([]string{"review", "submit", "acme/looper#99", "--event", "COMMENT"}, []byte(`{"body":"x"}`), dir)
+	if err == nil {
+		t.Fatal("ProxyReviewSubmit() = nil, want error for unbound PR")
+	}
+	if !strings.Contains(err.Error(), "bound to") && !strings.Contains(err.Error(), "rejects PR target") {
+		t.Fatalf("ProxyReviewSubmit() error = %v, want PR binding rejection", err)
+	}
+}
+
+func TestStartTrustedReviewProxyRequiresAllowedPR(t *testing.T) {
+	dir := t.TempDir()
+	realLooper := filepath.Join(dir, "real-looper")
+	if err := os.WriteFile(realLooper, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, ""); err == nil {
+		t.Fatal("StartTrustedReviewProxy() with empty allowed PR = nil, want error")
+	}
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "not-a-ref"); err == nil {
+		t.Fatal("StartTrustedReviewProxy() with invalid allowed PR = nil, want error")
 	}
 }
 

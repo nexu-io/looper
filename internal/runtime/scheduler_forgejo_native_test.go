@@ -208,17 +208,41 @@ func TestReviewerTrustedReviewEnvIsScopedToReviewer(t *testing.T) {
 	}
 }
 
+func TestReviewerAllowedPRRef(t *testing.T) {
+	t.Parallel()
+	if got := reviewerAllowedPRRef(nil); got != "" {
+		t.Fatalf("nil metadata = %q, want empty", got)
+	}
+	if got := reviewerAllowedPRRef(map[string]any{"repo": "acme/looper", "prNumber": int64(42)}); got != "acme/looper#42" {
+		t.Fatalf("int64 pr = %q, want acme/looper#42", got)
+	}
+	if got := reviewerAllowedPRRef(map[string]any{"repo": "acme/looper", "prNumber": float64(7)}); got != "acme/looper#7" {
+		t.Fatalf("float64 pr = %q, want acme/looper#7", got)
+	}
+	if got := reviewerAllowedPRRef(map[string]any{"repo": "acme/looper", "prNumber": 0}); got != "" {
+		t.Fatalf("zero pr = %q, want empty", got)
+	}
+	if got := reviewerAllowedPRRef(map[string]any{"prNumber": int64(1)}); got != "" {
+		t.Fatalf("missing repo = %q, want empty", got)
+	}
+}
+
 func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	workDir := t.TempDir()
 	scriptDir := t.TempDir()
 	outputPath := filepath.Join(scriptDir, "child.env")
 	scriptPath := filepath.Join(scriptDir, "dump-env")
-	script := "#!/bin/sh\nprintf 'sock=%s\\n' \"$LOOPER_TRUSTED_REVIEW_SOCK\" > \"" + outputPath + "\"\nprintf '__LOOPER_RESULT__={\"summary\":\"done\"}\\n'\n"
+	// Dump only whether a non-empty sock path was injected; the path is ephemeral.
+	script := "#!/bin/sh\nif [ -n \"$LOOPER_TRUSTED_REVIEW_SOCK\" ]; then printf 'sock=set\\n' > \"" + outputPath + "\"; else printf 'sock=\\n' > \"" + outputPath + "\"; fi\nprintf '__LOOPER_RESULT__={\"summary\":\"done\"}\\n'\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(scriptPath) error = %v", err)
 	}
+	// realLooper only needs to exist; this test asserts sock injection, not proxy exec.
+	realLooper := filepath.Join(scriptDir, "real-looper")
+	if err := os.WriteFile(realLooper, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
 
-	sock := filepath.Join(t.TempDir(), "trusted-review.sock")
 	// Shared executor config deliberately omits the sock — only the reviewer
 	// adapter may inject LOOPER_TRUSTED_REVIEW_SOCK for review-submit capability.
 	executor := agent.New(agent.ExecutorOptions{
@@ -228,12 +252,17 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 			Env:    map[string]string{"SHARED": "1"},
 		},
 	})
-	adapter := reviewerAgentExecutorAdapter{executor: executor, trustedReviewSock: sock}
+	adapter := reviewerAgentExecutorAdapter{
+		executor:   executor,
+		realLooper: realLooper,
+		trustedEnv: map[string]string{"FORGEJO_TOKEN": "test-token"},
+	}
 	execHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_trusted_sock",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
+		Metadata:         map[string]any{"repo": "acme/looper", "prNumber": int64(42)},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -250,13 +279,33 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile(outputPath) error = %v", err)
 	}
-	want := "sock=" + sock + "\n"
-	if string(data) != want {
-		t.Fatalf("child env dump = %q, want %q", string(data), want)
+	if string(data) != "sock=set\n" {
+		t.Fatalf("child env dump = %q, want sock=set", string(data))
+	}
+
+	// Without daemon-selected PR metadata, no review-publish capability is injected.
+	noPRHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_no_pr_meta",
+		WorkingDirectory: workDir,
+		Prompt:           "review",
+		Timeout:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start(no PR) error = %v", err)
+	}
+	if _, err := noPRHandle.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait(no PR) error = %v", err)
+	}
+	data, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile after no-PR run error = %v", err)
+	}
+	if string(data) != "sock=\n" {
+		t.Fatalf("no-PR child env dump = %q, want empty sock", string(data))
 	}
 
 	// Planner/worker/fixer path: shared executor without adapter injection must
-	// not expose the review-submit socket even when one exists on the daemon.
+	// not expose the review-submit socket.
 	plainExec, err := executor.Start(context.Background(), agent.RunInput{
 		ExecutionID:      "non_reviewer",
 		WorkingDirectory: workDir,
