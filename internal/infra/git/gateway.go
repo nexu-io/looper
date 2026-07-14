@@ -561,7 +561,11 @@ func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorkt
 		return DiscardWorktreeChangesResult{WorktreePath: worktreePath, WasDirty: false, NoOp: true}, nil
 	}
 
-	if err := g.runGit(ctx, worktreePath, nil, "reset", "--hard", "HEAD"); err != nil {
+	// Recurse into submodules so a dirty tracked submodule is reset with the
+	// superproject. Without --recurse-submodules, top-level tracked edits are
+	// discarded while submodule dirt remains, and the post-clean check fails
+	// after partial discard (not all-or-nothing for repos with submodules).
+	if err := g.runGit(ctx, worktreePath, nil, "reset", "--hard", "--recurse-submodules", "HEAD"); err != nil {
 		return DiscardWorktreeChangesResult{}, err
 	}
 	// Double -f is required so git clean also removes nested repositories
@@ -569,6 +573,12 @@ func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorkt
 	// behind, which fails the post-clean cleanliness check after tracked
 	// edits were already discarded via reset --hard.
 	if err := g.runGit(ctx, worktreePath, nil, "clean", "-ffd"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	// Top-level clean does not enter tracked submodules. Reset+clean each
+	// submodule so untracked/modified files inside them are discarded too.
+	// No-op when the worktree has no submodules.
+	if err := g.runGit(ctx, worktreePath, nil, "submodule", "foreach", "--recursive", "git reset --hard && git clean -ffd"); err != nil {
 		return DiscardWorktreeChangesResult{}, err
 	}
 

@@ -36,10 +36,14 @@ type checkpointWorktreeRef struct {
 // When prepare-worktree fails on a dirty tree it often returns before writing
 // checkpoint.worktree, leaving only work.branch (worker) or detail.headRefName
 // (fixer). Those branch hints still resolve the managed worktree row.
+// For push-existing workers, work.branch may be empty while the worktree was
+// created under pr-<PRNumber>; executionMode + prNumber recover that branch.
 type checkpointWithWorktree struct {
 	Worktree *checkpointWorktreeRef `json:"worktree,omitempty"`
 	Work     *struct {
-		Branch string `json:"branch,omitempty"`
+		Branch        string `json:"branch,omitempty"`
+		ExecutionMode string `json:"executionMode,omitempty"`
+		PRNumber      int64  `json:"prNumber,omitempty"`
 	} `json:"work,omitempty"`
 	Detail *struct {
 		HeadRefName string `json:"headRefName,omitempty"`
@@ -281,10 +285,17 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 		id = strings.TrimSpace(checkpoint.Worktree.ID)
 	}
 	// Dirty prepare-worktree often aborts before checkpoint.worktree is set.
-	// Prefer an explicit worktree.branch, then worker work.branch, then fixer
-	// detail.headRefName so GetByBranch can still locate the managed row.
+	// Prefer an explicit worktree.branch, then worker work.branch, then
+	// push-existing pr-<N> (CreateWorktree branch when work.branch is empty),
+	// then fixer detail.headRefName so GetByBranch can still locate the row.
 	if branch == "" && checkpoint.Work != nil {
 		branch = strings.TrimSpace(checkpoint.Work.Branch)
+		if branch == "" &&
+			strings.TrimSpace(checkpoint.Work.ExecutionMode) == "push-existing" &&
+			checkpoint.Work.PRNumber > 0 {
+			// Matches worker runPrepareWorktreeStep when work.Branch is empty.
+			branch = fmt.Sprintf("pr-%d", checkpoint.Work.PRNumber)
+		}
 	}
 	if branch == "" && checkpoint.Detail != nil {
 		branch = strings.TrimSpace(checkpoint.Detail.HeadRefName)

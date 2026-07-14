@@ -195,9 +195,65 @@ func TestParseCheckpointWorktreeFallsBackToWorkBranchAndDetail(t *testing.T) {
 	if ref == nil || ref.Branch != "feature/worktree" || ref.Path != "/tmp/wt" {
 		t.Fatalf("worktree preference = %#v", ref)
 	}
+	// push-existing with empty work.branch derives pr-<PRNumber>, matching
+	// worker runPrepareWorktreeStep before checkpoint.worktree is saved.
+	pushExisting := `{"work":{"executionMode":"push-existing","prNumber":42}}`
+	ref = parseCheckpointWorktree(&pushExisting)
+	if ref == nil || ref.Branch != "pr-42" {
+		t.Fatalf("push-existing empty branch = %#v, want branch pr-42", ref)
+	}
+	// Explicit work.branch wins over pr-N derivation.
+	pushExistingNamed := `{"work":{"branch":"feature/named","executionMode":"push-existing","prNumber":42}}`
+	ref = parseCheckpointWorktree(&pushExistingNamed)
+	if ref == nil || ref.Branch != "feature/named" {
+		t.Fatalf("push-existing named branch = %#v, want feature/named", ref)
+	}
 	empty := `{"work":{},"detail":{}}`
 	if got := parseCheckpointWorktree(&empty); got != nil {
 		t.Fatalf("empty hints = %#v, want nil", got)
+	}
+}
+
+func TestHandlerLoopRetryDiscardWorktreeChangesResolvesPushExistingPRBranch(t *testing.T) {
+	// push-existing dirty prepare creates worktree under pr-<N> but leaves
+	// work.branch empty and omits checkpoint.worktree.
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_push_existing",
+		LoopID:    "loop_retry_discard_push_existing",
+		LoopSeq:   3121,
+		LoopType:  "worker",
+		Branch:    "pr-77",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	pushExistingOnly := `{"work":{"executionMode":"push-existing","prNumber":77}}`
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_" + fixture.LoopID, LoopID: fixture.LoopID, Status: "failed", CheckpointJSON: &pushExistingOnly,
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(push-existing) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3121/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	discard := data["worktreeDiscard"].(map[string]any)
+	assertEqual(t, discard["discarded"], true)
+	assertEqual(t, discard["reason"], "discarded")
+	assertEqual(t, discard["worktreePath"], fixture.WorktreePath)
+	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dirty.txt still present after push-existing discard: %v", err)
 	}
 }
 
