@@ -2109,18 +2109,24 @@ func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
 func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name       string
-		diffResult shell.Result
-		diffErr    error
+		name           string
+		diffResult     shell.Result
+		diffErr        error
+		wantReason     string
+		wantGetDiffErr error
 	}{
 		{
-			name:       "GitHub rejects oversized diff",
-			diffResult: shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"},
-			diffErr:    &shell.CommandExecutionError{Message: "HTTP 406: diff exceeded maximum number of lines too_large"},
+			name:           "GitHub rejects oversized diff",
+			diffResult:     shell.Result{ExitCode: 1, Stderr: "HTTP 406: diff exceeded maximum number of lines too_large"},
+			diffErr:        &shell.CommandExecutionError{Message: "HTTP 406: diff exceeded maximum number of lines too_large"},
+			wantReason:     DiffTruncationReasonGitHubTooLarge,
+			wantGetDiffErr: ErrDiffTooLarge,
 		},
 		{
-			name:       "shell capture truncates diff",
-			diffResult: shell.Result{Stdout: strings.Repeat("x", 256*1024), StdoutTruncated: true},
+			name:           "shell capture truncates diff",
+			diffResult:     shell.Result{Stdout: strings.Repeat("x", 256*1024), StdoutTruncated: true},
+			wantReason:     DiffTruncationReasonLocalCapture,
+			wantGetDiffErr: ErrLocalCaptureTruncated,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2143,12 +2149,17 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 			}
 			gateway := New(Options{GHPath: "gh", GHRun: runner.run})
 
+			_, getErr := gateway.GetPullRequestDiff(context.Background(), GetPullRequestDiffInput{Repo: "acme/looper", PRNumber: 42})
+			if !errors.Is(getErr, tc.wantGetDiffErr) {
+				t.Fatalf("GetPullRequestDiff() error = %v, want %v", getErr, tc.wantGetDiffErr)
+			}
+
 			snapshot, err := gateway.CapturePullRequestSnapshot(context.Background(), CapturePullRequestSnapshotInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
 			if err != nil {
 				t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
 			}
-			if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"github_too_large"`) {
-				t.Fatalf("PayloadJSON = %v, want truncated marker", snapshot.PayloadJSON)
+			if snapshot.PayloadJSON == nil || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncated":true`) || !strings.Contains(*snapshot.PayloadJSON, `"diffTruncationReason":"`+tc.wantReason+`"`) {
+				t.Fatalf("PayloadJSON = %v, want truncated marker with reason %q", snapshot.PayloadJSON, tc.wantReason)
 			}
 		})
 	}

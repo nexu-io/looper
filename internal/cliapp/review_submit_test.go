@@ -33,11 +33,33 @@ func TestCanSubmitWithoutAnchorValidationOnlyAllowsLargeDiffTopLevelReviews(t *t
 	if !canSubmitWithoutAnchorValidation(githubinfra.ErrDiffTooLarge, nil) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = false, want true for large diff top-level review")
 	}
+	if !canSubmitWithoutAnchorValidation(githubinfra.ErrLocalCaptureTruncated, nil) {
+		t.Fatalf("canSubmitWithoutAnchorValidation() = false, want true for local capture truncation top-level review")
+	}
 	if canSubmitWithoutAnchorValidation(githubinfra.ErrDiffTooLarge, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false when inline comments need validation")
 	}
+	if canSubmitWithoutAnchorValidation(githubinfra.ErrLocalCaptureTruncated, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
+		t.Fatalf("canSubmitWithoutAnchorValidation(local truncation with comments) = true, want false")
+	}
+	if canSubmitWithoutAnchorValidation(githubinfra.ErrAnchorValidationUnavailable, []reviewSubmitComment{{Body: "inline", Path: "app.go", Line: 10, Side: "RIGHT"}}) {
+		t.Fatalf("canSubmitWithoutAnchorValidation(unavailable with comments) = true, want false fail-closed")
+	}
 	if canSubmitWithoutAnchorValidation(errors.New("network failed"), nil) {
 		t.Fatalf("canSubmitWithoutAnchorValidation() = true, want false for generic diff errors")
+	}
+}
+
+func TestValidateExpectedBaseCommit(t *testing.T) {
+	t.Parallel()
+	if err := validateExpectedBaseCommit("abc123", "ABC123"); err != nil {
+		t.Fatalf("validateExpectedBaseCommit() error = %v", err)
+	}
+	if err := validateExpectedBaseCommit("", "abc123"); err != nil {
+		t.Fatalf("validateExpectedBaseCommit(empty expected) error = %v, want nil", err)
+	}
+	if err := validateExpectedBaseCommit("abc123", "def456"); err == nil || !strings.Contains(err.Error(), "expected base commit") {
+		t.Fatalf("validateExpectedBaseCommit(mismatch) error = %v, want base drift failure", err)
 	}
 }
 
@@ -671,6 +693,42 @@ func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
 	labels, err = runtime.validateLatestReviewerReviewSubmitHold(cmd, gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
 	if err != nil {
 		t.Fatalf("validateLatestReviewerReviewSubmitHold(unheld) error = %v", err)
+	}
+	if len(labels) != 1 || labels[0] != "ready-for-review" {
+		t.Fatalf("labels = %#v, want refreshed PR labels for publish authority", labels)
+	}
+}
+
+func TestValidateLatestReviewerReviewSubmitPublicationRejectsHeadAndBaseDrift(t *testing.T) {
+	t.Parallel()
+
+	runtime := &commandRuntime{}
+	cmd := &cobra.Command{}
+	base := strings.Repeat("b", 40)
+	head := strings.Repeat("c", 40)
+	gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
+		Number: 42, HeadSHA: strings.Repeat("d", 40), BaseSHA: base, Labels: nil,
+	}}
+
+	_, err := runtime.validateLatestReviewerReviewSubmitPublication(cmd, gh, config.Config{}, "acme/looper", 42, head, base, false, "", "/repo")
+	if err == nil || !strings.Contains(err.Error(), "expected head commit") {
+		t.Fatalf("publication validation error = %v, want head drift rejection", err)
+	}
+
+	gh = &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
+		Number: 42, HeadSHA: head, BaseSHA: strings.Repeat("e", 40), Labels: nil,
+	}}
+	_, err = runtime.validateLatestReviewerReviewSubmitPublication(cmd, gh, config.Config{}, "acme/looper", 42, head, base, false, "", "/repo")
+	if err == nil || !strings.Contains(err.Error(), "expected base commit") {
+		t.Fatalf("publication validation error = %v, want base drift rejection", err)
+	}
+
+	gh = &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
+		Number: 42, HeadSHA: head, BaseSHA: base, Labels: []string{"ready-for-review"},
+	}}
+	labels, err := runtime.validateLatestReviewerReviewSubmitPublication(cmd, gh, config.Config{}, "acme/looper", 42, head, base, false, "", "/repo")
+	if err != nil {
+		t.Fatalf("publication validation error = %v, want nil when head/base match", err)
 	}
 	if len(labels) != 1 || labels[0] != "ready-for-review" {
 		t.Fatalf("labels = %#v, want refreshed PR labels for publish authority", labels)

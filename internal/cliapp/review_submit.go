@@ -233,7 +233,18 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {
 		return nil, fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
 	}
-	return githubinfra.New(githubinfra.Options{GHPath: *cfg.Tools.GHPath, CWD: cwd, GHRun: shell.Run, ReviewSubmitDiagnostic: diagnostic}), nil
+	gitPath := "git"
+	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
+		gitPath = strings.TrimSpace(*cfg.Tools.GitPath)
+	}
+	return githubinfra.New(githubinfra.Options{
+		GHPath:                 *cfg.Tools.GHPath,
+		GitPath:                gitPath,
+		CWD:                    cwd,
+		GHRun:                  shell.Run,
+		GitRun:                 shell.Run,
+		ReviewSubmitDiagnostic: diagnostic,
+	}), nil
 }
 
 // reviewSubmitProjectForRepo selects the configured project for a review-submit
@@ -457,11 +468,16 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	diff, err := gateway.GetPullRequestDiff(cmd.Context(), githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-	var anchors *diffanchor.Index
+
+	// Authority for whether an inline review comment is valid is the complete
+	// diff between the exact PR base and submitted head SHAs — not a bounded
+	// prefix of `gh pr diff` and not the agent-provided line alone.
+	anchors, err := resolveReviewSubmitAnchors(cmd.Context(), gateway, repo, prNumber, cwd, detail, payload.Comments)
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
-			freshLabels, err := r.validateLatestReviewerReviewSubmitHold(cmd, gateway, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+			// Body-only oversized/truncated fallback still must fail closed on base/head
+			// drift: hold-only refresh is not enough when commit_id was captured earlier.
+			freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 			if err != nil {
 				return err
 			}
@@ -470,16 +486,23 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 			}
 			return submitReviewWithoutAnchorValidation(cmd, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
-		return fmt.Errorf("fetch PR diff for anchor validation: %w", err)
+		// Never reach SubmitReview's content guard on this path: redact paths and
+		// never return path-bearing git/remote errors (path may be secret-shaped).
+		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+			Repo: repo, PRNumber: prNumber, Event: submissionEvent, CommitID: commitID, Payload: payload,
+			Error: githubinfra.AnchorValidationUnavailableReason, RedactPaths: true,
+			Extra: map[string]any{"reason": githubinfra.AnchorValidationUnavailableReason},
+		})
+		// Retryable sentinel only — authority errors can embed `git diff ... -- <path>` argv.
+		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", githubinfra.ErrAnchorValidationUnavailable)
 	}
-	parsedAnchors := diffanchor.Parse(diff)
-	anchors = &parsedAnchors
 
 	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
 	for _, comment := range payload.Comments {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
-	freshLabels, err := r.validateLatestReviewerReviewSubmitHold(cmd, gateway, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
+	// Fail closed on base/head drift between anchor resolution and mutation.
+	freshLabels, err := r.validateLatestReviewerReviewSubmitPublication(cmd, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd)
 	if err != nil {
 		return err
 	}
@@ -500,6 +523,52 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 		return nil
 	}
 	return validator.validateReviewRequest(ctx, prNumber, labels, manual)
+}
+
+// resolveReviewSubmitAnchors establishes complete base/head anchor authority.
+// For actionable inline comments it prefers path-targeted local diffs (GitHub
+// gateway) and never treats a truncated remote capture as authoritative.
+// Body-only reviews may still proceed when only GitHub oversized / local
+// capture limits block a full remote diff. Forgejo uses the remote PR diff as
+// complete authority.
+func resolveReviewSubmitAnchors(ctx context.Context, gateway reviewSubmitGateway, repo string, prNumber int64, cwd string, detail githubinfra.PullRequestDetail, comments []reviewSubmitComment) (*diffanchor.Index, error) {
+	if len(comments) == 0 {
+		diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		if err != nil {
+			return nil, err
+		}
+		parsed := diffanchor.Parse(diff)
+		return &parsed, nil
+	}
+
+	// Prefer complete local base/head authority when the gateway supports it.
+	if gh, ok := gateway.(*githubinfra.Gateway); ok {
+		paths := make([]string, 0, len(comments))
+		for _, comment := range comments {
+			paths = append(paths, comment.Path)
+		}
+		anchors, _, err := gh.BuildReviewAnchorIndex(ctx, githubinfra.BuildReviewAnchorIndexInput{
+			CWD:     cwd,
+			BaseSHA: detail.BaseSHA,
+			HeadSHA: detail.HeadSHA,
+			Paths:   paths,
+			RemoteDiff: func(ctx context.Context) (string, error) {
+				return gh.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return anchors, nil
+	}
+
+	// Forgejo and other gateways: remote PR diff is the complete authority.
+	diff, err := gateway.GetPullRequestDiff(ctx, githubinfra.GetPullRequestDiffInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return nil, err
+	}
+	parsed := diffanchor.Parse(diff)
+	return &parsed, nil
 }
 
 // wrapReviewSubmitError keeps content-safety rejections actionable for agents
@@ -733,6 +802,39 @@ func (r *commandRuntime) validateLatestReviewerReviewSubmitHold(cmd *cobra.Comma
 	return detail.Labels, nil
 }
 
+// validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
+// and fails closed on head/base drift plus hold labels. Refreshed labels are
+// returned so Forgejo publish authority uses the latest snapshot.
+func (r *commandRuntime) validateLatestReviewerReviewSubmitPublication(cmd *cobra.Command, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, commitID string, expectedBaseSHA string, manual bool, runID string, cwd string) ([]string, error) {
+	detail, err := gh.ViewPullRequest(cmd.Context(), githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		return nil, fmt.Errorf("refresh pull request before review publish: %w", err)
+	}
+	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
+		return nil, err
+	}
+	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
+		return nil, err
+	}
+	if err := r.validateReviewerReviewSubmitHold(cmd, cfg, repo, prNumber, manual, runID, detail.Labels); err != nil {
+		return nil, err
+	}
+	return detail.Labels, nil
+}
+
+func validateExpectedBaseCommit(expected string, actual string) error {
+	expected = strings.TrimSpace(expected)
+	actual = strings.TrimSpace(actual)
+	if expected == "" || actual == "" {
+		// Some fixtures omit base; only enforce when both sides are known.
+		return nil
+	}
+	if !strings.EqualFold(expected, actual) {
+		return fmt.Errorf("review submit expected base commit %s but PR base is %s; refresh the review before submitting", expected, actual)
+	}
+	return nil
+}
+
 func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (bool, error) {
 	runID = strings.TrimSpace(runID)
 	if runID == "" {
@@ -833,7 +935,12 @@ func parseReviewSubmitJSONObject(value *string) map[string]any {
 }
 
 func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment) bool {
-	return errors.Is(err, githubinfra.ErrDiffTooLarge) && len(comments) == 0
+	if len(comments) != 0 {
+		// Actionable inline comments must not silently become body-only when
+		// anchor authority is unavailable; fail closed for retry instead.
+		return false
+	}
+	return errors.Is(err, githubinfra.ErrDiffTooLarge) || errors.Is(err, githubinfra.ErrLocalCaptureTruncated)
 }
 
 func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh reviewSubmitGateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {
