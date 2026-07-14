@@ -942,6 +942,51 @@ func TestHandlerLoopRetryDiscardRejectsAwaitingHuman(t *testing.T) {
 	}
 }
 
+// TestHandlerLoopRetryDiscardRejectsHumanTakeover ensures discard+retry refuses
+// human_takeover loops so interactive edits pinned by takeover are not wiped
+// via direct /retry (mirroring /handback which also rejects discard).
+func TestHandlerLoopRetryDiscardRejectsHumanTakeover(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_human_takeover",
+		LoopID:    "loop_retry_discard_human_takeover",
+		LoopSeq:   3135,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-human-takeover",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("GetByID() = %#v, %v", loop, err)
+	}
+	loop.Status = "human_takeover"
+	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert(human_takeover) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3135/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "human_takeover") {
+		t.Fatalf("body = %s, want human_takeover rejection", recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after human_takeover reject = %q, want preserved", got)
+	}
+	loopAfter, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loopAfter == nil || loopAfter.Status != "human_takeover" {
+		t.Fatalf("loop after rejected discard retry = %#v, %v, want human_takeover", loopAfter, err)
+	}
+}
+
 // TestHandlerHandbackRejectsDiscardWorktreeChanges ensures /handback never honors
 // discardWorktreeChanges: the worktree may hold the human's interactive edits.
 func TestHandlerHandbackRejectsDiscardWorktreeChanges(t *testing.T) {

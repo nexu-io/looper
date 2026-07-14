@@ -5224,12 +5224,10 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		// (hitl_github_poll / Feishu helpers). Refuse discard so a poll-delivered
 		// answer cannot requeue between preflight and git reset, wiping the
 		// worktree for the answered continuation when the retry TX then conflicts.
-		if preflightLoop.Status == string(domain.LoopStatusAwaitingHuman) {
-			return retryLoopResponse{}, apiError{
-				code:    pkgapi.ErrorCodeValidationFailed,
-				status:  http.StatusConflict,
-				message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
-			}
+		// human_takeover pins the same worktree for interactive human edits;
+		// /handback already rejects discard, and direct /retry must match that.
+		if err := rejectDiscardWhileParkedForHuman(preflightLoop.Status, loopID); err != nil {
+			return retryLoopResponse{}, err
 		}
 
 		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *preflightLoop, nowISO); err != nil {
@@ -5255,12 +5253,8 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		if freshLoop == nil {
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if freshLoop.Status == string(domain.LoopStatusAwaitingHuman) {
-			return retryLoopResponse{}, apiError{
-				code:    pkgapi.ErrorCodeValidationFailed,
-				status:  http.StatusConflict,
-				message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
-			}
+		if err := rejectDiscardWhileParkedForHuman(freshLoop.Status, loopID); err != nil {
+			return retryLoopResponse{}, err
 		}
 		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *freshLoop, nowISO); err != nil {
 			var typed apiError
@@ -5741,6 +5735,29 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	status, _ := loopMeta["status"].(string)
 	return status == "terminated" || status == "stopped" || status == "failed"
+}
+
+// rejectDiscardWhileParkedForHuman refuses discard+retry when the loop is
+// parked for a human so interactive worktree edits stay intact. awaiting_human
+// is blocked against HITL poll requeue races; human_takeover matches /handback
+// which never honors discardWorktreeChanges.
+func rejectDiscardWhileParkedForHuman(status, loopID string) error {
+	switch status {
+	case string(domain.LoopStatusAwaitingHuman):
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
+		}
+	case string(domain.LoopStatusHumanTakeover):
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot discard worktree changes while loop %s is human_takeover; hand back without --discard-worktree-changes first, or retry without discard", loopID),
+		}
+	default:
+		return nil
+	}
 }
 
 // assertLoopRetryPreconditions validates non-mutating retry blockers that must
