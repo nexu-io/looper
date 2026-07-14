@@ -39,8 +39,8 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {
 			return shell.Result{Stdout: `{"number":1,"title":"PR 1","body":"body","url":"https://example.com/pulls/1","state":"OPEN","labels":[{"name":"bug"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-1","baseRefOid":"base-1","author":{"login":"octo"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"octo"}}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.Contains(cmd, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
-		case cmd == "api --paginate --slurp repos/acme/looper/issues/1/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(cmd, "api --paginate repos/acme/looper/issues/1/comments --jq "):
+			return shell.Result{}, nil
 		case strings.Contains(cmd, "api user --jq .login"):
 			counts["user_login"]++
 			switch options.CWD {
@@ -149,8 +149,8 @@ func TestDiscoverySnapshotDoesNotCacheFailedPullRequestDetailFetch(t *testing.T)
 			return shell.Result{Stdout: `{"number":7,"title":"PR 7","body":"body","url":"https://example.com/pulls/7","state":"OPEN","labels":[],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-7","baseRefOid":"base-7","author":{"login":"octo"},"reviewRequests":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}}],"statusCheckRollup":[{"conclusion":"SUCCESS"}]}`}, nil
 		case strings.Contains(cmd, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
-		case cmd == "api --paginate --slurp repos/acme/looper/issues/7/comments":
-			return shell.Result{Stdout: `[[]]`}, nil
+		case strings.HasPrefix(cmd, "api --paginate repos/acme/looper/issues/7/comments --jq "):
+			return shell.Result{}, nil
 		default:
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
 		}
@@ -185,9 +185,9 @@ func TestDiscoverySnapshotPreservesPendingWorkSignalsInPullRequestDetail(t *test
 		case strings.Contains(cmd, "reviewThreads"):
 			counts["review_threads"]++
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"path":"main.go","line":12,"comments":{"nodes":[{"id":"comment-1","body":"Fix this","updatedAt":"2026-06-29T14:08:40Z","url":"https://example.com/pulls/9#discussion_r1","path":"main.go","line":12,"authorAssociation":"NONE","author":{"login":"reviewer"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
-		case cmd == "api --paginate --slurp repos/acme/looper/issues/9/comments":
+		case strings.HasPrefix(cmd, "api --paginate repos/acme/looper/issues/9/comments --jq "):
 			counts["issue_comments"]++
-			return shell.Result{Stdout: `[[]]`}, nil
+			return shell.Result{}, nil
 		default:
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
 		}

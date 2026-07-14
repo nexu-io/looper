@@ -18,11 +18,13 @@ const (
 )
 
 type Result struct {
-	ExitCode   int
-	Stdout     string
-	Stderr     string
-	Duration   time.Duration
-	DurationMS int64
+	ExitCode        int
+	Stdout          string
+	Stderr          string
+	StdoutTruncated bool
+	StderrTruncated bool
+	Duration        time.Duration
+	DurationMS      int64
 }
 
 type Options struct {
@@ -135,11 +137,13 @@ func Run(ctx context.Context, options Options) (Result, error) {
 
 	duration := time.Since(startedAt)
 	result := Result{
-		ExitCode:   exitCode(cmd),
-		Stdout:     stdoutBuffer.String(),
-		Stderr:     stderrBuffer.String(),
-		Duration:   duration,
-		DurationMS: duration.Milliseconds(),
+		ExitCode:        exitCode(cmd),
+		Stdout:          stdoutBuffer.String(),
+		Stderr:          stderrBuffer.String(),
+		StdoutTruncated: stdoutBuffer.Truncated(),
+		StderrTruncated: stderrBuffer.Truncated(),
+		Duration:        duration,
+		DurationMS:      duration.Milliseconds(),
 	}
 
 	if timedOut {
@@ -199,9 +203,10 @@ func isProcessDone(err error) bool {
 }
 
 type boundedBuffer struct {
-	mu    sync.Mutex
-	data  []byte
-	limit int
+	mu        sync.Mutex
+	data      []byte
+	limit     int
+	truncated bool
 }
 
 func newBoundedBuffer(limit int) *boundedBuffer {
@@ -216,10 +221,14 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	defer b.mu.Unlock()
 	originalLen := len(p)
 	if len(b.data) >= b.limit {
+		if originalLen > 0 {
+			b.truncated = true
+		}
 		return originalLen, nil
 	}
 	remaining := b.limit - len(b.data)
 	if len(p) > remaining {
+		b.truncated = true
 		p = p[:remaining]
 	}
 	b.data = append(b.data, p...)
@@ -230,4 +239,10 @@ func (b *boundedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return string(b.data)
+}
+
+func (b *boundedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
 }

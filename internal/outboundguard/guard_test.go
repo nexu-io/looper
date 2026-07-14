@@ -74,6 +74,36 @@ func TestValidateAllowsCommonPublicationIdentifiers(t *testing.T) {
 	}
 }
 
+func TestValidateReviewThreadReplyAllowsExactOpaqueThreadID(t *testing.T) {
+	t.Parallel()
+	for _, threadID := range []string{"PRRT_kwDOSOgY8s6QeKwr", "MDQ6UHVsbFJlcXVlc3RSZXZpZXdUaHJlYWQxMjM0NTY="} {
+		body := "Looper checked this thread.\n<!-- looper:thread-resolution thread=" + threadID + " head=0dd6a5019812fc422f9f20626530758ad67ad66e decision=objectively_fixed -->"
+		if err := ValidateReviewThreadReply(body, threadID); err != nil {
+			t.Errorf("ValidateReviewThreadReply(%q) error = %v, want safe opaque thread ID", threadID, err)
+		}
+	}
+}
+
+func TestThreadIDExemptionIsScopedToMatchingReviewThreadReply(t *testing.T) {
+	threadID := "MDQ6UHVsbFJlcXVlc3RSZXZpZXdUaHJlYWQxMjM0NTY="
+	marker := "<!-- looper:thread-resolution thread=" + threadID + " head=0dd6a5019812fc422f9f20626530758ad67ad66e decision=objectively_fixed -->"
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "generic publication", err: Validate(Field{Name: "pull request body", Text: marker})},
+		{name: "different active thread", err: ValidateReviewThreadReply(marker, "PRRT_kwDOSOgY8s6QeKwr")},
+		{name: "high entropy prose", err: ValidateReviewThreadReply("Agent evidence q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/\n"+marker, threadID)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.err == nil || !strings.Contains(tc.err.Error(), "high-entropy") {
+				t.Fatalf("validation error = %v, want high-entropy rejection", tc.err)
+			}
+		})
+	}
+}
+
 func TestValidatePrefersLowFalsePositivesOnReviewProse(t *testing.T) {
 	t.Parallel()
 	// Guard is best-effort: ambiguous short names and non-secret config stay open.

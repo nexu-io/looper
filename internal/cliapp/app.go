@@ -107,7 +107,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -160,7 +160,10 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("project-path", "path", "Add a default project from a local repository path"),
 					boolFlag("enable-local-token", "Enable server.authMode=local-token for generated config"),
 					boolFlag("disable-osascript", "Disable osascript notifications for generated config"),
-					stringFlag("provider", "kind", "Task-source provider for the generated project: github (default) or plane"),
+					stringFlag("provider", "kind", "Task-source provider for the generated project: github (default), forgejo, or plane"),
+					stringFlag("forgejo-url", "url", "Forgejo server base URL (required for --provider forgejo)"),
+					stringFlag("forgejo-token-env", "ENV", "Env var holding the Forgejo token (required for --provider forgejo)"),
+					stringFlag("forgejo-provider-id", "id", "Provider id for Forgejo config (default forgejo)"),
 					stringFlag("code-repo", "owner/repo", "GitHub code repo for pull requests (plane provider); defaults to the --project-path git origin"),
 					stringFlag("trigger-label", "label", "Issue label that triggers planner/worker discovery (plane provider; default looper:plan)"),
 					stringFlag("plane-base-url", "url", "Plane REST API base URL (plane provider; default https://plane.powerformer.net/api/v1)"),
@@ -172,10 +175,23 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				exampleLines: []string{
 					"$ looper bootstrap",
 					"$ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode",
+					"$ looper bootstrap --yes --provider forgejo --project-path /path/to/repo --forgejo-url https://code.example.com --forgejo-token-env FORGEJO_TOKEN",
 					"$ looper bootstrap --yes --provider plane --project-path /path/to/repo --plane-workspace acme --plane-project <uuid> --feishu-webhook-env LOOPER_FEISHU_WEBHOOK_URL",
 				},
 			}),
 			newCommand(commandSpec{use: "version", short: "Show Looper version", runE: runtime.version}),
+			newCommand(commandSpec{
+				use:             "provider",
+				short:           "Provider commands",
+				helpSubcommands: []helpSubcommand{{name: "add", description: "Add a Forgejo provider"}, {name: "list", description: "List providers"}, {name: "test", description: "Test Forgejo access"}, {name: "remove", description: "Remove a provider"}},
+				helpWhenNoArgs:  true,
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "add", short: "Add a Forgejo provider", args: cobra.NoArgs, runE: runtime.providerAdd, localFlags: []flagSpec{stringFlag("id", "id", "Provider id"), stringFlag("forgejo-url", "url", "Forgejo server base URL"), stringFlag("forgejo-token-env", "ENV", "Env var holding the Forgejo token")}}),
+					newCommand(commandSpec{use: "list", short: "List providers", args: cobra.NoArgs, runE: runtime.providerList}),
+					newCommand(commandSpec{use: "test [id]", short: "Test Forgejo access and current identity", args: cobra.MaximumNArgs(1), runE: runtime.providerTest, localFlags: []flagSpec{stringFlag("repo", "owner/name", "Repository to verify")}}),
+					newCommand(commandSpec{use: "remove <id>", short: "Remove a provider", args: cobra.ExactArgs(1), runE: runtime.providerRemove, localFlags: []flagSpec{boolFlag("force", "Remove without prompting; still rejects bound projects")}}),
+				},
+			}),
 			newCommand(commandSpec{
 				use:             "project",
 				short:           "Project commands",
@@ -189,6 +205,8 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					stringFlag("worktree-root", "path", "Worktree root"),
 					stringFlag("repo", "repo", "Repository slug (owner/name)"),
 					stringFlag("provider", "id", "Provider id for non-GitHub projects (required to confirm a detected Forgejo host)"),
+					stringFlag("forgejo-url", "url", "Create a Forgejo provider before adding the project"),
+					stringFlag("forgejo-token-env", "ENV", "Env var holding the token for a created Forgejo provider"),
 					stringFlag("snapshot-mode", "mode", "Snapshot mode for project add: async, full, or off"),
 				},
 				exampleLines: []string{

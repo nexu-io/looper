@@ -103,6 +103,9 @@ func TestRunBoundsCapturedOutput(t *testing.T) {
 	if result.Stdout != "abcd" {
 		t.Fatalf("Stdout = %q, want abcd", result.Stdout)
 	}
+	if !result.StdoutTruncated {
+		t.Fatal("StdoutTruncated = false, want true")
+	}
 }
 
 func TestRunRespectsContextCancellation(t *testing.T) {

@@ -14,11 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -36,23 +38,30 @@ type bootstrapResult struct {
 	APIReachable       bool     `json:"apiReachable"`
 	NextSteps          []string `json:"nextSteps"`
 	Notes              []string `json:"notes,omitempty"`
+	ProviderID         string   `json:"providerId,omitempty"`
+	ProviderKind       string   `json:"providerKind,omitempty"`
+	Repo               string   `json:"repo,omitempty"`
+	Identity           string   `json:"identity,omitempty"`
 }
 
 type bootstrapOptions struct {
-	Yes              bool
-	Force            bool
-	AgentVendor      string
-	ProjectPath      string
-	EnableLocalToken bool
-	DisableOsascript bool
-	Provider         string
-	CodeRepo         string
-	TriggerLabel     string
-	PlaneBaseURL     string
-	PlaneWorkspace   string
-	PlaneProject     string
-	PlaneTokenEnv    string
-	FeishuWebhookEnv string
+	Yes               bool
+	Force             bool
+	AgentVendor       string
+	ProjectPath       string
+	EnableLocalToken  bool
+	DisableOsascript  bool
+	Provider          string
+	CodeRepo          string
+	TriggerLabel      string
+	PlaneBaseURL      string
+	PlaneWorkspace    string
+	PlaneProject      string
+	PlaneTokenEnv     string
+	FeishuWebhookEnv  string
+	ForgejoURL        string
+	ForgejoTokenEnv   string
+	ForgejoProviderID string
 }
 
 type bootstrapConfigPlan struct {
@@ -61,15 +70,20 @@ type bootstrapConfigPlan struct {
 	EnableLocalToken bool
 	ProjectPath      string
 	// Provider is the task-source provider for the generated project:
-	// "github" (default; unchanged behavior) or "plane".
-	Provider         string
-	CodeRepo         string
-	TriggerLabel     string
-	PlaneBaseURL     string
-	PlaneWorkspace   string
-	PlaneProject     string
-	PlaneTokenEnv    string
-	FeishuWebhookEnv string
+	// "github" (default; unchanged behavior), "forgejo", or "plane".
+	Provider          string
+	CodeRepo          string
+	TriggerLabel      string
+	PlaneBaseURL      string
+	PlaneWorkspace    string
+	PlaneProject      string
+	PlaneTokenEnv     string
+	FeishuWebhookEnv  string
+	ForgejoURL        string
+	ForgejoTokenEnv   string
+	ForgejoProviderID string
+	Repo              string
+	Identity          string
 }
 
 const (
@@ -86,20 +100,23 @@ func (r *commandRuntime) bootstrap(cmd *cobra.Command, args []string) error {
 
 	ctx := cmd.Context()
 	opts := bootstrapOptions{
-		Yes:              getBoolFlag(cmd, "yes"),
-		Force:            getBoolFlag(cmd, "force"),
-		AgentVendor:      strings.TrimSpace(getStringFlag(cmd, "agent-vendor")),
-		ProjectPath:      strings.TrimSpace(getStringFlag(cmd, "project-path")),
-		EnableLocalToken: getBoolFlag(cmd, "enable-local-token"),
-		DisableOsascript: getBoolFlag(cmd, "disable-osascript"),
-		Provider:         strings.TrimSpace(getStringFlag(cmd, "provider")),
-		CodeRepo:         strings.TrimSpace(getStringFlag(cmd, "code-repo")),
-		TriggerLabel:     strings.TrimSpace(getStringFlag(cmd, "trigger-label")),
-		PlaneBaseURL:     strings.TrimSpace(getStringFlag(cmd, "plane-base-url")),
-		PlaneWorkspace:   strings.TrimSpace(getStringFlag(cmd, "plane-workspace")),
-		PlaneProject:     strings.TrimSpace(getStringFlag(cmd, "plane-project")),
-		PlaneTokenEnv:    strings.TrimSpace(getStringFlag(cmd, "plane-token-env")),
-		FeishuWebhookEnv: strings.TrimSpace(getStringFlag(cmd, "feishu-webhook-env")),
+		Yes:               getBoolFlag(cmd, "yes"),
+		Force:             getBoolFlag(cmd, "force"),
+		AgentVendor:       strings.TrimSpace(getStringFlag(cmd, "agent-vendor")),
+		ProjectPath:       strings.TrimSpace(getStringFlag(cmd, "project-path")),
+		EnableLocalToken:  getBoolFlag(cmd, "enable-local-token"),
+		DisableOsascript:  getBoolFlag(cmd, "disable-osascript"),
+		Provider:          strings.TrimSpace(getStringFlag(cmd, "provider")),
+		CodeRepo:          strings.TrimSpace(getStringFlag(cmd, "code-repo")),
+		TriggerLabel:      strings.TrimSpace(getStringFlag(cmd, "trigger-label")),
+		PlaneBaseURL:      strings.TrimSpace(getStringFlag(cmd, "plane-base-url")),
+		PlaneWorkspace:    strings.TrimSpace(getStringFlag(cmd, "plane-workspace")),
+		PlaneProject:      strings.TrimSpace(getStringFlag(cmd, "plane-project")),
+		PlaneTokenEnv:     strings.TrimSpace(getStringFlag(cmd, "plane-token-env")),
+		FeishuWebhookEnv:  strings.TrimSpace(getStringFlag(cmd, "feishu-webhook-env")),
+		ForgejoURL:        strings.TrimSpace(getStringFlag(cmd, "forgejo-url")),
+		ForgejoTokenEnv:   strings.TrimSpace(getStringFlag(cmd, "forgejo-token-env")),
+		ForgejoProviderID: strings.TrimSpace(getStringFlag(cmd, "forgejo-provider-id")),
 	}
 
 	result, err := r.runBootstrap(ctx, cmd, opts)
@@ -152,6 +169,12 @@ func (r *commandRuntime) runBootstrap(ctx context.Context, cmd *cobra.Command, o
 	}
 	result.ConfigCreated = configCreated
 	result.ProjectAdded = projectAdded
+	if planned.Provider == bootstrapProviderForgejo {
+		result.ProviderID = planned.ForgejoProviderID
+		result.ProviderKind = planned.Provider
+		result.Repo = planned.Repo
+		result.Identity = planned.Identity
+	}
 
 	installState, installed, err := r.ensureBootstrapDaemon(ctx, opts.Force)
 	if err != nil {
@@ -212,7 +235,8 @@ func (r *commandRuntime) runBootstrap(ctx context.Context, cmd *cobra.Command, o
 
 	result.APIReachable = apiReachable
 	result.DaemonRunning = apiReachable
-	result.NextSteps = bootstrapNextSteps(planned.ProjectPath)
+	restartRequired := planned.Provider == bootstrapProviderForgejo && projectAdded && !configCreated && apiReachable && !installed
+	result.NextSteps = bootstrapNextStepsForPlan(planned, restartRequired)
 	return result, nil
 }
 
@@ -343,11 +367,12 @@ func (r *commandRuntime) resolveBootstrapProviderPlan(cmd *cobra.Command, plan *
 		plan.Provider = bootstrapProviderGitHub
 		return nil, nil
 	case bootstrapProviderForgejo:
-		return nil, fmt.Errorf("--provider forgejo is not scaffolded by bootstrap yet; use --provider github or plane, or edit config.json manually")
+		plan.Provider = bootstrapProviderForgejo
+		return r.resolveForgejoBootstrapPlan(cmd.Context(), plan, opts)
 	case bootstrapProviderPlane:
 		plan.Provider = bootstrapProviderPlane
 	default:
-		return nil, fmt.Errorf("unsupported --provider %q (supported: github, plane)", opts.Provider)
+		return nil, fmt.Errorf("unsupported --provider %q (supported: github, forgejo, plane)", opts.Provider)
 	}
 
 	if plan.ProjectPath == "" {
@@ -391,6 +416,169 @@ func (r *commandRuntime) resolveBootstrapProviderPlan(cmd *cobra.Command, plan *
 		notes = append(notes, fmt.Sprintf("feishu notifications: export %s with your Feishu (or generic) webhook URL", plan.FeishuWebhookEnv))
 	}
 	return notes, nil
+}
+
+var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func (r *commandRuntime) resolveForgejoBootstrapPlan(ctx context.Context, plan *bootstrapConfigPlan, opts bootstrapOptions) ([]string, error) {
+	if plan.ProjectPath == "" {
+		return nil, fmt.Errorf("--provider forgejo requires --project-path")
+	}
+	baseURL, err := validateForgejoBaseURL(opts.ForgejoURL)
+	if err != nil {
+		return nil, err
+	}
+	tokenEnv := strings.TrimSpace(opts.ForgejoTokenEnv)
+	if !environmentNamePattern.MatchString(tokenEnv) {
+		return nil, fmt.Errorf("--forgejo-token-env must name a valid environment variable")
+	}
+	token := os.Getenv(tokenEnv)
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("environment variable %s is not set; export the Forgejo token and rerun bootstrap", tokenEnv)
+	}
+	providerID := strings.TrimSpace(opts.ForgejoProviderID)
+	if providerID == "" {
+		providerID = "forgejo"
+	}
+	if deriveBootstrapProjectID(providerID) != providerID {
+		return nil, fmt.Errorf("--forgejo-provider-id must contain only lowercase letters, numbers, and hyphens")
+	}
+	remote, err := r.detectBootstrapOriginRemote(ctx, plan.ProjectPath)
+	if err != nil {
+		return nil, err
+	}
+	if !forgejoRemoteMatchesBaseURL(remote, baseURL) {
+		return nil, fmt.Errorf("origin host %q does not match --forgejo-url %q; pass the URL for that remote or correct origin", remote.Host, baseURL)
+	}
+	if remote.Repo == "" {
+		return nil, fmt.Errorf("could not detect owner/repo from origin for %s", plan.ProjectPath)
+	}
+	provider := config.ProviderConfig{ID: providerID, Kind: config.ProviderKindForgejo, BaseURL: baseURL, TokenEnv: stringPtr(tokenEnv)}
+	client, err := forge.NewForgejoClientFromConfig(provider, remote.Repo, forge.WithHTTPClient(r.app.deps.HTTPClient))
+	if err != nil {
+		return nil, err
+	}
+	identity, err := client.CurrentUser(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("validate Forgejo current identity: %w", err)
+	}
+	if strings.TrimSpace(identity.Login) == "" {
+		return nil, fmt.Errorf("validate Forgejo current identity: server returned an empty login")
+	}
+	if err := client.CheckRepository(ctx); err != nil {
+		return nil, fmt.Errorf("validate Forgejo repository %s: %w", remote.Repo, err)
+	}
+	plan.ForgejoURL = baseURL
+	plan.ForgejoTokenEnv = tokenEnv
+	plan.ForgejoProviderID = providerID
+	plan.Repo = remote.Repo
+	plan.Identity = identity.Login
+	return []string{fmt.Sprintf("forgejo provider: export %s before starting looperd", tokenEnv)}, nil
+}
+
+type bootstrapOriginRemote struct {
+	Scheme string
+	Host   string
+	Path   string
+	Repo   string
+}
+
+var bootstrapSCPRemotePattern = regexp.MustCompile(`^(?:[^@/:]+@)?(\[[^]]+\]|[^/:]+):(.+)$`)
+
+func (r *commandRuntime) detectBootstrapOriginRemote(ctx context.Context, projectPath string) (bootstrapOriginRemote, error) {
+	gitPath, err := r.lookPath()("git")
+	if err != nil || strings.TrimSpace(gitPath) == "" {
+		gitPath = "git"
+	}
+	result, err := r.runCommand(ctx, gitPath, []string{"-C", projectPath, "config", "--get", "remote.origin.url"}, 3*time.Second)
+	if err != nil || result.ExitCode != 0 {
+		return bootstrapOriginRemote{}, fmt.Errorf("read git origin for %s", projectPath)
+	}
+	remote, err := parseBootstrapRemote(strings.TrimSpace(result.Stdout))
+	if err != nil {
+		return bootstrapOriginRemote{}, err
+	}
+	return remote, nil
+}
+
+func parseBootstrapRemote(value string) (bootstrapOriginRemote, error) {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(value, ".git"))
+	if trimmed == "" {
+		return bootstrapOriginRemote{}, fmt.Errorf("git origin is empty")
+	}
+	var scheme, host, path string
+	if match := bootstrapSCPRemotePattern.FindStringSubmatch(trimmed); !strings.Contains(trimmed, "://") && match != nil {
+		scheme = "ssh"
+		host, path = match[1], match[2]
+	} else {
+		parsed, err := url.Parse(trimmed)
+		if err != nil || parsed.Hostname() == "" {
+			return bootstrapOriginRemote{}, fmt.Errorf("unsupported git origin URL")
+		}
+		scheme, host, path = strings.ToLower(parsed.Scheme), parsed.Host, parsed.Path
+	}
+	remotePath := strings.Trim(path, "/")
+	parts := strings.Split(remotePath, "/")
+	if host == "" || len(parts) < 2 || parts[len(parts)-2] == "" || parts[len(parts)-1] == "" {
+		return bootstrapOriginRemote{}, fmt.Errorf("git origin must identify owner/repo")
+	}
+	return bootstrapOriginRemote{Scheme: scheme, Host: strings.ToLower(host), Path: remotePath, Repo: parts[len(parts)-2] + "/" + parts[len(parts)-1]}, nil
+}
+
+func validateForgejoBaseURL(value string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("--forgejo-url must be an absolute http(s) URL without credentials, query, or fragment")
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func forgejoRemoteMatchesBaseURL(remote bootstrapOriginRemote, baseURL string) bool {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	remoteURL, err := url.Parse("//" + strings.TrimSpace(remote.Host))
+	if err != nil || remoteURL.Hostname() == "" {
+		return false
+	}
+	remoteHost := strings.TrimPrefix(strings.ToLower(remoteURL.Hostname()), "ssh.")
+	providerHost := strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
+	if strings.TrimPrefix(remoteHost, "www.") != providerHost {
+		return false
+	}
+	if remote.Scheme != "ssh" && forgejoURLPort(remote.Scheme, remoteURL.Port()) != forgejoURLPort(parsed.Scheme, parsed.Port()) {
+		return false
+	}
+	if remote.Scheme == "ssh" {
+		return len(strings.Split(remote.Path, "/")) == 2
+	}
+	basePath := strings.Trim(strings.TrimSpace(parsed.Path), "/")
+	if basePath == "" {
+		return len(strings.Split(remote.Path, "/")) == 2
+	}
+	return strings.HasPrefix(remote.Path, basePath+"/") && len(strings.Split(strings.TrimPrefix(remote.Path, basePath+"/"), "/")) == 2
+}
+
+func forgejoURLPort(scheme, port string) string {
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		return ""
+	}
+	return port
+}
+
+func forgejoBaseURLsMatch(first, second string) bool {
+	firstURL, firstErr := url.Parse(first)
+	secondURL, secondErr := url.Parse(second)
+	if firstErr != nil || secondErr != nil || firstURL.User != nil || secondURL.User != nil {
+		return false
+	}
+	return strings.EqualFold(firstURL.Scheme, secondURL.Scheme) &&
+		strings.EqualFold(firstURL.Hostname(), secondURL.Hostname()) &&
+		forgejoURLPort(strings.ToLower(firstURL.Scheme), firstURL.Port()) == forgejoURLPort(strings.ToLower(secondURL.Scheme), secondURL.Port()) &&
+		strings.TrimRight(firstURL.Path, "/") == strings.TrimRight(secondURL.Path, "/") &&
+		firstURL.RawQuery == secondURL.RawQuery && firstURL.Fragment == secondURL.Fragment
 }
 
 // detectBootstrapOriginRepo best-effort resolves owner/repo from the git origin
@@ -449,7 +637,7 @@ func (r *commandRuntime) bootstrapPreflight(ctx context.Context, configPath stri
 	if detected.Paths.GitPath == nil || strings.TrimSpace(*detected.Paths.GitPath) == "" {
 		missing = append(missing, "git")
 	}
-	if detected.Paths.GHPath == nil || strings.TrimSpace(*detected.Paths.GHPath) == "" {
+	if plan.Provider != bootstrapProviderForgejo && (detected.Paths.GHPath == nil || strings.TrimSpace(*detected.Paths.GHPath) == "") {
 		missing = append(missing, "gh")
 	}
 	if len(missing) > 0 {
@@ -461,7 +649,7 @@ func (r *commandRuntime) bootstrapPreflight(ctx context.Context, configPath stri
 		plan.EnableOsascript = false
 		notes = append(notes, "osascript was not detected; notifications.osascript.enabled will remain disabled")
 	}
-	if detected.Paths.GHPath != nil {
+	if plan.Provider != bootstrapProviderForgejo && detected.Paths.GHPath != nil {
 		result, err := r.runCommand(ctx, *detected.Paths.GHPath, []string{"auth", "status"}, 3*time.Second)
 		if err != nil || result.ExitCode != 0 {
 			notes = append(notes, "gh auth status is not ready yet; run `gh auth login` if you plan to use GitHub integration")
@@ -621,14 +809,48 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 	if err := config.Validate(normalized); err != nil {
 		return false, false, err
 	}
-	if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
+	if plan.Provider == bootstrapProviderForgejo {
+		providerExists := false
+		for _, provider := range normalized.Providers {
+			if provider.ID == plan.ForgejoProviderID {
+				providerExists = true
+				if provider.Kind != config.ProviderKindForgejo || !forgejoBaseURLsMatch(provider.BaseURL, plan.ForgejoURL) || provider.TokenEnv == nil || *provider.TokenEnv != plan.ForgejoTokenEnv {
+					return false, false, fmt.Errorf("provider id %q already exists with different settings; choose a different --forgejo-provider-id", plan.ForgejoProviderID)
+				}
+				break
+			}
+		}
+		for _, project := range normalized.Projects {
+			if !samePath(project.RepoPath, plan.ProjectPath) {
+				continue
+			}
+			if project.Provider != plan.ForgejoProviderID || project.Repo != plan.Repo {
+				return false, false, fmt.Errorf("project %q already exists for %s but is not bound to Forgejo provider %q repository %q; remove or rebind the project first", project.ID, plan.ProjectPath, plan.ForgejoProviderID, plan.Repo)
+			}
+			return false, false, nil
+		}
+		if !providerExists {
+			providers := []config.PartialProviderConfig{}
+			if partial.Providers != nil {
+				providers = append(providers, (*partial.Providers)...)
+			}
+			kind := config.ProviderKindForgejo
+			providers = append(providers, config.PartialProviderConfig{ID: plan.ForgejoProviderID, Kind: &kind, BaseURL: stringPtr(plan.ForgejoURL), TokenEnv: stringPtr(plan.ForgejoTokenEnv)})
+			partial.Providers = &providers
+		}
+	} else if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
 		return false, false, nil
 	}
 	projects := []config.PartialProjectRefConfig{}
 	if partial.Projects != nil {
 		projects = append(projects, (*partial.Projects)...)
 	}
-	projects = append(projects, partialProjectFromConfig(buildBootstrapProject(plan.ProjectPath, normalized.Defaults.BaseBranch)))
+	project := buildBootstrapProject(plan.ProjectPath, normalized.Defaults.BaseBranch)
+	if plan.Provider == bootstrapProviderForgejo {
+		project.Provider = plan.ForgejoProviderID
+		project.Repo = plan.Repo
+	}
+	projects = append(projects, partialProjectFromConfig(project))
 	partial.Projects = &projects
 	updated, err := config.Normalize(cwd, partial)
 	if err != nil {
@@ -671,9 +893,25 @@ func applyBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
 		applyPlaneBootstrapPlan(cfg, plan)
 		return
 	}
+	if plan.Provider == bootstrapProviderForgejo {
+		applyForgejoBootstrapPlan(cfg, plan)
+		return
+	}
 	if plan.ProjectPath != "" {
 		cfg.Projects = append(cfg.Projects, buildBootstrapProject(plan.ProjectPath, cfg.Defaults.BaseBranch))
 	}
+}
+
+func applyForgejoBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
+	cfg.Providers = append(cfg.Providers, config.ProviderConfig{
+		ID: plan.ForgejoProviderID, Kind: config.ProviderKindForgejo,
+		BaseURL: plan.ForgejoURL, TokenEnv: stringPtr(plan.ForgejoTokenEnv),
+	})
+	project := buildBootstrapProject(plan.ProjectPath, cfg.Defaults.BaseBranch)
+	project.Provider = plan.ForgejoProviderID
+	project.Repo = plan.Repo
+	config.ApplyForgejoProjectProfile(&project)
+	cfg.Projects = append(cfg.Projects, project)
 }
 
 // applyPlaneBootstrapPlan wires a Plane task-source provider + a project bound to
@@ -753,12 +991,21 @@ func partialProjectFromConfig(project config.ProjectRefConfig) config.PartialPro
 	return config.PartialProjectRefConfig{
 		ID:           project.ID,
 		Name:         project.Name,
+		Provider:     stringPtrIfSet(project.Provider),
+		Repo:         stringPtrIfSet(project.Repo),
 		RepoPath:     project.RepoPath,
 		Path:         project.Path,
 		BaseBranch:   project.BaseBranch,
 		WorktreeRoot: project.WorktreeRoot,
 		Roles:        project.Roles,
 	}
+}
+
+func stringPtrIfSet(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return stringPtr(value)
 }
 
 func writeBootstrapPartialConfig(path string, partial config.PartialConfig) error {
@@ -1074,8 +1321,24 @@ func bootstrapNextSteps(projectPath string) []string {
 	return steps
 }
 
+func bootstrapNextStepsForPlan(plan bootstrapConfigPlan, restartRequired bool) []string {
+	steps := bootstrapNextSteps(plan.ProjectPath)
+	if plan.Provider == bootstrapProviderForgejo {
+		if restartRequired {
+			steps = append([]string{"looper daemon restart"}, steps...)
+		}
+		steps = append([]string{fmt.Sprintf("export %s=<forgejo-token>", plan.ForgejoTokenEnv)}, steps...)
+	}
+	return steps
+}
+
 func writeHumanBootstrapResult(w io.Writer, result bootstrapResult) error {
-	printSection(w, "Bootstrap complete", [][2]any{{"configPath", result.ConfigPath}, {"configCreated", result.ConfigCreated}, {"projectAdded", result.ProjectAdded}, {"managedDaemonPath", result.ManagedDaemonPath}, {"daemonInstallState", result.DaemonInstallState}, {"apiReachable", result.APIReachable}})
+	entries := [][2]any{{"configPath", result.ConfigPath}, {"configCreated", result.ConfigCreated}, {"projectAdded", result.ProjectAdded}}
+	if result.ProviderID != "" {
+		entries = append(entries, [2]any{"provider", result.ProviderID}, [2]any{"providerKind", result.ProviderKind}, [2]any{"repo", result.Repo}, [2]any{"identity", result.Identity})
+	}
+	entries = append(entries, [2]any{"managedDaemonPath", result.ManagedDaemonPath}, [2]any{"daemonInstallState", result.DaemonInstallState}, [2]any{"apiReachable", result.APIReachable})
+	printSection(w, "Bootstrap complete", entries)
 	if len(result.Notes) > 0 {
 		_, _ = fmt.Fprintln(w)
 		_, _ = fmt.Fprintln(w, "Notes:")

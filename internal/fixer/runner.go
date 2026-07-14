@@ -1550,6 +1550,10 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: roles.Fixer.AutoDiscovery, IncludeDrafts: roles.Fixer.Triggers.IncludeDrafts, AuthorFilter: roles.Fixer.Triggers.AuthorFilter, Labels: append([]string(nil), roles.Fixer.Triggers.Labels...), LabelMode: roles.Fixer.Triggers.LabelMode}
 }
 
+func (r *Runner) isForgejoProject(projectID string) bool {
+	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
+}
+
 func defaultDiscoveryLimit(limit int) int {
 	if limit <= 0 {
 		return 30
@@ -1614,11 +1618,31 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
-	allFixItems := collectFixItems(detail)
+	detail, err = r.prepareForgejoDiscoveryDetail(ctx, project, detail)
+	if err != nil {
+		return err
+	}
+	var allFixItems []FixItem
+	if r.isForgejoProject(project.ID) {
+		allFixItems, err = collectFixItemsFromCheckpointForStep(fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)})
+		if err != nil {
+			return err
+		}
+	} else {
+		allFixItems = collectFixItems(detail)
+	}
 	if len(allFixItems) == 0 {
 		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
 			return err
 		}
+		result.Skipped++
+		return nil
+	}
+	actionableFixItems, err := r.unsatisfiedForgejoSummaryItems(project.ID, pullRequestCheckpointDetail(detail), allFixItems)
+	if err != nil {
+		return err
+	}
+	if len(actionableFixItems) == 0 {
 		result.Skipped++
 		return nil
 	}
@@ -1671,6 +1695,85 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	}
 	appendDiscoveryQueueItem(&result.QueueItems, queueItem)
 	return nil
+}
+
+func pullRequestCheckpointDetail(detail PullRequestDetail) *checkpointDetail {
+	return &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
+}
+
+func (r *Runner) prepareForgejoDiscoveryDetail(ctx context.Context, project storage.ProjectRecord, detail PullRequestDetail) (PullRequestDetail, error) {
+	if !r.isForgejoProject(project.ID) {
+		return detail, nil
+	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return detail, err
+	}
+	sanitizeForgejoSummaryAuthority(&detail, currentUser)
+	checkpoint := fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)}
+	if _, _, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
+		return detail, err
+	}
+	return detail, nil
+}
+
+func sanitizeForgejoSummaryAuthority(detail *PullRequestDetail, currentUser string) {
+	if detail == nil {
+		return
+	}
+	trusted := make([]map[string]any, 0, len(detail.IssueComments))
+	for _, comment := range detail.IssueComments {
+		body, _ := stringFromAny(comment["body"])
+		carriesSummary := strings.Contains(body, "<!-- "+forge.ReviewerSummaryMarker) || strings.Contains(body, "<!-- "+forge.FixerSummaryMarker)
+		if carriesSummary && !sameGitHubLogin(issueCommentAuthorLogin(comment), currentUser) {
+			continue
+		}
+		trusted = append(trusted, comment)
+	}
+	detail.IssueComments = trusted
+}
+
+func (r *Runner) sanitizeForgejoCheckpointSummaryAuthority(ctx context.Context, project storage.ProjectRecord, detail *checkpointDetail) error {
+	if !r.isForgejoProject(project.ID) || detail == nil {
+		return nil
+	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return err
+	}
+	prDetail := PullRequestDetail{IssueComments: cloneObjectSlice(detail.IssueComments)}
+	sanitizeForgejoSummaryAuthority(&prDetail, currentUser)
+	detail.IssueComments = prDetail.IssueComments
+	return nil
+}
+
+func (r *Runner) unsatisfiedForgejoSummaryItems(projectID string, detail *checkpointDetail, items []FixItem) ([]FixItem, error) {
+	if !r.isForgejoProject(projectID) {
+		return items, nil
+	}
+	reviewerSummary, hasReviewerSummary, err := reviewerSummaryFromCheckpointDetail(detail)
+	if err != nil {
+		return nil, err
+	}
+	consumedSummary := false
+	if hasReviewerSummary {
+		comments := forgeCommentsFromCheckpointDetail(detail)
+		if containsForgeSummaryMarker(comments, forge.FixerSummaryMarker) {
+			_, fixerSummary, parseErr := forge.ParseUniqueFixerSummaryComment(comments)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			consumedSummary = forge.ValidateFixerResultsForReviewerSummary(reviewerSummary, fixerSummary) == nil && strings.TrimSpace(fixerSummary.ObservedHeadSHA) == strings.TrimSpace(detail.HeadSHA)
+		}
+	}
+	result := make([]FixItem, 0, len(items))
+	for _, item := range items {
+		if item.Source == "forgejo-reviewer-summary" && consumedSummary {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result, nil
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -2375,6 +2478,9 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
 	}
+	if err := r.sanitizeForgejoCheckpointSummaryAuthority(ctx, input.Project, checkpoint.Detail); err != nil {
+		return checkpoint, err
+	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if (!policy.IncludeDrafts && checkpoint.Detail.IsDraft) || normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
@@ -2386,6 +2492,10 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 		}
 	}
 	fixItems, err := collectFixItemsFromCheckpointForStep(checkpoint)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	fixItems, err = r.unsatisfiedForgejoSummaryItems(input.Project.ID, checkpoint.Detail, fixItems)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
 	}
@@ -2424,16 +2534,19 @@ func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input st
 	if checkpoint == nil || checkpoint.Detail == nil {
 		return nil
 	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return err
+	}
+	detail := PullRequestDetail{IssueComments: cloneObjectSlice(checkpoint.Detail.IssueComments)}
+	sanitizeForgejoSummaryAuthority(&detail, currentUser)
+	checkpoint.Detail.IssueComments = detail.IssueComments
 	nativeComments, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return classifyForgejoNativeDiscoveryError(err)
 	}
 	if len(nativeComments) == 0 {
 		return nil
-	}
-	currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-	if err != nil {
-		return err
 	}
 	nativeComments = actionableNativeReviewComments(nativeComments, currentUser)
 	comments := make([]map[string]any, 0, len(nativeComments)+len(checkpoint.Detail.Comments))
@@ -2916,6 +3029,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	if err := r.sanitizeForgejoCheckpointSummaryAuthority(ctx, input.Project, checkpoint.Detail); err != nil {
+		return checkpoint, err
+	}
 	hasReviewerSummary := false
 	if _, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
@@ -2934,6 +3050,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, liveDetail.Labels) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+	}
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
+	if err != nil {
+		return checkpoint, err
 	}
 	// Ancestor guard: if we previously pushed a fix commit, make sure the
 	// live PR head still descends from it. If a collaborator force-pushed or
@@ -3283,12 +3403,19 @@ func classifyForgejoNativeDiscoveryError(err error) error {
 }
 
 func isForgejoNativeResolveUnsupported(err error) bool {
+	return isForgejoNativeCapabilityUnsupported(err)
+}
+
+func isForgejoNativeCapabilityUnsupported(err error) bool {
 	var httpErr *forge.ForgejoHTTPError
 	return errors.As(err, &httpErr) && (httpErr.StatusCode == 404 || httpErr.StatusCode == 405)
 }
 
 func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
+	if err := r.sanitizeForgejoCheckpointSummaryAuthority(ctx, input.Project, checkpoint.Detail); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
 	reviewerSummary, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
@@ -3309,6 +3436,10 @@ func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput
 		return checkpoint, &loopError{message: "forgejo fixer summary requires push step to complete", kind: FailureRetryableAfterResume}
 	}
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -3525,6 +3656,10 @@ func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepIn
 
 func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, evidence threadFixEvidence, item FixItem) (string, PullRequestDetail, error) {
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", PullRequestDetail{}, err
+	}
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
 	if err != nil {
 		return "", PullRequestDetail{}, err
 	}

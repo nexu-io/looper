@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -588,6 +589,82 @@ func TestFixerGitHubAdapterForgejoListNativeReviewComments(t *testing.T) {
 	}
 	if got := comments[2]; !got.ResolverPresent || !got.IsResolved || got.Author != "carol" {
 		t.Fatalf("comments[2] = %#v, want resolved comment with author preserved", got)
+	}
+}
+
+func TestFixerGitHubAdapterForgejoFiltersAuthorBeforeLimit(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		pulls := []map[string]any{{"number": 1, "state": "open", "user": map[string]any{"login": "other"}, "head": map[string]any{"ref": "one", "sha": "head-1"}, "base": map[string]any{"ref": "main", "sha": "base"}}}
+		for number := 2; number <= 36; number++ {
+			pulls = append(pulls, map[string]any{"number": number, "state": "open", "user": map[string]any{"login": "Looper"}, "head": map[string]any{"ref": fmt.Sprintf("pr-%d", number), "sha": fmt.Sprintf("head-%d", number)}, "base": map[string]any{"ref": "main", "sha": "base"}})
+		}
+		_ = json.NewEncoder(w).Encode(pulls)
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+
+	prs, err := adapter.ListOpenPullRequests(context.Background(), fixer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Author: "looper", Limit: 1})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 2 {
+		t.Fatalf("pull requests = %#v, want matching author after provider result filtering", prs)
+	}
+
+	prs, err = adapter.ListOpenPullRequests(context.Background(), fixer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath, Author: "looper"})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests(default limit) error = %v", err)
+	}
+	if len(prs) != 30 || prs[0].Number != 2 || prs[29].Number != 31 {
+		t.Fatalf("pull requests = %#v, want first 30 matching authors at the default limit", prs)
+	}
+}
+
+func TestFixerGitHubAdapterForgejoBoundsUnfilteredDefaultLimit(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/repos/acme/looper/pulls" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.URL.Query().Get("limit"); got != "30" {
+			t.Fatalf("limit = %q, want default discovery limit 30", got)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 1, "state": "open", "user": map[string]any{"login": "looper"}, "head": map[string]any{"ref": "one", "sha": "head-1"}, "base": map[string]any{"ref": "main", "sha": "base"}}})
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+
+	prs, err := adapter.ListOpenPullRequests(context.Background(), fixer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: repoPath})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 1 {
+		t.Fatalf("pull requests = %#v, want bounded provider result", prs)
+	}
+}
+
+func TestForgejoSupportsFixerDiscoveryWithoutOpeningCoordinatorLane(t *testing.T) {
+	if !providerSupportsFixerDiscovery(config.ProviderKindForgejo) {
+		t.Fatal("providerSupportsFixerDiscovery(forgejo) = false, want true")
+	}
+	if providerHasGitHubPullRequests(config.ProviderKindForgejo) {
+		t.Fatal("providerHasGitHubPullRequests(forgejo) = true, coordinator lane must remain disabled")
 	}
 }
 

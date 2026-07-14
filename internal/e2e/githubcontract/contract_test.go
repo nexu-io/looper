@@ -14,8 +14,9 @@ import (
 )
 
 type fakeGHState struct {
-	Routes  map[string]json.RawMessage `json:"routes,omitempty"`
-	GraphQL map[string]json.RawMessage `json:"graphql,omitempty"`
+	Routes       map[string]json.RawMessage       `json:"routes,omitempty"`
+	GraphQL      map[string]json.RawMessage       `json:"graphql,omitempty"`
+	PullRequests map[string]harness.GHPullRequest `json:"pullRequests,omitempty"`
 }
 
 func TestInvariantGatewayUsesSupportedGHJSONFields(t *testing.T) {
@@ -80,6 +81,58 @@ func TestInvariantGatewayUsesSupportedGHJSONFields(t *testing.T) {
 	assertInvocationMissingJSONField(t, invocations, "pr", "list", "authorAssociation")
 	assertInvocationContains(t, invocations, []string{"api", "repos/acme/looper/issues/7"})
 	assertInvocationContains(t, invocations, []string{"api", "graphql"})
+}
+
+func TestInvariantFixerDiscoveryUsesBoundedIssueCommentProjection(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	fakeGH := harness.NewFakeGH(t, bins, loadFixtureSchema(t))
+	writeFakeState(t, fakeGH.StatePath, fakeGHState{
+		Routes: map[string]json.RawMessage{
+			"repos/acme/looper/issues/42/comments": json.RawMessage(`[{"id":202,"body":"<!-- looper:fixer-round head=head-42 -->","html_url":"https://example.test/pull/42#issuecomment-202","user":{"login":"looper"}}]`),
+		},
+		GraphQL: map[string]json.RawMessage{
+			"default": json.RawMessage(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`),
+		},
+		PullRequests: map[string]harness.GHPullRequest{
+			"acme/looper#42": {Number: 42, Repo: "acme/looper", State: "OPEN", HeadSHA: "head-42", BaseSHA: "base-42", HeadRefName: "feature", BaseRefName: "main"},
+		},
+	})
+	root := t.TempDir()
+	for key, value := range fakeGH.EnvMap() {
+		t.Setenv(key, value)
+	}
+	t.Setenv("HOME", root)
+	gateway := githubinfra.New(githubinfra.Options{GHPath: fakeGH.Path, CWD: root})
+
+	detail, err := gateway.ViewPullRequestForFixer(context.Background(), githubinfra.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: root})
+	if err != nil {
+		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
+	}
+	if len(detail.IssueComments) != 1 || detail.IssueComments[0].ID != 202 {
+		t.Fatalf("IssueComments = %#v, want projected automation comment", detail.IssueComments)
+	}
+
+	invocations := readInvocationsForContract(t, fakeGH.InvocationLog)
+	for _, invocation := range invocations {
+		argv := argvStrings(invocation)
+		if !containsOrdered(argv, []string{"api", "--paginate", "repos/acme/looper/issues/42/comments", "--jq"}) {
+			continue
+		}
+		if containsOrdered(argv, []string{"--slurp"}) {
+			t.Fatalf("comment invocation = %v, want page-wise output without --slurp", argv)
+		}
+		filter := argv[len(argv)-1]
+		for _, required := range []string{"looper:forgejo-reviewer-summary", "looper:fixer-round", "looper:conflict-notice", "looper:reviewer:automerge-refused", "looper:forgejo-fixer-summary", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+			if !strings.Contains(filter, required) {
+				t.Fatalf("comment projection = %q, want %q", filter, required)
+			}
+		}
+		if strings.Contains(filter, `contains("looper:")`) || strings.Contains(filter, "looper:stamp") {
+			t.Fatalf("comment projection = %q, want only consumed protocol markers", filter)
+		}
+		return
+	}
+	t.Fatalf("missing bounded issue-comment projection in %#v", invocations)
 }
 
 func TestInvariantGatewayDependencyWrappersUseSupportedRoutes(t *testing.T) {

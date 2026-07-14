@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -1095,6 +1096,28 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 	return extractCommentInfos(rows), nil
 }
 
+// listPullRequestAutomationComments keeps PR discovery independent of the size
+// of the full issue conversation. gh applies this projection to each page
+// before writing to the shell capture buffer, so only comments consumed by the
+// fixer/reviewer protocols cross that bounded boundary.
+func (g *Gateway) listPullRequestAutomationComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	filter := `.[] | select((.body // "") | (contains("looper:forgejo-reviewer-summary") or contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused") or contains("looper:forgejo-fixer-summary"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONObjects(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractCommentInfos(rows), nil
+}
+
 func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
 	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
@@ -1409,7 +1432,7 @@ func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullR
 	}
 	issueComments := []CommentInfo(nil)
 	if includeIssueComments {
-		issueComments, err = g.ListIssueComments(ctx, ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
+		issueComments, err = g.listPullRequestAutomationComments(ctx, ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
 		if err != nil {
 			return PullRequestDetail{}, err
 		}
@@ -1744,7 +1767,7 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 }
 
 func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThreadReplyInput) error {
-	if err := outboundguard.Validate(outboundguard.Field{Name: "review thread reply body", Text: input.Body}); err != nil {
+	if err := outboundguard.ValidateReviewThreadReply(input.Body, input.ThreadID); err != nil {
 		return err
 	}
 	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
@@ -1791,6 +1814,9 @@ func (g *Gateway) CompareCommits(ctx context.Context, input CompareCommitsInput)
 
 func (g *Gateway) GetPullRequestDiff(ctx context.Context, input GetPullRequestDiffInput) (string, error) {
 	result, err := g.runGhWithTimeout(ctx, input.CWD, "", prDiffGhCommandTimeout, "pr", "diff", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo)
+	if result.StdoutTruncated {
+		return "", ErrDiffTooLarge
+	}
 	if err != nil {
 		if isDiffTooLargeError(err) {
 			return "", ErrDiffTooLarge
@@ -3225,6 +3251,20 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
 	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+	if result.StdoutTruncated || result.StderrTruncated {
+		streams := make([]string, 0, 2)
+		if result.StdoutTruncated {
+			streams = append(streams, fmt.Sprintf("stdout after %d bytes", len(result.Stdout)))
+		}
+		if result.StderrTruncated {
+			streams = append(streams, fmt.Sprintf("stderr after %d bytes", len(result.Stderr)))
+		}
+		message := "GitHub command output truncated: " + strings.Join(streams, ", ")
+		if err != nil {
+			message += "; command error: " + err.Error()
+		}
+		return result, &shell.CommandExecutionError{Message: message, Result: result}
+	}
 	if err != nil && isTransientGitHubMessage(strings.Join([]string{err.Error(), result.Stdout, result.Stderr}, "\n")) {
 		return result, &TransientError{Err: err}
 	}
@@ -3638,6 +3678,34 @@ func decodeJSONArrayOrPages(value string) ([]map[string]any, error) {
 		return []map[string]any{}, nil
 	}
 	return rows, nil
+}
+
+func decodeJSONObjects(value string) ([]map[string]any, error) {
+	decoder := json.NewDecoder(strings.NewReader(value))
+	rows := make([]map[string]any, 0)
+	for {
+		var item any
+		if err := decoder.Decode(&item); err != nil {
+			if errors.Is(err, io.EOF) {
+				return rows, nil
+			}
+			return nil, invalidJSONError(value, err)
+		}
+		switch typed := item.(type) {
+		case map[string]any:
+			rows = append(rows, typed)
+		case []any:
+			for _, entry := range typed {
+				row, ok := entry.(map[string]any)
+				if !ok {
+					return nil, invalidJSONError(value, fmt.Errorf("expected JSON object in array, got %T", entry))
+				}
+				rows = append(rows, row)
+			}
+		default:
+			return nil, invalidJSONError(value, fmt.Errorf("expected JSON object or array, got %T", item))
+		}
+	}
 }
 
 func invalidJSONError(stdout string, err error) error {

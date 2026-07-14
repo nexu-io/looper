@@ -75,15 +75,27 @@ func IsRejection(err error) bool {
 }
 
 func Validate(fields ...Field) error {
+	return validate(nil, fields...)
+}
+
+// ValidateReviewThreadReply validates a review-thread reply while allowing the
+// exact opaque thread ID supplied by GitHub. The exemption is intentionally
+// unavailable to other publication paths and cannot be substituted by content
+// from the reply body.
+func ValidateReviewThreadReply(body, threadID string) error {
+	return validate([]string{threadID}, Field{Name: "review thread reply body", Text: body})
+}
+
+func validate(highEntropyExemptions []string, fields ...Field) error {
 	for _, field := range fields {
-		if reason := unsafeText(field.Text); reason != "" {
+		if reason := unsafeText(field.Text, highEntropyExemptions); reason != "" {
 			return &Rejection{Field: field.Name, Reason: reason}
 		}
 	}
 	return nil
 }
 
-func unsafeText(text string) string {
+func unsafeText(text string, highEntropyExemptions []string) string {
 	if credentialURLRE.MatchString(text) || credentialQueryRE.MatchString(text) {
 		return "contains a credential-bearing connection URL"
 	}
@@ -103,7 +115,13 @@ func unsafeText(text string) string {
 	if environmentAssignments >= environmentAssignmentLimit {
 		return "contains an environment-dump-shaped block"
 	}
-	for _, token := range highEntropyCandidateRE.FindAllString(text, -1) {
+	entropyText := text
+	for _, exemption := range highEntropyExemptions {
+		if exemption != "" {
+			entropyText = strings.ReplaceAll(entropyText, exemption, "")
+		}
+	}
+	for _, token := range highEntropyCandidateRE.FindAllString(entropyText, -1) {
 		if gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token) {
 			continue
 		}

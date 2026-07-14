@@ -35,7 +35,7 @@ Also make sure:
 - Forgejo projects: the configured provider `tokenEnv` is exported in the daemon environment
 - `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
 
-Forgejo projects need a configured `[[providers]]` entry (`kind = "forgejo"`, `baseUrl`, `tokenEnv`) first. `looper project add` detects a matching Forgejo origin as a hint, but requires `--provider` to confirm the binding; `--repo` may be omitted only when it can be read from an origin matching that provider. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
+Forgejo projects can be onboarded with `looper bootstrap --provider forgejo`, managed with `looper provider add|list|test|remove`, or added to a running installation with `looper project add --forgejo-url ... --forgejo-token-env ...`. For configured providers, pass the provider id explicitly; `--provider forgejo` selects it only when the origin has one unambiguous match. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
 
 `looper status` probes each configured Forgejo provider with bounded, read-only requests. Human and JSON output distinguish endpoint reachability, token authentication, current identity, server version, per-project read/write access, and configured versus observed capabilities. An unavailable OpenAPI contract is reported as `unknown`, never as supported. Status output omits provider URLs, token environment names, tokens, and raw network errors.
 
@@ -337,14 +337,12 @@ Fixer will:
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
 
-For Forgejo projects, the manual/direct fixer path is slightly different:
+For Forgejo projects, automatic Fixer runs are summary-only because Forgejo's public REST API does not currently expose a native review-comment resolve mutation:
 
 - reviewer-summary items still come from the top-level Reviewer Summary comment
-- native Forgejo PR review comments are also read by default
-- native comments authored by the current Looper user are ignored
-- if a native comment response omits the `resolver` field, Looper stops with an unsupported-capability/manual-intervention error instead of silently downgrading
-- native comments are resolved only when the fixer agent reports them as `fixed`, validation passes, a push actually happened, and a post-push re-read shows the same unresolved comment fingerprint
-- `declined`, `deferred`, changed, deleted, already-resolved, or otherwise unmatched native comments stay unresolved
+- native Forgejo PR review comments do not trigger automatic Fixer runs, even when their response includes a `resolver` field
+- the `resolver` response field describes state; it is not treated as proof that a resolve mutation exists
+- explicit manual Fixer runs may inspect native comments, but stop with a manual-intervention error when the provider cannot resolve them
 
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 
