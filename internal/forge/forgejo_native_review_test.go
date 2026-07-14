@@ -19,7 +19,7 @@ func TestForgejoNativeReviewRequestDiscoveryAndPublicationContract(t *testing.T)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/swagger.v1.json":
-			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{"number": 1, "state": "open", "user": map[string]any{"login": "alice"}, "head": map[string]any{"sha": "head-1"}, "requested_reviewers": requested[1]},

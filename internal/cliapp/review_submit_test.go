@@ -102,7 +102,7 @@ func TestForgejoReviewSubmitGatewayReusesMatchingNativeReviewMarker(t *testing.T
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/swagger.v1.json":
-			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "reviewer"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
@@ -150,7 +150,7 @@ func TestForgejoReviewSubmitGatewayDoesNotReuseOtherAuthorsMatchingMarker(t *tes
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/swagger.v1.json":
-			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "reviewer"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
@@ -191,7 +191,7 @@ func TestForgejoReviewSubmitGatewayNormalizesInvalidAnchorsBeforePublish(t *test
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/swagger.v1.json":
-			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "reviewer"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
