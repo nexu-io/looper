@@ -7369,7 +7369,7 @@ func TestRunResolveCommentsStepForgejoSummaryOnlySkipsNativeThreadLogicAndPostsS
 		Repo:     "acme/looper",
 		PRNumber: 42,
 		Checkpoint: fixerCheckpoint{
-			Detail:       &checkpointDetail{HeadSHA: "head-sha", HeadRefName: "reviewer-fixer", BaseRefName: "main", IssueComments: cloneObjectSlice(liveDetail.IssueComments[:1])},
+			Detail:       &checkpointDetail{HeadSHA: "head-sha", HeadRefName: "reviewer-fixer", BaseRefName: "main", IssueComments: cloneObjectSlice(liveDetail.IssueComments)},
 			FixItems:     fixItems,
 			FixItemsHash: hashFixItems(fixItems),
 			Validation:   &ValidationResult{Passed: true, HeadSHA: "head-sha"},

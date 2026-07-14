@@ -3029,6 +3029,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	if err := r.sanitizeForgejoCheckpointSummaryAuthority(ctx, input.Project, checkpoint.Detail); err != nil {
+		return checkpoint, err
+	}
 	hasReviewerSummary := false
 	if _, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
