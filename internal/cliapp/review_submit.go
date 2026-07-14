@@ -79,6 +79,9 @@ type forgejoReviewSubmitGateway struct {
 }
 
 func (gateway forgejoReviewSubmitGateway) validateReviewRequest(ctx context.Context, prNumber int64, labels []string, manual bool) error {
+	// manual must be proven from trusted run metadata by the caller. The
+	// argv --reviewer-manual flag alone is never sufficient to skip the
+	// requested-reviewer / label publish gate.
 	if manual || !gateway.requireReviewRequest || forgeReviewSubmitLabelsMatch(labels, gateway.labels, gateway.labelMode) {
 		return nil
 	}
@@ -452,6 +455,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
+	// Manual publish bypass for Forgejo request/label gates is derived from
+	// trusted run/loop metadata, never from the agent-controlled argv flag alone.
+	manualBypass, err := r.trustedManualReviewSubmitBypass(cmd, loaded.Config, repo, prNumber)
+	if err != nil {
+		return err
+	}
 	if err := r.validateReviewerReviewSubmitHold(cmd, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), detail.Labels); err != nil {
 		return err
 	}
@@ -481,7 +490,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
-			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, getBoolFlag(cmd, "reviewer-manual")); err != nil {
+			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, manualBypass); err != nil {
 				return err
 			}
 			return submitReviewWithoutAnchorValidation(cmd, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
@@ -506,7 +515,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, getBoolFlag(cmd, "reviewer-manual")); err != nil {
+	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, manualBypass); err != nil {
 		return err
 	}
 	if err := gateway.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
@@ -523,6 +532,27 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 		return nil
 	}
 	return validator.validateReviewRequest(ctx, prNumber, labels, manual)
+}
+
+// trustedManualReviewSubmitBypass reports whether Forgejo review-request /
+// label publish gates may be skipped because the current run is a trusted
+// manual reviewer loop. Authority is storage run/loop metadata for
+// --reviewer-run-id, never the argv --reviewer-manual flag alone.
+func (r *commandRuntime) trustedManualReviewSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64) (bool, error) {
+	runID := strings.TrimSpace(getStringFlag(cmd, "reviewer-run-id"))
+	if runID == "" {
+		return false, nil
+	}
+	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
+	if dbPath == "" {
+		return false, nil
+	}
+	db, err := storage.OpenSQLiteDB(cmd.Context(), dbPath)
+	if err != nil {
+		return false, fmt.Errorf("validate trusted manual reviewer run: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	return trustedManualReviewerRun(cmd.Context(), storage.NewRepositories(db), repo, prNumber, runID)
 }
 
 // resolveReviewSubmitAnchors establishes complete base/head anchor authority.

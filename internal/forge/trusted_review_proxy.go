@@ -47,6 +47,15 @@ func FormatTrustedReviewPRRef(repo string, prNumber int64) string {
 	return fmt.Sprintf("%s#%d", repo, prNumber)
 }
 
+// TrustedReviewProxyPolicy is the daemon-selected clean/blocking review event
+// policy bound into a trusted review-submit proxy for one agent run.
+// Agent-supplied --clean-review-event / --blocking-review-event values are
+// stripped and replaced with this policy before the child runs.
+type TrustedReviewProxyPolicy struct {
+	Clean    string // COMMENT or APPROVE
+	Blocking string // COMMENT or REQUEST_CHANGES
+}
+
 // StartTrustedReviewProxy listens on a private Unix socket and runs
 // `looper review submit` in a daemon-side child with provider tokens injected.
 // Agents receive only the socket path (via TrustedReviewSockEnv), never a
@@ -59,7 +68,12 @@ func FormatTrustedReviewPRRef(repo string, prNumber int64) string {
 // allowedCwd must be the daemon-selected working directory for that run. Child
 // processes always use this CWD; request-supplied cwd is ignored so a
 // compromised agent cannot retarget provider-qualified project resolution.
-func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string) (sockPath string, cleanup func(), err error) {
+//
+// policy is the daemon-selected effective review-events policy for the run
+// (including loop-metadata overrides). Agent argv may still include local
+// policy flags for the prompted command shape, but the proxy always rewrites
+// them to this bound policy before spawning the token-injected child.
+func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	noop := func() {}
 	if realLooper == "" {
@@ -72,6 +86,10 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	boundCwd, err := normalizeTrustedReviewCwd(allowedCwd)
 	if err != nil {
 		return "", nil, fmt.Errorf("trusted review proxy allowed CWD: %w", err)
+	}
+	boundPolicy, err := normalizeTrustedReviewProxyPolicy(policy)
+	if err != nil {
+		return "", nil, fmt.Errorf("trusted review proxy review policy: %w", err)
 	}
 	if len(trustedEnv) == 0 {
 		return "", noop, nil
@@ -114,7 +132,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed, boundCwd)
+				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundPolicy)
 			}(conn)
 		}
 	}()
@@ -128,7 +146,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string) {
+func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, policy TrustedReviewProxyPolicy) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
@@ -143,7 +161,10 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 		return
 	}
 
-	cmd := exec.Command(realLooper, req.Argv...)
+	// Authority for clean/blocking event policy is the daemon-bound policy, not
+	// agent argv. Rewrite local policy flags after shape/PR validation.
+	childArgv := applyTrustedReviewProxyPolicy(req.Argv, policy)
+	cmd := exec.Command(realLooper, childArgv...)
 	// Never honor request-supplied cwd: project/provider resolution for
 	// provider-qualified same-owner/repo checkouts is CWD-sensitive. The child
 	// always runs in the daemon-selected worktree bound at proxy start.
@@ -172,12 +193,10 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 // loadConfig review-policy flags can rewrite daemon config before the child
 // validates the payload.
 //
-// Intentionally NOT blocked: review-submit local `--clean-review-event` and
-// `--blocking-review-event`. buildReviewPromptWithInstructions tells agents to
-// pass those flags with the daemon-selected effective policy (including
-// loop-metadata overrides). Blocking them rejects the exact command Looper
-// asks the agent to run, so native review publication fails before the child.
-// Authority for event validation remains the child after argv is accepted.
+// Local review-submit `--clean-review-event` / `--blocking-review-event` are
+// intentionally NOT blocked: the runner prompts agents to pass them so the
+// command shape matches documentation. They are never authoritative — the
+// proxy rewrites them to the daemon-bound policy before spawning the child.
 var trustedReviewProxyBlockedFlags = map[string]struct{}{
 	"config":                          {},
 	"db-path":                         {},
@@ -220,8 +239,8 @@ func validateTrustedReviewProxyArgv(argv []string, allowedPRRef string) error {
 	// first so a compromised agent cannot redirect the daemon-injected provider
 	// token via --config, or rewrite daemon loadConfig review-events before the
 	// child validates the payload, even after `review submit`. Local
-	// --clean-review-event / --blocking-review-event are allowed: they are the
-	// prompted effective-policy flags for review submit.
+	// --clean-review-event / --blocking-review-event are allowed for command
+	// shape only; handleTrustedReviewProxyConn rewrites them to the bound policy.
 	for _, arg := range argv {
 		if name := trustedReviewProxyFlagName(arg); name != "" {
 			if _, blocked := trustedReviewProxyBlockedFlags[name]; blocked {
@@ -339,6 +358,52 @@ func normalizeTrustedReviewCwd(value string) (string, error) {
 		return "", fmt.Errorf("working directory must be absolute")
 	}
 	return cleaned, nil
+}
+
+func normalizeTrustedReviewProxyPolicy(policy TrustedReviewProxyPolicy) (TrustedReviewProxyPolicy, error) {
+	clean := strings.ToUpper(strings.TrimSpace(policy.Clean))
+	blocking := strings.ToUpper(strings.TrimSpace(policy.Blocking))
+	switch clean {
+	case "COMMENT", "APPROVE":
+	default:
+		return TrustedReviewProxyPolicy{}, fmt.Errorf("clean review event must be COMMENT or APPROVE")
+	}
+	switch blocking {
+	case "COMMENT", "REQUEST_CHANGES":
+	default:
+		return TrustedReviewProxyPolicy{}, fmt.Errorf("blocking review event must be COMMENT or REQUEST_CHANGES")
+	}
+	return TrustedReviewProxyPolicy{Clean: clean, Blocking: blocking}, nil
+}
+
+// applyTrustedReviewProxyPolicy strips agent-supplied local review-policy flags
+// and injects the daemon-bound clean/blocking events so the child validates
+// markers against daemon-selected policy only.
+func applyTrustedReviewProxyPolicy(argv []string, policy TrustedReviewProxyPolicy) []string {
+	stripped := stripTrustedReviewProxyPolicyFlags(argv)
+	return append(stripped,
+		"--clean-review-event", policy.Clean,
+		"--blocking-review-event", policy.Blocking,
+	)
+}
+
+func stripTrustedReviewProxyPolicyFlags(argv []string) []string {
+	if len(argv) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		name := trustedReviewProxyFlagName(arg)
+		if name == "clean-review-event" || name == "blocking-review-event" {
+			if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+				i++
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 func trustedReviewProxyChildEnv(trustedEnv map[string]string) []string {

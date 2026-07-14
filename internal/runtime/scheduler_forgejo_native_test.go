@@ -227,6 +227,20 @@ func TestReviewerAllowedPRRef(t *testing.T) {
 	}
 }
 
+func TestReviewerAllowedReviewPolicy(t *testing.T) {
+	t.Parallel()
+	if got := reviewerAllowedReviewPolicy(nil); got.Clean != "" || got.Blocking != "" {
+		t.Fatalf("nil metadata = %#v, want empty", got)
+	}
+	got := reviewerAllowedReviewPolicy(map[string]any{
+		"cleanReviewEvent":    " APPROVE ",
+		"blockingReviewEvent": "REQUEST_CHANGES",
+	})
+	if got.Clean != "APPROVE" || got.Blocking != "REQUEST_CHANGES" {
+		t.Fatalf("reviewerAllowedReviewPolicy() = %#v, want APPROVE/REQUEST_CHANGES", got)
+	}
+}
+
 func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 	t.Parallel()
 	if reviewerAllowsTrustedReviewProxy(nil) {
@@ -284,7 +298,13 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
-		Metadata:         map[string]any{"phase": "review", "repo": "acme/looper", "prNumber": int64(42)},
+		Metadata: map[string]any{
+			"phase":               "review",
+			"repo":                "acme/looper",
+			"prNumber":            int64(42),
+			"cleanReviewEvent":    "APPROVE",
+			"blockingReviewEvent": "REQUEST_CHANGES",
+		},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)

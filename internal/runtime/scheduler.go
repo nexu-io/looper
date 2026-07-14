@@ -215,10 +215,10 @@ func resolveTrustedLooperCLIPath(cfg config.Config) string {
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
 // `looper review submit` with provider tokens, bound exclusively to allowedPRRef
-// (owner/repo#N) and allowedCwd (daemon-selected worktree). Agents only receive
-// the socket path (not tokens). cleanup stops the listener and must run when the
-// agent execution ends.
-func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, logger bootstrap.Logger) (sockPath string, cleanup func()) {
+// (owner/repo#N), allowedCwd (daemon-selected worktree), and the daemon-selected
+// review-events policy. Agents only receive the socket path (not tokens).
+// cleanup stops the listener and must run when the agent execution ends.
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, policy forge.TrustedReviewProxyPolicy, logger bootstrap.Logger) (sockPath string, cleanup func()) {
 	noop := func() {}
 	realLooper = strings.TrimSpace(realLooper)
 	allowedPRRef = strings.TrimSpace(allowedPRRef)
@@ -226,7 +226,7 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	if realLooper == "" || len(trustedEnv) == 0 || allowedPRRef == "" || allowedCwd == "" {
 		return "", noop
 	}
-	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd)
+	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, policy)
 	if err != nil {
 		if logger != nil {
 			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error(), "allowedPR": allowedPRRef})
@@ -1677,6 +1677,21 @@ func reviewerAllowedPRRef(metadata map[string]any) string {
 	return forge.FormatTrustedReviewPRRef(repo, prNumber)
 }
 
+// reviewerAllowedReviewPolicy extracts the daemon-selected clean/blocking
+// review-events policy from reviewer agent metadata so the trusted proxy can
+// inject those flags outside agent control.
+func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewProxyPolicy {
+	if metadata == nil {
+		return forge.TrustedReviewProxyPolicy{}
+	}
+	clean, _ := metadata["cleanReviewEvent"].(string)
+	blocking, _ := metadata["blockingReviewEvent"].(string)
+	return forge.TrustedReviewProxyPolicy{
+		Clean:    strings.TrimSpace(clean),
+		Blocking: strings.TrimSpace(blocking),
+	}
+}
+
 func metadataInt64(value any) (int64, bool) {
 	switch n := value.(type) {
 	case int64:
@@ -1708,15 +1723,18 @@ func metadataInt64(value any) (int64, bool) {
 
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
 	// Mint a per-run proxy only for review/publish phases, bound to the
-	// daemon-selected PR and worktree CWD. Thread-resolution classifiers reuse
-	// this adapter but must not receive review-publish capability.
+	// daemon-selected PR, worktree CWD, and review-events policy.
+	// Thread-resolution classifiers reuse this adapter but must not receive
+	// review-publish capability.
 	allowedPR := ""
 	allowedCwd := ""
+	policy := forge.TrustedReviewProxyPolicy{}
 	if reviewerAllowsTrustedReviewProxy(input.Metadata) {
 		allowedPR = reviewerAllowedPRRef(input.Metadata)
 		allowedCwd = strings.TrimSpace(input.WorkingDirectory)
+		policy = reviewerAllowedReviewPolicy(input.Metadata)
 	}
-	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, a.logger)
+	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, policy, a.logger)
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID:        input.ExecutionID,
 		ProjectID:          input.ProjectID,

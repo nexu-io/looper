@@ -328,6 +328,50 @@ func TestTrustedManualReviewerRunRequiresMatchingManualLoop(t *testing.T) {
 	}
 }
 
+func TestValidateForgejoReviewRequestManualRequiresCallerProof(t *testing.T) {
+	t.Parallel()
+
+	// When manual is false, requireReviewRequest=true, and no trigger labels match,
+	// the gateway must check requested reviewers (and fail when none match).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "reviewer-bot"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 42, "state": "open", "user": map[string]any{"login": "alice"},
+				"requested_reviewers": []any{},
+			})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+	if err != nil {
+		t.Fatalf("NewForgejoClient() error = %v", err)
+	}
+	gateway := forgejoReviewSubmitGateway{
+		client:               client,
+		stamper:              disclosure.FromConfig(config.Config{}),
+		requireReviewRequest: true,
+		labels:               []string{"looper:review"},
+		labelMode:            config.LabelModeAll,
+	}
+
+	// Agent-controlled manual=true without proven metadata would previously skip
+	// this check. Callers must pass manual only after trustedManualReviewerRun.
+	if err := gateway.validateReviewRequest(context.Background(), 42, nil, false); err == nil || !strings.Contains(err.Error(), "review request removed before publish") {
+		t.Fatalf("validateReviewRequest(auto) = %v, want review request removed", err)
+	}
+	if err := gateway.validateReviewRequest(context.Background(), 42, nil, true); err != nil {
+		t.Fatalf("validateReviewRequest(proven manual) error = %v, want nil", err)
+	}
+}
+
 func TestValidateReviewSubmitEventAcceptsRequestChanges(t *testing.T) {
 	t.Parallel()
 
