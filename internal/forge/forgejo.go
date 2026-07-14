@@ -934,6 +934,8 @@ func convertPullRequestReview(input forgejoPullRequestReview) PullRequestReview 
 
 func normalizeForgejoReviewEvent(event string) string {
 	switch strings.ToUpper(strings.TrimSpace(event)) {
+	case "APPROVE":
+		return "APPROVED"
 	case "COMMENTED":
 		return "COMMENT"
 	case "CHANGES_REQUESTED":

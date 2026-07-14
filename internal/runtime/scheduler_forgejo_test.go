@@ -401,7 +401,7 @@ func TestReviewerGitHubAdapterForgejoFindReviewMarkerUsesIssueComments(t *testin
 	}
 	adapter := reviewerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
 
-	marker, err := adapter.FindReviewMarker(context.Background(), reviewer.VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=reviewer:loop-1:abc123 head=abc123", AllowedReviewEvents: []reviewer.ReviewEvent{reviewer.ReviewEventApprove}, AuthorLogin: "reviewer-bot", AllowCleanComment: true, CWD: repoPath})
+	marker, err := adapter.FindReviewMarker(context.Background(), reviewer.VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=reviewer:loop-1:abc123 head=abc123", AllowedReviewEvents: []reviewer.ReviewEvent{reviewer.ReviewEventApprove}, AuthorLogin: "reviewer-bot", AllowCleanComment: true})
 	if err != nil {
 		t.Fatalf("FindReviewMarker() error = %v", err)
 	}

@@ -455,12 +455,25 @@ func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr for
 	return forgeIdentityLogins(requested), forgeNetworkPolicyUsers(requested), objects, decision, nil
 }
 
-func forgejoSummaryCommentMode(cfg *config.Config, cwd string) bool {
+func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
 	if cfg == nil {
 		return false
 	}
 	project, matched, err := projectForCWD(*cfg, cwd)
-	if err != nil || !matched || config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+	if err != nil {
+		return false
+	}
+	if !matched {
+		repo = strings.TrimSpace(repo)
+		for _, candidate := range cfg.Projects {
+			if strings.EqualFold(strings.TrimSpace(candidate.Repo), repo) {
+				project = candidate
+				matched = true
+				break
+			}
+		}
+	}
+	if !matched || config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
 		return false
 	}
 	return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
@@ -836,7 +849,7 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.CWD))
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
 			if err != nil {
 				return nil, err
 			}
@@ -922,7 +935,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.CWD))
+		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
@@ -1021,7 +1034,7 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 		if err != nil {
 			return reviewer.ReviewMarkerResult{}, err
 		}
-		if forgejoSummaryCommentMode(a.config, input.CWD) {
+		if forgejoSummaryCommentMode(a.config, input.Repo, input.CWD) {
 			comments, err := client.ListIssueComments(ctx, input.PRNumber)
 			if err != nil {
 				return reviewer.ReviewMarkerResult{}, err

@@ -68,7 +68,7 @@ func TestForgejoNativeReviewRequestDiscoveryAndPublicationContract(t *testing.T)
 	if _, err := client.CreatePullRequestReview(context.Background(), CreatePullRequestReviewInput{Number: 2, Event: "APPROVE", CommitID: "head-2", Body: "Looks good\n\n" + marker}); err != nil {
 		t.Fatalf("CreatePullRequestReview() error = %v", err)
 	}
-	if reviewPayload["event"] != "APPROVE" || reviewPayload["commit_id"] != "head-2" {
+	if reviewPayload["event"] != "APPROVED" || reviewPayload["commit_id"] != "head-2" {
 		t.Fatalf("review payload = %#v", reviewPayload)
 	}
 	listed, err := client.ListPullRequestReviews(context.Background(), 2)
