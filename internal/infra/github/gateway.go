@@ -1098,11 +1098,11 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 
 // listPullRequestAutomationComments keeps PR discovery independent of the size
 // of the full issue conversation. gh applies this projection to each page
-// before writing to the shell capture buffer, so only comments carrying a
-// Looper protocol marker cross that bounded boundary.
+// before writing to the shell capture buffer, so only comments consumed by the
+// fixer/reviewer protocols cross that bounded boundary.
 func (g *Gateway) listPullRequestAutomationComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	filter := `.[] | select((.body // "") | contains("looper:")) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	filter := `.[] | select((.body // "") | (contains("looper:forgejo-reviewer-summary") or contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused") or contains("looper:forgejo-fixer-summary"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
 	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)

@@ -480,10 +480,13 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 			if strings.Contains(args, "--slurp") {
 				t.Fatalf("comment command = %q, want page-wise projection without --slurp", args)
 			}
-			for _, required := range []string{`contains("looper:")`, "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+			for _, required := range []string{"looper:forgejo-reviewer-summary", "looper:fixer-round", "looper:conflict-notice", "looper:reviewer:automerge-refused", "looper:forgejo-fixer-summary", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
 				if !strings.Contains(args, required) {
 					t.Fatalf("comment command = %q, want projection %q", args, required)
 				}
+			}
+			if strings.Contains(args, `contains("looper:")`) || strings.Contains(args, "looper:stamp") {
+				t.Fatalf("comment command = %q, want only consumed protocol markers", args)
 			}
 			if options.MaxCapturedBytes != 0 {
 				t.Fatalf("MaxCapturedBytes = %d, want unchanged generic default", options.MaxCapturedBytes)
