@@ -28,9 +28,12 @@ func TestValidateTrustedReviewProxyArgv(t *testing.T) {
 		{name: "reject config after submit", argv: []string{"review", "submit", "acme/looper#1", "--config", "/tmp/cfg.json"}, allowed: allowed, wantErr: true},
 		{name: "reject db-path override", argv: []string{"--db-path", "/tmp/evil.sqlite", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
 		{name: "reject looper-path override", argv: []string{"--looper-path", "/tmp/evil", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
-		{name: "reject clean-review-event override", argv: []string{"review", "submit", "acme/looper#1", "--clean-review-event", "APPROVE"}, allowed: allowed, wantErr: true},
-		{name: "reject blocking-review-event override", argv: []string{"review", "submit", "acme/looper#1", "--blocking-review-event=COMMENT"}, allowed: allowed, wantErr: true},
+		// Local review-submit policy flags are prompted by the reviewer runner and
+		// must pass through the trusted proxy so agent publication can succeed.
+		{name: "allow clean-review-event local policy", argv: []string{"review", "submit", "acme/looper#1", "--event", "APPROVE", "--clean-review-event", "APPROVE", "--blocking-review-event", "COMMENT"}, allowed: allowed, wantErr: false},
+		{name: "allow blocking-review-event equals form", argv: []string{"review", "submit", "acme/looper#1", "--blocking-review-event=REQUEST_CHANGES", "--event", "REQUEST_CHANGES"}, allowed: allowed, wantErr: false},
 		{name: "reject global review-events-clean override", argv: []string{"--roles-reviewer-behavior-review-events-clean", "APPROVE", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
+		{name: "reject global reviewer-clean-review-event", argv: []string{"--reviewer-clean-review-event", "APPROVE", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
 		{name: "reject allow-auto-approve override", argv: []string{"--allow-auto-approve", "true", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
 		{name: "reject status", argv: []string{"status"}, allowed: allowed, wantErr: true},
 		{name: "reject review without submit", argv: []string{"review", "repair"}, allowed: allowed, wantErr: true},

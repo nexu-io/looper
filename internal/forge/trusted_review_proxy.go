@@ -168,9 +168,16 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 
 // trustedReviewProxyBlockedFlags are CLI overrides that must never be accepted
 // on the trusted review proxy. Config/tool/db path overrides can redirect
-// provider baseURL while the daemon still injects the real tokenEnv. Review
-// policy overrides can weaken the daemon-selected clean/blocking event policy
-// before the child validates the payload.
+// provider baseURL while the daemon still injects the real tokenEnv. Global
+// loadConfig review-policy flags can rewrite daemon config before the child
+// validates the payload.
+//
+// Intentionally NOT blocked: review-submit local `--clean-review-event` and
+// `--blocking-review-event`. buildReviewPromptWithInstructions tells agents to
+// pass those flags with the daemon-selected effective policy (including
+// loop-metadata overrides). Blocking them rejects the exact command Looper
+// asks the agent to run, so native review publication fails before the child.
+// Authority for event validation remains the child after argv is accepted.
 var trustedReviewProxyBlockedFlags = map[string]struct{}{
 	"config":                          {},
 	"db-path":                         {},
@@ -184,15 +191,12 @@ var trustedReviewProxyBlockedFlags = map[string]struct{}{
 	"gh-path":                         {},
 	"looper-path":                     {},
 	"osascript-path":                  {},
-	// Global loadConfig / review-policy overrides.
+	// Global loadConfig / review-policy overrides (not review-submit locals).
 	"allow-auto-approve":                             {},
 	"roles-reviewer-behavior-review-events-clean":    {},
 	"reviewer-clean-review-event":                    {},
 	"roles-reviewer-behavior-review-events-blocking": {},
 	"reviewer-blocking-review-event":                 {},
-	// review submit local policy flags (effectiveReviewSubmitPolicy).
-	"clean-review-event":    {},
-	"blocking-review-event": {},
 }
 
 func trustedReviewProxyFlagName(arg string) string {
@@ -212,10 +216,12 @@ func trustedReviewProxyFlagName(arg string) string {
 }
 
 func validateTrustedReviewProxyArgv(argv []string, allowedPRRef string) error {
-	// Reject config/tool/db and review-policy overrides anywhere in argv first so
-	// a compromised agent cannot redirect the daemon-injected provider token via
-	// --config, or weaken clean/blocking event policy before the child validates
-	// the payload, even after `review submit`.
+	// Reject config/tool/db and global review-policy overrides anywhere in argv
+	// first so a compromised agent cannot redirect the daemon-injected provider
+	// token via --config, or rewrite daemon loadConfig review-events before the
+	// child validates the payload, even after `review submit`. Local
+	// --clean-review-event / --blocking-review-event are allowed: they are the
+	// prompted effective-policy flags for review submit.
 	for _, arg := range argv {
 		if name := trustedReviewProxyFlagName(arg); name != "" {
 			if _, blocked := trustedReviewProxyBlockedFlags[name]; blocked {
