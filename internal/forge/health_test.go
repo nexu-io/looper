@@ -22,7 +22,7 @@ func TestProbeForgejoProviderReportsHealthAccessAndCapabilities(t *testing.T) {
 		case "/swagger.v1.json":
 			_, _ = w.Write([]byte(`{"paths":{` +
 				`"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}},` +
-				`"/repos/{owner}/{repo}/pulls/{index}/reviews":{"post":{}},` +
+				`"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},` +
 				`"/repos/{owner}/{repo}/pulls/comments/{id}/resolve":{"post":{}},` +
 				`"/repos/{owner}/{repo}/pulls/{index}/merge":{"post":{}},` +
 				`"/repos/{owner}/{repo}/hooks":{"post":{}}}}`))
@@ -53,6 +53,42 @@ func TestProbeForgejoProviderReportsHealthAccessAndCapabilities(t *testing.T) {
 	}
 	if len(health.Projects) != 1 || health.Projects[0].Access != AccessWritable {
 		t.Fatalf("projects = %#v", health.Projects)
+	}
+}
+
+func TestProbeForgejoProviderRequiresGetAndPostForNativeReviews(t *testing.T) {
+	t.Setenv("FORGEJO_HEALTH_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); r.URL.Path != "/api/v1/version" && got != "token secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		switch r.URL.Path {
+		case "/api/v1/version":
+			_, _ = w.Write([]byte(`{"version":"15.0.4+gitea-1.24.6"}`))
+		case "/swagger.v1.json":
+			// POST-only reviews must not mark nativeReviews observed/effective.
+			_, _ = w.Write([]byte(`{"paths":{` +
+				`"/repos/{owner}/{repo}/pulls/{index}/reviews":{"post":{}}}}`))
+		case "/api/v1/user":
+			_, _ = w.Write([]byte(`{"id":7,"login":"forge-bot"}`))
+		case "/api/v1/repos/acme/looper":
+			_, _ = w.Write([]byte(`{"permissions":{"pull":true,"push":true,"admin":false}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	health := ProbeForgejoProvider(context.Background(), forgejoProviderConfig(server.URL, "FORGEJO_HEALTH_TOKEN"), []ForgejoProbeProject{{ID: "looper", Repo: "acme/looper"}}, WithHTTPClient(server.Client()))
+	nativeReview := health.Capabilities["nativeReviews"]
+	if nativeReview.Configured != ProbeStateSupported {
+		t.Fatalf("nativeReviews.Configured = %s, want supported", nativeReview.Configured)
+	}
+	if nativeReview.Observed == ProbeStateSupported || nativeReview.Effective == ProbeStateSupported {
+		t.Fatalf("nativeReviews = %#v, want observed/effective unsupported when GET is missing", nativeReview)
+	}
+	if !nativeReview.Degraded {
+		t.Fatalf("nativeReviews.Degraded = false, want true when only POST is advertised")
 	}
 }
 

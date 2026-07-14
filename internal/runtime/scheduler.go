@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -205,24 +206,32 @@ func providerTrustedEnv(cfg config.Config) map[string]string {
 	return env
 }
 
-// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path. When
-// provider tokens are available, it installs a shim that injects
-// LOOPER_TRUSTED_ENV_FILE only into the real looper child. Agents receive the
-// shim path in prompts, never the trusted-env file path in their environment.
-func resolveTrustedLooperCLIPath(cfg config.Config, logger bootstrap.Logger) string {
+// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
+// Agents always receive the real configured looper path — never a secret-bearing
+// wrapper path. Provider tokens for `looper review submit` are supplied through
+// the daemon-side trusted review proxy socket (see installTrustedReviewProxy).
+func resolveTrustedLooperCLIPath(cfg config.Config) string {
+	return strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+}
+
+// installTrustedReviewProxy starts a daemon-side Unix socket that runs
+// `looper review submit` with provider tokens. Agents only receive the socket
+// path (not tokens or a secret wrapper path). cleanup stops the listener.
+func installTrustedReviewProxy(cfg config.Config, logger bootstrap.Logger) (sockPath string, cleanup func()) {
+	noop := func() {}
 	realLooper := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
 	trusted := providerTrustedEnv(cfg)
 	if realLooper == "" || len(trusted) == 0 {
-		return realLooper
+		return "", noop
 	}
-	wrapperPath, _, err := forge.WriteTrustedLooperWrapper(realLooper, trusted)
+	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trusted)
 	if err != nil {
 		if logger != nil {
-			logger.Warn("trusted looper wrapper install failed; agents will use the real looper path without provider token injection", map[string]any{"error": err.Error()})
+			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error()})
 		}
-		return realLooper
+		return "", noop
 	}
-	return wrapperPath
+	return path, stop
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
@@ -2590,14 +2599,23 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
 
-	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
+	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
+	trustedReviewSock, _ := installTrustedReviewProxy(cfg, logger)
+	agentEnv := cfg.Agent.Env
+	if trustedReviewSock != "" {
+		agentEnv = maps.Clone(cfg.Agent.Env)
+		if agentEnv == nil {
+			agentEnv = map[string]string{}
+		}
+		agentEnv[forge.TrustedReviewSockEnv] = trustedReviewSock
+	}
 
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
 			Vendor:              *cfg.Agent.Vendor,
 			Model:               cfg.Agent.Model,
 			Params:              cfg.Agent.Params,
-			Env:                 cfg.Agent.Env,
+			Env:                 agentEnv,
 			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 			// Env-gated (not a config field yet) so it stays zero-risk to the schema
 			// / parity fixtures until the codex --json path is proven end-to-end.

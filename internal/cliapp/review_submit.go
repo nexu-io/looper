@@ -25,6 +25,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// reviewSubmitProxyArgv returns the process argv after the program name for
+// trusted review-proxy forwarding.
+func reviewSubmitProxyArgv(osArgs []string) []string {
+	if len(osArgs) <= 1 {
+		return nil
+	}
+	return append([]string(nil), osArgs[1:]...)
+}
+
 type reviewSubmitPayload struct {
 	Body     string                `json:"body"`
 	Comments []reviewSubmitComment `json:"comments"`
@@ -359,6 +368,23 @@ func reviewSubmitCWDBelongsToProject(project config.ProjectRefConfig, cwd string
 }
 
 func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
+	// When a daemon-side trusted review proxy is configured, forward the full
+	// invocation there so provider tokens stay out of the agent process and out
+	// of any agent-visible wrapper path. The proxy child clears the socket env
+	// and re-enters this command with tokens injected.
+	if forge.TrustedReviewSockConfigured() {
+		raw, err := io.ReadAll(cmd.InOrStdin())
+		if err != nil {
+			return fmt.Errorf("read review payload from stdin: %w", err)
+		}
+		cwd, err := r.getwd()
+		if err != nil {
+			return fmt.Errorf("determine current working directory: %w", err)
+		}
+		argv := reviewSubmitProxyArgv(os.Args)
+		return forge.ProxyReviewSubmit(argv, raw, cwd)
+	}
+
 	repo, prNumber, err := parsePullRequestRef(args[0])
 	if err != nil {
 		return err

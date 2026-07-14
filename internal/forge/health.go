@@ -275,8 +275,10 @@ func forgejoCapabilityReports(paths map[string]map[string]json.RawMessage) map[s
 		"dependencies":         static.Dependencies,
 	}
 	observed := map[string]ProbeState{
-		"reviewRequests":       forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/requested_reviewers"),
-		"nativeReviews":        forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/reviews"),
+		"reviewRequests": forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/requested_reviewers"),
+		// Native review runs require list (GET) for discovery/marker verification
+		// and create (POST) for publication. Gate observed support on both.
+		"nativeReviews":        forgejoOpenAPISupportAll(paths, "/repos/{owner}/{repo}/pulls/{index}/reviews", http.MethodGet, http.MethodPost),
 		"reviewCommentResolve": forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/comments/{id}/resolve"),
 		"merge":                forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/merge"),
 		"webhooks":             forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/hooks"),
@@ -316,6 +318,29 @@ func forgejoOpenAPISupport(paths map[string]map[string]json.RawMessage, method, 
 		return ProbeStateUnsupported
 	}
 	return ProbeStateSupported
+}
+
+// forgejoOpenAPISupportAll requires every listed method on path to be present.
+// Unknown (missing OpenAPI document) wins over unsupported so callers can
+// distinguish "could not probe" from "probed and missing".
+func forgejoOpenAPISupportAll(paths map[string]map[string]json.RawMessage, path string, methods ...string) ProbeState {
+	if paths == nil {
+		return ProbeStateUnknown
+	}
+	if len(methods) == 0 {
+		return ProbeStateUnsupported
+	}
+	state := ProbeStateSupported
+	for _, method := range methods {
+		next := forgejoOpenAPISupport(paths, method, path)
+		if next == ProbeStateUnknown {
+			return ProbeStateUnknown
+		}
+		if next != ProbeStateSupported {
+			state = ProbeStateUnsupported
+		}
+	}
+	return state
 }
 
 func probeForgejoProject(ctx context.Context, client *http.Client, baseURL *url.URL, token string, project ForgejoProbeProject, capabilities map[string]CapabilityReport) ForgejoProjectHealth {

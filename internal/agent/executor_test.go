@@ -203,7 +203,21 @@ func TestBuildCommandEnvStripsTrustedEnvFilePath(t *testing.T) {
 		forge.TrustedEnvFileEnv: "/tmp/also-must-not-leak",
 	}))
 	if _, ok := env[forge.TrustedEnvFileEnv]; ok {
-		t.Fatalf("%s present in agent env; trusted tokens must use the looper shim channel", forge.TrustedEnvFileEnv)
+		t.Fatalf("%s present in agent env; trusted tokens must use the daemon review proxy, not an agent-readable env file", forge.TrustedEnvFileEnv)
+	}
+}
+
+func TestBuildCommandEnvAllowsTrustedReviewSock(t *testing.T) {
+	t.Setenv("PATH", "/safe/bin")
+	sock := "/tmp/looper-trusted-review.sock"
+	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{
+		forge.TrustedReviewSockEnv: sock,
+	}))
+	if got := env[forge.TrustedReviewSockEnv]; got != sock {
+		t.Fatalf("%s = %q, want capability socket path %q", forge.TrustedReviewSockEnv, got, sock)
+	}
+	if _, ok := env[forge.TrustedEnvFileEnv]; ok {
+		t.Fatalf("%s must not be present alongside the review proxy socket", forge.TrustedEnvFileEnv)
 	}
 }
 
