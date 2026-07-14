@@ -97,9 +97,11 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
-	// loopRetryLocks serializes retry (especially discard+retry) per loop so two
-	// concurrent operator retries cannot discard after another has already
-	// requeued/started work for the same loop.
+	// loopRetryLocks serializes per-loop queue rearm paths that can race with
+	// discard+retry: explicit retry, and start/unpause requeue via
+	// mutateLoopStatus(Running). Without this, /loops/{id}/start can enqueue
+	// between discard preflight and git reset, then the retry transaction
+	// conflicts after the worktree for the start-created item was already wiped.
 	loopRetryLocks sync.Map // loopID -> *sync.Mutex
 }
 
@@ -140,8 +142,9 @@ func NewHandler(context Context) *Handler {
 	}
 }
 
-// lockLoopRetry acquires a per-loop mutex for the duration of retryLoop so
-// destructive discard and requeue cannot interleave across concurrent requests.
+// lockLoopRetry acquires a per-loop mutex shared by retryLoop and start/requeue
+// (mutateLoopStatus → Running) so destructive discard cannot interleave with a
+// concurrent operator start that requeues from the latest failed item.
 func (h *Handler) lockLoopRetry(loopID string) func() {
 	value, _ := h.loopRetryLocks.LoadOrStore(loopID, &sync.Mutex{})
 	mu := value.(*sync.Mutex)
@@ -4539,6 +4542,14 @@ func (h *Handler) resolveLoop(ctx context.Context, selector string) (storage.Loo
 }
 
 func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status domain.LoopStatus) (loopResponse, error) {
+	// Running requeues from the latest failed/cancelled/manual_intervention item
+	// and can start replacement work. Share the per-loop retry lock so this cannot
+	// race discard+retry between preflight and destructive git reset.
+	if status == domain.LoopStatusRunning {
+		unlock := h.lockLoopRetry(loopID)
+		defer unlock()
+	}
+
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
@@ -5048,8 +5059,9 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	}
 	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
 
-	// Serialize per-loop retry so discard cannot race another retry's requeue or
-	// a scheduler-started run for the same loop between preflight and reset.
+	// Serialize per-loop retry with start/requeue so discard cannot race another
+	// retry or /loops/{id}/start that enqueues replacement work between preflight
+	// and reset (or a scheduler-started run for that replacement).
 	unlock := h.lockLoopRetry(loopID)
 	defer unlock()
 

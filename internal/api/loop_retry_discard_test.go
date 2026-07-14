@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
@@ -593,6 +595,153 @@ func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeOnUniqueLoopConflict(t *te
 	}
 	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "README.md")); got != "dirty tracked\n" {
 		t.Fatalf("README.md after unique conflict = %q, want preserved", got)
+	}
+}
+
+// TestHandlerLoopStartSharesRetryLockWithDiscard ensures /start requeue takes
+// the same per-loop mutex as discard+retry, so start cannot enqueue between
+// discard preflight and git reset (wiping the worktree for start-created work).
+func TestHandlerLoopStartSharesRetryLockWithDiscard(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_start_lock",
+		LoopID:    "loop_retry_discard_start_lock",
+		LoopSeq:   3122,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-start-lock",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// Hold the shared retry lock as if discard+retry is between preflight and reset.
+	unlock := h.lockLoopRetry(fixture.LoopID)
+
+	started := make(chan struct{})
+	finished := make(chan int, 1)
+	go func() {
+		close(started)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3122/start", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		finished <- recorder.Code
+	}()
+
+	<-started
+	select {
+	case code := <-finished:
+		unlock()
+		t.Fatalf("start completed while retry/discard lock held: status=%d", code)
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked on the shared lock — expected.
+	}
+
+	unlock()
+
+	select {
+	case code := <-finished:
+		if code != http.StatusOK {
+			t.Fatalf("start status after lock release = %d, want 200", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("start did not complete after retry/discard lock release")
+	}
+
+	// Start requeued from manual_intervention; dirty worktree must still exist
+	// because no discard ran (only start held the lock after release).
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after blocked start = %q, want preserved", got)
+	}
+	active, err := services.Repositories.Queue.FindActiveByLoopID(context.Background(), fixture.LoopID)
+	if err != nil {
+		t.Fatalf("FindActiveByLoopID() error = %v", err)
+	}
+	if active == nil || active.Status != "queued" || active.ID == fixture.FailedQueueID {
+		t.Fatalf("active queue after start = %#v, want new queued replacement", active)
+	}
+}
+
+// TestHandlerLoopRetryDiscardConflictsAfterStartSerializes verifies that when
+// start requeues first under the shared lock, a following discard+retry refuses
+// with conflict and does not wipe the worktree (the failure the race caused).
+func TestHandlerLoopRetryDiscardConflictsAfterStartSerializes(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_after_start",
+		LoopID:    "loop_retry_discard_after_start",
+		LoopSeq:   3123,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-after-start",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	startCode := make(chan int, 1)
+	retryCode := make(chan int, 1)
+	retryBody := make(chan string, 1)
+
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3123/start", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		startCode <- recorder.Code
+	}()
+	go func() {
+		defer wg.Done()
+		// Small delay so start is more likely to acquire the lock first; both
+		// orders are correct under serialization, but this path asserts the
+		// conflict+preserve-dirty outcome when start wins.
+		time.Sleep(20 * time.Millisecond)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3123/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		retryCode <- recorder.Code
+		retryBody <- recorder.Body.String()
+	}()
+	wg.Wait()
+
+	gotStart := <-startCode
+	gotRetry := <-retryCode
+	body := <-retryBody
+	if gotStart != http.StatusOK {
+		t.Fatalf("start status = %d, want 200", gotStart)
+	}
+
+	// Under shared lock, either order is valid:
+	// - start first → retry 409, dirty preserved
+	// - retry first → retry 200 (discarded), start 200 with active queue already present
+	switch gotRetry {
+	case http.StatusConflict:
+		if !strings.Contains(body, "while queue item") && !strings.Contains(body, "while a run is active") {
+			t.Fatalf("retry body = %s, want active queue/run conflict", body)
+		}
+		if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+			t.Fatalf("dirty.txt after conflicted discard retry = %q, want preserved", got)
+		}
+	case http.StatusOK:
+		if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); !os.IsNotExist(err) {
+			t.Fatalf("dirty.txt still present after successful discard retry: %v", err)
+		}
+	default:
+		t.Fatalf("retry status = %d, want 200 or 409; body=%s", gotRetry, body)
+	}
+
+	active, err := services.Repositories.Queue.FindActiveByLoopID(context.Background(), fixture.LoopID)
+	if err != nil {
+		t.Fatalf("FindActiveByLoopID() error = %v", err)
+	}
+	if active == nil || active.Status != "queued" {
+		t.Fatalf("active queue after serialized start/retry = %#v, want queued", active)
 	}
 }
 
