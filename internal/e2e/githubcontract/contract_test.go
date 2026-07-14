@@ -122,7 +122,7 @@ func TestInvariantFixerDiscoveryUsesBoundedIssueCommentProjection(t *testing.T) 
 			t.Fatalf("comment invocation = %v, want page-wise output without --slurp", argv)
 		}
 		filter := argv[len(argv)-1]
-		for _, required := range []string{"looper:forgejo-reviewer-summary", "looper:fixer-round", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+		for _, required := range []string{`contains("looper:")`, "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
 			if !strings.Contains(filter, required) {
 				t.Fatalf("comment projection = %q, want %q", filter, required)
 			}

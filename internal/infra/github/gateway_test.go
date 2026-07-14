@@ -480,7 +480,7 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 			if strings.Contains(args, "--slurp") {
 				t.Fatalf("comment command = %q, want page-wise projection without --slurp", args)
 			}
-			for _, required := range []string{"looper:forgejo-reviewer-summary", "looper:fixer-round", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+			for _, required := range []string{`contains("looper:")`, "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
 				if !strings.Contains(args, required) {
 					t.Fatalf("comment command = %q, want projection %q", args, required)
 				}
@@ -489,7 +489,10 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 				t.Fatalf("MaxCapturedBytes = %d, want unchanged generic default", options.MaxCapturedBytes)
 			}
 			return shell.Result{Stdout: "{\"id\":101,\"body\":\"<!-- looper:forgejo-reviewer-summary payload -->\",\"user\":{\"login\":\"reviewer\"}}\n" +
-				"{\"id\":202,\"body\":\"<!-- looper:fixer-round head=head-42 -->\",\"html_url\":\"https://example.test/pull/42#issuecomment-202\",\"user\":{\"login\":\"looper\"}}\n"}, nil
+				"{\"id\":202,\"body\":\"<!-- looper:fixer-round head=head-42 -->\",\"html_url\":\"https://example.test/pull/42#issuecomment-202\",\"user\":{\"login\":\"looper\"}}\n" +
+				"{\"id\":303,\"body\":\"<!-- looper:conflict-notice id=notice-1 -->\",\"user\":{\"login\":\"looper\"}}\n" +
+				"{\"id\":404,\"body\":\"<!-- looper:reviewer:automerge-refused -->\",\"user\":{\"login\":\"looper\"}}\n" +
+				"{\"id\":505,\"body\":\"<!-- looper:forgejo-fixer-summary payload -->\",\"user\":{\"login\":\"looper\"}}\n"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -501,8 +504,8 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 	if err != nil {
 		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
 	}
-	if len(detail.IssueComments) != 2 || detail.IssueComments[1].ID != 202 {
-		t.Fatalf("IssueComments = %#v, want projected marker comments from both pages", detail.IssueComments)
+	if len(detail.IssueComments) != 5 || detail.IssueComments[4].ID != 505 {
+		t.Fatalf("IssueComments = %#v, want all projected Looper marker comments", detail.IssueComments)
 	}
 }
 
