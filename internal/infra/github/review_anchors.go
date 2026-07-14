@@ -63,8 +63,11 @@ func (g *Gateway) BuildReviewAnchorIndex(ctx context.Context, input BuildReviewA
 		return localIndex, ReviewAnchorAuthorityLocalPathDiff, nil
 	}
 
+	// Never embed raw localErr: runGitForReviewAnchors can include full pathspecs after
+	// `git diff --`, and comments[].path may be secret-shaped (e.g. SERVICE_TOKEN=...).
+	localReason := sanitizeReviewAnchorLocalError(localErr)
 	if input.RemoteDiff == nil {
-		return nil, "", fmt.Errorf("%w: %v", ErrAnchorValidationUnavailable, localErr)
+		return nil, "", fmt.Errorf("%w: %s", ErrAnchorValidationUnavailable, localReason)
 	}
 	remoteDiff, remoteErr := input.RemoteDiff(ctx)
 	if remoteErr == nil {
@@ -73,9 +76,28 @@ func (g *Gateway) BuildReviewAnchorIndex(ctx context.Context, input BuildReviewA
 		return &parsed, ReviewAnchorAuthorityRemotePRDiff, nil
 	}
 	if errors.Is(remoteErr, ErrLocalCaptureTruncated) || errors.Is(remoteErr, ErrDiffTooLarge) {
-		return nil, "", fmt.Errorf("%w: remote PR diff unavailable (%s); local path authority failed: %v", ErrAnchorValidationUnavailable, remoteDiffAuthorityReason(remoteErr), localErr)
+		return nil, "", fmt.Errorf("%w: remote PR diff unavailable (%s); local path authority failed: %s", ErrAnchorValidationUnavailable, remoteDiffAuthorityReason(remoteErr), localReason)
 	}
-	return nil, "", fmt.Errorf("%w: remote PR diff failed: %v; local path authority failed: %v", ErrAnchorValidationUnavailable, remoteErr, localErr)
+	// Remote transport/message is also path-free: do not concatenate remoteErr text.
+	return nil, "", fmt.Errorf("%w: remote PR diff failed; local path authority failed: %s", ErrAnchorValidationUnavailable, localReason)
+}
+
+// sanitizeReviewAnchorLocalError maps local path-authority failures to path-free
+// reason codes suitable for returned errors and agent-facing diagnostics.
+func sanitizeReviewAnchorLocalError(err error) string {
+	if err == nil {
+		return "local_path_diff_failed"
+	}
+	switch {
+	case errors.Is(err, ErrLocalCaptureTruncated):
+		return DiffTruncationReasonLocalCapture
+	case errors.Is(err, ErrDiffTooLarge):
+		return DiffTruncationReasonGitHubTooLarge
+	case errors.Is(err, ErrReviewBaseHeadMismatch):
+		return "local_base_head_mismatch"
+	default:
+		return "local_path_diff_failed"
+	}
 }
 
 func remoteDiffAuthorityReason(err error) string {
@@ -170,6 +192,9 @@ func (g *Gateway) runGitForReviewAnchors(ctx context.Context, cwd string, args .
 	if err == nil {
 		return result, nil
 	}
+	// Summary omits pathspecs after "--" so secret-shaped comments[].path never
+	// appears in returned errors if a caller logs them before sanitization.
+	cmdSummary := reviewAnchorGitCommandSummary(args)
 	var commandErr *shell.CommandExecutionError
 	if errors.As(err, &commandErr) {
 		message := strings.TrimSpace(commandErr.Result.Stderr)
@@ -181,9 +206,29 @@ func (g *Gateway) runGitForReviewAnchors(ctx context.Context, cwd string, args .
 		}
 		formatted := *commandErr
 		formatted.Message = message
-		return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), &formatted)
+		return result, fmt.Errorf("git %s: %w", cmdSummary, &formatted)
 	}
-	return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	return result, fmt.Errorf("git %s: %w", cmdSummary, err)
+}
+
+// reviewAnchorGitCommandSummary formats git argv for errors without pathspecs.
+// Arguments after "--" are replaced with a count so path-shaped secrets cannot leak.
+func reviewAnchorGitCommandSummary(args []string) string {
+	if len(args) == 0 {
+		return "(no args)"
+	}
+	for i, arg := range args {
+		if arg != "--" {
+			continue
+		}
+		pathCount := len(args) - i - 1
+		prefix := strings.Join(args[:i+1], " ")
+		if pathCount <= 0 {
+			return prefix
+		}
+		return fmt.Sprintf("%s <%d paths>", prefix, pathCount)
+	}
+	return strings.Join(args, " ")
 }
 
 func uniqueReviewAnchorPaths(paths []string) []string {

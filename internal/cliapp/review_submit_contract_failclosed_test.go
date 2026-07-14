@@ -91,6 +91,10 @@ func TestReviewSubmitOrchestrationFailsClosedWhenRemoteOversizedAndLocalUnavaila
 	if !strings.Contains(err.Error(), "anchor") && !strings.Contains(stderr.String(), "anchor_validation_unavailable") {
 		t.Fatalf("error=%v stderr=%s, want anchor_validation_unavailable", err, stderr.String())
 	}
+	// Returned error must not wrap raw git argv with secret-shaped pathspecs.
+	if strings.Contains(err.Error(), secretPath) || strings.Contains(err.Error(), "SERVICE_TOKEN") {
+		t.Fatalf("returned error leaked secret-shaped path: %v", err)
+	}
 	// Authority failure never reaches SubmitReview content guard; diagnostics must redact paths.
 	if strings.Contains(stderr.String(), secretPath) {
 		t.Fatalf("stderr diagnostic echoed secret-shaped path: %s", stderr.String())

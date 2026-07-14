@@ -141,19 +141,22 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 	anchors, err := resolveReviewSubmitAnchors(cmd.Context(), gh, repo, prNumber, cwd, detail, payload.Comments)
 	if err != nil {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
-			if err := r.validateLatestReviewerReviewSubmitHold(cmd, gh, loaded.Config, repo, prNumber, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
+			// Body-only oversized/truncated fallback still must fail closed on base/head
+			// drift: hold-only refresh is not enough when commit_id was captured earlier.
+			if err := r.validateLatestReviewerReviewSubmitPublication(cmd, gh, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, getBoolFlag(cmd, "reviewer-manual"), getStringFlag(cmd, "reviewer-run-id"), cwd); err != nil {
 				return err
 			}
 			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
 		// Never reach SubmitReview's content guard on this path: redact paths and
-		// avoid echoing path-bearing git/remote errors (path may be secret-shaped).
+		// never return path-bearing git/remote errors (path may be secret-shaped).
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
 			Repo: repo, PRNumber: prNumber, Event: submissionEvent, CommitID: commitID, Payload: payload,
 			Error: githubinfra.AnchorValidationUnavailableReason, RedactPaths: true,
 			Extra: map[string]any{"reason": githubinfra.AnchorValidationUnavailableReason},
 		})
-		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", err)
+		// Retryable sentinel only — authority errors can embed `git diff ... -- <path>` argv.
+		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", githubinfra.ErrAnchorValidationUnavailable)
 	}
 
 	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))

@@ -500,6 +500,38 @@ func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
 	}
 }
 
+func TestValidateLatestReviewerReviewSubmitPublicationRejectsHeadAndBaseDrift(t *testing.T) {
+	t.Parallel()
+
+	runtime := &commandRuntime{}
+	cmd := &cobra.Command{}
+	base := strings.Repeat("b", 40)
+	head := strings.Repeat("c", 40)
+	gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
+		Number: 42, HeadSHA: strings.Repeat("d", 40), BaseSHA: base, Labels: nil,
+	}}
+
+	err := runtime.validateLatestReviewerReviewSubmitPublication(cmd, gh, config.Config{}, "acme/looper", 42, head, base, false, "", "/repo")
+	if err == nil || !strings.Contains(err.Error(), "expected head commit") {
+		t.Fatalf("publication validation error = %v, want head drift rejection", err)
+	}
+
+	gh = &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
+		Number: 42, HeadSHA: head, BaseSHA: strings.Repeat("e", 40), Labels: nil,
+	}}
+	err = runtime.validateLatestReviewerReviewSubmitPublication(cmd, gh, config.Config{}, "acme/looper", 42, head, base, false, "", "/repo")
+	if err == nil || !strings.Contains(err.Error(), "expected base commit") {
+		t.Fatalf("publication validation error = %v, want base drift rejection", err)
+	}
+
+	gh = &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{
+		Number: 42, HeadSHA: head, BaseSHA: base, Labels: nil,
+	}}
+	if err := runtime.validateLatestReviewerReviewSubmitPublication(cmd, gh, config.Config{}, "acme/looper", 42, head, base, false, "", "/repo"); err != nil {
+		t.Fatalf("publication validation error = %v, want nil when head/base match", err)
+	}
+}
+
 // Pre-gate validation (malformed marker / APPROVE-with-comments) never reaches
 // SubmitReview's content guard, so diagnostics must redact paths — a path may
 // itself be secret-shaped (SERVICE_TOKEN=...).

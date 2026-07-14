@@ -143,6 +143,74 @@ func TestBuildReviewAnchorIndexDoesNotParseTruncatedRemoteDiff(t *testing.T) {
 	}
 }
 
+func TestBuildReviewAnchorIndexRedactsPathspecsFromReturnedErrors(t *testing.T) {
+	t.Parallel()
+
+	secretPath := ":(SERVICE_TOKEN=secret-value-should-not-leak)"
+	baseSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	headSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	gateway := New(Options{
+		GHPath:  "gh",
+		GitPath: "git",
+		GitRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			// Succeed object verification so failure occurs on path-targeted diff argv.
+			if len(options.Args) >= 1 && options.Args[0] == "rev-parse" {
+				sha := baseSHA
+				for _, arg := range options.Args {
+					if strings.HasPrefix(arg, headSHA) {
+						sha = headSHA
+						break
+					}
+				}
+				return shell.Result{Stdout: sha + "\n"}, nil
+			}
+			// Simulate git rejecting a secret-shaped pathspec.
+			return shell.Result{ExitCode: 128, Stderr: "fatal: invalid pathspec"}, &shell.CommandExecutionError{
+				Message: "fatal: invalid pathspec",
+				Result:  shell.Result{ExitCode: 128, Stderr: "fatal: invalid pathspec"},
+			}
+		},
+	})
+	_, _, err := gateway.BuildReviewAnchorIndex(context.Background(), BuildReviewAnchorIndexInput{
+		CWD:     t.TempDir(),
+		BaseSHA: baseSHA,
+		HeadSHA: headSHA,
+		Paths:   []string{secretPath},
+		RemoteDiff: func(context.Context) (string, error) {
+			return "", ErrDiffTooLarge
+		},
+	})
+	if err == nil || !errors.Is(err, ErrAnchorValidationUnavailable) {
+		t.Fatalf("error = %v, want ErrAnchorValidationUnavailable", err)
+	}
+	if strings.Contains(err.Error(), secretPath) || strings.Contains(err.Error(), "SERVICE_TOKEN") {
+		t.Fatalf("error leaked secret-shaped pathspec: %v", err)
+	}
+	if !strings.Contains(err.Error(), DiffTruncationReasonGitHubTooLarge) {
+		t.Fatalf("error = %v, want github_diff_too_large reason", err)
+	}
+	if !strings.Contains(err.Error(), "local_path_diff_failed") {
+		t.Fatalf("error = %v, want sanitized local_path_diff_failed reason", err)
+	}
+}
+
+func TestReviewAnchorGitCommandSummaryOmitsPathspecs(t *testing.T) {
+	t.Parallel()
+
+	summary := reviewAnchorGitCommandSummary([]string{
+		"diff", "--no-ext-diff", "--no-color", "aaa...bbb", "--", ":(SERVICE_TOKEN=secret)",
+	})
+	if strings.Contains(summary, "SERVICE_TOKEN") || strings.Contains(summary, ":(") {
+		t.Fatalf("summary leaked pathspec: %q", summary)
+	}
+	if !strings.Contains(summary, "<1 paths>") {
+		t.Fatalf("summary = %q, want path count placeholder", summary)
+	}
+	if got := reviewAnchorGitCommandSummary([]string{"rev-parse", "--verify", "abc^{commit}"}); got != "rev-parse --verify abc^{commit}" {
+		t.Fatalf("rev-parse summary = %q", got)
+	}
+}
+
 func TestBuildReviewAnchorIndexSurfacesGitHubOversizedSeparately(t *testing.T) {
 	t.Parallel()
 
