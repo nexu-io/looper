@@ -548,7 +548,7 @@ func forgejoRemoteMatchesBaseURL(remote bootstrapOriginRemote, baseURL string) b
 	if strings.TrimPrefix(remoteHost, "www.") != providerHost {
 		return false
 	}
-	if remote.Scheme != "ssh" && remoteURL.Port() != parsed.Port() {
+	if remote.Scheme != "ssh" && forgejoURLPort(remote.Scheme, remoteURL.Port()) != forgejoURLPort(parsed.Scheme, parsed.Port()) {
 		return false
 	}
 	if remote.Scheme == "ssh" {
@@ -559,6 +559,26 @@ func forgejoRemoteMatchesBaseURL(remote bootstrapOriginRemote, baseURL string) b
 		return len(strings.Split(remote.Path, "/")) == 2
 	}
 	return strings.HasPrefix(remote.Path, basePath+"/") && len(strings.Split(strings.TrimPrefix(remote.Path, basePath+"/"), "/")) == 2
+}
+
+func forgejoURLPort(scheme, port string) string {
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		return ""
+	}
+	return port
+}
+
+func forgejoBaseURLsMatch(first, second string) bool {
+	firstURL, firstErr := url.Parse(first)
+	secondURL, secondErr := url.Parse(second)
+	if firstErr != nil || secondErr != nil || firstURL.User != nil || secondURL.User != nil {
+		return false
+	}
+	return strings.EqualFold(firstURL.Scheme, secondURL.Scheme) &&
+		strings.EqualFold(firstURL.Hostname(), secondURL.Hostname()) &&
+		forgejoURLPort(strings.ToLower(firstURL.Scheme), firstURL.Port()) == forgejoURLPort(strings.ToLower(secondURL.Scheme), secondURL.Port()) &&
+		strings.TrimRight(firstURL.Path, "/") == strings.TrimRight(secondURL.Path, "/") &&
+		firstURL.RawQuery == secondURL.RawQuery && firstURL.Fragment == secondURL.Fragment
 }
 
 // detectBootstrapOriginRepo best-effort resolves owner/repo from the git origin
@@ -793,18 +813,25 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 		return false, false, nil
 	}
 	if plan.Provider == bootstrapProviderForgejo {
+		providerExists := false
 		for _, provider := range normalized.Providers {
 			if provider.ID == plan.ForgejoProviderID {
-				return false, false, fmt.Errorf("provider id %q already exists; choose a different --forgejo-provider-id", plan.ForgejoProviderID)
+				providerExists = true
+				if provider.Kind != config.ProviderKindForgejo || !forgejoBaseURLsMatch(provider.BaseURL, plan.ForgejoURL) || provider.TokenEnv == nil || *provider.TokenEnv != plan.ForgejoTokenEnv {
+					return false, false, fmt.Errorf("provider id %q already exists with different settings; choose a different --forgejo-provider-id", plan.ForgejoProviderID)
+				}
+				break
 			}
 		}
-		providers := []config.PartialProviderConfig{}
-		if partial.Providers != nil {
-			providers = append(providers, (*partial.Providers)...)
+		if !providerExists {
+			providers := []config.PartialProviderConfig{}
+			if partial.Providers != nil {
+				providers = append(providers, (*partial.Providers)...)
+			}
+			kind := config.ProviderKindForgejo
+			providers = append(providers, config.PartialProviderConfig{ID: plan.ForgejoProviderID, Kind: &kind, BaseURL: stringPtr(plan.ForgejoURL), TokenEnv: stringPtr(plan.ForgejoTokenEnv)})
+			partial.Providers = &providers
 		}
-		kind := config.ProviderKindForgejo
-		providers = append(providers, config.PartialProviderConfig{ID: plan.ForgejoProviderID, Kind: &kind, BaseURL: stringPtr(plan.ForgejoURL), TokenEnv: stringPtr(plan.ForgejoTokenEnv)})
-		partial.Providers = &providers
 	}
 	projects := []config.PartialProjectRefConfig{}
 	if partial.Projects != nil {
