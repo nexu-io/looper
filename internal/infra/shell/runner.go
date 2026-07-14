@@ -2,6 +2,7 @@ package shell
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,10 @@ import (
 const (
 	defaultMaxOutputBytes = 256 * 1024
 	defaultGracefulStop   = 5 * time.Second
+	// startAttempts covers transient Linux ETXTBSY after a binary/script is
+	// installed (common when tests write a fake tool then exec it immediately).
+	startAttempts      = 8
+	startRetryBaseWait = 5 * time.Millisecond
 )
 
 type Result struct {
@@ -60,21 +65,11 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		gracefulShutdown = defaultGracefulStop
 	}
 
-	cmd := exec.Command(options.Command, options.Args...)
-	cmd.Dir = options.CWD
-	if len(options.Env) > 0 {
-		cmd.Env = envSlice(options.Env)
-	}
-	if options.Stdin != "" {
-		cmd.Stdin = strings.NewReader(options.Stdin)
-	}
-
 	stdoutBuffer := newBoundedBuffer(maxCapturedBytes)
 	stderrBuffer := newBoundedBuffer(maxCapturedBytes)
-	cmd.Stdout = stdoutBuffer
-	cmd.Stderr = stderrBuffer
 
-	if err := cmd.Start(); err != nil {
+	cmd, err := startCommand(ctx, options, stdoutBuffer, stderrBuffer)
+	if err != nil {
 		return Result{}, fmt.Errorf("start command: %w", err)
 	}
 
@@ -161,6 +156,51 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	return result, nil
 }
 
+func startCommand(ctx context.Context, options Options, stdout, stderr *boundedBuffer) (*exec.Cmd, error) {
+	var lastErr error
+	for attempt := 0; attempt < startAttempts; attempt++ {
+		if attempt > 0 {
+			wait := startRetryBaseWait * time.Duration(attempt)
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		cmd := exec.Command(options.Command, options.Args...)
+		cmd.Dir = options.CWD
+		if len(options.Env) > 0 {
+			cmd.Env = envSlice(options.Env)
+		}
+		if options.Stdin != "" {
+			cmd.Stdin = strings.NewReader(options.Stdin)
+		}
+		// Fresh buffers each attempt: Start never ran on failure, but reset
+		// so a partial Write cannot leak across retries if that ever changes.
+		stdout.reset()
+		stderr.reset()
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+
+		if err := cmd.Start(); err != nil {
+			lastErr = err
+			if isTextFileBusy(err) {
+				continue
+			}
+			return nil, err
+		}
+		return cmd, nil
+	}
+	return nil, lastErr
+}
+
+func isTextFileBusy(err error) bool {
+	return errors.Is(err, syscall.ETXTBSY)
+}
+
 func commandFailureMessage(result Result) string {
 	message := fmt.Sprintf("Command exited with code %d", result.ExitCode)
 	stderr := strings.TrimSpace(result.Stderr)
@@ -233,6 +273,13 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	}
 	b.data = append(b.data, p...)
 	return originalLen, nil
+}
+
+func (b *boundedBuffer) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.data = b.data[:0]
+	b.truncated = false
 }
 
 func (b *boundedBuffer) String() string {
