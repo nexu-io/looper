@@ -300,10 +300,12 @@ func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.
 // is label-triggered, also applies discovery trigger labels so reviewer
 // auto-discovery still matches. If native request fails but labels are
 // configured, labels alone keep compatibility instances working.
-// When native request succeeds, label application is best-effort: a missing or
-// transient label failure must not fail the handoff, because requested_reviewers
-// already makes the PR discoverable. Label failure remains fatal only as the
-// fallback path after native request failure.
+// When native request succeeds on a native-request-triggered project
+// (requireReviewRequest=true), label application is best-effort because
+// requested_reviewers already makes the PR discoverable. Label failure remains
+// fatal for label-triggered projects (requireReviewRequest=false with trigger
+// labels): discovery still filters by labels, so a missing label would leave
+// the handoff permanently undiscoverable if publish marked it done.
 func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoClient, cfg *config.Config, repo string, prNumber int64, reviewers []string, cwd string) error {
 	labels := forgejoReviewerDiscoveryLabelsForRepo(cfg, repo, cwd)
 	nativeErr := client.AddPullRequestReviewers(ctx, prNumber, reviewers)
@@ -315,12 +317,55 @@ func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoCl
 			if nativeErr != nil {
 				return fmt.Errorf("forgejo native review request failed (%v); label fallback also failed: %w", nativeErr, err)
 			}
-			// Native request already succeeded; keep label errors non-fatal so
-			// planner/worker publish does not retry a PR that is already assigned.
-			return nil
+			// Native request already succeeded. Only native-request-triggered
+			// discovery can treat labels as best-effort; label-triggered
+			// projects must keep the handoff retryable until labels land.
+			if forgejoReviewerRequireReviewRequestForRepo(cfg, repo, cwd) {
+				return nil
+			}
+			return err
 		}
 	}
 	return nil
+}
+
+// forgejoReviewerRequireReviewRequestForRepo reports whether reviewer discovery
+// for the matched Forgejo project requires a native review request. Defaults to
+// true when no unique project match exists (labels are also empty in that case).
+func forgejoReviewerRequireReviewRequestForRepo(cfg *config.Config, repo, cwd string) bool {
+	if cfg == nil {
+		return true
+	}
+	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return true
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerRequireReviewRequestForProject(*cfg, *matched)
+	}
+	return true
+}
+
+func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project config.ProjectRefConfig) bool {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return true
+	}
+	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
 }
 
 func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {

@@ -3084,6 +3084,21 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
+		// Mirror the clean-noop path: recheck review request before publishing
+		// a summary_comment review so a request removed mid-run cannot still
+		// create/update the top-level Reviewer Summary.
+		policy := r.discoveryPolicyForProject(input.Project.ID)
+		requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
+		if requireReviewRequest {
+			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
+			if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
+				return checkpoint, nil
+			}
+		}
 		if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 			return checkpoint, err
 		}
