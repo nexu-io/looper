@@ -108,6 +108,7 @@ type loopDiagnosticRun struct {
 	LastCompletedStep   *string `json:"lastCompletedStep,omitempty"`
 	Summary             *string `json:"summary,omitempty"`
 	ErrorMessage        *string `json:"errorMessage,omitempty"`
+	ResumePolicy        *string `json:"resumePolicy,omitempty"`
 	StartedAt           string  `json:"startedAt"`
 	LastHeartbeatAt     *string `json:"lastHeartbeatAt,omitempty"`
 	EndedAt             *string `json:"endedAt,omitempty"`
@@ -235,14 +236,14 @@ func (r *commandRuntime) loopFailures(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
-			if !includeLoopInFailures(loop, queueItem) {
-				continue
-			}
 			run, err := repos.Runs.GetLatestByLoopID(cmd.Context(), loop.ID)
 			if err != nil {
 				return err
 			}
-			item, err := buildLoopInspectOutput(cmd.Context(), repos, fmt.Sprintf("%d", loop.Seq), loopSelectorResult{Loop: loop, Run: run, SelectorKind: "loop"}, now)
+			if !includeLoopInFailures(loop, queueItem, run) {
+				continue
+			}
+			item, err := buildLoopInspectOutput(cmd.Context(), repos, fmt.Sprintf("%d", loop.Seq), loopSelectorResult{Loop: loop, Run: run, SelectorKind: "loopId"}, now)
 			if err != nil {
 				return err
 			}
@@ -364,6 +365,10 @@ func buildLoopInspectOutput(ctx context.Context, repos *storage.Repositories, se
 		return loopInspectOutput{}, err
 	}
 
+	// When the operator selected a historical run, do not let the loop's latest
+	// queue item rewrite that run's failure class/kind. Still surface the latest
+	// queue item as current loop state in LatestQueueItem.
+	associateQueueWithDiagnosis := resolved.SelectorKind != "runId"
 	output := loopInspectOutput{
 		NowISO:          eventlog.FormatJavaScriptISOString(now),
 		Selector:        selector,
@@ -371,7 +376,7 @@ func buildLoopInspectOutput(ctx context.Context, repos *storage.Repositories, se
 		Loop:            diagnosticLoopOutput(resolved.Loop),
 		Metadata:        metadata,
 		LatestQueueItem: queueOutput,
-		Diagnosis:       diagnoseLoop(resolved.Loop, resolved.Run, queueItem, metadata),
+		Diagnosis:       diagnoseLoop(resolved.Loop, resolved.Run, queueItem, metadata, associateQueueWithDiagnosis),
 	}
 	if resolved.Run != nil {
 		run := diagnosticRunOutput(*resolved.Run, now)
@@ -384,14 +389,31 @@ func buildLoopInspectOutput(ctx context.Context, repos *storage.Repositories, se
 	return output, nil
 }
 
-func includeLoopInFailures(loop storage.LoopRecord, queueItem *storage.QueueItemRecord) bool {
+func includeLoopInFailures(loop storage.LoopRecord, queueItem *storage.QueueItemRecord, run *storage.RunRecord) bool {
 	if loop.Status == "failed" {
 		return true
 	}
-	if loop.Status != "paused" || queueItem == nil {
+	if loop.Status != "paused" {
 		return false
 	}
-	return queueItem.Status == "manual_intervention"
+	if isManualInterventionQueueItem(queueItem) {
+		return true
+	}
+	policy := resumePolicyFromCheckpoint(nil)
+	if run != nil {
+		policy = resumePolicyFromCheckpoint(run.CheckpointJSON)
+	}
+	return policy != nil && *policy == "manual_intervention"
+}
+
+func isManualInterventionQueueItem(item *storage.QueueItemRecord) bool {
+	if item == nil {
+		return false
+	}
+	if item.Status == "manual_intervention" {
+		return true
+	}
+	return item.LastErrorKind != nil && strings.TrimSpace(*item.LastErrorKind) == "manual_intervention"
 }
 
 func parseLoopDiagnosticMetadata(raw *string) loopDiagnosticMetadata {
@@ -466,6 +488,7 @@ func diagnosticRunOutput(run storage.RunRecord, now time.Time) loopDiagnosticRun
 		LastCompletedStep: run.LastCompletedStep,
 		Summary:           run.Summary,
 		ErrorMessage:      run.ErrorMessage,
+		ResumePolicy:      resumePolicyFromCheckpoint(run.CheckpointJSON),
 		StartedAt:         run.StartedAt,
 		LastHeartbeatAt:   run.LastHeartbeatAt,
 		EndedAt:           run.EndedAt,
@@ -481,6 +504,23 @@ func diagnosticRunOutput(run storage.RunRecord, now time.Time) loopDiagnosticRun
 		output.HeartbeatAgeSeconds = elapsedSecondsPtr(*run.LastHeartbeatAt, eventlog.FormatJavaScriptISOString(now))
 	}
 	return output
+}
+
+func resumePolicyFromCheckpoint(checkpointJSON *string) *string {
+	if checkpointJSON == nil || strings.TrimSpace(*checkpointJSON) == "" {
+		return nil
+	}
+	var doc struct {
+		ResumePolicy string `json:"resumePolicy"`
+	}
+	if err := json.Unmarshal([]byte(*checkpointJSON), &doc); err != nil {
+		return nil
+	}
+	policy := strings.TrimSpace(doc.ResumePolicy)
+	if policy == "" {
+		return nil
+	}
+	return &policy
 }
 
 func diagnosticAgentOutput(agent storage.AgentExecutionRecord, now time.Time) loopDiagnosticAgent {
@@ -510,10 +550,17 @@ func diagnosticAgentOutput(agent storage.AgentExecutionRecord, now time.Time) lo
 	return output
 }
 
-func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storage.QueueItemRecord, metadata loopDiagnosticMetadata) loopDiagnosis {
+func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storage.QueueItemRecord, metadata loopDiagnosticMetadata, associateQueue bool) loopDiagnosis {
 	state := loop.Status
-	message, source := loopDiagnosticMessage(run, queue, metadata)
-	diagnosis := classifyDiagnosticMessage(message, queueErrorKind(queue))
+	var diagnosisQueue *storage.QueueItemRecord
+	if associateQueue {
+		diagnosisQueue = queue
+	}
+	message, source := loopDiagnosticMessage(run, diagnosisQueue, metadata)
+	// FailureClass/Retryable come from the structured error kind + message.
+	// Queue status "manual_intervention" is an operator-hold signal, not the
+	// underlying failure class — keep them separate.
+	diagnosis := classifyDiagnosticMessage(message, queueErrorKind(diagnosisQueue))
 	diagnosis.State = state
 	diagnosis.Source = source
 	if diagnosis.Message == "" {
@@ -526,6 +573,8 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 }
 
 func diagnoseQueueItem(item storage.QueueItemRecord) loopDiagnosis {
+	// Preserve LastErrorKind as the failure cause. Queue status remains in
+	// diagnosis.State so operators can see a parked manual hold separately.
 	diagnosis := classifyDiagnosticMessage(diagnosticString(item.LastError), diagnosticString(item.LastErrorKind))
 	diagnosis.State = item.Status
 	diagnosis.Source = "queueItem"
@@ -561,6 +610,15 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 	kind := strings.ToLower(strings.TrimSpace(errorKind))
 	if msg == "" && kind == "" {
 		return loopDiagnosis{}
+	}
+	if kind == "manual_intervention" {
+		retryable := false
+		return loopDiagnosis{
+			FailureClass:      "manual_intervention",
+			Retryable:         &retryable,
+			Message:           msg,
+			RecommendedAction: recommendedActionForManualIntervention(msg),
+		}
 	}
 	if strings.Contains(lower, "could not resolve to a pullrequest") {
 		retryable := false
@@ -640,12 +698,29 @@ func isTerminalGitHubDenial(message string) bool {
 	return false
 }
 
+func recommendedActionForManualIntervention(message string) string {
+	lower := strings.ToLower(message)
+	// Match the narrower dirty-worktree classifier used by failureclass.
+	if strings.Contains(lower, "dirty worktree") || strings.Contains(lower, "worktree is dirty") || strings.Contains(lower, "uncommitted changes") {
+		return "fix or discard local worktree changes, then looper retry <seq>"
+	}
+	if strings.Contains(lower, "worktree is locked") {
+		return "unlock or remove the locked worktree, then looper retry <seq>"
+	}
+	if strings.Contains(lower, "worktree") {
+		return "inspect the worktree path/state, then looper retry <seq>"
+	}
+	return "resolve the blocker, then looper retry <seq>"
+}
+
 func recommendedActionForState(state string) string {
 	switch state {
 	case "running":
 		return "monitor active run progress"
 	case "waiting":
 		return "no immediate action; loop is waiting for follow-up work"
+	case "paused":
+		return "use looper unpause <seq> if intentionally paused; otherwise looper describe <seq>"
 	case "failed":
 		return "inspect failure fields before requeueing"
 	case "terminated", "completed", "stopped":
@@ -653,6 +728,26 @@ func recommendedActionForState(state string) string {
 	default:
 		return "inspect loop details"
 	}
+}
+
+func formatActionWithSeq(action string, seq int64) string {
+	return strings.ReplaceAll(action, "<seq>", strconv.FormatInt(seq, 10))
+}
+
+func requiresOperatorHold(output loopInspectOutput) bool {
+	if output.Diagnosis.FailureClass == "manual_intervention" {
+		return true
+	}
+	if output.LatestQueueItem != nil && output.LatestQueueItem.Status == "manual_intervention" {
+		return true
+	}
+	if output.LatestQueueItem != nil && output.LatestQueueItem.LastErrorKind != nil && strings.TrimSpace(*output.LatestQueueItem.LastErrorKind) == "manual_intervention" {
+		return true
+	}
+	if output.Run != nil && output.Run.ResumePolicy != nil && strings.TrimSpace(*output.Run.ResumePolicy) == "manual_intervention" {
+		return true
+	}
+	return false
 }
 
 func queueErrorKind(queue *storage.QueueItemRecord) string {
@@ -692,8 +787,35 @@ func writeHumanLoopInspect(w io.Writer, output loopInspectOutput) error {
 				return err
 			}
 		}
+		if output.Run.ResumePolicy != nil && strings.TrimSpace(*output.Run.ResumePolicy) != "" {
+			if _, err := fmt.Fprintf(w, " · resumePolicy: %s", *output.Run.ResumePolicy); err != nil {
+				return err
+			}
+		}
 		if _, err := fmt.Fprintln(w); err != nil {
 			return err
+		}
+	}
+	queueError := ""
+	if output.LatestQueueItem != nil {
+		if _, err := fmt.Fprintf(w, "Queue %s · attempts %d/%d", output.LatestQueueItem.Status, output.LatestQueueItem.Attempts, output.LatestQueueItem.MaxAttempts); err != nil {
+			return err
+		}
+		if output.LatestQueueItem.LastErrorKind != nil && strings.TrimSpace(*output.LatestQueueItem.LastErrorKind) != "" {
+			if _, err := fmt.Fprintf(w, " · kind %s", *output.LatestQueueItem.LastErrorKind); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintln(w); err != nil {
+			return err
+		}
+		if output.LatestQueueItem.LastError != nil {
+			queueError = strings.TrimSpace(*output.LatestQueueItem.LastError)
+		}
+		if queueError != "" {
+			if _, err := fmt.Fprintf(w, "Error: %s\n", queueError); err != nil {
+				return err
+			}
 		}
 	}
 	if output.Agent != nil {
@@ -713,14 +835,20 @@ func writeHumanLoopInspect(w io.Writer, output loopInspectOutput) error {
 		if _, err := fmt.Fprintf(w, "Diagnosis: state=%s class=%s retryable=%s source=%s\n", output.Diagnosis.State, output.Diagnosis.FailureClass, humanBoolPtr(output.Diagnosis.Retryable), output.Diagnosis.Source); err != nil {
 			return err
 		}
-		if output.Diagnosis.Message != "" {
+		// Avoid printing the same failure text twice when queue Error already showed it.
+		if output.Diagnosis.Message != "" && strings.TrimSpace(output.Diagnosis.Message) != queueError {
 			if _, err := fmt.Fprintf(w, "Message: %s\n", output.Diagnosis.Message); err != nil {
 				return err
 			}
 		}
 	}
 	if output.Diagnosis.RecommendedAction != "" {
-		if _, err := fmt.Fprintf(w, "Action: %s\n", output.Diagnosis.RecommendedAction); err != nil {
+		if _, err := fmt.Fprintf(w, "Action: %s\n", formatActionWithSeq(output.Diagnosis.RecommendedAction, output.Loop.Seq)); err != nil {
+			return err
+		}
+	}
+	if requiresOperatorHold(output) {
+		if _, err := fmt.Fprintf(w, "Next: after resolving the blocker, looper retry %d (see also looper logs %d)\n", output.Loop.Seq, output.Loop.Seq); err != nil {
 			return err
 		}
 	}

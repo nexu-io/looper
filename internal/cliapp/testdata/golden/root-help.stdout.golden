@@ -29,6 +29,7 @@ Subcommands:
   takeover   Continuously review and fix a pull request until it merges
   feedback   Submit feedback as a GitHub issue
   ps         Show running loops
+  describe   Show loop diagnostics detail
   jump       Print shell command for a loop worktree
   logs       Show logs for a loop
   pause      Pause a loop by sequence number

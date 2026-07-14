@@ -446,7 +446,8 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 47, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_resume", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	runError := "checkpoint hold: operator must inspect worktree"
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_resume", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, ErrorMessage: &runError, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 
@@ -466,6 +467,8 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	assertEqual(t, item["loopStatus"], "paused")
 	assertEqual(t, item["displayStatus"], "manual_intervention")
 	assertEqual(t, item["resumePolicy"], "manual_intervention")
+	// No queue item: reason falls back to the latest run error so `looper ps` can show it.
+	assertEqual(t, item["lastFailureReason"], runError)
 }
 
 func TestHandlerActiveRunsSurfacesBackingOffDisplayStatus(t *testing.T) {

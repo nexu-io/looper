@@ -486,6 +486,7 @@ looper loop start --type fixer --pr owner/repo#42
 
 ```bash
 looper ps
+looper describe 12
 looper logs 12 --follow
 looper jump 12
 looper stop 12
@@ -494,7 +495,8 @@ looper run reconcile-stale
 
 Typical usage:
 
-- `looper ps`: see which loops are currently running
+- `looper ps`: see which loops are currently running (includes a truncated failure reason when present)
+- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`
 - `looper logs <id> --follow`: stream logs live
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
 - `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output

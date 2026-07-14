@@ -614,10 +614,38 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 		if strings.TrimSpace(item.DisplayStatus) != "" {
 			status = item.DisplayStatus
 		}
-		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))})
+		reason := ""
+		if item.LastFailureReason != nil {
+			reason = truncateCLIText(*item.LastFailureReason, 48)
+		}
+		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt)), "reason": reason})
 	}
-	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age"}, rows)
+	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age", "reason"}, rows)
 	return nil
+}
+
+func truncateCLIText(value string, max int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if value == "" {
+		return ""
+	}
+	value = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return -1
+		}
+		return r
+	}, value)
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
 }
 
 func writeHumanRunReconcileStale(w io.Writer, payload json.RawMessage) error {

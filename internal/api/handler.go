@@ -2771,6 +2771,17 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 		view.LastFailureKind = latestQueue.LastErrorKind
 		view.LastFailureReason = latestQueue.LastError
 	}
+	// Fall back to the latest run error/summary when no queue error is present
+	// (e.g. checkpoint-only manual holds or failed runs without a parked queue item).
+	if view.LastFailureReason == nil || strings.TrimSpace(*view.LastFailureReason) == "" {
+		if latestRun != nil {
+			if latestRun.ErrorMessage != nil && strings.TrimSpace(*latestRun.ErrorMessage) != "" {
+				view.LastFailureReason = latestRun.ErrorMessage
+			} else if latestRun.Summary != nil && strings.TrimSpace(*latestRun.Summary) != "" {
+				view.LastFailureReason = latestRun.Summary
+			}
+		}
+	}
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
 	// Do not override a closed loop's status with manual_intervention: the loop
 	// is no longer actionable even if the latest queue item still has that status.
