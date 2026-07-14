@@ -1074,6 +1074,56 @@ func TestGatewayDiscardWorktreeChangesResetsTrackedAndUntracked(t *testing.T) {
 	}
 }
 
+func TestGatewayDiscardWorktreeChangesRemovesNestedRepositories(t *testing.T) {
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	ctx := context.Background()
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/fixer",
+		BaseBranch:   "main",
+		PRNumber:     42,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	// Tracked dirt so discard does real work (not the clean no-op path).
+	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "dirty tracked\n")
+
+	// Untracked nested Git checkout: single-force git clean -fd leaves these
+	// behind; double-force -ffd is required to remove them.
+	nestedPath := filepath.Join(worktree.WorktreePath, "vendor-checkout")
+	mustMkdirAll(t, nestedPath)
+	runGit(t, nestedPath, "init")
+	writeFile(t, filepath.Join(nestedPath, "nested.txt"), "nested repo content\n")
+	runGit(t, nestedPath, "add", "nested.txt")
+	runGit(t, nestedPath, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "nested")
+
+	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		WorktreePath: worktree.WorktreePath,
+	})
+	if err != nil {
+		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
+	}
+	if result.NoOp || !result.WasDirty {
+		t.Fatalf("DiscardWorktreeChanges() = %#v, want dirty discard including nested repo", result)
+	}
+	if _, err := os.Stat(nestedPath); !os.IsNotExist(err) {
+		t.Fatalf("nested repository still exists after discard: %v", err)
+	}
+	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil || !clean {
+		t.Fatalf("WorktreeClean() = %v, %v, want clean after nested-repo discard", clean, err)
+	}
+}
+
 func TestGatewayDiscardWorktreeChangesRejectsUnsafePaths(t *testing.T) {
 	fixture := newFixture(t)
 	fixture.createMainOnlyRepo(t)

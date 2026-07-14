@@ -564,7 +564,11 @@ func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorkt
 	if err := g.runGit(ctx, worktreePath, nil, "reset", "--hard", "HEAD"); err != nil {
 		return DiscardWorktreeChangesResult{}, err
 	}
-	if err := g.runGit(ctx, worktreePath, nil, "clean", "-fd"); err != nil {
+	// Double -f is required so git clean also removes nested repositories
+	// (untracked checkouts with their own .git). Single -f leaves those
+	// behind, which fails the post-clean cleanliness check after tracked
+	// edits were already discarded via reset --hard.
+	if err := g.runGit(ctx, worktreePath, nil, "clean", "-ffd"); err != nil {
 		return DiscardWorktreeChangesResult{}, err
 	}
 
