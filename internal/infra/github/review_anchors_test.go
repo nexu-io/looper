@@ -103,7 +103,7 @@ func TestBuildLocalPathAnchorIndexPassesLiteralPathspecs(t *testing.T) {
 	magicPath := ":(foo).txt"
 	var sawDiffArgs []string
 	gateway := New(Options{
-		GHPath: "gh",
+		GHPath:  "gh",
 		GitPath: "git",
 		GitRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
 			if len(options.Args) >= 1 && options.Args[0] == "rev-parse" {
