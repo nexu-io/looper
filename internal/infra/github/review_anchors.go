@@ -44,6 +44,12 @@ type BuildReviewAnchorIndexInput struct {
 func (g *Gateway) BuildReviewAnchorIndex(ctx context.Context, input BuildReviewAnchorIndexInput) (*diffanchor.Index, string, error) {
 	paths := uniqueReviewAnchorPaths(input.Paths)
 	if len(paths) == 0 {
+		// Callers that pass path slots (inline comments) but every path trims empty
+		// have no usable authority. Returning (nil, "", nil) would let
+		// normalizeReviewAnchors keep malformed inline comments without validation.
+		if len(input.Paths) > 0 {
+			return nil, "", fmt.Errorf("%w: inline comments require non-empty paths", ErrAnchorValidationUnavailable)
+		}
 		return nil, "", nil
 	}
 	baseSHA := strings.TrimSpace(input.BaseSHA)

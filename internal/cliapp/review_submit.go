@@ -146,8 +146,11 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 			}
 			return submitReviewWithoutAnchorValidation(cmd, gh, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
+		// Never reach SubmitReview's content guard on this path: redact paths and
+		// avoid echoing path-bearing git/remote errors (path may be secret-shaped).
 		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
-			Repo: repo, PRNumber: prNumber, Event: submissionEvent, CommitID: commitID, Payload: payload, Error: err.Error(),
+			Repo: repo, PRNumber: prNumber, Event: submissionEvent, CommitID: commitID, Payload: payload,
+			Error: githubinfra.AnchorValidationUnavailableReason, RedactPaths: true,
 			Extra: map[string]any{"reason": githubinfra.AnchorValidationUnavailableReason},
 		})
 		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", err)
