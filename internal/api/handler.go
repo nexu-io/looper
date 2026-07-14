@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -96,6 +97,10 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
+	// loopRetryLocks serializes retry (especially discard+retry) per loop so two
+	// concurrent operator retries cannot discard after another has already
+	// requeued/started work for the same loop.
+	loopRetryLocks sync.Map // loopID -> *sync.Mutex
 }
 
 func NewHandler(context Context) *Handler {
@@ -133,6 +138,15 @@ func NewHandler(context Context) *Handler {
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
 	}
+}
+
+// lockLoopRetry acquires a per-loop mutex for the duration of retryLoop so
+// destructive discard and requeue cannot interleave across concurrent requests.
+func (h *Handler) lockLoopRetry(loopID string) func() {
+	value, _ := h.loopRetryLocks.LoadOrStore(loopID, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -5033,6 +5047,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
 	}
 	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
+
+	// Serialize per-loop retry so discard cannot race another retry's requeue or
+	// a scheduler-started run for the same loop between preflight and reset.
+	unlock := h.lockLoopRetry(loopID)
+	defer unlock()
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())

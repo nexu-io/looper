@@ -96,6 +96,111 @@ func TestHandlerLoopRetryDiscardWorktreeChangesDirtyFixer(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryDiscardWorktreeChangesResolvesBranchOnlyCheckpoint(t *testing.T) {
+	// Worker dirty prepare leaves work.branch without checkpoint.worktree.
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_branch_only",
+		LoopID:    "loop_retry_discard_branch_only",
+		LoopSeq:   3119,
+		LoopType:  "worker",
+		Branch:    "feature/discard-branch-only",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// Overwrite the run checkpoint to mimic prepare-worktree dirty failure:
+	// work.branch present, worktree absent.
+	branchOnly := fmt.Sprintf(`{"work":{"branch":%q,"executionMode":"push-existing"}}`, "feature/discard-branch-only")
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_" + fixture.LoopID, LoopID: fixture.LoopID, Status: "failed", CheckpointJSON: &branchOnly,
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(branch-only) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3119/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	discard := data["worktreeDiscard"].(map[string]any)
+	assertEqual(t, discard["discarded"], true)
+	assertEqual(t, discard["reason"], "discarded")
+	assertEqual(t, discard["worktreePath"], fixture.WorktreePath)
+	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dirty.txt still present after branch-only discard: %v", err)
+	}
+}
+
+func TestHandlerLoopRetryDiscardWorktreeChangesResolvesDetailHeadRef(t *testing.T) {
+	// Fixer dirty prepare leaves detail.headRefName without checkpoint.worktree.
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_detail_head",
+		LoopID:    "loop_retry_discard_detail_head",
+		LoopSeq:   3120,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-detail-head",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	detailOnly := fmt.Sprintf(`{"detail":{"headRefName":%q,"state":"OPEN"},"pause":{"reason":"dirty_worktree"}}`, "feature/discard-detail-head")
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_" + fixture.LoopID, LoopID: fixture.LoopID, Status: "failed", CheckpointJSON: &detailOnly,
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(detail-only) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3120/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	discard := data["worktreeDiscard"].(map[string]any)
+	assertEqual(t, discard["discarded"], true)
+	assertEqual(t, discard["worktreePath"], fixture.WorktreePath)
+}
+
+func TestParseCheckpointWorktreeFallsBackToWorkBranchAndDetail(t *testing.T) {
+	t.Parallel()
+	workOnly := `{"work":{"branch":"feature/from-work"}}`
+	ref := parseCheckpointWorktree(&workOnly)
+	if ref == nil || ref.Branch != "feature/from-work" || ref.Path != "" {
+		t.Fatalf("work-only = %#v, want branch feature/from-work", ref)
+	}
+	detailOnly := `{"detail":{"headRefName":"feature/from-detail"}}`
+	ref = parseCheckpointWorktree(&detailOnly)
+	if ref == nil || ref.Branch != "feature/from-detail" {
+		t.Fatalf("detail-only = %#v, want branch feature/from-detail", ref)
+	}
+	worktreeWins := `{"worktree":{"branch":"feature/worktree","path":"/tmp/wt"},"work":{"branch":"feature/work"}}`
+	ref = parseCheckpointWorktree(&worktreeWins)
+	if ref == nil || ref.Branch != "feature/worktree" || ref.Path != "/tmp/wt" {
+		t.Fatalf("worktree preference = %#v", ref)
+	}
+	empty := `{"work":{},"detail":{}}`
+	if got := parseCheckpointWorktree(&empty); got != nil {
+		t.Fatalf("empty hints = %#v, want nil", got)
+	}
+}
+
 func TestHandlerLoopRetryDiscardWorktreeChangesAlreadyClean(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

@@ -32,8 +32,18 @@ type checkpointWorktreeRef struct {
 	Branch string `json:"branch,omitempty"`
 }
 
+// checkpointWithWorktree extracts worktree location hints from a run checkpoint.
+// When prepare-worktree fails on a dirty tree it often returns before writing
+// checkpoint.worktree, leaving only work.branch (worker) or detail.headRefName
+// (fixer). Those branch hints still resolve the managed worktree row.
 type checkpointWithWorktree struct {
 	Worktree *checkpointWorktreeRef `json:"worktree,omitempty"`
+	Work     *struct {
+		Branch string `json:"branch,omitempty"`
+	} `json:"work,omitempty"`
+	Detail *struct {
+		HeadRefName string `json:"headRefName,omitempty"`
+	} `json:"detail,omitempty"`
 }
 
 // discardLoopWorktreeChanges performs the operator opt-in dirty-worktree discard
@@ -139,7 +149,9 @@ func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services loope
 	if resolved.ID != "" {
 		payload["worktreeId"] = resolved.ID
 	}
-	if err := eventlog.Append(ctx, services.Repositories, eventlog.AppendInput{
+	// Audit is best-effort: git discard already succeeded, and retry must still
+	// requeue. A transient events write failure must not strand the operator.
+	_ = eventlog.Append(ctx, services.Repositories, eventlog.AppendInput{
 		EventType: "looper.worktree.changes_discarded",
 		ProjectID: &projectID,
 		LoopID:    &loopID,
@@ -147,13 +159,7 @@ func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services loope
 		ActorID:   stringPtrOrNil("cli"),
 		Payload:   payload,
 		CreatedAt: h.now().UTC(),
-	}); err != nil {
-		return worktreeDiscardResult{}, apiError{
-			code:    pkgapi.ErrorCodeInternalError,
-			status:  http.StatusInternalServerError,
-			message: fmt.Sprintf("Failed to record worktree discard event: %v", err),
-		}
-	}
+	})
 	return result, nil
 }
 
@@ -266,12 +272,23 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	if err := json.Unmarshal([]byte(*raw), &checkpoint); err != nil {
 		return nil
 	}
-	if checkpoint.Worktree == nil {
-		return nil
+	path := ""
+	branch := ""
+	id := ""
+	if checkpoint.Worktree != nil {
+		path = strings.TrimSpace(checkpoint.Worktree.Path)
+		branch = strings.TrimSpace(checkpoint.Worktree.Branch)
+		id = strings.TrimSpace(checkpoint.Worktree.ID)
 	}
-	path := strings.TrimSpace(checkpoint.Worktree.Path)
-	branch := strings.TrimSpace(checkpoint.Worktree.Branch)
-	id := strings.TrimSpace(checkpoint.Worktree.ID)
+	// Dirty prepare-worktree often aborts before checkpoint.worktree is set.
+	// Prefer an explicit worktree.branch, then worker work.branch, then fixer
+	// detail.headRefName so GetByBranch can still locate the managed row.
+	if branch == "" && checkpoint.Work != nil {
+		branch = strings.TrimSpace(checkpoint.Work.Branch)
+	}
+	if branch == "" && checkpoint.Detail != nil {
+		branch = strings.TrimSpace(checkpoint.Detail.HeadRefName)
+	}
 	if path == "" && branch == "" && id == "" {
 		return nil
 	}
