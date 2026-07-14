@@ -227,6 +227,28 @@ func TestReviewerAllowedPRRef(t *testing.T) {
 	}
 }
 
+func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
+	t.Parallel()
+	if reviewerAllowsTrustedReviewProxy(nil) {
+		t.Fatal("nil metadata allowed, want false")
+	}
+	if reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "thread_resolution"}) {
+		t.Fatal("thread_resolution allowed, want false")
+	}
+	if reviewerAllowsTrustedReviewProxy(map[string]any{"phase": ""}) {
+		t.Fatal("empty phase allowed, want false")
+	}
+	if !reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "review"}) {
+		t.Fatal("review phase not allowed, want true")
+	}
+	if !reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "publish"}) {
+		t.Fatal("publish phase not allowed, want true")
+	}
+	if !reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "REVIEW"}) {
+		t.Fatal("REVIEW phase not allowed, want true")
+	}
+}
+
 func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	workDir := t.TempDir()
 	scriptDir := t.TempDir()
@@ -262,7 +284,7 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
-		Metadata:         map[string]any{"repo": "acme/looper", "prNumber": int64(42)},
+		Metadata:         map[string]any{"phase": "review", "repo": "acme/looper", "prNumber": int64(42)},
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -283,12 +305,35 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 		t.Fatalf("child env dump = %q, want sock=set", string(data))
 	}
 
+	// Thread-resolution classifiers must not receive review-publish capability.
+	threadHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_thread_resolution",
+		WorkingDirectory: workDir,
+		Prompt:           "classify",
+		Timeout:          5 * time.Second,
+		Metadata:         map[string]any{"phase": "thread_resolution", "repo": "acme/looper", "prNumber": int64(42)},
+	})
+	if err != nil {
+		t.Fatalf("Start(thread_resolution) error = %v", err)
+	}
+	if _, err := threadHandle.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait(thread_resolution) error = %v", err)
+	}
+	data, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile after thread_resolution run error = %v", err)
+	}
+	if string(data) != "sock=\n" {
+		t.Fatalf("thread_resolution child env dump = %q, want empty sock", string(data))
+	}
+
 	// Without daemon-selected PR metadata, no review-publish capability is injected.
 	noPRHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_no_pr_meta",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
+		Metadata:         map[string]any{"phase": "review"},
 	})
 	if err != nil {
 		t.Fatalf("Start(no PR) error = %v", err)

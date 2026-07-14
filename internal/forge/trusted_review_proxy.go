@@ -55,7 +55,11 @@ func FormatTrustedReviewPRRef(repo string, prNumber int64) string {
 // allowedPRRef must be the daemon-selected pull request in owner/repo#N form.
 // The proxy rejects any review-submit argv that targets a different PR so a
 // prompt-injected agent cannot publish under tokens for another PR.
-func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef string) (sockPath string, cleanup func(), err error) {
+//
+// allowedCwd must be the daemon-selected working directory for that run. Child
+// processes always use this CWD; request-supplied cwd is ignored so a
+// compromised agent cannot retarget provider-qualified project resolution.
+func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	noop := func() {}
 	if realLooper == "" {
@@ -64,6 +68,10 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	normalizedAllowed, err := normalizeTrustedReviewPRRef(allowedPRRef)
 	if err != nil {
 		return "", nil, fmt.Errorf("trusted review proxy allowed PR: %w", err)
+	}
+	boundCwd, err := normalizeTrustedReviewCwd(allowedCwd)
+	if err != nil {
+		return "", nil, fmt.Errorf("trusted review proxy allowed CWD: %w", err)
 	}
 	if len(trustedEnv) == 0 {
 		return "", noop, nil
@@ -106,7 +114,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed)
+				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed, boundCwd)
 			}(conn)
 		}
 	}()
@@ -120,7 +128,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef string) {
+func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
@@ -136,9 +144,10 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 	}
 
 	cmd := exec.Command(realLooper, req.Argv...)
-	if strings.TrimSpace(req.Cwd) != "" {
-		cmd.Dir = req.Cwd
-	}
+	// Never honor request-supplied cwd: project/provider resolution for
+	// provider-qualified same-owner/repo checkouts is CWD-sensitive. The child
+	// always runs in the daemon-selected worktree bound at proxy start.
+	cmd.Dir = allowedCwd
 	cmd.Env = trustedReviewProxyChildEnv(trustedEnv)
 	cmd.Stdin = bytes.NewReader(req.Stdin)
 	var stdout, stderr bytes.Buffer
@@ -157,10 +166,11 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
-// trustedReviewProxyBlockedFlags are global CLI overrides that must never be
-// accepted on the trusted review proxy. A worktree-controlled --config (or tool
-// /db path override) can redirect provider baseURL while the daemon still injects
-// the real tokenEnv into the child.
+// trustedReviewProxyBlockedFlags are CLI overrides that must never be accepted
+// on the trusted review proxy. Config/tool/db path overrides can redirect
+// provider baseURL while the daemon still injects the real tokenEnv. Review
+// policy overrides can weaken the daemon-selected clean/blocking event policy
+// before the child validates the payload.
 var trustedReviewProxyBlockedFlags = map[string]struct{}{
 	"config":                          {},
 	"db-path":                         {},
@@ -174,6 +184,15 @@ var trustedReviewProxyBlockedFlags = map[string]struct{}{
 	"gh-path":                         {},
 	"looper-path":                     {},
 	"osascript-path":                  {},
+	// Global loadConfig / review-policy overrides.
+	"allow-auto-approve":                             {},
+	"roles-reviewer-behavior-review-events-clean":    {},
+	"reviewer-clean-review-event":                    {},
+	"roles-reviewer-behavior-review-events-blocking": {},
+	"reviewer-blocking-review-event":                 {},
+	// review submit local policy flags (effectiveReviewSubmitPolicy).
+	"clean-review-event":    {},
+	"blocking-review-event": {},
 }
 
 func trustedReviewProxyFlagName(arg string) string {
@@ -193,13 +212,14 @@ func trustedReviewProxyFlagName(arg string) string {
 }
 
 func validateTrustedReviewProxyArgv(argv []string, allowedPRRef string) error {
-	// Reject config/tool/db overrides anywhere in argv first so a compromised
-	// agent cannot redirect the daemon-injected provider token via --config or
-	// tool/db path flags, even after `review submit`.
+	// Reject config/tool/db and review-policy overrides anywhere in argv first so
+	// a compromised agent cannot redirect the daemon-injected provider token via
+	// --config, or weaken clean/blocking event policy before the child validates
+	// the payload, even after `review submit`.
 	for _, arg := range argv {
 		if name := trustedReviewProxyFlagName(arg); name != "" {
 			if _, blocked := trustedReviewProxyBlockedFlags[name]; blocked {
-				return fmt.Errorf("trusted review proxy rejects config/tool/db override flag %q", name)
+				return fmt.Errorf("trusted review proxy rejects config/review-policy override flag %q", name)
 			}
 		}
 	}
@@ -298,6 +318,21 @@ func matchTrustedReviewProxyPRRef(got, allowed string) error {
 		return fmt.Errorf("trusted review proxy rejects PR target %q; bound to %s", strings.TrimSpace(got), normalizedAllowed)
 	}
 	return nil
+}
+
+func normalizeTrustedReviewCwd(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("working directory is required")
+	}
+	cleaned := filepath.Clean(value)
+	if cleaned == "." || cleaned == "" {
+		return "", fmt.Errorf("working directory is required")
+	}
+	if !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("working directory must be absolute")
+	}
+	return cleaned, nil
 }
 
 func trustedReviewProxyChildEnv(trustedEnv map[string]string) []string {

@@ -28,6 +28,10 @@ func TestValidateTrustedReviewProxyArgv(t *testing.T) {
 		{name: "reject config after submit", argv: []string{"review", "submit", "acme/looper#1", "--config", "/tmp/cfg.json"}, allowed: allowed, wantErr: true},
 		{name: "reject db-path override", argv: []string{"--db-path", "/tmp/evil.sqlite", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
 		{name: "reject looper-path override", argv: []string{"--looper-path", "/tmp/evil", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
+		{name: "reject clean-review-event override", argv: []string{"review", "submit", "acme/looper#1", "--clean-review-event", "APPROVE"}, allowed: allowed, wantErr: true},
+		{name: "reject blocking-review-event override", argv: []string{"review", "submit", "acme/looper#1", "--blocking-review-event=COMMENT"}, allowed: allowed, wantErr: true},
+		{name: "reject global review-events-clean override", argv: []string{"--roles-reviewer-behavior-review-events-clean", "APPROVE", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
+		{name: "reject allow-auto-approve override", argv: []string{"--allow-auto-approve", "true", "review", "submit", "acme/looper#1"}, allowed: allowed, wantErr: true},
 		{name: "reject status", argv: []string{"status"}, allowed: allowed, wantErr: true},
 		{name: "reject review without submit", argv: []string{"review", "repair"}, allowed: allowed, wantErr: true},
 		{name: "reject empty", argv: nil, allowed: allowed, wantErr: true},
@@ -63,13 +67,14 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 	dir := t.TempDir()
 	realLooper := filepath.Join(dir, "real-looper")
 	outPath := filepath.Join(dir, "out.txt")
-	// Child records whether FORGEJO_TOKEN is set and must not see the proxy socket env.
-	script := "#!/bin/sh\nprintf 'token=%s sock=%s\\n' \"$FORGEJO_TOKEN\" \"$LOOPER_TRUSTED_REVIEW_SOCK\" > \"" + outPath + "\"\n"
+	// Child records token/socket env and leaves a marker in its process CWD so
+	// daemon-bound workdir is observable without relying on pwd symlink form.
+	script := "#!/bin/sh\ntouch ./proxy-child-ran\nprintf 'token=%s sock=%s\\n' \"$FORGEJO_TOKEN\" \"$LOOPER_TRUSTED_REVIEW_SOCK\" > \"" + outPath + "\"\n"
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1")
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -83,7 +88,8 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 	// Ensure the client process does not already hold the token.
 	t.Setenv("FORGEJO_TOKEN", "")
 
-	if err := ProxyReviewSubmit([]string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, []byte(`{"body":"x"}`), dir); err != nil {
+	// Request cwd is intentionally wrong; daemon-bound cwd must win.
+	if err := ProxyReviewSubmit([]string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, []byte(`{"body":"x"}`), filepath.Join(dir, "not-bound")); err != nil {
 		t.Fatalf("ProxyReviewSubmit() error = %v", err)
 	}
 	out, err := os.ReadFile(outPath)
@@ -97,6 +103,9 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 	if strings.Contains(got, "sock="+sockPath) || strings.Contains(got, "sock=/") {
 		t.Fatalf("proxy child output = %q, want empty LOOPER_TRUSTED_REVIEW_SOCK in child", got)
 	}
+	if _, err := os.Stat(filepath.Join(dir, "proxy-child-ran")); err != nil {
+		t.Fatalf("proxy child did not run in bound cwd %q: %v", dir, err)
+	}
 }
 
 func TestStartTrustedReviewProxyRejectsUnboundPR(t *testing.T) {
@@ -108,7 +117,7 @@ func TestStartTrustedReviewProxyRejectsUnboundPR(t *testing.T) {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1")
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -133,11 +142,17 @@ func TestStartTrustedReviewProxyRequiresAllowedPR(t *testing.T) {
 	if err := os.WriteFile(realLooper, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, ""); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "", dir); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with empty allowed PR = nil, want error")
 	}
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "not-a-ref"); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "not-a-ref", dir); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with invalid allowed PR = nil, want error")
+	}
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", ""); err == nil {
+		t.Fatal("StartTrustedReviewProxy() with empty allowed CWD = nil, want error")
+	}
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", "relative/path"); err == nil {
+		t.Fatal("StartTrustedReviewProxy() with relative allowed CWD = nil, want error")
 	}
 }
 

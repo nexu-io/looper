@@ -215,16 +215,18 @@ func resolveTrustedLooperCLIPath(cfg config.Config) string {
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
 // `looper review submit` with provider tokens, bound exclusively to allowedPRRef
-// (owner/repo#N). Agents only receive the socket path (not tokens). cleanup
-// stops the listener and must run when the agent execution ends.
-func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef string, logger bootstrap.Logger) (sockPath string, cleanup func()) {
+// (owner/repo#N) and allowedCwd (daemon-selected worktree). Agents only receive
+// the socket path (not tokens). cleanup stops the listener and must run when the
+// agent execution ends.
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, logger bootstrap.Logger) (sockPath string, cleanup func()) {
 	noop := func() {}
 	realLooper = strings.TrimSpace(realLooper)
 	allowedPRRef = strings.TrimSpace(allowedPRRef)
-	if realLooper == "" || len(trustedEnv) == 0 || allowedPRRef == "" {
+	allowedCwd = strings.TrimSpace(allowedCwd)
+	if realLooper == "" || len(trustedEnv) == 0 || allowedPRRef == "" || allowedCwd == "" {
 		return "", noop
 	}
-	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef)
+	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd)
 	if err != nil {
 		if logger != nil {
 			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error(), "allowedPR": allowedPRRef})
@@ -1640,6 +1642,23 @@ func reviewerTrustedReviewEnv(sock string) map[string]string {
 	return map[string]string{forge.TrustedReviewSockEnv: sock}
 }
 
+// reviewerAllowsTrustedReviewProxy reports whether this reviewer agent start is
+// in a phase that is authorized to publish reviews. Thread-resolution
+// classifiers share the reviewer adapter but must not receive a live review
+// submit socket.
+func reviewerAllowsTrustedReviewProxy(metadata map[string]any) bool {
+	if metadata == nil {
+		return false
+	}
+	phase, _ := metadata["phase"].(string)
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "review", "publish":
+		return true
+	default:
+		return false
+	}
+}
+
 // reviewerAllowedPRRef extracts the daemon-selected owner/repo#N from reviewer
 // agent metadata so the trusted review proxy can be bound to that PR only.
 func reviewerAllowedPRRef(metadata map[string]any) string {
@@ -1688,11 +1707,16 @@ func metadataInt64(value any) (int64, bool) {
 }
 
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
-	// Mint a per-run proxy bound to the daemon-selected PR. A shared unbound
-	// socket would let a prompt-injected agent retarget review submit to any
-	// configured Forgejo PR the bot is authorized to review.
-	allowedPR := reviewerAllowedPRRef(input.Metadata)
-	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, a.logger)
+	// Mint a per-run proxy only for review/publish phases, bound to the
+	// daemon-selected PR and worktree CWD. Thread-resolution classifiers reuse
+	// this adapter but must not receive review-publish capability.
+	allowedPR := ""
+	allowedCwd := ""
+	if reviewerAllowsTrustedReviewProxy(input.Metadata) {
+		allowedPR = reviewerAllowedPRRef(input.Metadata)
+		allowedCwd = strings.TrimSpace(input.WorkingDirectory)
+	}
+	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, a.logger)
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID:        input.ExecutionID,
 		ProjectID:          input.ProjectID,
