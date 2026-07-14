@@ -98,10 +98,11 @@ type Handler struct {
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
 	// loopRetryLocks serializes per-loop queue rearm paths that can race with
-	// discard+retry: explicit retry, and start/unpause requeue via
-	// mutateLoopStatus(Running). Without this, /loops/{id}/start can enqueue
+	// discard+retry: explicit retry, start/unpause requeue via
+	// mutateLoopStatus(Running), and issue-worker reuse via POST /workers
+	// (resumeReusableWorkerLoopCompat). Without this, those paths can enqueue
 	// between discard preflight and git reset, then the retry transaction
-	// conflicts after the worktree for the start-created item was already wiped.
+	// conflicts after the worktree for the newly queued item was already wiped.
 	loopRetryLocks sync.Map // loopID -> *sync.Mutex
 }
 
@@ -142,9 +143,10 @@ func NewHandler(context Context) *Handler {
 	}
 }
 
-// lockLoopRetry acquires a per-loop mutex shared by retryLoop and start/requeue
-// (mutateLoopStatus → Running) so destructive discard cannot interleave with a
-// concurrent operator start that requeues from the latest failed item.
+// lockLoopRetry acquires a per-loop mutex shared by retryLoop, start/requeue
+// (mutateLoopStatus → Running), and issue-worker reuse (POST /workers) so
+// destructive discard cannot interleave with a concurrent requeue that creates
+// replacement work between preflight and git reset.
 func (h *Handler) lockLoopRetry(loopID string) func() {
 	value, _ := h.loopRetryLocks.LoadOrStore(loopID, &sync.Mutex{})
 	mu := value.(*sync.Mutex)
@@ -3762,6 +3764,23 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 	metadataJSON := string(payloadJSONBytes)
 	reusedWorkerLoop := false
+
+	// Issue-worker reuse enqueues the existing loop (same as start requeue).
+	// Take the shared per-loop retry lock before the TX so discard+retry cannot
+	// wipe the managed worktree after reuse preflight/enqueue races in.
+	// Pre-scan is best-effort identity for the lock; the TX re-evaluates reuse.
+	if issueNumber != nil && requestedIssueTarget != nil {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: listErr.Error()}
+		}
+		if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			return workerCreateResponse{}, reuseErr
+		} else if ok {
+			unlock := h.lockLoopRetry(existingLoop.ID)
+			defer unlock()
+		}
+	}
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)

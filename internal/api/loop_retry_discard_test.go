@@ -598,6 +598,86 @@ func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeOnUniqueLoopConflict(t *te
 	}
 }
 
+// TestHandlerWorkersCreateReuseSharesRetryLockWithDiscard ensures POST /workers
+// issue-worker reuse takes the same per-loop mutex as discard+retry, so reuse
+// cannot enqueue between discard preflight and git reset (wiping the worktree
+// for the reuse-created queue item, then failing retry with active-queue conflict).
+func TestHandlerWorkersCreateReuseSharesRetryLockWithDiscard(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	baseBranch := "main"
+	metadata := `{"repo":"acme/looper"}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_retry_discard_worker_reuse", Name: "Looper", RepoPath: "/tmp/repos/looper",
+		BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	loopID := "loop_retry_discard_worker_reuse"
+	targetID := "issue:acme/looper:88"
+	repo := "acme/looper"
+	workerMeta := `{"worker":{"title":"Paused issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":88}}`
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 3124, ProjectID: "project_retry_discard_worker_reuse", Type: "worker",
+		TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "paused",
+		MetadataJSON: &workerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Hold the shared retry lock as if discard+retry is between preflight and reset.
+	unlock := h.lockLoopRetry(loopID)
+
+	started := make(chan struct{})
+	finished := make(chan int, 1)
+	go func() {
+		close(started)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", strings.NewReader(
+			`{"projectId":"project_retry_discard_worker_reuse","repo":"acme/looper","issueNumber":88,"baseBranch":"main"}`,
+		))
+		req.Header.Set("content-type", "application/json")
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		finished <- recorder.Code
+	}()
+
+	<-started
+	select {
+	case code := <-finished:
+		unlock()
+		t.Fatalf("worker reuse completed while retry/discard lock held: status=%d", code)
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked on the shared lock — expected.
+	}
+
+	unlock()
+
+	select {
+	case code := <-finished:
+		if code != http.StatusOK {
+			t.Fatalf("worker reuse status after lock release = %d, want 200", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker reuse did not complete after retry/discard lock release")
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop after reuse = %#v, %v, want queued", loop, err)
+	}
+	active, err := services.Repositories.Queue.FindActiveByLoopID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("FindActiveByLoopID() error = %v", err)
+	}
+	if active == nil || active.Status != "queued" {
+		t.Fatalf("active queue after worker reuse = %#v, want queued", active)
+	}
+}
+
 // TestHandlerLoopStartSharesRetryLockWithDiscard ensures /start requeue takes
 // the same per-loop mutex as discard+retry, so start cannot enqueue between
 // discard preflight and git reset (wiping the worktree for start-created work).
