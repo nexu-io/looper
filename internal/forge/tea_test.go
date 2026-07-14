@@ -250,6 +250,42 @@ func TestNewForgejoClientFromConfigTeaMissingBinary(t *testing.T) {
 	}
 }
 
+func TestListTeaLoginsAcceptsStringDefaultFromTea014(t *testing.T) {
+	// Homebrew tea 0.14.x emits "default":"true" (string), not a JSON bool.
+	// Regression: unmarshaling that form used to fail as tea_auth_failed.
+	runner := &recordingTeaRunner{
+		loginsJSON: `[
+  {
+    "name": "powerformer-code",
+    "url": "https://code.powerformer.net",
+    "ssh_host": "code.powerformer.net",
+    "user": "mrcfps",
+    "default": "true"
+  },
+  {
+    "name": "other",
+    "url": "https://other.example.com",
+    "ssh_host": "other.example.com",
+    "user": "bob",
+    "default": false
+  }
+]`,
+	}
+	logins, err := ListTeaLogins(context.Background(), "/usr/bin/fake-tea", runner)
+	if err != nil {
+		t.Fatalf("ListTeaLogins() error = %v", err)
+	}
+	if len(logins) != 2 {
+		t.Fatalf("len(logins) = %d, want 2", len(logins))
+	}
+	if logins[0].Name != "powerformer-code" || !logins[0].Default.Bool() {
+		t.Fatalf("logins[0] = %#v, want powerformer-code default=true", logins[0])
+	}
+	if logins[1].Name != "other" || logins[1].Default.Bool() {
+		t.Fatalf("logins[1] = %#v, want other default=false", logins[1])
+	}
+}
+
 func mustJSON(t *testing.T, value any) string {
 	t.Helper()
 	raw, err := json.Marshal(value)

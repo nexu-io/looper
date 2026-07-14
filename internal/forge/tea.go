@@ -52,14 +52,50 @@ const (
 
 // TeaLogin describes a tea CLI login entry from `tea logins list -o json`.
 // Tokens are never present in this output and must never be requested.
-// Default is a boolean in current tea versions (not a string).
+// Default accepts both JSON bool and string forms: tea 0.14.x emits
+// "default":"true", while some builds emit a real boolean.
 type TeaLogin struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	SSHHost string `json:"ssh_host"`
-	User    string `json:"user"`
-	Default bool   `json:"default"`
+	Name    string         `json:"name"`
+	URL     string         `json:"url"`
+	SSHHost string         `json:"ssh_host"`
+	User    string         `json:"user"`
+	Default teaDefaultFlag `json:"default"`
 }
+
+// teaDefaultFlag unmarshals tea's login "default" field, which is a bool in
+// some tea builds and a string ("true"/"false") in Homebrew tea 0.14.x.
+type teaDefaultFlag bool
+
+func (f *teaDefaultFlag) UnmarshalJSON(data []byte) error {
+	if f == nil {
+		return errors.New("teaDefaultFlag: nil receiver")
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*f = false
+		return nil
+	}
+	var asBool bool
+	if err := json.Unmarshal(trimmed, &asBool); err == nil {
+		*f = teaDefaultFlag(asBool)
+		return nil
+	}
+	var asString string
+	if err := json.Unmarshal(trimmed, &asString); err != nil {
+		return fmt.Errorf("tea login default: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(asString)) {
+	case "true", "1", "yes":
+		*f = true
+	case "false", "0", "no", "":
+		*f = false
+	default:
+		return fmt.Errorf("tea login default: unsupported value %q", asString)
+	}
+	return nil
+}
+
+func (f teaDefaultFlag) Bool() bool { return bool(f) }
 
 // TeaCommandRunner executes tea CLI invocations. Tests inject a fake runner.
 type TeaCommandRunner interface {
