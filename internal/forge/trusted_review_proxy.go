@@ -138,10 +138,56 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
+// trustedReviewProxyBlockedFlags are global CLI overrides that must never be
+// accepted on the trusted review proxy. A worktree-controlled --config (or tool
+// /db path override) can redirect provider baseURL while the daemon still injects
+// the real tokenEnv into the child.
+var trustedReviewProxyBlockedFlags = map[string]struct{}{
+	"config":                          {},
+	"db-path":                         {},
+	"host":                            {},
+	"port":                            {},
+	"log-dir":                         {},
+	"daemon-mode":                     {},
+	"daemon-restart-policy":           {},
+	"daemon-restart-throttle-seconds": {},
+	"git-path":                        {},
+	"gh-path":                         {},
+	"looper-path":                     {},
+	"osascript-path":                  {},
+}
+
+func trustedReviewProxyFlagName(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if !strings.HasPrefix(arg, "-") {
+		return ""
+	}
+	// Normalize --flag=value / -flag=value / --flag / -flag.
+	arg = strings.TrimLeft(arg, "-")
+	if arg == "" {
+		return ""
+	}
+	if name, _, ok := strings.Cut(arg, "="); ok {
+		return strings.ToLower(strings.TrimSpace(name))
+	}
+	return strings.ToLower(arg)
+}
+
 func validateTrustedReviewProxyArgv(argv []string) error {
-	// Allow global flags before the "review submit" command path.
-	// Reject anything that is not a review-submit invocation so the proxy
-	// cannot be abused to run arbitrary looper subcommands with provider tokens.
+	// Reject config/tool/db overrides anywhere in argv first so a compromised
+	// agent cannot redirect the daemon-injected provider token via --config or
+	// tool/db path flags, even after `review submit`.
+	for _, arg := range argv {
+		if name := trustedReviewProxyFlagName(arg); name != "" {
+			if _, blocked := trustedReviewProxyBlockedFlags[name]; blocked {
+				return fmt.Errorf("trusted review proxy rejects config/tool/db override flag %q", name)
+			}
+		}
+	}
+
+	// Allow only `review submit` (plus harmless non-override flags). Reject
+	// anything that is not a review-submit invocation so the proxy cannot be
+	// abused to run arbitrary looper subcommands with provider tokens.
 	seenReview := false
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]

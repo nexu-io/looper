@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -234,6 +235,63 @@ func installTrustedReviewProxy(cfg config.Config, logger bootstrap.Logger) (sock
 	return path, stop
 }
 
+// trustedReviewProxyKey identifies a proxy configuration so catalog-mode
+// snapshots can reuse one listener instead of leaking one per tick.
+func trustedReviewProxyKey(cfg config.Config) string {
+	realLooper := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+	trusted := providerTrustedEnv(cfg)
+	if realLooper == "" || len(trusted) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(trusted))
+	for key := range trusted {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, 1+len(keys))
+	parts = append(parts, realLooper)
+	for _, key := range keys {
+		parts = append(parts, key+"="+trusted[key])
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// trustedReviewProxyHolder owns a single reusable trusted review proxy across
+// catalog-mode per-tick handler rebuilds.
+type trustedReviewProxyHolder struct {
+	mu      sync.Mutex
+	key     string
+	sock    string
+	cleanup func()
+}
+
+func (h *trustedReviewProxyHolder) ensure(cfg config.Config, logger bootstrap.Logger) string {
+	if h == nil {
+		return ""
+	}
+	key := trustedReviewProxyKey(cfg)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if key == "" {
+		if h.cleanup != nil {
+			h.cleanup()
+			h.cleanup = nil
+		}
+		h.key, h.sock = "", ""
+		return ""
+	}
+	if key == h.key && h.sock != "" {
+		return h.sock
+	}
+	if h.cleanup != nil {
+		h.cleanup()
+		h.cleanup = nil
+	}
+	sock, cleanup := installTrustedReviewProxy(cfg, logger)
+	h.key, h.sock, h.cleanup = key, sock, cleanup
+	return sock
+}
+
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
 	provider, ok, err := forgejoProviderForRepo(cfg, repo)
 	if !ok || err != nil {
@@ -244,6 +302,75 @@ func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient
 		return nil, true, err
 	}
 	return client, true, nil
+}
+
+// forgejoReviewerDiscoveryLabelsForRepo returns configured reviewer trigger
+// labels for a Forgejo project. Used as a discovery fallback when native
+// requested_reviewers alone is insufficient (label-triggered discovery or
+// instances without requested_reviewers support).
+func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string) []string {
+	if cfg == nil {
+		return nil
+	}
+	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return nil
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerDiscoveryLabelsForProject(*cfg, *matched)
+	}
+	return nil
+}
+
+func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return nil
+	}
+	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
+	result := make([]string, 0, len(labels))
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label != "" {
+			result = append(result, label)
+		}
+	}
+	return result
+}
+
+// addForgejoPullRequestReviewers requests native reviewers and, when the project
+// is label-triggered, also applies discovery trigger labels so reviewer
+// auto-discovery still matches. If native request fails but labels are
+// configured, labels alone keep compatibility instances working.
+func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoClient, cfg *config.Config, repo string, prNumber int64, reviewers []string, cwd string) error {
+	labels := forgejoReviewerDiscoveryLabelsForRepo(cfg, repo, cwd)
+	nativeErr := client.AddPullRequestReviewers(ctx, prNumber, reviewers)
+	if nativeErr != nil && len(labels) == 0 {
+		return nativeErr
+	}
+	if len(labels) > 0 {
+		if _, err := client.AddIssueLabels(ctx, prNumber, labels); err != nil {
+			if nativeErr != nil {
+				return fmt.Errorf("forgejo native review request failed (%v); label fallback also failed: %w", nativeErr, err)
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
@@ -814,7 +941,7 @@ func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input
 		if err != nil {
 			return err
 		}
-		return client.AddPullRequestReviewers(ctx, input.PRNumber, input.Reviewers)
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -2361,7 +2488,7 @@ func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input 
 		if err != nil {
 			return err
 		}
-		return client.AddPullRequestReviewers(ctx, input.PRNumber, input.Reviewers)
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -2461,9 +2588,14 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstra
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	claimMu := &sync.Mutex{}
-	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
+	// Own the trusted review proxy outside per-tick snapshots so catalog mode
+	// does not start a new Unix listener (and leak temp dirs) on every tick.
+	proxy := &trustedReviewProxyHolder{}
+	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source, "", false)
 	buildSnapshot := func() defaultSchedulerHandlers {
-		return buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
+		cfg := source.Snapshot()
+		sock := proxy.ensure(cfg, logger)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, sock, false)
 	}
 	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
@@ -2478,10 +2610,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstra
 }
 
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
+	return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, "", true)
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, trustedReviewSock string, manageTrustedReviewProxy bool) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2600,7 +2732,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 	var workerRunner workerScheduler
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
-	trustedReviewSock, _ := installTrustedReviewProxy(cfg, logger)
+	if manageTrustedReviewProxy {
+		// Non-catalog single-shot builds own their proxy for this handler graph.
+		// Catalog mode passes manageTrustedReviewProxy=false and a shared sock.
+		trustedReviewSock, _ = installTrustedReviewProxy(cfg, logger)
+	}
 	agentEnv := cfg.Agent.Env
 	if trustedReviewSock != "" {
 		agentEnv = maps.Clone(cfg.Agent.Env)

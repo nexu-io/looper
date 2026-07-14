@@ -15,7 +15,12 @@ func TestValidateTrustedReviewProxyArgv(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "submit", argv: []string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, wantErr: false},
-		{name: "global flags then submit", argv: []string{"--config", "/tmp/cfg.json", "review", "submit", "acme/looper#1"}, wantErr: false},
+		{name: "harmless global flags then submit", argv: []string{"--json", "review", "submit", "acme/looper#1"}, wantErr: false},
+		{name: "reject config override", argv: []string{"--config", "/tmp/cfg.json", "review", "submit", "acme/looper#1"}, wantErr: true},
+		{name: "reject config equals form", argv: []string{"--config=/tmp/cfg.json", "review", "submit", "acme/looper#1"}, wantErr: true},
+		{name: "reject config after submit", argv: []string{"review", "submit", "acme/looper#1", "--config", "/tmp/cfg.json"}, wantErr: true},
+		{name: "reject db-path override", argv: []string{"--db-path", "/tmp/evil.sqlite", "review", "submit", "acme/looper#1"}, wantErr: true},
+		{name: "reject looper-path override", argv: []string{"--looper-path", "/tmp/evil", "review", "submit", "acme/looper#1"}, wantErr: true},
 		{name: "reject status", argv: []string{"status"}, wantErr: true},
 		{name: "reject review without submit", argv: []string{"review", "repair"}, wantErr: true},
 		{name: "reject empty", argv: nil, wantErr: true},
