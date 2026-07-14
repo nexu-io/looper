@@ -863,9 +863,11 @@ func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "for i in 1 2 3; do printf \"beat$i\\n\"; sleep 0.05; done"}}}, Repos: repos})
+	// Emit several spaced lines so pipe-reader coalescing under parallel CI load
+	// still leaves enough distinct Write chunks for heartbeat progress updates.
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "for i in 1 2 3 4 5 6; do printf \"beat$i\\n\"; sleep 0.15; done"}}}, Repos: repos})
 
-	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_hb", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 2 * time.Second})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_hb", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
