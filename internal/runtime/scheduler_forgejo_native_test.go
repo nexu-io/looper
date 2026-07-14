@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/forge"
@@ -185,5 +188,96 @@ func TestListReviewRequestedPullRequestsSummaryCommentToleratesMissingNativeRevi
 	}
 	if len(prs[0].Reviews) != 0 || prs[0].ReviewDecision != "" {
 		t.Fatalf("review context = reviews=%#v decision=%q, want empty under summary_comment fallback", prs[0].Reviews, prs[0].ReviewDecision)
+	}
+}
+
+func TestReviewerTrustedReviewEnvIsScopedToReviewer(t *testing.T) {
+	t.Parallel()
+
+	if got := reviewerTrustedReviewEnv(""); got != nil {
+		t.Fatalf("reviewerTrustedReviewEnv(\"\") = %#v, want nil", got)
+	}
+	if got := reviewerTrustedReviewEnv("   "); got != nil {
+		t.Fatalf("reviewerTrustedReviewEnv(whitespace) = %#v, want nil", got)
+	}
+
+	sock := "/tmp/looper-trusted-review.sock"
+	got := reviewerTrustedReviewEnv("  " + sock + "  ")
+	if len(got) != 1 || got[forge.TrustedReviewSockEnv] != sock {
+		t.Fatalf("reviewerTrustedReviewEnv(%q) = %#v, want only %s=%q", sock, got, forge.TrustedReviewSockEnv, sock)
+	}
+}
+
+func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
+	workDir := t.TempDir()
+	scriptDir := t.TempDir()
+	outputPath := filepath.Join(scriptDir, "child.env")
+	scriptPath := filepath.Join(scriptDir, "dump-env")
+	script := "#!/bin/sh\nprintf 'sock=%s\\n' \"$LOOPER_TRUSTED_REVIEW_SOCK\" > \"" + outputPath + "\"\nprintf '__LOOPER_RESULT__={\"summary\":\"done\"}\\n'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+
+	sock := filepath.Join(t.TempDir(), "trusted-review.sock")
+	// Shared executor config deliberately omits the sock — only the reviewer
+	// adapter may inject LOOPER_TRUSTED_REVIEW_SOCK for review-submit capability.
+	executor := agent.New(agent.ExecutorOptions{
+		Config: agent.ExecutorConfig{
+			Vendor: config.AgentVendor("custom"),
+			Params: map[string]any{"command": scriptPath},
+			Env:    map[string]string{"SHARED": "1"},
+		},
+	})
+	adapter := reviewerAgentExecutorAdapter{executor: executor, trustedReviewSock: sock}
+	execHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_trusted_sock",
+		WorkingDirectory: workDir,
+		Prompt:           "review",
+		Timeout:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result.Status = %q stderr=%q, want completed", result.Status, result.Stderr)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile(outputPath) error = %v", err)
+	}
+	want := "sock=" + sock + "\n"
+	if string(data) != want {
+		t.Fatalf("child env dump = %q, want %q", string(data), want)
+	}
+
+	// Planner/worker/fixer path: shared executor without adapter injection must
+	// not expose the review-submit socket even when one exists on the daemon.
+	plainExec, err := executor.Start(context.Background(), agent.RunInput{
+		ExecutionID:      "non_reviewer",
+		WorkingDirectory: workDir,
+		Prompt:           "work",
+		Timeout:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("plain Start() error = %v", err)
+	}
+	plainResult, err := plainExec.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("plain Wait() error = %v", err)
+	}
+	if plainResult.Status != "completed" {
+		t.Fatalf("plain result.Status = %q, want completed", plainResult.Status)
+	}
+	data, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile(outputPath) after plain run error = %v", err)
+	}
+	if string(data) != "sock=\n" {
+		t.Fatalf("non-reviewer child env dump = %q, want empty sock", string(data))
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -1642,7 +1641,10 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
-type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type reviewerAgentExecutorAdapter struct {
+	executor          *agent.ConfiguredExecutor
+	trustedReviewSock string
+}
 type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
 
 type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
@@ -1667,8 +1669,32 @@ func (a reviewerGitAdapter) CleanupWorktree(ctx context.Context, input reviewer.
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
+// reviewerTrustedReviewEnv injects the trusted review-submit socket only for
+// reviewer agent runs. Planner/worker/fixer share the executor but must not
+// receive review publication capability via LOOPER_TRUSTED_REVIEW_SOCK.
+func reviewerTrustedReviewEnv(sock string) map[string]string {
+	sock = strings.TrimSpace(sock)
+	if sock == "" {
+		return nil
+	}
+	return map[string]string{forge.TrustedReviewSockEnv: sock}
+}
+
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID:        input.ExecutionID,
+		ProjectID:          input.ProjectID,
+		LoopID:             input.LoopID,
+		RunID:              input.RunID,
+		Prompt:             input.Prompt,
+		NativeResumePrompt: input.NativeResumePrompt,
+		WorkingDirectory:   input.WorkingDirectory,
+		Timeout:            input.Timeout,
+		HeartbeatTimeout:   input.HeartbeatTimeout,
+		Metadata:           input.Metadata,
+		IdempotencyKey:     input.IdempotencyKey,
+		Env:                reviewerTrustedReviewEnv(a.trustedReviewSock),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2737,21 +2763,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 		// Catalog mode passes manageTrustedReviewProxy=false and a shared sock.
 		trustedReviewSock, _ = installTrustedReviewProxy(cfg, logger)
 	}
-	agentEnv := cfg.Agent.Env
-	if trustedReviewSock != "" {
-		agentEnv = maps.Clone(cfg.Agent.Env)
-		if agentEnv == nil {
-			agentEnv = map[string]string{}
-		}
-		agentEnv[forge.TrustedReviewSockEnv] = trustedReviewSock
-	}
-
+	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of the shared agent executor env so
+	// planner/worker/fixer cannot publish reviews. Inject only via the
+	// reviewer adapter below.
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
 			Vendor:              *cfg.Agent.Vendor,
 			Model:               cfg.Agent.Model,
 			Params:              cfg.Agent.Params,
-			Env:                 agentEnv,
+			Env:                 cfg.Agent.Env,
 			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 			// Env-gated (not a config field yet) so it stays zero-risk to the schema
 			// / parity fixtures until the codex --json path is proven end-to-end.
@@ -2819,11 +2839,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 		),
 	})
 	reviewerRunner = reviewer.New(reviewer.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:              reviewerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
+		Git:    reviewerGitAdapter{gateway: gitGateway},
+		AgentExecutor: reviewerAgentExecutorAdapter{
+			executor:          agentExecutor,
+			trustedReviewSock: trustedReviewSock,
+		},
 		Logger:           logger,
 		Now:              now,
 		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
