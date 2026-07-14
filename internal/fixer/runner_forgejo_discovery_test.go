@@ -148,6 +148,49 @@ func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
 	}
 }
 
+func TestForgejoAutomaticCollectSkipsConsumedReviewerRound(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		liveHead  string
+		fixedHead string
+		wantItems int
+	}{
+		{name: "same head", liveHead: "head-1", fixedHead: "head-1", wantItems: 0},
+		{name: "changed head", liveHead: "head-2", fixedHead: "head-1", wantItems: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			cfg := forgejoFixerDiscoveryConfig(t, fixture)
+			detail := forgejoDiscoveryDetail(t, tc.liveHead, 3)
+			fixerSummary := forge.NewFixerSummary(4, 3, []forge.FixerResult{{ReviewItemID: "R-001", Result: forge.FixerItemResultFixed, Explanation: "Recorded the decision."}})
+			fixerSummary.ObservedHeadSHA = tc.fixedHead
+			marker, err := forge.RenderFixerSummary(fixerSummary)
+			if err != nil {
+				t.Fatalf("RenderFixerSummary() error = %v", err)
+			}
+			detail.IssueComments = append(detail.IssueComments, map[string]any{"id": int64(2), "body": marker, "author": map[string]any{"login": "looper"}})
+			github := &fakeGitHubGateway{currentUser: "looper"}
+			runner := New(Options{GitHub: github, CustomInstructions: cfg})
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+			}
+
+			checkpoint, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: *project, Loop: storage.LoopRecord{ProjectID: "project_1"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)}})
+			if err != nil {
+				t.Fatalf("runCollectFixesStep() error = %v", err)
+			}
+			if len(checkpoint.FixItems) != tc.wantItems {
+				t.Fatalf("FixItems = %#v, want %d", checkpoint.FixItems, tc.wantItems)
+			}
+			if tc.wantItems == 0 && checkpoint.SkipReason == "" {
+				t.Fatal("SkipReason is empty for consumed Reviewer Summary")
+			}
+		})
+	}
+}
+
 func TestForgejoAutoDiscoveryFailsLoudOnDuplicateReviewerSummaryAuthority(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

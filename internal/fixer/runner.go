@@ -1637,7 +1637,7 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
-	actionableFixItems, err := r.unsatisfiedForgejoDiscoveryItems(project.ID, detail, allFixItems)
+	actionableFixItems, err := r.unsatisfiedForgejoSummaryItems(project.ID, pullRequestCheckpointDetail(detail), allFixItems)
 	if err != nil {
 		return err
 	}
@@ -1746,18 +1746,17 @@ func (r *Runner) sanitizeForgejoCheckpointSummaryAuthority(ctx context.Context, 
 	return nil
 }
 
-func (r *Runner) unsatisfiedForgejoDiscoveryItems(projectID string, detail PullRequestDetail, items []FixItem) ([]FixItem, error) {
+func (r *Runner) unsatisfiedForgejoSummaryItems(projectID string, detail *checkpointDetail, items []FixItem) ([]FixItem, error) {
 	if !r.isForgejoProject(projectID) {
 		return items, nil
 	}
-	checkpointDetail := pullRequestCheckpointDetail(detail)
-	reviewerSummary, hasReviewerSummary, err := reviewerSummaryFromCheckpointDetail(checkpointDetail)
+	reviewerSummary, hasReviewerSummary, err := reviewerSummaryFromCheckpointDetail(detail)
 	if err != nil {
 		return nil, err
 	}
 	consumedSummary := false
 	if hasReviewerSummary {
-		comments := forgeCommentsFromCheckpointDetail(checkpointDetail)
+		comments := forgeCommentsFromCheckpointDetail(detail)
 		if containsForgeSummaryMarker(comments, forge.FixerSummaryMarker) {
 			_, fixerSummary, parseErr := forge.ParseUniqueFixerSummaryComment(comments)
 			if parseErr != nil {
@@ -2492,6 +2491,10 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 		}
 	}
 	fixItems, err := collectFixItemsFromCheckpointForStep(checkpoint)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	fixItems, err = r.unsatisfiedForgejoSummaryItems(input.Project.ID, checkpoint.Detail, fixItems)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
 	}
