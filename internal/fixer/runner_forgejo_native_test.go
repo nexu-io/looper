@@ -185,6 +185,32 @@ func TestRunCollectFixesStepFailsUnsupportedWhenNativeResolverMissing(t *testing
 	}
 }
 
+func TestRunCollectFixesStepFailsBeforeRepairWhenResolveCapabilityUnknown(t *testing.T) {
+	t.Parallel()
+	github := &capabilityProbeGitHub{
+		fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}}},
+		state:             forge.ProbeStateUnknown,
+	}
+	runner := New(Options{GitHub: github})
+	_, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
+	if err == nil || !strings.Contains(err.Error(), "resolution is unknown") {
+		t.Fatalf("runCollectFixesStep() error = %v, want unknown-capability failure", err)
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runCollectFixesStep() error = %#v, want manual intervention", err)
+	}
+}
+
+type capabilityProbeGitHub struct {
+	fakeGitHubGateway
+	state forge.ProbeState
+}
+
+func (f *capabilityProbeGitHub) ProbeNativeReviewCommentResolution(context.Context, ListNativeReviewCommentsInput) (forge.ProbeState, error) {
+	return f.state, nil
+}
+
 func TestRunCollectFixesStepUsesStepContextForManualForgejoNativeComments(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

@@ -26,6 +26,7 @@ type RepositoryRef struct {
 type ReviewDiscoveryStrategy string
 type ReviewPublishStrategy string
 type ThreadResolutionStrategy string
+type ReviewCommentResolutionStrategy string
 type WorkerClaimStrategy string
 type WebhookStrategy string
 
@@ -39,6 +40,10 @@ const (
 	ThreadResolutionNative   ThreadResolutionStrategy = "native"
 	ThreadResolutionDisabled ThreadResolutionStrategy = "disabled"
 
+	ReviewCommentResolutionNative     ReviewCommentResolutionStrategy = "native"
+	ReviewCommentResolutionManualOnly ReviewCommentResolutionStrategy = "manual_only"
+	ReviewCommentResolutionDisabled   ReviewCommentResolutionStrategy = "disabled"
+
 	WorkerClaimAssignSelf  WorkerClaimStrategy = "assign_self"
 	WorkerClaimPreAssigned WorkerClaimStrategy = "pre_assigned"
 
@@ -47,17 +52,19 @@ const (
 )
 
 type Capabilities struct {
-	Issues         bool
-	PullRequests   bool
-	Labels         bool
-	Assignees      bool
-	Comments       bool
-	Identity       bool
-	Diffs          bool
-	NativeReviews  bool
-	ReviewRequests bool
-	AutoMerge      bool
-	Webhooks       bool
+	Issues                  bool
+	PullRequests            bool
+	Labels                  bool
+	Assignees               bool
+	Comments                bool
+	Identity                bool
+	Diffs                   bool
+	NativeReviews           bool
+	ReviewRequests          bool
+	AutoMerge               bool
+	Webhooks                bool
+	ReviewCommentResolution ReviewCommentResolutionStrategy
+	Dependencies            bool
 
 	ReviewDiscovery  ReviewDiscoveryStrategy
 	ReviewPublish    ReviewPublishStrategy
@@ -69,14 +76,14 @@ type Capabilities struct {
 func StaticCapabilities(kind ProviderKind) (Capabilities, bool) {
 	switch kind {
 	case ProviderKindGitHub:
-		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: true, Webhooks: true, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionNative, WorkerClaim: WorkerClaimAssignSelf, Webhook: WebhookNative}, true
+		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: true, Webhooks: true, ReviewCommentResolution: ReviewCommentResolutionNative, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionNative, WorkerClaim: WorkerClaimAssignSelf, Webhook: WebhookNative}, true
 	case ProviderKindForgejo:
-		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: false, ReviewRequests: false, AutoMerge: false, Webhooks: false, ReviewDiscovery: ReviewDiscoveryLabel, ReviewPublish: ReviewPublishCommentOnly, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
+		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: false, ReviewRequests: false, AutoMerge: false, Webhooks: false, ReviewCommentResolution: ReviewCommentResolutionManualOnly, Dependencies: false, ReviewDiscovery: ReviewDiscoveryLabel, ReviewPublish: ReviewPublishCommentOnly, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
 	case ProviderKindPlane:
 		// Plane is a task-source: it owns issues/labels/comments/assignees but
 		// has no pull requests, diffs, or native reviews (those are delegated to
 		// the GitHub code repo). Issue discovery is polling by trigger label.
-		return Capabilities{Issues: true, PullRequests: false, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: false, NativeReviews: false, ReviewRequests: false, AutoMerge: false, Webhooks: false, ReviewDiscovery: ReviewDiscoveryLabel, ReviewPublish: ReviewPublishCommentOnly, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
+		return Capabilities{Issues: true, PullRequests: false, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: false, NativeReviews: false, ReviewRequests: false, AutoMerge: false, Webhooks: false, ReviewCommentResolution: ReviewCommentResolutionDisabled, ReviewDiscovery: ReviewDiscoveryLabel, ReviewPublish: ReviewPublishCommentOnly, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
 	default:
 		return Capabilities{}, false
 	}
@@ -90,8 +97,8 @@ type Provider interface {
 }
 
 type Identity struct {
-	Login string
-	ID    int64
+	Login string `json:"login"`
+	ID    int64  `json:"id"`
 }
 
 type Registry struct {

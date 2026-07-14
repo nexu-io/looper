@@ -201,6 +201,7 @@
             "inAppEnabled": true,
             "osascriptEnabled": true
           },
+          "providers": [],
           "tools": {
             "git": true,
             "gh": true,
