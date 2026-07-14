@@ -169,6 +169,7 @@ func (r *commandRuntime) queueFailed(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		output := queueFailedOutput{NowISO: eventlog.FormatJavaScriptISOString(time.Now().UTC()), Type: typeFilter, ProjectID: projectFilter, Limit: limit}
+		loopSeqByID := map[string]int64{}
 		for _, item := range items {
 			if item.Status != "failed" && item.Status != "manual_intervention" {
 				continue
@@ -179,7 +180,8 @@ func (r *commandRuntime) queueFailed(cmd *cobra.Command, args []string) error {
 			if projectFilter != "" && (item.ProjectID == nil || *item.ProjectID != projectFilter) {
 				continue
 			}
-			output.Items = append(output.Items, queueFailedItemOutput{QueueItem: queueItemOutput(item), Diagnosis: diagnoseQueueItem(item)})
+			loopSeq := resolveQueueItemLoopSeq(cmd.Context(), repos, item, loopSeqByID)
+			output.Items = append(output.Items, queueFailedItemOutput{QueueItem: queueItemOutput(item), Diagnosis: diagnoseQueueItem(item, loopSeq)})
 			if int64(len(output.Items)) >= limit {
 				break
 			}
@@ -579,7 +581,7 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 	return diagnosis
 }
 
-func diagnoseQueueItem(item storage.QueueItemRecord) loopDiagnosis {
+func diagnoseQueueItem(item storage.QueueItemRecord, loopSeq int64) loopDiagnosis {
 	// Preserve LastErrorKind as the failure cause. Queue status remains in
 	// diagnosis.State so operators can see a parked manual hold separately.
 	diagnosis := classifyDiagnosticMessage(diagnosticString(item.LastError), diagnosticString(item.LastErrorKind))
@@ -588,7 +590,51 @@ func diagnoseQueueItem(item storage.QueueItemRecord) loopDiagnosis {
 	if diagnosis.RecommendedAction == "" {
 		diagnosis.RecommendedAction = "inspect the owning loop before requeueing"
 	}
+	// Same contract as diagnoseLoop: never serialize the literal <seq>
+	// placeholder. Expand when the owning loop seq is known; otherwise rewrite
+	// guidance so queue-failed JSON does not leak unresolved tokens.
+	if loopSeq > 0 {
+		diagnosis.RecommendedAction = formatActionWithSeq(diagnosis.RecommendedAction, loopSeq)
+	} else {
+		diagnosis.RecommendedAction = actionWithoutSeqPlaceholder(diagnosis.RecommendedAction)
+	}
 	return diagnosis
+}
+
+// resolveQueueItemLoopSeq looks up the owning loop sequence for a queue item,
+// caching results so queue-failed listing does not repeat GetByID per item.
+func resolveQueueItemLoopSeq(ctx context.Context, repos *storage.Repositories, item storage.QueueItemRecord, cache map[string]int64) int64 {
+	if item.LoopID == nil {
+		return 0
+	}
+	loopID := strings.TrimSpace(*item.LoopID)
+	if loopID == "" {
+		return 0
+	}
+	if seq, ok := cache[loopID]; ok {
+		return seq
+	}
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		cache[loopID] = 0
+		return 0
+	}
+	cache[loopID] = loop.Seq
+	return loop.Seq
+}
+
+// actionWithoutSeqPlaceholder rewrites retry/unpause/describe guidance when no
+// loop sequence is available, so consumers never see a literal <seq> token.
+func actionWithoutSeqPlaceholder(action string) string {
+	rewritten := action
+	for _, pair := range [][2]string{
+		{"looper retry <seq>", "retry the owning loop"},
+		{"looper unpause <seq>", "unpause the owning loop"},
+		{"looper describe <seq>", "describe the owning loop"},
+	} {
+		rewritten = strings.ReplaceAll(rewritten, pair[0], pair[1])
+	}
+	return strings.ReplaceAll(rewritten, "<seq>", "the owning loop seq")
 }
 
 func loopDiagnosticMessage(run *storage.RunRecord, queue *storage.QueueItemRecord, metadata loopDiagnosticMetadata) (string, string) {

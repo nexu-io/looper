@@ -147,8 +147,9 @@ func TestQueueFailedCommandListsFailedItems(t *testing.T) {
 				Status string `json:"status"`
 			} `json:"queueItem"`
 			Diagnosis struct {
-				FailureClass string `json:"failureClass"`
-				Retryable    *bool  `json:"retryable"`
+				FailureClass      string `json:"failureClass"`
+				Retryable         *bool  `json:"retryable"`
+				RecommendedAction string `json:"recommendedAction"`
 			} `json:"diagnosis"`
 		} `json:"items"`
 	}
@@ -159,16 +160,18 @@ func TestQueueFailedCommandListsFailedItems(t *testing.T) {
 		t.Fatalf("queue failed output = %#v, want two items", decoded)
 	}
 	itemsByID := map[string]struct {
-		status       string
-		failureClass string
-		retryable    *bool
+		status            string
+		failureClass      string
+		retryable         *bool
+		recommendedAction string
 	}{}
 	for _, item := range decoded.Items {
 		itemsByID[item.QueueItem.ID] = struct {
-			status       string
-			failureClass string
-			retryable    *bool
-		}{status: item.QueueItem.Status, failureClass: item.Diagnosis.FailureClass, retryable: item.Diagnosis.Retryable}
+			status            string
+			failureClass      string
+			retryable         *bool
+			recommendedAction string
+		}{status: item.QueueItem.Status, failureClass: item.Diagnosis.FailureClass, retryable: item.Diagnosis.Retryable, recommendedAction: item.Diagnosis.RecommendedAction}
 	}
 	failed := itemsByID["qi_failed"]
 	if failed.status != "failed" || failed.failureClass != "github_transient" || failed.retryable == nil || !*failed.retryable {
@@ -177,6 +180,16 @@ func TestQueueFailedCommandListsFailedItems(t *testing.T) {
 	manual := itemsByID["qi_manual_intervention"]
 	if manual.status != "manual_intervention" {
 		t.Fatalf("qi_manual_intervention = %#v, want manual_intervention status", manual)
+	}
+	if manual.failureClass != "manual_intervention" {
+		t.Fatalf("qi_manual_intervention failureClass = %q, want manual_intervention", manual.failureClass)
+	}
+	if strings.Contains(manual.recommendedAction, "<seq>") {
+		t.Fatalf("qi_manual_intervention recommendedAction = %q, must not leak unresolved <seq>", manual.recommendedAction)
+	}
+	// loop_failed has seq 3 in the fixture; expand so operators get a real retry command.
+	if !strings.Contains(manual.recommendedAction, "looper retry 3") {
+		t.Fatalf("qi_manual_intervention recommendedAction = %q, want expanded looper retry 3", manual.recommendedAction)
 	}
 }
 

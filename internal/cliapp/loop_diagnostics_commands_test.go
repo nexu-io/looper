@@ -254,6 +254,30 @@ func TestDiagnoseLoopExpandsRetrySeqPlaceholder(t *testing.T) {
 	}
 }
 
+func TestDiagnoseQueueItemDoesNotEmitSeqPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	kind := "manual_intervention"
+	msg := "dirty worktree: uncommitted changes"
+	item := storage.QueueItemRecord{Status: "manual_intervention", LastError: &msg, LastErrorKind: &kind}
+
+	withSeq := diagnoseQueueItem(item, 3)
+	if strings.Contains(withSeq.RecommendedAction, "<seq>") {
+		t.Fatalf("RecommendedAction = %q, want expanded seq not literal <seq>", withSeq.RecommendedAction)
+	}
+	if !strings.Contains(withSeq.RecommendedAction, "looper retry 3") {
+		t.Fatalf("RecommendedAction = %q, want looper retry 3", withSeq.RecommendedAction)
+	}
+
+	withoutSeq := diagnoseQueueItem(item, 0)
+	if strings.Contains(withoutSeq.RecommendedAction, "<seq>") {
+		t.Fatalf("RecommendedAction = %q, must not leak unresolved <seq> when loop seq is unknown", withoutSeq.RecommendedAction)
+	}
+	if !strings.Contains(withoutSeq.RecommendedAction, "retry the owning loop") {
+		t.Fatalf("RecommendedAction = %q, want owning-loop retry guidance without placeholder", withoutSeq.RecommendedAction)
+	}
+}
+
 func TestDiagnoseLoopPreservesErrorKindWhenQueueIsManualHold(t *testing.T) {
 	t.Parallel()
 
