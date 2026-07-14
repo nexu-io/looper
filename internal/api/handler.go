@@ -4269,8 +4269,8 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 		return plannerCreateResponse{}, err
 	}
 
-	// Share same-target lock with discard+retry (planner discard is a no-op, but
-	// uniqueness races still matter for the requeue half of retry).
+	// Share same-target lock with discard+retry so planner uniqueness races
+	// cannot interleave with requeue while discard mutates the worktree.
 	unlockPlannerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning)
 	defer unlockPlannerTarget()
 

@@ -296,25 +296,23 @@ func TestHandlerLoopRetryDiscardWorktreeChangesAlreadyClean(t *testing.T) {
 	}
 }
 
-func TestHandlerLoopRetryDiscardWorktreeChangesPlannerNoOp(t *testing.T) {
+func TestHandlerLoopRetryDiscardWorktreeChangesDirtyPlanner(t *testing.T) {
+	// Planner prepare-worktree checkpoints a managed worktree; discard must clear
+	// it the same way as fixer/reviewer/worker rather than no-opping.
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
-	projectID := "project_retry_discard_planner"
-	loopID := "loop_retry_discard_planner"
-	targetID := projectID
 
-	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Planner", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3110, ProjectID: projectID, Type: "planner", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-	lastErrorKind := "manual_intervention"
-	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_retry_discard_planner", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "project", TargetID: targetID, DedupeKey: "planner:retry_discard", Priority: storage.QueuePriorityPlanner, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Queue.Upsert() error = %v", err)
-	}
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_planner",
+		LoopID:    "loop_retry_discard_planner",
+		LoopSeq:   3110,
+		LoopType:  "planner",
+		Branch:    "looper/planner/42-plan-this",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3110/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
 	recorder := httptest.NewRecorder()
@@ -323,9 +321,61 @@ func TestHandlerLoopRetryDiscardWorktreeChangesPlannerNoOp(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["discardWorktreeChanges"], true)
+	discard := data["worktreeDiscard"].(map[string]any)
+	assertEqual(t, discard["discarded"], true)
+	assertEqual(t, discard["noOp"], false)
+	assertEqual(t, discard["worktreePath"], fixture.WorktreePath)
+	assertEqual(t, discard["reason"], "discarded")
+
+	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dirty.txt still present after planner discard: %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "README.md")); got != "hello\n" {
+		t.Fatalf("README.md after planner discard = %q, want restored contents", got)
+	}
+	clean, err := gitinfra.New(gitinfra.Options{GitPath: "git"}).WorktreeClean(context.Background(), fixture.WorktreePath)
+	if err != nil || !clean {
+		t.Fatalf("planner worktree clean after discard = %v, %v", clean, err)
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop after retry = %#v, %v, want queued", loop, err)
+	}
+}
+
+func TestHandlerLoopRetryDiscardWorktreeChangesPlannerNoWorktree(t *testing.T) {
+	// Planner without a resolvable worktree still retries as a no-op discard.
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_discard_planner_none"
+	loopID := "loop_retry_discard_planner_none"
+	targetID := projectID
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Planner", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3136, ProjectID: projectID, Type: "planner", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lastErrorKind := "manual_intervention"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_retry_discard_planner_none", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "project", TargetID: targetID, DedupeKey: "planner:retry_discard_none", Priority: storage.QueuePriorityPlanner, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3136/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
 	discard := data["worktreeDiscard"].(map[string]any)
 	assertEqual(t, discard["noOp"], true)
-	assertEqual(t, discard["reason"], "planner_no_worktree")
+	assertEqual(t, discard["reason"], "no_worktree")
 	assertEqual(t, discard["discarded"], false)
 
 	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
@@ -1848,6 +1898,9 @@ func seedManagedWorktreeFixture(t *testing.T, repos *storage.Repositories, seed 
 		queue.Priority = storage.QueuePriorityReviewer
 		queue.Repo = &repo
 		queue.PRNumber = &prNumber
+	}
+	if seed.LoopType == "planner" {
+		queue.Priority = storage.QueuePriorityPlanner
 	}
 	if err := repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)

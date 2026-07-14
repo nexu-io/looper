@@ -55,13 +55,12 @@ type checkpointWithWorktree struct {
 }
 
 // discardLoopWorktreeChanges performs the operator opt-in dirty-worktree discard
-// for loop retry. Planner loops and loops without a resolvable managed worktree
-// are no-ops. Active run/queue must already be refused by the caller.
+// for loop retry. Agent loops (planner/fixer/reviewer/worker) resolve a managed
+// worktree from the latest run checkpoint or worktree row; loops without a
+// resolvable managed worktree are no-ops. Active run/queue must already be
+// refused by the caller.
 func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services looperdruntime.Services, loop storage.LoopRecord) (worktreeDiscardResult, error) {
-	if loop.Type == string(domain.LoopTypePlanner) {
-		return worktreeDiscardResult{NoOp: true, Reason: "planner_no_worktree"}, nil
-	}
-	if loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
+	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
 		return worktreeDiscardResult{NoOp: true, Reason: "loop_type_without_worktree"}, nil
 	}
 	if services.Repositories == nil {
