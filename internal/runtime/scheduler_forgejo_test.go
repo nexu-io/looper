@@ -266,6 +266,53 @@ func TestWorkerGitHubAdapterForgejoAddReviewersFallsBackToLabelsWhenNativeUnavai
 	}
 }
 
+func TestWorkerGitHubAdapterForgejoAddReviewersIgnoresLabelFailureAfterNativeSuccess(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	var reviewerBody map[string][]string
+	var labelAttempted bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/201/requested_reviewers":
+			if err := json.NewDecoder(r.Body).Decode(&reviewerBody); err != nil {
+				t.Fatalf("decode reviewers body: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/issues/201/labels":
+			labelAttempted = true
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"label missing"}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					Triggers: config.ReviewerRoleTriggersConfig{Labels: []string{"team-review"}},
+				},
+			},
+		},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := workerGitHubAdapter{stamper: disclosure.FromConfig(cfg), config: &cfg}
+	if err := adapter.AddPullRequestReviewers(context.Background(), worker.PullRequestReviewersInput{Repo: "acme/looper", PRNumber: 201, Reviewers: []string{"reviewer"}, CWD: repoPath}); err != nil {
+		t.Fatalf("AddPullRequestReviewers() error = %v, want nil after native success despite label failure", err)
+	}
+	if got := reviewerBody["reviewers"]; len(got) != 1 || got[0] != "reviewer" {
+		t.Fatalf("reviewer body = %#v, want native reviewer request", reviewerBody)
+	}
+	if !labelAttempted {
+		t.Fatal("expected label application attempt after native success")
+	}
+}
+
 func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var listLabels string

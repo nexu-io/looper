@@ -300,6 +300,10 @@ func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.
 // is label-triggered, also applies discovery trigger labels so reviewer
 // auto-discovery still matches. If native request fails but labels are
 // configured, labels alone keep compatibility instances working.
+// When native request succeeds, label application is best-effort: a missing or
+// transient label failure must not fail the handoff, because requested_reviewers
+// already makes the PR discoverable. Label failure remains fatal only as the
+// fallback path after native request failure.
 func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoClient, cfg *config.Config, repo string, prNumber int64, reviewers []string, cwd string) error {
 	labels := forgejoReviewerDiscoveryLabelsForRepo(cfg, repo, cwd)
 	nativeErr := client.AddPullRequestReviewers(ctx, prNumber, reviewers)
@@ -311,7 +315,9 @@ func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoCl
 			if nativeErr != nil {
 				return fmt.Errorf("forgejo native review request failed (%v); label fallback also failed: %w", nativeErr, err)
 			}
-			return err
+			// Native request already succeeded; keep label errors non-fatal so
+			// planner/worker publish does not retry a PR that is already assigned.
+			return nil
 		}
 	}
 	return nil
