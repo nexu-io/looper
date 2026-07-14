@@ -1591,6 +1591,9 @@ type reviewerAgentExecutorAdapter struct {
 	realLooper string
 	trustedEnv map[string]string
 	logger     bootstrap.Logger
+	// config is used to gate trusted review-submit sockets on per-project
+	// publish mode (summary_comment must not mint a native review socket).
+	config *config.Config
 }
 type reviewerAgentExecutionAdapter struct {
 	execution agent.Execution
@@ -1643,20 +1646,48 @@ func reviewerTrustedReviewEnv(sock string) map[string]string {
 }
 
 // reviewerAllowsTrustedReviewProxy reports whether this reviewer agent start is
-// in a phase that is authorized to publish reviews. Thread-resolution
-// classifiers share the reviewer adapter but must not receive a live review
-// submit socket.
-func reviewerAllowsTrustedReviewProxy(metadata map[string]any) bool {
+// authorized to receive a live review-submit socket. Thread-resolution
+// classifiers share the reviewer adapter but must not receive publish capability.
+// Forgejo summary_comment publish mode must also not mint a socket: Looper posts
+// one top-level summary comment, and a prompt-injected agent must not be able to
+// call `looper review submit` with daemon-injected provider tokens.
+func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, metadata map[string]any) bool {
 	if metadata == nil {
 		return false
 	}
 	phase, _ := metadata["phase"].(string)
 	switch strings.ToLower(strings.TrimSpace(phase)) {
 	case "review", "publish":
-		return true
+		// continue
 	default:
 		return false
 	}
+	if reviewerSummaryCommentPublishMode(cfg, projectID) {
+		return false
+	}
+	return true
+}
+
+// reviewerSummaryCommentPublishMode reports whether the selected project uses
+// Forgejo summary_comment publish mode (comment-only completion, no native review).
+func reviewerSummaryCommentPublishMode(cfg *config.Config, projectID string) bool {
+	if cfg == nil {
+		return false
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return false
+	}
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.ID) != projectID {
+			continue
+		}
+		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+			return false
+		}
+		return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
+	}
+	return false
 }
 
 // reviewerAllowedPRRef extracts the daemon-selected owner/repo#N from reviewer
@@ -1722,14 +1753,15 @@ func metadataInt64(value any) (int64, bool) {
 }
 
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
-	// Mint a per-run proxy only for review/publish phases, bound to the
-	// daemon-selected PR, worktree CWD, and review-events policy.
-	// Thread-resolution classifiers reuse this adapter but must not receive
-	// review-publish capability.
+	// Mint a per-run proxy only for review/publish phases on projects that
+	// publish native reviews, bound to the daemon-selected PR, worktree CWD,
+	// and review-events policy. Thread-resolution classifiers and summary_comment
+	// (comment-only) runs reuse this adapter but must not receive review-publish
+	// capability via LOOPER_TRUSTED_REVIEW_SOCK.
 	allowedPR := ""
 	allowedCwd := ""
 	policy := forge.TrustedReviewProxyPolicy{}
-	if reviewerAllowsTrustedReviewProxy(input.Metadata) {
+	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
 		allowedPR = reviewerAllowedPRRef(input.Metadata)
 		allowedCwd = strings.TrimSpace(input.WorkingDirectory)
 		policy = reviewerAllowedReviewPolicy(input.Metadata)
@@ -2898,6 +2930,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 			realLooper: looperCLIPath,
 			trustedEnv: providerTrustedEnv(cfg),
 			logger:     logger,
+			config:     &cfg,
 		},
 		Logger:           logger,
 		Now:              now,

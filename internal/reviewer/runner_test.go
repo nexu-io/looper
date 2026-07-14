@@ -1725,7 +1725,7 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("loopEnabled(empty metadata) = true, want false for legacy persisted loop")
 	}
 
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "acme/looper", 42)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "", "acme/looper", 42)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}
@@ -1741,7 +1741,7 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("reviewEvents = %#v, want snapshotted decision policy", reviewEvents)
 	}
 	current := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_wall_clock","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON(legacy budget metadata) error = %v", err)
 	}
@@ -1758,15 +1758,64 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("loop metadata status = %#v, want active after removing budget termination", loopMeta["status"])
 	}
 	current = `{"reviewEvents":{"clean":"BOGUS","blocking":"APPROVE"}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
 	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
 		t.Fatalf("ensureLoopMetadataJSON(invalid reviewEvents) error = %v, want validation error", err)
 	}
 	current = `{"reviewEvents":{"clean":123}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
 	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
 		t.Fatalf("ensureLoopMetadataJSON(malformed reviewEvents) error = %v, want validation error", err)
 	}
+}
+
+func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
+	t.Parallel()
+	// Global runner default is COMMENT/COMMENT; the project overrides to APPROVE/REQUEST_CHANGES.
+	projectCfg := config.Config{
+		Roles: config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{
+			ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
+		}}},
+		Projects: []config.ProjectRefConfig{{
+			ID: "forgejo-native", Name: "Forgejo", Repo: "owner/forgejo", RepoPath: "/tmp/forgejo",
+			Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{
+				Behavior: &config.PartialReviewerConfig{ReviewEvents: &config.PartialReviewerReviewEventsConfig{
+					Clean:    reviewEventPtr(config.ReviewerReviewEventApprove),
+					Blocking: reviewEventPtr(config.ReviewerReviewEventRequestChanges),
+				}},
+			}},
+		}},
+	}
+	runner := New(Options{
+		ReviewEvents:       config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
+		LoopConfig:         config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+		CustomInstructions: &projectCfg,
+	})
+
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "forgejo-native", "owner/forgejo", 7)
+	if err != nil {
+		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
+	}
+	meta := parseJSONObject(&metadataJSON)
+	reviewEvents, _ := meta["reviewEvents"].(map[string]any)
+	if reviewEvents["clean"] != string(config.ReviewerReviewEventApprove) || reviewEvents["blocking"] != string(config.ReviewerReviewEventRequestChanges) {
+		t.Fatalf("reviewEvents = %#v, want project-level APPROVE/REQUEST_CHANGES", reviewEvents)
+	}
+	// effectiveReviewEvents without snapshotted metadata must also resolve project overrides
+	// so the trusted proxy policy is not stuck on the global COMMENT default.
+	effective := runner.effectiveReviewEvents("forgejo-native", nil)
+	if effective.Clean != config.ReviewerReviewEventApprove || effective.Blocking != config.ReviewerReviewEventRequestChanges {
+		t.Fatalf("effectiveReviewEvents() = %#v, want project-level APPROVE/REQUEST_CHANGES", effective)
+	}
+	// Other projects fall back to the runner/global COMMENT default.
+	global := runner.effectiveReviewEvents("missing", nil)
+	if global.Clean != config.ReviewerReviewEventComment || global.Blocking != config.ReviewerReviewEventComment {
+		t.Fatalf("effectiveReviewEvents(missing) = %#v, want global COMMENT defaults", global)
+	}
+}
+
+func reviewEventPtr(event config.ReviewerReviewEvent) *config.ReviewerReviewEvent {
+	return &event
 }
 
 func TestEnsureLoopForPullRequestBackfillsLegacyFollowUpdatesDisabled(t *testing.T) {
@@ -6750,7 +6799,7 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 	queueID := "queue_publish_pr_not_found"
 	nowISO := fixture.nowISO()
 	worktreePath := filepath.Join(t.TempDir(), "reviewer-worktree")
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, repo, prNumber)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "project_1", repo, prNumber)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}

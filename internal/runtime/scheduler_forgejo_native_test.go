@@ -243,23 +243,42 @@ func TestReviewerAllowedReviewPolicy(t *testing.T) {
 
 func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 	t.Parallel()
-	if reviewerAllowsTrustedReviewProxy(nil) {
+	if reviewerAllowsTrustedReviewProxy(nil, "demo", nil) {
 		t.Fatal("nil metadata allowed, want false")
 	}
-	if reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "thread_resolution"}) {
+	if reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "thread_resolution"}) {
 		t.Fatal("thread_resolution allowed, want false")
 	}
-	if reviewerAllowsTrustedReviewProxy(map[string]any{"phase": ""}) {
+	if reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": ""}) {
 		t.Fatal("empty phase allowed, want false")
 	}
-	if !reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "review"}) {
+	if !reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "review"}) {
 		t.Fatal("review phase not allowed, want true")
 	}
-	if !reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "publish"}) {
+	if !reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "publish"}) {
 		t.Fatal("publish phase not allowed, want true")
 	}
-	if !reviewerAllowsTrustedReviewProxy(map[string]any{"phase": "REVIEW"}) {
+	if !reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "REVIEW"}) {
 		t.Fatal("REVIEW phase not allowed, want true")
+	}
+
+	// summary_comment mode must never mint a review-submit socket even in review phase.
+	summaryCfg := &config.Config{
+		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "forgejo-demo", Name: "Forgejo", Provider: "fj", Repo: "owner/repo", RepoPath: "/tmp/repo"}},
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
+	}
+	if reviewerAllowsTrustedReviewProxy(summaryCfg, "forgejo-demo", map[string]any{"phase": "review"}) {
+		t.Fatal("summary_comment project allowed socket, want false")
+	}
+	// Native single_review Forgejo projects still allow the socket.
+	nativeCfg := &config.Config{
+		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "forgejo-native", Name: "Forgejo", Provider: "fj", Repo: "owner/repo", RepoPath: "/tmp/repo"}},
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSingleReview}}},
+	}
+	if !reviewerAllowsTrustedReviewProxy(nativeCfg, "forgejo-native", map[string]any{"phase": "review"}) {
+		t.Fatal("single_review Forgejo project not allowed, want true")
 	}
 }
 
@@ -367,6 +386,44 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	}
 	if string(data) != "sock=\n" {
 		t.Fatalf("no-PR child env dump = %q, want empty sock", string(data))
+	}
+
+	// summary_comment projects must not mint a review-submit socket even with full PR metadata.
+	summaryCfg := &config.Config{
+		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "summary-project", Name: "Forgejo", Provider: "fj", Repo: "acme/looper", RepoPath: workDir}},
+		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSummaryComment}}},
+	}
+	summaryAdapter := reviewerAgentExecutorAdapter{
+		executor:   executor,
+		realLooper: realLooper,
+		trustedEnv: map[string]string{"FORGEJO_TOKEN": "test-token"},
+		config:     summaryCfg,
+	}
+	summaryHandle, err := summaryAdapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_summary_comment",
+		ProjectID:        "summary-project",
+		WorkingDirectory: workDir,
+		Prompt:           "review",
+		Timeout:          5 * time.Second,
+		Metadata: map[string]any{
+			"phase":    "review",
+			"repo":     "acme/looper",
+			"prNumber": int64(42),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start(summary_comment) error = %v", err)
+	}
+	if _, err := summaryHandle.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait(summary_comment) error = %v", err)
+	}
+	data, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile after summary_comment run error = %v", err)
+	}
+	if string(data) != "sock=\n" {
+		t.Fatalf("summary_comment child env dump = %q, want empty sock", string(data))
 	}
 
 	// Planner/worker/fixer path: shared executor without adapter injection must

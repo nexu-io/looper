@@ -2802,7 +2802,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
 		reviewRequestBypassReason = "follow_up_new_head"
 	}
-	reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	commentOnlyCompletion := r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
@@ -3014,7 +3014,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
-		reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 		if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
 			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 				return checkpoint, err
@@ -3082,7 +3082,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
-	reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
 		if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 			return checkpoint, err
@@ -3152,7 +3152,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
-	reviewPolicy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	reviewPolicy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if cleanReviewNoopSummary(pending.Summary) && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
 		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 	}
@@ -3249,7 +3249,7 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return ReviewMarkerResult{}, err
 	}
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
-	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Loop.MetadataJSON))
+	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON))
 	allowCleanComment := sameReviewAuthorLogin(currentLogin, prAuthorLogin)
 	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
@@ -3431,7 +3431,7 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 		shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, marker.Event, outcome)
 		if err := r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels); err != nil {
 			return err
@@ -3458,7 +3458,7 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 	}
-	policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
 	return r.applyCleanSpecLabelTransition(ctx, input, checkpoint, detail, shouldTransitionSpecLabels)
 }
@@ -3542,7 +3542,7 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 	if resolvePullRequestPhase(detail.Labels) == "spec" {
 		return nil, nil
 	}
-	if r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
+	if r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
 		return nil, nil
 	}
 	autoMergeCfg := r.reviewerAutoMergeConfigForProject(input.Project.ID)
@@ -3571,7 +3571,7 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 }
 
 func (r *Runner) publishCleanReviewWithoutCriteria(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail) (*criteriaPublishResult, error) {
-	policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if policy.Clean != config.ReviewerReviewEventApprove {
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return nil, err
@@ -4399,8 +4399,28 @@ func (r *Runner) allowedReviewEventsForPolicy(policy config.ReviewerReviewEvents
 	return events
 }
 
-func (r *Runner) effectiveReviewEvents(metadataJSON *string) config.ReviewerReviewEventsConfig {
+// reviewEventsForProject returns the effective clean/blocking review-events policy
+// for a project, consulting ProjectRoleConfigs so project-level APPROVE /
+// REQUEST_CHANGES overrides are not lost under a global COMMENT default.
+func (r *Runner) reviewEventsForProject(projectID string) config.ReviewerReviewEventsConfig {
 	policy := r.reviewEvents
+	if r.projectRoleConfig == nil {
+		return policy
+	}
+	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+	if roles.Reviewer.Behavior.ReviewEvents.Clean != "" {
+		policy.Clean = roles.Reviewer.Behavior.ReviewEvents.Clean
+	}
+	if roles.Reviewer.Behavior.ReviewEvents.Blocking != "" {
+		policy.Blocking = roles.Reviewer.Behavior.ReviewEvents.Blocking
+	}
+	return policy
+}
+
+func (r *Runner) effectiveReviewEvents(projectID string, metadataJSON *string) config.ReviewerReviewEventsConfig {
+	// Prefer snapshotted loop metadata when present; otherwise use the live
+	// per-project policy so newly auto-discovered loops honor project overrides.
+	policy := r.reviewEventsForProject(projectID)
 	meta := parseJSONObject(metadataJSON)
 	if reviewEvents, ok := meta["reviewEvents"].(map[string]any); ok {
 		if clean, ok := stringFromAny(reviewEvents["clean"]); ok && strings.TrimSpace(clean) != "" {
@@ -4635,7 +4655,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			text := string(encoded)
 			metadataJSONSource = &text
 		}
-		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, repo, prNumber)
+		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, project.ID, repo, prNumber)
 		if err != nil {
 			return loopUpsertResult{}, err
 		}
@@ -4655,7 +4675,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		return loopUpsertResult{}, err
 	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
-	metadataJSON, err := r.ensureLoopMetadataJSON(nil, repo, prNumber)
+	metadataJSON, err := r.ensureLoopMetadataJSON(nil, project.ID, repo, prNumber)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
@@ -5856,7 +5876,7 @@ func loopEnabledMetadataMissing(meta map[string]any) bool {
 	return true
 }
 
-func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber int64) (string, error) {
+func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64) (string, error) {
 	meta := parseJSONObject(current)
 	loopMeta, _ := meta["loop"].(map[string]any)
 	if loopMeta == nil {
@@ -5892,6 +5912,10 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 	if reviewEventsMeta == nil {
 		reviewEventsMeta = map[string]any{}
 	}
+	// Snapshot the per-project policy (not only the runner-wide global default)
+	// so Forgejo projects with clean=APPROVE / blocking=REQUEST_CHANGES keep
+	// those outcomes in loop metadata and the trusted proxy policy.
+	projectReviewEvents := r.reviewEventsForProject(projectID)
 	if cleanRaw, present := reviewEventsMeta["clean"]; present {
 		clean, ok := cleanRaw.(string)
 		if !ok {
@@ -5901,7 +5925,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 			return "", fmt.Errorf("reviewEvents.clean must be COMMENT or APPROVE")
 		}
 	} else {
-		reviewEventsMeta["clean"] = string(r.reviewEvents.Clean)
+		reviewEventsMeta["clean"] = string(projectReviewEvents.Clean)
 	}
 	if blockingRaw, present := reviewEventsMeta["blocking"]; present {
 		blocking, ok := blockingRaw.(string)
@@ -5912,7 +5936,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, repo string, prNumber i
 			return "", fmt.Errorf("reviewEvents.blocking must be COMMENT or REQUEST_CHANGES")
 		}
 	} else {
-		reviewEventsMeta["blocking"] = string(r.reviewEvents.Blocking)
+		reviewEventsMeta["blocking"] = string(projectReviewEvents.Blocking)
 	}
 	meta["reviewEvents"] = reviewEventsMeta
 	meta["loop"] = loopMeta
