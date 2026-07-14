@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +238,43 @@ func TestNewForgejoClientFromConfigReadsTrustedEnvFile(t *testing.T) {
 	}
 	if client.token != "file-token" {
 		t.Fatalf("client.token = %q, want file-token from trusted env file", client.token)
+	}
+}
+
+func TestWriteTrustedLooperWrapperInjectsEnvOnlyIntoChild(t *testing.T) {
+	realLooper := filepath.Join(t.TempDir(), "real-looper")
+	// Print whether LOOPER_TRUSTED_ENV_FILE is set and whether the token is readable.
+	script := "#!/bin/sh\nif [ -n \"$LOOPER_TRUSTED_ENV_FILE\" ]; then printf 'path=%s\\n' \"$LOOPER_TRUSTED_ENV_FILE\"; fi\nif [ -n \"$LOOPER_TRUSTED_ENV_FILE\" ] && [ -f \"$LOOPER_TRUSTED_ENV_FILE\" ]; then grep '^FORGEJO_TOKEN=' \"$LOOPER_TRUSTED_ENV_FILE\"; fi\n"
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+
+	wrapperPath, cleanup, err := WriteTrustedLooperWrapper(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"})
+	if err != nil {
+		t.Fatalf("WriteTrustedLooperWrapper() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	if wrapperPath == "" || wrapperPath == realLooper {
+		t.Fatalf("wrapperPath = %q, want distinct shim path", wrapperPath)
+	}
+
+	// Parent process must not see the trusted env file path.
+	if got := os.Getenv(TrustedEnvFileEnv); got != "" {
+		t.Fatalf("parent %s = %q, want empty", TrustedEnvFileEnv, got)
+	}
+
+	cmd := exec.Command(wrapperPath)
+	// Ensure the child does not inherit a leaked trusted-env path from the test process.
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper exec error = %v, out=%s", err, out)
+	}
+	if !strings.Contains(string(out), "FORGEJO_TOKEN=secret-token") {
+		t.Fatalf("wrapper child output = %q, want trusted token via LOOPER_TRUSTED_ENV_FILE", string(out))
+	}
+	if !strings.Contains(string(out), "path=") {
+		t.Fatalf("wrapper child output = %q, want LOOPER_TRUSTED_ENV_FILE path set for child", string(out))
 	}
 }
 

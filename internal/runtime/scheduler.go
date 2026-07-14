@@ -183,8 +183,8 @@ type plannerGitHubAdapter struct {
 }
 
 // providerTrustedEnv collects configured provider tokenEnv values from the
-// daemon process environment so trusted wrappers (review submit) can authenticate
-// without copying secrets into the agent process env.
+// daemon process environment so the trusted looper shim can inject them into
+// real `looper` child processes without exposing secrets to agent envs.
 func providerTrustedEnv(cfg config.Config) map[string]string {
 	env := map[string]string{}
 	for _, provider := range cfg.Providers {
@@ -203,6 +203,26 @@ func providerTrustedEnv(cfg config.Config) map[string]string {
 		return nil
 	}
 	return env
+}
+
+// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path. When
+// provider tokens are available, it installs a shim that injects
+// LOOPER_TRUSTED_ENV_FILE only into the real looper child. Agents receive the
+// shim path in prompts, never the trusted-env file path in their environment.
+func resolveTrustedLooperCLIPath(cfg config.Config, logger bootstrap.Logger) string {
+	realLooper := strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+	trusted := providerTrustedEnv(cfg)
+	if realLooper == "" || len(trusted) == 0 {
+		return realLooper
+	}
+	wrapperPath, _, err := forge.WriteTrustedLooperWrapper(realLooper, trusted)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("trusted looper wrapper install failed; agents will use the real looper path without provider token injection", map[string]any{"error": err.Error()})
+		}
+		return realLooper
+	}
+	return wrapperPath
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
@@ -2570,15 +2590,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
 
+	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
+
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
-			Vendor: *cfg.Agent.Vendor,
-			Model:  cfg.Agent.Model,
-			Params: cfg.Agent.Params,
-			Env:    cfg.Agent.Env,
-			// Provider tokens for trusted wrappers (looper review submit) stay out of
-			// the agent process env and are exposed via LOOPER_TRUSTED_ENV_FILE only.
-			TrustedEnv:          providerTrustedEnv(cfg),
+			Vendor:              *cfg.Agent.Vendor,
+			Model:               cfg.Agent.Model,
+			Params:              cfg.Agent.Params,
+			Env:                 cfg.Agent.Env,
 			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 			// Env-gated (not a config field yet) so it stays zero-risk to the schema
 			// / parity fixtures until the codex --json path is proven end-to-end.
@@ -2673,7 +2692,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 		Disclosure:              &cfg.Disclosure,
 		AgentRuntime:            agentRuntime,
 		CustomInstructions:      &cfg,
-		LooperCLIPath:           derefString(cfg.Tools.LooperPath),
+		LooperCLIPath:           looperCLIPath,
 		AgentModel:              cfg.Agent.Model,
 		AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,

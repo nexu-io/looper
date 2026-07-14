@@ -856,3 +856,121 @@ func TestReviewSubmitProjectForRepoResolvesAPIManagedForgejoFromSQLite(t *testin
 		t.Fatalf("reviewSubmitProjectForRepo() = %#v, want api-forgejo forgejo binding", matched)
 	}
 }
+
+func TestReviewSubmitProjectForRepoCombinesFileAndStorageCandidates(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	githubRepo := filepath.Join(root, "github-checkout")
+	forgejoRepo := filepath.Join(root, "forgejo-checkout")
+	for _, path := range []string{githubRepo, forgejoRepo} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+	}
+	dbPath := filepath.Join(root, "looper.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+
+	now := "2026-07-14T00:00:00.000Z"
+	metadata := `{"provider":"forgejo","repo":"acme/looper","source":"api"}`
+	if err := storage.NewRepositories(coordinator.DB()).Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "api-forgejo", Name: "API Forgejo", RepoPath: forgejoRepo, MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	mixedTokenEnv := "LOOPER_TEST_MIXED_PROJECT_TOKEN"
+	cfg := config.Config{
+		Storage: config.StorageConfig{DBPath: dbPath},
+		Providers: []config.ProviderConfig{{
+			ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: &mixedTokenEnv,
+		}},
+		// Single file-config match for the same owner/repo must not hide the storage project.
+		Projects: []config.ProjectRefConfig{
+			{ID: "github-acme", Name: "GitHub", Repo: "acme/looper", RepoPath: githubRepo, Provider: "github"},
+		},
+	}
+
+	matched, err := reviewSubmitProjectForRepo(cfg, "acme/looper", forgejoRepo)
+	if err != nil {
+		t.Fatalf("reviewSubmitProjectForRepo(forgejo cwd) error = %v", err)
+	}
+	if matched == nil || matched.ID != "api-forgejo" || matched.Provider != "forgejo" {
+		t.Fatalf("reviewSubmitProjectForRepo(forgejo cwd) = %#v, want api-forgejo", matched)
+	}
+
+	matched, err = reviewSubmitProjectForRepo(cfg, "acme/looper", githubRepo)
+	if err != nil {
+		t.Fatalf("reviewSubmitProjectForRepo(github cwd) error = %v", err)
+	}
+	if matched == nil || matched.ID != "github-acme" {
+		t.Fatalf("reviewSubmitProjectForRepo(github cwd) = %#v, want github-acme", matched)
+	}
+}
+
+func TestReviewSubmitGatewayUsesStorageProjectRoles(t *testing.T) {
+	// t.Setenv is incompatible with t.Parallel.
+	tokenEnv := "LOOPER_TEST_FORGEJO_STORAGE_ROLES_TOKEN"
+	t.Setenv(tokenEnv, "test-token")
+
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	dbPath := filepath.Join(root, "looper.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+
+	now := "2026-07-14T00:00:00.000Z"
+	// Project-specific policy: do not require a review request before publish.
+	metadata := `{"provider":"forgejo","repo":"acme/looper","source":"api","roles":{"reviewer":{"discovery":{"triggers":{"requireReviewRequest":false,"labels":["looper:review"]}}}}}`
+	if err := storage.NewRepositories(coordinator.DB()).Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "api-forgejo", Name: "API Forgejo", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	cfg := config.Config{
+		Storage: config.StorageConfig{DBPath: dbPath},
+		Providers: []config.ProviderConfig{{
+			ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: &tokenEnv,
+		}},
+		// Global policy still requires review requests; storage project must win.
+		Roles: config.RoleConfigs{
+			Reviewer: config.ReviewerRoleConfig{
+				Discovery: config.ReviewerRoleDiscoveryConfig{
+					Triggers: config.ReviewerRoleTriggersConfig{RequireReviewRequest: true},
+				},
+			},
+		},
+	}
+
+	gateway, err := reviewSubmitGatewayForConfig(cfg, "acme/looper", repoPath, nil)
+	if err != nil {
+		t.Fatalf("reviewSubmitGatewayForConfig() error = %v", err)
+	}
+	forgeGateway, ok := gateway.(forgejoReviewSubmitGateway)
+	if !ok {
+		t.Fatalf("gateway type = %T, want forgejoReviewSubmitGateway", gateway)
+	}
+	if forgeGateway.requireReviewRequest {
+		t.Fatalf("requireReviewRequest = true, want false from storage project roles")
+	}
+	if got := strings.Join(forgeGateway.labels, ","); got != "looper:review" {
+		t.Fatalf("labels = %q, want looper:review from storage project roles", got)
+	}
+}

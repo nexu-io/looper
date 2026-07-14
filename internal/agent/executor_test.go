@@ -195,31 +195,15 @@ func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *tes
 	}
 }
 
-func TestBuildCommandEnvWithTrustedExposesPathNotSecrets(t *testing.T) {
+func TestBuildCommandEnvStripsTrustedEnvFilePath(t *testing.T) {
 	t.Setenv("PATH", "/safe/bin")
-	t.Setenv("FORGEJO_TOKEN", "must-not-appear-in-agent-env")
+	t.Setenv(forge.TrustedEnvFileEnv, "/tmp/must-not-leak-to-agent")
 
-	envSlice, path, err := buildCommandEnvWithTrusted("/tmp/worktree", "hello", map[string]string{"FORGEJO_TOKEN": "secret-token"})
-	if err != nil {
-		t.Fatalf("buildCommandEnvWithTrusted() error = %v", err)
-	}
-	if strings.TrimSpace(path) == "" {
-		t.Fatal("trusted env path is empty")
-	}
-	t.Cleanup(func() { _ = os.Remove(path) })
-	env := envSliceToMap(envSlice)
-	if _, ok := env["FORGEJO_TOKEN"]; ok {
-		t.Fatalf("FORGEJO_TOKEN present in agent env, want only LOOPER_TRUSTED_ENV_FILE")
-	}
-	if got := env[forge.TrustedEnvFileEnv]; got != path {
-		t.Fatalf("%s = %q, want %q", forge.TrustedEnvFileEnv, got, path)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(trusted env) error = %v", err)
-	}
-	if !strings.Contains(string(raw), "FORGEJO_TOKEN=secret-token") {
-		t.Fatalf("trusted env file = %q, want FORGEJO_TOKEN value", string(raw))
+	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{
+		forge.TrustedEnvFileEnv: "/tmp/also-must-not-leak",
+	}))
+	if _, ok := env[forge.TrustedEnvFileEnv]; ok {
+		t.Fatalf("%s present in agent env; trusted tokens must use the looper shim channel", forge.TrustedEnvFileEnv)
 	}
 }
 

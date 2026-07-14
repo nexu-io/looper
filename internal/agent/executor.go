@@ -80,14 +80,10 @@ var inheritedAgentEnvKeys = []string{
 }
 
 type ExecutorConfig struct {
-	Vendor config.AgentVendor
-	Model  *string
-	Params map[string]any
-	Env    map[string]string
-	// TrustedEnv holds secrets for trusted Looper CLI wrappers such as
-	// `looper review submit`. Values are written to a temp file and exposed only
-	// via LOOPER_TRUSTED_ENV_FILE so they never enter the agent process env.
-	TrustedEnv          map[string]string
+	Vendor              config.AgentVendor
+	Model               *string
+	Params              map[string]any
+	Env                 map[string]string
 	NativeResumeEnabled bool
 	// LiveToolEvents runs codex with `--json` and parses its JSONL event stream so
 	// the live status card can show a structured tool-call feed ("✅ <cmd>"). Only
@@ -290,11 +286,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmdEnv, trustedEnvPath, err := buildCommandEnvWithTrusted(input.WorkingDirectory, spawnPrompt, e.config.TrustedEnv, e.config.Env, input.Env)
-	if err != nil {
-		return nil, err
-	}
-	cmd.Env = cmdEnv
+	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -320,7 +312,6 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		nativeSessionID:    resume.SessionID,
 		nativeResumeMode:   resume.Mode,
 		nativeResumeStatus: resume.Status,
-		trustedEnvPath:     trustedEnvPath,
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
 	}
@@ -329,7 +320,6 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 	if err := cmd.Start(); err != nil {
-		x.cleanupTrustedEnv()
 		if resume.Enabled {
 			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
 				// best-effort marker only; command fallback is the important recovery behavior
@@ -338,11 +328,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			cmdEnv, trustedEnvPath, envErr := buildCommandEnvWithTrusted(input.WorkingDirectory, input.Prompt, e.config.TrustedEnv, e.config.Env, input.Env)
-			if envErr != nil {
-				return nil, fmt.Errorf("start agent command: %w (native resume fallback after: %v)", envErr, err)
-			}
-			cmd.Env = cmdEnv
+			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 			x.mu.Lock()
@@ -353,10 +339,8 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			x.nativeResumeMode = "checkpoint_restart"
 			x.nativeResumeStatus = "fallback_started"
 			x.nativeResumeError = err.Error()
-			x.trustedEnvPath = trustedEnvPath
 			x.mu.Unlock()
 			if startErr := cmd.Start(); startErr != nil {
-				x.cleanupTrustedEnv()
 				return nil, fmt.Errorf("start agent command: %w (native resume fallback after: %v)", startErr, err)
 			}
 		} else {
@@ -407,8 +391,6 @@ type execution struct {
 	nativeResumeStatus      string
 	nativeResumeError       string
 
-	trustedEnvPath string
-
 	killCh chan string
 	doneCh chan execOutcome
 }
@@ -420,19 +402,6 @@ func (x *execution) Wait(ctx context.Context) (Result, error) {
 	case out := <-x.doneCh:
 		x.doneCh <- out
 		return out.result, out.err
-	}
-}
-
-func (x *execution) cleanupTrustedEnv() {
-	if x == nil {
-		return
-	}
-	x.mu.Lock()
-	path := x.trustedEnvPath
-	x.trustedEnvPath = ""
-	x.mu.Unlock()
-	if strings.TrimSpace(path) != "" {
-		_ = os.Remove(path)
 	}
 }
 
@@ -653,7 +622,6 @@ func (x *execution) run(ctx context.Context) {
 	}
 
 	x.persistFinal(status, result, errorMessage, endedAtISO)
-	x.cleanupTrustedEnv()
 	eventType := "agent.completed"
 	if status == "timeout" {
 		switch timeoutType {
@@ -721,19 +689,13 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmdEnv, trustedEnvPath, err := buildCommandEnvWithTrusted(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.TrustedEnv, x.executor.config.Env, x.input.Env)
-	if err != nil {
-		return Result{}, "", false
-	}
-	cmd.Env = cmdEnv
+	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 
 	now := x.executor.now().UTC()
 	nowISO := eventlog.FormatJavaScriptISOString(now)
 	x.mu.Lock()
-	// Replace the previous trusted env file only after the new one is ready.
-	previousTrustedEnv := x.trustedEnvPath
 	x.command = command
 	x.args = args
 	x.process = cmd
@@ -744,13 +706,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.nativeResumeMode = "checkpoint_restart"
 	x.nativeResumeStatus = "fallback_started"
 	x.nativeResumeError = nativeError
-	x.trustedEnvPath = trustedEnvPath
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	x.mu.Unlock()
-	if strings.TrimSpace(previousTrustedEnv) != "" && previousTrustedEnv != trustedEnvPath {
-		_ = os.Remove(previousTrustedEnv)
-	}
 	x.persistStatus("running", nil, nil, nil)
 	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
@@ -1534,12 +1492,14 @@ func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[s
 			envMap[key] = value
 		}
 	}
-	// Never inherit trusted-env path from the ambient daemon process; only the
-	// per-run materialization passed via envSources should expose it.
+	// Never expose the trusted-env path to agent processes. Secrets for
+	// `looper review submit` are injected only by the trusted looper shim.
 	delete(envMap, forge.TrustedEnvFileEnv)
 	for _, source := range envSources {
 		maps.Copy(envMap, source)
 	}
+	// Re-delete after source merge so caller env maps cannot reintroduce it.
+	delete(envMap, forge.TrustedEnvFileEnv)
 	for _, key := range unsafeAgentEnvKeys {
 		delete(envMap, key)
 	}
@@ -1549,23 +1509,6 @@ func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[s
 	envMap["LOOPER_PROMPT"] = prompt
 	envMap[completionMarkerEnv] = CompletionMarkerPrefix
 	return envMapToSlice(envMap)
-}
-
-func buildCommandEnvWithTrusted(workingDirectory string, prompt string, trustedEnv map[string]string, envSources ...map[string]string) ([]string, string, error) {
-	sources := make([]map[string]string, 0, len(envSources)+1)
-	trustedPath := ""
-	if len(trustedEnv) > 0 {
-		path, err := forge.WriteTrustedEnvFile(trustedEnv)
-		if err != nil {
-			return nil, "", fmt.Errorf("materialize trusted env for agent wrappers: %w", err)
-		}
-		if strings.TrimSpace(path) != "" {
-			trustedPath = path
-			sources = append(sources, map[string]string{forge.TrustedEnvFileEnv: path})
-		}
-	}
-	sources = append(sources, envSources...)
-	return buildCommandEnv(workingDirectory, prompt, sources...), trustedPath, nil
 }
 
 func BuildCommandEnv(workingDirectory string, prompt string, envSources ...map[string]string) []string {

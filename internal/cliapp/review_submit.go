@@ -215,7 +215,10 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 		if err != nil {
 			return nil, err
 		}
-		roles := config.ProjectRoleConfigs(cfg, matched.ID)
+		// Include storage-materialized projects so ProjectRoleConfigs sees
+		// project-specific roles instead of falling back to global defaults.
+		roleCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
+		roles := config.ProjectRoleConfigs(roleCfg, matched.ID)
 		return forgejoReviewSubmitGateway{client: client, stamper: disclosure.FromConfig(cfg), requireReviewRequest: roles.Reviewer.Discovery.Triggers.RequireReviewRequest, labels: append([]string(nil), roles.Reviewer.Discovery.Triggers.Labels...), labelMode: roles.Reviewer.Discovery.Triggers.LabelMode}, nil
 	}
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {
@@ -229,22 +232,50 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 // prefer the project whose registered checkout or worktree contains cwd before
 // treating the repository as ambiguous.
 //
-// File config is checked first. When no match is found, the SQLite project
-// catalog is materialized so API/CLI-added Forgejo bindings still resolve to a
-// native Forgejo review-submit gateway.
+// File-config and SQLite catalog projects are combined before matching so a
+// single file-config same-repo hit cannot hide an API-managed project that CWD
+// would otherwise select unambiguously.
 func reviewSubmitProjectForRepo(cfg config.Config, repo, cwd string) (*config.ProjectRefConfig, error) {
-	matched, err := reviewSubmitMatchProject(cfg.Projects, repo, cwd)
-	if err != nil || matched != nil {
-		return matched, err
+	candidates := append([]config.ProjectRefConfig(nil), cfg.Projects...)
+	seen := make(map[string]struct{}, len(candidates))
+	for _, project := range candidates {
+		if id := strings.TrimSpace(project.ID); id != "" {
+			seen[id] = struct{}{}
+		}
 	}
 	dbProjects, err := loadReviewSubmitProjectsFromStorage(cfg)
 	if err != nil {
 		return nil, err
 	}
-	if len(dbProjects) == 0 {
-		return nil, nil
+	for _, project := range dbProjects {
+		id := strings.TrimSpace(project.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		candidates = append(candidates, project)
 	}
-	return reviewSubmitMatchProject(dbProjects, repo, cwd)
+	return reviewSubmitMatchProject(candidates, repo, cwd)
+}
+
+// reviewSubmitConfigWithMatchedProject returns a config snapshot that includes
+// the matched project so ProjectRoleConfigs can resolve storage-materialized
+// role overrides when the project is absent from file config.
+func reviewSubmitConfigWithMatchedProject(cfg config.Config, matched *config.ProjectRefConfig) config.Config {
+	if matched == nil {
+		return cfg
+	}
+	matchedID := strings.TrimSpace(matched.ID)
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.ID) == matchedID {
+			return cfg
+		}
+	}
+	cfg.Projects = append(append([]config.ProjectRefConfig(nil), cfg.Projects...), *matched)
+	return cfg
 }
 
 func reviewSubmitMatchProject(projectList []config.ProjectRefConfig, repo, cwd string) (*config.ProjectRefConfig, error) {
