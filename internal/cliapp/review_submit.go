@@ -552,6 +552,17 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 	if dbPath == "" {
 		return false, nil
 	}
+	// Match loadReviewSubmitProjectsFromStorage: only probe an already-
+	// materialized daemon DB. OpenSQLiteDB creates missing files without
+	// migrations, which would turn an optional authority lookup into
+	// "no such table" failures for review-submit callers that only set
+	// storage.dbPath (CLI harnesses, one-shot agent config).
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("validate trusted review request bypass: %w", err)
+	}
 	db, err := storage.OpenSQLiteDB(cmd.Context(), dbPath)
 	if err != nil {
 		return false, fmt.Errorf("validate trusted review request bypass: %w", err)
