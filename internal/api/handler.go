@@ -2773,11 +2773,13 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	}
 	// Fall back to the latest run error/summary when no queue error is present
 	// (e.g. checkpoint-only manual holds or failed runs without a parked queue item).
+	// Summary is only used for failure-like runs: successful completeRun summaries
+	// must not appear as lastFailureReason on queued/running or --all listings.
 	if view.LastFailureReason == nil || strings.TrimSpace(*view.LastFailureReason) == "" {
 		if latestRun != nil {
 			if latestRun.ErrorMessage != nil && strings.TrimSpace(*latestRun.ErrorMessage) != "" {
 				view.LastFailureReason = latestRun.ErrorMessage
-			} else if latestRun.Summary != nil && strings.TrimSpace(*latestRun.Summary) != "" {
+			} else if shouldUseRunSummaryAsFailureReason(latestRun) && latestRun.Summary != nil && strings.TrimSpace(*latestRun.Summary) != "" {
 				view.LastFailureReason = latestRun.Summary
 			}
 		}
@@ -2792,6 +2794,21 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status
+	}
+}
+
+// shouldUseRunSummaryAsFailureReason reports whether a run's Summary is safe to
+// surface as lastFailureReason. Successful completeRun summaries must not be
+// treated as failures for queued/running loops or ps --all completed rows.
+func shouldUseRunSummaryAsFailureReason(run *storage.RunRecord) bool {
+	if run == nil {
+		return false
+	}
+	switch domain.RunStatus(strings.TrimSpace(run.Status)) {
+	case domain.RunStatusFailed, domain.RunStatusInterrupted, domain.RunStatusParseFailed:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -569,6 +569,9 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 	if diagnosis.RecommendedAction == "" {
 		diagnosis.RecommendedAction = recommendedActionForState(state)
 	}
+	// Expand <seq> before emitting JSON/human output so operators and scripts
+	// never see the literal placeholder outside writeHumanLoopInspect.
+	diagnosis.RecommendedAction = formatActionWithSeq(diagnosis.RecommendedAction, loop.Seq)
 	return diagnosis
 }
 
@@ -861,7 +864,8 @@ func writeHumanLoopFailures(w io.Writer, output loopFailuresOutput) error {
 		return err
 	}
 	for _, item := range output.Items {
-		if _, err := fmt.Fprintf(w, "#%d\t%s\t%s\tclass=%s\tretryable=%s\t%s\n", item.Loop.Seq, item.Loop.Type, item.Loop.Target.Label, item.Diagnosis.FailureClass, humanBoolPtr(item.Diagnosis.Retryable), item.Diagnosis.RecommendedAction); err != nil {
+		action := formatActionWithSeq(item.Diagnosis.RecommendedAction, item.Loop.Seq)
+		if _, err := fmt.Fprintf(w, "#%d\t%s\t%s\tclass=%s\tretryable=%s\t%s\n", item.Loop.Seq, item.Loop.Type, item.Loop.Target.Label, item.Diagnosis.FailureClass, humanBoolPtr(item.Diagnosis.Retryable), action); err != nil {
 			return err
 		}
 	}

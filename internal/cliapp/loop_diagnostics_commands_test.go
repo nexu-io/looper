@@ -230,6 +230,30 @@ func TestClassifyDiagnosticMessageManualIntervention(t *testing.T) {
 	}
 }
 
+func TestDiagnoseLoopExpandsRetrySeqPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	kind := "manual_intervention"
+	msg := "dirty worktree: uncommitted changes"
+	queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &msg, LastErrorKind: &kind}
+	run := &storage.RunRecord{Status: "failed", ErrorMessage: &msg}
+	got := diagnoseLoop(storage.LoopRecord{Seq: 42, Status: "paused"}, run, queue, loopDiagnosticMetadata{}, true)
+	if strings.Contains(got.RecommendedAction, "<seq>") {
+		t.Fatalf("RecommendedAction = %q, want expanded loop seq not literal <seq>", got.RecommendedAction)
+	}
+	if !strings.Contains(got.RecommendedAction, "looper retry 42") {
+		t.Fatalf("RecommendedAction = %q, want looper retry 42", got.RecommendedAction)
+	}
+
+	paused := diagnoseLoop(storage.LoopRecord{Seq: 7, Status: "paused"}, nil, nil, loopDiagnosticMetadata{}, false)
+	if strings.Contains(paused.RecommendedAction, "<seq>") {
+		t.Fatalf("paused RecommendedAction = %q, want expanded seq", paused.RecommendedAction)
+	}
+	if !strings.Contains(paused.RecommendedAction, "looper unpause 7") || !strings.Contains(paused.RecommendedAction, "looper describe 7") {
+		t.Fatalf("paused RecommendedAction = %q, want unpause/describe with seq 7", paused.RecommendedAction)
+	}
+}
+
 func TestDiagnoseLoopPreservesErrorKindWhenQueueIsManualHold(t *testing.T) {
 	t.Parallel()
 
