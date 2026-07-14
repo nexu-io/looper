@@ -310,6 +310,38 @@ func TestDiagnoseLoopPreservesErrorKindWhenQueueIsManualHold(t *testing.T) {
 	}
 }
 
+func TestDiagnoseLoopCheckpointOnlyManualHoldUsesResumePolicy(t *testing.T) {
+	t.Parallel()
+
+	// Paused loops included via checkpoint resumePolicy with no parked queue
+	// must classify as manual_intervention, not unknown.
+	msg := "dirty worktree: uncommitted changes"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	run := &storage.RunRecord{Status: "failed", ErrorMessage: &msg, CheckpointJSON: &checkpoint}
+
+	got := diagnoseLoop(storage.LoopRecord{Seq: 9, Status: "paused"}, run, nil, loopDiagnosticMetadata{}, true)
+	if got.FailureClass != "manual_intervention" {
+		t.Fatalf("FailureClass = %q, want manual_intervention for checkpoint-only hold", got.FailureClass)
+	}
+	if got.Retryable == nil || *got.Retryable {
+		t.Fatalf("Retryable = %#v, want false for manual_intervention", got.Retryable)
+	}
+	if !strings.Contains(got.RecommendedAction, "looper retry 9") {
+		t.Fatalf("RecommendedAction = %q, want operator-hold retry guidance for seq 9", got.RecommendedAction)
+	}
+	if got.Source != "run" || !strings.Contains(got.Message, "dirty worktree") {
+		t.Fatalf("diagnosis = %#v, want run-sourced dirty worktree message", got)
+	}
+
+	// Queue LastErrorKind still wins when present (do not overwrite with policy).
+	queueKind := "non_retryable"
+	queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &msg, LastErrorKind: &queueKind}
+	withQueue := diagnoseLoop(storage.LoopRecord{Seq: 9, Status: "paused"}, run, queue, loopDiagnosticMetadata{}, true)
+	if withQueue.FailureClass != "non_retryable" {
+		t.Fatalf("FailureClass = %q, want non_retryable from queue kind over resumePolicy", withQueue.FailureClass)
+	}
+}
+
 func TestDiagnoseLoopRunSelectorIgnoresLatestQueueKind(t *testing.T) {
 	t.Parallel()
 

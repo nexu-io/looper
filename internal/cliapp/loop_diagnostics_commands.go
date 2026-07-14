@@ -566,7 +566,16 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 	// FailureClass/Retryable come from the structured error kind + message.
 	// Queue status "manual_intervention" is an operator-hold signal, not the
 	// underlying failure class — keep them separate.
-	diagnosis := classifyDiagnosticMessage(message, queueErrorKind(diagnosisQueue))
+	// Checkpoint-only holds have no parked queue item, so queueErrorKind is
+	// empty; synthesize manual_intervention from the run resume policy so
+	// failures listing does not surface class=unknown for operator holds.
+	errorKind := queueErrorKind(diagnosisQueue)
+	if errorKind == "" && run != nil {
+		if policy := resumePolicyFromCheckpoint(run.CheckpointJSON); policy != nil && strings.TrimSpace(*policy) == "manual_intervention" {
+			errorKind = "manual_intervention"
+		}
+	}
+	diagnosis := classifyDiagnosticMessage(message, errorKind)
 	diagnosis.State = state
 	diagnosis.Source = source
 	if diagnosis.Message == "" {
