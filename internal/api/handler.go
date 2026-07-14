@@ -5038,7 +5038,9 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 
 	// Opt-in discard runs before requeue so git mutation stays outside the
-	// queue transaction. Active run/queue and terminal checks still apply.
+	// queue transaction. Every non-mutating retry blocker must pass first so a
+	// later precondition failure never leaves discarded worktree changes
+	// without creating a replacement queue item.
 	var worktreeDiscard *worktreeDiscardResult
 	if discardWorktreeChanges {
 		if services.Repositories == nil || services.Coordinator == nil {
@@ -5051,34 +5053,12 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if preflightLoop == nil {
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if strings.TrimSpace(preflightLoop.ProjectID) != "" {
-			if _, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, preflightLoop.ProjectID); err != nil {
-				return retryLoopResponse{}, err
+		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *preflightLoop, nowISO); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
 			}
-		}
-		if preflightLoop.Status == string(domain.LoopStatusStopped) || preflightLoop.Status == string(domain.LoopStatusTerminated) || preflightLoop.Status == string(domain.LoopStatusCompleted) {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", preflightLoop.Status, preflightLoop.ID)}
-		}
-		if preflightLoop.Type == string(domain.LoopTypeReviewer) {
-			if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(*preflightLoop); terminalMetadataStatus != "" {
-				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, preflightLoop.ID)}
-			}
-		}
-		runningRuns, err := services.Repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
-		if err != nil {
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-		}
-		for _, run := range runningRuns {
-			if run.LoopID == preflightLoop.ID {
-				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", preflightLoop.ID)}
-			}
-		}
-		activeQueue, err := services.Repositories.Queue.FindActiveByLoopID(ctx, preflightLoop.ID)
-		if err != nil {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-		}
-		if activeQueue != nil {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", preflightLoop.ID, activeQueue.ID)}
 		}
 		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
 		if discardErr != nil {
@@ -5104,49 +5084,13 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if loop == nil {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if strings.TrimSpace(loop.ProjectID) != "" {
-			if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
-				return retryResult{}, err
-			}
-		}
-		if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
-		}
-		if loop.Type == string(domain.LoopTypeReviewer) {
-			if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(*loop); terminalMetadataStatus != "" {
-				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
-			}
-		}
-		if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
-		}
-		runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
-		if err != nil {
+		if err := h.assertLoopRetryPreconditions(ctx, repos, *loop, nowISO); err != nil {
 			return retryResult{}, err
-		}
-		for _, run := range runningRuns {
-			if run.LoopID == loop.ID {
-				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", loop.ID)}
-			}
-		}
-		activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
-		if err != nil {
-			return retryResult{}, err
-		}
-		if activeQueue != nil {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", loop.ID, activeQueue.ID)}
 		}
 
 		target, targetErr := loopTargetFromRecordCompat(*loop)
 		if targetErr != nil {
 			return retryResult{}, targetErr
-		}
-		existing, err := repos.Loops.List(ctx)
-		if err != nil {
-			return retryResult{}, err
-		}
-		if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusQueued); uniqueErr != nil {
-			return retryResult{}, uniqueErr
 		}
 		latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -5194,6 +5138,8 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if !ok {
 			return retryResult{loop: *loop}, nil
 		}
+		// Dedupe is already asserted by assertLoopRetryPreconditions; re-check
+		// inside the transaction for races between preflight and commit.
 		if queueRecord.DedupeKey != "" {
 			activeDedupe, err := repos.Queue.FindActiveByDedupe(ctx, queueRecord.DedupeKey)
 			if err != nil {
@@ -5584,6 +5530,87 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	status, _ := loopMeta["status"].(string)
 	return status == "terminated" || status == "stopped" || status == "failed"
+}
+
+// assertLoopRetryPreconditions validates non-mutating retry blockers that must
+// pass before any destructive worktree discard or requeue. Callers that discard
+// dirty worktree state must invoke this first so a failed retry never deletes
+// local changes without creating a replacement queue item.
+func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
+	if strings.TrimSpace(loop.ProjectID) != "" {
+		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+			return err
+		}
+	}
+	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
+	}
+	if loop.Type == string(domain.LoopTypeReviewer) {
+		if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(loop); terminalMetadataStatus != "" {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
+		}
+	}
+	if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
+		return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
+	}
+	runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+	if err != nil {
+		return err
+	}
+	for _, run := range runningRuns {
+		if run.LoopID == loop.ID {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", loop.ID)}
+		}
+	}
+	activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if activeQueue != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", loop.ID, activeQueue.ID)}
+	}
+
+	target, targetErr := loopTargetFromRecordCompat(loop)
+	if targetErr != nil {
+		return targetErr
+	}
+	existing, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusQueued); uniqueErr != nil {
+		return uniqueErr
+	}
+
+	latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	dedupeKey := ""
+	if latestQueue != nil {
+		dedupeKey = latestQueue.DedupeKey
+	} else {
+		// Match requeue path: when there is no prior queue row, building the
+		// replacement record can fail on target/repo requirements and must
+		// block discard just as it blocks requeue.
+		built, ok, queueErr := buildQueuedLoopQueueRecordCompat(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		if queueErr != nil {
+			return queueErr
+		}
+		if ok {
+			dedupeKey = built.DedupeKey
+		}
+	}
+	if dedupeKey != "" {
+		activeDedupe, err := repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+		if err != nil {
+			return err
+		}
+		if activeDedupe != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while dedupe queue item %s is active", loop.ID, activeDedupe.ID)}
+		}
+	}
+	return nil
 }
 
 func terminalReviewerRetryMetadataStatus(loop storage.LoopRecord) string {

@@ -349,6 +349,92 @@ func TestHandlerLoopRetryWithoutDiscardDoesNotReportDiscard(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeWhenAgentNotConfigured(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.Agent.Vendor = nil
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_no_agent",
+		LoopID:    "loop_retry_discard_no_agent",
+		LoopSeq:   3116,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-no-agent",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3116/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "without config.agent.vendor") {
+		t.Fatalf("body = %s, want agent not configured rejection", recorder.Body.String())
+	}
+
+	// Destructive discard must not run when a later retry precondition fails.
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after failed discard retry = %q, want preserved untracked content", got)
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "README.md")); got != "dirty tracked\n" {
+		t.Fatalf("README.md after failed discard retry = %q, want preserved dirty tracked content", got)
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop after failed discard retry = %#v, %v, want paused", loop, err)
+	}
+}
+
+func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeOnUniqueLoopConflict(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_discard_unique"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_retry_discard_unique",
+		LoopSeq:   3117,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-unique",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// Another active fixer on the same PR target must block retry before discard.
+	repo := "acme/looper"
+	prNumber := int64(42)
+	prTarget := "pr:acme/looper:42"
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_retry_discard_unique_active", Seq: 3118, ProjectID: projectID,
+		Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(conflict) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3117/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "active loop already exists") {
+		t.Fatalf("body = %s, want unique loop conflict", recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after unique conflict = %q, want preserved", got)
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "README.md")); got != "dirty tracked\n" {
+		t.Fatalf("README.md after unique conflict = %q, want preserved", got)
+	}
+}
+
 type managedWorktreeSeed struct {
 	ProjectID string
 	LoopID    string
