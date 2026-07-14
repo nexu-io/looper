@@ -649,7 +649,13 @@ func (forgejo *ForgejoClient) ListPullRequestReviewComments(ctx context.Context,
 }
 
 func (forgejo *ForgejoClient) ListPullRequestReviews(ctx context.Context, number int64) ([]PullRequestReview, error) {
+	// Require both list and per-review comments: listing eagerly fetches
+	// /reviews/{id}/comments for marker verification. Matching health's
+	// nativeReviews gate avoids create-then-list failures on partial OpenAPI.
 	if err := forgejo.requireCapability(ctx, "nativeReviews", http.MethodGet, "/repos/{owner}/{repo}/pulls/{index}/reviews"); err != nil {
+		return nil, err
+	}
+	if err := forgejo.requireCapability(ctx, "nativeReviews", http.MethodGet, "/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments"); err != nil {
 		return nil, err
 	}
 	var output []forgejoPullRequestReview

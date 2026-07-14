@@ -97,6 +97,27 @@ func TestForgejoNativeReviewOperationsFailThroughCapabilityPath(t *testing.T) {
 	}
 }
 
+func TestListPullRequestReviewsRequiresReviewCommentsCapability(t *testing.T) {
+	// Instance advertises list/create reviews but not per-review comments.
+	// List must fail the capability gate before calling native endpoints so a
+	// later body-only submit cannot leave an untracked review after marker list fails.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/swagger.v1.json" {
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}}}}`))
+			return
+		}
+		t.Fatalf("native endpoint called despite missing review comments capability: %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+
+	client := newForgejoTestClient(t, server.URL)
+	_, err := client.ListPullRequestReviews(context.Background(), 2)
+	var capabilityErr *UnsupportedCapabilityError
+	if !errors.As(err, &capabilityErr) || capabilityErr.Capability != "nativeReviews" || capabilityErr.State != ProbeStateUnsupported {
+		t.Fatalf("error = %T %v, want unsupported nativeReviews capability", err, err)
+	}
+}
+
 func fmtSscanfPullNumber(path string, number *int64) (int, error) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	for index, part := range parts {
