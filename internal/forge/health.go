@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -133,7 +132,7 @@ func ProbeForgejoProvider(ctx context.Context, provider config.ProviderConfig, p
 
 	token := ""
 	if provider.TokenEnv != nil {
-		token = strings.TrimSpace(os.Getenv(strings.TrimSpace(*provider.TokenEnv)))
+		token = LookupProviderToken(*provider.TokenEnv)
 	}
 
 	versionResponse, versionErr := forgejoProbeGET(probeCtx, client, forgejoProbeURL(baseURL, "api/v1/version"), "", maxForgejoResponseBodyBytes)

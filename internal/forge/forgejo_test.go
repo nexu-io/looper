@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -216,6 +217,25 @@ func TestNewForgejoClientFromConfigReadsTokenEnv(t *testing.T) {
 	}
 	if client.Repository().ProviderID != "fj" || client.Repository().Repo != "acme/looper" {
 		t.Fatalf("Repository() = %#v", client.Repository())
+	}
+}
+
+func TestNewForgejoClientFromConfigReadsTrustedEnvFile(t *testing.T) {
+	// Clear ambient token so only the trusted file can supply auth.
+	t.Setenv("FORGEJO_TOKEN", "")
+	path, err := WriteTrustedEnvFile(map[string]string{"FORGEJO_TOKEN": "file-token"})
+	if err != nil {
+		t.Fatalf("WriteTrustedEnvFile() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	t.Setenv(TrustedEnvFileEnv, path)
+
+	client, err := NewForgejoClientFromConfig(config.ProviderConfig{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}, "acme/looper")
+	if err != nil {
+		t.Fatalf("NewForgejoClientFromConfig() error = %v", err)
+	}
+	if client.token != "file-token" {
+		t.Fatalf("client.token = %q, want file-token from trusted env file", client.token)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -191,6 +192,34 @@ func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *tes
 	}
 	if got := env[completionMarkerEnv]; got != CompletionMarkerPrefix {
 		t.Fatalf("%s = %q, want %q", completionMarkerEnv, got, CompletionMarkerPrefix)
+	}
+}
+
+func TestBuildCommandEnvWithTrustedExposesPathNotSecrets(t *testing.T) {
+	t.Setenv("PATH", "/safe/bin")
+	t.Setenv("FORGEJO_TOKEN", "must-not-appear-in-agent-env")
+
+	envSlice, path, err := buildCommandEnvWithTrusted("/tmp/worktree", "hello", map[string]string{"FORGEJO_TOKEN": "secret-token"})
+	if err != nil {
+		t.Fatalf("buildCommandEnvWithTrusted() error = %v", err)
+	}
+	if strings.TrimSpace(path) == "" {
+		t.Fatal("trusted env path is empty")
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	env := envSliceToMap(envSlice)
+	if _, ok := env["FORGEJO_TOKEN"]; ok {
+		t.Fatalf("FORGEJO_TOKEN present in agent env, want only LOOPER_TRUSTED_ENV_FILE")
+	}
+	if got := env[forge.TrustedEnvFileEnv]; got != path {
+		t.Fatalf("%s = %q, want %q", forge.TrustedEnvFileEnv, got, path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(trusted env) error = %v", err)
+	}
+	if !strings.Contains(string(raw), "FORGEJO_TOKEN=secret-token") {
+		t.Fatalf("trusted env file = %q, want FORGEJO_TOKEN value", string(raw))
 	}
 }
 

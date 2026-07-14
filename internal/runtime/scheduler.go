@@ -182,6 +182,29 @@ type plannerGitHubAdapter struct {
 	config  *config.Config
 }
 
+// providerTrustedEnv collects configured provider tokenEnv values from the
+// daemon process environment so trusted wrappers (review submit) can authenticate
+// without copying secrets into the agent process env.
+func providerTrustedEnv(cfg config.Config) map[string]string {
+	env := map[string]string{}
+	for _, provider := range cfg.Providers {
+		if provider.TokenEnv == nil {
+			continue
+		}
+		key := strings.TrimSpace(*provider.TokenEnv)
+		if key == "" {
+			continue
+		}
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			env[key] = value
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
 	provider, ok, err := forgejoProviderForRepo(cfg, repo)
 	if !ok || err != nil {
@@ -2549,10 +2572,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
-			Vendor:              *cfg.Agent.Vendor,
-			Model:               cfg.Agent.Model,
-			Params:              cfg.Agent.Params,
-			Env:                 cfg.Agent.Env,
+			Vendor: *cfg.Agent.Vendor,
+			Model:  cfg.Agent.Model,
+			Params: cfg.Agent.Params,
+			Env:    cfg.Agent.Env,
+			// Provider tokens for trusted wrappers (looper review submit) stay out of
+			// the agent process env and are exposed via LOOPER_TRUSTED_ENV_FILE only.
+			TrustedEnv:          providerTrustedEnv(cfg),
 			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 			// Env-gated (not a config field yet) so it stays zero-risk to the schema
 			// / parity fixtures until the codex --json path is proven end-to-end.

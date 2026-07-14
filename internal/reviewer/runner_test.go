@@ -7212,11 +7212,39 @@ func TestListOpenPullRequestsForDiscoveryCombinesForgejoLabelsAndReviewRequests(
 	if err != nil {
 		t.Fatalf("listOpenPullRequestsForDiscoveryWithPolicy() error = %v", err)
 	}
-	if len(pulls) != 3 || pulls[0].Number != 42 || pulls[1].Number != 43 || pulls[2].Number != 44 {
-		t.Fatalf("pulls = %#v, want deterministic deduplicated union [42, 43, 44]", pulls)
+	// Requested reviews are reserved first so label pages cannot starve them.
+	if len(pulls) != 3 || pulls[0].Number != 43 || pulls[1].Number != 44 || pulls[2].Number != 42 {
+		t.Fatalf("pulls = %#v, want requested-first union [43, 44, 42]", pulls)
 	}
 	if len(github.listCalls) != 1 || len(github.listReviewRequestedCalls) != 1 {
 		t.Fatalf("label calls = %#v, review-request calls = %#v, want one of each", github.listCalls, github.listReviewRequestedCalls)
+	}
+}
+
+func TestListOpenPullRequestsForDiscoveryDoesNotStarveRequestedReviewsWhenLabelsFillLimit(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{
+		currentLogin: "reviewer",
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"needs-review": {
+				{Number: 1, State: "OPEN", Labels: []string{"needs-review"}},
+				{Number: 2, State: "OPEN", Labels: []string{"needs-review"}},
+				{Number: 3, State: "OPEN", Labels: []string{"needs-review"}},
+			},
+		},
+		reviewRequestedPullRequests: []PullRequestSummary{
+			{Number: 99, State: "OPEN", ReviewRequests: []string{"reviewer"}},
+		},
+	}
+	runner := New(Options{GitHub: github})
+	policy := DiscoveryPolicy{RequireReviewRequest: true, Labels: []string{"needs-review"}, LabelMode: config.LabelModeAll, MatchAnyTrigger: true}
+
+	pulls, err := runner.listOpenPullRequestsForDiscoveryWithPolicy(context.Background(), "acme/looper", "/tmp/repo", 2, policy, "reviewer")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscoveryWithPolicy() error = %v", err)
+	}
+	if len(pulls) != 2 || pulls[0].Number != 99 || pulls[1].Number != 1 {
+		t.Fatalf("pulls = %#v, want requested PR 99 reserved before label filler", pulls)
 	}
 }
 

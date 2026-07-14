@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,9 +94,10 @@ func NewForgejoClientFromConfig(provider config.ProviderConfig, repo string, opt
 	if provider.TokenEnv == nil || strings.TrimSpace(*provider.TokenEnv) == "" {
 		return nil, fmt.Errorf("forgejo client: provider %q tokenEnv is required", provider.ID)
 	}
-	token := os.Getenv(strings.TrimSpace(*provider.TokenEnv))
+	tokenEnv := strings.TrimSpace(*provider.TokenEnv)
+	token := LookupProviderToken(tokenEnv)
 	if strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("forgejo client: environment variable %s is required", strings.TrimSpace(*provider.TokenEnv))
+		return nil, fmt.Errorf("forgejo client: environment variable %s is required", tokenEnv)
 	}
 	return NewForgejoClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindForgejo, BaseURL: provider.BaseURL, Repo: repo}, token, options...)
 }

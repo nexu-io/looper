@@ -1151,7 +1151,9 @@ func (r *Runner) listOpenPullRequestsForDiscoveryWithPolicy(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
-		return dedupePullRequestSummaries(append(labelPulls, requestedPulls...), defaultDiscoveryLimit(limit)), nil
+		// Reserve capacity for requested-review matches so a full label page
+		// cannot starve explicitly assigned PRs on every discovery tick.
+		return mergeLabelAndRequestedPullRequests(labelPulls, requestedPulls, defaultDiscoveryLimit(limit)), nil
 	}
 	if policy.RequireReviewRequest && strings.TrimSpace(currentLogin) != "" && len(labels) == 0 && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		return r.github.ListReviewRequestedPullRequests(ctx, ListReviewRequestedPullRequestsInput{Repo: repo, CWD: cwd, Limit: limit, Reviewer: currentLogin})
@@ -1203,6 +1205,44 @@ func dedupePullRequestSummaries(pulls []PullRequestSummary, limit int) []PullReq
 		if limit > 0 && len(result) >= limit {
 			break
 		}
+	}
+	return result
+}
+
+// mergeLabelAndRequestedPullRequests unions label and review-request discovery
+// results without letting the label source exhaust the limit first. Requested
+// reviews are reserved first; remaining slots are filled from label matches.
+func mergeLabelAndRequestedPullRequests(labelPulls, requestedPulls []PullRequestSummary, limit int) []PullRequestSummary {
+	if limit <= 0 {
+		return dedupePullRequestSummaries(append(requestedPulls, labelPulls...), 0)
+	}
+	requested := dedupePullRequestSummaries(requestedPulls, 0)
+	labels := dedupePullRequestSummaries(labelPulls, 0)
+	reserved := len(requested)
+	if reserved > limit {
+		reserved = limit
+	}
+	result := make([]PullRequestSummary, 0, limit)
+	seen := map[int64]struct{}{}
+	for _, pull := range requested {
+		if len(result) >= reserved {
+			break
+		}
+		if _, exists := seen[pull.Number]; exists {
+			continue
+		}
+		seen[pull.Number] = struct{}{}
+		result = append(result, pull)
+	}
+	for _, pull := range labels {
+		if len(result) >= limit {
+			break
+		}
+		if _, exists := seen[pull.Number]; exists {
+			continue
+		}
+		seen[pull.Number] = struct{}{}
+		result = append(result, pull)
 	}
 	return result
 }

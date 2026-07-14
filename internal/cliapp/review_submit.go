@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/outboundguard"
+	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -226,11 +228,30 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 // repository. When provider-qualified projects share the same owner/repo,
 // prefer the project whose registered checkout or worktree contains cwd before
 // treating the repository as ambiguous.
+//
+// File config is checked first. When no match is found, the SQLite project
+// catalog is materialized so API/CLI-added Forgejo bindings still resolve to a
+// native Forgejo review-submit gateway.
 func reviewSubmitProjectForRepo(cfg config.Config, repo, cwd string) (*config.ProjectRefConfig, error) {
+	matched, err := reviewSubmitMatchProject(cfg.Projects, repo, cwd)
+	if err != nil || matched != nil {
+		return matched, err
+	}
+	dbProjects, err := loadReviewSubmitProjectsFromStorage(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(dbProjects) == 0 {
+		return nil, nil
+	}
+	return reviewSubmitMatchProject(dbProjects, repo, cwd)
+}
+
+func reviewSubmitMatchProject(projectList []config.ProjectRefConfig, repo, cwd string) (*config.ProjectRefConfig, error) {
 	repo = strings.TrimSpace(repo)
 	var matches []*config.ProjectRefConfig
-	for index := range cfg.Projects {
-		project := &cfg.Projects[index]
+	for index := range projectList {
+		project := &projectList[index]
 		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
 			continue
 		}
@@ -252,6 +273,33 @@ func reviewSubmitProjectForRepo(cfg config.Config, repo, cwd string) (*config.Pr
 		return cwdMatches[0], nil
 	}
 	return nil, fmt.Errorf("review submit repository %s matches multiple configured projects", repo)
+}
+
+func loadReviewSubmitProjectsFromStorage(cfg config.Config) ([]config.ProjectRefConfig, error) {
+	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
+	if dbPath == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat project database for review submit: %w", err)
+	}
+	db, err := storage.OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open project database for review submit: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	records, err := storage.NewRepositories(db).Projects.List(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("list projects for review submit: %w", err)
+	}
+	materialized, err := projects.MaterializeCatalog(cfg, records)
+	if err != nil {
+		return nil, fmt.Errorf("materialize project catalog for review submit: %w", err)
+	}
+	return materialized, nil
 }
 
 func reviewSubmitCWDBelongsToProject(project config.ProjectRefConfig, cwd string) bool {

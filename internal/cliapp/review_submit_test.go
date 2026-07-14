@@ -813,3 +813,46 @@ func TestReviewSubmitGatewayForConfigUsesCWDMatchedForgejoProject(t *testing.T) 
 		t.Fatalf("gateway type = %T, want forgejoReviewSubmitGateway", gateway)
 	}
 }
+
+func TestReviewSubmitProjectForRepoResolvesAPIManagedForgejoFromSQLite(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	dbPath := filepath.Join(root, "looper.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+
+	now := "2026-07-14T00:00:00.000Z"
+	metadata := `{"provider":"forgejo","repo":"acme/looper","source":"api"}`
+	if err := storage.NewRepositories(coordinator.DB()).Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "api-forgejo", Name: "API Forgejo", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	tokenEnv := "LOOPER_TEST_FORGEJO_API_PROJECT_TOKEN"
+	cfg := config.Config{
+		Storage: config.StorageConfig{DBPath: dbPath},
+		Providers: []config.ProviderConfig{{
+			ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: &tokenEnv,
+		}},
+		// No file-config projects: binding lives only in SQLite.
+	}
+	matched, err := reviewSubmitProjectForRepo(cfg, "acme/looper", repoPath)
+	if err != nil {
+		t.Fatalf("reviewSubmitProjectForRepo() error = %v", err)
+	}
+	if matched == nil || matched.ID != "api-forgejo" || matched.Provider != "forgejo" {
+		t.Fatalf("reviewSubmitProjectForRepo() = %#v, want api-forgejo forgejo binding", matched)
+	}
+}
