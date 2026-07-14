@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/domain"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -823,6 +824,221 @@ func TestHandlerLoopRetryDiscardConflictsAfterStartSerializes(t *testing.T) {
 	if active == nil || active.Status != "queued" {
 		t.Fatalf("active queue after serialized start/retry = %#v, want queued", active)
 	}
+}
+
+// TestHandlerLoopRetryDiscardResolvesByPRNotSiblingBranch ensures that when the
+// sole (project, branch) worktree row points at a sibling PR's CreateWorktree
+// path (last writer won the unique branch index), discard+retry for PR 42 does
+// not reset/clean that sibling checkout.
+func TestHandlerLoopRetryDiscardResolvesByPRNotSiblingBranch(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_discard_pr_disambig"
+	branch := "feature/shared-head"
+
+	// Primary fixture creates ...-pr-42 for branch, then we retarget the row to a
+	// sibling PR-99 path (simulating another PR with the same head branch name
+	// overwriting the unique project+branch worktree record).
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_retry_discard_pr_disambig",
+		LoopSeq:   3125,
+		LoopType:  "fixer",
+		Branch:    branch,
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	siblingPath := filepath.Join(fixture.WorktreeRoot, fmt.Sprintf("looper-fix-%s-pr-99", projectID))
+	if err := os.MkdirAll(siblingPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(sibling) error = %v", err)
+	}
+	// Real git worktree so DiscardWorktreeChanges would succeed if wrongly selected.
+	runGitTest(t, fixture.RepoPath, "worktree", "add", "--force", siblingPath, branch)
+	if err := os.WriteFile(filepath.Join(siblingPath, "sibling-dirty.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(sibling dirty) error = %v", err)
+	}
+	existing, err := services.Repositories.Worktrees.GetByBranch(context.Background(), projectID, branch)
+	if err != nil || existing == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", existing, err)
+	}
+	existing.WorktreePath = siblingPath
+	existing.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), *existing); err != nil {
+		t.Fatalf("Worktrees.Upsert(retarget sibling) error = %v", err)
+	}
+
+	// Branch-only checkpoint (dirty prepare): no worktree path/id.
+	detailOnly := fmt.Sprintf(`{"detail":{"headRefName":%q,"state":"OPEN","prNumber":42},"pause":{"reason":"dirty_worktree"}}`, branch)
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_" + fixture.LoopID, LoopID: fixture.LoopID, Status: "failed", CheckpointJSON: &detailOnly,
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(detail-only) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3125/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	discard := data["worktreeDiscard"].(map[string]any)
+	// Must not discard the sibling PR-99 tree; no resolvable PR-42 worktree → no-op.
+	assertEqual(t, discard["discarded"], false)
+	assertEqual(t, discard["noOp"], true)
+
+	if got := readTestFile(t, filepath.Join(siblingPath, "sibling-dirty.txt")); got != "keep me\n" {
+		t.Fatalf("sibling worktree was discarded: sibling-dirty.txt = %q", got)
+	}
+	// Original PR-42 checkout dirt should also remain (we did not resolve it).
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("pr-42 dirty.txt = %q, want preserved (unresolved worktree)", got)
+	}
+}
+
+// TestHandlerLoopRetryDiscardRejectsAwaitingHuman ensures discard+retry refuses
+// awaiting_human loops so runtime HITL poll requeue cannot race after preflight
+// and leave a wiped worktree when the retry TX conflicts.
+func TestHandlerLoopRetryDiscardRejectsAwaitingHuman(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_awaiting_human",
+		LoopID:    "loop_retry_discard_awaiting_human",
+		LoopSeq:   3126,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-awaiting-human",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("GetByID() = %#v, %v", loop, err)
+	}
+	loop.Status = "awaiting_human"
+	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert(awaiting_human) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3126/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "awaiting_human") {
+		t.Fatalf("body = %s, want awaiting_human rejection", recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after awaiting_human reject = %q, want preserved", got)
+	}
+}
+
+// TestHandlerLoopCreateSharesTargetLockWithDiscard ensures POST /loops for the
+// same PR target takes the shared target mutex held by discard+retry, so create
+// cannot enqueue between preflight and git reset.
+func TestHandlerLoopCreateSharesTargetLockWithDiscard(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_discard_target_lock"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_retry_discard_target_lock",
+		LoopSeq:   3127,
+		LoopType:  "fixer",
+		Branch:    "feature/discard-target-lock",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// Align project metadata with create-loop validation (repo + no hold labels).
+	project, err := services.Repositories.Projects.GetByID(context.Background(), projectID)
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v", project, err)
+	}
+	meta, _ := json.Marshal(map[string]any{"worktreeRoot": fixture.WorktreeRoot, "repo": "acme/looper"})
+	metaJSON := string(meta)
+	project.MetadataJSON = &metaJSON
+	if err := services.Repositories.Projects.Upsert(context.Background(), *project); err != nil {
+		t.Fatalf("Projects.Upsert(repo meta) error = %v", err)
+	}
+
+	// Hold the same-target lock as discard+retry does after loading the loop.
+	target := mustLoopTargetFromFixture(t, services.Repositories, fixture.LoopID)
+	unlockTarget := h.lockLoopTarget(projectID, domain.LoopTypeFixer, target)
+
+	started := make(chan struct{})
+	finished := make(chan struct {
+		code int
+		body string
+	}, 1)
+	go func() {
+		close(started)
+		// Creating another fixer for the same PR target should block on the target lock.
+		// Use a different PR number so uniqueness does not 409 after the lock is released;
+		// we only need the create path to take lockLoopTargetForStatus for fixer+PR targets.
+		// Actually same target is required to share the key — expect 200 or conflict after.
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", strings.NewReader(
+			`{"projectId":"project_retry_discard_target_lock","type":"fixer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`,
+		))
+		req.Header.Set("content-type", "application/json")
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		finished <- struct {
+			code int
+			body string
+		}{recorder.Code, recorder.Body.String()}
+	}()
+
+	<-started
+	select {
+	case got := <-finished:
+		unlockTarget()
+		t.Fatalf("loop create completed while target lock held: status=%d body=%s", got.code, got.body)
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked — expected.
+	}
+
+	unlockTarget()
+
+	select {
+	case got := <-finished:
+		// After release, create may 200 (failed loop is not uniqueness-conflicting)
+		// or 409 for other reasons; we only require it was serialized behind the lock.
+		if got.code != http.StatusOK && got.code != http.StatusConflict {
+			t.Fatalf("loop create status after lock release = %d, want 200/409; body=%s", got.code, got.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop create did not complete after target lock release")
+	}
+
+	// Dirty worktree must still be present: only the lock was held, no discard ran.
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("dirty.txt after blocked create = %q, want preserved", got)
+	}
+}
+
+func mustLoopTargetFromFixture(t *testing.T, repos *storage.Repositories, loopID string) domain.LoopTarget {
+	t.Helper()
+	loop, err := repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("GetByID(%s) = %#v, %v", loopID, loop, err)
+	}
+	target, err := loopTargetFromRecordCompat(*loop)
+	if err != nil {
+		t.Fatalf("loopTargetFromRecordCompat() error = %v", err)
+	}
+	return target
 }
 
 type managedWorktreeSeed struct {

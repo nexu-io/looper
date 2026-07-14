@@ -104,6 +104,11 @@ type Handler struct {
 	// between discard preflight and git reset, then the retry transaction
 	// conflicts after the worktree for the newly queued item was already wiped.
 	loopRetryLocks sync.Map // loopID -> *sync.Mutex
+	// loopTargetLocks serializes same-target active loop creation against
+	// discard+retry. Per-loop locks alone cannot block POST /loops (or workers)
+	// from creating a *different* active loop for the same target after discard
+	// preflight, which leaves a wiped worktree when the retry TX then conflicts.
+	loopTargetLocks sync.Map // project|type|targetKey -> *sync.Mutex
 }
 
 func NewHandler(context Context) *Handler {
@@ -152,6 +157,31 @@ func (h *Handler) lockLoopRetry(loopID string) func() {
 	mu := value.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
+}
+
+// lockLoopTarget acquires a mutex keyed by project+loopType+target so discard
+// retry and same-target active loop creation cannot race. Concurrent project-
+// scoped workers are exempt (assertUniqueActiveLoopCompat allows them).
+// Call order with lockLoopRetry: take the per-loop lock first, then the target
+// lock, to avoid deadlocks with start/reuse paths that only take the loop lock.
+func (h *Handler) lockLoopTarget(projectID string, loopType domain.LoopType, target domain.LoopTarget) func() {
+	if loopType == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeProject {
+		return func() {}
+	}
+	key := fmt.Sprintf("%s|%s|%s", strings.TrimSpace(projectID), loopType, loopTargetKeyCompat(target))
+	value, _ := h.loopTargetLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// lockLoopTargetForStatus is a no-op when the candidate status is not a
+// uniqueness-conflicting active status (create of failed/completed/etc.).
+func (h *Handler) lockLoopTargetForStatus(projectID string, loopType domain.LoopType, target domain.LoopTarget, status domain.LoopStatus) func() {
+	if !domain.IsConflictingActiveLoopStatus(status) {
+		return func() {}
+	}
+	return h.lockLoopTarget(projectID, loopType, target)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -3516,6 +3546,15 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		return loopResponse{}, err
 	}
 
+	// Share the same-target lock with discard+retry so create cannot enqueue a
+	// new active loop for this target between discard preflight and requeue.
+	candidateStatusForLock := domain.LoopStatus(status)
+	if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatusForLock == domain.LoopStatusRunning {
+		candidateStatusForLock = domain.LoopStatusQueued
+	}
+	unlockTarget := h.lockLoopTargetForStatus(projectID, domain.LoopType(loopType), target, candidateStatusForLock)
+	defer unlockTarget()
+
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		transactionRepos := storage.NewRepositories(tx)
 		_, err := requireActiveProjectRecord(r.Context(), transactionRepos.Projects, projectID)
@@ -3781,6 +3820,11 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			defer unlock()
 		}
 	}
+	// New worker create (and non-reuse paths) share the same-target lock with
+	// discard+retry so a concurrent create for this target cannot pass unique
+	// checks after discard preflight and leave a wiped worktree.
+	unlockWorkerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued)
+	defer unlockWorkerTarget()
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
@@ -4237,6 +4281,11 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypePlanner, target, derefBool(body.Force)); err != nil {
 		return plannerCreateResponse{}, err
 	}
+
+	// Share same-target lock with discard+retry (planner discard is a no-op, but
+	// uniqueness races still matter for the requeue half of retry).
+	unlockPlannerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning)
+	defer unlockPlannerTarget()
 
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
@@ -5103,6 +5152,28 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if preflightLoop == nil {
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
+		// Runtime HITL poll requeues awaiting_human loops without the API lock
+		// (hitl_github_poll / Feishu helpers). Refuse discard so a poll-delivered
+		// answer cannot requeue between preflight and git reset, wiping the
+		// worktree for the answered continuation when the retry TX then conflicts.
+		if preflightLoop.Status == string(domain.LoopStatusAwaitingHuman) {
+			return retryLoopResponse{}, apiError{
+				code:    pkgapi.ErrorCodeValidationFailed,
+				status:  http.StatusConflict,
+				message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
+			}
+		}
+		// Hold the same-target create lock for the whole discard+requeue window
+		// so a concurrent POST /loops (or worker) create for this target cannot
+		// pass assertUniqueActiveLoopCompat after preflight and leave a wiped
+		// worktree when the retry TX conflicts.
+		target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+		if targetErr != nil {
+			return retryLoopResponse{}, targetErr
+		}
+		unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+		defer unlockTarget()
+
 		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *preflightLoop, nowISO); err != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {

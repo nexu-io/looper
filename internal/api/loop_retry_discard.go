@@ -27,9 +27,10 @@ type worktreeDiscardResult struct {
 }
 
 type checkpointWorktreeRef struct {
-	ID     string `json:"id,omitempty"`
-	Path   string `json:"path,omitempty"`
-	Branch string `json:"branch,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Branch   string `json:"branch,omitempty"`
+	PRNumber int64  `json:"prNumber,omitempty"`
 }
 
 // checkpointWithWorktree extracts worktree location hints from a run checkpoint.
@@ -38,6 +39,8 @@ type checkpointWorktreeRef struct {
 // (fixer). Those branch hints still resolve the managed worktree row.
 // For push-existing workers, work.branch may be empty while the worktree was
 // created under pr-<PRNumber>; executionMode + prNumber recover that branch.
+// PRNumber (from work.prNumber or detail.prNumber) disambiguates branch-only
+// lookups when multiple PRs share a head branch name.
 type checkpointWithWorktree struct {
 	Worktree *checkpointWorktreeRef `json:"worktree,omitempty"`
 	Work     *struct {
@@ -47,6 +50,7 @@ type checkpointWithWorktree struct {
 	} `json:"work,omitempty"`
 	Detail *struct {
 		HeadRefName string `json:"headRefName,omitempty"`
+		PRNumber    int64  `json:"prNumber,omitempty"`
 	} `json:"detail,omitempty"`
 }
 
@@ -191,20 +195,22 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 		fromCheckpoint = parseCheckpointWorktree(latestRun.CheckpointJSON)
 	}
 
+	// Prefer loop.PRNumber, then checkpoint PR hints. GitHub head branch names are
+	// not unique across forks/PRs; CreateWorktree embeds pr-<N> in the directory.
+	prNumber := int64(0)
+	if loop.PRNumber != nil && *loop.PRNumber > 0 {
+		prNumber = *loop.PRNumber
+	}
+	if prNumber == 0 && fromCheckpoint != nil && fromCheckpoint.PRNumber > 0 {
+		prNumber = fromCheckpoint.PRNumber
+	}
+
 	var record *storage.WorktreeRecord
 	if fromCheckpoint != nil {
 		if id := strings.TrimSpace(fromCheckpoint.ID); id != "" {
 			record, err = repos.Worktrees.GetByID(ctx, id)
 			if err != nil {
 				return nil, err
-			}
-		}
-		if record == nil {
-			if branch := strings.TrimSpace(fromCheckpoint.Branch); branch != "" {
-				record, err = repos.Worktrees.GetByBranch(ctx, project.ID, branch)
-				if err != nil {
-					return nil, err
-				}
 			}
 		}
 		if record == nil {
@@ -215,6 +221,22 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 					return nil, err
 				}
 			}
+		}
+		if record == nil {
+			if branch := strings.TrimSpace(fromCheckpoint.Branch); branch != "" {
+				record, err = findProjectWorktreeByBranch(ctx, repos, project.ID, branch, prNumber)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	// When checkpoint only has a branch (or none) but the loop is PR-scoped,
+	// resolve via PR-tagged managed path so we never pick a sibling PR's row.
+	if record == nil && prNumber > 0 {
+		record, err = findProjectWorktreeByPR(ctx, repos, project.ID, prNumber)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -279,6 +301,7 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	path := ""
 	branch := ""
 	id := ""
+	prNumber := int64(0)
 	if checkpoint.Worktree != nil {
 		path = strings.TrimSpace(checkpoint.Worktree.Path)
 		branch = strings.TrimSpace(checkpoint.Worktree.Branch)
@@ -287,7 +310,13 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	// Dirty prepare-worktree often aborts before checkpoint.worktree is set.
 	// Prefer an explicit worktree.branch, then worker work.branch, then
 	// push-existing pr-<N> (CreateWorktree branch when work.branch is empty),
-	// then fixer detail.headRefName so GetByBranch can still locate the row.
+	// then fixer detail.headRefName so branch/PR lookup can still locate the row.
+	if checkpoint.Work != nil && checkpoint.Work.PRNumber > 0 {
+		prNumber = checkpoint.Work.PRNumber
+	}
+	if prNumber == 0 && checkpoint.Detail != nil && checkpoint.Detail.PRNumber > 0 {
+		prNumber = checkpoint.Detail.PRNumber
+	}
 	if branch == "" && checkpoint.Work != nil {
 		branch = strings.TrimSpace(checkpoint.Work.Branch)
 		if branch == "" &&
@@ -300,10 +329,10 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	if branch == "" && checkpoint.Detail != nil {
 		branch = strings.TrimSpace(checkpoint.Detail.HeadRefName)
 	}
-	if path == "" && branch == "" && id == "" {
+	if path == "" && branch == "" && id == "" && prNumber == 0 {
 		return nil
 	}
-	return &checkpointWorktreeRef{ID: id, Path: path, Branch: branch}
+	return &checkpointWorktreeRef{ID: id, Path: path, Branch: branch, PRNumber: prNumber}
 }
 
 func findProjectWorktreeByPath(ctx context.Context, repos *storage.Repositories, projectID, path string) (*storage.WorktreeRecord, error) {
@@ -320,6 +349,157 @@ func findProjectWorktreeByPath(ctx context.Context, repos *storage.Repositories,
 		}
 	}
 	return nil, nil
+}
+
+// findProjectWorktreeByBranch resolves an active worktree row for project+branch.
+// When prNumber is known, refuse rows whose CreateWorktree directory embeds a
+// different pr-<M>: GitHub head branch names are not unique across PRs, and the
+// unique (project_id, branch) index means the stored row may belong to a sibling
+// PR that last claimed the branch. Prefer path/branch markers for pr-<N>.
+func findProjectWorktreeByBranch(ctx context.Context, repos *storage.Repositories, projectID, branch string, prNumber int64) (*storage.WorktreeRecord, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return nil, nil
+	}
+	items, err := repos.Worktrees.ListByProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	var matches []storage.WorktreeRecord
+	for i := range items {
+		if items[i].CleanedAt != nil {
+			continue
+		}
+		if strings.TrimSpace(items[i].Branch) != branch {
+			continue
+		}
+		matches = append(matches, items[i])
+	}
+	if prNumber <= 0 {
+		return pickUniqueActiveWorktree(matches), nil
+	}
+	var preferred []storage.WorktreeRecord
+	for i := range matches {
+		if worktreeBelongsToPR(matches[i], prNumber) {
+			preferred = append(preferred, matches[i])
+		}
+	}
+	if len(preferred) > 0 {
+		return pickUniqueActiveWorktree(preferred), nil
+	}
+	// Known PR but no row clearly owned by it: do not discard a sibling PR path.
+	return nil, nil
+}
+
+// worktreeBelongsToPR reports whether a worktree row is owned by the given PR.
+// True when the directory embeds pr-<N>, the branch is bare pr-<N> (push-existing),
+// or the path embeds no PR marker at all (legacy non-PR-named checkouts).
+func worktreeBelongsToPR(record storage.WorktreeRecord, prNumber int64) bool {
+	if prNumber <= 0 {
+		return true
+	}
+	if worktreePathMatchesPR(record.WorktreePath, prNumber) {
+		return true
+	}
+	if strings.TrimSpace(record.Branch) == fmt.Sprintf("pr-%d", prNumber) {
+		return true
+	}
+	if embedded, ok := worktreePathEmbeddedPR(record.WorktreePath); ok && embedded != prNumber {
+		return false
+	}
+	// No conflicting PR marker in the path — accept (legacy / non-PR path shapes).
+	return !worktreePathHasPRMarker(record.WorktreePath)
+}
+
+// findProjectWorktreeByPR finds the active managed worktree whose path embeds
+// pr-<N>, used when branch lookup is empty or ambiguous but the loop is PR-scoped.
+func findProjectWorktreeByPR(ctx context.Context, repos *storage.Repositories, projectID string, prNumber int64) (*storage.WorktreeRecord, error) {
+	if prNumber <= 0 {
+		return nil, nil
+	}
+	items, err := repos.Worktrees.ListByProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	var matches []storage.WorktreeRecord
+	for i := range items {
+		if items[i].CleanedAt != nil {
+			continue
+		}
+		if worktreePathMatchesPR(items[i].WorktreePath, prNumber) {
+			matches = append(matches, items[i])
+		}
+	}
+	return pickUniqueActiveWorktree(matches), nil
+}
+
+func worktreePathMatchesPR(worktreePath string, prNumber int64) bool {
+	if prNumber <= 0 {
+		return false
+	}
+	base := filepath.Base(strings.TrimSpace(worktreePath))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return false
+	}
+	// CreateWorktree dirs: looper-fix-<project>-pr-<N>[ -detached]
+	// Worker push-existing may also use bare pr-<N>.
+	marker := fmt.Sprintf("-pr-%d", prNumber)
+	if strings.HasSuffix(base, marker) || strings.HasSuffix(base, marker+"-detached") {
+		return true
+	}
+	return base == fmt.Sprintf("pr-%d", prNumber)
+}
+
+func worktreePathHasPRMarker(worktreePath string) bool {
+	_, ok := worktreePathEmbeddedPR(worktreePath)
+	return ok
+}
+
+// worktreePathEmbeddedPR extracts pr-<N> from a CreateWorktree directory base name.
+func worktreePathEmbeddedPR(worktreePath string) (int64, bool) {
+	base := filepath.Base(strings.TrimSpace(worktreePath))
+	if base == "" || base == "." {
+		return 0, false
+	}
+	// Bare pr-<N>
+	var bare int64
+	if _, err := fmt.Sscanf(base, "pr-%d", &bare); err == nil && bare > 0 && base == fmt.Sprintf("pr-%d", bare) {
+		return bare, true
+	}
+	// …-pr-<N> or …-pr-<N>-detached
+	const marker = "-pr-"
+	idx := strings.LastIndex(base, marker)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := base[idx+len(marker):]
+	rest = strings.TrimSuffix(rest, "-detached")
+	var n int64
+	if _, err := fmt.Sscanf(rest, "%d", &n); err != nil || n <= 0 {
+		return 0, false
+	}
+	if rest != fmt.Sprintf("%d", n) {
+		return 0, false
+	}
+	return n, true
+}
+
+func pickUniqueActiveWorktree(matches []storage.WorktreeRecord) *storage.WorktreeRecord {
+	switch len(matches) {
+	case 0:
+		return nil
+	case 1:
+		return &matches[0]
+	default:
+		// Prefer most recently updated among remaining PR-scoped matches.
+		best := 0
+		for i := 1; i < len(matches); i++ {
+			if matches[i].UpdatedAt > matches[best].UpdatedAt {
+				best = i
+			}
+		}
+		return &matches[best]
+	}
 }
 
 func projectWorktreeRoot(project storage.ProjectRecord) (string, error) {
