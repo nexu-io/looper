@@ -1394,6 +1394,126 @@ func TestHandlerLoopStartSharesTargetLockAcrossLoops(t *testing.T) {
 	}
 }
 
+// TestHandlerLoopTargetLockSharedAcrossPRLoopTypes ensures fixer and worker for
+// the same PR share one target mutex so discard+retry cannot race another type
+// on the shared looper-fix-<project>-pr-N worktree.
+func TestHandlerLoopTargetLockSharedAcrossPRLoopTypes(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_pr_type_lock"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: projectID,
+		LoopID:    "loop_retry_pr_type_lock_fixer",
+		LoopSeq:   3140,
+		LoopType:  "fixer",
+		Branch:    "feature/pr-type-lock",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	markLoopFailed(t, services.Repositories, fixture.LoopID, nowISO)
+
+	// Failed worker on the same PR (different type — uniqueness allows this).
+	repo := "acme/looper"
+	prNumber := int64(42)
+	prTarget := "pr:acme/looper:42"
+	workerID := "loop_retry_pr_type_lock_worker"
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: workerID, Seq: 3141, ProjectID: projectID, Type: "worker",
+		TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
+		Status: "failed", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(worker) error = %v", err)
+	}
+	lastErrorKind := "manual_intervention"
+	lastError := "prior failure"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_" + workerID, ProjectID: &projectID, LoopID: &workerID, Type: "worker",
+		TargetType: "pull_request", TargetID: prTarget, Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: "worker:" + projectID + ":" + repo + ":42", Priority: storage.QueuePriorityWorker,
+		Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3,
+		LastError: &lastError, LastErrorKind: &lastErrorKind,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(worker) error = %v", err)
+	}
+
+	// Hold fixer PR target lock as discard would; worker retry must block.
+	target := mustLoopTargetFromFixture(t, services.Repositories, fixture.LoopID)
+	unlockTarget := h.lockLoopTarget(projectID, domain.LoopTypeFixer, target)
+
+	started := make(chan struct{})
+	finished := make(chan int, 1)
+	go func() {
+		close(started)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3141/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+		req.Header.Set("content-type", "application/json")
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		finished <- recorder.Code
+	}()
+
+	<-started
+	select {
+	case code := <-finished:
+		unlockTarget()
+		t.Fatalf("worker retry completed while fixer PR target lock held: status=%d", code)
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked — expected shared PR worktree key.
+	}
+
+	unlockTarget()
+
+	select {
+	case code := <-finished:
+		if code != http.StatusOK {
+			t.Fatalf("worker retry status after PR target lock release = %d, want 200", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker retry did not complete after PR target lock release")
+	}
+}
+
+// TestHandlerLockLoopTargetIsProcessWideWithRuntime ensures API lockLoopTarget
+// and runtime LockLoopTarget share the same mutex entry for a PR target.
+func TestHandlerLockLoopTargetIsProcessWideWithRuntime(t *testing.T) {
+	h := NewHandler(Context{})
+	projectID := "project_target_lock_process_wide"
+	target := domain.LoopTarget{
+		TargetType: domain.LoopTargetTypePullRequest,
+		Repo:       "acme/looper",
+		PRNumber:   42,
+	}
+	unlock := h.lockLoopTarget(projectID, domain.LoopTypeFixer, target)
+
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		close(started)
+		// Worker type, same PR — must wait on the shared PR key.
+		key := looperdruntime.LoopTargetGuardKey(projectID, string(domain.LoopTypeWorker), string(domain.LoopTargetTypePullRequest), loopTargetKeyCompat(target))
+		unlockRuntime := looperdruntime.LockLoopTarget(key)
+		unlockRuntime()
+		close(finished)
+	}()
+
+	<-started
+	select {
+	case <-finished:
+		unlock()
+		t.Fatal("runtime LockLoopTarget completed while Handler.lockLoopTarget held — PR keys not shared across types")
+	case <-time.After(150 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime LockLoopTarget did not complete after Handler.lockLoopTarget release")
+	}
+}
+
 func markLoopFailed(t *testing.T, repos *storage.Repositories, loopID, nowISO string) {
 	t.Helper()
 	loop, err := repos.Loops.GetByID(context.Background(), loopID)

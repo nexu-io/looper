@@ -20,7 +20,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -97,12 +96,6 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
-	// loopTargetLocks serializes same-target active loop creation against
-	// discard+retry. Per-loop requeue locks alone cannot block POST /loops (or
-	// workers) from creating a *different* active loop for the same target after
-	// discard preflight, which leaves a wiped worktree when the retry TX then
-	// conflicts.
-	loopTargetLocks sync.Map // project|type|targetKey -> *sync.Mutex
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -157,21 +150,16 @@ func (h *Handler) lockLoopRetry(loopID string) func() {
 	return looperdruntime.LockLoopRequeue(loopID)
 }
 
-// lockLoopTarget acquires a mutex keyed by project+loopType+target so discard
-// retry, same-target requeue (regular retry / start), and active loop creation
-// cannot race. Concurrent project-scoped workers are exempt
-// (assertUniqueActiveLoopCompat allows them).
+// lockLoopTarget acquires the process-wide same-target mutex so discard retry,
+// same-target requeue (regular retry / start), active loop creation, and runtime
+// HITL requeues cannot race. Concurrent project-scoped workers are exempt
+// (assertUniqueActiveLoopCompat allows them). Pull-request targets omit loop
+// type so fixer/reviewer/worker share one key for the shared PR worktree.
 // Call order with lockLoopRetry: take the per-loop lock first, then the target
 // lock, so retry/start/reuse paths share a consistent order with discard.
 func (h *Handler) lockLoopTarget(projectID string, loopType domain.LoopType, target domain.LoopTarget) func() {
-	if loopType == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeProject {
-		return func() {}
-	}
-	key := fmt.Sprintf("%s|%s|%s", strings.TrimSpace(projectID), loopType, loopTargetKeyCompat(target))
-	value, _ := h.loopTargetLocks.LoadOrStore(key, &sync.Mutex{})
-	mu := value.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	key := looperdruntime.LoopTargetGuardKey(projectID, string(loopType), string(target.TargetType), loopTargetKeyCompat(target))
+	return looperdruntime.LockLoopTarget(key)
 }
 
 // lockLoopTargetForStatus is a no-op when the candidate status is not a
