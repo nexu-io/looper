@@ -5791,9 +5791,9 @@ func rejectDiscardWhileParkedForHuman(status, loopID string) error {
 // type already holds a worktree-owning status on the same pull-request target.
 // assertUniqueActiveLoopCompat only conflicts same-type loops; managed PR
 // worktrees (looper-fix-<project>-pr-N) are shared across fixer/reviewer/
-// worker, so a sibling that is queued, running, waiting, or human_takeover
-// would lose its checkout to git reset/clean. Non-PR targets and non-discard
-// retries are unaffected.
+// worker, so a sibling that is queued, running, waiting, failed, interrupted,
+// or human_takeover would lose its checkout to git reset/clean. Non-PR targets
+// and non-discard retries are unaffected.
 func (h *Handler) assertDiscardSharedPRWorktreeClear(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) error {
 	if loop.TargetType != string(domain.LoopTargetTypePullRequest) {
 		return nil
@@ -5807,11 +5807,16 @@ func (h *Handler) assertDiscardSharedPRWorktreeClear(ctx context.Context, repos 
 
 // isDiscardBlockingSiblingPRStatus reports whether a sibling loop's status
 // still pins the shared PR managed worktree. Includes IsConflictingActiveLoopStatus
-// plus waiting: waiting is intentionally excluded from uniqueness conflicts
-// (reviewer debounce can sit waiting while another type fails), but cleanup and
-// worktree ownership still treat waiting as an active owner.
+// plus waiting/failed/interrupted: those are intentionally excluded from
+// uniqueness conflicts (reviewer debounce can sit waiting while another type
+// fails; failed/interrupted are retryable terminals), but worktree cleanup
+// (protectsLoopStatus) and ownership still treat them as active owners whose
+// checkpointed local state must not be wiped by a sibling discard retry.
 func isDiscardBlockingSiblingPRStatus(status domain.LoopStatus) bool {
-	return domain.IsConflictingActiveLoopStatus(status) || status == domain.LoopStatusWaiting
+	if domain.IsConflictingActiveLoopStatus(status) || status == domain.LoopStatusWaiting {
+		return true
+	}
+	return status == domain.LoopStatusFailed || status == domain.LoopStatusInterrupted
 }
 
 // assertNoActiveSiblingPRWorktreeLoops reports a conflict when any other

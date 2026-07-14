@@ -653,9 +653,10 @@ func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeOnUniqueLoopConflict(t *te
 // TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop ensures discard+retry
 // refuses when a different loop type already holds a worktree-owning status on
 // the same PR. Same-type uniqueness alone would allow a failed fixer discard to
-// git reset/clean under a queued/running/waiting/human_takeover reviewer or
-// worker that shares the managed PR worktree. waiting is intentionally outside
-// IsConflictingActiveLoopStatus but still pins the checkout.
+// git reset/clean under a queued/running/waiting/failed/interrupted/
+// human_takeover reviewer or worker that shares the managed PR worktree.
+// waiting/failed/interrupted are outside IsConflictingActiveLoopStatus but
+// still pin the checkout (worktree cleanup protects them).
 func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -665,6 +666,8 @@ func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
 		{name: "queued_reviewer", siblingType: "reviewer", siblingStatus: "queued"},
 		{name: "running_worker", siblingType: "worker", siblingStatus: "running"},
 		{name: "waiting_reviewer", siblingType: "reviewer", siblingStatus: "waiting"},
+		{name: "failed_reviewer", siblingType: "reviewer", siblingStatus: "failed"},
+		{name: "interrupted_worker", siblingType: "worker", siblingStatus: "interrupted"},
 		{name: "human_takeover_reviewer", siblingType: "reviewer", siblingStatus: "human_takeover"},
 	}
 	for _, tc := range cases {
@@ -719,21 +722,22 @@ func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
 	}
 }
 
-// TestHandlerLoopRetryDiscardAllowsFailedSiblingPRLoop documents that a
-// terminal/non-conflicting sibling on the same PR does not block discard.
-func TestHandlerLoopRetryDiscardAllowsFailedSiblingPRLoop(t *testing.T) {
+// TestHandlerLoopRetryDiscardAllowsCompletedSiblingPRLoop documents that a
+// truly terminal sibling (completed/stopped/terminated) on the same PR does
+// not pin the managed worktree and therefore does not block discard.
+func TestHandlerLoopRetryDiscardAllowsCompletedSiblingPRLoop(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
-	projectID := "project_retry_discard_failed_sibling"
+	projectID := "project_retry_discard_completed_sibling"
 
 	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
 		ProjectID: projectID,
-		LoopID:    "loop_retry_discard_failed_sibling",
+		LoopID:    "loop_retry_discard_completed_sibling",
 		LoopSeq:   3142,
 		LoopType:  "fixer",
-		Branch:    "feature/discard-failed-sibling",
+		Branch:    "feature/discard-completed-sibling",
 		NowISO:    nowISO,
 		Dirty:     true,
 	})
@@ -742,11 +746,11 @@ func TestHandlerLoopRetryDiscardAllowsFailedSiblingPRLoop(t *testing.T) {
 	prNumber := int64(42)
 	prTarget := "pr:acme/looper:42"
 	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: "loop_failed_sibling_reviewer", Seq: 3143, ProjectID: projectID,
+		ID: "loop_completed_sibling_reviewer", Seq: 3143, ProjectID: projectID,
 		Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
-		Status: "failed", CreatedAt: nowISO, UpdatedAt: nowISO,
+		Status: "completed", CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
-		t.Fatalf("Loops.Upsert(failed sibling) error = %v", err)
+		t.Fatalf("Loops.Upsert(completed sibling) error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+fixture.LoopID+"/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
@@ -756,7 +760,7 @@ func TestHandlerLoopRetryDiscardAllowsFailedSiblingPRLoop(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); !os.IsNotExist(err) {
-		t.Fatalf("dirty.txt still present after discard with failed sibling: %v", err)
+		t.Fatalf("dirty.txt still present after discard with completed sibling: %v", err)
 	}
 }
 
