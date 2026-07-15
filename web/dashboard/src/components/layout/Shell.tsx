@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { Link, NavLink, Outlet } from "react-router-dom";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
 
@@ -8,6 +8,9 @@ const navItems: { to: string; label: string; end?: boolean }[] = [
   { to: "/loops", label: "Loops" },
   { to: "/projects", label: "Projects" },
 ];
+
+/** Public asset under Vite base (/dashboard/). */
+const logoSrc = `${import.meta.env.BASE_URL}apple-touch-icon.png`;
 
 export type ShellProps = {
   hostPort: string;
@@ -77,9 +80,21 @@ export function Shell({
       <header className="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--bg-elevated)]">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-1.5">
           <div className="flex items-center gap-3">
-            <span className="text-[14px] font-semibold tracking-tight">
-              Looper
-            </span>
+            <Link
+              to="/"
+              className="flex items-center gap-2 text-[14px] font-semibold tracking-tight"
+              title="Overview"
+            >
+              <img
+                src={logoSrc}
+                alt=""
+                width={20}
+                height={20}
+                className="h-5 w-5 shrink-0 rounded-[4px]"
+                decoding="async"
+              />
+              <span>Looper</span>
+            </Link>
             <span className="mono text-[12px] text-[var(--text-muted)]">
               {hostPort}
             </span>

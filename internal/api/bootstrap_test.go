@@ -391,6 +391,19 @@ func TestNewRootHandlerDashboardRedirectAndAPI(t *testing.T) {
 	if rec.Code != http.StatusTeapot || apiHits != 1 {
 		t.Fatalf("api status = %d hits=%d", rec.Code, apiHits)
 	}
+
+	// Host-root favicon is served from embedded dashboard assets (not the API).
+	rec = httptest.NewRecorder()
+	root.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/favicon.ico", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("favicon status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatal("favicon body empty")
+	}
+	if apiHits != 1 {
+		t.Fatalf("favicon must not hit API handler, apiHits=%d", apiHits)
+	}
 }
 
 func mintBootstrapCode(t *testing.T, h *Handler, token string) string {

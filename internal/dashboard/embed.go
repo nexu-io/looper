@@ -24,7 +24,9 @@ const (
 )
 
 // Vite content hashes are not pure hex (e.g. index-w7rK2NGL.js).
-var hashedAssetPattern = regexp.MustCompile(`(?i)[-.][A-Za-z0-9_-]{8,}\.[a-z0-9]+$`)
+// Do not allow hyphens inside the hash segment — otherwise names like
+// apple-touch-icon.png falsely match via "-touch-icon".
+var hashedAssetPattern = regexp.MustCompile(`(?i)-[A-Za-z0-9_]{8,}\.[a-z0-9]+$`)
 
 // HasProductionAssets reports whether the binary embeds a production SPA build
 // (marker file assets/.production present in the embed FS).
@@ -171,10 +173,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, root fs.FS, name string, 
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 
-	contentType := mime.TypeByExtension(path.Ext(name))
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
+	contentType := contentTypeFor(name)
 	w.Header().Set("Content-Type", contentType)
 
 	if r.Method == http.MethodHead {
@@ -183,6 +182,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, root fs.FS, name string, 
 	}
 
 	// Prefer http.ServeContent when the file supports seeking for Range, else copy.
+	// Content-Type is set above; ServeContent keeps an already-set Content-Type.
 	if rs, ok := f.(io.ReadSeeker); ok {
 		http.ServeContent(w, r, name, info.ModTime(), rs)
 		return true
@@ -190,4 +190,53 @@ func serveFile(w http.ResponseWriter, r *http.Request, root fs.FS, name string, 
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, f)
 	return true
+}
+
+// ServeNamed serves a file from the dashboard content root (production assets or
+// fallback). Used for host-root shortcuts like /favicon.ico that browsers request
+// outside /dashboard/.
+func ServeNamed(w http.ResponseWriter, r *http.Request, name string) bool {
+	setSecurityHeaders(w)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return true
+	}
+	name = strings.TrimPrefix(path.Clean("/"+name), "/")
+	if name == "" || name == "." || strings.Contains(name, "/") {
+		return false
+	}
+	return serveFile(w, r, contentRoot(), name, false)
+}
+
+func contentTypeFor(name string) string {
+	ext := strings.ToLower(path.Ext(name))
+	switch ext {
+	case ".ico":
+		return "image/x-icon"
+	case ".png":
+		return "image/png"
+	case ".svg":
+		return "image/svg+xml"
+	case ".webmanifest":
+		return "application/manifest+json"
+	case ".html":
+		return "text/html; charset=utf-8"
+	case ".js":
+		return "text/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".map":
+		return "application/json; charset=utf-8"
+	case ".woff2":
+		return "font/woff2"
+	case ".woff":
+		return "font/woff"
+	}
+	if ct := mime.TypeByExtension(ext); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
 }

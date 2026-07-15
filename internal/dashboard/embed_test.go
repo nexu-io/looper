@@ -124,6 +124,35 @@ func TestLooksHashedAsset(t *testing.T) {
 	if looksHashedAsset("index.html") {
 		t.Fatal("index.html should not look hashed")
 	}
+	// Public icons must not be treated as content-hashed (false positive via "-touch-icon").
+	if looksHashedAsset("apple-touch-icon.png") {
+		t.Fatal("apple-touch-icon.png should not look hashed")
+	}
+	if looksHashedAsset("favicon-32x32.png") {
+		t.Fatal("favicon-32x32.png should not look hashed")
+	}
+}
+
+func TestServeNamedFavicon(t *testing.T) {
+	t.Parallel()
+
+	// Production assets may or may not be present in the test binary; fallback
+	// always embeds favicon.ico after the dashboard favicon work.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/favicon.ico", nil)
+	if !ServeNamed(rec, req, "favicon.ico") {
+		t.Fatal("ServeNamed(favicon.ico) = false, want true when embedded")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() == 0 {
+		t.Fatal("favicon body empty")
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "image/") {
+		t.Fatalf("Content-Type = %q, want image/*", ct)
+	}
 }
 
 func assertSecurityHeaders(t *testing.T, rec *httptest.ResponseRecorder) {
