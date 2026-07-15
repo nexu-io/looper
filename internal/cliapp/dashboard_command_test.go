@@ -2,12 +2,16 @@ package cliapp
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -144,6 +148,87 @@ func TestDashboardRemoteDownDoesNotStart(t *testing.T) {
 		// Error is printed as "looper: ..."
 		if !strings.Contains(stderr.String(), "looperd is not reachable") {
 			t.Fatalf("stderr = %q, want unreachable message", stderr.String())
+		}
+	}
+}
+
+func TestDashboardColdStartStdoutIsURLOnly(t *testing.T) {
+	t.Parallel()
+
+	// Local host/port without baseURL: daemon is down → dashboard starts it, but
+	// stdout must remain a single URL line (no "Started looperd" / PID chatter).
+	homeDir := t.TempDir()
+	managedPath := filepath.Join(homeDir, ".looper", "bin", "looperd")
+	configPath := writeDaemonCLIConfigForBindEndpoint(t, "http://127.0.0.1:17310", nil)
+	var daemonStarted atomic.Bool
+	stdout := &strings.Builder{}
+	stderr := &strings.Builder{}
+
+	app := New(Deps{
+		Stdout:  stdout,
+		Stderr:  stderr,
+		HomeDir: homeDir,
+		HTTPClient: newTestHTTPClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Path {
+			case "/api/v1/status", "/api/v1/healthz":
+				if !daemonStarted.Load() {
+					return nil, fmt.Errorf("daemon offline")
+				}
+				return jsonResponse(t, http.StatusOK, `{"ok":true,"requestId":"req_status","data":{"service":{"healthy":true,"binary":{"name":"looperd","path":"/usr/bin/looperd"},"version":"1.0.0"}}}`), nil
+			default:
+				t.Fatalf("unexpected request %s %s", req.Method, req.URL.String())
+				return nil, nil
+			}
+		}),
+		RunCommand: func(ctx context.Context, command string, args []string, timeout time.Duration) (commandExecutionResult, error) {
+			_ = ctx
+			_ = timeout
+			if command == managedPath && strings.Join(args, " ") == "--version" {
+				return commandExecutionResult{ExitCode: 0, Stdout: "1.0.0\n"}, nil
+			}
+			if command == "ps" && len(args) >= 2 {
+				return commandExecutionResult{ExitCode: 0, Stdout: managedPath + "\n"}, nil
+			}
+			return commandExecutionResult{ExitCode: 1, Stderr: "not found"}, nil
+		},
+		SpawnDetached: func(command string, args []string, cwd string, env []string) (int, error) {
+			_ = args
+			_ = cwd
+			_ = env
+			if command != managedPath {
+				return 0, fmt.Errorf("unexpected command %q", command)
+			}
+			daemonStarted.Store(true)
+			return 4321, nil
+		},
+		KillProcess: func(pid int, signal int) error {
+			if pid == 4321 && signal == 0 {
+				return nil
+			}
+			return fmt.Errorf("unexpected kill(%d, %d)", pid, signal)
+		},
+		ReadFile: func(path string) ([]byte, error) {
+			return nil, os.ErrNotExist
+		},
+		Sleep:   func(time.Duration) {},
+		OpenURL: func(string) error { return nil },
+	})
+
+	exitCode := app.Run(context.Background(), []string{"dashboard", "--no-open", "--config", configPath})
+	if exitCode != 0 {
+		t.Fatalf("exit = %d stderr=%q", exitCode, stderr.String())
+	}
+	if !daemonStarted.Load() {
+		t.Fatal("expected cold-start SpawnDetached")
+	}
+	got := strings.TrimSpace(stdout.String())
+	want := "http://127.0.0.1:17310/dashboard/"
+	if got != want {
+		t.Fatalf("stdout = %q, want URL-only %q", stdout.String(), want)
+	}
+	for _, chatter := range []string{"Started looperd", "PID file:", "State file:", "Startup log:"} {
+		if strings.Contains(stdout.String(), chatter) {
+			t.Fatalf("stdout contains daemon-start chatter %q: %q", chatter, stdout.String())
 		}
 	}
 }

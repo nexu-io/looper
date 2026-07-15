@@ -11,17 +11,29 @@ import (
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
+// rewriteHTTPtestDefaultHost is enabled only by TestMain during `go test`.
+// httptest.NewRequest uses the synthetic Host "example.com" for path-only URLs;
+// when this flag is set, that Host is evaluated as the configured server
+// authority so unit tests need not set Host on every request. Production
+// binaries leave this false so a real Host: example.com is not rewritten.
+var rewriteHTTPtestDefaultHost bool
+
 // validateBrowserRequest enforces Host allowlisting and Origin matching for
 // browser requests, including safe methods (GET/HEAD) that expose dashboard
-// state. CLI clients without an Origin header continue to work.
+// state.
 //
-// DNS rebinding under authMode=none: when a browser sends Host and Origin for an
-// attacker domain, both are checked against authorities derived from server
-// config (bind host/port, loopback aliases, optional server.baseUrl) — not from
-// the request Host itself. This applies to API/dashboard reads as well as
-// mutations so rebinding cannot exfiltrate local state over GET.
+// DNS rebinding under authMode=none: same-origin navigation to a rebound
+// daemon URL may omit Origin entirely. Host is therefore always validated —
+// never skipped solely because Origin is absent. Origin matching runs only when
+// the header is present. Authorities come from server config (bind host/port,
+// loopback aliases, optional server.baseUrl), not from the request Host alone.
+//
+// When Origin is absent (CLI / non-browser), Host must be allowlisted or a
+// loopback authority. Loopback is accepted without requiring an exact config
+// port match because the client already dialed the process; this still rejects
+// attacker Hosts such as evil.example that DNS rebinding would present.
 func validateBrowserRequest(r *http.Request, cfg config.Config) error {
-	host := strings.TrimSpace(r.Host)
+	host := effectiveRequestHost(r, cfg)
 	if host == "" {
 		return apiError{
 			code:    pkgapi.ErrorCodeUnauthorized,
@@ -30,14 +42,19 @@ func validateBrowserRequest(r *http.Request, cfg config.Config) error {
 		}
 	}
 
+	allowed := allowedAuthorities(cfg)
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
-		// Non-browser clients (CLI): Host is the dial target; unit tests often
-		// leave httptest's default Host. DNS rebinding always includes Origin.
-		return nil
+		if authorityAllowed(host, allowed) || isLoopbackAuthority(host) {
+			return nil
+		}
+		return apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "Host is not allowed",
+		}
 	}
 
-	allowed := allowedAuthorities(cfg)
 	if !authorityAllowed(host, allowed) {
 		return apiError{
 			code:    pkgapi.ErrorCodeUnauthorized,
@@ -53,6 +70,41 @@ func validateBrowserRequest(r *http.Request, cfg config.Config) error {
 		}
 	}
 	return nil
+}
+
+// effectiveRequestHost returns the Host used for allowlisting. Under tests only,
+// httptest's synthetic "example.com" maps to the configured bind authority.
+func effectiveRequestHost(r *http.Request, cfg config.Config) string {
+	host := strings.TrimSpace(r.Host)
+	if rewriteHTTPtestDefaultHost && strings.EqualFold(host, "example.com") {
+		return configuredRequestAuthority(cfg)
+	}
+	return host
+}
+
+func configuredRequestAuthority(cfg config.Config) string {
+	port := cfg.Server.Port
+	if port <= 0 {
+		port = config.DefaultServerPort
+	}
+	portStr := strconv.Itoa(port)
+	host := normalizeAuthorityHost(cfg.Server.Host)
+	switch {
+	case host == "" || isWildcardBindHost(host) || isLoopbackHostname(host):
+		return net.JoinHostPort("127.0.0.1", portStr)
+	default:
+		return net.JoinHostPort(host, portStr)
+	}
+}
+
+// isLoopbackAuthority reports whether hostport is a loopback hostname/IP,
+// optionally with any port (CLI and httptest.Server dial targets).
+func isLoopbackAuthority(hostport string) bool {
+	host, _, err := splitHostPort(hostport)
+	if err != nil {
+		return false
+	}
+	return isLoopbackHostname(host)
 }
 
 // allowedAuthorities returns host:port authorities the daemon accepts for

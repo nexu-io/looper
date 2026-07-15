@@ -3,6 +3,7 @@ package cliapp
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os/exec"
@@ -79,8 +80,14 @@ func (r *commandRuntime) ensureDashboardDaemonReady(ctx context.Context, cmd *co
 		return fmt.Errorf("looperd is not reachable at %s; start the remote daemon before opening the dashboard", client.baseURL)
 	}
 
-	// Local target: start then re-verify.
-	if err := r.daemonStart(cmd, nil); err != nil {
+	// Local target: start then re-verify. Suppress daemon lifecycle chatter so
+	// `looper dashboard --no-open` (and headless/SSH scripts) keep stdout as
+	// the dashboard URL only.
+	originalOut := cmd.OutOrStdout()
+	cmd.SetOut(io.Discard)
+	err = r.daemonStart(cmd, nil)
+	cmd.SetOut(originalOut)
+	if err != nil {
 		return err
 	}
 

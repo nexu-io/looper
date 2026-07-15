@@ -277,6 +277,29 @@ func TestAttackerHostAndOriginRejectedOnSafeGetAuthNone(t *testing.T) {
 	}
 }
 
+func TestAttackerHostWithoutOriginRejectedOnSafeGetAuthNone(t *testing.T) {
+	t.Parallel()
+
+	// Same-origin DNS rebinding omits Origin; Host allowlist must still reject.
+	h := NewHandler(Context{Config: config.Config{
+		Server: config.ServerConfig{
+			Host:     "127.0.0.1",
+			Port:     17310,
+			AuthMode: config.AuthModeNone,
+		},
+	}})
+
+	for _, path := range []string{"/api/v1/config", "/api/v1/status", "/api/v1/does-not-exist"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "evil.example"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("GET %s without Origin status = %d, want 403 body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 func TestCLIGetWithoutOriginAllowed(t *testing.T) {
 	t.Parallel()
 
