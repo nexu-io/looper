@@ -1,9 +1,11 @@
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 
 export type Column<T> = {
   key: string;
   header: string;
   className?: string;
+  /** When true, clicks inside this cell do not trigger onRowClick. */
+  stopRowClick?: boolean;
   cell: (row: T) => ReactNode;
 };
 
@@ -36,7 +38,7 @@ export function DataTable<T>({
             {columns.map((col) => (
               <th
                 key={col.key}
-                className={`px-2 py-1 font-medium ${col.className ?? ""}`}
+                className={`px-2 py-1.5 align-middle font-medium ${col.className ?? ""}`}
               >
                 {col.header}
               </th>
@@ -54,13 +56,39 @@ export function DataTable<T>({
                   : "",
               ].join(" ")}
               onClick={onRowClick ? () => onRowClick(row) : undefined}
+              onKeyDown={
+                onRowClick
+                  ? (e: KeyboardEvent<HTMLTableRowElement>) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        onRowClick(row);
+                      }
+                    }
+                  : undefined
+              }
+              tabIndex={onRowClick ? 0 : undefined}
+              role={onRowClick ? "link" : undefined}
             >
               {columns.map((col) => (
                 <td
                   key={col.key}
-                  className={`px-2 py-1 align-top ${col.className ?? ""}`}
+                  className={`px-2 py-1.5 align-middle ${col.className ?? ""}`}
+                  onClick={
+                    col.stopRowClick
+                      ? (e) => {
+                          e.stopPropagation();
+                        }
+                      : undefined
+                  }
+                  onKeyDown={
+                    col.stopRowClick
+                      ? (e) => {
+                          e.stopPropagation();
+                        }
+                      : undefined
+                  }
                 >
-                  {col.cell(row)}
+                  <div className="flex min-h-7 items-center">{col.cell(row)}</div>
                 </td>
               ))}
             </tr>

@@ -223,6 +223,9 @@ export type Loop = {
 
 export type LoopsList = {
   items: Loop[];
+  total: number;
+  limit?: number | null;
+  offset?: number;
 };
 
 export type Project = {
@@ -333,8 +336,22 @@ export function fetchActiveRuns(signal?: AbortSignal): Promise<ActiveRunsList> {
   return apiFetch<ActiveRunsList>("/api/v1/runs/active", { signal });
 }
 
-export function fetchLoops(signal?: AbortSignal): Promise<LoopsList> {
-  return apiFetch<LoopsList>("/api/v1/loops", { signal });
+export function fetchLoops(opts?: {
+  status?: string;
+  projectId?: string;
+  limit?: number;
+  offset?: number;
+  signal?: AbortSignal;
+}): Promise<LoopsList> {
+  const params = new URLSearchParams();
+  if (opts?.status) params.set("status", opts.status);
+  if (opts?.projectId) params.set("projectId", opts.projectId);
+  if (opts?.limit != null) params.set("limit", String(opts.limit));
+  if (opts?.offset != null) params.set("offset", String(opts.offset));
+  const qs = params.toString();
+  return apiFetch<LoopsList>(`/api/v1/loops${qs ? `?${qs}` : ""}`, {
+    signal: opts?.signal,
+  });
 }
 
 export function fetchLoop(

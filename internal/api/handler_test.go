@@ -2243,6 +2243,144 @@ func TestHandlerProjectsCreateRouteMapsProjectIDConflict(t *testing.T) {
 	assertEqual(t, typed.message, "Derived project id collides with an existing explicit project: looper")
 }
 
+func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
+	fixture := newTestFixture(t)
+	ctx := context.Background()
+	repos := fixture.runtime.Services().Repositories
+
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID: "project_a", Name: "A", RepoPath: "/tmp/a",
+		CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z",
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_a) error = %v", err)
+	}
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID: "project_b", Name: "B", RepoPath: "/tmp/b",
+		CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z",
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_b) error = %v", err)
+	}
+	for _, loop := range []storage.LoopRecord{
+		{ID: "loop_1", Seq: 1, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:01.000Z", UpdatedAt: "2026-04-11T12:00:01.000Z"},
+		{ID: "loop_2", Seq: 2, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: "2026-04-11T12:00:02.000Z", UpdatedAt: "2026-04-11T12:00:02.000Z"},
+		{ID: "loop_3", Seq: 3, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:03.000Z", UpdatedAt: "2026-04-11T12:00:03.000Z"},
+		{ID: "loop_4", Seq: 4, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:04.000Z", UpdatedAt: "2026-04-11T12:00:04.000Z"},
+		{ID: "loop_5", Seq: 5, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "failed", CreatedAt: "2026-04-11T12:00:05.000Z", UpdatedAt: "2026-04-11T12:00:05.000Z"},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+
+	t.Run("unlimited returns all items and total", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 5 {
+			t.Fatalf("items len = %d, want 5", len(items))
+		}
+		assertEqual(t, data["total"], float64(5))
+		assertEqual(t, data["offset"], float64(0))
+		if _, ok := data["limit"]; ok {
+			t.Fatalf("limit present on unlimited list: %#v", data["limit"])
+		}
+	})
+
+	t.Run("limit and offset page with total", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?limit=2&offset=1", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 2 {
+			t.Fatalf("items len = %d, want 2", len(items))
+		}
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_4")
+		assertEqual(t, items[1].(map[string]any)["id"], "loop_3")
+		assertEqual(t, data["total"], float64(5))
+		assertEqual(t, data["limit"], float64(2))
+		assertEqual(t, data["offset"], float64(1))
+	})
+
+	t.Run("status filter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?status=running", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 3 {
+			t.Fatalf("items len = %d, want 3", len(items))
+		}
+		assertEqual(t, data["total"], float64(3))
+		for _, item := range items {
+			assertEqual(t, item.(map[string]any)["status"], "running")
+		}
+	})
+
+	t.Run("projectId filter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?projectId=project_b", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 2 {
+			t.Fatalf("items len = %d, want 2", len(items))
+		}
+		assertEqual(t, data["total"], float64(2))
+		for _, item := range items {
+			assertEqual(t, item.(map[string]any)["projectId"], "project_b")
+		}
+	})
+
+	t.Run("invalid limit", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/loops?limit=0", "/api/v1/loops?limit=-1", "/api/v1/loops?limit=abc", "/api/v1/loops?limit=201"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d, want 400; body=%s", path, recorder.Code, recorder.Body.String())
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errObj := body["error"].(map[string]any)
+			assertEqual(t, errObj["code"], string(pkgapi.ErrorCodeValidationFailed))
+		}
+	})
+
+	t.Run("invalid offset", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/loops?offset=-1", "/api/v1/loops?offset=abc"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d, want 400; body=%s", path, recorder.Code, recorder.Body.String())
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errObj := body["error"].(map[string]any)
+			assertEqual(t, errObj["code"], string(pkgapi.ErrorCodeValidationFailed))
+		}
+	})
+}
+
 func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 	requestArtifact := loadRequestArtifact(t)

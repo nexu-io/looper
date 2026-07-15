@@ -8,7 +8,34 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   base: "/dashboard/",
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    {
+      name: "dashboard-base-redirect",
+      configureServer(server) {
+        // base is /dashboard/; bare / or /dashboard (no slash) otherwise 404s with
+        // "configured with a public base URL of /dashboard/".
+        server.middlewares.use((req, res, next) => {
+          const url = req.url ?? "";
+          if (url === "/" || url === "/?") {
+            res.statusCode = 302;
+            res.setHeader("Location", "/dashboard/");
+            res.end();
+            return;
+          }
+          if (url === "/dashboard" || url.startsWith("/dashboard?")) {
+            const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
+            res.statusCode = 302;
+            res.setHeader("Location", `/dashboard/${qs}`);
+            res.end();
+            return;
+          }
+          next();
+        });
+      },
+    },
+  ],
   resolve: {
     alias: {
       "@": path.resolve(rootDir, "./src"),
@@ -19,6 +46,7 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    open: "/dashboard/",
     proxy: {
       "/api": {
         target: "http://127.0.0.1:17310",

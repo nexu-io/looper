@@ -1,8 +1,27 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { useNavigate } from "react-router-dom";
+import { DataTable, type Column } from "@/components/DataTable";
+import { LoopActionBar } from "@/components/LoopActionBar";
+import { PanelError } from "@/components/PanelError";
+import { StatusChip } from "@/components/StatusChip";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { fetchStatus, type LoopRoleCounts, type StatusData } from "@/lib/api";
+import {
+  fetchStatus,
+  type ActiveRun,
+  type LoopRoleCounts,
+  type StatusData,
+} from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
+import { formatAge } from "@/lib/format";
+import { useProjectFilter } from "@/lib/ProjectFilterContext";
 
 const STATUS_SLOW_MS = 45_000;
 
@@ -63,12 +82,30 @@ function Kv({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
+function activeTargetLabel(run: ActiveRun): string {
+  const t = run.target;
+  if (t?.label) return t.label;
+  if (t?.repo && t.prNumber != null) return `${t.repo}#${t.prNumber}`;
+  if (t?.repo) return t.repo;
+  return t?.type || "—";
+}
+
+function activeAgentLabel(run: ActiveRun): string {
+  const agent = run.agent;
+  if (!agent) return "—";
+  const pid = agent.pid != null ? `pid ${agent.pid}` : "no pid";
+  const vendor = agent.vendor || "agent";
+  return `${vendor} · ${pid}`;
+}
+
 export function OverviewPage({
   onHealthChange,
 }: {
   onHealthChange?: (healthy: boolean | null, version?: string) => void;
 }) {
-  const { health, healthy: sharedHealthy } = useDashboardData();
+  const navigate = useNavigate();
+  const { projectId } = useProjectFilter();
+  const { health, healthy: sharedHealthy, activeRuns } = useDashboardData();
 
   const [status, setStatus] = useState<StatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -151,6 +188,107 @@ export function OverviewPage({
   useEffect(() => {
     onHealthChange?.(sharedHealthy, status?.service?.version);
   }, [sharedHealthy, onHealthChange, status?.service?.version]);
+
+  const runningRows = useMemo(() => {
+    const items = activeRuns.data?.items ?? [];
+    if (!projectId) return items;
+    return items.filter((r) => r.projectId === projectId);
+  }, [activeRuns.data, projectId]);
+
+  const onRunningMutated = useCallback(async () => {
+    await activeRuns.forceRefresh();
+  }, [activeRuns]);
+
+  const onRunningRowClick = useCallback(
+    (run: ActiveRun) => {
+      navigate(`/loops/${run.seq}`);
+    },
+    [navigate],
+  );
+
+  const runningColumns: Column<ActiveRun>[] = useMemo(
+    () => [
+      {
+        key: "seq",
+        header: "Seq",
+        cell: (r) => (
+          <span className="mono text-[var(--accent)]">{r.seq}</span>
+        ),
+      },
+      {
+        key: "type",
+        header: "Type",
+        cell: (r) => <span className="mono">{r.type}</span>,
+      },
+      {
+        key: "projectId",
+        header: "Project",
+        cell: (r) => (
+          <span className="mono text-[var(--text-muted)]" title={r.projectId}>
+            {r.projectId}
+          </span>
+        ),
+      },
+      {
+        key: "status",
+        header: "Status",
+        cell: (r) => (
+          <StatusChip status={r.displayStatus || r.loopStatus || r.status} />
+        ),
+      },
+      {
+        key: "step",
+        header: "Step",
+        cell: (r) => (
+          <span className="mono text-[var(--text-muted)]">
+            {r.currentStep ?? "—"}
+          </span>
+        ),
+      },
+      {
+        key: "target",
+        header: "Target",
+        cell: (r) => (
+          <span className="mono" title={activeTargetLabel(r)}>
+            {activeTargetLabel(r)}
+          </span>
+        ),
+      },
+      {
+        key: "agent",
+        header: "Agent / PID",
+        cell: (r) => (
+          <span className="mono text-[var(--text-muted)]">
+            {activeAgentLabel(r)}
+          </span>
+        ),
+      },
+      {
+        key: "age",
+        header: "Age",
+        cell: (r) => (
+          <span className="mono text-[var(--text-muted)]">
+            {r.startedAt ? formatAge(r.startedAt) : "—"}
+          </span>
+        ),
+      },
+      {
+        key: "actions",
+        header: "Actions",
+        stopRowClick: true,
+        cell: (r) => (
+          <LoopActionBar
+            selector={String(r.seq)}
+            status={r.loopStatus || r.status}
+            hasActiveRun
+            onMutated={onRunningMutated}
+            mode="compact"
+          />
+        ),
+      },
+    ],
+    [onRunningMutated],
+  );
 
   if (health.loading && !health.data && !health.error) {
     return (
@@ -348,6 +486,47 @@ export function OverviewPage({
           </dl>
         </Card>
       </div>
+
+      <Card
+        title={
+          projectId
+            ? `Running loops · project ${projectId}`
+            : "Running loops"
+        }
+      >
+        {activeRuns.error && !activeRuns.data ? (
+          <PanelError
+            message={activeRuns.error}
+            onRetry={activeRuns.refresh}
+          />
+        ) : activeRuns.loading && !activeRuns.data ? (
+          <p className="m-0 text-[12px] text-[var(--text-muted)]">
+            Loading running loops…
+          </p>
+        ) : (
+          <>
+            {activeRuns.error ? (
+              <div className="mb-2">
+                <PanelError
+                  message={activeRuns.error}
+                  onRetry={activeRuns.refresh}
+                />
+              </div>
+            ) : null}
+            <DataTable
+              columns={runningColumns}
+              rows={runningRows}
+              rowKey={(r) => r.loopId || String(r.seq)}
+              empty={
+                projectId
+                  ? "No running loops for this project"
+                  : "No running loops"
+              }
+              onRowClick={onRunningRowClick}
+            />
+          </>
+        )}
+      </Card>
     </div>
   );
 }

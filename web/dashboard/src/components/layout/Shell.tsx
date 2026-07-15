@@ -5,7 +5,6 @@ import { useProjectFilter } from "@/lib/ProjectFilterContext";
 
 const navItems: { to: string; label: string; end?: boolean }[] = [
   { to: "/", label: "Overview", end: true },
-  { to: "/running", label: "Running" },
   { to: "/loops", label: "Loops" },
   { to: "/projects", label: "Projects" },
 ];
@@ -123,7 +122,7 @@ export function Shell({
                 }
               >
                 {item.label}
-                {item.to === "/running" &&
+                {item.to === "/loops" &&
                 !activeRuns.error &&
                 activeRuns.data != null &&
                 activeCount > 0 ? (
@@ -144,7 +143,7 @@ export function Shell({
                 disabled={!projectsReady}
                 title={
                   projectsReady
-                    ? "Filter Running/Loops by project"
+                    ? "Filter Loops by project"
                     : projects.error
                       ? "Projects unavailable — filter disabled"
                       : "Loading projects…"

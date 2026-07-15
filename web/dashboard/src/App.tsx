@@ -9,7 +9,6 @@ import { LoopDetailPage } from "@/pages/LoopDetail";
 import { LoopsPage } from "@/pages/Loops";
 import { OverviewPage } from "@/pages/Overview";
 import { ProjectsPage } from "@/pages/Projects";
-import { RunningPage } from "@/pages/Running";
 
 function resolveHostPort(): string {
   // Prefer the browser's authority as displayed in the address bar.
@@ -117,7 +116,7 @@ export default function App() {
                   index
                   element={<OverviewPage onHealthChange={onHealthChange} />}
                 />
-                <Route path="running" element={<RunningPage />} />
+                <Route path="running" element={<Navigate to="/loops" replace />} />
                 <Route path="loops" element={<LoopsPage />} />
                 <Route path="loops/:selector" element={<LoopDetailPage />} />
                 <Route path="projects" element={<ProjectsPage />} />

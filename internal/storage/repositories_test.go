@@ -1918,6 +1918,110 @@ func TestQueueStatsAndCleanupStaleQueued(t *testing.T) {
 	}
 }
 
+func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+
+	for _, project := range []ProjectRecord{
+		{ID: "project_a", Name: "A", RepoPath: "/tmp/a", CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "project_b", Name: "B", RepoPath: "/tmp/b", CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"},
+	} {
+		if err := repos.Projects.Upsert(ctx, project); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", project.ID, err)
+		}
+	}
+
+	// Distinct updated_at so ORDER BY updated_at DESC, seq DESC is deterministic.
+	loops := []LoopRecord{
+		{ID: "loop_1", Seq: 1, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:01.000Z", UpdatedAt: "2026-04-11T12:00:01.000Z"},
+		{ID: "loop_2", Seq: 2, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: "2026-04-11T12:00:02.000Z", UpdatedAt: "2026-04-11T12:00:02.000Z"},
+		{ID: "loop_3", Seq: 3, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:03.000Z", UpdatedAt: "2026-04-11T12:00:03.000Z"},
+		{ID: "loop_4", Seq: 4, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:04.000Z", UpdatedAt: "2026-04-11T12:00:04.000Z"},
+		{ID: "loop_5", Seq: 5, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "failed", CreatedAt: "2026-04-11T12:00:05.000Z", UpdatedAt: "2026-04-11T12:00:05.000Z"},
+	}
+	for _, loop := range loops {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	all, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{})
+	if err != nil {
+		t.Fatalf("ListFiltered(unlimited) error = %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("ListFiltered(unlimited) len = %d, want 5", len(all))
+	}
+	if all[0].ID != "loop_5" || all[4].ID != "loop_1" {
+		t.Fatalf("ListFiltered(unlimited) order = %v, want newest-first", loopIDs(all))
+	}
+
+	total, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{})
+	if err != nil {
+		t.Fatalf("CountFiltered(all) error = %v", err)
+	}
+	if total != 5 {
+		t.Fatalf("CountFiltered(all) = %d, want 5", total)
+	}
+
+	page, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Limit: 2, Offset: 1})
+	if err != nil {
+		t.Fatalf("ListFiltered(limit/offset) error = %v", err)
+	}
+	if got := loopIDs(page); !reflect.DeepEqual(got, []string{"loop_4", "loop_3"}) {
+		t.Fatalf("ListFiltered(limit=2,offset=1) = %v, want [loop_4 loop_3]", got)
+	}
+
+	running, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running"})
+	if err != nil {
+		t.Fatalf("ListFiltered(status) error = %v", err)
+	}
+	if got := loopIDs(running); !reflect.DeepEqual(got, []string{"loop_4", "loop_3", "loop_1"}) {
+		t.Fatalf("ListFiltered(status=running) = %v, want [loop_4 loop_3 loop_1]", got)
+	}
+	runningTotal, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{Status: "running"})
+	if err != nil {
+		t.Fatalf("CountFiltered(status) error = %v", err)
+	}
+	if runningTotal != 3 {
+		t.Fatalf("CountFiltered(status=running) = %d, want 3", runningTotal)
+	}
+
+	projectB, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{ProjectID: "project_b"})
+	if err != nil {
+		t.Fatalf("ListFiltered(projectId) error = %v", err)
+	}
+	if got := loopIDs(projectB); !reflect.DeepEqual(got, []string{"loop_5", "loop_4"}) {
+		t.Fatalf("ListFiltered(projectId=project_b) = %v, want [loop_5 loop_4]", got)
+	}
+
+	combined, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running", ProjectID: "project_a", Limit: 1, Offset: 0})
+	if err != nil {
+		t.Fatalf("ListFiltered(combined) error = %v", err)
+	}
+	if got := loopIDs(combined); !reflect.DeepEqual(got, []string{"loop_3"}) {
+		t.Fatalf("ListFiltered(status+project+limit) = %v, want [loop_3]", got)
+	}
+	combinedTotal, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{Status: "running", ProjectID: "project_a"})
+	if err != nil {
+		t.Fatalf("CountFiltered(combined) error = %v", err)
+	}
+	if combinedTotal != 2 {
+		t.Fatalf("CountFiltered(status+project) = %d, want 2", combinedTotal)
+	}
+}
+
+func loopIDs(items []LoopRecord) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
 func strPtr(value string) *string {
 	return &value
 }

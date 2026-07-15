@@ -1343,8 +1343,13 @@ type projectsListResponse struct {
 }
 
 type loopsListResponse struct {
-	Items []loopResponse `json:"items"`
+	Items  []loopResponse `json:"items"`
+	Total  int64          `json:"total"`
+	Limit  *int64         `json:"limit,omitempty"`
+	Offset int64          `json:"offset"`
 }
+
+const maxLoopsListLimit int64 = 200
 
 type eventsListResponse struct {
 	Items []eventResponse `json:"items"`
@@ -1695,7 +1700,17 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 
 	switch r.Method {
 	case http.MethodGet:
-		items, err := services.Repositories.Loops.List(r.Context())
+		opts, err := parseLoopsListOptions(r)
+		if err != nil {
+			return nil, err
+		}
+
+		total, err := services.Repositories.Loops.CountFiltered(r.Context(), opts)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+
+		items, err := services.Repositories.Loops.ListFiltered(r.Context(), opts)
 		if err != nil {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
@@ -1705,12 +1720,49 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 			responseItems = append(responseItems, serializeLoop(item))
 		}
 
-		return loopsListResponse{Items: responseItems}, nil
+		resp := loopsListResponse{
+			Items:  responseItems,
+			Total:  total,
+			Offset: opts.Offset,
+		}
+		if opts.Limit > 0 {
+			limit := opts.Limit
+			resp.Limit = &limit
+		}
+		return resp, nil
 	case http.MethodPost:
 		return h.buildCreateLoopResponse(r)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/loops")}
 	}
+}
+
+func parseLoopsListOptions(r *http.Request) (storage.ListLoopsOptions, error) {
+	opts := storage.ListLoopsOptions{
+		Status:    strings.TrimSpace(r.URL.Query().Get("status")),
+		ProjectID: strings.TrimSpace(r.URL.Query().Get("projectId")),
+	}
+
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "limit must be a positive integer"}
+		}
+		if parsed > maxLoopsListLimit {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be at most %d", maxLoopsListLimit)}
+		}
+		opts.Limit = parsed
+	}
+
+	if offsetValue := strings.TrimSpace(r.URL.Query().Get("offset")); offsetValue != "" {
+		parsed, err := strconv.ParseInt(offsetValue, 10, 64)
+		if err != nil || parsed < 0 {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "offset must be a non-negative integer"}
+		}
+		opts.Offset = parsed
+	}
+
+	return opts, nil
 }
 
 func (h *Handler) buildRunsRouteResponse(r *http.Request) (runsListResponse, error) {

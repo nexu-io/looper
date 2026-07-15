@@ -576,14 +576,67 @@ func (r *LoopsRepository) AllocateSeq(ctx context.Context) (int64, error) {
 	return next, nil
 }
 
+// ListLoopsOptions filters and paginates loop listings.
+// Empty Status/ProjectID match all. Limit 0 means no limit (full list); Offset is ignored when Limit == 0.
+type ListLoopsOptions struct {
+	Status    string
+	ProjectID string
+	Limit     int64
+	Offset    int64
+}
+
 func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops ORDER BY updated_at DESC, seq DESC`)
+	return r.ListFiltered(ctx, ListLoopsOptions{})
+}
+
+func (r *LoopsRepository) ListFiltered(ctx context.Context, opts ListLoopsOptions) ([]LoopRecord, error) {
+	query, args := buildLoopsListQuery(`SELECT * FROM loops`, opts, true)
+	rows, err := r.q.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list loops: %w", err)
+		return nil, fmt.Errorf("list loops filtered: %w", err)
 	}
 	defer rows.Close()
 
 	return scanLoops(rows)
+}
+
+func (r *LoopsRepository) CountFiltered(ctx context.Context, opts ListLoopsOptions) (int64, error) {
+	query, args := buildLoopsListQuery(`SELECT COUNT(*) FROM loops`, opts, false)
+	var total int64
+	if err := r.q.QueryRowContext(ctx, query, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count loops filtered: %w", err)
+	}
+	return total, nil
+}
+
+func buildLoopsListQuery(base string, opts ListLoopsOptions, withOrderAndLimit bool) (string, []any) {
+	var clauses []string
+	var args []any
+	if status := strings.TrimSpace(opts.Status); status != "" {
+		clauses = append(clauses, "status = ?")
+		args = append(args, status)
+	}
+	if projectID := strings.TrimSpace(opts.ProjectID); projectID != "" {
+		clauses = append(clauses, "project_id = ?")
+		args = append(args, projectID)
+	}
+
+	query := base
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	if withOrderAndLimit {
+		query += " ORDER BY updated_at DESC, seq DESC"
+		if opts.Limit > 0 {
+			query += " LIMIT ?"
+			args = append(args, opts.Limit)
+			if opts.Offset > 0 {
+				query += " OFFSET ?"
+				args = append(args, opts.Offset)
+			}
+		}
+	}
+	return query, args
 }
 
 func (r *LoopsRepository) ListByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]LoopRecord, error) {
