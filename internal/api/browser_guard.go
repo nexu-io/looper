@@ -32,7 +32,17 @@ var rewriteHTTPtestDefaultHost bool
 // loopback authority. Loopback is accepted without requiring an exact config
 // port match because the client already dialed the process; this still rejects
 // attacker Hosts such as evil.example that DNS rebinding would present.
+//
+// Exception: non-browser external callbacks (see isNonBrowserCallbackPath)
+// authenticate with their own shared secret (e.g. Feishu verification token).
+// When Origin is absent, Host allowlisting is skipped for those paths so a
+// public Host on server.host=0.0.0.0 without server.baseUrl still reaches the
+// token-verified handler.
 func validateBrowserRequest(r *http.Request, cfg config.Config) error {
+	return validateBrowserRequestForPath(r, cfg, r.URL.Path)
+}
+
+func validateBrowserRequestForPath(r *http.Request, cfg config.Config, path string) error {
 	host := effectiveRequestHost(r, cfg)
 	if host == "" {
 		return apiError{
@@ -46,6 +56,11 @@ func validateBrowserRequest(r *http.Request, cfg config.Config) error {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		if authorityAllowed(host, allowed) || isLoopbackAuthority(host) {
+			return nil
+		}
+		// Token-verified inbound callbacks are not browser reads; do not require
+		// server.baseUrl just so a public Host survives the Host allowlist.
+		if isNonBrowserCallbackPath(path) {
 			return nil
 		}
 		return apiError{
@@ -296,4 +311,17 @@ func isLoopbackHostname(host string) bool {
 
 func isDashboardBootstrapPath(path string) bool {
 	return path == dashboardBootstrapCodePath || path == dashboardBootstrapExchangePath
+}
+
+// isNonBrowserCallbackPath reports paths that receive external non-browser
+// webhooks/callbacks and authenticate via their own shared secret rather than
+// browser Host/Origin. Host allowlisting still applies when Origin is present
+// (browser-initiated requests).
+func isNonBrowserCallbackPath(path string) bool {
+	switch path {
+	case apiBasePath + "/hitl/feishu":
+		return true
+	default:
+		return false
+	}
 }

@@ -67,6 +67,15 @@ describe("needsSeparateStderrFollow", () => {
     );
   });
 
+  it("is true for initially empty snapshots so later stderr is not dropped", () => {
+    expect(needsSeparateStderrFollow({ stdout: "", stderr: "" })).toBe(true);
+    expect(needsSeparateStderrFollow({ stdout: "  ", stderr: "  " })).toBe(
+      true,
+    );
+    expect(needsSeparateStderrFollow(null)).toBe(true);
+    expect(needsSeparateStderrFollow(undefined)).toBe(true);
+  });
+
   it("is false when default follow already covers stderr-only output", () => {
     expect(needsSeparateStderrFollow({ stdout: "", stderr: "err\n" })).toBe(
       false,
@@ -74,8 +83,6 @@ describe("needsSeparateStderrFollow", () => {
     expect(needsSeparateStderrFollow({ stdout: "  ", stderr: "err\n" })).toBe(
       false,
     );
-    expect(needsSeparateStderrFollow(null)).toBe(false);
-    expect(needsSeparateStderrFollow(undefined)).toBe(false);
   });
 });
 

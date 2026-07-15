@@ -38,15 +38,20 @@ export function nextReconnectDelayMs(
 }
 
 /**
- * Default follow stream tracks stdout unless stdout is empty (then stderr).
- * When snapshot stdout is non-empty, open a separate `stderr=1` follow so live
- * stderr after the snapshot is not dropped.
+ * Default follow tracks stdout unless stdout is empty and stderr already has
+ * content (then stderr). Open a separate `stderr=1` follow in every other case
+ * so later stderr is not dropped when default locks onto stdout first —
+ * including the initially-empty snapshot (no agent / both streams empty).
  */
 export function needsSeparateStderrFollow(agent?: {
   stdout?: string | null;
+  stderr?: string | null;
 } | null): boolean {
-  if (!agent) return false;
-  return Boolean(agent.stdout?.trim());
+  // Default follow already covers stderr-only snapshots.
+  if (agent && !agent.stdout?.trim() && agent.stderr?.trim()) {
+    return false;
+  }
+  return true;
 }
 
 /**

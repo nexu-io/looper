@@ -639,7 +639,9 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 
 	// Browser foundation: Host allowlist + Origin match against config-derived
 	// authorities when Origin is present (reads and mutations). CLI without Origin OK.
-	if err := validateBrowserRequest(r, cfg); err != nil {
+	// Non-browser callbacks (e.g. Feishu) with no Origin skip Host allowlist so a
+	// public Host on 0.0.0.0 without server.baseUrl still reaches token verification.
+	if err := validateBrowserRequestForPath(r, cfg, path); err != nil {
 		return err
 	}
 
