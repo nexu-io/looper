@@ -251,6 +251,76 @@ func TestAttackerHostAndOriginRejectedAuthNone(t *testing.T) {
 	}
 }
 
+func TestAttackerHostAndOriginRejectedOnSafeGetAuthNone(t *testing.T) {
+	t.Parallel()
+
+	// DNS rebinding via browser-readable GET (config / logs / status): Host+Origin
+	// from the attacker domain must 403 even when authMode=none. Auth runs before
+	// route dispatch, so unknown paths still prove the guard.
+	h := NewHandler(Context{Config: config.Config{
+		Server: config.ServerConfig{
+			Host:     "127.0.0.1",
+			Port:     17310,
+			AuthMode: config.AuthModeNone,
+		},
+	}})
+
+	for _, path := range []string{"/api/v1/config", "/api/v1/status", "/api/v1/does-not-exist"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "evil.example"
+		req.Header.Set("Origin", "http://evil.example")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("GET %s status = %d, want 403 body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestCLIGetWithoutOriginAllowed(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(Context{Config: config.Config{
+		Server: config.ServerConfig{
+			Host:     "127.0.0.1",
+			Port:     17310,
+			AuthMode: config.AuthModeNone,
+		},
+	}})
+
+	// Unknown route still proves auth/origin passed (not 403).
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/does-not-exist", nil)
+	req.Host = "127.0.0.1:17310"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusForbidden {
+		t.Fatalf("CLI GET without Origin must not get 403")
+	}
+}
+
+func TestLegitimateHostOriginAllowedOnSafeGet(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(Context{Config: config.Config{
+		Server: config.ServerConfig{
+			Host:     "127.0.0.1",
+			Port:     17310,
+			AuthMode: config.AuthModeNone,
+		},
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/does-not-exist", nil)
+	req.Host = "127.0.0.1:17310"
+	req.Header.Set("Origin", "http://127.0.0.1:17310")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusForbidden {
+		t.Fatalf("legitimate loopback GET Host/Origin must not get 403: %s", rec.Body.String())
+	}
+}
+
 func TestLegitimateHostOriginAllowed(t *testing.T) {
 	t.Parallel()
 

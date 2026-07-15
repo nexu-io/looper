@@ -12,19 +12,15 @@ import (
 )
 
 // validateBrowserRequest enforces Host allowlisting and Origin matching for
-// unsafe browser methods. CLI clients without an Origin header continue to work.
+// browser requests, including safe methods (GET/HEAD) that expose dashboard
+// state. CLI clients without an Origin header continue to work.
 //
 // DNS rebinding under authMode=none: when a browser sends Host and Origin for an
 // attacker domain, both are checked against authorities derived from server
 // config (bind host/port, loopback aliases, optional server.baseUrl) — not from
-// the request Host itself.
+// the request Host itself. This applies to API/dashboard reads as well as
+// mutations so rebinding cannot exfiltrate local state over GET.
 func validateBrowserRequest(r *http.Request, cfg config.Config) error {
-	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-	default:
-		return nil
-	}
-
 	host := strings.TrimSpace(r.Host)
 	if host == "" {
 		return apiError{

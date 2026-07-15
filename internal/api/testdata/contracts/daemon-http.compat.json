@@ -46,8 +46,8 @@
           "method": "POST",
           "behavior": "When authMode is local-token, POST exchange is allowed without a Bearer token so the SPA can redeem a one-shot bootstrap code for the configured localToken. Mint (POST /api/v1/dashboard/bootstrap/code) still requires a matching Bearer token. Both responses set Cache-Control: no-store."
         },
-        "browserOriginOnUnsafeMethods": {
-          "behavior": "For POST/PUT/PATCH/DELETE, if an Origin header is present it must match an origin derived from the request Host (http(s)://Host, plus loopback aliases). Mismatch returns 403. Requests without Origin (CLI) are allowed. Empty Host on unsafe methods returns 403."
+        "browserOriginHostAllowlist": {
+          "behavior": "For all methods (including GET/HEAD reads that expose dashboard state), if an Origin header is present, both Host and Origin must match authorities derived from server config (bind host/port, loopback aliases, optional server.baseUrl). Mismatch returns 403. Requests without Origin (CLI) are allowed. Empty Host always returns 403."
         }
       }
     },

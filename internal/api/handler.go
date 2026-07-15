@@ -637,8 +637,8 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 		}
 	}
 
-	// Browser mutation foundation: Host allowlist + Origin match against
-	// config-derived authorities when Origin is present. CLI without Origin OK.
+	// Browser foundation: Host allowlist + Origin match against config-derived
+	// authorities when Origin is present (reads and mutations). CLI without Origin OK.
 	if err := validateBrowserRequest(r, cfg); err != nil {
 		return err
 	}
