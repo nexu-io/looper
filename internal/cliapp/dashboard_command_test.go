@@ -305,6 +305,34 @@ func TestDashboardHTTPBaseURLBracketsIPv6(t *testing.T) {
 	}
 }
 
+// Cold-start via daemonStart rebuilds its probe client with localAPIClientFromLoaded;
+// that path must bracket IPv6 the same way as dashboardAPIClient / dashboardHTTPBaseURL.
+func TestLocalAPIClientFromLoadedBracketsIPv6(t *testing.T) {
+	t.Parallel()
+
+	r := newCommandRuntime(New(Deps{}), nil)
+	loaded := config.LoadedFileConfig{
+		Config: config.Config{
+			Server: config.ServerConfig{
+				Host: "::1",
+				Port: 17310,
+			},
+		},
+	}
+	client := r.localAPIClientFromLoaded(loaded)
+	if client == nil {
+		t.Fatal("expected client")
+	}
+	if client.baseURL != "http://[::1]:17310" {
+		t.Fatalf("localAPIClientFromLoaded baseURL = %q, want http://[::1]:17310", client.baseURL)
+	}
+	// apiClientFromLoaded without baseUrl must match (used by non-dashboard paths).
+	apiClient := r.apiClientFromLoaded(loaded)
+	if apiClient.baseURL != "http://[::1]:17310" {
+		t.Fatalf("apiClientFromLoaded baseURL = %q, want http://[::1]:17310", apiClient.baseURL)
+	}
+}
+
 func TestDashboardWildcardHostProbesLoopback(t *testing.T) {
 	t.Parallel()
 
