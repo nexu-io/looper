@@ -28,6 +28,7 @@ import {
   needsSeparateStderrFollow,
   nextReconnectDelayMs,
   resolveLogsStreamStatus,
+  stderrGapFromSecondarySnapshot,
 } from "@/lib/logsStream";
 import { consumeSSE } from "@/lib/sse";
 import { usePolling } from "@/lib/usePolling";
@@ -167,7 +168,8 @@ function LogsPane({ selector }: { selector: string }) {
         // stderr, but post-snapshot stderr only arrives on stderr=1.
         if (!needsSeparateStderrFollow(snap.agent)) return;
 
-        let sectionHeaderPresent = Boolean(snap.agent?.stderr?.trim());
+        const primaryStderr = snap.agent?.stderr ?? "";
+        let sectionHeaderPresent = Boolean(primaryStderr.trim());
 
         void (async () => {
           try {
@@ -180,7 +182,30 @@ function LogsPane({ selector }: { selector: string }) {
               response,
               (event, rawData) => {
                 if (generation !== generationRef.current) return;
-                // Snapshot is already applied from the primary stream.
+                // Secondary snapshot is the server baseline for later chunks.
+                // Apply any stderr written after the primary seed and before
+                // this connection's snapshot; pure chunks alone miss that gap.
+                if (event === "snapshot") {
+                  try {
+                    const secondary = JSON.parse(rawData) as LoopLogsSnapshot;
+                    const gap = stderrGapFromSecondarySnapshot(
+                      primaryStderr,
+                      secondary.agent?.stderr ?? "",
+                    );
+                    if (gap) {
+                      appendText(
+                        formatLiveStderrChunk(gap, sectionHeaderPresent),
+                      );
+                      sectionHeaderPresent = true;
+                      setPhase("live");
+                    } else if (secondary.agent?.stderr?.trim()) {
+                      sectionHeaderPresent = true;
+                    }
+                  } catch {
+                    // Keep primary stream alive; soft-fail malformed stderr only.
+                  }
+                  return;
+                }
                 if (event !== "chunk") return;
                 try {
                   const chunk = JSON.parse(rawData) as LoopLogsChunk;

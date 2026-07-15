@@ -5,6 +5,7 @@ import {
   needsSeparateStderrFollow,
   nextReconnectDelayMs,
   resolveLogsStreamStatus,
+  stderrGapFromSecondarySnapshot,
 } from "./logsStream";
 
 describe("resolveLogsStreamStatus", () => {
@@ -85,5 +86,25 @@ describe("formatLiveStderrChunk", () => {
     );
     expect(formatLiveStderrChunk("more\n", true)).toBe("more\n");
     expect(formatLiveStderrChunk("", false)).toBe("");
+  });
+});
+
+describe("stderrGapFromSecondarySnapshot", () => {
+  it("returns empty when secondary has no new stderr", () => {
+    expect(stderrGapFromSecondarySnapshot("err\n", "err\n")).toBe("");
+    expect(stderrGapFromSecondarySnapshot("err\n", "")).toBe("");
+    expect(stderrGapFromSecondarySnapshot("", "")).toBe("");
+  });
+
+  it("returns full secondary when primary had none", () => {
+    expect(stderrGapFromSecondarySnapshot("", "late\n")).toBe("late\n");
+  });
+
+  it("returns only the append suffix when secondary extends primary", () => {
+    expect(stderrGapFromSecondarySnapshot("a\n", "a\nb\n")).toBe("b\n");
+  });
+
+  it("returns full secondary on non-prefix rewrite", () => {
+    expect(stderrGapFromSecondarySnapshot("old\n", "new\n")).toBe("new\n");
   });
 });

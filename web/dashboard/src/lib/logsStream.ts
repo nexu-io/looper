@@ -61,3 +61,27 @@ export function formatLiveStderrChunk(
   if (sectionHeaderPresent) return content;
   return `\n--- stderr ---\n${content}`;
 }
+
+/**
+ * Bytes present only in the secondary stderr=1 snapshot relative to the
+ * primary (default-follow) snapshot already seeded into the logs pane.
+ *
+ * The server baselines follow chunks from its own snapshot, so any stderr
+ * written between the two snapshots would never appear as a chunk unless the
+ * client applies this gap from the secondary snapshot event.
+ *
+ * Mirrors server appendedLogChunk suffix logic when content is append-only.
+ */
+export function stderrGapFromSecondarySnapshot(
+  primaryStderr: string,
+  secondaryStderr: string,
+): string {
+  if (!secondaryStderr) return "";
+  if (!primaryStderr) return secondaryStderr;
+  if (secondaryStderr === primaryStderr) return "";
+  if (secondaryStderr.startsWith(primaryStderr)) {
+    return secondaryStderr.slice(primaryStderr.length);
+  }
+  // Non-prefix rewrite (e.g. new execution): surface full secondary content.
+  return secondaryStderr;
+}
