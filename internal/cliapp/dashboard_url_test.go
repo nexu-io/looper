@@ -32,6 +32,48 @@ func TestResolveDashboardBrowserBaseURLMapsWildcard(t *testing.T) {
 	}
 }
 
+func TestResolveDashboardBrowserBaseURLRejectsPathPrefix(t *testing.T) {
+	t.Parallel()
+
+	base := "https://daemon.example.test/base"
+	loaded := config.LoadedFileConfig{
+		Config: config.Config{
+			Server: config.ServerConfig{
+				BaseURL:  &base,
+				AuthMode: config.AuthModeLocalToken,
+			},
+		},
+	}
+	_, err := resolveDashboardBrowserBaseURL(loaded)
+	if err == nil {
+		t.Fatal("expected error for pathful server.baseUrl")
+	}
+	if !strings.Contains(err.Error(), "path prefix") {
+		t.Fatalf("error = %q, want path prefix rejection", err)
+	}
+}
+
+func TestResolveDashboardBrowserBaseURLAllowsOriginOnlyBaseURL(t *testing.T) {
+	t.Parallel()
+
+	base := "https://daemon.example.test"
+	loaded := config.LoadedFileConfig{
+		Config: config.Config{
+			Server: config.ServerConfig{
+				BaseURL:  &base,
+				AuthMode: config.AuthModeLocalToken,
+			},
+		},
+	}
+	got, err := resolveDashboardBrowserBaseURL(loaded)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got != "https://daemon.example.test" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestResolveDashboardBrowserBaseURLBracketsIPv6(t *testing.T) {
 	t.Parallel()
 

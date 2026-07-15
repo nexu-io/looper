@@ -124,6 +124,12 @@ func resolveDashboardBrowserBaseURL(loaded config.LoadedFileConfig) (string, err
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 			return "", fmt.Errorf("invalid server.baseUrl %q", base)
 		}
+		// SPA is rooted at /dashboard/ with root-relative /api/v1/... calls.
+		// A path prefix (e.g. https://host/base) would open /base/dashboard/ while
+		// assets and API still target site root, so dashboard would break after mint.
+		if path := strings.Trim(parsed.Path, "/"); path != "" {
+			return "", fmt.Errorf("server.baseUrl must not include a path prefix for the dashboard (got %s); the SPA is served at /dashboard/ with root-relative API paths", base)
+		}
 		host := parsed.Hostname()
 		if !isLoopbackHostname(host) && !strings.EqualFold(parsed.Scheme, "https") {
 			return "", fmt.Errorf("server.baseUrl must use https for non-loopback hosts (got %s)", base)
