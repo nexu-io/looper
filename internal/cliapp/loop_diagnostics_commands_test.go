@@ -163,8 +163,254 @@ func TestLoopFailuresIncludesPausedManualInterventionLoops(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v\noutput=%q", err, stdout)
 	}
+	// Queue status is manual_intervention (operator hold), but LastErrorKind is
+	// non_retryable — FailureClass must preserve the structured kind.
 	if decoded.Count != 1 || len(decoded.Items) != 1 || decoded.Items[0].Loop.Seq != 8 || decoded.Items[0].Loop.Status != "paused" || decoded.Items[0].LatestQueueItem.Status != "manual_intervention" || decoded.Items[0].Diagnosis.FailureClass != "non_retryable" {
-		t.Fatalf("loop failures output = %#v, want one paused manual-intervention worker loop", decoded)
+		t.Fatalf("loop failures output = %#v, want one paused manual-hold worker loop with non_retryable class", decoded)
+	}
+}
+
+func TestDescribeAliasesLoopInspect(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeLoopDiagnosticsFixture(t, "")
+	exitCode, stdout, stderr := runApp(t, "describe", "run_reviewer_failed", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([describe]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	var decoded struct {
+		SelectorKind string `json:"selectorKind"`
+		Loop         struct {
+			Seq int64 `json:"seq"`
+		} `json:"loop"`
+		Run struct {
+			ID string `json:"id"`
+		} `json:"run"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v\noutput=%q", err, stdout)
+	}
+	if decoded.SelectorKind != "runId" || decoded.Loop.Seq != 7 || decoded.Run.ID != "run_reviewer_failed" {
+		t.Fatalf("describe output = %#v, want same resolution as loop inspect", decoded)
+	}
+}
+
+func TestDescribeHumanShowsManualInterventionReason(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeLoopDiagnosticsFixture(t, "")
+	exitCode, stdout, stderr := runApp(t, "describe", "8", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([describe 8]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	for _, want := range []string{"worktree is locked", "manual_intervention", "retry"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("describe human output = %q, want to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestClassifyDiagnosticMessageManualIntervention(t *testing.T) {
+	t.Parallel()
+
+	got := classifyDiagnosticMessage("dirty worktree: uncommitted changes", "manual_intervention")
+	if got.FailureClass != "manual_intervention" || got.Retryable == nil || *got.Retryable {
+		t.Fatalf("diagnosis = %#v, want non-retryable manual_intervention", got)
+	}
+	if !strings.Contains(got.RecommendedAction, "discard") || !strings.Contains(got.RecommendedAction, "retry") {
+		t.Fatalf("RecommendedAction = %q, want dirty-worktree discard/retry guidance", got.RecommendedAction)
+	}
+
+	locked := classifyDiagnosticMessage("fatal: worktree is locked", "manual_intervention")
+	if strings.Contains(locked.RecommendedAction, "discard") {
+		t.Fatalf("RecommendedAction = %q, must not recommend discard for locked worktree", locked.RecommendedAction)
+	}
+	if !strings.Contains(locked.RecommendedAction, "unlock") {
+		t.Fatalf("RecommendedAction = %q, want unlock guidance for locked worktree", locked.RecommendedAction)
+	}
+}
+
+func TestDiagnoseLoopExpandsRetrySeqPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	kind := "manual_intervention"
+	msg := "dirty worktree: uncommitted changes"
+	queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &msg, LastErrorKind: &kind}
+	run := &storage.RunRecord{Status: "failed", ErrorMessage: &msg}
+	got := diagnoseLoop(storage.LoopRecord{Seq: 42, Status: "paused"}, run, queue, loopDiagnosticMetadata{}, true)
+	if strings.Contains(got.RecommendedAction, "<seq>") {
+		t.Fatalf("RecommendedAction = %q, want expanded loop seq not literal <seq>", got.RecommendedAction)
+	}
+	if !strings.Contains(got.RecommendedAction, "looper retry 42") {
+		t.Fatalf("RecommendedAction = %q, want looper retry 42", got.RecommendedAction)
+	}
+
+	paused := diagnoseLoop(storage.LoopRecord{Seq: 7, Status: "paused"}, nil, nil, loopDiagnosticMetadata{}, false)
+	if strings.Contains(paused.RecommendedAction, "<seq>") {
+		t.Fatalf("paused RecommendedAction = %q, want expanded seq", paused.RecommendedAction)
+	}
+	if !strings.Contains(paused.RecommendedAction, "looper unpause 7") || !strings.Contains(paused.RecommendedAction, "looper describe 7") {
+		t.Fatalf("paused RecommendedAction = %q, want unpause/describe with seq 7", paused.RecommendedAction)
+	}
+}
+
+func TestDiagnoseQueueItemDoesNotEmitSeqPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	kind := "manual_intervention"
+	msg := "dirty worktree: uncommitted changes"
+	item := storage.QueueItemRecord{Status: "manual_intervention", LastError: &msg, LastErrorKind: &kind}
+
+	withSeq := diagnoseQueueItem(item, 3)
+	if strings.Contains(withSeq.RecommendedAction, "<seq>") {
+		t.Fatalf("RecommendedAction = %q, want expanded seq not literal <seq>", withSeq.RecommendedAction)
+	}
+	if !strings.Contains(withSeq.RecommendedAction, "looper retry 3") {
+		t.Fatalf("RecommendedAction = %q, want looper retry 3", withSeq.RecommendedAction)
+	}
+
+	withoutSeq := diagnoseQueueItem(item, 0)
+	if strings.Contains(withoutSeq.RecommendedAction, "<seq>") {
+		t.Fatalf("RecommendedAction = %q, must not leak unresolved <seq> when loop seq is unknown", withoutSeq.RecommendedAction)
+	}
+	if !strings.Contains(withoutSeq.RecommendedAction, "retry the owning loop") {
+		t.Fatalf("RecommendedAction = %q, want owning-loop retry guidance without placeholder", withoutSeq.RecommendedAction)
+	}
+}
+
+func TestDiagnoseLoopPreservesErrorKindWhenQueueIsManualHold(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		kind      string
+		message   string
+		wantClass string
+		retryable bool
+	}{
+		{name: "retryable_transient", kind: "retryable_transient", message: `Post "https://api.github.com/graphql": EOF`, wantClass: "github_transient", retryable: true},
+		{name: "retryable_after_resume", kind: "retryable_after_resume", message: "agent interrupted", wantClass: "retryable_after_resume", retryable: true},
+		{name: "non_retryable", kind: "non_retryable", message: "fatal: worktree is locked", wantClass: "non_retryable", retryable: false},
+		{name: "manual_intervention kind", kind: "manual_intervention", message: "dirty worktree: uncommitted changes", wantClass: "manual_intervention", retryable: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kind := tt.kind
+			msg := tt.message
+			queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &msg, LastErrorKind: &kind}
+			run := &storage.RunRecord{Status: "failed", ErrorMessage: &msg}
+			got := diagnoseLoop(storage.LoopRecord{Status: "paused"}, run, queue, loopDiagnosticMetadata{}, true)
+			if got.FailureClass != tt.wantClass {
+				t.Fatalf("FailureClass = %q, want %q", got.FailureClass, tt.wantClass)
+			}
+			if got.Retryable == nil || *got.Retryable != tt.retryable {
+				t.Fatalf("Retryable = %#v, want %v", got.Retryable, tt.retryable)
+			}
+		})
+	}
+}
+
+func TestDiagnoseLoopCheckpointOnlyManualHoldUsesResumePolicy(t *testing.T) {
+	t.Parallel()
+
+	// Paused loops included via checkpoint resumePolicy with no parked queue
+	// must classify as manual_intervention, not unknown.
+	msg := "dirty worktree: uncommitted changes"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	run := &storage.RunRecord{Status: "failed", ErrorMessage: &msg, CheckpointJSON: &checkpoint}
+
+	got := diagnoseLoop(storage.LoopRecord{Seq: 9, Status: "paused"}, run, nil, loopDiagnosticMetadata{}, true)
+	if got.FailureClass != "manual_intervention" {
+		t.Fatalf("FailureClass = %q, want manual_intervention for checkpoint-only hold", got.FailureClass)
+	}
+	if got.Retryable == nil || *got.Retryable {
+		t.Fatalf("Retryable = %#v, want false for manual_intervention", got.Retryable)
+	}
+	if !strings.Contains(got.RecommendedAction, "looper retry 9") {
+		t.Fatalf("RecommendedAction = %q, want operator-hold retry guidance for seq 9", got.RecommendedAction)
+	}
+	if got.Source != "run" || !strings.Contains(got.Message, "dirty worktree") {
+		t.Fatalf("diagnosis = %#v, want run-sourced dirty worktree message", got)
+	}
+
+	// Queue LastErrorKind still wins when present (do not overwrite with policy).
+	queueKind := "non_retryable"
+	queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &msg, LastErrorKind: &queueKind}
+	withQueue := diagnoseLoop(storage.LoopRecord{Seq: 9, Status: "paused"}, run, queue, loopDiagnosticMetadata{}, true)
+	if withQueue.FailureClass != "non_retryable" {
+		t.Fatalf("FailureClass = %q, want non_retryable from queue kind over resumePolicy", withQueue.FailureClass)
+	}
+}
+
+func TestDiagnoseLoopRunSelectorIgnoresLatestQueueKind(t *testing.T) {
+	t.Parallel()
+
+	runMsg := `Post "https://api.github.com/graphql": EOF`
+	queueMsg := "dirty worktree: uncommitted changes"
+	queueKind := "manual_intervention"
+	run := &storage.RunRecord{Status: "failed", ErrorMessage: &runMsg}
+	queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &queueMsg, LastErrorKind: &queueKind}
+
+	got := diagnoseLoop(storage.LoopRecord{Status: "paused"}, run, queue, loopDiagnosticMetadata{}, false)
+	if got.FailureClass != "github_transient" {
+		t.Fatalf("FailureClass = %q, want github_transient from historical run only", got.FailureClass)
+	}
+	if got.Source != "run" || !strings.Contains(got.Message, "api.github.com") {
+		t.Fatalf("diagnosis = %#v, want run-sourced github message", got)
+	}
+}
+
+func TestDiagnoseLoopRunSelectorIgnoresLoopMetadataLastFailure(t *testing.T) {
+	t.Parallel()
+
+	// Historical run succeeded (or has no error); loop metadata still carries a
+	// later run's lastFailure. Run-id diagnosis must not adopt that signal.
+	laterFailure := "dirty worktree: uncommitted changes from a later run"
+	metadata := loopDiagnosticMetadata{
+		Loop: &loopDiagnosticLoopMetadata{LastFailure: &laterFailure},
+	}
+	run := &storage.RunRecord{Status: "succeeded"}
+	queueMsg := "queue error from current hold"
+	queueKind := "manual_intervention"
+	queue := &storage.QueueItemRecord{Status: "manual_intervention", LastError: &queueMsg, LastErrorKind: &queueKind}
+
+	got := diagnoseLoop(storage.LoopRecord{Status: "paused"}, run, queue, metadata, false)
+	if got.Source == "loopMetadata" || strings.Contains(got.Message, laterFailure) {
+		t.Fatalf("diagnosis = %#v, want no loop metadata lastFailure for run-id selector", got)
+	}
+	if got.Source == "queueItem" || strings.Contains(got.Message, queueMsg) {
+		t.Fatalf("diagnosis = %#v, want no latest queue error for run-id selector", got)
+	}
+	if got.Message != "" && got.Source != "run" {
+		t.Fatalf("diagnosis = %#v, want empty or run-only diagnosis for successful historical run", got)
+	}
+}
+
+func TestRecommendedActionForPausedIsNotAlwaysRetry(t *testing.T) {
+	t.Parallel()
+
+	got := recommendedActionForState("paused")
+	if strings.Contains(got, "retry") && !strings.Contains(got, "unpause") {
+		t.Fatalf("paused action = %q, want unpause/describe guidance not forced retry", got)
+	}
+	if !strings.Contains(got, "unpause") {
+		t.Fatalf("paused action = %q, want unpause guidance", got)
+	}
+}
+
+func TestTruncateCLITextIsRuneSafeAndSingleLine(t *testing.T) {
+	t.Parallel()
+
+	// 10 runes of multi-byte text + control/newline collapse.
+	got := truncateCLIText("你好世界测试文本更长\nline2\twith\ttabs", 8)
+	if strings.Contains(got, "\n") || strings.Contains(got, "\t") {
+		t.Fatalf("truncateCLIText = %q, want single-line sanitized text", got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("truncateCLIText = %q, want ellipsis suffix", got)
+	}
+	if len([]rune(got)) != 8 {
+		t.Fatalf("truncateCLIText rune len = %d, want 8 (including ...)", len([]rune(got)))
 	}
 }
 

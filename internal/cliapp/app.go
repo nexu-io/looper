@@ -107,7 +107,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "describe", description: "Show loop diagnostics detail"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -521,6 +521,17 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper ps --status completed --type worker",
 					"$ looper ps --all",
 					"$ looper ps --type reviewer --project project_1",
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "describe <seq|loopId|runId>",
+				short: "Show loop diagnostics detail",
+				args:  cobra.ExactArgs(1),
+				runE:  runtime.loopInspect,
+				exampleLines: []string{
+					"$ looper describe 12",
+					"$ looper describe 12 --json",
+					"$ looper loop inspect 12",
 				},
 			}),
 			newCommand(commandSpec{

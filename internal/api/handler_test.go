@@ -446,7 +446,8 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 47, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_resume", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	runError := "checkpoint hold: operator must inspect worktree"
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_resume", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, ErrorMessage: &runError, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 
@@ -466,6 +467,88 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	assertEqual(t, item["loopStatus"], "paused")
 	assertEqual(t, item["displayStatus"], "manual_intervention")
 	assertEqual(t, item["resumePolicy"], "manual_intervention")
+	// No queue item: reason falls back to the latest run error so `looper ps` can show it.
+	assertEqual(t, item["lastFailureReason"], runError)
+}
+
+// Successful completeRun summaries must not populate lastFailureReason when there
+// is no queue error (queued/running loops and ps --all completed rows).
+func TestHandlerActiveRunsDoesNotUseSuccessSummaryAsFailureReason(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_success_summary"
+	loopID := "loop_success_summary"
+	targetID := projectID
+	successSummary := "worker completed successfully"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 61, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_success_summary", LoopID: loopID, Status: "success", Summary: &successSummary, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	// Queue has no lastError: decoration would previously fall back to run Summary.
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_success_summary", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:success_summary", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(items), items)
+	}
+	item := items[0].(map[string]any)
+	if reason, ok := item["lastFailureReason"]; ok && reason != nil {
+		t.Fatalf("lastFailureReason = %#v, want omitted/nil for successful run summary", reason)
+	}
+}
+
+func TestHandlerActiveRunsUsesFailedRunSummaryAsFailureReason(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_failed_summary"
+	loopID := "loop_failed_summary"
+	targetID := projectID
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	failedSummary := "worktree is locked; operator hold"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 62, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	// Summary-only failure (no ErrorMessage): still surfaces as lastFailureReason.
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_summary", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, Summary: &failedSummary, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	items := body["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items len = %d, want 1: %#v", len(items), items)
+	}
+	item := items[0].(map[string]any)
+	assertEqual(t, item["lastFailureReason"], failedSummary)
 }
 
 func TestHandlerActiveRunsSurfacesBackingOffDisplayStatus(t *testing.T) {

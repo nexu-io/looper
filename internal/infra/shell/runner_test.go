@@ -3,7 +3,10 @@ package shell
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -122,5 +125,63 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestIsTextFileBusy(t *testing.T) {
+	t.Parallel()
+	if !isTextFileBusy(syscall.ETXTBSY) {
+		t.Fatal("isTextFileBusy(syscall.ETXTBSY) = false, want true")
+	}
+	if isTextFileBusy(os.ErrNotExist) {
+		t.Fatal("isTextFileBusy(os.ErrNotExist) = true, want false")
+	}
+	if isTextFileBusy(nil) {
+		t.Fatal("isTextFileBusy(nil) = true, want false")
+	}
+}
+
+func TestRunRetriesStartOnTextFileBusy(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "tool")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf ok\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	// Keep an exclusive write fd open so the first Start hits ETXTBSY on Linux.
+	// Release it shortly after Run begins so a later retry succeeds.
+	holder, err := os.OpenFile(script, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open script for write hold: %v", err)
+	}
+	// Confirm this platform produces ETXTBSY under a write hold; skip otherwise
+	// (some filesystems / kernels do not surface it for shell scripts).
+	if probe, probeErr := startCommand(context.Background(), Options{Command: script}, newBoundedBuffer(64), newBoundedBuffer(64)); probeErr == nil {
+		_ = holder.Close()
+		if waitErr := probe.Wait(); waitErr != nil {
+			t.Fatalf("probe Wait() error = %v", waitErr)
+		}
+		t.Skip("filesystem does not return ETXTBSY while script is open for write")
+	} else if !isTextFileBusy(probeErr) {
+		_ = holder.Close()
+		t.Skipf("probe start error = %v, want ETXTBSY to exercise retry", probeErr)
+	}
+
+	release := make(chan struct{})
+	go func() {
+		<-release
+		time.Sleep(15 * time.Millisecond)
+		_ = holder.Close()
+	}()
+
+	close(release)
+	result, err := Run(context.Background(), Options{Command: script})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want retry past ETXTBSY", err)
+	}
+	if result.Stdout != "ok" {
+		t.Fatalf("Stdout = %q, want ok", result.Stdout)
 	}
 }

@@ -252,10 +252,13 @@ Loop inspection commands:
 
 ```bash
 looper ps
+looper describe <id>
 looper logs <id> --follow
 looper jump <id>
 looper stop <id>
 ```
+
+`looper describe` is the top-level alias for `looper loop inspect` and shows diagnosis detail for blocked or failed loops.
 
 Manual fixer trigger:
 

@@ -95,18 +95,9 @@ case "$1" in
     ;;
 esac
 `, submitLog, baseSHA, headSHA, diffMode, filepath.Join(root, "gh-invocations.log"))
-	// Write via temp + rename so the final path is never open for write when
-	// tests immediately exec it (avoids intermittent Linux ETXTBSY / "text file busy").
-	ghTmp := ghPath + ".tmp"
-	if err := os.WriteFile(ghTmp, []byte(script), 0o644); err != nil {
-		t.Fatalf("write fake gh tmp: %v", err)
-	}
-	if err := os.Chmod(ghTmp, 0o755); err != nil {
-		t.Fatalf("chmod fake gh: %v", err)
-	}
-	if err := os.Rename(ghTmp, ghPath); err != nil {
-		t.Fatalf("rename fake gh: %v", err)
-	}
+	// Write via temp+sync+rename so fork/exec never races a still-open write fd
+	// (Linux ETXTBSY "text file busy" under parallel package tests on CI).
+	writeExecutableScript(t, ghPath, script)
 
 	configPayload := map[string]any{
 		"tools": map[string]any{
@@ -218,6 +209,44 @@ func seedReviewSubmitDeletedRepo(t *testing.T, repo string) (baseSHA, headSHA st
 	headSHA = strings.TrimSpace(runReviewSubmitGitOutput(t, repo, "rev-parse", "HEAD"))
 	deletedLine = 4
 	return baseSHA, headSHA, deletedLine
+}
+
+// writeExecutableScript atomically installs an executable script at path.
+// Direct WriteFile+immediate exec can fail with ETXTBSY on Linux when the
+// write fd is still visible to the kernel at fork/exec under load.
+func writeExecutableScript(t *testing.T, path, contents string) {
+	t.Helper()
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".exec-*")
+	if err != nil {
+		t.Fatalf("create temp executable: %v", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.WriteString(contents); err != nil {
+		_ = tmp.Close()
+		t.Fatalf("write temp executable: %v", err)
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		_ = tmp.Close()
+		t.Fatalf("chmod temp executable: %v", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		t.Fatalf("sync temp executable: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close temp executable: %v", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		t.Fatalf("rename temp executable to %s: %v", path, err)
+	}
+	cleanup = false
 }
 
 func runReviewSubmitGit(t *testing.T, repo string, args ...string) {

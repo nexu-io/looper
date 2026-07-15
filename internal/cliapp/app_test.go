@@ -3397,6 +3397,45 @@ func TestPSWithoutJSONShowsDisplayStatusWhenPresent(t *testing.T) {
 	}
 }
 
+func TestPSWithoutJSONShowsTruncatedFailureReason(t *testing.T) {
+	t.Parallel()
+
+	longReason := "fatal: worktree is locked and cannot be cleaned automatically without operator review of local changes"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{{
+			"seq":               9,
+			"type":              "worker",
+			"status":            "paused",
+			"displayStatus":     "manual_intervention",
+			"lastFailureReason": longReason,
+			"currentStep":       "prepare_work",
+			"target":            map[string]any{"label": "Looper"},
+		}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "ps", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps]) stderr = %q, want empty string", stderr)
+	}
+	if !strings.Contains(stdout, "manual_intervention") {
+		t.Fatalf("Run([ps]) stdout = %q, want display status manual_intervention", stdout)
+	}
+	if !strings.Contains(stdout, "fatal: worktree is locked") || !strings.Contains(stdout, "...") {
+		t.Fatalf("Run([ps]) stdout = %q, want truncated failure reason", stdout)
+	}
+	if strings.Contains(stdout, longReason) {
+		t.Fatalf("Run([ps]) stdout = %q, did not expect full untruncated failure reason", stdout)
+	}
+}
+
 func TestPSStatusAndTypeFiltersUseActiveRunsQueryAndShowInactiveCompletedLoop(t *testing.T) {
 	t.Parallel()
 
