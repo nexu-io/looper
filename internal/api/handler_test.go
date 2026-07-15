@@ -2314,6 +2314,29 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 		assertEqual(t, data["offset"], float64(1))
 	})
 
+	t.Run("offset without limit still skips rows", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?offset=2", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 3 {
+			t.Fatalf("items len = %d, want 3", len(items))
+		}
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[1].(map[string]any)["id"], "loop_2")
+		assertEqual(t, items[2].(map[string]any)["id"], "loop_1")
+		assertEqual(t, data["total"], float64(5))
+		assertEqual(t, data["offset"], float64(2))
+		if _, ok := data["limit"]; ok {
+			t.Fatalf("limit present on offset-only list: %#v", data["limit"])
+		}
+	})
+
 	t.Run("status filter", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?status=running", nil)
 		recorder := httptest.NewRecorder()

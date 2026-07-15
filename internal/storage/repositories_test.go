@@ -1975,6 +1975,15 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 		t.Fatalf("ListFiltered(limit=2,offset=1) = %v, want [loop_4 loop_3]", got)
 	}
 
+	// Offset without limit must still skip rows (SQLite LIMIT -1 OFFSET n).
+	offsetOnly, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Offset: 2})
+	if err != nil {
+		t.Fatalf("ListFiltered(offset-only) error = %v", err)
+	}
+	if got := loopIDs(offsetOnly); !reflect.DeepEqual(got, []string{"loop_3", "loop_2", "loop_1"}) {
+		t.Fatalf("ListFiltered(offset=2) = %v, want [loop_3 loop_2 loop_1]", got)
+	}
+
 	running, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running"})
 	if err != nil {
 		t.Fatalf("ListFiltered(status) error = %v", err)

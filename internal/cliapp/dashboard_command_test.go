@@ -189,6 +189,37 @@ func TestResolveDashboardBrowserBaseURLMapsWildcard(t *testing.T) {
 	}
 }
 
+func TestResolveDashboardBrowserBaseURLBracketsIPv6(t *testing.T) {
+	t.Parallel()
+
+	loaded := config.LoadedFileConfig{
+		Config: config.Config{
+			Server: config.ServerConfig{
+				Host: "::1",
+				Port: 17310,
+			},
+		},
+	}
+	got, err := resolveDashboardBrowserBaseURL(loaded)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got != "http://[::1]:17310" {
+		t.Fatalf("got %q, want http://[::1]:17310", got)
+	}
+}
+
+func TestDashboardHTTPBaseURLBracketsIPv6(t *testing.T) {
+	t.Parallel()
+
+	if got := dashboardHTTPBaseURL("::1", 17310); got != "http://[::1]:17310" {
+		t.Fatalf("got %q", got)
+	}
+	if got := dashboardHTTPBaseURL("127.0.0.1", 17310); got != "http://127.0.0.1:17310" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestDashboardWildcardHostProbesLoopback(t *testing.T) {
 	t.Parallel()
 

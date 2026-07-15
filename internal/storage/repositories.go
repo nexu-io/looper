@@ -577,7 +577,8 @@ func (r *LoopsRepository) AllocateSeq(ctx context.Context) (int64, error) {
 }
 
 // ListLoopsOptions filters and paginates loop listings.
-// Empty Status/ProjectID match all. Limit 0 means no limit (full list); Offset is ignored when Limit == 0.
+// Empty Status/ProjectID match all. Limit 0 means no limit (full list).
+// Offset is always applied when > 0, including when Limit == 0 (SQLite LIMIT -1 OFFSET n).
 type ListLoopsOptions struct {
 	Status    string
 	ProjectID string
@@ -634,6 +635,10 @@ func buildLoopsListQuery(base string, opts ListLoopsOptions, withOrderAndLimit b
 				query += " OFFSET ?"
 				args = append(args, opts.Offset)
 			}
+		} else if opts.Offset > 0 {
+			// SQLite: LIMIT -1 means no upper bound, so OFFSET-only paging is honest.
+			query += " LIMIT -1 OFFSET ?"
+			args = append(args, opts.Offset)
 		}
 	}
 	return query, args

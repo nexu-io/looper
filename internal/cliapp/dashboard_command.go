@@ -106,7 +106,7 @@ func (r *commandRuntime) dashboardAPIClient(loaded config.LoadedFileConfig) *Dae
 		return r.apiClientFromLoaded(loaded)
 	}
 	host := browserHostForDashboard(loaded.Config.Server.Host)
-	baseURL := fmt.Sprintf("http://%s:%d", host, loaded.Config.Server.Port)
+	baseURL := dashboardHTTPBaseURL(host, loaded.Config.Server.Port)
 	return r.newAPIClientForLoaded(loaded, baseURL)
 }
 
@@ -125,7 +125,13 @@ func resolveDashboardBrowserBaseURL(loaded config.LoadedFileConfig) (string, err
 	}
 
 	host := browserHostForDashboard(loaded.Config.Server.Host)
-	return fmt.Sprintf("http://%s:%d", host, loaded.Config.Server.Port), nil
+	return dashboardHTTPBaseURL(host, loaded.Config.Server.Port), nil
+}
+
+// dashboardHTTPBaseURL builds an http:// URL authority with IPv6 hosts bracketed
+// (net.JoinHostPort), matching how looperd listens.
+func dashboardHTTPBaseURL(host string, port int) string {
+	return "http://" + net.JoinHostPort(host, fmt.Sprintf("%d", port))
 }
 
 func browserHostForDashboard(host string) string {
