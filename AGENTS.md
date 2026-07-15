@@ -67,14 +67,6 @@ If a subsystem receives a second `fix:` PR shortly after the first, default to r
 
 Before adding durability, recovery, persistence, confirmation, or a new gate, first attempt the opposite direction: can a layer be removed to make the problem disappear? Record the result in the PR description, even if the conclusion is "no". A strongly positive net diff on a path that has already been patched is suspect by default.
 
-### Mandatory oracle review for authority-bearing changes
-
-PRs on agent-driven paths must be reviewed by `@oracle` before merge if they introduce:
-
-- a new schema field on a checkpoint, repair record, or persisted run state
-- a new gate or precondition on a side-effecting action (push, resolve, reply, comment, mutate)
-- a new "trust this signal over the agent" inference
-
 ### Test-file growth is a design smell
 
-A single PR that adds more than 300 lines to one `*_test.go` file for a runner or subsystem must trigger an `@oracle` design review before merge. Explosive test growth usually means an internal state machine is being propped up rather than simplified.
+A single PR that adds more than 300 lines to one `*_test.go` file for a runner or subsystem is a design smell. Explosive test growth usually means an internal state machine is being propped up rather than simplified.
