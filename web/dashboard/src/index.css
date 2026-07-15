@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #f4f4f5;
+  --bg-elevated: #ffffff;
+  --bg-muted: #e4e4e7;
+  --border: #d4d4d8;
+  --text: #18181b;
+  --text-muted: #52525b;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --danger: #dc2626;
+  --ok: #16a34a;
+  --warn: #ca8a04;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #09090b;
+    --bg-elevated: #18181b;
+    --bg-muted: #27272a;
+    --border: #3f3f46;
+    --text: #fafafa;
+    --text-muted: #a1a1aa;
+    --accent: #3b82f6;
+    --accent-fg: #f8fafc;
+    --danger: #f87171;
+    --ok: #4ade80;
+    --warn: #facc15;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.4;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.mono {
+  font-family: var(--mono);
+}

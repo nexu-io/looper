@@ -96,6 +96,7 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
+	bootstrap        *bootstrapCodes
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -131,11 +132,15 @@ func NewHandler(context Context) *Handler {
 		}
 	}
 
+	bootstrap := newBootstrapCodes()
+	bootstrap.now = now
+
 	return &Handler{
 		context:          context,
 		now:              now,
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
+		bootstrap:        bootstrap,
 	}
 }
 
@@ -183,11 +188,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)
 		}
+		// Bootstrap paths must never be cached, including auth/Host/Origin failures.
+		if isDashboardBootstrapPath(path) {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		h.writeError(w, requestID, typed)
 		return
 	}
 
 	switch path {
+	case dashboardBootstrapCodePath:
+		h.handleBootstrapMint(w, r, requestID)
+		return
+	case dashboardBootstrapExchangePath:
+		h.handleBootstrapExchange(w, r, requestID)
+		return
 	case webhookForwardPath:
 		payload, err := h.buildWebhookForwardResponse(r)
 		if err != nil {
@@ -621,6 +636,13 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 			return nil
 		}
 	}
+
+	// Browser mutation foundation: Host allowlist + Origin match against
+	// config-derived authorities when Origin is present. CLI without Origin OK.
+	if err := validateBrowserRequest(r, cfg); err != nil {
+		return err
+	}
+
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
 		return nil
 	}
@@ -631,6 +653,11 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 			status:  http.StatusInternalServerError,
 			message: "Local token auth is enabled but no token is configured",
 		}
+	}
+
+	// Public one-shot exception: SPA exchanges bootstrap code without Bearer.
+	if isDashboardBootstrapExchange(path, r.Method) {
+		return nil
 	}
 
 	if r.Header.Get("Authorization") != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {

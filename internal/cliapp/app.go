@@ -45,6 +45,10 @@ type Deps struct {
 	// need to exercise the upgrade path with mock binaries inject "stable"
 	// here so the dev-build channel guard does not short-circuit them.
 	CLIChannel string
+
+	// OpenURL opens a URL in the operator's browser. Tests inject a stub.
+	// When nil, the platform default opener is used (open / xdg-open).
+	OpenURL func(string) error
 }
 
 type App struct {
@@ -107,10 +111,23 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "describe", description: "Show loop diagnostics detail"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "dashboard", description: "Open the local operator dashboard"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "describe", description: "Show loop diagnostics detail"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
+			newCommand(commandSpec{
+				use:   "dashboard",
+				short: "Open the local operator dashboard",
+				args:  cobra.NoArgs,
+				runE:  runtime.dashboard,
+				localFlags: []flagSpec{
+					boolFlag("no-open", "Print the dashboard URL without opening a browser"),
+				},
+				exampleLines: []string{
+					"$ looper dashboard",
+					"$ looper dashboard --no-open",
+				},
+			}),
 			newCommand(commandSpec{
 				use:             "network",
 				short:           "Network membership commands",

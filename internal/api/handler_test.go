@@ -2252,24 +2252,52 @@ func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 		method  string
 		path    string
 		body    string
-		prepare func(*testing.T, *Handler)
-	}{{routeID: "loops.list", method: http.MethodGet, path: "/api/v1/loops"}, {routeID: "loop.detail", method: http.MethodGet, path: "/api/v1/loops/loop_1"}, {routeID: "loop.logs", method: http.MethodGet, path: "/api/v1/loops/loop_1/logs"}, {routeID: "loop.start", method: http.MethodPost, path: "/api/v1/loops/loop_1/start"}, {routeID: "loop.pause", method: http.MethodPost, path: "/api/v1/loops/loop_1/pause", prepare: func(t *testing.T, h *Handler) {
-		t.Helper()
-		startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/start", nil)
-		startRecorder := httptest.NewRecorder()
-		h.ServeHTTP(startRecorder, startReq)
-		if startRecorder.Code != http.StatusOK {
-			t.Fatalf("pre-start status = %d, want 200", startRecorder.Code)
-		}
-	}}, {routeID: "loops.create", method: http.MethodPost, path: "/api/v1/loops", body: marshalArtifactRequestBody(t, requestArtifact, "loops.create")}}
+		prepare func(*testing.T, *Handler, *looperdruntime.Runtime)
+	}{
+		{routeID: "loops.list", method: http.MethodGet, path: "/api/v1/loops"},
+		{routeID: "loop.detail", method: http.MethodGet, path: "/api/v1/loops/loop_1"},
+		{routeID: "loop.logs", method: http.MethodGet, path: "/api/v1/loops/loop_1/logs"},
+		{routeID: "loop.start", method: http.MethodPost, path: "/api/v1/loops/loop_1/start"},
+		{routeID: "loop.pause", method: http.MethodPost, path: "/api/v1/loops/loop_1/pause", prepare: func(t *testing.T, h *Handler, _ *looperdruntime.Runtime) {
+			t.Helper()
+			startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/start", nil)
+			startRecorder := httptest.NewRecorder()
+			h.ServeHTTP(startRecorder, startReq)
+			if startRecorder.Code != http.StatusOK {
+				t.Fatalf("pre-start status = %d, want 200", startRecorder.Code)
+			}
+		}},
+		{routeID: "loop.retry", method: http.MethodPost, path: "/api/v1/loops/loop_1/retry", body: marshalArtifactRequestBody(t, requestArtifact, "loop.retry"), prepare: func(t *testing.T, _ *Handler, rt *looperdruntime.Runtime) {
+			t.Helper()
+			prepareLoopRouteForRetry(t, rt, "paused")
+		}},
+		{routeID: "loop.takeover", method: http.MethodPost, path: "/api/v1/loops/loop_1/takeover"},
+		{routeID: "loop.handback", method: http.MethodPost, path: "/api/v1/loops/loop_1/handback", body: marshalArtifactRequestBody(t, requestArtifact, "loop.handback"), prepare: func(t *testing.T, _ *Handler, rt *looperdruntime.Runtime) {
+			t.Helper()
+			prepareLoopRouteForRetry(t, rt, "human_takeover")
+		}},
+		{routeID: "loops.create", method: http.MethodPost, path: "/api/v1/loops", body: marshalArtifactRequestBody(t, requestArtifact, "loops.create")},
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.routeID, func(t *testing.T) {
 			fixture := newTestFixture(t)
 			seedLoopRouteData(t, fixture.runtime)
-			h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+			h := NewHandler(Context{
+				Config:  fixture.config,
+				Runtime: fixture.runtime,
+				Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+				TakeoverLoop: func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
+					return TakeoverResult{
+						LoopID:       loopID,
+						Vendor:       "codex",
+						SessionID:    "session_fixture_1",
+						WorktreePath: "/tmp/worktrees/loop_1",
+					}, nil
+				},
+			})
 			if tt.prepare != nil {
-				tt.prepare(t, h)
+				tt.prepare(t, h, fixture.runtime)
 			}
 
 			var body io.Reader
@@ -2285,7 +2313,7 @@ func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 			h.ServeHTTP(recorder, req)
 
 			if recorder.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200", recorder.Code)
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 			}
 
 			actual := normalizeResponseValue(parseJSONValue(t, recorder.Body.Bytes()), fixture.rootDir)
@@ -6994,6 +7022,42 @@ func (f *fakeWebhookForwarder) Close() {}
 func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
 	t.Helper()
 	seedStatusData(t, rt)
+}
+
+// prepareLoopRouteForRetry clears active run/queue blockers on seeded loop_1 and
+// sets the loop status so /retry and /handback contract routes can succeed.
+func prepareLoopRouteForRetry(t *testing.T, rt *looperdruntime.Runtime, loopStatus string) {
+	t.Helper()
+	services := rt.Services()
+	ctx := context.Background()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	loop, err := services.Repositories.Loops.GetByID(ctx, "loop_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID(loop_1) = %#v, %v", loop, err)
+	}
+	loop.Status = loopStatus
+	loop.UpdatedAt = nowISO
+	if err := services.Repositories.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(loop_1) error = %v", err)
+	}
+
+	run, err := services.Repositories.Runs.GetByID(ctx, "run_1")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID(run_1) = %#v, %v", run, err)
+	}
+	run.Status = "completed"
+	endedAt := nowISO
+	run.EndedAt = &endedAt
+	run.UpdatedAt = nowISO
+	if err := services.Repositories.Runs.Upsert(ctx, *run); err != nil {
+		t.Fatalf("Runs.Upsert(run_1) error = %v", err)
+	}
+
+	reason := "cleared for contract fixture"
+	if _, err := services.Repositories.Queue.CancelByLoop(ctx, "loop_1", nowISO, &reason); err != nil {
+		t.Fatalf("Queue.CancelByLoop(loop_1) error = %v", err)
+	}
 }
 
 func seedEventAndPullRequestRouteData(t *testing.T, rt *looperdruntime.Runtime) {

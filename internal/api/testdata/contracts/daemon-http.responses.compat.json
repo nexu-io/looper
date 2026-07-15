@@ -720,6 +720,58 @@
       }
     },
     {
+      "id": "loop.logs.follow",
+      "status": 200,
+      "contentType": "text/event-stream",
+      "notes": [
+        "GET /api/v1/loops/{id}/logs?follow=1 returns text/event-stream (not a JSON envelope).",
+        "Wire format: event: <name>\\ndata: <json>\\n\\n",
+        "Event order: snapshot (once), zero or more chunk, optional end then close.",
+        "snapshot data shape matches loop.logs body.data.",
+        "chunk data shape: { content: string, runId?, currentStep?, executionId?, vendor?, pid?, status? }.",
+        "end data shape: { reason?: string } (e.g. run_completed)."
+      ],
+      "events": {
+        "snapshot": {
+          "event": "snapshot",
+          "data": {
+            "seq": 1,
+            "loopId": "loop_1",
+            "loopType": "reviewer",
+            "loopStatus": "running",
+            "run": {
+              "runId": "run_1",
+              "status": "running",
+              "currentStep": "review",
+              "startedAt": "2026-04-11T12:00:00.000Z",
+              "endedAt": null,
+              "summary": null,
+              "errorMessage": null
+            },
+            "agent": null
+          }
+        },
+        "chunk": {
+          "event": "chunk",
+          "data": {
+            "content": "appended log text",
+            "runId": "run_1",
+            "currentStep": "review",
+            "executionId": "exec_1",
+            "vendor": "opencode",
+            "pid": 12345,
+            "status": "running"
+          }
+        },
+        "end": {
+          "event": "end",
+          "data": {
+            "reason": "run_completed"
+          }
+        }
+      }
+    },
+    {
       "id": "loop.start",
       "status": 200,
       "body": {
@@ -765,6 +817,84 @@
           "nextRunAt": null,
           "createdAt": "2026-04-11T12:00:00.000Z",
           "updatedAt": "<generated-timestamp>"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.retry",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "loop": {
+            "id": "loop_1",
+            "seq": 1,
+            "projectId": "project_1",
+            "type": "reviewer",
+            "targetType": "pull_request",
+            "targetId": "pr:acme/looper:42",
+            "repo": "acme/looper",
+            "prNumber": 42,
+            "status": "queued",
+            "configJson": null,
+            "metadataJson": null,
+            "lastRunAt": "2026-04-11T12:00:00.000Z",
+            "nextRunAt": "<generated-timestamp>",
+            "createdAt": "2026-04-11T12:00:00.000Z",
+            "updatedAt": "<generated-timestamp>"
+          },
+          "queueItemId": "<uuid>",
+          "mode": "auto",
+          "resetAttempts": true,
+          "discardWorktreeChanges": false
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.takeover",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "loopId": "loop_1",
+          "vendor": "codex",
+          "sessionId": "session_fixture_1",
+          "worktreePath": "/tmp/worktrees/loop_1",
+          "supported": true,
+          "resumeCommand": "cd /tmp/worktrees/loop_1 && codex resume session_fixture_1"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.handback",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "loop": {
+            "id": "loop_1",
+            "seq": 1,
+            "projectId": "project_1",
+            "type": "reviewer",
+            "targetType": "pull_request",
+            "targetId": "pr:acme/looper:42",
+            "repo": "acme/looper",
+            "prNumber": 42,
+            "status": "queued",
+            "configJson": null,
+            "metadataJson": null,
+            "lastRunAt": "2026-04-11T12:00:00.000Z",
+            "nextRunAt": "<generated-timestamp>",
+            "createdAt": "2026-04-11T12:00:00.000Z",
+            "updatedAt": "<generated-timestamp>"
+          },
+          "queueItemId": "<uuid>",
+          "mode": "auto",
+          "resetAttempts": true,
+          "discardWorktreeChanges": false
         },
         "requestId": "fixture-request-id"
       }
@@ -1011,6 +1141,29 @@
         "data": {
           "stopped": true,
           "loopId": "loop_1"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "dashboard.bootstrap.code",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "code": "<bootstrap-code>",
+          "expiresAt": "<generated-timestamp>"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "dashboard.bootstrap.exchange",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "token": "<local-token>"
         },
         "requestId": "fixture-request-id"
       }

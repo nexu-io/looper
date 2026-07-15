@@ -16,6 +16,7 @@ import (
 	looperdapi "github.com/nexu-io/looper/internal/api"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/dashboard"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/loops"
@@ -131,7 +132,7 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		return nil, err
 	}
 
-	handler := looperdapi.NewHandler(looperdapi.Context{
+	apiHandler := looperdapi.NewHandler(looperdapi.Context{
 		Config:  deps.Config,
 		Runtime: rt,
 		ReconcileStaleRuns: func(ctx context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
@@ -153,7 +154,8 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 			rt.TriggerSchedulerTick()
 		},
 	})
-	server := looperdapi.NewServer(deps.Config, handler)
+	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
+	server := looperdapi.NewServer(deps.Config, root)
 	if err := server.Start(); err != nil {
 		if deps.Logger != nil {
 			deps.Logger.Warn("looperd recovery aborted because instance did not acquire ownership", map[string]any{"error": err.Error()})

@@ -6,6 +6,7 @@ Version:
 
 Subcommands:
   status     Show service status
+  dashboard  Open the local operator dashboard
   network    Network membership commands
   netadmin   Network repo operator commands
   webhook    Webhook configuration and status

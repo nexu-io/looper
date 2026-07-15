@@ -408,6 +408,26 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/dashboard/pnpm-lock.yaml
+
+      - name: Build dashboard assets
+        working-directory: web/dashboard
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          test -f ../../internal/dashboard/assets/.production
+          test -f ../../internal/dashboard/assets/index.html
+
       - name: Build looperd for ${{ matrix.target }}
         env:
           GOOS: ${{ matrix.goos }}

@@ -3,6 +3,8 @@
 .DS_Store
 node_modules/
 dist/
+internal/dashboard/assets/**
+!internal/dashboard/assets/.gitkeep
 *.test
 /looper
 /looperd

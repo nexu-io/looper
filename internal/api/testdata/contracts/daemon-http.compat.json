@@ -24,7 +24,7 @@
       "modeField": "config.server.authMode",
       "noneMode": {
         "value": "none",
-        "behavior": "Requests are accepted without Authorization."
+        "behavior": "Requests are accepted without Authorization. Dashboard bootstrap routes (POST /api/v1/dashboard/bootstrap/code and /exchange) return 404."
       },
       "localTokenMode": {
         "value": "local-token",
@@ -40,6 +40,14 @@
         "matchingBearerToken": {
           "status": 200,
           "behavior": "If the bearer token matches, normal route dispatch continues."
+        },
+        "dashboardBootstrapExchangeException": {
+          "path": "/api/v1/dashboard/bootstrap/exchange",
+          "method": "POST",
+          "behavior": "When authMode is local-token, POST exchange is allowed without a Bearer token so the SPA can redeem a one-shot bootstrap code for the configured localToken. Mint (POST /api/v1/dashboard/bootstrap/code) still requires a matching Bearer token. Both responses set Cache-Control: no-store."
+        },
+        "browserOriginOnUnsafeMethods": {
+          "behavior": "For POST/PUT/PATCH/DELETE, if an Origin header is present it must match an origin derived from the request Host (http(s)://Host, plus loopback aliases). Mismatch returns 403. Requests without Origin (CLI) are allowed. Empty Host on unsafe methods returns 403."
         }
       }
     },
@@ -154,7 +162,50 @@
       "path": "/api/v1/loops/1/logs",
       "fixture": "default",
       "expectedStatus": 200,
-      "routeSpecificStatuses": [400, 404]
+      "routeSpecificStatuses": [400, 404],
+      "notes": [
+        "Default (no follow) returns application/json success envelope with loop logs snapshot data.",
+        "See loop.logs.follow for the SSE follow contract."
+      ]
+    },
+    {
+      "id": "loop.logs.follow",
+      "method": "GET",
+      "path": "/api/v1/loops/{id}/logs?follow=1",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404],
+      "response": {
+        "contentType": "text/event-stream",
+        "headers": {
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        },
+        "format": "Server-Sent Events (not a JSON success envelope)",
+        "query": {
+          "follow": "1 or true enables SSE follow mode",
+          "stderr": "optional; 1 or true streams stderr instead of stdout when applicable"
+        },
+        "events": [
+          {
+            "event": "snapshot",
+            "data": "JSON object matching the non-follow loop.logs data payload (seq, loopId, loopType, loopStatus, run, agent)"
+          },
+          {
+            "event": "chunk",
+            "data": "JSON object with content (string) and optional runId, currentStep, executionId, vendor, pid, status"
+          },
+          {
+            "event": "end",
+            "data": "JSON object with optional reason (e.g. run_completed); stream closes after this event"
+          }
+        ]
+      },
+      "notes": [
+        "follow=1 (or true) switches Content-Type to text/event-stream.",
+        "Clients must not parse the body as a JSON envelope when follow is enabled.",
+        "Non-follow GET /api/v1/loops/{id}/logs remains application/json (route id loop.logs)."
+      ]
     },
     {
       "id": "loop.start",
@@ -171,6 +222,51 @@
       "fixture": "default",
       "expectedStatus": 200,
       "routeSpecificStatuses": [404]
+    },
+    {
+      "id": "loop.retry",
+      "method": "POST",
+      "path": "/api/v1/loops/loop_1/retry",
+      "fixture": "default",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "mode": "auto",
+          "resetAttempts": true
+        }
+      },
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404, 409],
+      "notes": "Operator retry re-arms the loop. Body is retry-shaped; discardWorktreeChanges is optional and destructive."
+    },
+    {
+      "id": "loop.takeover",
+      "method": "POST",
+      "path": "/api/v1/loops/loop_1/takeover",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404, 503],
+      "notes": "Parks loop in human_takeover and returns worktreePath + resumeCommand when interactive resume is supported."
+    },
+    {
+      "id": "loop.handback",
+      "method": "POST",
+      "path": "/api/v1/loops/loop_1/handback",
+      "fixture": "default",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "mode": "auto",
+          "resetAttempts": true
+        }
+      },
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 404, 409],
+      "notes": "Retry-shaped body without discardWorktreeChanges. discardWorktreeChanges is rejected on handback."
     },
     {
       "id": "workers.create",
@@ -274,6 +370,24 @@
       "fixture": "runtime-control",
       "expectedStatus": 200,
       "routeSpecificStatuses": [400, 404, 501]
+    },
+    {
+      "id": "dashboard.bootstrap.code",
+      "method": "POST",
+      "path": "/api/v1/dashboard/bootstrap/code",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [401, 404, 500],
+      "notes": "Requires local-token Bearer auth. Returns 404 when authMode=none. Response Cache-Control: no-store."
+    },
+    {
+      "id": "dashboard.bootstrap.exchange",
+      "method": "POST",
+      "path": "/api/v1/dashboard/bootstrap/exchange",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 401, 404, 500],
+      "notes": "Public exception under local-token (no Bearer required). Body {code}. Returns {token: localToken}. One-shot; invalid/expired/reused share a generic error. Returns 404 when authMode=none. Response Cache-Control: no-store."
     }
   ]
 }
