@@ -475,10 +475,28 @@ export function handbackLoop(
   );
 }
 
-/** Open loop logs SSE stream (follow=1). Caller must parse body with sse.ts. */
+/** Build path for loop logs SSE follow stream (`follow=1`, optional `stderr=1`). */
+export function loopLogsFollowPath(
+  selector: string,
+  opts?: { stderr?: boolean },
+): string {
+  const params = new URLSearchParams({ follow: "1" });
+  if (opts?.stderr) {
+    params.set("stderr", "1");
+  }
+  return `/api/v1/loops/${encodeURIComponent(selector)}/logs?${params.toString()}`;
+}
+
+/**
+ * Open loop logs SSE stream (follow=1).
+ * Pass `{ stderr: true }` to follow agent stderr; default follows stdout
+ * (server may fall back to stderr when stdout is empty).
+ * Caller must parse body with sse.ts.
+ */
 export async function openLoopLogsStream(
   selector: string,
   signal?: AbortSignal,
+  opts?: { stderr?: boolean },
 ): Promise<Response> {
   const headers = new Headers({
     Accept: "text/event-stream",
@@ -488,10 +506,10 @@ export async function openLoopLogsStream(
     headers.set("Authorization", `Bearer ${token}`);
   }
 
-  const response = await fetch(
-    `/api/v1/loops/${encodeURIComponent(selector)}/logs?follow=1`,
-    { headers, signal },
-  );
+  const response = await fetch(loopLogsFollowPath(selector, opts), {
+    headers,
+    signal,
+  });
 
   if (!response.ok) {
     let message = `Request failed (${response.status} ${response.statusText})`;

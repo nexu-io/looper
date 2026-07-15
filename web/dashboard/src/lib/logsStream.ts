@@ -36,3 +36,28 @@ export function nextReconnectDelayMs(
   const idx = Math.max(0, Math.min(attempt, delays.length - 1));
   return delays[idx] ?? delays[delays.length - 1]!;
 }
+
+/**
+ * Default follow stream tracks stdout unless stdout is empty (then stderr).
+ * When snapshot stdout is non-empty, open a separate `stderr=1` follow so live
+ * stderr after the snapshot is not dropped.
+ */
+export function needsSeparateStderrFollow(agent?: {
+  stdout?: string | null;
+} | null): boolean {
+  if (!agent) return false;
+  return Boolean(agent.stdout?.trim());
+}
+
+/**
+ * Prefix the first live stderr chunk with the same section header used by the
+ * snapshot seed when stderr was empty at connect time.
+ */
+export function formatLiveStderrChunk(
+  content: string,
+  sectionHeaderPresent: boolean,
+): string {
+  if (!content) return "";
+  if (sectionHeaderPresent) return content;
+  return `\n--- stderr ---\n${content}`;
+}

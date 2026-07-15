@@ -24,6 +24,8 @@ import { formatTs } from "@/lib/format";
 import { capLogChunk, capLogSeed, trimLogBuffer } from "@/lib/logBuffer";
 import {
   type LogsStreamPhase,
+  formatLiveStderrChunk,
+  needsSeparateStderrFollow,
   nextReconnectDelayMs,
   resolveLogsStreamStatus,
 } from "@/lib/logsStream";
@@ -160,6 +162,58 @@ function LogsPane({ selector }: { selector: string }) {
         }, delay);
       };
 
+      const startStderrFollow = (snap: LoopLogsSnapshot) => {
+        // Default follow sticks to stdout when non-empty; seed already rendered
+        // stderr, but post-snapshot stderr only arrives on stderr=1.
+        if (!needsSeparateStderrFollow(snap.agent)) return;
+
+        let sectionHeaderPresent = Boolean(snap.agent?.stderr?.trim());
+
+        void (async () => {
+          try {
+            const response = await openLoopLogsStream(
+              selector,
+              controller.signal,
+              { stderr: true },
+            );
+            await consumeSSE(
+              response,
+              (event, rawData) => {
+                if (generation !== generationRef.current) return;
+                // Snapshot is already applied from the primary stream.
+                if (event !== "chunk") return;
+                try {
+                  const chunk = JSON.parse(rawData) as LoopLogsChunk;
+                  if (typeof chunk.content === "string" && chunk.content) {
+                    appendText(
+                      formatLiveStderrChunk(
+                        chunk.content,
+                        sectionHeaderPresent,
+                      ),
+                    );
+                    sectionHeaderPresent = true;
+                    setPhase("live");
+                  }
+                } catch {
+                  // Keep primary stream alive; soft-fail malformed stderr only.
+                }
+              },
+              controller.signal,
+            );
+          } catch (err) {
+            if (
+              controller.signal.aborted ||
+              generation !== generationRef.current
+            ) {
+              return;
+            }
+            if (err instanceof Error && err.name === "AbortError") return;
+            if (err instanceof DOMException && err.name === "AbortError") return;
+            // Soft-fail: stdout stream remains authoritative for phase/errors.
+          }
+        })();
+      };
+
       void (async () => {
         try {
           const response = await openLoopLogsStream(selector, controller.signal);
@@ -171,6 +225,7 @@ function LogsPane({ selector }: { selector: string }) {
                   const snap = JSON.parse(rawData) as LoopLogsSnapshot;
                   replaceText(seedFromSnapshot(snap));
                   setPhase("live");
+                  startStderrFollow(snap);
                 } catch {
                   setError("Malformed snapshot event (invalid JSON)");
                   setPhase("idle");
