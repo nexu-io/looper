@@ -40,7 +40,12 @@ func NewRootHandler(api http.Handler, dash http.Handler) http.Handler {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			http.Redirect(w, r, "/dashboard/", http.StatusFound)
+			// Preserve query (e.g. one-shot bootstrap ?code=...) across the slash redirect.
+			target := "/dashboard/"
+			if q := r.URL.RawQuery; q != "" {
+				target = target + "?" + q
+			}
+			http.Redirect(w, r, target, http.StatusFound)
 			return
 		}
 		if path == "/dashboard/" || strings.HasPrefix(path, "/dashboard/") {

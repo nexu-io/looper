@@ -43,6 +43,16 @@ func TestNewRootHandlerDashboardRedirectAndAPI(t *testing.T) {
 		t.Fatalf("Location = %q, want /dashboard/", loc)
 	}
 
+	// Bootstrap codes arrive as /dashboard?code=...; redirect must keep the query.
+	rec = httptest.NewRecorder()
+	root.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard?code=bootstrap-one-shot", nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("query redirect status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/dashboard/?code=bootstrap-one-shot" {
+		t.Fatalf("Location = %q, want /dashboard/?code=bootstrap-one-shot", loc)
+	}
+
 	rec = httptest.NewRecorder()
 	root.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/", nil))
 	if rec.Code != http.StatusOK || rec.Body.String() != "dash" {
