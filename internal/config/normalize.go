@@ -29,6 +29,12 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
 	normalized := normalizeLayerPartial(clonePartialConfig(partial))
 	normalized.LegacyReviewer = nil
+	if normalized.Agent != nil && normalized.Agent.Timeouts != nil {
+		normalized.Agent.Timeouts.PlannerSeconds = nil
+		normalized.Agent.Timeouts.WorkerSeconds = nil
+		normalized.Agent.Timeouts.ReviewerSeconds = nil
+		normalized.Agent.Timeouts.FixerSeconds = nil
+	}
 
 	if normalized.Defaults != nil {
 		normalized.Defaults.AllowAutoApprove = nil
@@ -60,6 +66,24 @@ func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
 
 func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 	normalized := partial
+	if normalized.Agent != nil && normalized.Agent.Timeouts != nil {
+		agent := *normalized.Agent
+		timeouts := *agent.Timeouts
+		agent.Timeouts = &timeouts
+		normalized.Agent = &agent
+		if timeouts.PlannerMaxRuntimeSeconds == nil {
+			timeouts.PlannerMaxRuntimeSeconds = timeouts.PlannerSeconds
+		}
+		if timeouts.WorkerMaxRuntimeSeconds == nil {
+			timeouts.WorkerMaxRuntimeSeconds = timeouts.WorkerSeconds
+		}
+		if timeouts.ReviewerMaxRuntimeSeconds == nil {
+			timeouts.ReviewerMaxRuntimeSeconds = timeouts.ReviewerSeconds
+		}
+		if timeouts.FixerMaxRuntimeSeconds == nil {
+			timeouts.FixerMaxRuntimeSeconds = timeouts.FixerSeconds
+		}
+	}
 
 	if normalized.LegacyReviewer != nil {
 		reviewer := ensureReviewerRoleConfig(&normalized)

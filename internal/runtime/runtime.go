@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -82,9 +83,16 @@ type RecoveryOrphanAgentCleanup struct {
 
 type Options struct {
 	Config config.Config
-	// ConfigPath is the daemon-loaded config file path (from --config / LOOPER_CONFIG
-	// resolution). Passed into trusted review-submit proxy children as LOOPER_CONFIG
-	// so they load the same config when the daemon was started with --config only.
+	// InitialConfig and ReloadConfig are supplied by bootstrap so hot reloads
+	// replay the daemon's exact startup precedence (file, environment, and CLI).
+	// Tests and embedders that omit ReloadConfig simply run without a watcher.
+	InitialConfig        config.LoadedFileConfig
+	ReloadConfig         func() (config.LoadedFileConfig, error)
+	LoadConfigAt         func(string) (config.LoadedFileConfig, error)
+	ConfigReloadInterval time.Duration
+	// ConfigPath is the daemon-loaded config file path (from --config /
+	// LOOPER_CONFIG resolution). Runtime config management patches this source;
+	// trusted review-submit children receive a separate sanitized run snapshot.
 	ConfigPath                  string
 	Logger                      bootstrap.Logger
 	Now                         func() time.Time
@@ -118,6 +126,16 @@ type Runtime struct {
 	configPath string
 	logger     bootstrap.Logger
 	now        func() time.Time
+
+	configReloadMu       sync.Mutex
+	configBoundary       sync.RWMutex
+	loadedConfig         config.LoadedFileConfig
+	reloadConfig         func() (config.LoadedFileConfig, error)
+	loadConfigAt         func(string) (config.LoadedFileConfig, error)
+	configReloadInterval time.Duration
+	configReloadStop     chan struct{}
+	configReloadDone     chan struct{}
+	configReloadStatus   ConfigReloadStatus
 
 	openSQLiteCoordinator  OpenSQLiteCoordinatorFunc
 	syncConfiguredProjects SyncConfiguredProjectsFunc
@@ -159,11 +177,18 @@ type Runtime struct {
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
 	webhookForwarder            WebhookForwarder
-	networkManager              *networkclient.Manager
+	networkManager              runtimeNetworkManager
 	schedulerDisabled           bool
 	startupReadyOnce            sync.Once
 	startupReadyErr             error
 	ownershipAcquired           bool
+}
+
+type runtimeNetworkManager interface {
+	Start(context.Context) error
+	Stop()
+	Status() networkclient.Status
+	UpdateConfig(config.Config)
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -206,11 +231,24 @@ func New(options Options) *Runtime {
 	}
 
 	projectCatalog := projects.NewCatalog(options.Config)
+	loadedConfig := options.InitialConfig
+	if reflect.DeepEqual(loadedConfig.Config, config.Config{}) {
+		loadedConfig.Config = options.Config
+		loadedConfig.Metadata.ConfigPath = strings.TrimSpace(options.ConfigPath)
+	}
+	reloadInterval := options.ConfigReloadInterval
+	if reloadInterval <= 0 {
+		reloadInterval = time.Second
+	}
 	rt := &Runtime{
 		config:                      options.Config,
 		configPath:                  strings.TrimSpace(options.ConfigPath),
 		logger:                      options.Logger,
 		now:                         now,
+		loadedConfig:                loadedConfig,
+		reloadConfig:                options.ReloadConfig,
+		loadConfigAt:                options.LoadConfigAt,
+		configReloadInterval:        reloadInterval,
 		openSQLiteCoordinator:       openSQLiteCoordinator,
 		syncConfiguredProjects:      syncConfiguredProjects,
 		runSchedulerTick:            runSchedulerTick,
@@ -237,8 +275,11 @@ func New(options Options) *Runtime {
 
 func Start(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
 	rt := New(Options{
-		Config: deps.Config,
-		Logger: deps.Logger,
+		Config:        deps.Config,
+		InitialConfig: deps.InitialConfig,
+		ReloadConfig:  deps.ReloadConfig,
+		LoadConfigAt:  deps.LoadConfigAt,
+		Logger:        deps.Logger,
 	})
 	if err := rt.Start(ctx); err != nil {
 		return nil, err
@@ -261,6 +302,7 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
+		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
@@ -559,12 +601,13 @@ func (r *Runtime) start(ctx context.Context) error {
 		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	}
 	projectService := &projects.Service{
-		DB:           coordinator.DB(),
-		Repos:        repositories,
-		Logger:       r.logger,
-		Config:       r.config,
-		ConfigSource: r.projectCatalog,
-		Now:          r.now,
+		DB:             coordinator.DB(),
+		Repos:          repositories,
+		Logger:         r.logger,
+		Config:         r.config,
+		ConfigSource:   r.projectCatalog,
+		ConfigBoundary: &r.configBoundary,
+		Now:            r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
 			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.Snapshot(), repoPath)
 		},
@@ -612,11 +655,12 @@ func (r *Runtime) start(ctx context.Context) error {
 			return githubGateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 		},
 		AsyncSnapshotQueueEnabled: func() bool {
-			return r.customSchedulerTick || r.config.Agent.Vendor != nil
+			return r.customSchedulerTick || r.Config().Agent.Vendor != nil
 		},
 		PublishProjects: func(projects []config.ProjectRefConfig) {
-			r.publishProjects(projects)
+			r.publishProjectsSnapshot(projects)
 		},
+		AfterPublishProjects: r.afterProjectsPublished,
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
@@ -653,7 +697,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	schedulerDisabled := false
 	if !r.customSchedulerTick {
-		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
+		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, &r.configBoundary, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
@@ -738,15 +782,17 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			}
 		}
 		if schedulerDisabled && r.logger != nil {
-			r.logger.Warn("looperd scheduler disabled", map[string]any{"reason": "config.agent.vendor is not set"})
+			r.logger.Warn("looperd scheduler waiting for agent configuration", map[string]any{"reason": "config.agent.vendor is not set"})
 		}
-		if !schedulerDisabled {
-			r.startSchedulerLoop()
-		}
+		// The scheduler's handlers snapshot the current config for each operation.
+		// Keep the loop alive even without an initial vendor so configuring one can
+		// take effect without restarting looperd.
+		r.startSchedulerLoop()
 		if r.config.Daemon.WorktreeCleanup.Enabled {
 			r.startWorktreeCleanupLoop()
 		}
 		r.startDeferredReviewerRecovery(githubGateway)
+		r.startConfigReloadLoop()
 
 		if r.logger != nil {
 			catalog := r.Config()
@@ -904,23 +950,46 @@ func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repos
 }
 
 func (r *Runtime) publishProjects(materialized []config.ProjectRefConfig) {
+	r.publishProjectsSnapshot(materialized)
+	r.afterProjectsPublished()
+}
+
+// publishProjectsSnapshot is the atomic in-memory half of project
+// publication. Project mutations call it while holding configBoundary so a
+// concurrent config reload cannot validate or publish a mixed catalog.
+func (r *Runtime) publishProjectsSnapshot(materialized []config.ProjectRefConfig) {
 	if r == nil || r.projectCatalog == nil {
 		return
 	}
 	r.projectCatalog.Publish(materialized)
-	next := r.projectCatalog.Snapshot()
+	r.publishCatalogConsumers(r.projectCatalog.Snapshot())
+}
 
-	r.mu.Lock()
+// publishCatalogConsumers keeps long-lived consumers on the same coherent
+// globals-plus-projects snapshot used for new scheduler claims.
+func (r *Runtime) publishCatalogConsumers(next config.Config) {
+	r.mu.RLock()
 	webhook := r.webhook
 	networkManager := r.networkManager
-	started := r.startedAt != nil
-	r.mu.Unlock()
+	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.updateConfig(next)
 	}
 	if networkManager != nil {
 		networkManager.UpdateConfig(next)
 	}
+}
+
+// afterProjectsPublished deliberately runs outside configBoundary. Webhook
+// reconciliation can invoke gh and other external operations; those must not
+// block config publication or new claim snapshots.
+func (r *Runtime) afterProjectsPublished() {
+	if r == nil {
+		return
+	}
+	r.mu.RLock()
+	started := r.startedAt != nil
+	r.mu.RUnlock()
 	if started {
 		r.TriggerSchedulerTick()
 		r.TriggerSchedulerClaim()
@@ -1499,7 +1568,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			if recoveredQueueItems == 0 {
-				if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.config.Scheduler.RetryMaxAttempts)); err != nil {
+				if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts)); err != nil {
 					return RecoverySummary{}, err
 				}
 			}
@@ -2085,7 +2154,7 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 		}
 		createdQueue := int64(0)
 		if requeuedCount == 0 {
-			if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.config.Scheduler.RetryMaxAttempts)); err != nil {
+			if err := ensureRecoveryQueueItem(ctx, repositories, requeuedLoop, nowISO, int64(r.Config().Scheduler.RetryMaxAttempts)); err != nil {
 				return staleRunQueueRepairSummary{}, err
 			}
 			activeQueue, err = repositories.Queue.FindActiveByLoopID(ctx, loop.ID)
@@ -2235,7 +2304,7 @@ func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositori
 	if cleaned.ErrorMessage == nil {
 		cleaned.ErrorMessage = stringPtr(message)
 	}
-	if r.config.Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
+	if r.Config().Agent.NativeResume.Enabled && runtimeNativeResumeSupported(cleaned.Vendor) && cleaned.NativeSessionID != nil && strings.TrimSpace(*cleaned.NativeSessionID) != "" {
 		cleaned.NativeResumeMode = stringPtr("native_resume")
 		cleaned.NativeResumeStatus = stringPtr("pending")
 		if r.logger != nil {

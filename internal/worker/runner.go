@@ -1723,8 +1723,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// Handed back from an interactive human takeover: resume the exact session
 		// the human drove (independent of HITL) so the daemon sees their turns.
 		if nativeSessionID == "" {
-			if takeoverPrompt, takeoverSession := r.pendingTakeoverResume(&input.Loop); takeoverSession != "" {
-				nativeResumePrompt, nativeSessionID = takeoverPrompt, takeoverSession
+			if takeoverPrompt, takeoverSession := r.pendingTakeoverResume(ctx, &input.Loop); takeoverPrompt != "" {
+				nativeResumePrompt = takeoverPrompt
+				nativeSessionID = takeoverSession
 				prompt += "\n\n" + takeoverPrompt
 			}
 		}

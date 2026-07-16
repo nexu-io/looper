@@ -844,7 +844,7 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	req.Header.Set("x-request-id", "fixture-request-id")
 	recorder := httptest.NewRecorder()
 
-	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
@@ -917,7 +917,7 @@ func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {
 	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: &tokenEnv}}
 	cfg.Projects = []config.ProjectRefConfig{{ID: "project-forgejo", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: t.TempDir()}}
 	recorder := httptest.NewRecorder()
-	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
@@ -994,7 +994,9 @@ func TestHandlerConfigSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, server["host"], cfg.Server.Host)
 	assertEqual(t, server["port"], float64(cfg.Server.Port))
 	assertEqual(t, server["authMode"], string(cfg.Server.AuthMode))
-	assertEqual(t, server["localTokenConfigured"], false)
+	if _, ok := server["localTokenConfigured"]; ok {
+		t.Fatalf("server.localTokenConfigured should be omitted: %#v", server)
+	}
 	assertEqual(t, storageInfo["mode"], cfg.Storage.Mode)
 	assertEqual(t, daemon["mode"], string(cfg.Daemon.Mode))
 	assertEqual(t, daemon["workingDirectory"], cfg.Daemon.WorkingDirectory)
@@ -1082,7 +1084,7 @@ func TestHandlerAuthMisconfigured(t *testing.T) {
 	req.Header.Set("x-request-id", "error-request-id")
 	recorder := httptest.NewRecorder()
 
-	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", recorder.Code)
@@ -1104,7 +1106,7 @@ func TestHandlerUnauthorized(t *testing.T) {
 	req.Header.Set("x-request-id", "error-request-id")
 	recorder := httptest.NewRecorder()
 
-	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", recorder.Code)
@@ -1121,7 +1123,7 @@ func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
 	triggered := 0
 	recorded := 0
-	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus {
 		return looperdruntime.WebhookStatus{Enabled: true}
 	}, record: func(eventType, deliveryID string) {
 		recorded++
@@ -1157,7 +1159,7 @@ func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.
 	fixture := newTestFixture(t)
 	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus {
 		return looperdruntime.WebhookStatus{Enabled: true, Degraded: true, DegradedReasons: []string{"another repo forwarder exited"}}
 	}}
 	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
@@ -1185,7 +1187,7 @@ func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T
 	fixture.config.Server.LocalToken = &token
 	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder})
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), WebhookForwarder: forwarder})
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"review_requested"}`)))
 	req.RemoteAddr = "192.168.1.24:1234"
@@ -1211,7 +1213,7 @@ func TestHandlerWebhookForwardAcceptsLoopbackWithForwardedHeadersAndBearerToken(
 	fixture.config.Server.LocalToken = &token
 	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus {
 		return looperdruntime.WebhookStatus{Enabled: true}
 	}}
 	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
@@ -1244,7 +1246,7 @@ func TestHandlerWebhookForwardRejectsLoopbackWithForwardedHeadersWithoutBearerTo
 	fixture.config.Server.LocalToken = &token
 	fixture.config.Webhook.Enabled = true
 	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
-	runtime := webhookForwardRuntime{Runtime: fixture.runtime, status: func() looperdruntime.WebhookStatus {
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus {
 		return looperdruntime.WebhookStatus{Enabled: true}
 	}}
 	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
@@ -1631,7 +1633,7 @@ func TestHandlerMatchesFrozenErrorArtifactForStatusRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.caseID, func(t *testing.T) {
-			h := NewHandler(Context{Config: tt.cfg, Runtime: rt})
+			h := NewHandler(Context{Config: tt.cfg, Runtime: runtimeWithConfig(rt, tt.cfg)})
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			for key, value := range tt.headers {
 				req.Header.Set(key, value)
@@ -1654,26 +1656,39 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 	seedStatusData(t, fixture.runtime)
 
 	routes := loadResponseArtifact(t)
+	requestRoutes := loadRequestArtifact(t)
 	h := NewHandler(Context{
 		Config:  fixture.config,
 		Runtime: fixture.runtime,
 		Now:     func() time.Time { return fixture.now },
+		PatchConfig: func(context.Context, ConfigPatchRequest) error {
+			return nil
+		},
 		RecoverySummary: func() any {
 			return map[string]any{"expiredLocksReleased": 1}
 		},
 	})
 
-	for _, routeID := range []string{"healthz.get", "status.get", "config.get"} {
+	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch"} {
 		t.Run(routeID, func(t *testing.T) {
 			path := "/api/v1/healthz"
+			method := http.MethodGet
+			var requestBody io.Reader
 			switch routeID {
 			case "status.get":
 				path = "/api/v1/status"
 			case "config.get":
 				path = "/api/v1/config"
+			case "config.patch":
+				path = "/api/v1/config"
+				method = http.MethodPatch
+				requestBody = strings.NewReader(marshalArtifactRequestBody(t, requestRoutes, routeID))
 			}
 
-			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req := httptest.NewRequest(method, path, requestBody)
+			if routeID == "config.patch" {
+				req.RemoteAddr = "127.0.0.1:17310"
+			}
 			req.Header.Set("x-request-id", "fixture-request-id")
 			recorder := httptest.NewRecorder()
 			h.ServeHTTP(recorder, req)
@@ -2614,7 +2629,7 @@ func TestHandlerLoopStartRejectsCodingLoopsWithoutAgentConfigured(t *testing.T) 
 			req.Header.Set("x-request-id", "error-request-id")
 			recorder := httptest.NewRecorder()
 
-			NewHandler(Context{Config: configWithoutAgent, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+			NewHandler(Context{Config: configWithoutAgent, Runtime: runtimeWithConfig(fixture.runtime, configWithoutAgent), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
 
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", recorder.Code)
@@ -3194,7 +3209,7 @@ func TestHandlerWorkerRouteErrorsMatchArtifactCases(t *testing.T) {
 			req.Header.Set("x-request-id", "error-request-id")
 			req.Header.Set("content-type", "application/json")
 			recorder := httptest.NewRecorder()
-			NewHandler(Context{Config: tt.cfg, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+			NewHandler(Context{Config: tt.cfg, Runtime: runtimeWithConfig(fixture.runtime, tt.cfg), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
 
 			want := findArtifactCase(t, artifact.Cases, tt.caseID)
 			if recorder.Code != want.ExpectedStatus {
@@ -3558,7 +3573,7 @@ func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }})
 	for _, tc := range []struct{ name, path, body string }{
 		{name: "planner", path: "/api/v1/planners", body: `{"projectId":"project_1","issueNumber":77}`},
 		{name: "reviewer", path: "/api/v1/loops", body: `{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`},
@@ -3596,7 +3611,7 @@ func TestHandlerPlannerCreateForceBypassesHold(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
-	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
@@ -3617,7 +3632,7 @@ func TestHandlerWorkerCreateRejectsHeldRequestedIssueEvenWhenPlannerPRExists(t *
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
-	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
@@ -3645,7 +3660,7 @@ func TestHandlerCreateManualLoopForceBypassesHoldButStillConflicts(t *testing.T)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
-	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
 	}
@@ -3668,7 +3683,7 @@ func TestHandlerCreateReviewerLoopForcePersistsManualMetadata(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
-	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+	NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
@@ -3713,7 +3728,7 @@ func TestHandlerCreateManualHoldValidationSkipsWhenRepoPathOrGHPathMissing(t *te
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`)))
 			req.Header.Set("content-type", "application/json")
 			rec := httptest.NewRecorder()
-			NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
+			NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 			}
@@ -3932,7 +3947,7 @@ func TestHandlerCreateLoopRejectsWorkerAndPlannerWithoutAgentConfigured(t *testi
 			req.Header.Set("content-type", "application/json")
 			recorder := httptest.NewRecorder()
 
-			NewHandler(Context{Config: configWithoutAgent, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+			NewHandler(Context{Config: configWithoutAgent, Runtime: runtimeWithConfig(fixture.runtime, configWithoutAgent), Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
 
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", recorder.Code)
@@ -6959,6 +6974,7 @@ func (r webhookReconcileRuntime) RefreshWebhookForwarders() error {
 
 type webhookForwardRuntime struct {
 	*looperdruntime.Runtime
+	config *config.Config
 	status func() looperdruntime.WebhookStatus
 	record func(string, string)
 }
@@ -6973,6 +6989,13 @@ func (r webhookForwardRuntime) WebhookStatus() looperdruntime.WebhookStatus {
 		return r.status()
 	}
 	return r.Runtime.WebhookStatus()
+}
+
+func (r webhookForwardRuntime) Config() config.Config {
+	if r.config != nil {
+		return *r.config
+	}
+	return r.Runtime.Config()
 }
 
 func (r webhookForwardRuntime) RecordWebhookDelivery(eventType, deliveryID string) {
@@ -7438,6 +7461,10 @@ func findResponseArtifactRoute(t *testing.T, routes []responseArtifactRoute, rou
 	t.Helper()
 	for _, route := range routes {
 		if route.ID == routeID {
+			if route.SameAs != "" {
+				base := findResponseArtifactRoute(t, routes, route.SameAs)
+				route.Body = base.Body
+			}
 			return route
 		}
 	}
@@ -7693,8 +7720,9 @@ type errorArtifactCase struct {
 }
 
 type responseArtifactRoute struct {
-	ID   string `json:"id"`
-	Body any    `json:"body"`
+	ID     string `json:"id"`
+	Body   any    `json:"body"`
+	SameAs string `json:"sameAs,omitempty"`
 }
 
 type requestArtifactRoute struct {

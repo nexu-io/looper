@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,7 +26,12 @@ type EnvLookupFunc func(string) (string, bool)
 type LoadFileMetadata struct {
 	ConfigPath        string
 	ConfigFilePresent bool
-	ToolDetection     map[string]ToolDetectionStatus
+	// ConfigFileRevision identifies the exact file generation decoded into this
+	// LoadedFileConfig. Keeping it beside the snapshot prevents a later read from
+	// pairing old effective values with a newer, not-yet-published file hash.
+	ConfigFileRevision string
+	ToolDetection      map[string]ToolDetectionStatus
+	FieldSources       map[string]ValueSource
 }
 
 type LoadedFileConfig struct {
@@ -37,12 +43,16 @@ type LoadedFileConfig struct {
 }
 
 type LoadFileOptions struct {
-	CWD               string
-	ConfigPath        string
-	DefaultConfigPath string
-	Args              []string
-	LookupEnv         EnvLookupFunc
-	LookPath          LookPathFunc
+	CWD        string
+	ConfigPath string
+	// ConfigPathOverride force-selects a file before --config and LOOPER_CONFIG
+	// path selection while retaining their ordinary value overrides. It is used
+	// to validate a temporary dashboard edit under the daemon's startup layers.
+	ConfigPathOverride string
+	DefaultConfigPath  string
+	Args               []string
+	LookupEnv          EnvLookupFunc
+	LookPath           LookPathFunc
 }
 
 type parsedCLIArgs struct {
@@ -80,7 +90,9 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	configPath := ""
-	if parsedCLI.hasConfigPath {
+	if options.ConfigPathOverride != "" {
+		configPath = options.ConfigPathOverride
+	} else if parsedCLI.hasConfigPath {
 		configPath = parsedCLI.configPath
 	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok && strings.TrimSpace(envConfigPath) != "" {
 		configPath = envConfigPath
@@ -99,7 +111,7 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	resolvedConfigPath := ResolveConfigPath(configPath, cwd)
-	partialConfig, present, err := readConfigFile(resolvedConfigPath)
+	partialConfig, present, revision, err := readConfigFileGeneration(resolvedConfigPath)
 	if err != nil {
 		return LoadedFileConfig{}, err
 	}
@@ -142,9 +154,11 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		Warnings: dedupeWarnings(fileWarnings, envWarnings, cliWarnings),
 		Notices:  fileNotices,
 		Metadata: LoadFileMetadata{
-			ConfigPath:        resolvedConfigPath,
-			ConfigFilePresent: present,
-			ToolDetection:     toolDetection.Detection,
+			ConfigPath:         resolvedConfigPath,
+			ConfigFilePresent:  present,
+			ConfigFileRevision: revision,
+			ToolDetection:      toolDetection.Detection,
+			FieldSources:       discoverFieldSources(config, partialConfig, envOverrides, parsedCLI.overrides),
 		},
 	}, nil
 }
@@ -266,25 +280,45 @@ func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial Partial
 }
 
 func readConfigFile(path string) (PartialConfig, bool, error) {
+	partial, present, _, err := readConfigFileGeneration(path)
+	return partial, present, err
+}
+
+func readConfigFileGeneration(path string) (PartialConfig, bool, string, error) {
 	if err := validateConfigFileSuffix(path); err != nil {
-		return PartialConfig{}, false, err
+		return PartialConfig{}, false, "", err
 	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return PartialConfig{}, false, nil
+			return PartialConfig{}, false, ConfigFileRevision(nil, false), nil
 		}
 
-		return PartialConfig{}, false, fmt.Errorf("failed to read config file at %s: %w", path, err)
+		return PartialConfig{}, false, "", fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
+	revision := ConfigFileRevision(raw, true)
 
 	partialConfig, err := decodeConfigFile(path, raw)
 	if err != nil {
-		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
+		return PartialConfig{}, true, revision, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
 
-	return partialConfig, true, nil
+	return partialConfig, true, revision, nil
+}
+
+// ConfigFileRevision returns the equality token used by dashboard reads and
+// patches. File presence is part of the token, so an absent file and an empty
+// file are distinct generations.
+func ConfigFileRevision(raw []byte, present bool) string {
+	marker := "missing\x00"
+	if present {
+		marker = "present\x00"
+	}
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(marker))
+	_, _ = hasher.Write(raw)
+	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
 }
 
 func validateConfigFileSuffix(path string) error {

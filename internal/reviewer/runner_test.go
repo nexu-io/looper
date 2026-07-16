@@ -1814,6 +1814,42 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 	}
 }
 
+func TestRecordLoopRunStartMetadataRefreshesInheritedReviewEventsForNewClaim(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{ReviewEvents: config.ReviewerReviewEventsConfig{
+		Clean:    config.ReviewerReviewEventApprove,
+		Blocking: config.ReviewerReviewEventRequestChanges,
+	}})
+	queuedUnderOldConfig := `{"reviewEvents":{"clean":"COMMENT","blocking":"COMMENT"},"loop":{"status":"queued"}}`
+
+	metadataJSON, err := runner.recordLoopRunStartMetadata(&queuedUnderOldConfig, "project_1")
+	if err != nil {
+		t.Fatalf("recordLoopRunStartMetadata() error = %v", err)
+	}
+	got := runner.effectiveReviewEvents("project_1", &metadataJSON)
+	if got.Clean != config.ReviewerReviewEventApprove || got.Blocking != config.ReviewerReviewEventRequestChanges {
+		t.Fatalf("claimed review events = %#v, want current claim snapshot APPROVE/REQUEST_CHANGES", got)
+	}
+}
+
+func TestRecordLoopRunStartMetadataPreservesManualReviewEventOverrides(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{ReviewEvents: config.ReviewerReviewEventsConfig{
+		Clean:    config.ReviewerReviewEventApprove,
+		Blocking: config.ReviewerReviewEventRequestChanges,
+	}})
+	manualOverride := `{"manual":true,"reviewEvents":{"clean":"COMMENT","blocking":"COMMENT"},"loop":{"status":"queued"}}`
+
+	metadataJSON, err := runner.recordLoopRunStartMetadata(&manualOverride, "project_1")
+	if err != nil {
+		t.Fatalf("recordLoopRunStartMetadata() error = %v", err)
+	}
+	got := runner.effectiveReviewEvents("project_1", &metadataJSON)
+	if got.Clean != config.ReviewerReviewEventComment || got.Blocking != config.ReviewerReviewEventComment {
+		t.Fatalf("manual review events = %#v, want explicit COMMENT/COMMENT overrides", got)
+	}
+}
+
 func reviewEventPtr(event config.ReviewerReviewEvent) *config.ReviewerReviewEvent {
 	return &event
 }
@@ -3451,6 +3487,15 @@ func TestProcessClaimedItemAllowsManualQueuedLoopWithoutReviewRequest(t *testing
 	if len(agent.starts) != 1 {
 		t.Fatalf("agent starts=%d, want agent-native review to run", len(agent.starts))
 	}
+	if got, _ := agent.starts[0].Metadata["expectedCommitID"].(string); got != "abc123" {
+		t.Fatalf("agent metadata expectedCommitID = %q, want captured head abc123", got)
+	}
+	if manual, _ := agent.starts[0].Metadata["reviewerManual"].(bool); !manual {
+		t.Fatalf("agent metadata reviewerManual = %v, want true for manual loop", agent.starts[0].Metadata["reviewerManual"])
+	}
+	if got, _ := agent.starts[0].Metadata["reviewerRunID"].(string); got != result.RunID || got != agent.starts[0].RunID {
+		t.Fatalf("agent metadata reviewerRunID = %q, want daemon-authored run %q", got, result.RunID)
+	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil || updatedLoop == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", updatedLoop, err)
@@ -4133,6 +4178,18 @@ func TestProcessClaimedItemInterruptsRunningReviewerWhenHeadChanges(t *testing.T
 	}
 	if len(agent.killedReasons) != 1 || !contains(agent.killedReasons[0], "new-head") {
 		t.Fatalf("killedReasons = %#v, want one head-change kill", agent.killedReasons)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts = %d, want one reviewer start", len(agent.starts))
+	}
+	if got, _ := agent.starts[0].Metadata["expectedCommitID"].(string); got != "abc123" {
+		t.Fatalf("agent metadata expectedCommitID = %q, want active snapshot head abc123", got)
+	}
+	if manual, _ := agent.starts[0].Metadata["reviewerManual"].(bool); manual {
+		t.Fatalf("agent metadata reviewerManual = %v, want false for automatic loop", agent.starts[0].Metadata["reviewerManual"])
+	}
+	if got, _ := agent.starts[0].Metadata["reviewerRunID"].(string); got != result.RunID || got != agent.starts[0].RunID {
+		t.Fatalf("agent metadata reviewerRunID = %q, want daemon-authored run %q", got, result.RunID)
 	}
 	interruptedRun, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
 	if err != nil || interruptedRun == nil {

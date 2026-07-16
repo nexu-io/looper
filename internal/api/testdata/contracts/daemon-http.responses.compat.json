@@ -7,7 +7,8 @@
   ],
   "notes": [
     "This artifact freezes the current /api/v1 success-envelope JSON shapes using the seeded fixture in apps/looperd/src/server/index.test.ts.",
-    "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary."
+    "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary.",
+    "A route with sameAs intentionally shares the complete frozen response shape of the referenced route."
   ],
   "placeholders": {
     "<tmp-root>": "Temporary fixture root directory used by the test harness.",
@@ -220,8 +221,7 @@
           "server": {
             "host": "127.0.0.1",
             "port": 17310,
-            "authMode": "none",
-            "localTokenConfigured": false
+            "authMode": "none"
           },
           "storage": {
             "mode": "sqlite",
@@ -243,8 +243,15 @@
             "publicBaseUrl": "",
             "fallbackPollIntervalSeconds": 300
           },
+          "network": {
+            "enrolled": false,
+            "loopernetBaseUrl": "",
+            "nodeName": "",
+            "githubLogin": ""
+          },
           "agent": {
             "env": {},
+            "envKeys": [],
             "nativeResume": {
               "enabled": true
             },
@@ -288,6 +295,18 @@
               "throttleWindowSeconds": 60
             }
           },
+          "disclosure": {
+            "enabled": true,
+            "includeAgent": true,
+            "includeOS": false,
+            "channels": {
+              "gitCommit": true,
+              "pullRequest": true,
+              "issueComment": true,
+              "reviewComment": true,
+              "inlineCommentVisible": true
+            }
+          },
           "tools": {
             "gitPath": "/usr/bin/git",
             "ghPath": "/usr/bin/gh",
@@ -325,6 +344,13 @@
             "fixAllPullRequests": false,
             "openPrStrategy": "all_done",
             "addSnapshotMode": "async"
+          },
+          "instructions": {
+            "enabled": true,
+            "maxBytes": 8192
+          },
+          "hitl": {
+            "enabled": false
           },
           "roles": {
             "coordinator": {
@@ -460,10 +486,24 @@
               }
             }
           },
-          "projects": []
+          "providers": [],
+          "projects": [],
+          "metadata": {
+            "configPath": "",
+            "format": "",
+            "filePresent": false,
+            "revision": "",
+            "rejectedPaths": [],
+            "fields": {}
+          }
         },
         "requestId": "fixture-request-id"
       }
+    },
+    {
+      "id": "config.patch",
+      "status": 200,
+      "sameAs": "config.get"
     },
     {
       "id": "events.list",

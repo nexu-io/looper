@@ -11,6 +11,23 @@
   ],
   "routes": [
     {
+      "id": "config.patch",
+      "method": "PATCH",
+      "path": "/api/v1/config",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "revision": "sha256:observed-config-revision",
+          "set": {
+            "scheduler.maxConcurrentRuns": 4
+          },
+          "unset": []
+        }
+      }
+    },
+    {
       "id": "loops.create",
       "method": "POST",
       "path": "/api/v1/loops",

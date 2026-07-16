@@ -17,14 +17,14 @@ type ConfigSource interface {
 	Snapshot() config.Config
 }
 
-// Catalog owns the immutable runtime view of Projects. The non-project portion
-// of the configuration is frozen at construction; Publish atomically replaces
-// only the already-materialized Projects view.
+// Catalog owns the immutable runtime configuration view. Publish and
+// PublishGlobals update disjoint portions of that view with compare-and-swap
+// loops so concurrent database materialization and config reloads cannot undo
+// one another.
 //
 // Catalog keeps no caller-owned slices, maps, or pointers. Snapshot likewise
 // returns a detached copy so a consumer cannot mutate the published view.
 type Catalog struct {
-	global  config.Config
 	current atomic.Pointer[config.Config]
 }
 
@@ -33,9 +33,8 @@ type Catalog struct {
 // Catalog before the first database materialization is published.
 func NewCatalog(global config.Config) *Catalog {
 	frozen := cloneCatalogConfig(global)
-	catalog := &Catalog{global: frozen}
-	initial := cloneCatalogConfig(frozen)
-	catalog.current.Store(&initial)
+	catalog := &Catalog{}
+	catalog.current.Store(&frozen)
 	return catalog
 }
 
@@ -46,9 +45,40 @@ func (c *Catalog) Publish(projects []config.ProjectRefConfig) {
 	if c == nil {
 		return
 	}
-	next := cloneCatalogConfig(c.global)
-	next.Projects = cloneCatalogProjects(projects)
-	c.current.Store(&next)
+	detachedProjects := cloneCatalogProjects(projects)
+	for {
+		current := c.current.Load()
+		var next config.Config
+		if current != nil {
+			next = cloneCatalogConfig(*current)
+		}
+		next.Projects = cloneCatalogProjects(detachedProjects)
+		if c.current.CompareAndSwap(current, &next) {
+			return
+		}
+	}
+}
+
+// PublishGlobals atomically installs candidate's global configuration while
+// preserving the currently materialized SQLite Projects view. candidate's
+// Projects are import input and are deliberately ignored here.
+func (c *Catalog) PublishGlobals(candidate config.Config) {
+	if c == nil {
+		return
+	}
+	detachedCandidate := cloneCatalogConfig(candidate)
+	for {
+		current := c.current.Load()
+		next := cloneCatalogConfig(detachedCandidate)
+		if current != nil {
+			next.Projects = cloneCatalogProjects(current.Projects)
+		} else {
+			next.Projects = nil
+		}
+		if c.current.CompareAndSwap(current, &next) {
+			return
+		}
+	}
 }
 
 // Snapshot returns a coherent, detached copy of the currently published full

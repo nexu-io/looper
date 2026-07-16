@@ -124,6 +124,9 @@ type executionMatchesProcessFunc func(context.Context, storage.AgentExecutionRec
 func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.Runtime, error) {
 	rt := looperdruntime.New(looperdruntime.Options{
 		Config:        deps.Config,
+		InitialConfig: deps.InitialConfig,
+		ReloadConfig:  deps.ReloadConfig,
+		LoadConfigAt:  deps.LoadConfigAt,
 		ConfigPath:    deps.Metadata.ConfigPath,
 		Logger:        deps.Logger,
 		DeferRecovery: true,
@@ -133,7 +136,14 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 	}
 
 	apiHandler := looperdapi.NewHandler(looperdapi.Context{
-		Config:  deps.Config,
+		Config: deps.Config,
+		ConfigSnapshot: func() (config.Config, looperdapi.ConfigMetadata) {
+			cfg, status := rt.ConfigSnapshot()
+			return cfg, runtimeConfigMetadataFromStatus(status)
+		},
+		PatchConfig: func(ctx context.Context, patch looperdapi.ConfigPatchRequest) error {
+			return patchRuntimeConfig(ctx, rt, patch)
+		},
 		Runtime: rt,
 		ReconcileStaleRuns: func(ctx context.Context) (looperdruntime.StaleRunReconcileSummary, error) {
 			return rt.ReconcileStaleRunningRuns(ctx)
@@ -182,6 +192,174 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		server:          server,
 		shutdownTimeout: shutdownTimeout,
 	}, nil
+}
+
+func runtimeConfigMetadata(rt *looperdruntime.Runtime) looperdapi.ConfigMetadata {
+	_, status := rt.ConfigSnapshot()
+	return runtimeConfigMetadataFromStatus(status)
+}
+
+func runtimeConfigMetadataFromStatus(status looperdruntime.ConfigReloadStatus) looperdapi.ConfigMetadata {
+	rejectedPaths := publicConfigRejectedPaths(status.RejectedPaths)
+	lastError := sanitizeConfigDiagnostic(status.LastError, status.RejectedPaths)
+	metadata := looperdapi.ConfigMetadata{
+		ConfigPath:    status.ConfigPath,
+		Format:        status.Format,
+		FilePresent:   status.FilePresent,
+		Revision:      status.Revision,
+		LastAttemptAt: status.LastAttemptAt,
+		LastAppliedAt: status.LastAppliedAt,
+		RejectedPaths: rejectedPaths,
+		Fields:        make(map[string]looperdapi.ConfigFieldMetadata, len(status.FieldSources)),
+	}
+	if lastError != "" {
+		metadata.LastError = &lastError
+	}
+	for path, source := range status.FieldSources {
+		if path == "projects" || strings.HasPrefix(path, "projects.") || isSensitiveConfigMetadataPath(path) || config.IsHotReloadCompatibilityPath(path) {
+			continue
+		}
+		hot := config.IsHotEditablePath(path)
+		fieldLevel := config.IsFieldLevelConfigPath(path) || path == "agent.env"
+		editable := hot && fieldLevel && source != config.ValueSourceEnv && source != config.ValueSourceCLI
+		applyMode := "restart"
+		if hot {
+			applyMode = "hot"
+		}
+		metadata.Fields[path] = looperdapi.ConfigFieldMetadata{
+			Source:    string(source),
+			Editable:  editable,
+			ApplyMode: applyMode,
+		}
+	}
+	return metadata
+}
+
+var sensitiveConfigMetadataRoots = []string{
+	"server.localToken",
+	"agent.params",
+	"daemon.environment",
+}
+
+func isSensitiveConfigMetadataPath(path string) bool {
+	for _, root := range sensitiveConfigMetadataRoots {
+		if path == root || strings.HasPrefix(path, root+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func publicConfigPath(path string) string {
+	for _, root := range sensitiveConfigMetadataRoots {
+		if path == root || strings.HasPrefix(path, root+".") {
+			return root
+		}
+	}
+	return path
+}
+
+func publicConfigRejectedPaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = publicConfigPath(path)
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sanitizeConfigDiagnostic(message string, paths []string) string {
+	if message != "" && len(paths) == 0 {
+		// Field-less parser errors can embed the rejected YAML/TOML scalar. Keep
+		// the API defensive even if a caller supplies status not produced by the
+		// runtime's own sanitized diagnostic path.
+		return "configuration reload rejected: config file could not be decoded or validated"
+	}
+	hasSensitive := false
+	for _, path := range paths {
+		if isSensitiveConfigMetadataPath(path) {
+			hasSensitive = true
+			break
+		}
+	}
+	if hasSensitive {
+		prefix := "configuration reload rejected"
+		if strings.Contains(strings.ToLower(message), "restart") {
+			prefix = "configuration changes require a daemon restart"
+		}
+		return prefix + "; sensitive field details are hidden"
+	}
+	return message
+}
+
+func patchRuntimeConfig(ctx context.Context, rt *looperdruntime.Runtime, patch looperdapi.ConfigPatchRequest) error {
+	err := rt.PatchConfig(ctx, looperdruntime.ConfigPatch{Revision: patch.Revision, Set: patch.Set, Unset: patch.Unset})
+	if err == nil {
+		return nil
+	}
+
+	requestError := looperdapi.ConfigRequestError{
+		Kind:    looperdapi.ConfigRequestErrorKindValidation,
+		Message: err.Error(),
+	}
+	var patchError *looperdruntime.ConfigPatchError
+	if errors.As(err, &patchError) {
+		switch patchError.Kind {
+		case "conflict":
+			requestError.Kind = looperdapi.ConfigRequestErrorKindConflict
+		case "unsupported":
+			requestError.Kind = looperdapi.ConfigRequestErrorKindUnsupported
+		case "validation":
+			requestError.Kind = looperdapi.ConfigRequestErrorKindValidation
+		default:
+			// Filesystem and bootstrap failures are server errors, not user input
+			// failures. Preserve the untyped error so the API returns 500.
+			return err
+		}
+		for _, path := range patchError.Paths {
+			requestError.Issues = append(requestError.Issues, looperdapi.ConfigPatchIssue{
+				Path:    path,
+				Code:    configPatchIssueCode(patchError.Kind),
+				Message: patchError.Error(),
+			})
+		}
+	}
+
+	var validationError *config.ConfigValidationError
+	if errors.As(err, &validationError) {
+		requestError.Issues = requestError.Issues[:0]
+		for _, issue := range validationError.Issues {
+			requestError.Issues = append(requestError.Issues, looperdapi.ConfigPatchIssue{
+				Path:    issue.Path,
+				Code:    "invalid_value",
+				Message: issue.Message,
+			})
+		}
+	}
+	if len(requestError.Issues) == 0 {
+		requestError.Issues = []looperdapi.ConfigPatchIssue{{
+			Code:    configPatchIssueCode(string(requestError.Kind)),
+			Message: err.Error(),
+		}}
+	}
+	return requestError
+}
+
+func configPatchIssueCode(kind string) string {
+	switch kind {
+	case "conflict":
+		return "file_changed"
+	case "unsupported":
+		return "field_not_editable"
+	default:
+		return "invalid_value"
+	}
 }
 
 func stopServerWithTimeout(stop func(context.Context) error, timeout time.Duration) error {

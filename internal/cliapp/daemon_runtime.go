@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/spf13/cobra"
 )
 
@@ -744,6 +745,12 @@ func splitLogLines(content string) []string {
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
+	if loaded, configured, err := forge.LoadTrustedReviewConfigSnapshot(); configured {
+		if err != nil {
+			return config.LoadedFileConfig{}, err
+		}
+		return loaded, nil
+	}
 	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
 	if err != nil {
 		return config.LoadedFileConfig{}, err

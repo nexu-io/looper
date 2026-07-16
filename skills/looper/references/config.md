@@ -54,6 +54,44 @@ Custom config path examples:
 
 Relative config paths resolve from the working directory used to start `looperd`.
 
+## Live reload and dashboard management
+
+`looperd` watches the selected config file and reparses the complete, captured precedence stack while it runs. A valid candidate is published atomically only when every changed effective field is hot-safe. A claim made after publication uses the new snapshot; an already active run keeps the snapshot it started with.
+
+If the file is invalid, or if one changed field is restart-bound, the entire candidate is rejected. The daemon keeps running on its last-known-good snapshot and exposes the error and rejected paths on the Configuration page at `/dashboard/config`. Do not restart merely to apply a hot-safe edit. Correct a rejected file, or restart only when the change is intentionally restart-bound.
+
+Hot-safe fields are deliberately curated:
+
+- `scheduler.maxConcurrentRuns` and `scheduler.slowLaneWarnThresholdMs`
+- `agent.vendor`, `agent.model`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`; configuring the first vendor after startup is supported
+- `notifications.inApp`, `notifications.osascript.enabled`, `notifications.osascript.soundForLevels`, and `notifications.osascript.throttleWindowSeconds`
+- every current `disclosure.*` field
+- `defaults.allowAutoCommit`, `defaults.allowAutoPush`, `defaults.allowRiskyFixes`, `defaults.openPrStrategy`, and `defaults.addSnapshotMode`; `defaults.baseBranch` is restart-bound because configured project records materialize it
+- `instructions.enabled` only
+- the current Planner `autoDiscovery`, `instructions`, and trigger fields except `roles.planner.triggers.planeAssigneeId`; all current Worker `autoDiscovery`, `triggers.*`, and `instructions` fields; the equivalent current Fixer fields; current Reviewer `discovery.*`, most `behavior.*`, and `instructions`; and current Coordinator `pollInterval`, `triage.*`, `dispatch.*`, and merge-watch policy except `mergeWatch.transientRetries`
+- `tools.looperPath` and `tools.osascriptPath`
+
+`agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and an explicit `agent.model` is changed or unset in the same edit instead of being silently carried across vendors. Clearing a configured vendor uses the same guard, preventing a retained profile from passing through an intermediate `null`. Configuring the first vendor may use an already prepared model/params profile. Cross-vendor continuations keep their checkpoint, worktree, HITL answer, and human instructions but start a fresh native session.
+
+Everything else is restart-bound. Important exclusions are `agent.nativeResume.*`, arbitrary `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `notifications.webhook.*` (including its Feishu transport), all `hitl.*`, `instructions.maxBytes`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*`. The Planner Plane-assignee field is file-only; Worker `roles.worker.triggers.planeAssigneeId` remains a supported hot-safe control. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget. The Reviewer-specific `roles.reviewer.behavior.nativeResume.*` fields are part of the curated Reviewer behavior surface; the global `agent.nativeResume.*` field is not. Listener/storage/runtime ownership, polling/cache topology, logger ownership, providers, projects, `tools.gitPath`, and `tools.ghPath` also require restart. New fields default to restart-bound until explicitly classified. Mixed hot-safe and restart-bound edits are rejected as one candidate; Looper never applies only the convenient half.
+
+Deprecated file-only aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are watcher-hot compatibility representations of canonical fields. They are never dashboard controls. A canonical dashboard edit retires the matching alias leaf so unsetting the canonical value later cannot reveal stale compatibility policy.
+
+The dashboard provides curated field-level controls rather than a raw config editor:
+
+- environment- or CLI-overridden fields are visible but read-only because those higher-precedence layers remain authoritative
+- `agent.env` values are write-only: the dashboard shows configured key names and supports set/replace/remove, but the API never returns values
+- `server.localToken`, `daemon.environment`, and arbitrary `agent.params` remain file-only
+- projects remain managed by the Projects API and SQLite catalog, not the generic Configuration page
+- each config read returns the revision captured with its published values; each patch submits it and repeats an identity/mode/byte check immediately before atomic rename, catching changes present before that final check
+- portable filesystems leave a tiny final-check-to-rename race, so do not combine simultaneous manual and dashboard writes
+- in `local-token` mode, PATCH uses normal token authentication; without token authentication, `PATCH /api/v1/config` requires a direct loopback peer and Host authority and rejects proxy-forwarding headers
+- dashboard writes preserve the selected TOML/YAML/JSON format, unknown top-level extension sections and their native scalar values, and ordinary permission bits, and are validated before atomic replacement; ACLs and extended filesystem metadata are not guaranteed to survive
+- serialization may canonicalize comments, quoting, key/table order, and other lexical formatting
+- a symlinked config path can be watched for external edits, but dashboard PATCH refuses to replace it; edit the symlink target directly
+
+After an external edit, use `/dashboard/config` to confirm the last attempt and last applied time. For a rejected candidate, inspect the displayed paths or daemon logs, then make a targeted correction. Do not expose config secrets while troubleshooting.
+
 ## Canonical taxonomy
 
 Looper's frozen canonical top-level config roots are:
@@ -62,6 +100,8 @@ Looper's frozen canonical top-level config roots are:
 - `daemon`
 - `storage`
 - `scheduler`
+- `webhook`
+- `network`
 - `agent`
 - `logging`
 - `notifications`
@@ -70,6 +110,7 @@ Looper's frozen canonical top-level config roots are:
 - `package`
 - `defaults`
 - `instructions`
+- `hitl`
 - `roles`
 - `providers`
 - `projects`
@@ -266,10 +307,14 @@ fallbackPollIntervalSeconds = 300
 vendor = "opencode"
 
 [agent.timeouts]
-plannerSeconds = 1800
-workerSeconds = 3600
-reviewerSeconds = 1800
-fixerSeconds = 1800
+plannerIdleTimeoutSeconds = 600
+plannerMaxRuntimeSeconds = 3600
+workerIdleTimeoutSeconds = 900
+workerMaxRuntimeSeconds = 10800
+reviewerIdleTimeoutSeconds = 600
+reviewerMaxRuntimeSeconds = 5400
+fixerIdleTimeoutSeconds = 600
+fixerMaxRuntimeSeconds = 7200
 
 [logging]
 level = "info"
@@ -477,4 +522,5 @@ looperd \
 - Ask before creating, overwriting, or deleting `~/.looper/config.toml`.
 - Never expose secrets from `agent.env`, tokens, or local environment variables.
 - Prefer targeted TOML edits over rewriting the whole config.
-- Confirm before changing configured projects, worktree roots, defaults that allow auto-push/auto-merge, reviewer approval behavior, or notification settings.
+- After a targeted edit, verify its reload result before proposing a restart. Active runs intentionally retain their original snapshot.
+- Confirm before changing configured projects, worktree roots, defaults that allow auto-push or risky fixes, reviewer approval behavior, or notification settings.

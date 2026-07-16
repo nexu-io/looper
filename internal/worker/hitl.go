@@ -118,7 +118,7 @@ func asAwaitingHumanError(err error) (*awaitingHumanError, bool) {
 // human drove during an interactive takeover that has since been handed back, so
 // the daemon's next worker run resumes THAT session and sees their turns. Empty
 // when no takeover resume is pending. Independent of hitl.enabled.
-func (r *Runner) pendingTakeoverResume(loop *storage.LoopRecord) (string, string) {
+func (r *Runner) pendingTakeoverResume(ctx context.Context, loop *storage.LoopRecord) (string, string) {
 	tr, ok := loops.ReadTakeoverResume(loop.MetadataJSON)
 	if !ok || strings.TrimSpace(tr.SessionID) == "" {
 		return "", ""
@@ -127,7 +127,18 @@ func (r *Runner) pendingTakeoverResume(loop *storage.LoopRecord) (string, string
 	if prompt == "" {
 		prompt = "A human took this task's agent session over directly and has handed it back. Review the whole conversation so far — including their turns — and continue from where they left off; do not restart from scratch."
 	}
-	return prompt, tr.SessionID
+	if r.repos == nil || r.repos.AgentExecutions == nil {
+		return takeoverCheckpointRestartPrompt(), ""
+	}
+	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || execution == nil || execution.NativeSessionID == nil || strings.TrimSpace(*execution.NativeSessionID) != strings.TrimSpace(tr.SessionID) || strings.TrimSpace(execution.Vendor) != strings.TrimSpace(r.agentRuntime) {
+		return takeoverCheckpointRestartPrompt(), ""
+	}
+	return prompt, strings.TrimSpace(tr.SessionID)
+}
+
+func takeoverCheckpointRestartPrompt() string {
+	return "A human took this task over directly and has handed it back. The configured agent vendor no longer matches the captured session, so start a fresh session, inspect the current worktree and task state, and continue without trying to attach to the old conversation."
 }
 
 // latestNativeSessionID returns the loop's most recent captured agent session id,
@@ -138,7 +149,7 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID string) strin
 		return ""
 	}
 	execution, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
-	if err != nil || execution == nil || execution.NativeSessionID == nil {
+	if err != nil || execution == nil || execution.NativeSessionID == nil || strings.TrimSpace(execution.Vendor) != strings.TrimSpace(r.agentRuntime) {
 		return ""
 	}
 	return strings.TrimSpace(*execution.NativeSessionID)
@@ -198,7 +209,10 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 		return "", ""
 	}
 	resumePrompt := fmt.Sprintf("A human answered the question you asked earlier (%q). Their decision: %s\nContinue the task using this decision; do not ask the same question again.", ask.Question, ask.Answer)
-	return resumePrompt, ask.SessionID
+	if strings.TrimSpace(ask.Vendor) != strings.TrimSpace(r.agentRuntime) {
+		return resumePrompt + "\nThe configured agent vendor changed after the question was asked, so continue in a fresh session rather than trying to attach to the prior vendor's session.", ""
+	}
+	return resumePrompt, strings.TrimSpace(ask.SessionID)
 }
 
 // markHumanAnswerConsumed flips a delivered human answer from "answered" to

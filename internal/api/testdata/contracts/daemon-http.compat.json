@@ -82,6 +82,14 @@
       "routeSpecificStatuses": []
     },
     {
+      "id": "config.patch",
+      "method": "PATCH",
+      "path": "/api/v1/config",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400, 403, 409, 413]
+    },
+    {
       "id": "events.list",
       "method": "GET",
       "path": "/api/v1/events?limit=1",

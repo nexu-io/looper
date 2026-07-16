@@ -1627,17 +1627,22 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}()
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
-		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON)
+		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON, project.ID)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
 		}
-	}); err != nil {
+	})
+	if err != nil {
 		return ProcessResult{}, err
 	}
+	// The runner is the immutable claim snapshot. Carry the just-persisted
+	// policy into every step so stale loop metadata from an earlier queued run
+	// cannot override configuration published before this claim.
+	loop = &updatedLoop
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
@@ -1772,7 +1777,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{}, err
 	}
-	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updatedLoop, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
@@ -2824,6 +2829,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		"prNumber":            input.PRNumber,
 		"cleanReviewEvent":    string(reviewEvents.Clean),
 		"blockingReviewEvent": string(reviewEvents.Blocking),
+		"expectedCommitID":    checkpoint.Snapshot.HeadSHA,
+		"reviewerManual":      isManualReviewerLoop(input.Loop),
+		"reviewerRunID":       input.Run.ID,
 	}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -5970,11 +5978,22 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 	return string(encoded), err
 }
 
-func (r *Runner) recordLoopRunStartMetadata(current *string) (string, error) {
+func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (string, error) {
 	meta := parseJSONObject(current)
 	loopMeta := reviewerLoopMetadata(meta)
 	loopMeta["status"] = "active"
 	loopMeta["lastStatus"] = "running"
+	// Manual loops may carry explicit CLI review-event overrides and remain
+	// authoritative for that loop. Auto-discovered loop metadata is inherited
+	// policy, so refresh it from this claim's immutable runner snapshot.
+	manual, _ := meta["manual"].(bool)
+	if !manual {
+		reviewEvents := r.reviewEventsForProject(projectID)
+		meta["reviewEvents"] = map[string]any{
+			"clean":    string(reviewEvents.Clean),
+			"blocking": string(reviewEvents.Blocking),
+		}
+	}
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err

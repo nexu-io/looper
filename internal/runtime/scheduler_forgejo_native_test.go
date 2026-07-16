@@ -235,9 +235,32 @@ func TestReviewerAllowedReviewPolicy(t *testing.T) {
 	got := reviewerAllowedReviewPolicy(map[string]any{
 		"cleanReviewEvent":    " APPROVE ",
 		"blockingReviewEvent": "REQUEST_CHANGES",
+		"expectedCommitID":    " head-42 ",
+		"reviewerManual":      true,
+		"reviewerRunID":       " run_42 ",
 	})
-	if got.Clean != "APPROVE" || got.Blocking != "REQUEST_CHANGES" {
-		t.Fatalf("reviewerAllowedReviewPolicy() = %#v, want APPROVE/REQUEST_CHANGES", got)
+	if got.Clean != "APPROVE" || got.Blocking != "REQUEST_CHANGES" || got.ExpectedCommitID != "head-42" || !got.ReviewerManual || got.ReviewerRunID != "run_42" {
+		t.Fatalf("reviewerAllowedReviewPolicy() = %#v, want bound events/head/manual run", got)
+	}
+}
+
+func TestTrustedReviewChildEnvCapturesAgentAndProviderCredentials(t *testing.T) {
+	providerTokenEnv := "LOOPER_TEST_TRUSTED_REVIEW_PROVIDER_TOKEN"
+	t.Setenv(providerTokenEnv, "daemon-provider-token")
+	cfg := config.Config{
+		Agent: config.AgentConfig{Env: map[string]string{
+			"GH_TOKEN":       "config-only-github-token",
+			providerTokenEnv: "agent-value-must-not-win",
+		}},
+		Providers: []config.ProviderConfig{{TokenEnv: &providerTokenEnv}},
+	}
+
+	got := trustedReviewChildEnv(cfg)
+	if got["GH_TOKEN"] != "config-only-github-token" {
+		t.Fatalf("trusted child GH_TOKEN = %q, want captured Agent.Env value", got["GH_TOKEN"])
+	}
+	if got[providerTokenEnv] != "daemon-provider-token" {
+		t.Fatalf("trusted child provider token = %q, want daemon provider value", got[providerTokenEnv])
 	}
 }
 
@@ -252,8 +275,8 @@ func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 	if reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": ""}) {
 		t.Fatal("empty phase allowed, want false")
 	}
-	// Without a Forgejo project config, review/publish phases must not mint a socket
-	// (mixed installs must keep GitHub on the normal review-submit path).
+	// Without a captured project config, review/publish phases cannot bind a
+	// native review socket safely.
 	if reviewerAllowsTrustedReviewProxy(nil, "demo", map[string]any{"phase": "review"}) {
 		t.Fatal("nil config review phase allowed, want false")
 	}
@@ -285,7 +308,8 @@ func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 	if !reviewerAllowsTrustedReviewProxy(nativeCfg, "forgejo-native", map[string]any{"phase": "REVIEW"}) {
 		t.Fatal("REVIEW phase on native Forgejo not allowed, want true")
 	}
-	// GitHub projects in a mixed install must not receive the Forgejo review proxy.
+	// GitHub projects use the same run-bound proxy so review submit cannot reload
+	// a changed live config during the active run.
 	githubCfg := &config.Config{
 		Providers: []config.ProviderConfig{
 			{ID: "gh", Kind: config.ProviderKindGitHub},
@@ -297,8 +321,8 @@ func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 		},
 		Roles: config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSingleReview}}},
 	}
-	if reviewerAllowsTrustedReviewProxy(githubCfg, "github-demo", map[string]any{"phase": "review"}) {
-		t.Fatal("GitHub project allowed socket, want false")
+	if !reviewerAllowsTrustedReviewProxy(githubCfg, "github-demo", map[string]any{"phase": "review"}) {
+		t.Fatal("GitHub project did not allow run-bound socket, want true")
 	}
 	if !reviewerAllowsTrustedReviewProxy(githubCfg, "forgejo-native", map[string]any{"phase": "review"}) {
 		t.Fatal("Forgejo project in mixed install not allowed, want true")
@@ -344,6 +368,7 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	execHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_trusted_sock",
 		ProjectID:        "forgejo-native",
+		RunID:            "run_forgejo_auto",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
@@ -353,6 +378,9 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 			"prNumber":            int64(42),
 			"cleanReviewEvent":    "APPROVE",
 			"blockingReviewEvent": "REQUEST_CHANGES",
+			"expectedCommitID":    "head-42",
+			"reviewerManual":      false,
+			"reviewerRunID":       "run_forgejo_auto",
 		},
 	})
 	if err != nil {
@@ -385,6 +413,7 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	teaHandle, err := teaAdapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_tea_trusted_sock",
 		ProjectID:        "forgejo-native",
+		RunID:            "run_forgejo_manual",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
@@ -394,6 +423,9 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 			"prNumber":            int64(42),
 			"cleanReviewEvent":    "APPROVE",
 			"blockingReviewEvent": "REQUEST_CHANGES",
+			"expectedCommitID":    "head-42",
+			"reviewerManual":      true,
+			"reviewerRunID":       "run_forgejo_manual",
 		},
 	})
 	if err != nil {
@@ -410,20 +442,22 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 		t.Fatalf("tea child env dump = %q, want sock=set", string(data))
 	}
 
-	// GitHub projects must not receive the Forgejo review proxy socket.
+	// GitHub native review runs receive the same run-bound config socket.
 	githubCfg := &config.Config{
 		Providers: []config.ProviderConfig{{ID: "gh", Kind: config.ProviderKindGitHub}},
 		Projects:  []config.ProjectRefConfig{{ID: "github-demo", Name: "GitHub", Provider: "gh", Repo: "acme/looper", RepoPath: workDir}},
+		Agent:     config.AgentConfig{Env: map[string]string{"GH_TOKEN": "config-only-token"}},
 	}
 	githubAdapter := reviewerAgentExecutorAdapter{
 		executor:   executor,
 		realLooper: realLooper,
-		trustedEnv: map[string]string{"FORGEJO_TOKEN": "test-token"},
+		trustedEnv: trustedReviewChildEnv(*githubCfg),
 		config:     githubCfg,
 	}
 	githubHandle, err := githubAdapter.Start(context.Background(), reviewer.AgentRunInput{
-		ExecutionID:      "reviewer_github_no_sock",
+		ExecutionID:      "reviewer_github_trusted_sock",
 		ProjectID:        "github-demo",
+		RunID:            "run_github_auto",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
 		Timeout:          5 * time.Second,
@@ -433,6 +467,9 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 			"prNumber":            int64(42),
 			"cleanReviewEvent":    "APPROVE",
 			"blockingReviewEvent": "REQUEST_CHANGES",
+			"expectedCommitID":    "head-42",
+			"reviewerManual":      false,
+			"reviewerRunID":       "run_github_auto",
 		},
 	})
 	if err != nil {
@@ -445,8 +482,8 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile after github run error = %v", err)
 	}
-	if string(data) != "sock=\n" {
-		t.Fatalf("github child env dump = %q, want empty sock", string(data))
+	if string(data) != "sock=set\n" {
+		t.Fatalf("github child env dump = %q, want sock=set", string(data))
 	}
 
 	// Thread-resolution classifiers must not receive review-publish capability.
@@ -472,8 +509,9 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 		t.Fatalf("thread_resolution child env dump = %q, want empty sock", string(data))
 	}
 
-	// Without daemon-selected PR metadata, no review-publish capability is injected.
-	noPRHandle, err := adapter.Start(context.Background(), reviewer.AgentRunInput{
+	// A native review run without daemon-selected PR metadata fails closed. It
+	// must not fall back to the direct live-config review-submit path.
+	_, err = adapter.Start(context.Background(), reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_no_pr_meta",
 		ProjectID:        "forgejo-native",
 		WorkingDirectory: workDir,
@@ -481,18 +519,53 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 		Timeout:          5 * time.Second,
 		Metadata:         map[string]any{"phase": "review"},
 	})
-	if err != nil {
-		t.Fatalf("Start(no PR) error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "daemon-selected pull request is required") {
+		t.Fatalf("Start(no PR) error = %v, want fail-closed missing PR error", err)
 	}
-	if _, err := noPRHandle.Wait(context.Background()); err != nil {
-		t.Fatalf("Wait(no PR) error = %v", err)
+
+	// Native review authority is incomplete without the daemon-authored head.
+	_, err = adapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_missing_expected_head",
+		ProjectID:        "forgejo-native",
+		RunID:            "run_missing_head",
+		WorkingDirectory: workDir,
+		Prompt:           "review",
+		Timeout:          5 * time.Second,
+		Metadata: map[string]any{
+			"phase":               "review",
+			"repo":                "acme/looper",
+			"prNumber":            int64(42),
+			"cleanReviewEvent":    "APPROVE",
+			"blockingReviewEvent": "REQUEST_CHANGES",
+			"reviewerManual":      false,
+			"reviewerRunID":       "run_missing_head",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "expected commit id is required") {
+		t.Fatalf("Start(missing head) error = %v, want fail-closed expected-head error", err)
 	}
-	data, err = os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatalf("ReadFile after no-PR run error = %v", err)
-	}
-	if string(data) != "sock=\n" {
-		t.Fatalf("no-PR child env dump = %q, want empty sock", string(data))
+
+	// Manual mode must bind the exact daemon-authored run identity.
+	_, err = adapter.Start(context.Background(), reviewer.AgentRunInput{
+		ExecutionID:      "reviewer_forged_manual_run",
+		ProjectID:        "forgejo-native",
+		RunID:            "run_daemon",
+		WorkingDirectory: workDir,
+		Prompt:           "review",
+		Timeout:          5 * time.Second,
+		Metadata: map[string]any{
+			"phase":               "review",
+			"repo":                "acme/looper",
+			"prNumber":            int64(42),
+			"cleanReviewEvent":    "APPROVE",
+			"blockingReviewEvent": "REQUEST_CHANGES",
+			"expectedCommitID":    "head-42",
+			"reviewerManual":      true,
+			"reviewerRunID":       "run_forged",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "reviewer run id does not match") {
+		t.Fatalf("Start(forged manual run) error = %v, want fail-closed run binding error", err)
 	}
 
 	// summary_comment projects must not mint a review-submit socket even with full PR metadata.

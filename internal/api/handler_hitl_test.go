@@ -117,7 +117,7 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 	// Feishu verification token before it will deliver an answer.
 	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN", "verify-tok-123")
 	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN"
-	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
 	projectID := "project_card"
@@ -156,7 +156,7 @@ func TestHandlerFeishuCardActionDeliversAnswer(t *testing.T) {
 // handler + services for card-action security tests.
 func setupAwaitingCardLoop(t *testing.T, cfg config.Config, rt *looperdruntime.Runtime, projectID, loopID string, seq int64) *Handler {
 	t.Helper()
-	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
 	targetID := projectID

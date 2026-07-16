@@ -84,6 +84,8 @@ type defaultSchedulerTickInput struct {
 	Now                      func() time.Time
 	MaxConcurrentRuns        int
 	ClaimMu                  *sync.Mutex
+	ClaimBoundary            *sync.RWMutex
+	RefreshForClaim          func() defaultSchedulerTickInput
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
@@ -99,15 +101,65 @@ type defaultSchedulerTickInput struct {
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	// OnHITLAsk is the exact transport callback captured by the snapshot's
+	// worker runner. Keeping it beside the answer callback makes the snapshot
+	// ownership boundary explicit and testable end to end.
+	OnHITLAsk worker.HITLNotifyFunc
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
 }
 
 type defaultSchedulerHandlers struct {
-	tick    RunSchedulerTickFunc
-	claim   RunSchedulerTickFunc
-	webhook WebhookForwarder
+	tick                 RunSchedulerTickFunc
+	claim                RunSchedulerTickFunc
+	webhook              WebhookForwarder
+	reviewer             reviewerScheduler
+	fixer                fixerScheduler
+	input                func(Services) defaultSchedulerTickInput
+	snapshot             func() defaultSchedulerHandlers
+	notificationGateways *schedulerNotificationGatewayFactory
+}
+
+type catalogWebhookReviewer struct {
+	snapshot func() reviewerScheduler
+}
+
+func (r catalogWebhookReviewer) DiscoverPullRequest(ctx context.Context, input reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	if r.snapshot == nil {
+		return reviewer.DiscoveryResult{}, fmt.Errorf("reviewer is not configured")
+	}
+	reviewerRunner := r.snapshot()
+	if reviewerRunner == nil {
+		return reviewer.DiscoveryResult{}, fmt.Errorf("agent.vendor is not configured")
+	}
+	return reviewerRunner.DiscoverPullRequest(ctx, input)
+}
+
+type catalogWebhookFixer struct {
+	snapshot func() fixerScheduler
+}
+
+func (f catalogWebhookFixer) DiscoverPullRequest(ctx context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
+	if f.snapshot == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer is not configured")
+	}
+	fixerRunner := f.snapshot()
+	if fixerRunner == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("agent.vendor is not configured")
+	}
+	return fixerRunner.DiscoverPullRequest(ctx, input)
+}
+
+func (f catalogWebhookFixer) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, input fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
+	if f.snapshot == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer is not configured")
+	}
+	fixerRunner := f.snapshot()
+	if fixerRunner == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("agent.vendor is not configured")
+	}
+	return fixerRunner.DiscoverPullRequestsForBaseBranchUpdate(ctx, input)
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -205,6 +257,26 @@ func providerTrustedEnv(cfg config.Config) map[string]string {
 	return env
 }
 
+// trustedReviewChildEnv captures the environment that a run-bound review-submit
+// child needs. Agent.Env is already visible to that run's agent process, so
+// forwarding the same captured values to the trusted child does not widen agent
+// access and preserves config-only GitHub auth such as GH_TOKEN. Provider token
+// values sourced from the daemon environment win on collisions and remain
+// available only to the trusted child.
+func trustedReviewChildEnv(cfg config.Config) map[string]string {
+	env := make(map[string]string, len(cfg.Agent.Env))
+	for key, value := range cfg.Agent.Env {
+		env[key] = value
+	}
+	for key, value := range providerTrustedEnv(cfg) {
+		env[key] = value
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
 // resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
 // Agents always receive the real configured looper path — never a secret-bearing
 // wrapper path. Provider tokens for `looper review submit` are supplied through
@@ -214,30 +286,27 @@ func resolveTrustedLooperCLIPath(cfg config.Config) string {
 }
 
 // mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
-// `looper review submit` with optional provider tokens, bound exclusively to
-// allowedPRRef (owner/repo#N), allowedCwd (daemon-selected worktree), configPath
-// (daemon-loaded config file for LOOPER_CONFIG injection), and the
-// daemon-selected review-events policy. Agents only receive the socket path
-// (not tokens). trustedEnv may be empty for tea-backed Forgejo providers: the
-// proxy still binds PR/CWD/policy/config so the agent cannot retarget submit.
-// cleanup stops the listener and must run when the agent execution ends.
-func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy forge.TrustedReviewProxyPolicy, logger bootstrap.Logger) (sockPath string, cleanup func()) {
-	noop := func() {}
+// `looper review submit` with captured credentials, bound exclusively to
+// allowedPRRef (owner/repo#N), allowedCwd (daemon-selected worktree), the
+// materialized run config snapshot, and the daemon-selected review-events
+// policy. Agents only receive the socket path (not tokens or snapshot path).
+// trustedEnv may be empty when ambient credential stores suffice. Setup fails
+// closed: callers must not fall back to direct review submit. cleanup stops the
+// listener and must run when the agent execution ends.
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy forge.TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	allowedPRRef = strings.TrimSpace(allowedPRRef)
 	allowedCwd = strings.TrimSpace(allowedCwd)
-	configPath = strings.TrimSpace(configPath)
-	if realLooper == "" || allowedPRRef == "" || allowedCwd == "" {
-		return "", noop
+	if realLooper == "" {
+		return "", nil, fmt.Errorf("trusted looper path is required")
 	}
-	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, configPath, policy)
-	if err != nil {
-		if logger != nil {
-			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error(), "allowedPR": allowedPRRef})
-		}
-		return "", noop
+	if allowedPRRef == "" {
+		return "", nil, fmt.Errorf("daemon-selected pull request is required")
 	}
-	return path, stop
+	if allowedCwd == "" {
+		return "", nil, fmt.Errorf("daemon-selected working directory is required")
+	}
+	return forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy)
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
@@ -1645,10 +1714,6 @@ type reviewerAgentExecutorAdapter struct {
 	executor   *agent.ConfiguredExecutor
 	realLooper string
 	trustedEnv map[string]string
-	// configPath is the daemon-loaded config file path injected as LOOPER_CONFIG
-	// into proxy children so review submit matches looperd's --config selection.
-	configPath string
-	logger     bootstrap.Logger
 	// config is used to gate trusted review-submit sockets on per-project
 	// publish mode (summary_comment must not mint a native review socket).
 	config *config.Config
@@ -1706,10 +1771,9 @@ func reviewerTrustedReviewEnv(sock string) map[string]string {
 // reviewerAllowsTrustedReviewProxy reports whether this reviewer agent start is
 // authorized to receive a live review-submit socket. Thread-resolution
 // classifiers share the reviewer adapter but must not receive publish capability.
-// Only native Forgejo review/publish runs need the socket: GitHub projects keep
-// the normal review-submit path (agent env credentials such as GH_TOKEN from
-// agent.env), and Forgejo summary_comment mode must not mint a socket because
-// Looper posts one top-level summary comment without native review submit.
+// Every native review/publish run needs the socket so its review-submit child
+// uses the immutable run config. Summary-comment mode must not mint a socket
+// because Looper posts that top-level comment outside agent review submit.
 func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, metadata map[string]any) bool {
 	if metadata == nil {
 		return false
@@ -1721,13 +1785,13 @@ func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, meta
 	default:
 		return false
 	}
-	return reviewerNativeForgejoNeedsTrustedProxy(cfg, projectID)
+	return reviewerProjectNeedsTrustedProxy(cfg, projectID)
 }
 
-// reviewerNativeForgejoNeedsTrustedProxy reports whether the selected project is
-// a Forgejo project that publishes native reviews (not summary_comment). Only
-// those runs should receive LOOPER_TRUSTED_REVIEW_SOCK.
-func reviewerNativeForgejoNeedsTrustedProxy(cfg *config.Config, projectID string) bool {
+// reviewerProjectNeedsTrustedProxy reports whether the selected project
+// publishes native reviews (not summary_comment). This includes GitHub, Plane's
+// GitHub code side, and native Forgejo projects.
+func reviewerProjectNeedsTrustedProxy(cfg *config.Config, projectID string) bool {
 	if cfg == nil {
 		return false
 	}
@@ -1738,9 +1802,6 @@ func reviewerNativeForgejoNeedsTrustedProxy(cfg *config.Config, projectID string
 	for _, project := range cfg.Projects {
 		if strings.TrimSpace(project.ID) != projectID {
 			continue
-		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
-			return false
 		}
 		return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode != config.ReviewerPublishModeSummaryComment
 	}
@@ -1765,18 +1826,24 @@ func reviewerAllowedPRRef(metadata map[string]any) string {
 	return forge.FormatTrustedReviewPRRef(repo, prNumber)
 }
 
-// reviewerAllowedReviewPolicy extracts the daemon-selected clean/blocking
-// review-events policy from reviewer agent metadata so the trusted proxy can
-// inject those flags outside agent control.
+// reviewerAllowedReviewPolicy extracts daemon-selected review policy, head,
+// and run identity from reviewer metadata. The runner authors these fields from
+// its immutable loop/run checkpoint; agent argv is never authoritative.
 func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewProxyPolicy {
 	if metadata == nil {
 		return forge.TrustedReviewProxyPolicy{}
 	}
 	clean, _ := metadata["cleanReviewEvent"].(string)
 	blocking, _ := metadata["blockingReviewEvent"].(string)
+	expectedCommitID, _ := metadata["expectedCommitID"].(string)
+	reviewerManual, _ := metadata["reviewerManual"].(bool)
+	reviewerRunID, _ := metadata["reviewerRunID"].(string)
 	return forge.TrustedReviewProxyPolicy{
-		Clean:    strings.TrimSpace(clean),
-		Blocking: strings.TrimSpace(blocking),
+		Clean:            strings.TrimSpace(clean),
+		Blocking:         strings.TrimSpace(blocking),
+		ExpectedCommitID: strings.TrimSpace(expectedCommitID),
+		ReviewerManual:   reviewerManual,
+		ReviewerRunID:    strings.TrimSpace(reviewerRunID),
 	}
 }
 
@@ -1815,15 +1882,21 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 	// and review-events policy. Thread-resolution classifiers and summary_comment
 	// (comment-only) runs reuse this adapter but must not receive review-publish
 	// capability via LOOPER_TRUSTED_REVIEW_SOCK.
-	allowedPR := ""
-	allowedCwd := ""
-	policy := forge.TrustedReviewProxyPolicy{}
+	sock := ""
+	proxyCleanup := func() {}
 	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
-		allowedPR = reviewerAllowedPRRef(input.Metadata)
-		allowedCwd = strings.TrimSpace(input.WorkingDirectory)
-		policy = reviewerAllowedReviewPolicy(input.Metadata)
+		allowedPR := reviewerAllowedPRRef(input.Metadata)
+		allowedCwd := strings.TrimSpace(input.WorkingDirectory)
+		policy := reviewerAllowedReviewPolicy(input.Metadata)
+		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
+			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
+		}
+		var err error
+		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, *a.config, policy)
+		if err != nil {
+			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
+		}
 	}
-	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, a.configPath, policy, a.logger)
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID:        input.ExecutionID,
 		ProjectID:          input.ProjectID,
@@ -2754,36 +2827,107 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+type schedulerNotificationGatewayFactory struct {
+	state         *notify.GatewayState
+	feishuAppHTTP notify.FeishuAppHTTPFunc
+}
+
+func newSchedulerNotificationGatewayFactory() *schedulerNotificationGatewayFactory {
+	return &schedulerNotificationGatewayFactory{state: notify.NewGatewayState()}
+}
+
+func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notify.Gateway {
+	if options.FeishuAppHTTP == nil {
+		options.FeishuAppHTTP = f.feishuAppHTTP
+	}
+	options.State = f.state
+	return notify.NewGateway(options)
+}
+
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	claimMu := &sync.Mutex{}
+	notificationGateways := newSchedulerNotificationGatewayFactory()
+	coordinatorState := coordinatorrole.NewRuntimeState()
 	// Trusted review proxies are minted per reviewer agent run (bound to that
-	// run's PR). Catalog snapshots only need claim mutex + config source reuse.
-	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
+	// run's PR). Catalog snapshots reuse claim serialization and notification
+	// transport continuity while retaining config-specific policy.
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState)
 	}
 	handlers := defaultSchedulerHandlers{
-		tick: func(ctx context.Context, services Services) error {
-			return buildSnapshot().tick(ctx, services)
-		},
-		claim: func(ctx context.Context, services Services) error {
-			return buildSnapshot().claim(ctx, services)
-		},
-		webhook: initial.webhook,
+		snapshot:             buildSnapshot,
+		notificationGateways: notificationGateways,
+	}
+	if coordinator != nil && repos != nil {
+		handlers.webhook = webhookforward.New(webhookforward.Options{
+			Repos:        repos,
+			Config:       source.Snapshot(),
+			ConfigSource: source,
+			Reviewer: catalogWebhookReviewer{snapshot: func() reviewerScheduler {
+				return handlers.snapshot().reviewer
+			}},
+			Fixer: catalogWebhookFixer{snapshot: func() fixerScheduler {
+				return handlers.snapshot().fixer
+			}},
+			Logger: logger,
+			Now:    now,
+		})
+	}
+	handlers.tick = func(ctx context.Context, services Services) error {
+		snapshot := handlers.snapshot()
+		if snapshot.input == nil {
+			return snapshot.tick(ctx, services)
+		}
+		input := snapshot.input(services)
+		input.ClaimBoundary = claimBoundary
+		input.RefreshForClaim = func() defaultSchedulerTickInput {
+			latestSnapshot := handlers.snapshot()
+			if latestSnapshot.input == nil {
+				stopped := input
+				stopped.MaxConcurrentRuns = 0
+				stopped.RefreshForClaim = nil
+				return stopped
+			}
+			latest := latestSnapshot.input(services)
+			latest.ClaimBoundary = claimBoundary
+			return latest
+		}
+		return runDefaultSchedulerTick(ctx, input)
+	}
+	handlers.claim = func(ctx context.Context, services Services) error {
+		snapshot := handlers.snapshot()
+		if snapshot.input == nil {
+			return snapshot.claim(ctx, services)
+		}
+		input := snapshot.input(services)
+		input.ClaimBoundary = claimBoundary
+		input.RefreshForClaim = func() defaultSchedulerTickInput {
+			latestSnapshot := handlers.snapshot()
+			if latestSnapshot.input == nil {
+				stopped := input
+				stopped.MaxConcurrentRuns = 0
+				stopped.RefreshForClaim = nil
+				return stopped
+			}
+			latest := latestSnapshot.input(services)
+			latest.ClaimBoundary = claimBoundary
+			return latest
+		}
+		return runIndependentClaimPass(ctx, input)
 	}
 	return handlers
 }
 
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
+	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, newSchedulerNotificationGatewayFactory(), coordinatorrole.NewRuntimeState())
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2797,7 +2941,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		noop := func(context.Context, Services) error { return nil }
 		return defaultSchedulerHandlers{tick: noop, claim: noop}
 	}
-	notificationGateway := notify.NewGateway(notify.Options{
+	notificationGateway := notificationGateways.New(notify.Options{
 		Config:        cfg.Notifications,
 		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
 		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
@@ -2971,6 +3115,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Config:  &cfg,
 		Logger:  logger,
 		Now:     now,
+		State:   coordinatorState,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
 		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
@@ -2985,9 +3130,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		AgentExecutor: reviewerAgentExecutorAdapter{
 			executor:   agentExecutor,
 			realLooper: looperCLIPath,
-			trustedEnv: providerTrustedEnv(cfg),
-			configPath: strings.TrimSpace(configPath),
-			logger:     logger,
+			trustedEnv: trustedReviewChildEnv(cfg),
 			config:     &cfg,
 		},
 		Logger:           logger,
@@ -3056,6 +3199,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 		},
 	})
+	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
+		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
+			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
+			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
+			SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
+			TriggerLogin:      ask.TriggerLogin,
+			Recommendation:    ask.Recommendation,
+			RecommendedOption: ask.RecommendedOption,
+			Consequences:      ask.Consequences,
+			Confidence:        ask.Confidence,
+		})
+	}
 	workerRunner = worker.New(worker.Options{
 		DB:     coordinator.DB(),
 		Repos:  repos,
@@ -3092,18 +3247,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		HITLEnabled:         cfg.HITL.Enabled,
 		HITLAnswerTransport: cfg.HITL.AnswerTransport,
 		HITLGitHub:          hitlGitHubSettings(cfg.HITL.GitHub),
-		HITLNotify: func(ctx context.Context, ask worker.HITLAskNotification) error {
-			return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
-				ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
-				Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
-				SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
-				TriggerLogin:      ask.TriggerLogin,
-				Recommendation:    ask.Recommendation,
-				RecommendedOption: ask.RecommendedOption,
-				Consequences:      ask.Consequences,
-				Confidence:        ask.Confidence,
-			})
-		},
+		HITLNotify:          notifyHITLAsk,
 	})
 	if claimMu == nil {
 		claimMu = &sync.Mutex{}
@@ -3136,6 +3280,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
 	}
@@ -3147,6 +3292,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		claim: func(ctx context.Context, services Services) error {
 			return runIndependentClaimPass(ctx, inputForServices(services))
 		},
+		reviewer:             reviewerRunner,
+		fixer:                fixerRunner,
+		input:                inputForServices,
+		notificationGateways: notificationGateways,
 	}
 	if includeWebhook {
 		handlers.webhook = webhookforward.New(webhookforward.Options{
@@ -3488,6 +3637,13 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	if input.ClaimMu != nil {
 		input.ClaimMu.Lock()
 		defer input.ClaimMu.Unlock()
+	}
+	if input.ClaimBoundary != nil {
+		input.ClaimBoundary.RLock()
+		defer input.ClaimBoundary.RUnlock()
+	}
+	if input.RefreshForClaim != nil {
+		input = input.RefreshForClaim()
 	}
 	start := time.Now()
 	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)

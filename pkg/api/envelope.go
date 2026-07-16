@@ -6,6 +6,7 @@ const (
 	ErrorCodeActiveRunNotFound          ErrorCode = "ACTIVE_RUN_NOT_FOUND"
 	ErrorCodeAgentNotConfigured         ErrorCode = "AGENT_NOT_CONFIGURED"
 	ErrorCodeAuthMisconfigured          ErrorCode = "AUTH_MISCONFIGURED"
+	ErrorCodeConfigConflict             ErrorCode = "CONFIG_CONFLICT"
 	ErrorCodeInternalError              ErrorCode = "INTERNAL_ERROR"
 	ErrorCodeLoopConflict               ErrorCode = "LOOP_CONFLICT"
 	ErrorCodeLoopNotFound               ErrorCode = "LOOP_NOT_FOUND"
@@ -18,6 +19,7 @@ const (
 	ErrorCodePullRequestNotFound        ErrorCode = "PULL_REQUEST_NOT_FOUND"
 	ErrorCodePullRequestProjectMismatch ErrorCode = "PULL_REQUEST_PROJECT_MISMATCH"
 	ErrorCodeRouteNotFound              ErrorCode = "ROUTE_NOT_FOUND"
+	ErrorCodeRequestTooLarge            ErrorCode = "REQUEST_TOO_LARGE"
 	ErrorCodeRunNotFound                ErrorCode = "RUN_NOT_FOUND"
 	ErrorCodeRuntimeControlUnavailable  ErrorCode = "RUNTIME_CONTROL_UNAVAILABLE"
 	ErrorCodeUnauthorized               ErrorCode = "UNAUTHORIZED"
@@ -65,6 +67,8 @@ func (c ErrorCode) Status() int {
 		return 400
 	case ErrorCodeAuthMisconfigured:
 		return 500
+	case ErrorCodeConfigConflict:
+		return 409
 	case ErrorCodeInternalError:
 		return 500
 	case ErrorCodeLoopConflict:
@@ -89,6 +93,8 @@ func (c ErrorCode) Status() int {
 		return 409
 	case ErrorCodeRouteNotFound:
 		return 404
+	case ErrorCodeRequestTooLarge:
+		return 413
 	case ErrorCodeRunNotFound:
 		return 404
 	case ErrorCodeRuntimeControlUnavailable:
@@ -107,6 +113,7 @@ func AllErrorCodes() []ErrorCode {
 		ErrorCodeActiveRunNotFound,
 		ErrorCodeAgentNotConfigured,
 		ErrorCodeAuthMisconfigured,
+		ErrorCodeConfigConflict,
 		ErrorCodeInternalError,
 		ErrorCodeLoopConflict,
 		ErrorCodeLoopNotFound,
@@ -119,6 +126,7 @@ func AllErrorCodes() []ErrorCode {
 		ErrorCodePullRequestNotFound,
 		ErrorCodePullRequestProjectMismatch,
 		ErrorCodeRouteNotFound,
+		ErrorCodeRequestTooLarge,
 		ErrorCodeRunNotFound,
 		ErrorCodeRuntimeControlUnavailable,
 		ErrorCodeUnauthorized,

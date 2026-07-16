@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 )
 
 var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type ValidationIssue struct {
 	Path    string
@@ -32,12 +34,11 @@ func (err *ConfigValidationError) Error() string {
 		return "config validation failed"
 	}
 
-	if len(err.Issues) == 1 {
-		issue := err.Issues[0]
-		return fmt.Sprintf("config validation failed: %s %s", issue.Path, issue.Message)
+	details := make([]string, 0, len(err.Issues))
+	for _, issue := range err.Issues {
+		details = append(details, strings.TrimSpace(issue.Path+" "+issue.Message))
 	}
-
-	return fmt.Sprintf("config validation failed with %d issues", len(err.Issues))
+	return "config validation failed: " + strings.Join(details, "; ")
 }
 
 func Validate(config Config) error {
@@ -108,6 +109,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
 		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild)})
 	}
+	validateEnvironmentNames(config.Agent.Env, "agent.env", &issues)
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
 
 	if !isValidLogLevel(config.Logging.Level) {
@@ -150,9 +152,31 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "notifications.webhook.mode", Message: "must be one of: webhook, app"})
 	}
 
+	transport := strings.ToLower(strings.TrimSpace(config.HITL.AnswerTransport))
+	switch transport {
+	case "", "github", "respond":
+	case "feishu":
+		if config.HITL.Feishu == nil {
+			issues = append(issues, ValidationIssue{Path: "hitl.feishu", Message: "is required when hitl.answerTransport is feishu"})
+		} else {
+			if !strings.EqualFold(strings.TrimSpace(config.HITL.Feishu.Inbound), "cf-inbox") {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.inbound", Message: "must be cf-inbox when hitl.answerTransport is feishu"})
+			}
+			if strings.TrimSpace(config.HITL.Feishu.EventInboxURLEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxUrlEnv", Message: "is required when hitl.answerTransport is feishu"})
+			}
+			if strings.TrimSpace(config.HITL.Feishu.EventInboxTokenEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxTokenEnv", Message: "is required when hitl.answerTransport is feishu"})
+			}
+		}
+	default:
+		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be one of: github, feishu, respond"})
+	}
+
 	if !isValidDaemonMode(config.Daemon.Mode) {
 		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
 	}
+	validateEnvironmentNames(config.Daemon.Environment, "daemon.environment", &issues)
 
 	if !isValidDaemonRestartPolicy(config.Daemon.RestartPolicy) {
 		issues = append(issues, ValidationIssue{Path: "daemon.restartPolicy", Message: fmt.Sprintf("must be one of: %s, %s, %s", DaemonRestartNever, DaemonRestartOnFailure, DaemonRestartAlways)})
@@ -590,6 +614,19 @@ func validateAgentTimeouts(timeouts AgentTimeoutConfig, path string, issues *[]V
 	validateAgentTimeoutSeconds(timeouts.ReviewerMaxRuntimeSeconds, path+".reviewerMaxRuntimeSeconds", issues)
 	validateAgentTimeoutSeconds(timeouts.FixerIdleTimeoutSeconds, path+".fixerIdleTimeoutSeconds", issues)
 	validateAgentTimeoutSeconds(timeouts.FixerMaxRuntimeSeconds, path+".fixerMaxRuntimeSeconds", issues)
+}
+
+func validateEnvironmentNames(values map[string]string, path string, issues *[]ValidationIssue) {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !environmentNamePattern.MatchString(key) {
+			*issues = append(*issues, ValidationIssue{Path: path + "." + key, Message: "must be a valid environment-variable name"})
+		}
+	}
 }
 
 func validateAgentTimeoutSeconds(seconds int, path string, issues *[]ValidationIssue) {

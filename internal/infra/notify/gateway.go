@@ -26,6 +26,7 @@ const (
 
 	feishuAPIBase           = "https://open.feishu.cn"
 	feishuTokenSafetyMargin = 60 * time.Second
+	gatewayStateLoopLimit   = 4096
 )
 
 type RunCommandFunc func(context.Context, shell.Options) (shell.Result, error)
@@ -44,10 +45,76 @@ type Options struct {
 	OsascriptPath string
 	LogFilePath   string
 	Repositories  *storage.Repositories
+	State         *GatewayState
 	Now           func() time.Time
 	RunCommand    RunCommandFunc
 	HTTPPost      HTTPPostFunc
 	FeishuAppHTTP FeishuAppHTTPFunc
+}
+
+// GatewayState retains transport continuity across immutable, config-specific
+// Gateway instances. Policy stays on each Gateway; only token/live-card state
+// needed to update an already-created notification is shared.
+type GatewayState struct {
+	feishuTokenMu  sync.Mutex
+	feishuToken    string
+	feishuTokenExp time.Time
+
+	liveMu sync.Mutex
+	// liveTails retains the most recent agent-activity snapshot per loop so the
+	// completion card can include the final live tail.
+	liveTails map[string]liveTailEntry
+	// askCards retains the message/card pair needed to patch an answered ask.
+	askCards map[string]askCardState
+	// liveFeeds retains each loop's in-thread live-progress message id.
+	liveFeeds map[string]string
+	// loopLastUsed bounds the union of loop-scoped transport entries without
+	// persisting delivery state. All access is protected by liveMu.
+	loopLastUsed  map[string]uint64
+	loopUseSerial uint64
+}
+
+func NewGatewayState() *GatewayState {
+	return &GatewayState{}
+}
+
+func (s *GatewayState) touchLoopLocked(loopID string) {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return
+	}
+	if s.loopLastUsed == nil {
+		s.loopLastUsed = make(map[string]uint64)
+	}
+	if _, exists := s.loopLastUsed[loopID]; !exists && len(s.loopLastUsed) >= gatewayStateLoopLimit {
+		oldestLoop := ""
+		oldestUse := ^uint64(0)
+		for candidate, lastUse := range s.loopLastUsed {
+			if lastUse < oldestUse {
+				oldestLoop = candidate
+				oldestUse = lastUse
+			}
+		}
+		delete(s.loopLastUsed, oldestLoop)
+		delete(s.liveTails, oldestLoop)
+		delete(s.askCards, oldestLoop)
+		delete(s.liveFeeds, oldestLoop)
+	}
+	s.loopUseSerial++
+	s.loopLastUsed[loopID] = s.loopUseSerial
+}
+
+func (s *GatewayState) forgetLoopIfUnusedLocked(loopID string) {
+	if _, exists := s.liveTails[loopID]; exists {
+		return
+	}
+	if _, exists := s.askCards[loopID]; exists {
+		return
+	}
+	if _, exists := s.liveFeeds[loopID]; exists {
+		return
+	}
+	delete(s.loopLastUsed, loopID)
 }
 
 type SystemNotificationPayload struct {
@@ -75,26 +142,7 @@ type Gateway struct {
 	runCommand    RunCommandFunc
 	httpPost      HTTPPostFunc
 	feishuAppHTTP FeishuAppHTTPFunc
-
-	feishuTokenMu  sync.Mutex
-	feishuToken    string
-	feishuTokenExp time.Time
-
-	// liveTails holds the most recent agent-activity snapshot per loop, kept in
-	// memory (not the loop record) so frequent progress ticks never race the
-	// scheduler's loop/run writes. Retained across the completion rebuild so the
-	// final card still shows the last activity.
-	liveMu    sync.Mutex
-	liveTails map[string]liveTailEntry
-	// askCards remembers each loop's live ask card (message id + the card it was
-	// built from) so the card can be patched to its resolved "✅ 已选:X" state when
-	// the answer arrives — keeping the full brief for review.
-	askCards map[string]askCardState
-	// liveFeeds remembers each loop's live-progress comment (a reply threaded under
-	// the anchor). The raw tool-call feed lives HERE — inside the thread — so the
-	// outer anchor card stays a human-scannable brief. Keyed by loop id → message id;
-	// posted on first activity, patched in place thereafter.
-	liveFeeds map[string]string
+	state         *GatewayState
 }
 
 type askCardState struct {
@@ -122,6 +170,10 @@ func NewGateway(options Options) *Gateway {
 	if feishuAppHTTP == nil {
 		feishuAppHTTP = defaultFeishuAppHTTP
 	}
+	state := options.State
+	if state == nil {
+		state = NewGatewayState()
+	}
 
 	return &Gateway{
 		config:        options.Config,
@@ -132,6 +184,7 @@ func NewGateway(options Options) *Gateway {
 		runCommand:    runCommand,
 		httpPost:      httpPost,
 		feishuAppHTTP: feishuAppHTTP,
+		state:         state,
 	}
 }
 
@@ -584,12 +637,13 @@ func (g *Gateway) SendHITLAsk(ctx context.Context, card HITLAskCard) error {
 	}
 	// Remember the card so MarkAskAnswered can patch it in place on delivery.
 	if strings.TrimSpace(msgID) != "" && strings.TrimSpace(card.LoopID) != "" {
-		g.liveMu.Lock()
-		if g.askCards == nil {
-			g.askCards = map[string]askCardState{}
+		g.state.liveMu.Lock()
+		if g.state.askCards == nil {
+			g.state.askCards = map[string]askCardState{}
 		}
-		g.askCards[card.LoopID] = askCardState{msgID: msgID, card: card}
-		g.liveMu.Unlock()
+		g.state.touchLoopLocked(card.LoopID)
+		g.state.askCards[card.LoopID] = askCardState{msgID: msgID, card: card}
+		g.state.liveMu.Unlock()
 	}
 	return nil
 }
@@ -606,9 +660,12 @@ func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
 	// Always log the decision to the loop's story (+ refresh the anchor), even if
 	// this process no longer holds the ask card to patch.
 	g.RecordMilestone(ctx, loopID, "🧑‍⚖️ 已定夺:"+answer)
-	g.liveMu.Lock()
-	st, ok := g.askCards[loopID]
-	g.liveMu.Unlock()
+	g.state.liveMu.Lock()
+	st, ok := g.state.askCards[loopID]
+	if ok {
+		g.state.touchLoopLocked(loopID)
+	}
+	g.state.liveMu.Unlock()
 	if !ok || strings.TrimSpace(st.msgID) == "" {
 		return
 	}
@@ -628,9 +685,10 @@ func (g *Gateway) MarkAskAnswered(ctx context.Context, loopID, answer string) {
 		return
 	}
 	if err := g.patchFeishuAppCard(ctx, token, st.msgID, string(cardJSON)); err == nil {
-		g.liveMu.Lock()
-		delete(g.askCards, loopID)
-		g.liveMu.Unlock()
+		g.state.liveMu.Lock()
+		delete(g.state.askCards, loopID)
+		g.state.forgetLoopIfUnusedLocked(loopID)
+		g.state.liveMu.Unlock()
 	}
 }
 
@@ -846,11 +904,11 @@ func feishuConfidenceLabel(confidence string) string {
 // fetches a fresh one from Feishu. Access is serialized so concurrent
 // notifications share one token.
 func (g *Gateway) feishuTenantToken(ctx context.Context, appID, appSecret string) (string, error) {
-	g.feishuTokenMu.Lock()
-	defer g.feishuTokenMu.Unlock()
+	g.state.feishuTokenMu.Lock()
+	defer g.state.feishuTokenMu.Unlock()
 
-	if g.feishuToken != "" && g.now().UTC().Before(g.feishuTokenExp) {
-		return g.feishuToken, nil
+	if g.state.feishuToken != "" && g.now().UTC().Before(g.state.feishuTokenExp) {
+		return g.state.feishuToken, nil
 	}
 
 	body, err := json.Marshal(map[string]string{"app_id": appID, "app_secret": appSecret})
@@ -884,9 +942,9 @@ func (g *Gateway) feishuTenantToken(ctx context.Context, appID, appSecret string
 	if ttl <= 0 {
 		ttl = 2 * time.Hour
 	}
-	g.feishuToken = parsed.TenantAccessToken
-	g.feishuTokenExp = g.now().UTC().Add(ttl - feishuTokenSafetyMargin)
-	return g.feishuToken, nil
+	g.state.feishuToken = parsed.TenantAccessToken
+	g.state.feishuTokenExp = g.now().UTC().Add(ttl - feishuTokenSafetyMargin)
+	return g.state.feishuToken, nil
 }
 
 func feishuResponseCode(body []byte) (int, string) {
@@ -1163,12 +1221,13 @@ func (g *Gateway) RefreshThreadHeader(ctx context.Context, loopID string, tail [
 		return
 	}
 	if len(tail) > 0 || elapsedSec > 0 {
-		g.liveMu.Lock()
-		if g.liveTails == nil {
-			g.liveTails = map[string]liveTailEntry{}
+		g.state.liveMu.Lock()
+		if g.state.liveTails == nil {
+			g.state.liveTails = map[string]liveTailEntry{}
 		}
-		g.liveTails[loopID] = liveTailEntry{lines: tail, elapsedSec: elapsedSec}
-		g.liveMu.Unlock()
+		g.state.touchLoopLocked(loopID)
+		g.state.liveTails[loopID] = liveTailEntry{lines: tail, elapsedSec: elapsedSec}
+		g.state.liveMu.Unlock()
 	}
 	cfg := g.config.Webhook
 	appID := strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.AppIDEnv)))
@@ -1209,12 +1268,15 @@ func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID strin
 	if !ok {
 		return
 	}
-	g.liveMu.Lock()
+	g.state.liveMu.Lock()
 	msgID := ""
-	if g.liveFeeds != nil {
-		msgID = g.liveFeeds[loopID]
+	if g.state.liveFeeds != nil {
+		msgID = g.state.liveFeeds[loopID]
 	}
-	g.liveMu.Unlock()
+	if msgID != "" {
+		g.state.touchLoopLocked(loopID)
+	}
+	g.state.liveMu.Unlock()
 	if msgID != "" {
 		_ = g.patchFeishuAppCard(ctx, token, msgID, cardJSON)
 		return
@@ -1227,22 +1289,26 @@ func (g *Gateway) updateLiveFeedComment(ctx context.Context, token, loopID strin
 	if err != nil || strings.TrimSpace(newID) == "" {
 		return
 	}
-	g.liveMu.Lock()
-	if g.liveFeeds == nil {
-		g.liveFeeds = map[string]string{}
+	g.state.liveMu.Lock()
+	if g.state.liveFeeds == nil {
+		g.state.liveFeeds = map[string]string{}
 	}
-	g.liveFeeds[loopID] = newID
-	g.liveMu.Unlock()
+	g.state.touchLoopLocked(loopID)
+	g.state.liveFeeds[loopID] = newID
+	g.state.liveMu.Unlock()
 }
 
 // liveTailFor returns the retained live activity snapshot for a loop.
 func (g *Gateway) liveTailFor(loopID string) ([]string, int64) {
-	g.liveMu.Lock()
-	defer g.liveMu.Unlock()
-	if g.liveTails == nil {
+	g.state.liveMu.Lock()
+	defer g.state.liveMu.Unlock()
+	if g.state.liveTails == nil {
 		return nil, 0
 	}
-	e := g.liveTails[strings.TrimSpace(loopID)]
+	e := g.state.liveTails[strings.TrimSpace(loopID)]
+	if len(e.lines) > 0 || e.elapsedSec > 0 {
+		g.state.touchLoopLocked(loopID)
+	}
 	return e.lines, e.elapsedSec
 }
 

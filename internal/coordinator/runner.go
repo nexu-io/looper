@@ -100,6 +100,22 @@ type Options struct {
 	Inspector  RepositoryInspector
 	Disclosure *config.DisclosureConfig
 	Network    NetworkGateway
+	State      *RuntimeState
+}
+
+// RuntimeState contains coordinator lifecycle state that must outlive one
+// immutable configuration snapshot. Snapshot-specific policy remains on Runner.
+type RuntimeState struct {
+	mu                sync.Mutex
+	lastTickByProject map[string]time.Time
+	watchLocks        map[string]*sync.Mutex
+}
+
+func NewRuntimeState() *RuntimeState {
+	return &RuntimeState{
+		lastTickByProject: map[string]time.Time{},
+		watchLocks:        map[string]*sync.Mutex{},
+	}
 }
 
 type Runner struct {
@@ -112,10 +128,7 @@ type Runner struct {
 	inspector  RepositoryInspector
 	disclosure *config.DisclosureConfig
 	network    NetworkGateway
-
-	mu                sync.Mutex
-	lastTickByProject map[string]time.Time
-	watchLocks        map[string]*sync.Mutex
+	state      *RuntimeState
 }
 
 type loadedIssue struct {
@@ -159,18 +172,21 @@ func New(options Options) *Runner {
 	if inspector == nil {
 		inspector = localRepositoryInspector{}
 	}
+	state := options.State
+	if state == nil {
+		state = NewRuntimeState()
+	}
 	return &Runner{
-		repos:             options.Repos,
-		github:            options.GitHub,
-		config:            options.Config,
-		logger:            options.Logger,
-		now:               now,
-		triageLLM:         options.TriageLLM,
-		inspector:         inspector,
-		network:           options.Network,
-		disclosure:        options.Disclosure,
-		lastTickByProject: map[string]time.Time{},
-		watchLocks:        map[string]*sync.Mutex{},
+		repos:      options.Repos,
+		github:     options.GitHub,
+		config:     options.Config,
+		logger:     options.Logger,
+		now:        now,
+		triageLLM:  options.TriageLLM,
+		inspector:  inspector,
+		network:    options.Network,
+		disclosure: options.Disclosure,
+		state:      state,
 	}
 }
 
@@ -1783,13 +1799,13 @@ func (r *Runner) shouldRunTick(projectID string) bool {
 		return true
 	}
 	now := r.now().UTC()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	lastRun, ok := r.lastTickByProject[projectID]
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	lastRun, ok := r.state.lastTickByProject[projectID]
 	if ok && now.Sub(lastRun) < interval {
 		return false
 	}
-	r.lastTickByProject[projectID] = now
+	r.state.lastTickByProject[projectID] = now
 	return true
 }
 

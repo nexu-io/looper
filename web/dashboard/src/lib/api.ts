@@ -15,16 +15,23 @@ export class ApiError extends Error {
   status: number;
   code?: string;
   requestId?: string;
+  details?: unknown;
 
   constructor(
     message: string,
-    opts: { status: number; code?: string; requestId?: string },
+    opts: {
+      status: number;
+      code?: string;
+      requestId?: string;
+      details?: unknown;
+    },
   ) {
     super(message);
     this.name = "ApiError";
     this.status = opts.status;
     this.code = opts.code;
     this.requestId = opts.requestId;
+    this.details = opts.details;
   }
 }
 
@@ -81,6 +88,7 @@ export async function apiFetch<T>(
       status: response.status,
       code: envelope?.error?.code,
       requestId: envelope?.requestId,
+      details: envelope?.error?.details,
     });
   }
 
@@ -245,6 +253,63 @@ export type ProjectsList = {
   items: Project[];
 };
 
+export type ConfigScalar = string | number | boolean | null;
+export type ConfigValue =
+  | ConfigScalar
+  | ConfigValue[]
+  | { [key: string]: ConfigValue | undefined };
+
+export type ConfigFieldMetadata = {
+  source: "default" | "config-file" | "env" | "cli" | string;
+  editable: boolean;
+  applyMode: "hot" | "restart" | string;
+};
+
+export type ConfigMetadata = {
+  configPath: string;
+  format: string;
+  filePresent: boolean;
+  revision: string;
+  lastAttemptAt?: string | null;
+  lastAppliedAt?: string | null;
+  lastError?: string | null;
+  rejectedPaths?: string[];
+  fields: Record<string, ConfigFieldMetadata>;
+};
+
+export type ConfigAgentView = {
+  vendor?: string | null;
+  model?: string | null;
+  nativeResume?: { enabled?: boolean };
+  timeouts?: Record<string, number>;
+  /** Secret-safe projection: values are never returned. */
+  envKeys?: string[];
+};
+
+/**
+ * Effective config view. The backend deliberately omits startup-only sections
+ * from dashboard editing metadata and projects remain managed by their own API.
+ */
+export type ConfigData = {
+  metadata: ConfigMetadata;
+  scheduler?: Record<string, ConfigValue | undefined>;
+  agent?: ConfigAgentView;
+  tools?: Record<string, ConfigValue | undefined>;
+  defaults?: Record<string, ConfigValue | undefined>;
+  notifications?: Record<string, ConfigValue | undefined>;
+  disclosure?: Record<string, ConfigValue | undefined>;
+  instructions?: Record<string, ConfigValue | undefined>;
+  hitl?: Record<string, ConfigValue | undefined>;
+  roles?: Record<string, ConfigValue | undefined>;
+  [key: string]: ConfigValue | ConfigAgentView | ConfigMetadata | undefined;
+};
+
+export type PatchConfigBody = {
+  revision: string;
+  set: Record<string, ConfigValue>;
+  unset: string[];
+};
+
 export type LoopLogsRun = {
   runId: string;
   status: string;
@@ -365,6 +430,21 @@ export function fetchLoop(
 
 export function fetchProjects(signal?: AbortSignal): Promise<ProjectsList> {
   return apiFetch<ProjectsList>("/api/v1/projects", { signal });
+}
+
+export function fetchConfig(signal?: AbortSignal): Promise<ConfigData> {
+  return apiFetch<ConfigData>("/api/v1/config", { signal });
+}
+
+export function patchConfig(
+  body: PatchConfigBody,
+  signal?: AbortSignal,
+): Promise<ConfigData> {
+  return apiFetch<ConfigData>("/api/v1/config", {
+    method: "PATCH",
+    body: JSON.stringify(body),
+    signal,
+  });
 }
 
 // --- Loop / run mutations (operator dashboard) ---

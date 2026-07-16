@@ -90,6 +90,31 @@ Rules:
 
 Later layers override earlier ones. Objects are merged deeply, arrays are replaced as a whole, and omitted fields keep the previous-layer value.
 
+### Dynamic reload
+
+`looperd` watches the selected config file and publishes a candidate atomically only when every changed effective field is hot-safe. A claim made after publication uses the new snapshot; an already active run keeps the snapshot it started with. Invalid candidates and candidates containing restart-bound changes leave the last-known-good snapshot active and expose diagnostics at `/dashboard/config`. Mixed candidates are rejected as a whole rather than partially applied.
+
+The hot-safe surface is an explicit allowlist:
+
+- `agent.vendor` (including adding the first vendor after daemon startup), `agent.model`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`
+- `scheduler.maxConcurrentRuns` and `scheduler.slowLaneWarnThresholdMs`
+- `notifications.inApp` and the current `notifications.osascript.*` fields; notification webhooks and Feishu notification transport are restart-bound
+- the current `disclosure.*` fields
+- `defaults.allowAutoCommit`, `defaults.allowAutoPush`, `defaults.allowRiskyFixes`, `defaults.openPrStrategy`, and `defaults.addSnapshotMode`; `defaults.baseBranch` is restart-bound because configured project records materialize it
+- `instructions.enabled` only
+- the current Planner discovery/trigger/instruction fields except `roles.planner.triggers.planeAssigneeId`; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
+- `tools.looperPath` and `tools.osascriptPath`
+
+`agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. Configuring the first vendor may use an already prepared model/params profile. A continuation created under an old vendor starts a fresh new-vendor session while retaining its checkpoint, worktree, HITL answer, and queued human instructions—it never sends an old vendor's native session ID to the new CLI.
+
+Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+
+Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
+
+The dashboard is a curated field-level editor, not a raw file editor. Environment- and CLI-owned fields are read-only. `agent.env` values are write-only (only key names are returned), while `server.localToken`, `daemon.environment`, and `agent.params` remain file-only. Projects remain under the Projects API and SQLite authority. When token authentication is not configured, `PATCH /api/v1/config` accepts only direct requests whose peer and Host authority are loopback and rejects proxy-forwarding headers; in `local-token` mode it requires the normal token authentication.
+
+Every dashboard read includes the revision of the exact file generation that produced its published values, and every patch must submit that revision. The revision check and a final identity/mode/byte check catch changes present before that final check, including a newer generation not yet accepted by the reload loop. The writer then uses a crash-safe atomic rename. Portable filesystems do not offer a conditional compare-and-rename, so an external editor racing in the tiny interval between the final check and rename can still be replaced; avoid simultaneous manual and dashboard writes. A successful patch preserves the selected TOML/YAML/JSON format, unknown top-level extension sections and their native scalar values, and ordinary permission bits, but serialization can canonicalize comments, quoting, key/table order, and other lexical formatting; ACLs and extended filesystem metadata are not guaranteed to survive atomic replacement. Dashboard patching refuses a symlinked config path; edit the symlink target directly instead.
+
 ## Supported formats and default path
 
 Looper accepts config files in these formats:
@@ -595,10 +620,14 @@ OPENAI_API_KEY = "replace-me"
 enabled = true
 
 [agent.timeouts]
-plannerSeconds = 1800
-workerSeconds = 3600
-reviewerSeconds = 1800
-fixerSeconds = 1800
+plannerIdleTimeoutSeconds = 600
+plannerMaxRuntimeSeconds = 3600
+workerIdleTimeoutSeconds = 900
+workerMaxRuntimeSeconds = 10800
+reviewerIdleTimeoutSeconds = 600
+reviewerMaxRuntimeSeconds = 5400
+fixerIdleTimeoutSeconds = 600
+fixerMaxRuntimeSeconds = 7200
 
 [logging]
 level = "info"
@@ -646,7 +675,6 @@ baseBranch = "main"
 allowAutoCommit = true
 allowAutoPush = true
 allowAutoApprove = true
-allowAutoMerge = false
 allowRiskyFixes = false
 openPrStrategy = "all_done"
 addSnapshotMode = "async"

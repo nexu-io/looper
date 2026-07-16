@@ -77,12 +77,16 @@ type CapturePullRequestSnapshotInput struct {
 }
 
 type Service struct {
-	mutationMu                 sync.Mutex
-	DB                         *sql.DB
-	Repos                      *storage.Repositories
-	Logger                     bootstrap.Logger
-	Config                     config.Config
-	ConfigSource               ConfigSource
+	mutationMu   sync.Mutex
+	DB           *sql.DB
+	Repos        *storage.Repositories
+	Logger       bootstrap.Logger
+	Config       config.Config
+	ConfigSource ConfigSource
+	// ConfigBoundary serializes project materialization/commit/publication with
+	// global config validation/publication. It prevents a valid mutation on each
+	// side from combining into an invalid catalog snapshot.
+	ConfigBoundary             *sync.RWMutex
 	Now                        func() time.Time
 	DetectRepo                 DetectRepoFunc
 	GetRepositorySettings      GetRepositorySettingsFunc
@@ -92,6 +96,10 @@ type Service struct {
 	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
 	AsyncSnapshotQueueEnabled  func() bool
 	PublishProjects            func([]config.ProjectRefConfig)
+	// AfterPublishProjects runs after ConfigBoundary is released. Keep any
+	// external reconciliation or other potentially blocking follow-up here;
+	// PublishProjects itself is part of the atomic config/catalog publication.
+	AfterPublishProjects func()
 }
 
 type AddInput struct {
@@ -280,15 +288,28 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if existing != nil {
 		record.CreatedAt = existing.CreatedAt
 	}
-	nextProjects, err := s.materializeCandidate(ctx, &record, "")
+	var nextProjects []config.ProjectRefConfig
+	publishedProjects := false
+	err = s.withConfigBoundary(func() error {
+		var materializeErr error
+		nextProjects, materializeErr = s.materializeCandidate(ctx, &record, "")
+		if materializeErr != nil {
+			return ProjectValidationError{Message: materializeErr.Error()}
+		}
+		if upsertErr := s.Repos.Projects.Upsert(ctx, record); upsertErr != nil {
+			return upsertErr
+		}
+		if s.PublishProjects != nil {
+			s.PublishProjects(nextProjects)
+			publishedProjects = true
+		}
+		return nil
+	})
 	if err != nil {
-		return AddResult{}, ProjectValidationError{Message: err.Error()}
-	}
-	if err := s.Repos.Projects.Upsert(ctx, record); err != nil {
 		return AddResult{}, err
 	}
-	if s.PublishProjects != nil {
-		s.PublishProjects(nextProjects)
+	if publishedProjects && s.AfterPublishProjects != nil {
+		s.AfterPublishProjects()
 	}
 
 	discoveredWorktrees, err := s.discoverWorktrees(ctx, record, nowISO, &warnings)
@@ -363,40 +384,61 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 
 	nowISO := currentISO(s.Now)
 	cancelReason := "project archived"
-	nextProjects, err := s.materializeCandidate(ctx, nil, project.ID)
-	if err != nil {
-		return storage.ProjectRecord{}, err
-	}
-	archived, err := storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (bool, error) {
-		repos := storage.NewRepositories(tx)
-		archived, err := repos.Projects.Archive(ctx, project.ID, nowISO)
-		if err != nil {
-			return false, err
+	var archived bool
+	publishedProjects := false
+	err = s.withConfigBoundary(func() error {
+		nextProjects, materializeErr := s.materializeCandidate(ctx, nil, project.ID)
+		if materializeErr != nil {
+			return materializeErr
 		}
-		if !archived {
-			return false, nil
+		var transactionErr error
+		archived, transactionErr = storage.WithTransactionValue(ctx, s.DB, nil, func(tx *sql.Tx) (bool, error) {
+			repos := storage.NewRepositories(tx)
+			archived, archiveErr := repos.Projects.Archive(ctx, project.ID, nowISO)
+			if archiveErr != nil {
+				return false, archiveErr
+			}
+			if !archived {
+				return false, nil
+			}
+			if _, terminateErr := repos.Loops.TerminateByProject(ctx, project.ID, nowISO); terminateErr != nil {
+				return false, terminateErr
+			}
+			if _, cancelErr := repos.Queue.CancelByProject(ctx, project.ID, nowISO, &cancelReason); cancelErr != nil {
+				return false, cancelErr
+			}
+			return true, nil
+		})
+		if transactionErr != nil || !archived {
+			return transactionErr
 		}
-		if _, err := repos.Loops.TerminateByProject(ctx, project.ID, nowISO); err != nil {
-			return false, err
+		if s.PublishProjects != nil {
+			s.PublishProjects(nextProjects)
+			publishedProjects = true
 		}
-		if _, err := repos.Queue.CancelByProject(ctx, project.ID, nowISO, &cancelReason); err != nil {
-			return false, err
-		}
-		return true, nil
+		return nil
 	})
 	if err != nil {
 		return storage.ProjectRecord{}, err
+	}
+	if publishedProjects && s.AfterPublishProjects != nil {
+		s.AfterPublishProjects()
 	}
 	if !archived {
 		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: trimmed}
 	}
 	project.Archived = true
 	project.UpdatedAt = nowISO
-	if s.PublishProjects != nil {
-		s.PublishProjects(nextProjects)
-	}
-
 	return *project, nil
+}
+
+func (s *Service) withConfigBoundary(action func() error) error {
+	if s.ConfigBoundary == nil {
+		return action()
+	}
+	s.ConfigBoundary.Lock()
+	defer s.ConfigBoundary.Unlock()
+	return action()
 }
 
 func (s *Service) resolveActiveProjectForRemoval(ctx context.Context, identifier string) (*storage.ProjectRecord, error) {

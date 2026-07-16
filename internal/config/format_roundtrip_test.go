@@ -66,6 +66,133 @@ func TestMarshalConfigFilePreservesIntegerTOMLNumbers(t *testing.T) {
 	}
 }
 
+func TestMarshalPatchedConfigFilePreservesUnknownNativeScalars(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		path string
+		raw  string
+	}{
+		{
+			name: "json large integer",
+			path: "config.json",
+			raw:  `{"scheduler":{"maxConcurrentRuns":2},"x-extension":{"huge":18446744073709551615}}`,
+		},
+		{
+			name: "yaml timestamp and unsigned integer",
+			path: "config.yaml",
+			raw:  "scheduler:\n  maxConcurrentRuns: 2\nx-extension:\n  releasedAt: 2026-07-16T09:30:00Z\n  huge: 18446744073709551615\n",
+		},
+		{
+			name: "toml date and datetime",
+			path: "config.toml",
+			raw:  "[scheduler]\nmaxConcurrentRuns = 2\n\n[x-extension]\nreleaseDate = 2026-07-16\nreleasedAt = 2026-07-16T09:30:00Z\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			partial, err := DecodePartialConfigFile(tc.path, []byte(tc.raw))
+			if err != nil {
+				t.Fatalf("DecodePartialConfigFile() error = %v", err)
+			}
+			patched, err := ApplyFieldPatch(partial, map[string]json.RawMessage{
+				"scheduler.maxConcurrentRuns": json.RawMessage("3"),
+			}, nil)
+			if err != nil {
+				t.Fatalf("ApplyFieldPatch() error = %v", err)
+			}
+			encoded, err := MarshalPatchedConfigFile(tc.path, []byte(tc.raw), true, patched, []string{"scheduler.maxConcurrentRuns"})
+			if err != nil {
+				t.Fatalf("MarshalPatchedConfigFile() error = %v", err)
+			}
+			before, err := decodeGenericConfigDocument(tc.path, []byte(tc.raw))
+			if err != nil {
+				t.Fatalf("decode original extension error = %v", err)
+			}
+			after, err := decodeGenericConfigDocument(tc.path, encoded)
+			if err != nil {
+				t.Fatalf("decode patched extension error = %v\n%s", err, encoded)
+			}
+			if !reflect.DeepEqual(after["x-extension"], before["x-extension"]) {
+				t.Fatalf("unknown extension changed type or value\nbefore: %#v\nafter:  %#v\nencoded:\n%s", before["x-extension"], after["x-extension"], encoded)
+			}
+		})
+	}
+}
+
+func TestMarshalPatchedConfigFileRemovesOnlyShadowingLegacyAliases(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+  "agent":{"timeouts":{"workerSeconds":600}},
+  "defaults":{"allowAutoApprove":true,"fixAllPullRequests":true,"allowAutoPush":false},
+  "reviewer":{"reviewEvents":{"clean":"APPROVE","blocking":"REQUEST_CHANGES"},"dedupeFindings":true},
+  "roles":{"reviewer":{"autoDiscovery":false,"behavior":{"dedupeFindings":true}}}
+}`)
+	partial, err := DecodePartialConfigFile("config.json", raw)
+	if err != nil {
+		t.Fatalf("DecodePartialConfigFile() error = %v", err)
+	}
+	set := map[string]json.RawMessage{
+		"agent.timeouts.workerMaxRuntimeSeconds":          json.RawMessage("700"),
+		"roles.fixer.triggers.authorFilter":               json.RawMessage(`"current_user"`),
+		"roles.reviewer.discovery.autoDiscovery":          json.RawMessage("true"),
+		"roles.reviewer.behavior.reviewEvents.clean":      json.RawMessage(`"COMMENT"`),
+		"roles.reviewer.behavior.detectDuplicateFindings": json.RawMessage("false"),
+	}
+	patched, err := ApplyFieldPatch(partial, set, nil)
+	if err != nil {
+		t.Fatalf("ApplyFieldPatch() error = %v", err)
+	}
+	paths := make([]string, 0, len(set))
+	for path := range set {
+		paths = append(paths, path)
+	}
+	encoded, err := MarshalPatchedConfigFile("config.json", raw, true, patched, paths)
+	if err != nil {
+		t.Fatalf("MarshalPatchedConfigFile() error = %v", err)
+	}
+	root, err := decodeGenericConfigDocument("config.json", encoded)
+	if err != nil {
+		t.Fatalf("decode patched document: %v\n%s", err, encoded)
+	}
+	assertDocumentPathMissing(t, root, "agent.timeouts.workerSeconds")
+	assertDocumentPathMissing(t, root, "defaults.allowAutoApprove")
+	assertDocumentPathMissing(t, root, "defaults.fixAllPullRequests")
+	assertDocumentPathMissing(t, root, "reviewer.reviewEvents.clean")
+	assertDocumentPathMissing(t, root, "reviewer.dedupeFindings")
+	assertDocumentPathMissing(t, root, "roles.reviewer.autoDiscovery")
+	assertDocumentPathMissing(t, root, "roles.reviewer.behavior.dedupeFindings")
+	if got := root["reviewer"].(map[string]any)["reviewEvents"].(map[string]any)["blocking"]; got != "REQUEST_CHANGES" {
+		t.Fatalf("unrelated legacy reviewer blocking event = %#v", got)
+	}
+	if got := root["defaults"].(map[string]any)["allowAutoPush"]; got != false {
+		t.Fatalf("unrelated defaults.allowAutoPush = %#v", got)
+	}
+}
+
+func assertDocumentPathMissing(t *testing.T, root map[string]any, path string) {
+	t.Helper()
+	current := root
+	segments := strings.Split(path, ".")
+	for index, segment := range segments {
+		value, exists := current[segment]
+		if !exists {
+			return
+		}
+		if index == len(segments)-1 {
+			t.Fatalf("document path %q still exists with value %#v", path, value)
+		}
+		next, ok := value.(map[string]any)
+		if !ok {
+			return
+		}
+		current = next
+	}
+}
+
 func canonicalRoundTripFixtureConfig() Config {
 	baseURL := "https://looper.example.test"
 	localToken := "local-token"

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -44,6 +45,7 @@ const (
 	requestIDHeaderName        = "x-request-id"
 	apiBasePath                = "/api/v1"
 	webhookForwardPath         = "/webhook/forward"
+	maxConfigPatchBodyBytes    = 1 << 20
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
 	activeRunHeartbeatTTL      = 30 * time.Minute
@@ -62,8 +64,70 @@ type activeRunExecutionVerifier interface {
 	ExecutionMatchesProcess(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
 }
 
+// ConfigFieldMetadata describes where an effective field came from and whether
+// the dashboard may change it without restarting looperd.
+type ConfigFieldMetadata struct {
+	Source    string `json:"source"`
+	Editable  bool   `json:"editable"`
+	ApplyMode string `json:"applyMode"`
+}
+
+// ConfigMetadata describes the effective configuration source and the most
+// recent file reload attempt. Fields is keyed by canonical dotted config path.
+type ConfigMetadata struct {
+	ConfigPath    string                         `json:"configPath"`
+	Format        string                         `json:"format"`
+	FilePresent   bool                           `json:"filePresent"`
+	Revision      string                         `json:"revision"`
+	LastAttemptAt *time.Time                     `json:"lastAttemptAt,omitempty"`
+	LastAppliedAt *time.Time                     `json:"lastAppliedAt,omitempty"`
+	LastError     *string                        `json:"lastError,omitempty"`
+	RejectedPaths []string                       `json:"rejectedPaths"`
+	Fields        map[string]ConfigFieldMetadata `json:"fields"`
+}
+
+// ConfigPatchRequest is the dashboard's field-level mutation contract. Set
+// values stay as raw JSON so the configuration authority performs all typing
+// and validation; Unset removes values from the file layer.
+type ConfigPatchRequest struct {
+	Revision string                     `json:"revision"`
+	Set      map[string]json.RawMessage `json:"set"`
+	Unset    []string                   `json:"unset"`
+}
+
+type ConfigRequestErrorKind string
+
+const (
+	ConfigRequestErrorKindValidation  ConfigRequestErrorKind = "validation"
+	ConfigRequestErrorKindConflict    ConfigRequestErrorKind = "conflict"
+	ConfigRequestErrorKindUnsupported ConfigRequestErrorKind = "unsupported"
+	ConfigRequestErrorKindTooLarge    ConfigRequestErrorKind = "too_large"
+)
+
+// ConfigPatchIssue identifies one rejected field-level mutation.
+type ConfigPatchIssue struct {
+	Path    string `json:"path,omitempty"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// ConfigRequestError lets the configuration authority report stable field
+// issues while the HTTP layer owns status codes and envelope formatting.
+type ConfigRequestError struct {
+	Kind    ConfigRequestErrorKind
+	Message string
+	Issues  []ConfigPatchIssue
+}
+
+func (e ConfigRequestError) Error() string {
+	return e.Message
+}
+
 type Context struct {
 	Config             config.Config
+	ConfigMetadata     func() ConfigMetadata
+	ConfigSnapshot     func() (config.Config, ConfigMetadata)
+	PatchConfig        func(context.Context, ConfigPatchRequest) error
 	Runtime            RuntimeState
 	WebhookForwarder   webhookforward.Forwarder
 	ProjectsService    projectService
@@ -177,10 +241,29 @@ func (h *Handler) lockLoopTargetForStatus(projectID string, loopType domain.Loop
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestHandler := *h
+	requestHandler.context = h.context
+	// The config endpoint needs one coherent config-and-metadata snapshot.
+	// Other routes use the current in-memory runtime config for authorization
+	// and policy without constructing dashboard metadata.
+	if normalizePath(r.URL.Path) == apiBasePath+"/config" && h.context.ConfigSnapshot != nil {
+		cfg, metadata := h.context.ConfigSnapshot()
+		requestHandler.context.Config = cfg
+		requestHandler.context.ConfigMetadata = func() ConfigMetadata { return metadata }
+	} else if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+		requestHandler.context.Config = runtimeConfig.Config()
+	}
+	requestHandler.serveHTTP(w, r)
+}
+
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := normalizePath(r.URL.Path)
 	requestID := strings.TrimSpace(r.Header.Get(requestIDHeaderName))
 	if requestID == "" {
 		requestID = generateRequestID()
+	}
+	if path == apiBasePath+"/config" {
+		w.Header().Set("Cache-Control", "no-store")
 	}
 
 	if err := authorizeRequest(r, path, h.context.Config); err != nil {
@@ -249,11 +332,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeSuccess(w, requestID, h.buildVersionResponse())
 		return
 	case apiBasePath + "/config":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-
-		h.writeSuccess(w, requestID, h.buildConfigResponse())
+		h.handleConfigRoute(w, r, requestID)
 		return
 	case apiBasePath + "/webhook/status":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
@@ -512,7 +591,15 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	if !isLoopbackRequest(r) {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusForbidden, message: "Webhook forwarding is limited to loopback callers"}
 	}
-	if h.webhookForwarder == nil {
+	forwarder := h.webhookForwarder
+	if runtimeWithForwarder, ok := any(h.context.Runtime).(interface {
+		WebhookForwarder() looperdruntime.WebhookForwarder
+	}); ok {
+		if current := runtimeWithForwarder.WebhookForwarder(); current != nil {
+			forwarder = current
+		}
+	}
+	if forwarder == nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
 	}
 	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
@@ -529,7 +616,7 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	}
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	eventType := r.Header.Get("X-GitHub-Event")
-	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
+	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
 	if err != nil {
 		status := http.StatusBadRequest
 		code := pkgapi.ErrorCodeValidationFailed
@@ -562,8 +649,12 @@ func isLoopbackRequest(r *http.Request) bool {
 }
 
 func hasForwardingProxyHeaders(headers http.Header) bool {
-	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip", "X-Real-IP"} {
-		for _, value := range headers.Values(name) {
+	for name, values := range headers {
+		normalized := strings.ToLower(strings.TrimSpace(name))
+		if normalized != "forwarded" && normalized != "x-real-ip" && !strings.HasPrefix(normalized, "x-forwarded-") {
+			continue
+		}
+		for _, value := range values {
 			if strings.TrimSpace(value) != "" {
 				return true
 			}
@@ -644,6 +735,13 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	if err := validateBrowserRequestForPath(r, cfg, path); err != nil {
 		return err
 	}
+	if path == apiBasePath+"/config" && r.Method == http.MethodPatch && cfg.Server.AuthMode != config.AuthModeLocalToken && !isDirectLoopbackConfigMutation(r, cfg) {
+		return apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "Configuration updates without token authentication are limited to direct loopback clients",
+		}
+	}
 
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
 		return nil
@@ -671,6 +769,17 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	}
 
 	return nil
+}
+
+func isDirectLoopbackConfigMutation(r *http.Request, cfg config.Config) bool {
+	if r == nil || !isLoopbackRemoteAddr(r.RemoteAddr) || hasForwardingProxyHeaders(r.Header) {
+		return false
+	}
+	// RemoteAddr alone identifies a local reverse proxy, not the original
+	// caller. Requiring a literal loopback request authority closes the common
+	// stripped-forwarding-header proxy path while retaining direct CLI/browser
+	// access through localhost, 127.0.0.1, or ::1.
+	return isLoopbackAuthority(effectiveRequestHost(r, cfg))
 }
 
 func isLoopbackRemoteAddr(remoteAddr string) bool {
@@ -918,28 +1027,281 @@ type statusTools struct {
 	Osascript bool `json:"osascript"`
 }
 
+func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.writeSuccess(w, requestID, h.buildConfigResponse())
+	case http.MethodPatch:
+		patch, err := decodeConfigPatchRequest(w, r)
+		if err != nil {
+			h.writeError(w, requestID, configRequestAPIError(err))
+			return
+		}
+		if h.context.PatchConfig == nil {
+			h.writeError(w, requestID, configRequestAPIError(ConfigRequestError{
+				Kind:    ConfigRequestErrorKindUnsupported,
+				Message: "Dynamic configuration updates are unavailable",
+				Issues: []ConfigPatchIssue{{
+					Code:    "config_patch_unsupported",
+					Message: "This daemon does not support field-level configuration updates",
+				}},
+			}))
+			return
+		}
+		if err := h.context.PatchConfig(r.Context(), patch); err != nil {
+			h.writeError(w, requestID, configRequestAPIError(err))
+			return
+		}
+
+		// A mutation establishes a new snapshot boundary. Refresh once after the
+		// callback so the PATCH response projects the configuration just applied.
+		if h.context.ConfigSnapshot != nil {
+			cfg, metadata := h.context.ConfigSnapshot()
+			h.context.Config = cfg
+			h.context.ConfigMetadata = func() ConfigMetadata { return metadata }
+		} else if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
+			h.context.Config = runtimeConfig.Config()
+		}
+		h.writeSuccess(w, requestID, h.buildConfigResponse())
+	default:
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeMethodNotAllowed,
+			status:  http.StatusMethodNotAllowed,
+			message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/config"),
+		})
+	}
+}
+
+func decodeConfigPatchRequest(w http.ResponseWriter, r *http.Request) (ConfigPatchRequest, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfigPatchBodyBytes)
+	raw, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(readErr, &maxBytesError) {
+			return ConfigPatchRequest{}, ConfigRequestError{
+				Kind:    ConfigRequestErrorKindTooLarge,
+				Message: "Configuration patch is too large",
+				Issues:  []ConfigPatchIssue{{Code: "request_too_large", Message: fmt.Sprintf("Request body exceeds %d bytes", maxConfigPatchBodyBytes)}},
+			}
+		}
+		return ConfigPatchRequest{}, ConfigRequestError{Kind: ConfigRequestErrorKindValidation, Message: "Invalid configuration patch", Issues: []ConfigPatchIssue{{Code: "invalid_json", Message: readErr.Error()}}}
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := config.ValidateUniqueJSONNames(raw); err != nil {
+			return ConfigPatchRequest{}, ConfigRequestError{
+				Kind:    ConfigRequestErrorKindValidation,
+				Message: "Invalid configuration patch",
+				Issues:  []ConfigPatchIssue{{Code: "duplicate_json_name", Message: err.Error()}},
+			}
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+
+	var decoded *ConfigPatchRequest
+	if err := decoder.Decode(&decoded); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			return ConfigPatchRequest{}, ConfigRequestError{
+				Kind:    ConfigRequestErrorKindTooLarge,
+				Message: "Configuration patch is too large",
+				Issues: []ConfigPatchIssue{{
+					Code:    "request_too_large",
+					Message: fmt.Sprintf("Request body exceeds %d bytes", maxConfigPatchBodyBytes),
+				}},
+			}
+		}
+		message := "Request body must be a JSON object"
+		code := "invalid_json"
+		if errors.Is(err, io.EOF) {
+			message = "Request body is required"
+			code = "request_body_required"
+		}
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Code: code, Message: message}},
+		}
+	}
+	if decoded == nil {
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Code: "invalid_json", Message: "Request body must be a JSON object"}},
+		}
+	}
+	patch := *decoded
+	if strings.TrimSpace(patch.Revision) == "" {
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Path: "revision", Code: "missing_revision", Message: "revision is required; refresh configuration and try again"}},
+		}
+	}
+
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err != nil {
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				return ConfigPatchRequest{}, ConfigRequestError{
+					Kind:    ConfigRequestErrorKindTooLarge,
+					Message: "Configuration patch is too large",
+					Issues:  []ConfigPatchIssue{{Code: "request_too_large", Message: fmt.Sprintf("Request body exceeds %d bytes", maxConfigPatchBodyBytes)}},
+				}
+			}
+		}
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Code: "trailing_json", Message: "Request body must contain exactly one JSON object"}},
+		}
+	}
+
+	issues := validateConfigPatchRequest(patch)
+	if len(issues) > 0 {
+		return ConfigPatchRequest{}, ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  issues,
+		}
+	}
+	if patch.Set == nil {
+		patch.Set = map[string]json.RawMessage{}
+	}
+	if patch.Unset == nil {
+		patch.Unset = []string{}
+	}
+	return patch, nil
+}
+
+func validateConfigPatchRequest(patch ConfigPatchRequest) []ConfigPatchIssue {
+	issues := make([]ConfigPatchIssue, 0)
+	if len(patch.Set) == 0 && len(patch.Unset) == 0 {
+		issues = append(issues, ConfigPatchIssue{Code: "empty_patch", Message: "At least one set or unset operation is required"})
+	}
+
+	setPaths := make(map[string]struct{}, len(patch.Set))
+	for path, raw := range patch.Set {
+		setPaths[path] = struct{}{}
+		if path == "" || path != strings.TrimSpace(path) {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "invalid_path", Message: "Set paths must be non-empty and contain no surrounding whitespace"})
+		}
+		if len(raw) == 0 {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "missing_value", Message: "Set operations require a JSON value"})
+		}
+	}
+
+	unsetPaths := make(map[string]struct{}, len(patch.Unset))
+	for _, path := range patch.Unset {
+		if path == "" || path != strings.TrimSpace(path) {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "invalid_path", Message: "Unset paths must be non-empty and contain no surrounding whitespace"})
+		}
+		if _, exists := unsetPaths[path]; exists {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "duplicate_unset", Message: "Unset paths must be unique"})
+		}
+		unsetPaths[path] = struct{}{}
+		if _, exists := setPaths[path]; exists {
+			issues = append(issues, ConfigPatchIssue{Path: path, Code: "conflicting_operation", Message: "A path cannot be both set and unset"})
+		}
+	}
+
+	sort.SliceStable(issues, func(i, j int) bool {
+		if issues[i].Path == issues[j].Path {
+			return issues[i].Code < issues[j].Code
+		}
+		return issues[i].Path < issues[j].Path
+	})
+	return issues
+}
+
+func configRequestAPIError(err error) apiError {
+	requestError, ok := asConfigRequestError(err)
+	if !ok {
+		return internalServerError(err)
+	}
+
+	status := http.StatusBadRequest
+	code := pkgapi.ErrorCodeValidationFailed
+	switch requestError.Kind {
+	case ConfigRequestErrorKindValidation, ConfigRequestErrorKindUnsupported:
+	case ConfigRequestErrorKindConflict:
+		status = http.StatusConflict
+		code = pkgapi.ErrorCodeConfigConflict
+	case ConfigRequestErrorKindTooLarge:
+		status = http.StatusRequestEntityTooLarge
+		code = pkgapi.ErrorCodeRequestTooLarge
+	default:
+		return internalServerError(err)
+	}
+
+	message := strings.TrimSpace(requestError.Message)
+	if message == "" {
+		message = "Configuration update failed"
+	}
+	issues := append([]ConfigPatchIssue{}, requestError.Issues...)
+	return apiError{
+		code:    code,
+		status:  status,
+		message: message,
+		details: struct {
+			Issues []ConfigPatchIssue `json:"issues"`
+		}{Issues: issues},
+	}
+}
+
+func asConfigRequestError(err error) (ConfigRequestError, bool) {
+	if err == nil {
+		return ConfigRequestError{}, false
+	}
+	var pointer *ConfigRequestError
+	if errors.As(err, &pointer) && pointer != nil {
+		return *pointer, true
+	}
+	var value ConfigRequestError
+	if errors.As(err, &value) {
+		return value, true
+	}
+	return ConfigRequestError{}, false
+}
+
 type configResponse struct {
 	Server        configServerResponse      `json:"server"`
 	Storage       config.StorageConfig      `json:"storage"`
 	Scheduler     config.SchedulerConfig    `json:"scheduler"`
 	Webhook       config.WebhookConfig      `json:"webhook"`
-	Agent         config.AgentConfig        `json:"agent"`
+	Network       config.NetworkConfig      `json:"network"`
+	Agent         configAgentResponse       `json:"agent"`
 	Logging       config.LoggingConfig      `json:"logging"`
 	Notifications config.NotificationConfig `json:"notifications"`
+	Disclosure    config.DisclosureConfig   `json:"disclosure"`
 	Tools         config.ToolPathsConfig    `json:"tools"`
 	Daemon        configDaemonResponse      `json:"daemon"`
 	Package       config.PackageConfig      `json:"package"`
 	Defaults      config.DefaultsConfig     `json:"defaults"`
+	Instructions  config.InstructionsConfig `json:"instructions"`
+	HITL          config.HITLConfig         `json:"hitl"`
 	Roles         config.RoleConfigs        `json:"roles"`
+	Providers     []config.ProviderConfig   `json:"providers"`
 	Projects      []config.ProjectRefConfig `json:"projects"`
+	Metadata      ConfigMetadata            `json:"metadata"`
 }
 
 type configServerResponse struct {
-	Host                 string          `json:"host"`
-	Port                 int             `json:"port"`
-	BaseURL              *string         `json:"baseUrl,omitempty"`
-	AuthMode             config.AuthMode `json:"authMode"`
-	LocalTokenConfigured bool            `json:"localTokenConfigured"`
+	Host     string          `json:"host"`
+	Port     int             `json:"port"`
+	BaseURL  *string         `json:"baseUrl,omitempty"`
+	AuthMode config.AuthMode `json:"authMode"`
+}
+
+type configAgentResponse struct {
+	Vendor       *config.AgentVendor            `json:"vendor,omitempty"`
+	Model        *string                        `json:"model,omitempty"`
+	Params       map[string]any                 `json:"params"`
+	Env          map[string]string              `json:"env"`
+	EnvKeys      []string                       `json:"envKeys"`
+	Timeouts     config.AgentTimeoutConfig      `json:"timeouts"`
+	NativeResume config.AgentNativeResumeConfig `json:"nativeResume"`
 }
 
 type configDaemonResponse struct {
@@ -955,24 +1317,30 @@ type configDaemonResponse struct {
 
 func (h *Handler) buildConfigResponse() configResponse {
 	cfg := h.context.Config
-	if runtimeConfig, ok := any(h.context.Runtime).(interface{ Config() config.Config }); ok {
-		cfg = runtimeConfig.Config()
-	}
 
 	return configResponse{
 		Server: configServerResponse{
-			Host:                 cfg.Server.Host,
-			Port:                 cfg.Server.Port,
-			BaseURL:              cfg.Server.BaseURL,
-			AuthMode:             cfg.Server.AuthMode,
-			LocalTokenConfigured: cfg.Server.LocalToken != nil && *cfg.Server.LocalToken != "",
+			Host:     cfg.Server.Host,
+			Port:     cfg.Server.Port,
+			BaseURL:  cfg.Server.BaseURL,
+			AuthMode: cfg.Server.AuthMode,
 		},
-		Storage:       cfg.Storage,
-		Scheduler:     cfg.Scheduler,
-		Webhook:       cfg.Webhook,
-		Agent:         cfg.Agent,
+		Storage:   cfg.Storage,
+		Scheduler: cfg.Scheduler,
+		Webhook:   cfg.Webhook,
+		Network:   cfg.Network,
+		Agent: configAgentResponse{
+			Vendor:       cfg.Agent.Vendor,
+			Model:        cfg.Agent.Model,
+			Params:       map[string]any{},
+			Env:          map[string]string{},
+			EnvKeys:      sortedMapKeys(cfg.Agent.Env),
+			Timeouts:     cfg.Agent.Timeouts,
+			NativeResume: cfg.Agent.NativeResume,
+		},
 		Logging:       cfg.Logging,
 		Notifications: cfg.Notifications,
+		Disclosure:    cfg.Disclosure,
 		Tools:         cfg.Tools,
 		Daemon: configDaemonResponse{
 			Mode:                   cfg.Daemon.Mode,
@@ -981,14 +1349,41 @@ func (h *Handler) buildConfigResponse() configResponse {
 			PlistPath:              cfg.Daemon.PlistPath,
 			LogDir:                 cfg.Daemon.LogDir,
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
-			Environment:            cfg.Daemon.Environment,
+			Environment:            map[string]string{},
 			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
 		},
-		Package:  cfg.Package,
-		Defaults: cfg.Defaults,
-		Roles:    cfg.Roles,
-		Projects: append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Package:      cfg.Package,
+		Defaults:     cfg.Defaults,
+		Instructions: cfg.Instructions,
+		HITL:         cfg.HITL,
+		Roles:        cfg.Roles,
+		Providers:    append([]config.ProviderConfig{}, cfg.Providers...),
+		Projects:     append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Metadata:     h.buildConfigMetadata(),
 	}
+}
+
+func (h *Handler) buildConfigMetadata() ConfigMetadata {
+	metadata := ConfigMetadata{}
+	if h.context.ConfigMetadata != nil {
+		metadata = h.context.ConfigMetadata()
+	}
+	metadata.RejectedPaths = append([]string{}, metadata.RejectedPaths...)
+	fields := make(map[string]ConfigFieldMetadata, len(metadata.Fields))
+	for path, field := range metadata.Fields {
+		fields[path] = field
+	}
+	metadata.Fields = fields
+	return metadata
+}
+
+func sortedMapKeys[T any](values map[string]T) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (h *Handler) buildWebhookStatusResponse() looperdruntime.WebhookStatus {

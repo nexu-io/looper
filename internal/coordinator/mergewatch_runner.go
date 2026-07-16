@@ -286,12 +286,12 @@ func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string) []st
 
 func (r *Runner) watchLock(repo string, issueNumber int64) *sync.Mutex {
 	key := fmt.Sprintf("%s#%d", repo, issueNumber)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.watchLocks[key] == nil {
-		r.watchLocks[key] = &sync.Mutex{}
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	if r.state.watchLocks[key] == nil {
+		r.state.watchLocks[key] = &sync.Mutex{}
 	}
-	return r.watchLocks[key]
+	return r.state.watchLocks[key]
 }
 
 func linkedPullRequestNumbers(timeline []map[string]any) []int64 {

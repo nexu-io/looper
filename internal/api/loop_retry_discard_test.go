@@ -567,7 +567,7 @@ func TestHandlerLoopRetryWithoutDiscardDoesNotReportDiscard(t *testing.T) {
 func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeWhenAgentNotConfigured(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.Agent.Vendor = nil
-	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
 	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
 

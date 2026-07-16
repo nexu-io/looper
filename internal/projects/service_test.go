@@ -158,6 +158,47 @@ func TestServiceConcurrentAddsPublishCommittedCatalog(t *testing.T) {
 	}
 }
 
+func TestServiceProjectPostPublicationRunsOutsideConfigBoundary(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	boundary := &sync.RWMutex{}
+	publishCount := 0
+	afterPublishCount := 0
+	service := &Service{
+		DB:             coordinator.DB(),
+		Repos:          repos,
+		ConfigBoundary: boundary,
+		Now:            time.Now,
+		PublishProjects: func([]config.ProjectRefConfig) {
+			publishCount++
+			if boundary.TryLock() {
+				boundary.Unlock()
+				t.Fatal("PublishProjects ran without ConfigBoundary held")
+			}
+		},
+		AfterPublishProjects: func() {
+			afterPublishCount++
+			if !boundary.TryLock() {
+				t.Fatal("AfterPublishProjects ran while ConfigBoundary was held")
+			}
+			boundary.Unlock()
+		},
+	}
+
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if _, err := service.RemoveProject(ctx, "looper"); err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+	if publishCount != 2 || afterPublishCount != 2 {
+		t.Fatalf("publication callbacks = (%d, %d), want (2, 2)", publishCount, afterPublishCount)
+	}
+}
+
 func TestServiceAddProjectRejectsProjectIDWithBackslash(t *testing.T) {
 	t.Parallel()
 

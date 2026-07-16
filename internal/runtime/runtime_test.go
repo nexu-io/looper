@@ -195,6 +195,19 @@ func TestRuntimeProjectMutationsAtomicallyPublishCatalog(t *testing.T) {
 
 	projectService := rt.Services().Projects
 	projectService.ListWorktrees = nil
+	if projectService.AfterPublishProjects == nil {
+		t.Fatal("Projects.AfterPublishProjects = nil, want runtime follow-up hook")
+	}
+	originalAfterPublish := projectService.AfterPublishProjects
+	afterPublishCalls := 0
+	projectService.AfterPublishProjects = func() {
+		if !rt.configBoundary.TryRLock() {
+			t.Fatal("runtime project follow-up ran while config publication boundary was held")
+		}
+		rt.configBoundary.RUnlock()
+		afterPublishCalls++
+		originalAfterPublish()
+	}
 	repo := "acme/live"
 	added, err := projectService.AddProject(context.Background(), projects.AddInput{
 		ID: "live", Name: "Live", RepoPath: workingDir, Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
@@ -209,12 +222,18 @@ func TestRuntimeProjectMutationsAtomicallyPublishCatalog(t *testing.T) {
 	if len(afterAdd.Projects) != 1 || afterAdd.Projects[0].ID != "live" || afterAdd.Projects[0].Repo != repo {
 		t.Fatalf("Config().Projects after add = %#v, want live project", afterAdd.Projects)
 	}
+	if afterPublishCalls != 1 {
+		t.Fatalf("project follow-up calls after add = %d, want 1", afterPublishCalls)
+	}
 
 	if _, err := projectService.RemoveProject(context.Background(), "live"); err != nil {
 		t.Fatalf("RemoveProject() error = %v", err)
 	}
 	if got := rt.Config().Projects; len(got) != 0 {
 		t.Fatalf("Config().Projects after remove = %#v, want empty catalog", got)
+	}
+	if afterPublishCalls != 2 {
+		t.Fatalf("project follow-up calls after remove = %d, want 2", afterPublishCalls)
 	}
 }
 

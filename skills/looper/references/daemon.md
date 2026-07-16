@@ -14,6 +14,20 @@ looper daemon logs
 looper daemon logs --startup
 ```
 
+## Config reload versus restart
+
+The daemon watches its selected TOML, YAML, or JSON config while running. Hot-safe policy changes are validated and published without changing the daemon PID. Claims made after publication use the new snapshot; active runs retain the snapshot they started with.
+
+Use the Configuration page at `/dashboard/config` to see the selected path, winning source for each dashboard-managed hot field, last reload attempt, last successful application, and any rejected paths. File-only, project, and sensitive metadata families are intentionally omitted. Daemon logs also record a rejected reload. Invalid candidates and candidates containing a restart-bound change leave the last-known-good runtime configuration active.
+
+Do not restart after every config edit. The hot-safe allowlist covers `agent.vendor` (including configuring the first vendor after startup), model, individual env entries, and canonical idle/max-runtime timeouts; scheduler concurrency/slow-lane fields; in-app and osascript notifications; disclosure; auto-commit/push, risky-fix, PR-strategy, and snapshot-mode defaults; `instructions.enabled`; curated role policy; and Looper/osascript paths. Planner `roles.planner.triggers.planeAssigneeId` remains file-only and restart-bound; Worker `roles.worker.triggers.planeAssigneeId` remains hot-safe. `defaults.baseBranch` remains restart-bound because configured project records materialize it.
+
+Leaving one configured vendor—by switching or clearing it—requires empty `agent.params`; if `agent.model` is explicit, change or unset it in the same edit. Configuring the first vendor may use a prepared profile. Work continued after a cross-vendor switch uses the existing checkpoint and worktree in a fresh native session.
+
+Restart is required for process-owned settings such as the HTTP listener, storage/runtime paths, logger, webhook/network topology, providers/projects, polling/cache cadence, and `git`/`gh` tool paths. It is also required for `agent.nativeResume`, `agent.params`, notification webhooks/Feishu, HITL, `instructions.maxBytes`, scheduler retry budget/base delay, Reviewer auto-merge and queue timing, `roles.coordinator.enabled`, Coordinator merge-watch transient retries, and Coordinator dependencies. See `references/config.md` for the exact current field list.
+
+The Configuration page sends the file revision captured with its published values and performs a final identity/mode/byte check before atomic rename. A conflict normally means another editor changed the file, even if that generation has not yet passed reload validation; wait for it to publish and refresh, or fix its displayed diagnostics in the file before retrying. Portable filesystems leave a tiny final-check-to-rename race, so avoid simultaneous manual and dashboard writes. Without token authentication, config PATCH requires a direct loopback peer and Host authority and rejects forwarding headers; proxied access requires `local-token`. Dashboard writes retain unknown top-level extension sections and their native scalar values but may canonicalize comments and lexical ordering, and they reject symlinked config paths.
+
 ## Install and start
 
 Managed daemon install:

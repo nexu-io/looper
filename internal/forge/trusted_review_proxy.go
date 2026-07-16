@@ -2,8 +2,10 @@ package forge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -11,7 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/nexu-io/looper/internal/config"
 )
 
 // TrustedReviewSockEnv is the agent-facing env key for the trusted review-submit
@@ -23,6 +28,21 @@ const TrustedReviewSockEnv = "LOOPER_TRUSTED_REVIEW_SOCK"
 // trustedReviewProxySkipEnv marks a proxy-spawned looper child so it does not
 // re-enter the proxy (the child receives provider tokens directly).
 const trustedReviewProxySkipEnv = "LOOPER_TRUSTED_REVIEW_PROXY_CHILD"
+
+// TrustedReviewConfigFDEnv identifies the inherited, read-only pipe containing
+// the exact materialized config snapshot for a trusted review child. The pipe
+// replaces a named temporary file so the same-UID agent cannot discover or
+// rewrite the snapshot between proxy minting and review submission.
+const TrustedReviewConfigFDEnv = "LOOPER_TRUSTED_REVIEW_CONFIG_FD"
+
+const (
+	maxTrustedReviewProxyConnections   = 4
+	maxTrustedReviewProxyRequestBytes  = 2 << 20
+	maxTrustedReviewProxyStdinBytes    = 1 << 20
+	maxTrustedReviewProxyOutputBytes   = 256 << 10
+	maxTrustedReviewProxyResponseBytes = 4 << 20
+	maxTrustedReviewConfigSnapshotSize = 4 << 20
+)
 
 type trustedReviewProxyRequest struct {
 	Argv  []string `json:"argv"`
@@ -47,19 +67,23 @@ func FormatTrustedReviewPRRef(repo string, prNumber int64) string {
 	return fmt.Sprintf("%s#%d", repo, prNumber)
 }
 
-// TrustedReviewProxyPolicy is the daemon-selected clean/blocking review event
-// policy bound into a trusted review-submit proxy for one agent run.
-// Agent-supplied --clean-review-event / --blocking-review-event values are
-// stripped and replaced with this policy before the child runs.
+// TrustedReviewProxyPolicy is the daemon-selected review authority bound into
+// a trusted review-submit proxy for one agent run. Agent-supplied review-event,
+// expected-head, and manual-run identity flags are stripped and replaced with
+// these values before the child runs.
 type TrustedReviewProxyPolicy struct {
-	Clean    string // COMMENT or APPROVE
-	Blocking string // COMMENT or REQUEST_CHANGES
+	Clean            string // COMMENT or APPROVE
+	Blocking         string // COMMENT or REQUEST_CHANGES
+	ExpectedCommitID string
+	ReviewerManual   bool
+	ReviewerRunID    string
 }
 
 // StartTrustedReviewProxy listens on a private Unix socket and runs
-// `looper review submit` in a daemon-side child with optional provider tokens
-// injected. Agents receive only the socket path (via TrustedReviewSockEnv),
-// never a secret-bearing wrapper path or LOOPER_TRUSTED_ENV_FILE.
+// `looper review submit` in a daemon-side child with the run-captured credential
+// environment injected. Agents receive only the socket path (via
+// TrustedReviewSockEnv), never a secret-bearing wrapper path, config snapshot
+// path, or LOOPER_TRUSTED_ENV_FILE.
 //
 // trustedEnv may be empty for tea-backed Forgejo providers that have no
 // tokenEnv. The proxy still binds PR/CWD/policy/config so agents cannot retarget
@@ -73,17 +97,17 @@ type TrustedReviewProxyPolicy struct {
 // processes always use this CWD; request-supplied cwd is ignored so a
 // compromised agent cannot retarget provider-qualified project resolution.
 //
-// configPath is the daemon-loaded config file path (for example from --config).
-// When non-empty it is injected as LOOPER_CONFIG for the child so review submit
-// resolves the same provider/project/review policy as the daemon even when the
-// path was not present in the daemon process environment. Agent-supplied
-// --config remains rejected.
+// configSnapshot is the complete materialized config captured by the run. The
+// proxy sanitizes and retains its encoded bytes in memory, then supplies them
+// to each child through an inherited pipe. The agent receives neither a path
+// nor the snapshot bytes and therefore cannot rewrite the child's authority.
 //
-// policy is the daemon-selected effective review-events policy for the run
-// (including loop-metadata overrides). Agent argv may still include local
-// policy flags for the prompted command shape, but the proxy always rewrites
-// them to this bound policy before spawning the token-injected child.
-func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
+// policy is the daemon-selected effective review-events policy, expected PR
+// head, and manual-run identity for the run (including loop-metadata
+// overrides). Agent argv may still include local flags for the prompted command
+// shape, but the proxy always rewrites them to this bound authority before
+// spawning the credential-injected child.
+func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	if realLooper == "" {
 		return "", nil, fmt.Errorf("real looper path is required for trusted review proxy")
@@ -96,13 +120,16 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	if err != nil {
 		return "", nil, fmt.Errorf("trusted review proxy allowed CWD: %w", err)
 	}
-	boundConfigPath := strings.TrimSpace(configPath)
 	boundPolicy, err := normalizeTrustedReviewProxyPolicy(policy)
 	if err != nil {
 		return "", nil, fmt.Errorf("trusted review proxy review policy: %w", err)
 	}
 	if _, err := os.Stat(realLooper); err != nil {
 		return "", nil, fmt.Errorf("stat real looper path: %w", err)
+	}
+	boundConfig, err := marshalTrustedReviewConfigSnapshot(configSnapshot)
+	if err != nil {
+		return "", nil, err
 	}
 
 	dir, err := os.MkdirTemp("", "looper-trusted-review-sock-*")
@@ -123,6 +150,16 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	proxyContext, cancelProxy := context.WithCancel(context.Background())
+	slots := make(chan struct{}, maxTrustedReviewProxyConnections)
+	connections := map[net.Conn]struct{}{}
+	var connectionsMu sync.Mutex
+	closing := false
+	unregister := func(conn net.Conn) {
+		connectionsMu.Lock()
+		delete(connections, conn)
+		connectionsMu.Unlock()
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -136,31 +173,71 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 					continue
 				}
 			}
+			connectionsMu.Lock()
+			if closing {
+				connectionsMu.Unlock()
+				_ = conn.Close()
+				continue
+			}
+			connections[conn] = struct{}{}
+			connectionsMu.Unlock()
+			select {
+			case slots <- struct{}{}:
+				// continue below
+			default:
+				_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+				_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "trusted review proxy is busy"})
+				_ = conn.Close()
+				unregister(conn)
+				continue
+			}
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
-				handleTrustedReviewProxyConn(c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfigPath, boundPolicy)
+				defer func() { <-slots }()
+				defer unregister(c)
+				handleTrustedReviewProxyConn(proxyContext, c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfig, boundPolicy)
 			}(conn)
 		}
 	}()
 
+	var cleanupOnce sync.Once
 	cleanup = func() {
-		close(stop)
-		_ = listener.Close()
-		wg.Wait()
-		_ = os.RemoveAll(dir)
+		cleanupOnce.Do(func() {
+			cancelProxy()
+			connectionsMu.Lock()
+			closing = true
+			for conn := range connections {
+				_ = conn.Close()
+			}
+			connectionsMu.Unlock()
+			close(stop)
+			_ = listener.Close()
+			wg.Wait()
+			_ = os.RemoveAll(dir)
+		})
 	}
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy TrustedReviewProxyPolicy) {
+func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot []byte, policy TrustedReviewProxyPolicy) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
 	var req trustedReviewProxyRequest
-	decoder := json.NewDecoder(conn)
+	limited := &io.LimitedReader{R: conn, N: maxTrustedReviewProxyRequestBytes + 1}
+	decoder := json.NewDecoder(limited)
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "decode trusted review proxy request: " + err.Error()})
+		message := "decode trusted review proxy request: " + err.Error()
+		if limited.N <= 0 {
+			message = "trusted review proxy request exceeds size limit"
+		}
+		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: message})
+		return
+	}
+	if len(req.Stdin) > maxTrustedReviewProxyStdinBytes {
+		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "trusted review proxy stdin exceeds size limit"})
 		return
 	}
 	if err := validateTrustedReviewProxyArgv(req.Argv, allowedPRRef); err != nil {
@@ -172,16 +249,47 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 	// agent argv. Rewrite local policy flags after shape/PR validation.
 	childArgv := applyTrustedReviewProxyPolicy(req.Argv, policy)
 	cmd := exec.Command(realLooper, childArgv...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	configReader, configWriter, err := os.Pipe()
+	if err != nil {
+		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "create trusted review config pipe: " + err.Error()})
+		return
+	}
+	cmd.ExtraFiles = []*os.File{configReader}
 	// Never honor request-supplied cwd: project/provider resolution for
 	// provider-qualified same-owner/repo checkouts is CWD-sensitive. The child
 	// always runs in the daemon-selected worktree bound at proxy start.
 	cmd.Dir = allowedCwd
-	cmd.Env = trustedReviewProxyChildEnv(trustedEnv, configPath)
+	cmd.Env = trustedReviewProxyChildEnv(trustedEnv, 3)
 	cmd.Stdin = bytes.NewReader(req.Stdin)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
+	stdout := newTrustedReviewBoundedBuffer(maxTrustedReviewProxyOutputBytes)
+	stderr := newTrustedReviewBoundedBuffer(maxTrustedReviewProxyOutputBytes)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		_ = configReader.Close()
+		_ = configWriter.Close()
+		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: err.Error()})
+		return
+	}
+	_ = configReader.Close()
+	configWriteDone := make(chan error, 1)
+	go func() {
+		_, writeErr := io.Copy(configWriter, bytes.NewReader(configSnapshot))
+		if closeErr := configWriter.Close(); writeErr == nil {
+			writeErr = closeErr
+		}
+		configWriteDone <- writeErr
+	}()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case err = <-waitDone:
+	case <-ctx.Done():
+		_ = killTrustedReviewProxyChild(cmd)
+		err = <-waitDone
+	}
+	configWriteErr := <-configWriteDone
 	resp := trustedReviewProxyResponse{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -191,7 +299,27 @@ func handleTrustedReviewProxyConn(conn net.Conn, realLooper string, trustedEnv m
 			resp.Error = err.Error()
 		}
 	}
+	if stdout.Truncated() || stderr.Truncated() {
+		resp.ExitCode = 1
+		resp.Error = "trusted review proxy child output exceeds size limit"
+	} else if configWriteErr != nil && err == nil {
+		resp.ExitCode = 1
+		resp.Error = "write trusted review config snapshot: " + configWriteErr.Error()
+	}
 	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+func killTrustedReviewProxyChild(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return os.ErrProcessDone
+	}
+	pid := cmd.Process.Pid
+	if pid > 0 {
+		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil || err == syscall.ESRCH {
+			return nil
+		}
+	}
+	return cmd.Process.Kill()
 }
 
 // trustedReviewProxyBlockedFlags are CLI overrides that must never be accepted
@@ -370,6 +498,8 @@ func normalizeTrustedReviewCwd(value string) (string, error) {
 func normalizeTrustedReviewProxyPolicy(policy TrustedReviewProxyPolicy) (TrustedReviewProxyPolicy, error) {
 	clean := strings.ToUpper(strings.TrimSpace(policy.Clean))
 	blocking := strings.ToUpper(strings.TrimSpace(policy.Blocking))
+	expectedCommitID := strings.TrimSpace(policy.ExpectedCommitID)
+	reviewerRunID := strings.TrimSpace(policy.ReviewerRunID)
 	switch clean {
 	case "COMMENT", "APPROVE":
 	default:
@@ -380,7 +510,16 @@ func normalizeTrustedReviewProxyPolicy(policy TrustedReviewProxyPolicy) (Trusted
 	default:
 		return TrustedReviewProxyPolicy{}, fmt.Errorf("blocking review event must be COMMENT or REQUEST_CHANGES")
 	}
-	return TrustedReviewProxyPolicy{Clean: clean, Blocking: blocking}, nil
+	if expectedCommitID == "" {
+		return TrustedReviewProxyPolicy{}, fmt.Errorf("expected commit id is required")
+	}
+	if policy.ReviewerManual && reviewerRunID == "" {
+		return TrustedReviewProxyPolicy{}, fmt.Errorf("manual reviewer run id is required")
+	}
+	return TrustedReviewProxyPolicy{
+		Clean: clean, Blocking: blocking, ExpectedCommitID: expectedCommitID,
+		ReviewerManual: policy.ReviewerManual, ReviewerRunID: reviewerRunID,
+	}, nil
 }
 
 // applyTrustedReviewProxyPolicy strips agent-supplied local review-policy flags
@@ -388,10 +527,15 @@ func normalizeTrustedReviewProxyPolicy(policy TrustedReviewProxyPolicy) (Trusted
 // markers against daemon-selected policy only.
 func applyTrustedReviewProxyPolicy(argv []string, policy TrustedReviewProxyPolicy) []string {
 	stripped := stripTrustedReviewProxyPolicyFlags(argv)
-	return append(stripped,
+	bound := append(stripped,
 		"--clean-review-event", policy.Clean,
 		"--blocking-review-event", policy.Blocking,
+		"--commit-id", policy.ExpectedCommitID,
 	)
+	if policy.ReviewerManual {
+		bound = append(bound, "--reviewer-manual", "--reviewer-run-id", policy.ReviewerRunID)
+	}
+	return bound
 }
 
 func stripTrustedReviewProxyPolicyFlags(argv []string) []string {
@@ -402,7 +546,10 @@ func stripTrustedReviewProxyPolicyFlags(argv []string) []string {
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
 		name := trustedReviewProxyFlagName(arg)
-		if name == "clean-review-event" || name == "blocking-review-event" {
+		switch name {
+		case "reviewer-manual":
+			continue
+		case "clean-review-event", "blocking-review-event", "commit-id", "reviewer-run-id":
 			if !strings.Contains(arg, "=") && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
 				i++
 			}
@@ -413,7 +560,78 @@ func stripTrustedReviewProxyPolicyFlags(argv []string) []string {
 	return out
 }
 
-func trustedReviewProxyChildEnv(trustedEnv map[string]string, configPath string) []string {
+func marshalTrustedReviewConfigSnapshot(source config.Config) ([]byte, error) {
+	// Review submit needs the materialized provider/project policy and the
+	// run's hot settings, but none of these process secrets. Auth mode is not
+	// consulted by review submit; clear it together with localToken so the
+	// sanitized snapshot remains valid when the daemon uses local-token auth.
+	snapshot := source
+	snapshot.Server.AuthMode = config.AuthModeNone
+	snapshot.Server.LocalToken = nil
+	snapshot.Agent.Env = nil
+	snapshot.Agent.Params = nil
+	snapshot.Daemon.Environment = nil
+
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("encode trusted review config snapshot: %w", err)
+	}
+	if len(encoded) > maxTrustedReviewConfigSnapshotSize {
+		return nil, fmt.Errorf("trusted review config snapshot exceeds %d bytes", maxTrustedReviewConfigSnapshotSize)
+	}
+	return encoded, nil
+}
+
+// LoadTrustedReviewConfigSnapshot consumes the exact materialized snapshot
+// supplied to a proxy child. It intentionally bypasses normal config file,
+// environment, and CLI precedence: those layers were already resolved by the
+// daemon when it captured the run. Provider credential variables remain in the
+// child environment for the selected transport but cannot rewrite this config.
+func LoadTrustedReviewConfigSnapshot() (config.LoadedFileConfig, bool, error) {
+	if strings.TrimSpace(os.Getenv(trustedReviewProxySkipEnv)) == "" {
+		return config.LoadedFileConfig{}, false, nil
+	}
+	rawFD := strings.TrimSpace(os.Getenv(TrustedReviewConfigFDEnv))
+	if rawFD == "" {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config descriptor is required")
+	}
+	fd, err := strconv.ParseUint(rawFD, 10, 64)
+	if err != nil || fd < 3 {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config descriptor is invalid")
+	}
+	file := os.NewFile(uintptr(fd), "trusted-review-config")
+	if file == nil {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config descriptor is unavailable")
+	}
+	defer file.Close()
+	limited := &io.LimitedReader{R: file, N: maxTrustedReviewConfigSnapshotSize + 1}
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("read trusted review config snapshot: %w", err)
+	}
+	if len(raw) > maxTrustedReviewConfigSnapshotSize {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config snapshot exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var snapshot config.Config
+	if err := decoder.Decode(&snapshot); err != nil {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("decode trusted review config snapshot: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
+		return config.LoadedFileConfig{}, true, fmt.Errorf("decode trusted review config snapshot: %w", err)
+	}
+	if err := config.Validate(snapshot); err != nil {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("validate trusted review config snapshot: %w", err)
+	}
+	return config.LoadedFileConfig{Config: snapshot}, true, nil
+}
+
+func trustedReviewProxyChildEnv(trustedEnv map[string]string, configFD int) []string {
 	base := os.Environ()
 	envMap := make(map[string]string, len(base)+len(trustedEnv)+3)
 	for _, entry := range base {
@@ -423,16 +641,6 @@ func trustedReviewProxyChildEnv(trustedEnv map[string]string, configPath string)
 		}
 		envMap[key] = value
 	}
-	// Prevent proxy re-entry and never expose a trusted-env file path to the child
-	// beyond the direct token keys the daemon already holds in memory.
-	delete(envMap, TrustedReviewSockEnv)
-	delete(envMap, TrustedEnvFileEnv)
-	envMap[trustedReviewProxySkipEnv] = "1"
-	// Daemon-loaded config path wins over ambient LOOPER_CONFIG so children use
-	// the same config as looperd when it was started with --config only.
-	if path := strings.TrimSpace(configPath); path != "" {
-		envMap["LOOPER_CONFIG"] = path
-	}
 	for key, value := range trustedEnv {
 		key = strings.TrimSpace(key)
 		if key == "" {
@@ -440,12 +648,53 @@ func trustedReviewProxyChildEnv(trustedEnv map[string]string, configPath string)
 		}
 		envMap[key] = value
 	}
+	// Security controls are applied after every data-environment source. A
+	// configured Agent.Env or provider tokenEnv must not retarget the config,
+	// re-enter the proxy, or expose a trusted-env file path.
+	delete(envMap, TrustedReviewSockEnv)
+	delete(envMap, TrustedEnvFileEnv)
+	delete(envMap, TrustedReviewConfigFDEnv)
+	delete(envMap, "LOOPER_CONFIG")
+	envMap[trustedReviewProxySkipEnv] = "1"
+	if configFD >= 3 {
+		envMap[TrustedReviewConfigFDEnv] = strconv.Itoa(configFD)
+	}
 	out := make([]string, 0, len(envMap))
 	for key, value := range envMap {
 		out = append(out, key+"="+value)
 	}
 	return out
 }
+
+type trustedReviewBoundedBuffer struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func newTrustedReviewBoundedBuffer(limit int) *trustedReviewBoundedBuffer {
+	return &trustedReviewBoundedBuffer{limit: limit}
+}
+
+func (b *trustedReviewBoundedBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := b.limit - b.buffer.Len()
+	if remaining > 0 {
+		keep := len(p)
+		if keep > remaining {
+			keep = remaining
+		}
+		_, _ = b.buffer.Write(p[:keep])
+	}
+	if len(p) > remaining {
+		b.truncated = true
+	}
+	return written, nil
+}
+
+func (b *trustedReviewBoundedBuffer) String() string { return b.buffer.String() }
+
+func (b *trustedReviewBoundedBuffer) Truncated() bool { return b.truncated }
 
 // TrustedReviewSockConfigured reports whether this process should proxy
 // `review submit` through the daemon-side trusted socket.
@@ -485,7 +734,11 @@ func ProxyReviewSubmit(argv []string, stdin []byte, cwd string) error {
 		return fmt.Errorf("encode trusted review proxy request: %w", err)
 	}
 	var resp trustedReviewProxyResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+	limited := &io.LimitedReader{R: conn, N: maxTrustedReviewProxyResponseBytes + 1}
+	if err := json.NewDecoder(limited).Decode(&resp); err != nil {
+		if limited.N <= 0 {
+			return fmt.Errorf("trusted review proxy response exceeds size limit")
+		}
 		return fmt.Errorf("decode trusted review proxy response: %w", err)
 	}
 	if resp.Stdout != "" {

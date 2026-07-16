@@ -32,6 +32,50 @@ func TestCatalogPublishesFullConfigAtomically(t *testing.T) {
 	}
 }
 
+func TestCatalogPublishGlobalsPreservesMaterializedProjects(t *testing.T) {
+	t.Parallel()
+
+	oldModel := "old"
+	newModel := "new"
+	catalog := NewCatalog(config.Config{
+		Agent:    config.AgentConfig{Model: &oldModel},
+		Projects: []config.ProjectRefConfig{{ID: "import-input"}},
+	})
+	catalog.Publish([]config.ProjectRefConfig{{ID: "database", Repo: "core/database"}})
+
+	candidate := config.Config{
+		Agent:    config.AgentConfig{Model: &newModel, Env: map[string]string{"TOKEN": "original"}},
+		Projects: []config.ProjectRefConfig{{ID: "new-import-input"}},
+	}
+	catalog.PublishGlobals(candidate)
+	candidate.Agent.Env["TOKEN"] = "caller-mutated"
+
+	got := catalog.Snapshot()
+	if got.Agent.Model == nil || *got.Agent.Model != newModel || got.Agent.Env["TOKEN"] != "original" {
+		t.Fatalf("Snapshot().Agent = %#v, want detached new globals", got.Agent)
+	}
+	if len(got.Projects) != 1 || got.Projects[0].ID != "database" {
+		t.Fatalf("Snapshot().Projects = %#v, want preserved database view", got.Projects)
+	}
+}
+
+func TestCatalogPublishPreservesReloadedGlobals(t *testing.T) {
+	t.Parallel()
+
+	model := "reloaded"
+	catalog := NewCatalog(config.Config{})
+	catalog.PublishGlobals(config.Config{Agent: config.AgentConfig{Model: &model}})
+	catalog.Publish([]config.ProjectRefConfig{{ID: "database"}})
+
+	got := catalog.Snapshot()
+	if got.Agent.Model == nil || *got.Agent.Model != model {
+		t.Fatalf("Snapshot().Agent.Model = %#v, want reloaded globals", got.Agent.Model)
+	}
+	if len(got.Projects) != 1 || got.Projects[0].ID != "database" {
+		t.Fatalf("Snapshot().Projects = %#v, want database view", got.Projects)
+	}
+}
+
 func TestCatalogDoesNotRetainOrReturnMutableAliases(t *testing.T) {
 	t.Parallel()
 
@@ -110,6 +154,47 @@ func TestCatalogConcurrentSnapshotsObserveWholePublications(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+func TestCatalogConcurrentGlobalAndProjectPublicationsPreserveBothAuthorities(t *testing.T) {
+	t.Parallel()
+
+	catalog := NewCatalog(config.Config{})
+	const iterations = 300
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for index := 0; index < iterations; index++ {
+			model := "global-a"
+			if index == iterations-1 {
+				model = "global-final"
+			}
+			catalog.PublishGlobals(config.Config{
+				Agent:    config.AgentConfig{Model: &model},
+				Projects: []config.ProjectRefConfig{{ID: "must-never-publish"}},
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for index := 0; index < iterations; index++ {
+			projectID := "database-a"
+			if index == iterations-1 {
+				projectID = "database-final"
+			}
+			catalog.Publish([]config.ProjectRefConfig{{ID: projectID}})
+		}
+	}()
+	wg.Wait()
+
+	got := catalog.Snapshot()
+	if got.Agent.Model == nil || *got.Agent.Model != "global-final" {
+		t.Fatalf("Snapshot().Agent.Model = %#v, want final global publication", got.Agent.Model)
+	}
+	if len(got.Projects) != 1 || got.Projects[0].ID != "database-final" {
+		t.Fatalf("Snapshot().Projects = %#v, want final database publication", got.Projects)
+	}
 }
 
 func TestMaterializeCatalogUsesRecordsAsProjectAuthority(t *testing.T) {

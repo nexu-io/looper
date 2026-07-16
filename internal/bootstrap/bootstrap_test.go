@@ -44,8 +44,8 @@ func TestBootstrapLoadsConfigEnsuresPathsCreatesLoggerAndStartsRuntime(t *testin
 		Args: []string{"--port", "9999"},
 		Env:  map[string]string{"LOOPER_CONFIG": "/tmp/override.json"},
 		LoadConfig: func(options config.LoadFileOptions) (config.LoadedFileConfig, error) {
-			if options.CWD != "" {
-				t.Fatalf("LoadConfigOptions.CWD = %q, want empty string", options.CWD)
+			if options.CWD == "" {
+				t.Fatal("LoadConfigOptions.CWD is empty, want frozen bootstrap working directory")
 			}
 			if got, ok := options.LookupEnv("LOOPER_CONFIG"); !ok || got != "/tmp/override.json" {
 				t.Fatalf("LookupEnv(LOOPER_CONFIG) = (%q, %t), want (/tmp/override.json, true)", got, ok)

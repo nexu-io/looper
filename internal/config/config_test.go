@@ -36,6 +36,9 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	if loaded.Metadata.ConfigFilePresent {
 		t.Fatal("LoadFile().Metadata.ConfigFilePresent = true, want false")
 	}
+	if got, want := loaded.Metadata.ConfigFileRevision, ConfigFileRevision(nil, false); got != want {
+		t.Fatalf("LoadFile().Metadata.ConfigFileRevision = %q, want %q", got, want)
+	}
 
 	if loaded.Config.Server.Host != "127.0.0.1" {
 		t.Fatalf("LoadFile().Config.Server.Host = %q, want default %q", loaded.Config.Server.Host, "127.0.0.1")
@@ -57,7 +60,8 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 func TestLoadFileUsesDefaultsWhenConfigFileIsTopLevelNull(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
-	if err := os.WriteFile(configPath, []byte(`null`), 0o644); err != nil {
+	raw := []byte(`null`)
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
 
@@ -72,6 +76,9 @@ func TestLoadFileUsesDefaultsWhenConfigFileIsTopLevelNull(t *testing.T) {
 	}
 	if !loaded.Metadata.ConfigFilePresent {
 		t.Fatal("LoadFile().Metadata.ConfigFilePresent = false, want true")
+	}
+	if got, want := loaded.Metadata.ConfigFileRevision, ConfigFileRevision(raw, true); got != want {
+		t.Fatalf("LoadFile().Metadata.ConfigFileRevision = %q, want %q", got, want)
 	}
 	if loaded.Partial != (PartialConfig{}) {
 		t.Fatalf("LoadFile().Partial = %#v, want empty config", loaded.Partial)
@@ -672,6 +679,13 @@ func TestAgentTimeoutConfigOverrides(t *testing.T) {
 	got := loaded.Config.Agent.Timeouts
 	if got.PlannerSeconds != 1200 || got.PlannerMaxRuntimeSeconds != 1200 || got.WorkerSeconds != 4200 || got.WorkerMaxRuntimeSeconds != 4200 || got.ReviewerSeconds != 2100 || got.ReviewerMaxRuntimeSeconds != 2100 || got.FixerSeconds != 1800 || got.FixerMaxRuntimeSeconds != 1800 {
 		t.Fatalf("agent timeouts = %#v", got)
+	}
+	if loaded.Partial.Agent == nil || loaded.Partial.Agent.Timeouts == nil {
+		t.Fatalf("loaded raw timeout partial = %#v", loaded.Partial.Agent)
+	}
+	rawTimeouts := loaded.Partial.Agent.Timeouts
+	if rawTimeouts.PlannerMaxRuntimeSeconds != nil || rawTimeouts.WorkerMaxRuntimeSeconds != nil || rawTimeouts.ReviewerMaxRuntimeSeconds != nil || rawTimeouts.FixerMaxRuntimeSeconds != nil {
+		t.Fatalf("LoadFile mutated raw legacy timeout partial with canonical aliases: %#v", rawTimeouts)
 	}
 }
 

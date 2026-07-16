@@ -3,10 +3,11 @@ import { Link, NavLink, Outlet } from "react-router-dom";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
 
-const navItems: { to: string; label: string; end?: boolean }[] = [
+export const navItems: { to: string; label: string; end?: boolean }[] = [
   { to: "/", label: "Overview", end: true },
   { to: "/loops", label: "Loops" },
   { to: "/projects", label: "Projects" },
+  { to: "/config", label: "Config" },
 ];
 
 /** Public asset under Vite base (/dashboard/). */

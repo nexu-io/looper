@@ -41,6 +41,72 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	}
 }
 
+func TestWorkerDoesNotAttachOldVendorSessionsAfterVendorChange(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	sessionID := "codex-session-123"
+	metadata, err := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{
+		Question:  "Which datastore?",
+		SessionID: sessionID,
+		Vendor:    "codex",
+		Answer:    "postgres",
+		Status:    "answered",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	metadata, err = loops.WriteTakeoverResume(&metadata, loops.TakeoverResume{SessionID: sessionID})
+	if err != nil {
+		t.Fatalf("WriteTakeoverResume() error = %v", err)
+	}
+	loop.MetadataJSON = &metadata
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := loop.ProjectID
+	loopID := loop.ID
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{
+		ID:              "agent_old_vendor",
+		ProjectID:       &projectID,
+		LoopID:          &loopID,
+		Vendor:          "codex",
+		Status:          "completed",
+		NativeSessionID: &sessionID,
+		StartedAt:       fixture.nowISO(),
+		CreatedAt:       fixture.nowISO(),
+		UpdatedAt:       fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	sameVendor := New(Options{Repos: fixture.repos, AgentRuntime: "codex"})
+	if prompt, gotSession := sameVendor.pendingHumanAnswer(ctx, loop); !strings.Contains(prompt, "postgres") || gotSession != sessionID {
+		t.Fatalf("same-vendor HITL resume = (%q, %q), want decision prompt + %q", prompt, gotSession, sessionID)
+	}
+	if prompt, gotSession := sameVendor.pendingTakeoverResume(ctx, loop); prompt == "" || gotSession != sessionID {
+		t.Fatalf("same-vendor takeover resume = (%q, %q), want prompt + %q", prompt, gotSession, sessionID)
+	}
+	if got := sameVendor.latestNativeSessionID(ctx, loop.ID); got != sessionID {
+		t.Fatalf("same-vendor mailbox session = %q, want %q", got, sessionID)
+	}
+
+	newVendor := New(Options{Repos: fixture.repos, AgentRuntime: "claude-code"})
+	if prompt, gotSession := newVendor.pendingHumanAnswer(ctx, loop); !strings.Contains(prompt, "postgres") || !strings.Contains(prompt, "vendor changed") || gotSession != "" {
+		t.Fatalf("cross-vendor HITL resume = (%q, %q), want decision prompt + fresh session", prompt, gotSession)
+	}
+	if prompt, gotSession := newVendor.pendingTakeoverResume(ctx, loop); !strings.Contains(prompt, "fresh session") || gotSession != "" {
+		t.Fatalf("cross-vendor takeover resume = (%q, %q), want checkpoint prompt + fresh session", prompt, gotSession)
+	}
+	if got := newVendor.latestNativeSessionID(ctx, loop.ID); got != "" {
+		t.Fatalf("cross-vendor mailbox session = %q, want fresh session", got)
+	}
+}
+
 func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	ctx := context.Background()
