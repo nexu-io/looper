@@ -20,7 +20,11 @@ import {
   type StatusData,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
-import { formatAge } from "@/lib/format";
+import {
+  formatAge,
+  formatAttempts,
+  truncateReason,
+} from "@/lib/format";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
 
 const STATUS_SLOW_MS = 45_000;
@@ -262,6 +266,31 @@ export function OverviewPage({
             {activeAgentLabel(r)}
           </span>
         ),
+      },
+      {
+        key: "attempts",
+        header: "Attempts",
+        cell: (r) => (
+          <span className="mono text-[var(--text-muted)]">
+            {formatAttempts(r.attempts, r.maxAttempts) ?? "—"}
+          </span>
+        ),
+      },
+      {
+        key: "reason",
+        header: "Reason",
+        cell: (r) => {
+          const full = r.lastFailureReason?.trim() || null;
+          const display = full ? truncateReason(full, 48) ?? "—" : "—";
+          return (
+            <span
+              className="mono text-[var(--text-muted)] max-w-[14rem] truncate inline-block align-bottom"
+              title={full ?? undefined}
+            >
+              {display}
+            </span>
+          );
+        },
       },
       {
         key: "age",

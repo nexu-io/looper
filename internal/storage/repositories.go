@@ -1440,6 +1440,54 @@ func (r *QueueRepository) GetLatestByLoopID(ctx context.Context, loopID string) 
 	return &record, nil
 }
 
+// ListLatestByLoopIDs returns the latest queue item per loop_id for the given IDs.
+// Ordering within a loop matches GetLatestByLoopID: updated_at, created_at, id DESC.
+func (r *QueueRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []string) ([]QueueItemRecord, error) {
+	if len(loopIDs) == 0 {
+		return []QueueItemRecord{}, nil
+	}
+	chunks := chunkStrings(loopIDs, sqliteMaxVariables)
+	items := make([]QueueItemRecord, 0, len(loopIDs))
+	for _, chunk := range chunks {
+		args := make([]any, 0, len(chunk))
+		for _, loopID := range chunk {
+			args = append(args, loopID)
+		}
+		rows, err := r.q.QueryContext(ctx, `
+			SELECT
+				id, project_id, loop_id, type, target_type, target_id, repo, pr_number, dedupe_key,
+				priority, status, available_at, attempts, max_attempts, claimed_by, claimed_at,
+				started_at, finished_at, lock_key, payload_json, last_error, last_error_kind,
+				created_at, updated_at
+			FROM (
+				SELECT
+					queue_items.*,
+					ROW_NUMBER() OVER (
+						PARTITION BY loop_id
+						ORDER BY updated_at DESC, created_at DESC, id DESC
+					) AS row_num
+				FROM queue_items
+				WHERE loop_id IN (`+sqlPlaceholders(len(chunk))+`)
+			)
+			WHERE row_num = 1
+			ORDER BY updated_at DESC, created_at DESC, id DESC
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list latest queue items by loop ids: %w", err)
+		}
+		chunkItems, scanErr := scanQueueItems(rows)
+		closeErr := rows.Close()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close list latest queue items by loop ids rows: %w", closeErr)
+		}
+		items = append(items, chunkItems...)
+	}
+	return items, nil
+}
+
 func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM queue_items ORDER BY created_at DESC`)
 	if err != nil {

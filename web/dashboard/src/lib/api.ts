@@ -188,6 +188,10 @@ export type ActiveRun = {
   status: string;
   loopStatus: string;
   displayStatus: string;
+  /** Current attempt count from latest queue item when present. */
+  attempts?: number | null;
+  /** Max attempts (-1 = unlimited) from latest queue item when present. */
+  maxAttempts?: number | null;
   lastFailureKind?: string | null;
   lastFailureReason?: string | null;
   resumePolicy?: string | null;
@@ -219,6 +223,12 @@ export type Loop = {
   nextRunAt?: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Current attempt count from latest queue item when present. */
+  attempts?: number | null;
+  /** Max attempts (-1 = unlimited) from latest queue item when present. */
+  maxAttempts?: number | null;
+  lastFailureKind?: string | null;
+  lastFailureReason?: string | null;
 };
 
 export type LoopsList = {

@@ -31,6 +31,41 @@ export function formatTs(iso: string | null | undefined): string {
   }
 }
 
+/**
+ * Format attempt count as current/max (e.g. "2/5", "1/-1" for unlimited).
+ * Returns null when attempt metadata is absent so callers can hide clutter.
+ */
+export function formatAttempts(
+  attempts: number | null | undefined,
+  maxAttempts: number | null | undefined,
+): string | null {
+  if (attempts == null || Number.isNaN(Number(attempts))) {
+    return null;
+  }
+  const current = Math.trunc(Number(attempts));
+  if (maxAttempts == null || Number.isNaN(Number(maxAttempts))) {
+    return String(current);
+  }
+  return `${current}/${Math.trunc(Number(maxAttempts))}`;
+}
+
+/**
+ * Collapse whitespace and truncate for dense list rows. Full text stays in title/tooltip.
+ */
+export function truncateReason(
+  value: string | null | undefined,
+  max = 64,
+): string | null {
+  if (value == null) return null;
+  const collapsed = value.replace(/\s+/g, " ").trim();
+  if (!collapsed) return null;
+  if (max <= 0) return "";
+  const runes = Array.from(collapsed);
+  if (runes.length <= max) return collapsed;
+  if (max <= 3) return runes.slice(0, max).join("");
+  return `${runes.slice(0, max - 3).join("")}...`;
+}
+
 export function statusColor(status: string | null | undefined): string {
   const s = (status ?? "").toLowerCase();
   if (

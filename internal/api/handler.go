@@ -1441,6 +1441,11 @@ type loopResponse struct {
 	NextRunAt    *string `json:"nextRunAt"`
 	CreatedAt    string  `json:"createdAt"`
 	UpdatedAt    string  `json:"updatedAt"`
+	// Queue-derived diagnostics (latest queue item / run), matching looper describe / ps.
+	Attempts          *int64  `json:"attempts,omitempty"`
+	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
+	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
+	LastFailureReason *string `json:"lastFailureReason,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -1543,6 +1548,8 @@ type activeRunView struct {
 	Status            string             `json:"status"`
 	LoopStatus        string             `json:"loopStatus"`
 	DisplayStatus     string             `json:"displayStatus"`
+	Attempts          *int64             `json:"attempts,omitempty"`
+	MaxAttempts       *int64             `json:"maxAttempts,omitempty"`
 	LastFailureKind   *string            `json:"lastFailureKind,omitempty"`
 	LastFailureReason *string            `json:"lastFailureReason,omitempty"`
 	ResumePolicy      *string            `json:"resumePolicy,omitempty"`
@@ -1717,9 +1724,41 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 
+		loopIDs := make([]string, 0, len(items))
+		for _, item := range items {
+			loopIDs = append(loopIDs, item.ID)
+		}
+		latestQueueByLoopID := map[string]*storage.QueueItemRecord{}
+		latestRunByLoopID := map[string]*storage.RunRecord{}
+		if len(loopIDs) > 0 && services.Repositories.Queue != nil {
+			queues, qErr := services.Repositories.Queue.ListLatestByLoopIDs(r.Context(), loopIDs)
+			if qErr != nil {
+				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: qErr.Error()}
+			}
+			for i := range queues {
+				item := &queues[i]
+				if item.LoopID == nil || strings.TrimSpace(*item.LoopID) == "" {
+					continue
+				}
+				latestQueueByLoopID[*item.LoopID] = item
+			}
+		}
+		if len(loopIDs) > 0 && services.Repositories.Runs != nil {
+			runs, rErr := services.Repositories.Runs.ListLatestByLoopIDs(r.Context(), loopIDs)
+			if rErr != nil {
+				return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: rErr.Error()}
+			}
+			for i := range runs {
+				run := &runs[i]
+				latestRunByLoopID[run.LoopID] = run
+			}
+		}
+
 		responseItems := make([]loopResponse, 0, len(items))
 		for _, item := range items {
-			responseItems = append(responseItems, serializeLoop(item))
+			view := serializeLoop(item)
+			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID])
+			responseItems = append(responseItems, view)
 		}
 
 		resp := loopsListResponse{
@@ -2888,6 +2927,10 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	}
 	view.DisplayStatus = view.Status
 	if latestQueue != nil {
+		attempts := latestQueue.Attempts
+		maxAttempts := latestQueue.MaxAttempts
+		view.Attempts = &attempts
+		view.MaxAttempts = &maxAttempts
 		view.LastFailureKind = latestQueue.LastErrorKind
 		view.LastFailureReason = latestQueue.LastError
 	}
@@ -2914,6 +2957,31 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status
+	}
+}
+
+// decorateLoopDiagnostics attaches latest-queue attempt counts and failure reason
+// (with the same run fallback as active-run views) for dashboard list/detail.
+func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
+	if view == nil {
+		return
+	}
+	if latestQueue != nil {
+		attempts := latestQueue.Attempts
+		maxAttempts := latestQueue.MaxAttempts
+		view.Attempts = &attempts
+		view.MaxAttempts = &maxAttempts
+		view.LastFailureKind = latestQueue.LastErrorKind
+		view.LastFailureReason = latestQueue.LastError
+	}
+	if view.LastFailureReason == nil || strings.TrimSpace(*view.LastFailureReason) == "" {
+		if latestRun != nil {
+			if latestRun.ErrorMessage != nil && strings.TrimSpace(*latestRun.ErrorMessage) != "" {
+				view.LastFailureReason = latestRun.ErrorMessage
+			} else if shouldUseRunSummaryAsFailureReason(latestRun) && latestRun.Summary != nil && strings.TrimSpace(*latestRun.Summary) != "" {
+				view.LastFailureReason = latestRun.Summary
+			}
+		}
 	}
 }
 
@@ -3276,7 +3344,7 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 		if r.Method != http.MethodGet {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
-		return serializeLoop(loop), nil
+		return h.serializeLoopWithDiagnostics(r.Context(), loop)
 	}
 
 	subresource := parts[1]
@@ -5618,6 +5686,30 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		CreatedAt:    loop.CreatedAt,
 		UpdatedAt:    loop.UpdatedAt,
 	}
+}
+
+// serializeLoopWithDiagnostics loads latest queue/run and attaches attempt/error fields.
+func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage.LoopRecord) (loopResponse, error) {
+	view := serializeLoop(loop)
+	services := h.context.Runtime.Services()
+	var latestQueue *storage.QueueItemRecord
+	var latestRun *storage.RunRecord
+	if services.Repositories != nil && services.Repositories.Queue != nil {
+		queue, err := services.Repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		latestQueue = queue
+	}
+	if services.Repositories != nil && services.Repositories.Runs != nil {
+		run, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		latestRun = run
+	}
+	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	return view, nil
 }
 
 func serializeRun(run storage.RunRecord) runResponse {

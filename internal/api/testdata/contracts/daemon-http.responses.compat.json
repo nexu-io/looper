@@ -638,7 +638,11 @@
               "lastRunAt": "2026-04-11T12:00:00.000Z",
               "nextRunAt": "2026-04-11T12:00:00.000Z",
               "createdAt": "2026-04-11T12:00:00.000Z",
-              "updatedAt": "2026-04-11T12:00:00.000Z"
+              "updatedAt": "2026-04-11T12:00:00.000Z",
+              "attempts": 1,
+              "maxAttempts": 3,
+              "lastFailureKind": "manual_intervention",
+              "lastFailureReason": "dirty worker worktree"
             }
           ],
           "total": 1,
@@ -692,7 +696,11 @@
           "lastRunAt": "2026-04-11T12:00:00.000Z",
           "nextRunAt": "2026-04-11T12:00:00.000Z",
           "createdAt": "2026-04-11T12:00:00.000Z",
-          "updatedAt": "2026-04-11T12:00:00.000Z"
+          "updatedAt": "2026-04-11T12:00:00.000Z",
+          "attempts": 1,
+          "maxAttempts": 3,
+          "lastFailureKind": "manual_intervention",
+          "lastFailureReason": "dirty worker worktree"
         },
         "requestId": "fixture-request-id"
       }
@@ -1092,6 +1100,8 @@
               "status": "queued",
               "loopStatus": "queued",
               "displayStatus": "queued",
+              "attempts": 0,
+              "maxAttempts": 3,
               "currentStep": null,
               "startedAt": "<generated-timestamp>",
               "target": {

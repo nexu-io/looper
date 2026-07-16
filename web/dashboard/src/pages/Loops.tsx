@@ -8,7 +8,12 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { fetchLoops, type ActiveRun, type Loop } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
-import { formatAge, formatTs } from "@/lib/format";
+import {
+  formatAge,
+  formatAttempts,
+  formatTs,
+  truncateReason,
+} from "@/lib/format";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
 import { usePolling } from "@/lib/usePolling";
 
@@ -54,6 +59,25 @@ function agentLabel(run: ActiveRun | undefined): string {
   const pid = agent.pid != null ? `pid ${agent.pid}` : "no pid";
   const vendor = agent.vendor || "agent";
   return `${vendor} · ${pid}`;
+}
+
+/** Prefer loop fields; fall back to joined active-run diagnostics when present. */
+function rowAttempts(l: LoopRow): string {
+  return (
+    formatAttempts(l.attempts, l.maxAttempts) ??
+    formatAttempts(l.activeRun?.attempts, l.activeRun?.maxAttempts) ??
+    "—"
+  );
+}
+
+function rowReason(l: LoopRow): { display: string; full: string | null } {
+  const full =
+    (l.lastFailureReason && l.lastFailureReason.trim()) ||
+    (l.activeRun?.lastFailureReason &&
+      l.activeRun.lastFailureReason.trim()) ||
+    null;
+  if (!full) return { display: "—", full: null };
+  return { display: truncateReason(full, 48) ?? "—", full };
 }
 
 export function LoopsPage() {
@@ -185,6 +209,28 @@ export function LoopsPage() {
             {agentLabel(l.activeRun)}
           </span>
         ),
+      },
+      {
+        key: "attempts",
+        header: "Attempts",
+        cell: (l) => (
+          <span className="mono text-[var(--text-muted)]">{rowAttempts(l)}</span>
+        ),
+      },
+      {
+        key: "reason",
+        header: "Reason",
+        cell: (l) => {
+          const { display, full } = rowReason(l);
+          return (
+            <span
+              className="mono text-[var(--text-muted)] max-w-[14rem] truncate inline-block align-bottom"
+              title={full ?? undefined}
+            >
+              {display}
+            </span>
+          );
+        },
       },
       {
         key: "age",

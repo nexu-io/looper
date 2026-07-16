@@ -428,6 +428,65 @@ func TestHandlerActiveRunsSurfacesManualInterventionStatus(t *testing.T) {
 	assertEqual(t, item["loopStatus"], "paused")
 	assertEqual(t, item["lastFailureKind"], "manual_intervention")
 	assertEqual(t, item["lastFailureReason"], "dirty worker worktree")
+	assertEqual(t, item["attempts"], float64(1))
+	assertEqual(t, item["maxAttempts"], float64(3))
+}
+
+func TestHandlerLoopDetailAndListSurfaceAttemptsAndFailureReason(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_loop_diag"
+	loopID := "loop_loop_diag"
+	targetID := projectID
+	lastErrorKind := "retryable_transient"
+	lastError := "agent idle timed out after 10m0s without observable progress"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 569, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "failed", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_loop_diag", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID,
+		DedupeKey: "worker:loop_diag", Priority: storage.QueuePriorityWorker, Status: "failed", AvailableAt: nowISO,
+		Attempts: 2, MaxAttempts: -1, LastError: &lastError, LastErrorKind: &lastErrorKind, FinishedAt: &nowISO,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/569", nil)
+	detailRec := httptest.NewRecorder()
+	h.ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
+	}
+	detailBody := parseJSONMap(t, detailRec.Body.Bytes())
+	detail := detailBody["data"].(map[string]any)
+	assertEqual(t, detail["attempts"], float64(2))
+	assertEqual(t, detail["maxAttempts"], float64(-1))
+	assertEqual(t, detail["lastFailureKind"], "retryable_transient")
+	assertEqual(t, detail["lastFailureReason"], lastError)
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops?status=failed", nil)
+	listRec := httptest.NewRecorder()
+	h.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200; body=%s", listRec.Code, listRec.Body.String())
+	}
+	listBody := parseJSONMap(t, listRec.Body.Bytes())
+	items := listBody["data"].(map[string]any)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("list items len = %d, want 1: %#v", len(items), items)
+	}
+	listItem := items[0].(map[string]any)
+	assertEqual(t, listItem["attempts"], float64(2))
+	assertEqual(t, listItem["maxAttempts"], float64(-1))
+	assertEqual(t, listItem["lastFailureKind"], "retryable_transient")
+	assertEqual(t, listItem["lastFailureReason"], lastError)
 }
 
 func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {

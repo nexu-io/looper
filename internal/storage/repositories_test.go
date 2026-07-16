@@ -1597,6 +1597,24 @@ func TestTargetedListRepositories(t *testing.T) {
 		t.Fatalf("Queue.ListLatestByLoopStatuses() ids = %#v, want %#v", latestQueueIDs, want)
 	}
 
+	latestQueueByIDs, err := repos.Queue.ListLatestByLoopIDs(ctx, []string{loopManual, loopDone, loopQueued})
+	if err != nil {
+		t.Fatalf("Queue.ListLatestByLoopIDs() error = %v", err)
+	}
+	if len(latestQueueByIDs) != 3 {
+		t.Fatalf("len(Queue.ListLatestByLoopIDs()) = %d, want 3", len(latestQueueByIDs))
+	}
+	latestByLoop := map[string]string{}
+	for _, item := range latestQueueByIDs {
+		if item.LoopID == nil {
+			t.Fatalf("Queue.ListLatestByLoopIDs() item missing loop id: %#v", item)
+		}
+		latestByLoop[*item.LoopID] = item.ID
+	}
+	if latestByLoop[loopManual] != "queue_manual" || latestByLoop[loopQueued] != "queue_queued" || latestByLoop[loopDone] != "queue_done" {
+		t.Fatalf("Queue.ListLatestByLoopIDs() by loop = %#v, want latest ids per loop", latestByLoop)
+	}
+
 	latestRuns, err := repos.Runs.ListLatestByLoopIDs(ctx, []string{loopManual, loopDone})
 	if err != nil {
 		t.Fatalf("Runs.ListLatestByLoopIDs() error = %v", err)

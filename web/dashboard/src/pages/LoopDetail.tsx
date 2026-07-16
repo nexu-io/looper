@@ -20,7 +20,7 @@ import {
   type LoopLogsSnapshot,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
-import { formatTs } from "@/lib/format";
+import { formatAttempts, formatTs } from "@/lib/format";
 import { capLogChunk, capLogSeed, trimLogBuffer } from "@/lib/logBuffer";
 import {
   type LogsStreamPhase,
@@ -482,6 +482,32 @@ export function LoopDetailPage() {
               <Kv
                 label="PR"
                 value={data.prNumber != null ? String(data.prNumber) : "—"}
+              />
+              <Kv
+                label="Attempts"
+                value={
+                  formatAttempts(data.attempts, data.maxAttempts) ?? "—"
+                }
+              />
+              <Kv
+                label="Error kind"
+                value={
+                  data.lastFailureKind?.trim()
+                    ? data.lastFailureKind.trim()
+                    : "—"
+                }
+              />
+              <Kv
+                label="Error / reason"
+                value={
+                  data.lastFailureReason?.trim() ? (
+                    <span className="whitespace-pre-wrap break-words">
+                      {data.lastFailureReason.trim()}
+                    </span>
+                  ) : (
+                    "—"
+                  )
+                }
               />
               <Kv label="Last run" value={formatTs(data.lastRunAt)} />
               <Kv label="Next run" value={formatTs(data.nextRunAt)} />
