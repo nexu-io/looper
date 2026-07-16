@@ -133,6 +133,34 @@ func TestLocalAPIClientFromLoadedBracketsIPv6(t *testing.T) {
 	}
 }
 
+// Wildcard binds are not valid request Host values under the browser Host guard.
+// CLI clients (daemon status, config, etc.) must dial loopback like dashboardAPIClient.
+func TestAPIClientsMapWildcardBindToLoopback(t *testing.T) {
+	t.Parallel()
+
+	r := newCommandRuntime(New(Deps{}), nil)
+	for _, host := range []string{"0.0.0.0", "::", "[::]"} {
+		loaded := config.LoadedFileConfig{
+			Config: config.Config{
+				Server: config.ServerConfig{
+					Host: host,
+					Port: 17310,
+				},
+			},
+		}
+		want := "http://127.0.0.1:17310"
+		if got := r.localAPIClientFromLoaded(loaded).baseURL; got != want {
+			t.Fatalf("localAPIClientFromLoaded(%q) baseURL = %q, want %q", host, got, want)
+		}
+		if got := r.apiClientFromLoaded(loaded).baseURL; got != want {
+			t.Fatalf("apiClientFromLoaded(%q) baseURL = %q, want %q", host, got, want)
+		}
+		if got := r.dashboardAPIClient(loaded).baseURL; got != want {
+			t.Fatalf("dashboardAPIClient(%q) baseURL = %q, want %q", host, got, want)
+		}
+	}
+}
+
 func TestDashboardWildcardHostProbesLoopback(t *testing.T) {
 	t.Parallel()
 

@@ -164,9 +164,8 @@ function LogsPane({ selector }: { selector: string }) {
       };
 
       const startStderrFollow = (snap: LoopLogsSnapshot) => {
-        // Open stderr=1 unless default follow already covers stderr-only output.
-        // Needed for non-empty stdout and for initially empty snapshots (default
-        // may later lock onto stdout and drop subsequent stderr).
+        // Always open stderr=1. Default follow may track stderr while stdout is
+        // blank then switch to stdout, dropping later stderr without this stream.
         if (!needsSeparateStderrFollow(snap.agent)) return;
 
         const primaryStderr = snap.agent?.stderr ?? "";

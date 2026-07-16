@@ -58,30 +58,25 @@ describe("nextReconnectDelayMs", () => {
 });
 
 describe("needsSeparateStderrFollow", () => {
-  it("is true when default follow would stick to non-empty stdout", () => {
+  it("is always true so stderr is not dropped after default locks onto stdout", () => {
     expect(
       needsSeparateStderrFollow({ stdout: "out\n", stderr: "err\n" }),
     ).toBe(true);
     expect(needsSeparateStderrFollow({ stdout: "out\n", stderr: "" })).toBe(
       true,
     );
-  });
-
-  it("is true for initially empty snapshots so later stderr is not dropped", () => {
     expect(needsSeparateStderrFollow({ stdout: "", stderr: "" })).toBe(true);
     expect(needsSeparateStderrFollow({ stdout: "  ", stderr: "  " })).toBe(
       true,
     );
     expect(needsSeparateStderrFollow(null)).toBe(true);
     expect(needsSeparateStderrFollow(undefined)).toBe(true);
-  });
-
-  it("is false when default follow already covers stderr-only output", () => {
+    // stderr-only: default may later switch to stdout; keep secondary follow.
     expect(needsSeparateStderrFollow({ stdout: "", stderr: "err\n" })).toBe(
-      false,
+      true,
     );
     expect(needsSeparateStderrFollow({ stdout: "  ", stderr: "err\n" })).toBe(
-      false,
+      true,
     );
   });
 });
