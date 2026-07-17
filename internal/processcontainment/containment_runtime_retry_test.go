@@ -121,10 +121,26 @@ func TestDarwinAndLinuxGroupSignalSemantics(t *testing.T) {
 	_, _ = cmd.Process.Wait()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(-pgid, 0); errors.Is(err, syscall.ESRCH) {
+		// Match package confirmed-dead semantics: on Linux, kill(-pgid, 0) can
+		// still succeed for zombie-only groups, which are not runnable.
+		if !groupStillRunnable(pgid) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("group %d still runnable after SIGKILL on %s", pgid, runtime.GOOS)
+}
+
+// groupStillRunnable mirrors Handle.groupRunnable for tests outside a Handle:
+// signal-0 liveness plus the Linux non-zombie /proc filter.
+func groupStillRunnable(pgid int) bool {
+	err := syscall.Kill(-pgid, 0)
+	if err != nil {
+		// ESRCH (or equivalent) => no addressable group members.
+		return !errors.Is(err, syscall.ESRCH)
+	}
+	if live, ok := groupHasNonZombieMember(pgid); ok {
+		return live
+	}
+	return true
 }

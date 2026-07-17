@@ -95,7 +95,19 @@ exit 0
 func TestSignalOnlyIsNeverSuccess(t *testing.T) {
 	requireUnixProcessGroup(t)
 
-	cmd := exec.Command("/bin/sh", "-c", `trap '' TERM; while true; do sleep 0.05; done`)
+	// Ready-file handshake: Start only guarantees the shell is exec'd, not that
+	// trap '' TERM is installed. Signaling early can kill the leader and leave
+	// a zombie that assertProcessRunning rejects on Linux.
+	workDir := t.TempDir()
+	readyPath := filepath.Join(workDir, "ready")
+	script := `
+trap '' TERM
+echo ready > "$READY_FILE"
+while true; do sleep 0.05; done
+`
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(), "READY_FILE="+readyPath)
 	handle, err := Start(cmd, Options{
 		GracePeriod:  50 * time.Millisecond,
 		DrainTimeout: 2 * time.Second,
@@ -107,6 +119,7 @@ func TestSignalOnlyIsNeverSuccess(t *testing.T) {
 		_ = handle.Kill(context.Background())
 	})
 
+	waitForReadyFile(t, readyPath)
 	if err := handle.SignalGroup(syscall.SIGTERM); err != nil {
 		t.Fatalf("SignalGroup(SIGTERM) error = %v", err)
 	}
