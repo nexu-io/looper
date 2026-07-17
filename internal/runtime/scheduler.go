@@ -3362,13 +3362,11 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	// Gate the entire work-producing tick (discovery, HITL, claims, stale
 	// reconcile), not only ClaimNext*. Admission closed during starting/stopping
 	// must not enqueue via CreateOrGetActiveByDedupe or requeue via reconcile.
-	if input.AllowClaim != nil {
-		if err := input.AllowClaim(); err != nil {
-			if input.Logger != nil {
-				input.Logger.Debug("scheduler tick skipped: admission closed", map[string]any{"error": err.Error()})
-			}
-			return nil
+	if err := admissionRefuseWork(input); err != nil {
+		if input.Logger != nil {
+			input.Logger.Debug("scheduler tick skipped: admission closed", map[string]any{"error": err.Error()})
 		}
+		return nil
 	}
 
 	startedAt := time.Now()
@@ -3440,6 +3438,15 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			retErr = errors.Join(append(errs, err)...)
 			return retErr
 		}
+		// Recheck before each project's work-producing lanes so BeginShutdown
+		// during HTTP drain cannot leave a tick that passed the entry gate free
+		// to enqueue discovery/HITL after admission is already stopping.
+		if err := admissionRefuseWork(input); err != nil {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler tick stopped mid-flight: admission closed", map[string]any{"error": err.Error(), "projectId": project.ID})
+			}
+			break
+		}
 		if project.Archived {
 			continue
 		}
@@ -3467,6 +3474,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
 				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -3483,6 +3493,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
+				if err := admissionRefuseWork(input); err != nil {
+					break
+				}
 				appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
 					_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 					return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
@@ -3492,6 +3505,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
 				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -3508,6 +3524,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
+				if err := admissionRefuseWork(input); err != nil {
+					break
+				}
 				appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
 					result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 					trackRunnableDiscovery(result.QueueItems)
@@ -3520,6 +3539,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "worker issue discovery", project.ID, repo, func() error {
 				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -3533,12 +3555,17 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 
 		// HITL (github transport): deliver any human answers posted on this
 		// project's awaiting_human PRs so those loops resume.
+		if err := admissionRefuseWork(input); err != nil {
+			break
+		}
 		runGitHubHITLPoll(ctx, input, project)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
 	// deliver any answers for this looper's awaiting loops.
-	runFeishuHITLPoll(ctx, input)
+	if err := admissionRefuseWork(input); err == nil {
+		runFeishuHITLPoll(ctx, input)
+	}
 
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
@@ -3548,6 +3575,16 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	}
 	retErr = errors.Join(errs...)
 	return retErr
+}
+
+// admissionRefuseWork rechecks the admission projection mid-tick. Nil AllowClaim
+// means ungated (tests). A non-nil error means admission is closed and the
+// caller must not start further discovery/HITL enqueue work.
+func admissionRefuseWork(input defaultSchedulerTickInput) error {
+	if input.AllowClaim == nil {
+		return nil
+	}
+	return input.AllowClaim()
 }
 
 func discoveryEnabled(value *bool) bool {
@@ -3666,11 +3703,10 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		input = input.RefreshForClaim()
 	}
 	// Re-check after RefreshForClaim so a mid-tick catalog snapshot cannot open
-	// claims/reconcile after admission closed. Discovery/HITL are gated at tick start.
-	if input.AllowClaim != nil {
-		if err := input.AllowClaim(); err != nil {
-			return 0, 0, nil
-		}
+	// claims/reconcile after admission closed. Discovery/HITL recheck via
+	// admissionRefuseWork around each work-producing lane as well.
+	if err := admissionRefuseWork(input); err != nil {
+		return 0, 0, nil
 	}
 	start := time.Now()
 	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)

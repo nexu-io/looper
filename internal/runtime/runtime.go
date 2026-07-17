@@ -361,11 +361,20 @@ func (r *Runtime) Stop(reason string) {
 
 // BeginShutdown transitions admission to stopping without closing storage.
 // Daemon stop drains HTTP ingress after this so mutations/claims stop first.
+// Also cancels the scheduler context so an in-flight full tick observes
+// cancellation during the HTTP drain window before Runtime.Stop closes the
+// loop; work-producing lanes still recheck AllowClaim as the Authority.
 func (r *Runtime) BeginShutdown(reason string) {
 	if r == nil {
 		return
 	}
 	_ = r.admission.BeginShutdown(reason)
+	r.mu.Lock()
+	cancel := r.schedulerCancel
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // AdmissionState returns the authoritative live admission state.
@@ -852,6 +861,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
+		// startSchedulerLoop already fired an immediate full tick while admission
+		// was still starting (gate no-op). Wake full + claim pumps now that
+		// admission is ready so discovery/HITL do not wait a full poll interval.
+		r.TriggerSchedulerTick()
 
 		if r.logger != nil {
 			catalog := r.Config()
