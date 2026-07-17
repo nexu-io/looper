@@ -355,10 +355,10 @@ func TestSafetyFloorAdmissionCloseMidBatchProcessesClaimedItems(t *testing.T) {
 	var allowCalls atomic.Int64
 	worker := &stubWorkerScheduler{}
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
-		Repos:        repos,
-		Now:          func() time.Time { return now },
-		Worker:       worker,
-		AsyncRunner:  immediateSchedulerRunner{},
+		Repos:       repos,
+		Now:         func() time.Time { return now },
+		Worker:      worker,
+		AsyncRunner: immediateSchedulerRunner{},
 		AllowClaim: func() error {
 			// First call: allow claim of slot 0. Second call: admission stopping
 			// before slot 1 — mid-batch close with one durable claim already held.
