@@ -76,9 +76,10 @@ const (
 )
 
 type RecoveryOrphanAgentCleanup struct {
-	Attempted    bool   `json:"attempted"`
-	CleanedCount int64  `json:"cleanedCount"`
-	Warning      string `json:"warning,omitempty"`
+	Attempted        bool   `json:"attempted"`
+	CleanedCount     int64  `json:"cleanedCount"`
+	QuarantinedCount int64  `json:"quarantinedCount"`
+	Warning          string `json:"warning,omitempty"`
 }
 
 type Options struct {
@@ -181,7 +182,11 @@ type Runtime struct {
 	schedulerDisabled           bool
 	startupReadyOnce            sync.Once
 	startupReadyErr             error
-	ownershipAcquired           bool
+	// ownershipAcquired remains true after CompleteStartup succeeds so stop
+	// still writes looperd.stopped. Admission is the sole ready Authority;
+	// this flag is not a mutation/claim gate.
+	ownershipAcquired bool
+	admission         *Admission
 }
 
 type runtimeNetworkManager interface {
@@ -263,6 +268,7 @@ func New(options Options) *Runtime {
 		activeExecutions:            NewActiveExecutionRegistry(),
 		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
+		admission:                   NewAdmission(),
 	}
 	if rt.webhook != nil {
 		rt.webhook.forwarder = rt.WebhookForwarder
@@ -301,6 +307,10 @@ func (r *Runtime) Stop(reason string) {
 		if r.logger != nil {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
+
+		// Close admission before draining producers so claim/mutation projections
+		// refuse new work while shutdown proceeds (ADR-0015 shutdown order).
+		_ = r.admission.BeginShutdown(reason)
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
@@ -347,6 +357,47 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopped", map[string]any{"reason": reason})
 		}
 	})
+}
+
+// BeginShutdown transitions admission to stopping without closing storage.
+// Daemon stop drains HTTP ingress after this so mutations/claims stop first.
+func (r *Runtime) BeginShutdown(reason string) {
+	if r == nil {
+		return
+	}
+	_ = r.admission.BeginShutdown(reason)
+}
+
+// AdmissionState returns the authoritative live admission state.
+func (r *Runtime) AdmissionState() AdmissionState {
+	if r == nil || r.admission == nil {
+		return AdmissionStopping
+	}
+	return r.admission.State()
+}
+
+// AllowMutations is the HTTP mutation readiness projection of admission.
+func (r *Runtime) AllowMutations() error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.AllowMutations()
+}
+
+// AllowClaim is the scheduler claim projection of admission.
+func (r *Runtime) AllowClaim() error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.AllowClaim()
+}
+
+// MarkDegraded sticks admission until restart/clear.
+func (r *Runtime) MarkDegraded(reason string) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.MarkDegraded(reason)
 }
 
 func (r *Runtime) WaitForShutdown() {
@@ -794,6 +845,13 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.startDeferredReviewerRecovery(githubGateway)
 		r.startConfigReloadLoop()
 
+		// Open admission only after recovery and producer loops are assembled.
+		// HTTP mutations and scheduler claims are projections of this state.
+		if err := r.admission.MarkReady("complete startup"); err != nil {
+			r.startupReadyErr = err
+			return
+		}
+
 		if r.logger != nil {
 			catalog := r.Config()
 			r.logger.Info("looperd runtime assembled", map[string]any{
@@ -803,6 +861,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 				"backupRequired":         r.config.Package.RequireBackupBeforeMigrate,
 				"recoverySummary":        recoverySummary,
 				"schedulerDefaultActive": !r.customSchedulerTick && !schedulerDisabled,
+				"admissionState":         string(r.admission.State()),
 			})
 		}
 	})
@@ -1250,6 +1309,10 @@ func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Serv
 }
 
 func (r *Runtime) executeSchedulerClaimPass(ctx context.Context) {
+	// Claim is a projection of admission — refuse before any durable claim.
+	if err := r.AllowClaim(); err != nil {
+		return
+	}
 	r.mu.RLock()
 	services := r.services
 	claim := r.defaultSchedulerClaim
@@ -1287,64 +1350,87 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.OrphanAgentCleanup.Attempted = true
 	uncertainAgentRunIDs := make(map[string]struct{})
 	uncertainExecutionIDs := make(map[string]struct{})
+	quarantinedLoopIDs := make(map[string]struct{})
 	if repositories.AgentExecutions != nil {
 		activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
 		if err != nil {
 			return RecoverySummary{}, err
 		}
 		for _, execution := range activeExecutions {
-			if execution.PID == nil || *execution.PID <= 0 {
-				continue
+			// Safety floor (#575): never SIGTERM/SIGKILL raw PID/PGID or mark
+			// terminal as "cleaned" without containment confirmation. Durable
+			// agent_executions rows remain evidence; quarantine affected work.
+			pid := 0
+			if execution.PID != nil && *execution.PID > 0 {
+				pid = int(*execution.PID)
 			}
-			pid := int(*execution.PID)
-			matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
-			if err != nil {
-				if r.logger != nil {
-					r.logger.Warn("failed to verify orphan agent execution identity", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
+			scope := "orphan_cleanup"
+			if pid > 0 {
+				matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
+				if err != nil {
+					if r.logger != nil {
+						r.logger.Warn("failed to verify orphan agent execution identity", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
+					}
+					if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+						uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+					}
+					uncertainExecutionIDs[execution.ID] = struct{}{}
+					written, appendErr := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope, nowISO)
+					if appendErr != nil {
+						return RecoverySummary{}, appendErr
+					}
+					if written {
+						eventsWritten += 1
+					}
+				} else if running && !matches {
+					if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+						uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+					}
+					uncertainExecutionIDs[execution.ID] = struct{}{}
+					written, err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, scope, nowISO)
+					if err != nil {
+						return RecoverySummary{}, err
+					}
+					if written {
+						eventsWritten += 1
+					}
+				} else if running && matches {
+					// Observed live after restart: still not Supervisor-owned.
+					// Leave the process alone; quarantine so work cannot requeue.
+					if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+						uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+					}
+					uncertainExecutionIDs[execution.ID] = struct{}{}
+				} else {
+					// PID not running or probe says dead — still not confirmed-dead
+					// Authority. Keep the row as evidence and quarantine.
+					if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
+						uncertainAgentRunIDs[*execution.RunID] = struct{}{}
+					}
+					uncertainExecutionIDs[execution.ID] = struct{}{}
 				}
-				continue
-			}
-			if running && !matches {
+			} else {
 				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
 					uncertainAgentRunIDs[*execution.RunID] = struct{}{}
 				}
-				if _, ok := uncertainExecutionIDs[execution.ID]; !ok {
-					uncertainExecutionIDs[execution.ID] = struct{}{}
-				}
-				written, err := r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, pid, "orphan_cleanup", nowISO)
-				if err != nil {
-					return RecoverySummary{}, err
-				}
-				if written {
-					eventsWritten += 1
-				}
-				continue
+				uncertainExecutionIDs[execution.ID] = struct{}{}
 			}
-			if running {
-				if err := r.signalAgentProcessGroup(pid, syscall.SIGTERM); err != nil {
-					if errors.Is(err, syscall.ESRCH) {
-						running = false
-					} else {
-						if r.logger != nil {
-							r.logger.Warn("failed to cleanup orphan agent execution", map[string]any{"executionId": execution.ID, "pid": pid, "error": err.Error()})
-						}
-						continue
-					}
-				}
-				if running {
-					go func(pid int) {
-						timer := time.NewTimer(5 * time.Second)
-						defer timer.Stop()
-						<-timer.C
-						_ = r.signalAgentProcessGroup(pid, syscall.SIGKILL)
-					}(pid)
-				}
-			}
-			if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, pid, nowISO, "Killed during looperd recovery"); err != nil {
+			quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, "startup recovery: active execution evidence without containment confirmation")
+			if err != nil {
 				return RecoverySummary{}, err
 			}
-			summary.OrphanAgentCleanup.CleanedCount += 1
-			eventsWritten += 1
+			if quarantined {
+				summary.OrphanAgentCleanup.QuarantinedCount += 1
+				if execution.LoopID != nil && strings.TrimSpace(*execution.LoopID) != "" {
+					quarantinedLoopIDs[*execution.LoopID] = struct{}{}
+				}
+			}
+			if wrote {
+				eventsWritten += 1
+			}
+		}
+		if summary.OrphanAgentCleanup.QuarantinedCount > 0 {
+			summary.OrphanAgentCleanup.Warning = "active executions were quarantined without process kill; containment is not confirmed"
 		}
 	}
 
@@ -1426,6 +1512,10 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	}
 	for _, loop := range loops {
 		if _, wasRequeued := requeuedLoopIDs[loop.ID]; wasRequeued {
+			continue
+		}
+		// Quarantined work must not requeue or auto-recover as if cleaned.
+		if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
 			continue
 		}
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
@@ -1882,16 +1972,23 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		summary.LoopIDs = append(summary.LoopIDs, run.LoopID)
 
 		for _, execution := range decision.CleanupExecutions {
-			pid := 0
-			if execution.PID != nil && *execution.PID > 0 {
-				pid = int(*execution.PID)
+			// #575: do not mark terminal as "cleaned" from PID evidence alone.
+			// Quarantine affected work; leave agent_executions as evidence.
+			message := decision.ExecutionMessage
+			if strings.TrimSpace(message) == "" {
+				message = "stale-run reconciliation: execution evidence without containment confirmation"
 			}
-			if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, pid, nowISO, decision.ExecutionMessage); err != nil {
+			quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, message)
+			if err != nil {
 				return StaleRunReconcileSummary{}, err
 			}
-			summary.CleanedExecutions += 1
-			summary.EventsWritten += 1
-			summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
+			if quarantined {
+				summary.CleanedExecutions += 1
+				summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
+			}
+			if wrote {
+				summary.EventsWritten += 1
+			}
 		}
 
 		latestRunBlocksRequeue := false
@@ -1977,25 +2074,19 @@ func (r *Runtime) evaluateStaleRunCandidate(ctx context.Context, repositories *s
 	if mode == staleRunReconcileModeStartup {
 		decision.Candidate = true
 		if latestRun != nil && latestRun.ID == run.ID && len(activeExecutions) > 0 {
+			// Active execution evidence is never Authority to kill, mark terminal,
+			// or requeue as cleaned (#575). Leave durable rows; orphan cleanup
+			// quarantines the work separately.
 			verification, err := r.verifyRunExecutionLiveness(ctx, repositories, activeExecutions, now, "startup_stale_run")
 			if err != nil {
 				return staleRunCandidateDecision{}, err
 			}
 			decision.EventsWritten += verification.EventsWritten
-			if verification.Uncertain {
-				decision.Uncertain = true
-				return decision, nil
-			}
-			if verification.Live {
-				return staleRunCandidateDecision{}, nil
-			}
+			decision.Uncertain = true
+			return decision, nil
 		}
+		// No active agent execution rows: interrupt orphan running runs only.
 		decision.Interrupt = latestRun == nil || latestRun.ID != run.ID || len(activeExecutions) == 0
-		if latestRun != nil && latestRun.ID == run.ID && len(activeExecutions) > 0 {
-			decision.Interrupt = true
-			decision.CleanupExecutions = append(decision.CleanupExecutions, activeExecutions...)
-			decision.ExecutionMessage = "Killed during stale-run recovery"
-		}
 		decision.Message = "Interrupted stale/orphaned running run during looperd recovery"
 		return decision, nil
 	}
@@ -2299,6 +2390,8 @@ func (r *Runtime) appendUncertainProcessIdentityEvent(ctx context.Context, repos
 }
 
 func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, pid int, nowISO string, message string) error {
+	// Retained for any non-recovery callers; startup recovery must not use this
+	// to invent cleanliness from raw PID probes (#575).
 	cleaned := execution
 	cleaned.Status = "killed"
 	if cleaned.ErrorMessage == nil {
@@ -2333,6 +2426,108 @@ func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositori
 		PayloadJSON: mustMarshalJSON(payload),
 		CreatedAt:   nowISO,
 	})
+}
+
+// quarantineRecoveryEvidence parks work tied to uncertain/orphan execution
+// evidence using existing manual_intervention / paused states. It does not
+// signal processes or mark agent_executions terminal.
+//
+// Returns (didQuarantine, wroteEvent, err).
+func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, nowISO, reason string) (bool, bool, error) {
+	if repositories == nil {
+		return false, false, nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "recovery quarantine: execution evidence without containment confirmation"
+	}
+	did := false
+	wrote := false
+
+	if execution.LoopID != nil && strings.TrimSpace(*execution.LoopID) != "" && repositories.Loops != nil {
+		loop, err := repositories.Loops.GetByID(ctx, *execution.LoopID)
+		if err != nil {
+			return false, false, err
+		}
+		if loop != nil {
+			switch loop.Status {
+			case "paused", "completed", "failed", "terminated", "stopped":
+				// Already non-actionable for claim/requeue.
+			default:
+				updated := *loop
+				updated.Status = "paused"
+				updated.NextRunAt = nil
+				updated.UpdatedAt = nowISO
+				if err := repositories.Loops.Upsert(ctx, updated); err != nil {
+					return false, false, err
+				}
+				did = true
+			}
+		}
+	}
+
+	if execution.LoopID != nil && strings.TrimSpace(*execution.LoopID) != "" && repositories.Queue != nil {
+		var items []storage.QueueItemRecord
+		if active, err := repositories.Queue.FindActiveByLoopID(ctx, *execution.LoopID); err != nil {
+			return false, false, err
+		} else if active != nil {
+			items = append(items, *active)
+		}
+		if latest, err := repositories.Queue.GetLatestByLoopID(ctx, *execution.LoopID); err != nil {
+			return false, false, err
+		} else if latest != nil && (len(items) == 0 || items[0].ID != latest.ID) {
+			items = append(items, *latest)
+		}
+		for _, item := range items {
+			if item.Status != "queued" && item.Status != "running" {
+				continue
+			}
+			msg := reason
+			if err := repositories.Queue.Fail(ctx, storage.QueueFailInput{
+				ID:           item.ID,
+				FinishedAt:   nowISO,
+				UpdatedAt:    nowISO,
+				ErrorMessage: &msg,
+				ErrorKind:    "manual_intervention",
+			}); err != nil {
+				return false, false, err
+			}
+			did = true
+		}
+	}
+
+	payload := map[string]any{
+		"reason":      reason,
+		"recoveredAt": nowISO,
+		"executionId": execution.ID,
+		"status":      execution.Status,
+	}
+	if execution.PID != nil && *execution.PID > 0 {
+		payload["pid"] = *execution.PID
+	}
+	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:          newRuntimeEventID(),
+		EventType:   "looperd.recovery.execution_quarantined",
+		ProjectID:   execution.ProjectID,
+		LoopID:      execution.LoopID,
+		RunID:       execution.RunID,
+		EntityType:  stringPtr("agent_execution"),
+		EntityID:    stringPtr(execution.ID),
+		PayloadJSON: mustMarshalJSON(payload),
+		CreatedAt:   nowISO,
+	}); err != nil {
+		return did, false, err
+	}
+	wrote = true
+	if r.logger != nil {
+		r.logger.Warn("recovery quarantined execution evidence without process kill", map[string]any{
+			"executionId": execution.ID,
+			"loopId":      execution.LoopID,
+			"runId":       execution.RunID,
+			"reason":      reason,
+		})
+	}
+	return did || wrote, wrote, nil
 }
 
 func ensureRecoveryQueueItem(ctx context.Context, repositories *storage.Repositories, loop storage.LoopRecord, nowISO string, maxAttempts int64) error {

@@ -370,10 +370,19 @@ func stopServerWithTimeout(stop func(context.Context) error, timeout time.Durati
 
 func (d *daemonRuntime) Stop(reason string) {
 	d.stopOnce.Do(func() {
+		// Admission → HTTP ingress drain → runtime storage close (ADR-0015 / #575).
+		if d.runtime != nil {
+			d.runtime.BeginShutdown(reason)
+		}
 		if d.server != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), d.shutdownTimeout)
-			_ = d.server.Stop(ctx)
+			err := d.server.Stop(ctx)
 			cancel()
+			if err != nil {
+				// Fail loud when ingress drain is incomplete. Full producer drain
+				// is later slices; still close storage so stop cannot hang forever.
+				_, _ = fmt.Fprintf(os.Stderr, "looperd: HTTP ingress drain incomplete during shutdown: %v\n", err)
+			}
 		}
 		if d.runtime != nil {
 			d.runtime.Stop(reason)

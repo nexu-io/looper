@@ -7118,6 +7118,11 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Runtime.Start() error = %v", err)
 	}
+	// Admission opens only after CompleteStartup. DeferRecovery fixtures still
+	// need a ready gate for mutation API tests (#575).
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("Runtime.CompleteStartup() error = %v", err)
+	}
 
 	t.Cleanup(func() {
 		rt.Stop("test cleanup")

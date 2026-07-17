@@ -110,6 +110,10 @@
       "status": 501
     },
     {
+      "code": "SERVICE_UNAVAILABLE",
+      "status": 503
+    },
+    {
       "code": "UNAUTHORIZED",
       "status": 401
     },

@@ -22,6 +22,7 @@ const (
 	ErrorCodeRequestTooLarge            ErrorCode = "REQUEST_TOO_LARGE"
 	ErrorCodeRunNotFound                ErrorCode = "RUN_NOT_FOUND"
 	ErrorCodeRuntimeControlUnavailable  ErrorCode = "RUNTIME_CONTROL_UNAVAILABLE"
+	ErrorCodeServiceUnavailable         ErrorCode = "SERVICE_UNAVAILABLE"
 	ErrorCodeUnauthorized               ErrorCode = "UNAUTHORIZED"
 	ErrorCodeValidationFailed           ErrorCode = "VALIDATION_FAILED"
 )
@@ -99,6 +100,8 @@ func (c ErrorCode) Status() int {
 		return 404
 	case ErrorCodeRuntimeControlUnavailable:
 		return 501
+	case ErrorCodeServiceUnavailable:
+		return 503
 	case ErrorCodeUnauthorized:
 		return 401
 	case ErrorCodeValidationFailed:
@@ -129,6 +132,7 @@ func AllErrorCodes() []ErrorCode {
 		ErrorCodeRequestTooLarge,
 		ErrorCodeRunNotFound,
 		ErrorCodeRuntimeControlUnavailable,
+		ErrorCodeServiceUnavailable,
 		ErrorCodeUnauthorized,
 		ErrorCodeValidationFailed,
 	}

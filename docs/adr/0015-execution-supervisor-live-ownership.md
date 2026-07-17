@@ -115,7 +115,7 @@ to a slice while any open blocker remains.
 | Order | Issue | Role | ADR consequences in this slice | Enforcement (as of this ADR) |
 |------:|-------|------|--------------------------------|------------------------------|
 | R0 | #573 | Contract + inventory | Authority statement, matrix, producer inventory, mid-state rules, exit criteria | **Enforced** (docs-only; this document) |
-| R1 | #575 | Safety floor: one admission state; stop unsafe recovery PID action | Single admission Authority; no mutation/claim before ready; recovery no-act + quarantine; drain ingress before storage close | **Deferred** |
+| R1 | #575 | Safety floor: one admission state; stop unsafe recovery PID action | Single admission Authority; no mutation/claim before ready; recovery no-act + quarantine; drain ingress before storage close | **Enforced** |
 | R2 | #574 | Process containment handle with confirmed drain | Containment API; kill success = confirmed drain; no production removal of PID fallback yet | **Deferred** |
 | R3 | #576 | Own all in-scope agent spawns at common executor boundary | Lease before `cmd.Start`; bind handle before return; stop-kill via handle; remove agent live PID fallback only after full agent coverage | **Deferred** |
 | R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Deferred** |
@@ -128,15 +128,16 @@ Update the **Enforcement** column as each issue closes (move the slice from
 Deferred → Enforced). ADR Accepted only when the matrix has no deferred
 in-scope items and full-program exit criteria hold.
 
-### Admission state (target; enforced by #575+)
+### Admission state (enforced by #575)
 
 Authoritative live states: `starting | ready | stopping | degraded`.
 
 - Transitions are monotonic / legal only (e.g. `starting→ready`, `ready→stopping`,
-  sticky `degraded` until restart/clear).
-- HTTP mutation readiness and scheduler claim/discovery are **projections** of
-  this state, not a second Authority.
-- Admission decisions must be atomic with the action they gate.
+  sticky `degraded` until restart/clear). Documented in `internal/runtime/admission.go`.
+- HTTP mutation readiness and scheduler **claim** are **projections** of
+  this state, not a second Authority. Exhaustive non-claim mutation coverage is #580.
+- Admission decisions must be atomic with the action they gate (single `Admission`
+  mutex; no dual ready flag that can disagree).
 
 ### Shutdown order (target; partial in #575, complete in #577/#580)
 

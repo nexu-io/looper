@@ -279,6 +279,15 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Mutation readiness is a projection of the single admission Authority
+	// (ADR-0015 / #575). Reads remain available while starting/stopping/degraded.
+	if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) {
+		if typed, denied := h.admissionMutationDenial(); denied {
+			h.writeError(w, requestID, typed)
+			return
+		}
+	}
+
 	switch path {
 	case dashboardBootstrapCodePath:
 		h.handleBootstrapMint(w, r, requestID)
@@ -719,6 +728,46 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 	})
 
 	return false
+}
+
+func isMutatingHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// isAdmissionExemptMutationPath lists mutation routes that must stay available
+// before admission is ready (dashboard bootstrap) or are not work-producing.
+func isAdmissionExemptMutationPath(path string) bool {
+	switch path {
+	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) admissionMutationDenial() (apiError, bool) {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		// Tests and embedders without a runtime keep prior open-admission behavior.
+		return apiError{}, false
+	}
+	gate, ok := any(runtimeValue).(interface{ AllowMutations() error })
+	if !ok {
+		return apiError{}, false
+	}
+	if err := gate.AllowMutations(); err != nil {
+		return apiError{
+			code:    pkgapi.ErrorCodeServiceUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: err.Error(),
+		}, true
+	}
+	return apiError{}, false
 }
 
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
@@ -1709,10 +1758,11 @@ func normalizeRecoverySummary(summary looperdruntime.RecoverySummary) map[string
 	if summary.CompletedAt != "" {
 		normalized["completedAt"] = summary.CompletedAt
 	}
-	if summary.OrphanAgentCleanup.Attempted || summary.OrphanAgentCleanup.CleanedCount != 0 || summary.OrphanAgentCleanup.Warning != "" {
+	if summary.OrphanAgentCleanup.Attempted || summary.OrphanAgentCleanup.CleanedCount != 0 || summary.OrphanAgentCleanup.QuarantinedCount != 0 || summary.OrphanAgentCleanup.Warning != "" {
 		orphan := map[string]any{
-			"attempted":    summary.OrphanAgentCleanup.Attempted,
-			"cleanedCount": summary.OrphanAgentCleanup.CleanedCount,
+			"attempted":        summary.OrphanAgentCleanup.Attempted,
+			"cleanedCount":     summary.OrphanAgentCleanup.CleanedCount,
+			"quarantinedCount": summary.OrphanAgentCleanup.QuarantinedCount,
 		}
 		if summary.OrphanAgentCleanup.Warning != "" {
 			orphan["warning"] = summary.OrphanAgentCleanup.Warning
