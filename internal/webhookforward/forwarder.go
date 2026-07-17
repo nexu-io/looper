@@ -111,6 +111,11 @@ type Options struct {
 	DeliveryTTL        time.Duration
 	RetryDelay         time.Duration
 	RecentOutcomeLimit int
+	// AllowExecute, when set, is rechecked immediately before each worker
+	// discovery attempt. Forward may accept a delivery while admission is
+	// still open; the background worker drains later and must refuse to
+	// persist queue work after BeginShutdown. Nil means ungated (tests).
+	AllowExecute func() error
 }
 
 type deliveryRecord struct {
@@ -210,6 +215,7 @@ type forwarder struct {
 	deliveryTTL        time.Duration
 	retryDelay         time.Duration
 	recentOutcomeLimit int
+	allowExecute       func() error
 
 	mu              sync.Mutex
 	cond            *sync.Cond
@@ -261,6 +267,7 @@ func New(options Options) Forwarder {
 		deliveryTTL:        deliveryTTL,
 		retryDelay:         retryDelay,
 		recentOutcomeLimit: recentOutcomeLimit,
+		allowExecute:       options.AllowExecute,
 		works:              map[string]*workItem{},
 		deliveries:         map[string]deliveryRecord{},
 	}
@@ -548,6 +555,13 @@ func (f *forwarder) executeWithRetry(ctx context.Context, key workKey, item work
 }
 
 func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem) error {
+	// Recheck admission at discovery time: Forward may have accepted this work
+	// while ready, but BeginShutdown can close admission before the worker runs.
+	if f.allowExecute != nil {
+		if err := f.allowExecute(); err != nil {
+			return err
+		}
+	}
 	if _, ok := item.lanes[LaneReviewer]; ok {
 		if f.reviewer == nil {
 			return fmt.Errorf("reviewer targeted discovery is not configured")

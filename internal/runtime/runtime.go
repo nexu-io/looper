@@ -273,7 +273,8 @@ func New(options Options) *Runtime {
 	if rt.webhook != nil {
 		rt.webhook.forwarder = rt.WebhookForwarder
 		// Tunnel listener is not behind the API mutation gate; consult the same
-		// admission Authority before enqueueing reviewer/fixer work (#583).
+		// admission Authority before accepting deliveries (#583). Worker-side
+		// discovery rechecks via webhookforward.Options.AllowExecute.
 		rt.webhook.allowForward = rt.AllowMutations
 	}
 	if !customSchedulerTick {

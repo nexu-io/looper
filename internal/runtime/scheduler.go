@@ -2889,6 +2889,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			}},
 			Logger: logger,
 			Now:    now,
+			// Worker discovery must recheck the same admission Authority as
+			// scheduler claims: Forward can accept just before BeginShutdown,
+			// then drain after admission is already stopping (#583).
+			AllowExecute: allowClaim,
 		})
 	}
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
@@ -3715,6 +3719,12 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		return 0, 0, err
 	}
 	if availableSlots == 0 && input.ReconcileStaleRuns != nil {
+		// Recheck immediately before stale reconcile: availableSlots can race
+		// with BeginShutdown after the count returns, and ReconcileStaleRuns
+		// mutates runs/queue during the HTTP drain window.
+		if err := admissionRefuseWork(input); err != nil {
+			return 0, 0, nil
+		}
 		if _, err := input.ReconcileStaleRuns(ctx); err != nil {
 			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 			return 0, 0, err

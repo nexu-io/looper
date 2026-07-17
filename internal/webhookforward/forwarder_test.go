@@ -2,9 +2,11 @@ package webhookforward
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +15,62 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// Contract: Forward may accept while admission is open; worker discovery must
+// still refuse when AllowExecute closes before executeWithRetry runs.
+func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:     repos,
+		Config:    testConfig(t),
+		Reviewer:  reviewerRunner,
+		Fixer:     targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			executeCalls.Add(1)
+			return errors.New("daemon admission is stopping")
+		},
+	})
+	defer forwarder.Close()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-closed-exec",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v", err)
+	}
+	if result.Status != "accepted" || result.WorkItems != 1 {
+		t.Fatalf("Forward() = %#v, want accepted with work", result)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stats := forwarder.Stats()
+		if stats.ExecutionsFailed >= 1 && stats.InFlight == 0 && stats.Queued == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stats := forwarder.Stats()
+	if stats.ExecutionsFailed < 1 {
+		t.Fatalf("ExecutionsFailed = %d, want >= 1 after admission refuse", stats.ExecutionsFailed)
+	}
+	if executeCalls.Load() == 0 {
+		t.Fatal("AllowExecute was not consulted at worker discovery time")
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
+	if stats.ExecutionsSucceeded != 0 {
+		t.Fatalf("ExecutionsSucceeded = %d, want 0 when admission refuses discovery", stats.ExecutionsSucceeded)
+	}
+}
 
 func TestForwardDedupesDeliveriesWithinTTLAndExpiresAfterAnHour(t *testing.T) {
 	repos := newTestRepositories(t)
