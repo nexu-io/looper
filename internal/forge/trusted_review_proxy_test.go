@@ -98,6 +98,13 @@ func testTrustedReviewPolicy() TrustedReviewProxyPolicy {
 	return TrustedReviewProxyPolicy{Clean: "COMMENT", Blocking: "COMMENT", ExpectedCommitID: "abc123"}
 }
 
+// trustedReviewProxyStubScript builds a fake looper child that first drains the
+// inherited config snapshot pipe (fd 3). Without that drain, a fast-exiting
+// stub races the proxy's snapshot writer and can surface "broken pipe" on CI.
+func trustedReviewProxyStubScript(body string) string {
+	return "#!/bin/sh\ncat <&3 >/dev/null 2>&1 || true\n" + body
+}
+
 func TestFormatTrustedReviewPRRef(t *testing.T) {
 	t.Parallel()
 	if got := FormatTrustedReviewPRRef(" acme/looper ", 42); got != "acme/looper#42" {
@@ -116,7 +123,7 @@ func TestStartTrustedReviewProxyAllowsEmptyTrustedEnv(t *testing.T) {
 	realLooper := filepath.Join(dir, "real-looper")
 	outPath := filepath.Join(dir, "out.txt")
 	// Tea-backed providers have no tokenEnv; proxy still binds PR/CWD/config.
-	script := "#!/bin/sh\ntouch ./proxy-child-ran\nprintf 'sock=%s config=%s fd=%s\\n' \"$LOOPER_TRUSTED_REVIEW_SOCK\" \"$LOOPER_CONFIG\" \"$LOOPER_TRUSTED_REVIEW_CONFIG_FD\" > \"" + outPath + "\"\n"
+	script := trustedReviewProxyStubScript("touch ./proxy-child-ran\nprintf 'sock=%s config=%s fd=%s\\n' \"$LOOPER_TRUSTED_REVIEW_SOCK\" \"$LOOPER_CONFIG\" \"$LOOPER_TRUSTED_REVIEW_CONFIG_FD\" > \"" + outPath + "\"\n")
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
@@ -159,7 +166,7 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 	outPath := filepath.Join(dir, "out.txt")
 	// Child records token/socket/config env and leaves a marker in its process
 	// CWD so daemon-bound workdir is observable without relying on pwd symlink form.
-	script := "#!/bin/sh\ntouch ./proxy-child-ran\nprintf 'token=%s sock=%s config=%s fd=%s\\n' \"$FORGEJO_TOKEN\" \"$LOOPER_TRUSTED_REVIEW_SOCK\" \"$LOOPER_CONFIG\" \"$LOOPER_TRUSTED_REVIEW_CONFIG_FD\" > \"" + outPath + "\"\n"
+	script := trustedReviewProxyStubScript("touch ./proxy-child-ran\nprintf 'token=%s sock=%s config=%s fd=%s\\n' \"$FORGEJO_TOKEN\" \"$LOOPER_TRUSTED_REVIEW_SOCK\" \"$LOOPER_CONFIG\" \"$LOOPER_TRUSTED_REVIEW_CONFIG_FD\" > \"" + outPath + "\"\n")
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
@@ -208,7 +215,7 @@ func TestStartTrustedReviewProxyRewritesPolicyFlags(t *testing.T) {
 	realLooper := filepath.Join(dir, "real-looper")
 	outPath := filepath.Join(dir, "argv.txt")
 	// Record argv so we can assert daemon-bound policy replaced agent values.
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + outPath + "\"\n"
+	script := trustedReviewProxyStubScript("printf '%s\\n' \"$@\" > \"" + outPath + "\"\n")
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
@@ -271,7 +278,7 @@ func TestStartTrustedReviewProxyRejectsUnboundPR(t *testing.T) {
 	dir := t.TempDir()
 	realLooper := filepath.Join(dir, "real-looper")
 	// Child should never run for a mismatched PR.
-	script := "#!/bin/sh\necho should-not-run\nexit 0\n"
+	script := trustedReviewProxyStubScript("echo should-not-run\nexit 0\n")
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
@@ -433,6 +440,7 @@ func TestTrustedReviewProxyKeepsRunConfigWhenLiveFileChanges(t *testing.T) {
 	realLooper := filepath.Join(dir, "real-looper")
 	capturedPath := filepath.Join(dir, "captured-config.json")
 	configPathOutput := filepath.Join(dir, "config-path.txt")
+	// This stub intentionally consumes fd 3 into a file for assertions.
 	script := "#!/bin/sh\ncat <&3 > \"" + capturedPath + "\"\nprintf '%s' \"$LOOPER_CONFIG\" > \"" + configPathOutput + "\"\n"
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)

@@ -16,7 +16,7 @@ func TestTrustedReviewProxyRejectsOversizedStdinBeforeStartingChild(t *testing.T
 	dir := t.TempDir()
 	realLooper := filepath.Join(dir, "real-looper")
 	marker := filepath.Join(dir, "child-ran")
-	if err := os.WriteFile(realLooper, []byte("#!/bin/sh\ntouch \""+marker+"\"\n"), 0o755); err != nil {
+	if err := os.WriteFile(realLooper, []byte(trustedReviewProxyStubScript("touch \""+marker+"\"\n")), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
@@ -43,7 +43,7 @@ func TestTrustedReviewProxyCleanupClosesPartialConnectionsAndKillsChildGroup(t *
 	dir := t.TempDir()
 	realLooper := filepath.Join(dir, "real-looper")
 	started := filepath.Join(dir, "started")
-	script := "#!/bin/sh\ntouch \"" + started + "\"\nsleep 30\n"
+	script := trustedReviewProxyStubScript("touch \"" + started + "\"\nsleep 30\n")
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
