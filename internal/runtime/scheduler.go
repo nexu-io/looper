@@ -3809,6 +3809,10 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	// If admission closes mid-batch after some ClaimNext* already persisted
 	// running/claimed items, stop claiming further slots but still process the
 	// items already claimed — never return them un-dispatched (stranded).
+	// The same invariant applies when BeginShutdown cancels the scheduler
+	// context mid-batch: stop further ClaimNext*, but still dispatch already
+	// durable claims (do not return the non-empty claimed slice with ctx.Err
+	// before runScheduledQueueItems).
 	admitClaim := func() error {
 		if input.AllowClaim == nil {
 			return nil
@@ -3818,7 +3822,8 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
-			return queueItems, err
+			// Match admission mid-batch: stop claiming, fall through to dispatch.
+			break
 		}
 		if err := admitClaim(); err != nil {
 			stopClaiming = true
@@ -3826,7 +3831,12 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		}
 		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
-			return queueItems, err
+			// BeginShutdown may cancel mid-ClaimNext after earlier slots succeeded.
+			// Stop claiming and dispatch already-durable claims instead of stranding.
+			if ctx.Err() != nil {
+				break
+			}
+			return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, err)
 		}
 		if item == nil {
 			break
@@ -3835,21 +3845,40 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
 		if err := ctx.Err(); err != nil {
-			return queueItems, err
+			break
 		}
 		if err := admitClaim(); err != nil {
 			break
 		}
 		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
-			return queueItems, err
+			if ctx.Err() != nil {
+				break
+			}
+			return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, err)
 		}
 		if item == nil {
 			break
 		}
 		queueItems = append(queueItems, *item)
 	}
-	return queueItems, runScheduledQueueItems(ctx, queueItems, input)
+	return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, nil)
+}
+
+// dispatchClaimedQueueItems launches processors for items already durable as
+// running/claimed. When the scheduler context is canceled (BeginShutdown),
+// detach cancel so launch and claim-lifecycle DB work are not aborted before
+// a processor starts — otherwise claims strand until a later recovery pass.
+func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput, priorErr error) error {
+	if len(queueItems) == 0 {
+		return priorErr
+	}
+	dispatchCtx := ctx
+	if ctx != nil && ctx.Err() != nil {
+		dispatchCtx = context.WithoutCancel(ctx)
+	}
+	runErr := runScheduledQueueItems(dispatchCtx, queueItems, input)
+	return errors.Join(runErr, priorErr)
 }
 
 // schedulerLoopParked reports whether a claimed queue item's loop was parked
@@ -3881,11 +3910,10 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		now = time.Now
 	}
 	errList := make([]error, 0)
+	// Do not abort the launch loop on ctx cancel: every item in queueItems is
+	// already durable as claimed/running. Skipping remaining launches strands
+	// those claims (BeginShutdown cancels the scheduler context during drain).
 	for _, item := range queueItems {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
 		// A loop parked for human takeover (or paused) must never be run, even if a
 		// queue item survived a race with the parking and got claimed. Release the
 		// claim (so the slot frees) and skip — only an explicit handback re-arms it.
