@@ -166,6 +166,10 @@ func TestGroupRunnableAfterReapWithDescendants(t *testing.T) {
 			t.Fatalf("unexpected pid %d in signalFn", pid)
 			return nil
 		},
+		// Force the signal-0 path: a synthetic PGID is not visible in /proc on
+		// Linux CI, which would otherwise report no live members and hide the
+		// orphaned-descendant branch under test.
+		groupLive: func(int) (bool, bool) { return false, false },
 	}
 	close(h.waitCh)
 	if !h.groupRunnable() {

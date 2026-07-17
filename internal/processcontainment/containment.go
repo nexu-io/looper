@@ -76,6 +76,10 @@ type Handle struct {
 	killEscalated bool
 	confirmedDead bool
 	waitConsumed  bool
+
+	// groupLive overrides groupHasNonZombieMember when non-nil (unit tests).
+	// Production always leaves this nil so the platform /proc probe is used.
+	groupLive func(pgid int) (hasLive bool, ok bool)
 }
 
 // Configure sets process-group isolation on cmd before Start.
@@ -491,11 +495,21 @@ func (h *Handle) groupRunnable() bool {
 	}
 	// kill(-pgid, 0) succeeds for zombie-only groups on Linux. Those are not
 	// runnable; confirmed-dead must not wait on init reaping them.
-	if live, ok := groupHasNonZombieMember(h.pgid); ok {
+	if live, ok := h.groupHasLiveMember(h.pgid); ok {
 		return live
 	}
 	// No platform non-zombie probe (or scan failed): trust signal 0.
 	return true
+}
+
+// groupHasLiveMember reports non-zombie membership for pgid.
+// Tests may override via Handle.groupLive so synthetic signalFn fixtures do
+// not collide with a real /proc scan of an unused numeric PGID on Linux.
+func (h *Handle) groupHasLiveMember(pgid int) (hasLive bool, ok bool) {
+	if h.groupLive != nil {
+		return h.groupLive(pgid)
+	}
+	return groupHasNonZombieMember(pgid)
 }
 
 func (h *Handle) withDrainTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
