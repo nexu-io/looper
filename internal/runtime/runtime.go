@@ -885,9 +885,11 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
-		// Deferred reviewer recovery requeues failed loops without AllowClaim;
-		// start it only after admission is ready so startup cannot bypass the
-		// safety-floor gate by persisting queue/loop work while still starting.
+		// Deferred reviewer recovery requeues failed loops without the scheduler
+		// claim path; start it only after admission is ready, and only while
+		// admission remains ready (startDeferredReviewerRecovery rechecks under
+		// the shutdown race where BeginShutdown may have already missed a nil
+		// recoveryCancel between MarkReady and registration).
 		r.startDeferredReviewerRecovery(githubGateway)
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
@@ -1236,12 +1238,36 @@ func (r *Runtime) startDeferredReviewerRecovery(githubGateway *githubinfra.Gatew
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	r.mu.Lock()
+	// Refuse to arm recovery once shutdown has begun or admission is no longer
+	// ready. BeginShutdown may already have observed recoveryCancel==nil; starting
+	// a live goroutine afterward would let requeue persist work while stopping
+	// (and stopDeferredReviewerRecovery may already have passed).
+	if r.stopped || r.admission == nil || r.admission.State() != AdmissionReady {
+		r.mu.Unlock()
+		cancel()
+		return
+	}
 	r.recoveryCancel = cancel
 	r.recoveryDone = done
 	r.mu.Unlock()
 
+	// Publish-then-recheck: if BeginShutdown raced between the ready check and
+	// assigning recoveryCancel, it missed cancel. If admission is no longer
+	// ready, cancel immediately so the goroutine is born canceled.
+	if err := r.AllowClaim(); err != nil {
+		cancel()
+	}
+
 	go func(repositories *storage.Repositories) {
 		defer close(done)
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		// Deferred recovery requeues without AllowClaim on the scheduler path;
+		// refuse when admission already closed after MarkReady/shutdown race.
+		if err := r.AllowClaim(); err != nil {
+			return
+		}
 		requeued, err := r.runDeferredReviewerRecovery(ctx, repositories, githubGateway, r.now().UTC())
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -1280,6 +1306,22 @@ func (r *Runtime) stopDeferredReviewerRecovery() {
 		if r.logger != nil {
 			r.logger.Warn("looperd stop timed out waiting for deferred reviewer recovery", map[string]any{"timeoutMs": r.shutdownTimeout.Milliseconds()})
 		}
+	}
+}
+
+// admissionRefusesDeferredRequeue reports whether deferred recovery must not
+// persist queue/loop requeues. Stopping and degraded are hard refusals;
+// starting is allowed only for direct unit-test helpers (production arms
+// deferred recovery only after MarkReady via startDeferredReviewerRecovery).
+func (r *Runtime) admissionRefusesDeferredRequeue() bool {
+	if r == nil || r.admission == nil {
+		return true
+	}
+	switch r.admission.State() {
+	case AdmissionStopping, AdmissionDegraded:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1840,6 +1882,12 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 	if repositories == nil || githubGateway == nil {
 		return 0, nil
 	}
+	// Refuse up front when admission already closed for shutdown/degraded.
+	// (startDeferredReviewerRecovery only arms after ready; unit tests may call
+	// this helper while still starting.)
+	if r.admissionRefusesDeferredRequeue() {
+		return 0, nil
+	}
 	nowISO := formatJavaScriptISOString(now)
 	loops, err := repositories.Loops.List(ctx)
 	if err != nil {
@@ -1850,6 +1898,11 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 	for _, loop := range loops {
 		if err := ctx.Err(); err != nil {
 			return requeued, err
+		}
+		// Recheck before each durable requeue so BeginShutdown cannot leave a
+		// still-running recovery path persisting queued loop/queue state.
+		if r.admissionRefusesDeferredRequeue() {
+			return requeued, nil
 		}
 		latestRun, err := repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -1887,6 +1940,11 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 		}
 		if currentLoop == nil || !shouldAutoRecoverFailedReviewerLoop(*currentLoop, latestRun, latestQueue, policy) {
 			continue
+		}
+		// Final admission gate immediately before lock+persist: matches the
+		// shutdown race where cancel registration was missed after MarkReady.
+		if r.admissionRefusesDeferredRequeue() {
+			return requeued, nil
 		}
 		// Share discard/retry exclusion: recovery requeue of a PR reviewer must
 		// not interleave with operator discard of a sibling loop on the same
