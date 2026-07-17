@@ -177,7 +177,7 @@ and must not exist without a Supervisor lease.
 
 | Producer | Path | Separate Authority |
 |----------|------|--------------------|
-| **Webhook forwarder (`gh webhook forward`)** | `internal/runtime/webhook_forwarder.go` | ADR-0005: local identity gate (PID + process start + command shape). Not Supervisor domain unless this ADR is amended. |
+| **Webhook forwarder (`gh webhook forward`)** | `internal/runtime/webhook.go` (`newWebhookRuntime` / `runForwarder`; `webhook_forwarder.go` manager is not production-wired) | ADR-0005: local identity gate (PID + process start + command shape). Not Supervisor domain unless this ADR is amended. |
 | **Webhook tunnel `gh` subprocesses** | `internal/runtime/webhook_tunnel.go` | Local tunnel lifecycle under webhook tunnel design (ADR-0006 family); not agent work ownership. |
 | **CLI feedback agent** | `internal/cliapp/feedback.go` → `agent.ResolveSpawn` + `exec.CommandContext` in **CLI process** | CLI process owns the child for the duration of `looper feedback`. Not looperd Supervisor. |
 | **CLI interactive takeover resume** | `internal/cliapp/takeover_commands.go` runs operator shell with `ResumeCommand` after daemon parks loop | Operator terminal owns the interactive agent. Daemon Authority for parking/stopping the prior run remains Supervisor-owned once #576 lands. |
