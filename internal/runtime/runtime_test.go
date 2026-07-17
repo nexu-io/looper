@@ -2334,6 +2334,137 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 	}
 }
 
+// Regression: after quarantining dead/nil-PID execution evidence, stale-run
+// reconciliation must not requeue via pre-quarantine loop/latestRun repair or the
+// later interrupted-loop pass while agent_executions remain running evidence.
+func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		reconcile func(*Runtime, context.Context) (StaleRunReconcileSummary, error)
+	}{
+		{name: "live", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
+			return rt.reconcileLiveStaleRunningRuns(ctx)
+		}},
+		{name: "manual", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
+			return rt.ReconcileStaleRunningRuns(ctx)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			cfg, err := config.DefaultConfig(workingDir)
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+			backupDir := filepath.Join(workingDir, "backups")
+			cfg.Storage.BackupDir = &backupDir
+			now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
+			nowISO := formatJavaScriptISOString(now)
+			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+			// PID gone: empty process command probes as dead (not uncertain).
+			deadPID := int64(6161)
+
+			rt := New(Options{
+				Config:             cfg,
+				Logger:             &testLogger{},
+				Now:                func() time.Time { return now },
+				ReadProcessCommand: func(context.Context, int) (string, error) { return "", nil },
+				SignalProcess: func(int, syscall.Signal) error {
+					t.Fatal("SignalProcess called, want no recovery PID action after dead probe")
+					return nil
+				},
+			})
+			if err := rt.Start(context.Background()); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			defer rt.Stop("test cleanup")
+			repos := rt.Services().Repositories
+			repo := "nexu-io/looper"
+			prNumber := int64(575)
+			targetID := "pr:nexu-io/looper:575"
+			loopID := "loop_dead_exec_quarantine"
+			runID := "run_dead_exec_quarantine"
+			queueID := "queue_dead_exec_quarantine"
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("repair"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+				t.Fatalf("Runs.Upsert() error = %v", err)
+			}
+			if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+				ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID,
+				DedupeKey: "fixer:project_1:" + loopID, Priority: storage.QueuePriorityFixer, Status: "running",
+				AvailableAt: oldISO, Attempts: 1, MaxAttempts: 3, ClaimedBy: stringPtr("scheduler"), ClaimedAt: stringPtr(oldISO),
+				StartedAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO,
+			}); err != nil {
+				t.Fatalf("Queue.Upsert() error = %v", err)
+			}
+			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+				ID: "exec_dead_quarantine", ProjectID: stringPtr("project_1"), LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
+				PID: &deadPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir),
+				StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
+			}); err != nil {
+				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+			}
+
+			summary, err := tc.reconcile(rt, context.Background())
+			if err != nil {
+				t.Fatalf("reconcile error = %v", err)
+			}
+			if summary.CandidateRuns != 1 || summary.InterruptedRuns != 1 {
+				t.Fatalf("summary = %#v, want one interrupted stale run", summary)
+			}
+			if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
+				t.Fatalf("summary = %#v, want no requeue after quarantine", summary)
+			}
+			if summary.CleanedExecutions != 1 {
+				t.Fatalf("summary.CleanedExecutions = %d, want 1 quarantined execution", summary.CleanedExecutions)
+			}
+
+			run, err := repos.Runs.GetByID(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("Runs.GetByID() error = %v", err)
+			}
+			if run == nil || run.Status != "interrupted" {
+				t.Fatalf("run = %#v, want interrupted", run)
+			}
+			execution, err := repos.AgentExecutions.GetByID(context.Background(), "exec_dead_quarantine")
+			if err != nil {
+				t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+			}
+			if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
+				t.Fatalf("execution = %#v, want still-running evidence", execution)
+			}
+			loop, err := repos.Loops.GetByID(context.Background(), loopID)
+			if err != nil {
+				t.Fatalf("Loops.GetByID() error = %v", err)
+			}
+			if loop == nil || loop.Status != "paused" {
+				t.Fatalf("loop = %#v, want paused quarantine (not requeued)", loop)
+			}
+			queue, err := repos.Queue.GetByID(context.Background(), queueID)
+			if err != nil {
+				t.Fatalf("Queue.GetByID() error = %v", err)
+			}
+			if queue == nil || queue.Status != "manual_intervention" {
+				t.Fatalf("queue = %#v, want manual_intervention quarantine", queue)
+			}
+			active, err := repos.Queue.FindActiveByLoopID(context.Background(), loopID)
+			if err != nil {
+				t.Fatalf("FindActiveByLoopID() error = %v", err)
+			}
+			if active != nil {
+				t.Fatalf("FindActiveByLoopID = %#v, want no active queue after quarantine", active)
+			}
+		})
+	}
+}
+
 func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecution(t *testing.T) {
 	t.Parallel()
 

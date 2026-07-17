@@ -1932,6 +1932,10 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			activeExecutionsByRunID[*execution.RunID] = append(activeExecutionsByRunID[*execution.RunID], execution)
 		}
 	}
+	// Loops whose work was parked via quarantineRecoveryEvidence must not be
+	// requeued by the post-interrupt repair pass or the later interrupted-loop
+	// sweep while agent_executions remain running evidence (#575).
+	quarantinedLoopIDs := make(map[string]struct{})
 	for _, run := range runningRuns {
 		if err := ctx.Err(); err != nil {
 			return StaleRunReconcileSummary{}, err
@@ -1971,6 +1975,7 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		summary.RunIDs = append(summary.RunIDs, run.ID)
 		summary.LoopIDs = append(summary.LoopIDs, run.LoopID)
 
+		quarantinedAny := false
 		for _, execution := range decision.CleanupExecutions {
 			// #575: do not mark terminal as "cleaned" from PID evidence alone.
 			// Quarantine affected work; leave agent_executions as evidence.
@@ -1983,12 +1988,22 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 				return StaleRunReconcileSummary{}, err
 			}
 			if quarantined {
+				quarantinedAny = true
 				summary.CleanedExecutions += 1
 				summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
 			}
 			if wrote {
 				summary.EventsWritten += 1
 			}
+		}
+		// Dead/nil-PID cleanup paths leave agent_executions as running evidence and
+		// may have just parked the loop/queue. Do not continue into queue repair
+		// with the pre-quarantine loop/latestRun snapshot — that can flip
+		// paused/manual_intervention back to interrupted/queued and create an
+		// active queue item, defeating the safety floor.
+		if quarantinedAny || len(decision.CleanupExecutions) > 0 {
+			quarantinedLoopIDs[run.LoopID] = struct{}{}
+			continue
 		}
 
 		latestRunBlocksRequeue := false
@@ -2015,6 +2030,9 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			return StaleRunReconcileSummary{}, err
 		}
 		for _, loop := range loops {
+			if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
+				continue
+			}
 			queueRepair, err := r.repairInterruptedLoopQueueIfNeeded(ctx, repositories, loop, nowISO)
 			if err != nil {
 				return StaleRunReconcileSummary{}, err
