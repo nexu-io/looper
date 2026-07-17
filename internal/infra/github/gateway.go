@@ -1095,10 +1095,20 @@ func (g *Gateway) listDependencyIssues(ctx context.Context, input ViewIssueInput
 	return out, nil
 }
 
+// findAnyIssueNumberJQ projects each issues page down to number + PR marker only.
+// Full issue bodies easily exceed the shell capture cap on busy sandbox repos;
+// gh applies this filter before writing to the bounded stdout buffer.
+const findAnyIssueNumberJQ = `[.[] | {number, pull_request}]`
+
 func (g *Gateway) FindAnyIssueNumber(ctx context.Context, repo string, cwd string) (int64, error) {
 	hostname, repoName := splitRepoHostname(repo)
 	for page := 1; ; page++ {
-		args := []string{"api", fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page)}
+		args := []string{
+			"api",
+			fmt.Sprintf("repos/%s/issues?state=all&per_page=100&page=%d", repoName, page),
+			"--jq",
+			findAnyIssueNumberJQ,
+		}
 		if hostname != "" {
 			args = append(args, "--hostname", hostname)
 		}

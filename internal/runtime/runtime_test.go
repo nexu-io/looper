@@ -4442,7 +4442,7 @@ func TestValidateCoordinatorDependencyGatesFailsClosedWhenAPIUnavailable(t *test
 	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case args == "api repos/acme/looper/issues?state=all&per_page=100&page=1":
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=1") && strings.Contains(args, "--jq"):
 			return shell.Result{Stdout: `[{"number":7}]`}, nil
 		case strings.Contains(args, "dependencies/blocked_by"):
 			result := shell.Result{ExitCode: 1, Stderr: "gh: HTTP 404: Not Found"}
@@ -4480,7 +4480,7 @@ func TestValidateCoordinatorDependencyGatesAllowsAvailableAPI(t *testing.T) {
 	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case args == "api repos/acme/looper/issues?state=all&per_page=100&page=1":
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=1") && strings.Contains(args, "--jq"):
 			return shell.Result{Stdout: `[{"number":7}]`}, nil
 		case strings.Contains(args, "dependencies/blocked_by"):
 			return shell.Result{Stdout: `[]`}, nil
@@ -4517,9 +4517,9 @@ func TestValidateCoordinatorDependencyGatesSkipsProbeWhenRepoHasNoIssues(t *test
 	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case args == "api repos/acme/looper/issues?state=all&per_page=100&page=1":
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=1") && strings.Contains(args, "--jq"):
 			return shell.Result{Stdout: `[{"number":12,"pull_request":{}}]`}, nil
-		case args == "api repos/acme/looper/issues?state=all&per_page=100&page=2":
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=2") && strings.Contains(args, "--jq"):
 			return shell.Result{Stdout: `[]`}, nil
 		case strings.Contains(args, "dependencies/blocked_by"):
 			blockedByCalls++
@@ -4559,7 +4559,7 @@ func TestValidateCoordinatorDependencyGatesReturnsInvalidJSONFromIssueProbe(t *t
 	githubGateway := githubinfra.New(githubinfra.Options{GHRun: func(ctx context.Context, options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
 		switch {
-		case args == "api repos/acme/looper/issues?state=all&per_page=100&page=1":
+		case strings.HasPrefix(args, "api repos/acme/looper/issues?state=all&per_page=100&page=1") && strings.Contains(args, "--jq"):
 			return shell.Result{Stdout: `not-json`}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)

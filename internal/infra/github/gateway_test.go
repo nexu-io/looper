@@ -1843,7 +1843,7 @@ func TestFindAnyIssueNumberSkipsPullRequests(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
-		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues?state=all&per_page=100&page=1" {
+		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/issues?state=all&per_page=100&page=1 --jq "+findAnyIssueNumberJQ {
 			t.Fatalf("unexpected gh args: %q", got)
 		}
 		return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}},{"number":7}]`}, nil
@@ -1863,9 +1863,9 @@ func TestFindAnyIssueNumberChecksLaterPages(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		switch got := strings.Join(options.Args, " "); got {
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=1":
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=1 --jq " + findAnyIssueNumberJQ:
 			return shell.Result{Stdout: `[{"number":99,"pull_request":{"url":"https://example.test/pr/99"}}]`}, nil
-		case "api repos/acme/looper/issues?state=all&per_page=100&page=2":
+		case "api repos/acme/looper/issues?state=all&per_page=100&page=2 --jq " + findAnyIssueNumberJQ:
 			return shell.Result{Stdout: `[{"number":7}]`}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", got)
@@ -1882,6 +1882,28 @@ func TestFindAnyIssueNumberChecksLaterPages(t *testing.T) {
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("FindAnyIssueNumber() calls = %d, want two paged requests", len(runner.calls))
+	}
+}
+
+func TestFindAnyIssueNumberProjectsPayloadBeforeShellCapture(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if !strings.Contains(args, "--jq "+findAnyIssueNumberJQ) {
+			t.Fatalf("FindAnyIssueNumber must project issue pages with --jq before shell capture; got %q", args)
+		}
+		// Projected rows stay tiny even when the underlying page would exceed the
+		// 256 KiB shell capture cap used by runGh.
+		return shell.Result{Stdout: `[{"number":7,"pull_request":null}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	issueNumber, err := gateway.FindAnyIssueNumber(context.Background(), "acme/looper", "")
+	if err != nil {
+		t.Fatalf("FindAnyIssueNumber() error = %v", err)
+	}
+	if issueNumber != 7 {
+		t.Fatalf("FindAnyIssueNumber() = %d, want 7", issueNumber)
 	}
 }
 
