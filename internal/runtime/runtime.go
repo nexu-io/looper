@@ -855,7 +855,6 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		if r.config.Daemon.WorktreeCleanup.Enabled {
 			r.startWorktreeCleanupLoop()
 		}
-		r.startDeferredReviewerRecovery(githubGateway)
 		r.startConfigReloadLoop()
 
 		// Open admission only after recovery and producer loops are assembled.
@@ -864,6 +863,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
+		// Deferred reviewer recovery requeues failed loops without AllowClaim;
+		// start it only after admission is ready so startup cannot bypass the
+		// safety-floor gate by persisting queue/loop work while still starting.
+		r.startDeferredReviewerRecovery(githubGateway)
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
 		// admission is ready so discovery/HITL do not wait a full poll interval.

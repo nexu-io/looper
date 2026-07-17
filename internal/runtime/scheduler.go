@@ -3866,15 +3866,17 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 }
 
 // dispatchClaimedQueueItems launches processors for items already durable as
-// running/claimed. When the scheduler context is canceled (BeginShutdown),
-// detach cancel so launch and claim-lifecycle DB work are not aborted before
-// a processor starts — otherwise claims strand until a later recovery pass.
+// running/claimed. Always detach the scheduler cancel: BeginShutdown may race
+// after a clean ctx.Err() check here but before ProcessClaimedQueueItem runs
+// its storage reads and Fail/Complete recovery writes. Relying on cancellation
+// already being visible at this exact check strands claims as running/
+// claimed_by=scheduler until a later recovery pass.
 func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput, priorErr error) error {
 	if len(queueItems) == 0 {
 		return priorErr
 	}
 	dispatchCtx := ctx
-	if ctx != nil && ctx.Err() != nil {
+	if ctx != nil {
 		dispatchCtx = context.WithoutCancel(ctx)
 	}
 	runErr := runScheduledQueueItems(dispatchCtx, queueItems, input)
