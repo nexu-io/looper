@@ -1,12 +1,14 @@
 package processcontainment
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -150,13 +152,17 @@ func TestKillTimeoutFailsLoud(t *testing.T) {
 	// insufficient on Linux once the real group is empty). Kill must not
 	// report success and must return ErrNotConfirmedDead when drain times out.
 	// Ready-file handshake avoids racing SIGTERM before trap is installed.
+	//
+	// Do not use set -e: group SIGTERM still kills sleep(1) children. With set -e
+	// that non-zero exit ends the leader, the group becomes zombie-only, Linux
+	// /proc probes report not-runnable, and Kill returns success instead of
+	// timing out. Keep the shell alive and restart sleep after TERM.
 	workDir := t.TempDir()
 	readyPath := filepath.Join(workDir, "ready")
 	script := `
-set -e
 trap '' TERM
 echo ready > "$READY_FILE"
-while true; do sleep 0.05; done
+while true; do sleep 0.05 || true; done
 `
 	cmd := exec.Command("/bin/sh", "-c", script)
 	cmd.Dir = workDir
@@ -369,16 +375,62 @@ func assertProcessRunning(t *testing.T, pid int) {
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("pid %d not running: %v", pid, err)
 	}
+	// Linux kill(0) also succeeds for zombies; require a non-zombie when possible.
+	if runtime.GOOS == "linux" {
+		if zombie, ok := linuxPIDIsZombie(pid); ok && zombie {
+			t.Fatalf("pid %d is a zombie, want a runnable process", pid)
+		}
+	}
 }
 
 func assertProcessDead(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		if processIsNonRunnable(pid) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("pid %d still running", pid)
+}
+
+// processIsNonRunnable matches package confirmed-dead semantics: ESRCH, or a
+// Linux zombie that kill(0) still addresses. Zombie-only descendants must not
+// fail tests after a successful Kill/Drain.
+func processIsNonRunnable(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	if errors.Is(err, syscall.ESRCH) {
+		return true
+	}
+	if err != nil {
+		// Unexpected probe error — do not treat as dead.
+		return false
+	}
+	if runtime.GOOS == "linux" {
+		if zombie, ok := linuxPIDIsZombie(pid); ok {
+			return zombie
+		}
+	}
+	return false
+}
+
+// linuxPIDIsZombie reports whether /proc/pid is a zombie (state Z).
+// ok is false when the stat file cannot be read/parsed.
+func linuxPIDIsZombie(pid int) (zombie bool, ok bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		// Process may have vanished between kill(0) and open.
+		if errors.Is(err, os.ErrNotExist) {
+			return true, true
+		}
+		return false, false
+	}
+	// Format: pid (comm) state ... — state is the first field after the final ") ".
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return false, false
+	}
+	state := data[i+2]
+	return state == 'Z' || state == 'X' || state == 'x', true
 }
