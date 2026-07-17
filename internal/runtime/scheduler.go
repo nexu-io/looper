@@ -3746,18 +3746,23 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
 	// Recheck admission at each durable claim so BeginShutdown cannot race past
 	// an earlier pump-level AllowClaim and still ClaimNext under scheduler locks.
+	// If admission closes mid-batch after some ClaimNext* already persisted
+	// running/claimed items, stop claiming further slots but still process the
+	// items already claimed — never return them un-dispatched (stranded).
 	admitClaim := func() error {
 		if input.AllowClaim == nil {
 			return nil
 		}
 		return input.AllowClaim()
 	}
+	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
 		}
 		if err := admitClaim(); err != nil {
-			return queueItems, nil
+			stopClaiming = true
+			break
 		}
 		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
@@ -3768,12 +3773,12 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		}
 		queueItems = append(queueItems, *item)
 	}
-	for len(queueItems) < availableSlots {
+	for !stopClaiming && len(queueItems) < availableSlots {
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
 		}
 		if err := admitClaim(); err != nil {
-			return queueItems, nil
+			break
 		}
 		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
