@@ -308,6 +308,11 @@ func (h *Handle) ProcessState() *os.ProcessState {
 // period, waits for leader reap, and drains descendants until the group is
 // confirmed non-runnable. Returns nil only on confirmed-dead; otherwise an
 // explicit error (including context/timeout wrapped with ErrNotConfirmedDead).
+//
+// If the leader was already reaped (for example Wait then Kill as cleanup),
+// Kill skips the initial group signal and only drains/confirms: the leader
+// PID/PGID may already have been released, so an unconditional SIGTERM to
+// -pgid could hit a reused process group when no descendants remain.
 func (h *Handle) Kill(ctx context.Context) error {
 	h.mu.Lock()
 	if h.confirmedDead {
@@ -321,6 +326,14 @@ func (h *Handle) Kill(ctx context.Context) error {
 
 	ctx, cancel := h.withDrainTimeout(ctx)
 	defer cancel()
+
+	// Already reaped: drain only. Do not SIGTERM -pgid before observing waitCh.
+	select {
+	case <-h.waitCh:
+		_ = h.consumeWait()
+		return h.drainGroup(ctx)
+	default:
+	}
 
 	if err := h.SignalGroup(syscall.SIGTERM); err != nil {
 		return fmt.Errorf("process containment: SIGTERM: %w", err)

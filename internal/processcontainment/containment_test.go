@@ -72,6 +72,46 @@ func TestSignalGroupNoOpAfterConfirmedDead(t *testing.T) {
 	}
 }
 
+// TestKillAfterWaitDrainsWithoutSignalingEmptyGroup ensures Wait-then-Kill
+// cleanup does not send SIGTERM to -pgid when the leader is already reaped and
+// the group is empty (reusable PGID guard).
+func TestKillAfterWaitDrainsWithoutSignalingEmptyGroup(t *testing.T) {
+	var nonZeroSignals []syscall.Signal
+	h := &Handle{
+		pgid:         12345,
+		waitCh:       make(chan struct{}),
+		gracePeriod:  -1,
+		drainTimeout: time.Second,
+		now:          time.Now,
+		signalFn: func(pid int, sig syscall.Signal) error {
+			if sig == 0 {
+				// Empty group: no addressable members.
+				return syscall.ESRCH
+			}
+			nonZeroSignals = append(nonZeroSignals, sig)
+			return nil
+		},
+	}
+	close(h.waitCh)
+	// Simulate a prior Wait that already consumed the reaped leader.
+	if err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+
+	if err := h.Kill(context.Background()); err != nil {
+		t.Fatalf("Kill() after Wait error = %v, want nil", err)
+	}
+	if len(nonZeroSignals) != 0 {
+		t.Fatalf("Kill() delivered signals %v to -pgid, want none after Wait on empty group", nonZeroSignals)
+	}
+	if !h.ConfirmedDead() {
+		t.Fatal("ConfirmedDead() = false after Kill on already-reaped empty group, want true")
+	}
+	if h.termDelivered || h.killEscalated {
+		t.Fatalf("termDelivered=%v killEscalated=%v, want both false when no signal delivered", h.termDelivered, h.killEscalated)
+	}
+}
+
 func TestConfigureSetsProcessGroup(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "true")
 	Configure(cmd)
