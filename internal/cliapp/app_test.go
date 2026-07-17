@@ -329,17 +329,18 @@ func TestRunReconcileStaleOutputsHumanAndJSON(t *testing.T) {
 			t.Fatalf("request method = %q, want %q", got, want)
 		}
 		writeEnvelope(t, w, pkgapi.Success("req_reconcile", map[string]any{
-			"mode":                 "manual",
-			"candidateRuns":        2,
-			"interruptedRuns":      1,
-			"loopsRequeued":        1,
-			"queueItemsRequeued":   1,
-			"queueItemsCancelled":  0,
-			"cleanedExecutions":    1,
-			"skippedUncertainRuns": 0,
-			"runIds":               []string{"run_1"},
-			"loopIds":              []string{"loop_1"},
-			"executionIds":         []string{"exec_1"},
+			"mode":                  "manual",
+			"candidateRuns":         2,
+			"interruptedRuns":       1,
+			"loopsRequeued":         1,
+			"queueItemsRequeued":    1,
+			"queueItemsCancelled":   0,
+			"cleanedExecutions":     0,
+			"quarantinedExecutions": 1,
+			"skippedUncertainRuns":  0,
+			"runIds":                []string{"run_1"},
+			"loopIds":               []string{"loop_1"},
+			"executionIds":          []string{"exec_1"},
 		}))
 	}))
 	defer server.Close()

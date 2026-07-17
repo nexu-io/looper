@@ -51,20 +51,23 @@ type RecoverySummary struct {
 }
 
 type StaleRunReconcileSummary struct {
-	Mode                 string   `json:"mode"`
-	StartedAt            string   `json:"startedAt,omitempty"`
-	CompletedAt          string   `json:"completedAt,omitempty"`
-	CandidateRuns        int64    `json:"candidateRuns"`
-	InterruptedRuns      int64    `json:"interruptedRuns"`
-	LoopsRequeued        int64    `json:"loopsRequeued"`
-	QueueItemsRequeued   int64    `json:"queueItemsRequeued"`
-	QueueItemsCancelled  int64    `json:"queueItemsCancelled"`
-	CleanedExecutions    int64    `json:"cleanedExecutions"`
-	SkippedUncertainRuns int64    `json:"skippedUncertainRuns"`
-	EventsWritten        int64    `json:"eventsWritten"`
-	RunIDs               []string `json:"runIds,omitempty"`
-	LoopIDs              []string `json:"loopIds,omitempty"`
-	ExecutionIDs         []string `json:"executionIds,omitempty"`
+	Mode                string `json:"mode"`
+	StartedAt           string `json:"startedAt,omitempty"`
+	CompletedAt         string `json:"completedAt,omitempty"`
+	CandidateRuns       int64  `json:"candidateRuns"`
+	InterruptedRuns     int64  `json:"interruptedRuns"`
+	LoopsRequeued       int64  `json:"loopsRequeued"`
+	QueueItemsRequeued  int64  `json:"queueItemsRequeued"`
+	QueueItemsCancelled int64  `json:"queueItemsCancelled"`
+	CleanedExecutions   int64  `json:"cleanedExecutions"`
+	// QuarantinedExecutions counts executions parked via quarantineRecoveryEvidence
+	// (still-running evidence + manual_intervention). Never report these as cleaned.
+	QuarantinedExecutions int64    `json:"quarantinedExecutions"`
+	SkippedUncertainRuns  int64    `json:"skippedUncertainRuns"`
+	EventsWritten         int64    `json:"eventsWritten"`
+	RunIDs                []string `json:"runIds,omitempty"`
+	LoopIDs               []string `json:"loopIds,omitempty"`
+	ExecutionIDs          []string `json:"executionIds,omitempty"`
 }
 
 type staleRunReconcileMode string
@@ -315,9 +318,11 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
-		// Close admission before draining producers so claim/mutation projections
-		// refuse new work while shutdown proceeds (ADR-0015 shutdown order).
-		_ = r.admission.BeginShutdown(reason)
+		// Close admission and cancel work-producing contexts before draining
+		// producers (ADR-0015 shutdown order). Use BeginShutdown so direct
+		// Runtime.Stop matches the daemon path: scheduler, deferred recovery,
+		// and in-flight webhook discovery are canceled before any waits.
+		r.BeginShutdown(reason)
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
@@ -2047,7 +2052,8 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			}
 			if quarantined {
 				quarantinedAny = true
-				summary.CleanedExecutions += 1
+				// Quarantine is not cleanup: agent_executions stay active evidence.
+				summary.QuarantinedExecutions += 1
 				summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
 			}
 			if wrote {

@@ -2422,8 +2422,11 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 			if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
 				t.Fatalf("summary = %#v, want no requeue after quarantine", summary)
 			}
-			if summary.CleanedExecutions != 1 {
-				t.Fatalf("summary.CleanedExecutions = %d, want 1 quarantined execution", summary.CleanedExecutions)
+			if summary.CleanedExecutions != 0 {
+				t.Fatalf("summary.CleanedExecutions = %d, want 0 (quarantine is not cleanup)", summary.CleanedExecutions)
+			}
+			if summary.QuarantinedExecutions != 1 {
+				t.Fatalf("summary.QuarantinedExecutions = %d, want 1", summary.QuarantinedExecutions)
 			}
 
 			run, err := repos.Runs.GetByID(context.Background(), runID)
