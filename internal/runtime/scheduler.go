@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -306,7 +307,15 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	if allowedCwd == "" {
 		return "", nil, fmt.Errorf("daemon-selected working directory is required")
 	}
-	return forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy)
+	resolvedLooper, err := exec.LookPath(realLooper)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve trusted looper path %q: %w", realLooper, err)
+	}
+	resolvedLooper, err = filepath.Abs(resolvedLooper)
+	if err != nil {
+		return "", nil, fmt.Errorf("make trusted looper path absolute: %w", err)
+	}
+	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy)
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
