@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,5 +82,38 @@ func TestHandlerMutationAdmissionGate(t *testing.T) {
 	degraded.ServeHTTP(degradedRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/loops", nil))
 	if degradedRecorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("POST while degraded status = %d, want 503", degradedRecorder.Code)
+	}
+}
+
+// Contract: Feishu url_verification must echo the challenge while admission is
+// closed; real card actions still require admission (#583).
+func TestHandlerFeishuURLVerificationBypassesAdmission(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	handler := NewHandler(Context{
+		Config:  cfg,
+		Runtime: admissionGateRuntime{err: looperdruntime.ErrAdmissionStopping},
+	})
+
+	challengeBody := `{"type":"url_verification","challenge":"abc123","token":"t"}`
+	challengeRec := httptest.NewRecorder()
+	handler.ServeHTTP(challengeRec, httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(challengeBody)))
+	if challengeRec.Code != http.StatusOK {
+		t.Fatalf("url_verification while stopping status = %d body=%s, want 200", challengeRec.Code, challengeRec.Body.String())
+	}
+	if !strings.Contains(challengeRec.Body.String(), `"challenge":"abc123"`) {
+		t.Fatalf("challenge echo missing: %s", challengeRec.Body.String())
+	}
+
+	// Non-handshake Feishu callbacks remain gated.
+	actionBody := `{"action":{"tag":"button","value":{"loopSeq":"1","answer":"yes"}}}`
+	actionRec := httptest.NewRecorder()
+	handler.ServeHTTP(actionRec, httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(actionBody)))
+	if actionRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("card action while stopping status = %d body=%s, want 503", actionRec.Code, actionRec.Body.String())
 	}
 }

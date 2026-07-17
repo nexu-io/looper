@@ -281,7 +281,9 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Mutation readiness is a projection of the single admission Authority
 	// (ADR-0015 / #575). Reads remain available while starting/stopping/degraded.
-	if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) {
+	// Feishu url_verification is a non-mutating challenge echo and is gated
+	// inside handleFeishuCardActionRoute after the handshake branch.
+	if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
 		if typed, denied := h.admissionMutationDenial(); denied {
 			h.writeError(w, requestID, typed)
 			return
@@ -5674,7 +5676,9 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(presentedToken), []byte(expectedToken)) == 1
 
 	// Feishu URL-verification handshake: echo the challenge verbatim. When a token
-	// is configured, require it to match even for the handshake.
+	// is configured, require it to match even for the handshake. This path produces
+	// no work and must succeed while admission is starting/stopping/degraded so
+	// Feishu can register or revalidate the callback URL.
 	if envelope.Type == "url_verification" {
 		if expectedToken != "" && !tokenMatches {
 			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
@@ -5682,6 +5686,11 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
+		return
+	}
+	// Real card actions and thread replies mutate HITL state; require admission.
+	if typed, denied := h.admissionMutationDenial(); denied {
+		h.writeError(w, requestID, typed)
 		return
 	}
 	if !h.context.Config.HITL.Enabled {

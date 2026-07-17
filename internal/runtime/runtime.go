@@ -119,6 +119,9 @@ type Services struct {
 type WebhookForwarder interface {
 	Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error)
 	Stats() webhookforward.Stats
+	// CancelExecute aborts in-flight webhook discovery without waiting for drain.
+	// BeginShutdown calls this so admission-closed races cannot still enqueue.
+	CancelExecute()
 	Close()
 }
 
@@ -368,6 +371,8 @@ func (r *Runtime) Stop(reason string) {
 // Also cancels the scheduler context so an in-flight full tick observes
 // cancellation during the HTTP drain window before Runtime.Stop closes the
 // loop; work-producing lanes still recheck AllowClaim as the Authority.
+// Cancels webhook-forward discovery so a worker that already passed
+// AllowExecute cannot finish CreateOrGetActiveByDedupe after admission closes.
 func (r *Runtime) BeginShutdown(reason string) {
 	if r == nil {
 		return
@@ -375,9 +380,13 @@ func (r *Runtime) BeginShutdown(reason string) {
 	_ = r.admission.BeginShutdown(reason)
 	r.mu.Lock()
 	cancel := r.schedulerCancel
+	forwarder := r.webhookForwarder
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if forwarder != nil {
+		forwarder.CancelExecute()
 	}
 }
 

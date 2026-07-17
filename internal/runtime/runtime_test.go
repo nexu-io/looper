@@ -3283,6 +3283,8 @@ func (s stubRuntimeWebhookForwarder) Forward(context.Context, webhookforward.Del
 
 func (s stubRuntimeWebhookForwarder) Stats() webhookforward.Stats { return s.stats }
 
+func (stubRuntimeWebhookForwarder) CancelExecute() {}
+
 func (stubRuntimeWebhookForwarder) Close() {}
 
 func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {

@@ -125,6 +125,7 @@ func (f *recordingConfigRouteForwarder) Forward(context.Context, webhookforward.
 }
 
 func (f *recordingConfigRouteForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
+func (f *recordingConfigRouteForwarder) CancelExecute()              {}
 func (f *recordingConfigRouteForwarder) Close()                      {}
 func (f *recordingConfigRouteForwarder) callCount() int {
 	f.mu.Lock()

@@ -172,6 +172,8 @@ func (f *testTunnelForwarder) Forward(_ context.Context, req webhookforward.Deli
 
 func (f *testTunnelForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
 
+func (f *testTunnelForwarder) CancelExecute() {}
+
 func (f *testTunnelForwarder) Close() {}
 
 func (f *testTunnelForwarder) reset() {

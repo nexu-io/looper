@@ -7273,6 +7273,8 @@ func (f *fakeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryR
 
 func (f *fakeWebhookForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
 
+func (f *fakeWebhookForwarder) CancelExecute() {}
+
 func (f *fakeWebhookForwarder) Close() {}
 
 func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
