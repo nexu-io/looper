@@ -185,6 +185,7 @@ and must not exist without a Supervisor lease.
 | **CLI config editor / dashboard browser open** | `config_commands.go`, `dashboard_command.go` | Short-lived operator tools; CLI-owned. |
 | **osascript notifications** | `internal/infra/notify/gateway.go` via `shell.Run` | Notification channel lifecycle; short-lived; not queue/agent ownership. |
 | **git / gh / tea tool invocations** | `internal/infra/git`, `internal/infra/github`, `internal/forge/tea` via `shell.Run` | Provider/tool gateways; request-scoped short commands under their gateways, not Supervisor agent leases. If a future path becomes long-lived owned work, reclassify before cutover. |
+| **Daemon `ps` liveness/identity probes** | `internal/runtime/runtime.go` (`defaultReadProcessCommand` for agent execution match); `internal/runtime/webhook_lifecycle.go` (`defaultProcessProbe.Argv` / `psProcessStart` non-Linux paths for forwarder identity) | Short-lived recovery/identity **evidence** only (see Authority). Not Supervisor-owned work producers and not R4 containment targets. They must never authorize live stop, terminal, requeue, or overlap while the daemon is live, and must not become confirmed-dead Authority after restart solely from PID absence. #575/#581 keep probes as evidence; do not migrate them onto Supervisor leases. |
 
 ### Explicitly out of scope
 
