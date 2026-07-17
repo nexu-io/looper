@@ -105,12 +105,31 @@ func (d *DaemonProcess) WaitForReady(ctx context.Context) (map[string]any, error
 			if readErr == nil && resp.StatusCode == http.StatusOK {
 				var envelope pkgapi.Envelope[map[string]any]
 				if decodeErr := json.Unmarshal(body, &envelope); decodeErr == nil && envelope.OK && envelope.Data != nil {
-					return *envelope.Data, nil
+					// HTTP status is available while admission is still
+					// "starting" (reads stay open). Wait until admission is
+					// ready so mutation-heavy e2e steps do not race 503.
+					if statusAdmissionReady(*envelope.Data) {
+						return *envelope.Data, nil
+					}
 				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// statusAdmissionReady reports whether /api/v1/status indicates the daemon
+// admits mutations. Missing admissionState (older daemons) is treated as ready.
+func statusAdmissionReady(status map[string]any) bool {
+	service, _ := status["service"].(map[string]any)
+	if service == nil {
+		return false
+	}
+	state, ok := service["admissionState"].(string)
+	if !ok {
+		return true
+	}
+	return state == "ready"
 }
 
 func (d *DaemonProcess) Stop(ctx context.Context) {

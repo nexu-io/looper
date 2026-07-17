@@ -922,6 +922,7 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 
 	assertEqual(t, service["healthy"], true)
 	assertEqual(t, service["daemonMode"], "foreground")
+	assertEqual(t, service["admissionState"], "ready")
 	binaryPath, ok := binaryInfo["path"].(string)
 	if !ok || strings.TrimSpace(binaryPath) == "" {
 		t.Fatalf("service.binary.path missing/invalid: %#v", binaryInfo["path"])

@@ -770,6 +770,22 @@ func (h *Handler) admissionMutationDenial() (apiError, bool) {
 	return apiError{}, false
 }
 
+// admissionStateString projects the single admission Authority for status
+// surfaces. Missing/partial runtimes report "ready" so embedders and older
+// test doubles keep open-admission behavior (same as AllowMutations).
+func (h *Handler) admissionStateString() string {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		return string(looperdruntime.AdmissionReady)
+	}
+	if typed, ok := any(runtimeValue).(interface {
+		AdmissionState() looperdruntime.AdmissionState
+	}); ok {
+		return string(typed.AdmissionState())
+	}
+	return string(looperdruntime.AdmissionReady)
+}
+
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
 		if !hasForwardingProxyHeaders(r.Header) {
@@ -944,9 +960,12 @@ type statusService struct {
 	Version    string                `json:"version"`
 	Build      version.BuildMetadata `json:"build"`
 	DaemonMode config.DaemonMode     `json:"daemonMode"`
-	StartedAt  *string               `json:"startedAt,omitempty"`
-	Recovery   any                   `json:"recovery"`
-	Binary     statusBinary          `json:"binary"`
+	// AdmissionState is the single live admission Authority (ADR-0015 R1).
+	// HTTP mutations and scheduler claims open only when this is "ready".
+	AdmissionState string       `json:"admissionState"`
+	StartedAt      *string      `json:"startedAt,omitempty"`
+	Recovery       any          `json:"recovery"`
+	Binary         statusBinary `json:"binary"`
 }
 
 type statusBinary struct {
@@ -1520,12 +1539,13 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 
 	return statusResponse{
 		Service: statusService{
-			Healthy:    storageState.OK,
-			Version:    version.Current().Version,
-			Build:      version.Current().Metadata,
-			DaemonMode: h.context.Config.Daemon.Mode,
-			StartedAt:  h.startedAtISO(),
-			Recovery:   h.recoverySummary(),
+			Healthy:        storageState.OK,
+			Version:        version.Current().Version,
+			Build:          version.Current().Metadata,
+			DaemonMode:     h.context.Config.Daemon.Mode,
+			AdmissionState: h.admissionStateString(),
+			StartedAt:      h.startedAtISO(),
+			Recovery:       h.recoverySummary(),
 			Binary: statusBinary{
 				Name:             "looperd",
 				Path:             daemonExecutablePath(),
