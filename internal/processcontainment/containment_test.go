@@ -2,6 +2,7 @@ package processcontainment
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,6 +12,27 @@ import (
 	"testing"
 	"time"
 )
+
+// TestWaitPrefersCompletedReapOverCanceledContext ensures Wait does not return
+// ctx.Err() when the leader is already reaped (both select cases ready).
+// Returning cancel after reap makes Drain clear confirmedDead incorrectly.
+func TestWaitPrefersCompletedReapOverCanceledContext(t *testing.T) {
+	h := &Handle{
+		waitCh:  make(chan struct{}),
+		waitErr: nil,
+	}
+	close(h.waitCh)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := h.Wait(ctx); err != nil {
+		t.Fatalf("Wait() error = %v, want nil when leader already reaped", err)
+	}
+	if !h.waitConsumed {
+		t.Fatal("waitConsumed = false after Wait on closed waitCh, want true")
+	}
+}
 
 func TestConfigureSetsProcessGroup(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "true")

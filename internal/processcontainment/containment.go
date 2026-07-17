@@ -241,17 +241,39 @@ func (h *Handle) SignalGroup(sig syscall.Signal) error {
 
 // Wait waits for the leader to exit and reaps it exactly once.
 // Leader exit alone does not confirm descendants are dead; call Drain.
+//
+// When waitCh is already closed and ctx is also canceled, prefer the completed
+// wait. Returning ctx.Err() after reap would make Drain treat a finished
+// stop as failNotConfirmed and clear confirmedDead, allowing a later Kill to
+// re-signal a reusable PGID.
 func (h *Handle) Wait(ctx context.Context) error {
+	// Fast path: already reaped.
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
 	case <-h.waitCh:
+		return h.consumeWait()
+	default:
 	}
+	select {
+	case <-h.waitCh:
+		return h.consumeWait()
+	case <-ctx.Done():
+		// Both may be ready; re-check wait before honoring cancellation.
+		select {
+		case <-h.waitCh:
+			return h.consumeWait()
+		default:
+			return ctx.Err()
+		}
+	}
+}
+
+// consumeWait records that the leader has been reaped and returns waitErr.
+// Call only after receiving from waitCh (or observing it closed).
+func (h *Handle) consumeWait() error {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.waitConsumed = true
-	err := h.waitErr
-	h.mu.Unlock()
-	return err
+	return h.waitErr
 }
 
 // ProcessState returns the reaped leader ProcessState, or nil if not yet waited.
@@ -281,27 +303,44 @@ func (h *Handle) Kill(ctx context.Context) error {
 		return fmt.Errorf("process containment: SIGTERM: %w", err)
 	}
 
-	// Concurrently wait for leader exit while grace period runs.
-	leaderDone := make(chan struct{})
-	go func() {
-		_ = h.Wait(context.Background())
-		close(leaderDone)
-	}()
-
+	// Wait on waitCh in this goroutine (no detached waiter). A background
+	// Wait(context.Background()) would keep a goroutine and the handle/cmd
+	// alive after Kill returns on timeout, and each retry would add another.
 	graceTimer := h.graceTimer()
 	escalated := false
 	for {
+		// Prefer completed leader wait over cancellation when both are ready.
 		select {
-		case <-ctx.Done():
-			_ = h.SignalGroup(syscall.SIGKILL)
-			return h.failNotConfirmed(fmt.Errorf("kill interrupted: %w", ctx.Err()))
-		case <-leaderDone:
-			leaderDone = nil
+		case <-h.waitCh:
+			_ = h.consumeWait()
+			if err := h.drainGroup(ctx); err != nil {
+				return err
+			}
+			return nil
+		default:
+		}
+
+		select {
+		case <-h.waitCh:
+			_ = h.consumeWait()
 			// Leader reaped; still must drain descendants.
 			if err := h.drainGroup(ctx); err != nil {
 				return err
 			}
 			return nil
+		case <-ctx.Done():
+			// Re-check waitCh in case reap raced with cancellation.
+			select {
+			case <-h.waitCh:
+				_ = h.consumeWait()
+				if err := h.drainGroup(ctx); err != nil {
+					return err
+				}
+				return nil
+			default:
+				_ = h.SignalGroup(syscall.SIGKILL)
+				return h.failNotConfirmed(fmt.Errorf("kill interrupted: %w", ctx.Err()))
+			}
 		case <-graceTimer:
 			graceTimer = nil
 			if !escalated {
@@ -346,8 +385,8 @@ func (h *Handle) drainGroup(ctx context.Context) error {
 			// Leader must be reaped for confirmed-dead.
 			select {
 			case <-h.waitCh:
+				_ = h.consumeWait()
 				h.mu.Lock()
-				h.waitConsumed = true
 				h.confirmedDead = true
 				h.mu.Unlock()
 				return nil
