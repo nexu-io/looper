@@ -68,6 +68,73 @@ func TestSignalGroupNoOpAfterConfirmedDead(t *testing.T) {
 	}
 }
 
+// TestSignalGroupAfterWaitDoesNotSignalReusedPGID ensures Wait-then-SignalGroup
+// cleanup does not deliver non-zero signals when kill(-pgid,0) succeeds only
+// because a new process group reused the numeric PGID (confirmedDead still false).
+func TestSignalGroupAfterWaitDoesNotSignalReusedPGID(t *testing.T) {
+	var nonZeroSignals []syscall.Signal
+	h := &Handle{
+		pgid:   12345,
+		waitCh: make(chan struct{}),
+		signalFn: func(pid int, sig syscall.Signal) error {
+			if sig == 0 {
+				// Reused group: -pgid and +pgid both appear live.
+				return nil
+			}
+			nonZeroSignals = append(nonZeroSignals, sig)
+			return nil
+		},
+	}
+	close(h.waitCh)
+	if err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+
+	if err := h.SignalGroup(syscall.SIGTERM); err != nil {
+		t.Fatalf("SignalGroup(SIGTERM) error = %v, want nil on reused PGID", err)
+	}
+	if err := h.SignalGroup(syscall.SIGKILL); err != nil {
+		t.Fatalf("SignalGroup(SIGKILL) error = %v, want nil on reused PGID", err)
+	}
+	if len(nonZeroSignals) != 0 {
+		t.Fatalf("SignalGroup delivered %v, want none when PGID was reused after Wait", nonZeroSignals)
+	}
+	if h.termDelivered || h.killEscalated {
+		t.Fatalf("termDelivered=%v killEscalated=%v, want both false when reuse blocked signaling", h.termDelivered, h.killEscalated)
+	}
+}
+
+// TestSignalGroupAfterWaitDoesNotSignalEmptyGroup ensures Wait-then-SignalGroup
+// is a no-op when the group is already empty (ESRCH on probe) before confirmedDead.
+func TestSignalGroupAfterWaitDoesNotSignalEmptyGroup(t *testing.T) {
+	var nonZeroSignals []syscall.Signal
+	h := &Handle{
+		pgid:   12345,
+		waitCh: make(chan struct{}),
+		signalFn: func(pid int, sig syscall.Signal) error {
+			if sig == 0 {
+				return syscall.ESRCH
+			}
+			nonZeroSignals = append(nonZeroSignals, sig)
+			return nil
+		},
+	}
+	close(h.waitCh)
+	if err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+
+	if err := h.SignalGroup(syscall.SIGKILL); err != nil {
+		t.Fatalf("SignalGroup(SIGKILL) error = %v, want nil on empty group", err)
+	}
+	if len(nonZeroSignals) != 0 {
+		t.Fatalf("SignalGroup delivered %v, want none on empty post-reap group", nonZeroSignals)
+	}
+	if h.killEscalated {
+		t.Fatal("killEscalated = true after no-op SignalGroup, want false")
+	}
+}
+
 // TestKillAfterWaitDrainsWithoutSignalingEmptyGroup ensures Wait-then-Kill
 // cleanup does not send SIGTERM to -pgid when the leader is already reaped and
 // the group is empty (reusable PGID guard).

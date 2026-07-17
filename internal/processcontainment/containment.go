@@ -234,6 +234,12 @@ func (h *Handle) ConfirmedDead() bool {
 // After confirmed-dead, returns nil without signaling: the leader was reaped
 // and the numeric pgid may later be reused, so late cleanup/retry must not
 // target -pgid (same reusable-ID guard as Kill/Drain).
+//
+// Non-zero signals also re-check groupRunnable before delivery. Callers may
+// Wait (reap the leader) then use this low-level path for cleanup before
+// Drain/Kill sets confirmedDead; once the original group is empty the PGID
+// can already be released/reused, and groupRunnable's wait-done/reuse probes
+// are the same authority Kill/Drain use to avoid signaling an unrelated group.
 func (h *Handle) SignalGroup(sig syscall.Signal) error {
 	h.mu.Lock()
 	if h.confirmedDead {
@@ -244,6 +250,11 @@ func (h *Handle) SignalGroup(sig syscall.Signal) error {
 
 	if h.pgid <= 0 {
 		return fmt.Errorf("process containment: invalid pgid %d", h.pgid)
+	}
+	// Probe (sig==0) must still reach signalFn so groupRunnable can observe
+	// liveness/reuse. Cleanup signals must not.
+	if sig != 0 && !h.groupRunnable() {
+		return nil
 	}
 	err := h.signalFn(-h.pgid, sig)
 	if err == nil {
