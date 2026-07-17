@@ -1261,6 +1261,27 @@ func (r *Runtime) stopDeferredReviewerRecovery() {
 	}
 }
 
+// WaitForDeferredReviewerRecovery blocks until the post-ready deferred
+// reviewer recovery goroutine exits, or until ctx is canceled. It returns
+// immediately when deferred recovery was never started (for example when no
+// GitHub gateway is configured). Test fixtures call this after CompleteStartup
+// so later inserts of terminal reviewer metadata cannot race
+// normalizeTerminalReviewerLoopForRecovery.
+func (r *Runtime) WaitForDeferredReviewerRecovery(ctx context.Context) error {
+	r.mu.RLock()
+	done := r.recoveryDone
+	r.mu.RUnlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (r *Runtime) TriggerSchedulerTick() {
 	r.mu.RLock()
 	if r.stopped {

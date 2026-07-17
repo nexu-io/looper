@@ -7124,6 +7124,13 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("Runtime.CompleteStartup() error = %v", err)
 	}
+	// CompleteStartup starts deferred reviewer recovery after MarkReady. Wait
+	// so tests that insert terminal reviewer metadata (status=failed + metadata
+	// terminated) cannot race normalizeTerminalReviewerLoopForRecovery flipping
+	// loop.Status to terminated before retry preconditions run.
+	if err := rt.WaitForDeferredReviewerRecovery(context.Background()); err != nil {
+		t.Fatalf("Runtime.WaitForDeferredReviewerRecovery() error = %v", err)
+	}
 
 	t.Cleanup(func() {
 		rt.Stop("test cleanup")
