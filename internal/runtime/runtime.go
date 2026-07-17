@@ -752,7 +752,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
@@ -2451,8 +2451,9 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 		}
 		if loop != nil {
 			switch loop.Status {
-			case "paused", "completed", "failed", "terminated", "stopped":
-				// Already non-actionable for claim/requeue.
+			case "paused", "completed", "failed", "terminated", "stopped", "human_takeover":
+				// Already non-actionable for claim/requeue. human_takeover is a
+				// deliberate park (interactive handback); do not rewrite to paused.
 			default:
 				updated := *loop
 				updated.Status = "paused"

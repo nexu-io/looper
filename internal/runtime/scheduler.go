@@ -79,14 +79,17 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos                    *storage.Repositories
-	GitHubGateway            *githubinfra.Gateway
-	Logger                   bootstrap.Logger
-	Now                      func() time.Time
-	MaxConcurrentRuns        int
-	ClaimMu                  *sync.Mutex
-	ClaimBoundary            *sync.RWMutex
-	RefreshForClaim          func() defaultSchedulerTickInput
+	Repos             *storage.Repositories
+	GitHubGateway     *githubinfra.Gateway
+	Logger            bootstrap.Logger
+	Now               func() time.Time
+	MaxConcurrentRuns int
+	ClaimMu           *sync.Mutex
+	ClaimBoundary     *sync.RWMutex
+	RefreshForClaim   func() defaultSchedulerTickInput
+	// AllowClaim, when set, is rechecked immediately before each durable
+	// ClaimNext* so admission stopping cannot race past an earlier pump gate.
+	AllowClaim               func() error
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
@@ -2853,7 +2856,7 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -2887,47 +2890,38 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			Now:    now,
 		})
 	}
-	handlers.tick = func(ctx context.Context, services Services) error {
-		snapshot := handlers.snapshot()
-		if snapshot.input == nil {
-			return snapshot.tick(ctx, services)
-		}
-		input := snapshot.input(services)
+	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
+		input.AllowClaim = allowClaim
 		input.RefreshForClaim = func() defaultSchedulerTickInput {
 			latestSnapshot := handlers.snapshot()
 			if latestSnapshot.input == nil {
 				stopped := input
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
+				stopped.AllowClaim = allowClaim
 				return stopped
 			}
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
+			latest.AllowClaim = allowClaim
 			return latest
 		}
-		return runDefaultSchedulerTick(ctx, input)
+		return input
+	}
+	handlers.tick = func(ctx context.Context, services Services) error {
+		snapshot := handlers.snapshot()
+		if snapshot.input == nil {
+			return snapshot.tick(ctx, services)
+		}
+		return runDefaultSchedulerTick(ctx, attachClaimGate(snapshot.input(services), services))
 	}
 	handlers.claim = func(ctx context.Context, services Services) error {
 		snapshot := handlers.snapshot()
 		if snapshot.input == nil {
 			return snapshot.claim(ctx, services)
 		}
-		input := snapshot.input(services)
-		input.ClaimBoundary = claimBoundary
-		input.RefreshForClaim = func() defaultSchedulerTickInput {
-			latestSnapshot := handlers.snapshot()
-			if latestSnapshot.input == nil {
-				stopped := input
-				stopped.MaxConcurrentRuns = 0
-				stopped.RefreshForClaim = nil
-				return stopped
-			}
-			latest := latestSnapshot.input(services)
-			latest.ClaimBoundary = claimBoundary
-			return latest
-		}
-		return runIndependentClaimPass(ctx, input)
+		return runIndependentClaimPass(ctx, attachClaimGate(snapshot.input(services), services))
 	}
 	return handlers
 }
@@ -3750,9 +3744,20 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
+	// Recheck admission at each durable claim so BeginShutdown cannot race past
+	// an earlier pump-level AllowClaim and still ClaimNext under scheduler locks.
+	admitClaim := func() error {
+		if input.AllowClaim == nil {
+			return nil
+		}
+		return input.AllowClaim()
+	}
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
+		}
+		if err := admitClaim(); err != nil {
+			return queueItems, nil
 		}
 		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
@@ -3766,6 +3771,9 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	for len(queueItems) < availableSlots {
 		if err := ctx.Err(); err != nil {
 			return queueItems, err
+		}
+		if err := admitClaim(); err != nil {
+			return queueItems, nil
 		}
 		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
