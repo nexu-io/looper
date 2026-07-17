@@ -212,6 +212,48 @@ func TestBindRequiresStartedProcess(t *testing.T) {
 	}
 }
 
+func TestBindRejectsNonGroupLeader(t *testing.T) {
+	requireUnixProcessGroup(t)
+
+	// Started without Configure: child shares the caller's ambient process group.
+	cmd := exec.Command("/bin/sh", "-c", "sleep 60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	_, err := Bind(cmd, Options{})
+	if err == nil {
+		t.Fatal("Bind() error = nil, want error when command is not process group leader")
+	}
+}
+
+func TestKillIdempotentAfterConfirmedDead(t *testing.T) {
+	requireUnixProcessGroup(t)
+
+	cmd := exec.Command("/bin/sh", "-c", `while true; do sleep 0.05; done`)
+	handle, err := Start(cmd, Options{
+		GracePeriod:  20 * time.Millisecond,
+		DrainTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := handle.Kill(context.Background()); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if !handle.ConfirmedDead() {
+		t.Fatal("ConfirmedDead() = false after successful Kill")
+	}
+	// Second Kill must not re-signal a potentially reused pgid.
+	if err := handle.Kill(context.Background()); err != nil {
+		t.Fatalf("second Kill() error = %v, want nil after confirmed dead", err)
+	}
+}
+
 func TestDarwinAndLinuxGroupSignalSemantics(t *testing.T) {
 	requireUnixProcessGroup(t)
 

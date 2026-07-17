@@ -93,6 +93,10 @@ func Configure(cmd *exec.Cmd) {
 // Bind attaches a Handle to an already-started command that was Configure'd
 // (or otherwise started in its own process group). Arms exactly-once wait
 // without treating the process as drained.
+//
+// The bound process must be its process-group leader (pgid == pid). Binding a
+// command that shares the caller's ambient group would make SignalGroup target
+// -pgid against Looper and sibling processes.
 func Bind(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, fmt.Errorf("process containment: started command with process is required")
@@ -103,8 +107,10 @@ func Bind(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	}
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
-		// Fall back to leader pid as pgid (Setpgid leaders use pid==pgid).
-		pgid = pid
+		return nil, fmt.Errorf("process containment: getpgid(%d): %w", pid, err)
+	}
+	if pgid != pid {
+		return nil, fmt.Errorf("process containment: pid %d is not process group leader (pgid=%d); Configure before Start", pid, pgid)
 	}
 	h := newHandle(cmd, pid, pgid, opts)
 	h.armWait()
@@ -155,8 +161,13 @@ func newHandle(cmd *exec.Cmd, pid, pgid int, opts Options) *Handle {
 func (h *Handle) armWait() {
 	go func() {
 		h.waitOnce.Do(func() {
-			h.waitErr = h.cmd.Wait()
-			h.state = h.cmd.ProcessState
+			err := h.cmd.Wait()
+			state := h.cmd.ProcessState
+			// Publish under mu so Snapshot/ProcessState cannot race the write.
+			h.mu.Lock()
+			h.waitErr = err
+			h.state = state
+			h.mu.Unlock()
 			close(h.waitCh)
 		})
 	}()
@@ -249,6 +260,14 @@ func (h *Handle) ProcessState() *os.ProcessState {
 // confirmed non-runnable. Returns nil only on confirmed-dead; otherwise an
 // explicit error (including context/timeout wrapped with ErrNotConfirmedDead).
 func (h *Handle) Kill(ctx context.Context) error {
+	h.mu.Lock()
+	if h.confirmedDead {
+		h.mu.Unlock()
+		// Already confirmed; never re-signal a reusable numeric pgid/pid.
+		return nil
+	}
+	h.mu.Unlock()
+
 	ctx, cancel := h.withDrainTimeout(ctx)
 	defer cancel()
 
@@ -365,10 +384,17 @@ func (h *Handle) groupRunnable() bool {
 		return false
 	}
 	err := h.signalFn(-h.pgid, 0)
-	if err == nil {
-		return true
+	if err != nil {
+		// ESRCH / process done => no addressable group members.
+		return !isNoSuchProcess(err)
 	}
-	return !isNoSuchProcess(err)
+	// kill(-pgid, 0) succeeds for zombie-only groups on Linux. Those are not
+	// runnable; confirmed-dead must not wait on init reaping them.
+	if live, ok := groupHasNonZombieMember(h.pgid); ok {
+		return live
+	}
+	// No platform non-zombie probe (or scan failed): trust signal 0.
+	return true
 }
 
 func (h *Handle) withDrainTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
