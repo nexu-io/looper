@@ -65,6 +65,7 @@ type Handle struct {
 	signalFn     SignalFunc
 	now          func() time.Time
 
+	armOnce  sync.Once
 	waitOnce sync.Once
 	waitCh   chan struct{}
 	waitErr  error
@@ -97,8 +98,10 @@ func Configure(cmd *exec.Cmd) {
 }
 
 // Bind attaches a Handle to an already-started command that was Configure'd
-// (or otherwise started in its own process group). Arms exactly-once wait
-// without treating the process as drained.
+// (or otherwise started in its own process group). Does not treat the process
+// as drained. Exactly-once wait is armed lazily on the first Wait, Kill, or
+// Drain so callers can start StdoutPipe/StderrPipe readers before Wait closes
+// those pipes.
 //
 // The bound process must be its process-group leader (pgid == pid). Binding a
 // command that shares the caller's ambient group would make SignalGroup target
@@ -118,12 +121,12 @@ func Bind(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	if pgid != pid {
 		return nil, fmt.Errorf("process containment: pid %d is not process group leader (pgid=%d); Configure before Start", pid, pgid)
 	}
-	h := newHandle(cmd, pid, pgid, opts)
-	h.armWait()
-	return h, nil
+	return newHandle(cmd, pid, pgid, opts), nil
 }
 
-// Start is Configure + cmd.Start + Bind.
+// Start is Configure + cmd.Start + Bind. Wait is not armed before Start
+// returns, so short-lived producers that use StdoutPipe/StderrPipe can begin
+// draining before the reaper closes the pipes.
 func Start(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	if cmd == nil {
 		return nil, fmt.Errorf("process containment: command is required")
@@ -164,19 +167,27 @@ func newHandle(cmd *exec.Cmd, pid, pgid int, opts Options) *Handle {
 	}
 }
 
+// armWait starts exactly-once leader reaping. Deferred until Wait/Kill/Drain
+// so Bind/Start can return before any pipe readers are running.
+// No-op when cmd is unset (unit-test handles that close waitCh directly).
 func (h *Handle) armWait() {
-	go func() {
-		h.waitOnce.Do(func() {
-			err := h.cmd.Wait()
-			state := h.cmd.ProcessState
-			// Publish under mu so Snapshot/ProcessState cannot race the write.
-			h.mu.Lock()
-			h.waitErr = err
-			h.state = state
-			h.mu.Unlock()
-			close(h.waitCh)
-		})
-	}()
+	if h.cmd == nil {
+		return
+	}
+	h.armOnce.Do(func() {
+		go func() {
+			h.waitOnce.Do(func() {
+				err := h.cmd.Wait()
+				state := h.cmd.ProcessState
+				// Publish under mu so Snapshot/ProcessState cannot race the write.
+				h.mu.Lock()
+				h.waitErr = err
+				h.state = state
+				h.mu.Unlock()
+				close(h.waitCh)
+			})
+		}()
+	})
 }
 
 // PID returns the leader process id.
@@ -247,6 +258,7 @@ func (h *Handle) SignalGroup(sig syscall.Signal) error {
 // stop as failNotConfirmed and clear confirmedDead, allowing a later Kill to
 // re-signal a reusable PGID.
 func (h *Handle) Wait(ctx context.Context) error {
+	h.armWait()
 	// Fast path: already reaped.
 	select {
 	case <-h.waitCh:
@@ -295,6 +307,8 @@ func (h *Handle) Kill(ctx context.Context) error {
 		return nil
 	}
 	h.mu.Unlock()
+
+	h.armWait()
 
 	ctx, cancel := h.withDrainTimeout(ctx)
 	defer cancel()
@@ -355,8 +369,16 @@ func (h *Handle) Kill(ctx context.Context) error {
 // Drain waits for the leader (if needed) and ensures no runnable members remain
 // in the owned process group. Intended after normal leader exit leaves
 // background descendants, or as the confirmation half of stop delivery.
-// Returns nil only when ConfirmedDead.
+// Returns nil only when ConfirmedDead. Already-confirmed handles no-op so
+// retry paths never re-probe a reusable numeric pgid.
 func (h *Handle) Drain(ctx context.Context) error {
+	h.mu.Lock()
+	if h.confirmedDead {
+		h.mu.Unlock()
+		return nil
+	}
+	h.mu.Unlock()
+
 	ctx, cancel := h.withDrainTimeout(ctx)
 	defer cancel()
 

@@ -227,6 +227,67 @@ func TestKillIdempotentAfterConfirmedDead(t *testing.T) {
 	}
 }
 
+func TestDrainIdempotentAfterConfirmedDead(t *testing.T) {
+	requireUnixProcessGroup(t)
+
+	cmd := exec.Command("/bin/sh", "-c", `while true; do sleep 0.05; done`)
+	handle, err := Start(cmd, Options{
+		GracePeriod:  20 * time.Millisecond,
+		DrainTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := handle.Kill(context.Background()); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	if !handle.ConfirmedDead() {
+		t.Fatal("ConfirmedDead() = false after successful Kill")
+	}
+	// Second Drain must no-op: re-probing a reaped pgid risks signaling a reused id.
+	if err := handle.Drain(context.Background()); err != nil {
+		t.Fatalf("second Drain() error = %v, want nil after confirmed dead", err)
+	}
+	if !handle.ConfirmedDead() {
+		t.Fatal("ConfirmedDead() cleared by Drain after confirmation")
+	}
+}
+
+// TestStartStdoutPipeSurvivesShortLivedLeader ensures Start does not arm Wait
+// before returning, so StdoutPipe readers can drain short-lived producers.
+func TestStartStdoutPipeSurvivesShortLivedLeader(t *testing.T) {
+	requireUnixProcessGroup(t)
+
+	cmd := exec.Command("/bin/sh", "-c", `printf 'hello-from-pipe'`)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe() error = %v", err)
+	}
+	handle, err := Start(cmd, Options{
+		DrainTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// Read after Start returns; Wait must not have closed the pipe yet.
+	buf := make([]byte, 64)
+	n, readErr := stdout.Read(buf)
+	if readErr != nil && n == 0 {
+		t.Fatalf("stdout.Read() error = %v (pipe closed before reader started?)", readErr)
+	}
+	got := string(buf[:n])
+	if got != "hello-from-pipe" {
+		t.Fatalf("stdout = %q, want %q", got, "hello-from-pipe")
+	}
+	if err := handle.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if err := handle.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain() error = %v", err)
+	}
+}
+
 func TestDarwinAndLinuxGroupSignalSemantics(t *testing.T) {
 	requireUnixProcessGroup(t)
 
