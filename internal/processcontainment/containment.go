@@ -80,6 +80,10 @@ type Handle struct {
 // Configure sets process-group isolation on cmd before Start.
 // The child becomes the leader of a new process group (Setpgid).
 // Shared by agent and shell producers when they migrate onto this handle.
+//
+// Inherited SysProcAttr fields are normalized: a non-zero Pgid would join an
+// existing group instead of creating one, and Setsid combined with Setpgid can
+// make cmd.Start fail. Clear both so Bind's pgid==pid invariant holds after Start.
 func Configure(cmd *exec.Cmd) {
 	if cmd == nil {
 		return
@@ -88,6 +92,8 @@ func Configure(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Pgid = 0
+	cmd.SysProcAttr.Setsid = false
 }
 
 // Bind attaches a Handle to an already-started command that was Configure'd
