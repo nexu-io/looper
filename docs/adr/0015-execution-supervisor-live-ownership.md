@@ -134,10 +134,20 @@ Authoritative live states: `starting | ready | stopping | degraded`.
 
 - Transitions are monotonic / legal only (e.g. `starting→ready`, `ready→stopping`,
   sticky `degraded` until restart/clear). Documented in `internal/runtime/admission.go`.
-- HTTP mutation readiness and scheduler **claim** are **projections** of
-  this state, not a second Authority. Exhaustive non-claim mutation coverage is #580.
+- HTTP mutation readiness and the work-producing **scheduler tick** (discovery,
+  HITL, claims, stale-reconcile) are **projections** of this state, not a second
+  Authority. Exhaustive non-claim mutation surface audit remains #580.
 - Admission decisions must be atomic with the action they gate (single `Admission`
   mutex; no dual ready flag that can disagree).
+
+**Admission concept trade-off (R1):**
+
+| | |
+|--|--|
+| **Failure prevented** | Dual ready flags and claim-only gates that admit enqueue/mutate while starting or after `BeginShutdown`; recovery acting on reusable PIDs without a closed process-lifetime Authority. |
+| **Costs** | Sticky `degraded`; no-op ticks while not ready; every new work-producing path must consult admission; more quarantine/`manual_intervention` during uncertain recovery. |
+| **Why not simpler** | A boolean ready next to `ownershipAcquired` re-creates dual Authority. Gating only `ClaimNext*` still lets discovery/HITL/reconcile persist queue work. SQLite/PID probes lag and are not atomic with admission. |
+| **Deletion attempt** | Drop separate readiness and trust process/agent signals alone — insufficient for multi-PR ownership rollout before Supervisor coverage. |
 
 ### Shutdown order (target; partial in #575, complete in #577/#580)
 

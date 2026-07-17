@@ -384,7 +384,8 @@ func (r *Runtime) AllowMutations() error {
 	return r.admission.AllowMutations()
 }
 
-// AllowClaim is the scheduler claim projection of admission.
+// AllowClaim is the scheduler work-producing projection of admission
+// (full tick + durable claims).
 func (r *Runtime) AllowClaim() error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping

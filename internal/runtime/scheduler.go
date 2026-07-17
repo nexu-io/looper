@@ -87,8 +87,9 @@ type defaultSchedulerTickInput struct {
 	ClaimMu           *sync.Mutex
 	ClaimBoundary     *sync.RWMutex
 	RefreshForClaim   func() defaultSchedulerTickInput
-	// AllowClaim, when set, is rechecked immediately before each durable
-	// ClaimNext* so admission stopping cannot race past an earlier pump gate.
+	// AllowClaim, when set, is the admission projection for all work-producing
+	// scheduler activity: the full default tick (discovery, HITL, claims,
+	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
 	AllowClaim               func() error
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
@@ -3358,6 +3359,17 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Repos == nil || input.Repos.Projects == nil {
 		return nil
 	}
+	// Gate the entire work-producing tick (discovery, HITL, claims, stale
+	// reconcile), not only ClaimNext*. Admission closed during starting/stopping
+	// must not enqueue via CreateOrGetActiveByDedupe or requeue via reconcile.
+	if input.AllowClaim != nil {
+		if err := input.AllowClaim(); err != nil {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler tick skipped: admission closed", map[string]any{"error": err.Error()})
+			}
+			return nil
+		}
+	}
 
 	startedAt := time.Now()
 	claimStats := schedulerClaimStats{}
@@ -3605,6 +3617,11 @@ func (s *schedulerClaimStats) record(claimedCount, availableSlots int) {
 }
 
 func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInput) error {
+	if input.AllowClaim != nil {
+		if err := input.AllowClaim(); err != nil {
+			return nil
+		}
+	}
 	_, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil || !catalogCurrent {
 		return err
@@ -3647,6 +3664,13 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	}
 	if input.RefreshForClaim != nil {
 		input = input.RefreshForClaim()
+	}
+	// Re-check after RefreshForClaim so a mid-tick catalog snapshot cannot open
+	// claims/reconcile after admission closed. Discovery/HITL are gated at tick start.
+	if input.AllowClaim != nil {
+		if err := input.AllowClaim(); err != nil {
+			return 0, 0, nil
+		}
 	}
 	start := time.Now()
 	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)

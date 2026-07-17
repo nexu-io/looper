@@ -251,6 +251,58 @@ func TestSafetyFloorBeginShutdownClosesAdmissionBeforeStorage(t *testing.T) {
 	rt.Stop("test stop")
 }
 
+// Contract: admission closed must skip the entire work-producing tick
+// (discovery / HITL / claims / stale-reconcile), not only ClaimNext*.
+func TestSafetyFloorTickSkipsDiscoveryAndReconcileWhenAdmissionClosed(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler.sqlite"), backupDir)
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	projectMetadata := `{"repo":"nexu-io/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "looper", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"),
+		BaseBranch: &baseBranch, MetadataJSON: &projectMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	plannerRunner := &stubPlannerScheduler{}
+	var reconcileCalls atomic.Int64
+	var allowCalls atomic.Int64
+	err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		MaxConcurrentRuns: 1,
+		Planner:           plannerRunner,
+		ReconcileStaleRuns: func(context.Context) (StaleRunReconcileSummary, error) {
+			reconcileCalls.Add(1)
+			return StaleRunReconcileSummary{}, nil
+		},
+		AllowClaim: func() error {
+			allowCalls.Add(1)
+			return ErrAdmissionStopping
+		},
+	})
+	if err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if allowCalls.Load() == 0 {
+		t.Fatal("AllowClaim was not consulted at tick start")
+	}
+	if len(plannerRunner.discoverCalls) != 0 {
+		t.Fatalf("planner discover calls = %#v, want none when admission closed", plannerRunner.discoverCalls)
+	}
+	if reconcileCalls.Load() != 0 {
+		t.Fatalf("ReconcileStaleRuns calls = %d, want 0 when admission closed", reconcileCalls.Load())
+	}
+}
+
 // Contract: AllowClaim is rechecked immediately before each durable ClaimNext*
 // so a pump-level pass cannot race with BeginShutdown and still claim work.
 func TestSafetyFloorClaimRechecksAdmissionBeforeClaimNext(t *testing.T) {

@@ -7,8 +7,28 @@ import (
 )
 
 // AdmissionState is the single authoritative live-daemon admission state
-// (ADR-0015 R1 / issue #575). HTTP mutation readiness and scheduler claim
-// decisions are projections of this state — not a second ready flag.
+// (ADR-0015 R1 / issue #575). HTTP mutation readiness and scheduler work
+// (full tick: discovery/HITL/claims/stale-reconcile) are projections of this
+// state — not a second ready flag.
+//
+// Trade-off (AGENTS.md new-concept gate):
+//
+// Failure prevented: mid-rollout dual ready flags (ownershipAcquired vs HTTP/
+// scheduler gates) that disagree, admitting mutations or enqueueing work while
+// recovery is incomplete or shutdown has begun; recovery inventing cleanliness
+// from reusable PIDs without a single closed admission Authority.
+//
+// Costs / new edge cases: sticky degraded until restart/clear; startup window
+// where reads work but all mutations and work-producing ticks no-op; shutdown
+// must BeginShutdown before storage close; every new work-producing path must
+// call AllowMutations/AllowClaim (easy to miss → #580 audit); more
+// manual_intervention quarantine instead of aggressive auto-clean.
+//
+// Why simpler alternatives are insufficient: a boolean ready flag next to
+// ownershipAcquired re-creates dual Authority; gating only ClaimNext* leaves
+// discovery/HITL/reconcile free to mutate queue storage while admission is
+// closed; trusting SQLite or PID probes as live Authority lags and is not
+// atomic with admission decisions.
 //
 // Legal transitions (monotonic / legal only):
 //
@@ -39,6 +59,9 @@ var (
 // Admission is the single Authority for live daemon admission.
 // All gates must call AllowMutations / AllowClaim under the same mutex as
 // state reads so there is no check-then-act dual flag that can disagree.
+// Deletion attempt: remove separate ownershipAcquired readiness and trust only
+// agent/process signals — insufficient for multi-PR rollout because recovery
+// and ingress need a process-lifetime closed gate before Supervisor ownership.
 type Admission struct {
 	mu     sync.Mutex
 	state  AdmissionState
@@ -165,8 +188,9 @@ func (a *Admission) AllowMutations() error {
 	return a.allowWork()
 }
 
-// AllowClaim is the atomic gate for scheduler queue claims. Same Authority as
-// AllowMutations — a projection, not a second decision.
+// AllowClaim is the atomic gate for work-producing scheduler activity (full
+// tick and each durable ClaimNext*). Same Authority as AllowMutations — a
+// projection, not a second decision.
 func (a *Admission) AllowClaim() error {
 	return a.allowWork()
 }
