@@ -116,7 +116,7 @@ to a slice while any open blocker remains.
 |------:|-------|------|--------------------------------|------------------------------|
 | R0 | #573 | Contract + inventory | Authority statement, matrix, producer inventory, mid-state rules, exit criteria | **Enforced** (docs-only; this document) |
 | R1 | #575 | Safety floor: one admission state; stop unsafe recovery PID action | Single admission Authority; no mutation/claim before ready; recovery no-act + quarantine; drain ingress before storage close | **Enforced** |
-| R2 | #574 | Process containment handle with confirmed drain | Containment API; kill success = confirmed drain; no production removal of PID fallback yet | **Deferred** |
+| R2 | #574 | Process containment handle with confirmed drain | Containment API; kill success = confirmed drain; no production removal of PID fallback yet | **Enforced** |
 | R3 | #576 | Own all in-scope agent spawns at common executor boundary | Lease before `cmd.Start`; bind handle before return; stop-kill via handle; remove agent live PID fallback only after full agent coverage | **Deferred** |
 | R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Deferred** |
 | R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Deferred** |
@@ -148,6 +148,24 @@ Authoritative live states: `starting | ready | stopping | degraded`.
 | **Costs** | Sticky `degraded`; no-op ticks while not ready; every new work-producing path must consult admission; more quarantine/`manual_intervention` during uncertain recovery. |
 | **Why not simpler** | A boolean ready next to `ownershipAcquired` re-creates dual Authority. Gating only `ClaimNext*` still lets discovery/HITL/reconcile persist queue work. SQLite/PID probes lag and are not atomic with admission. |
 | **Deletion attempt** | Drop separate readiness and trust process/agent signals alone — insufficient for multi-PR ownership rollout before Supervisor coverage. |
+
+### Process containment handle (enforced by #574)
+
+Library: `internal/processcontainment`. Additive only — producers still use
+existing stop/kill paths until #576/#577. The handle owns configure (Setpgid),
+signal, exactly-once leader wait/reap, descendant drain, and **confirmed-dead**
+reporting. Kill/Drain success means the owned process group is confirmed
+non-runnable and the leader is reaped; signal delivery alone is never success.
+Timeouts fail loud (`ErrNotConfirmedDead`) rather than reporting false success.
+
+**Containment concept trade-off (R2):**
+
+| | |
+|--|--|
+| **Failure prevented** | Stop paths treating SIGTERM/SIGKILL delivery (or leader exit alone) as success while TERM-resistant children or background group members remain runnable. |
+| **Costs** | Platform-specific process-group drain; stop latency when descendants resist TERM; callers must handle explicit drain timeout/failure. |
+| **Why not simpler** | Reusing PID/PGID probe-then-signal without a wait/reap Authority reintroduces the reusable-ID and false-success failures this program forbids. |
+| **Deletion attempt** | Remove dual kill paths immediately — blocked until #576/#577 migrate producers; this slice stays additive so mid-rollout does not create partial cutover. |
 
 ### Shutdown order (target; partial in #575, complete in #577/#580)
 
