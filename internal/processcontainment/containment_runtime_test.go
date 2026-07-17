@@ -3,6 +3,7 @@ package processcontainment
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,6 +91,51 @@ exit 0
 		t.Fatal("ConfirmedDead() = false after Drain cleaned background child")
 	}
 	assertProcessDead(t, childPID)
+}
+
+// TestDrainWriterCaptureReapsBackgroundDescendant covers writer-based stdout
+// capture (cmd.Stdout = io.Writer): after the leader exits, a background child
+// that inherited the pipe keeps cmd.Wait blocked on copy-EOF. Drain must still
+// TERM/KILL the group so Wait can finish and confirmed-dead succeeds.
+func TestDrainWriterCaptureReapsBackgroundDescendant(t *testing.T) {
+	requireUnixProcessGroup(t)
+
+	workDir := t.TempDir()
+	childPIDPath := filepath.Join(workDir, "child.pid")
+	script := `
+set -e
+(sleep 60) &
+echo $! > "$CHILD_PID_FILE"
+exit 0
+`
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(), "CHILD_PID_FILE="+childPIDPath)
+	// Same pattern as agent stream capture: non-file Writers force pipe+copy
+	// goroutines that only finish after every inherited write end closes.
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+
+	handle, err := Start(cmd, Options{
+		GracePeriod:  20 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	childPID := waitForPIDFile(t, childPIDPath)
+	// Do not call Wait first: that is the stuck path when descendants hold pipes.
+	assertProcessRunning(t, childPID)
+
+	if err := handle.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain() error = %v", err)
+	}
+	if !handle.ConfirmedDead() {
+		t.Fatal("ConfirmedDead() = false after Drain with writer capture")
+	}
+	assertProcessDead(t, childPID)
+	assertProcessDead(t, handle.PID())
 }
 
 func TestSignalOnlyIsNeverSuccess(t *testing.T) {

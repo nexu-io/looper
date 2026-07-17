@@ -397,6 +397,13 @@ func (h *Handle) Kill(ctx context.Context) error {
 // background descendants, or as the confirmation half of stop delivery.
 // Returns nil only when ConfirmedDead. Already-confirmed handles no-op so
 // retry paths never re-probe a reusable numeric pgid.
+//
+// Drain must not block on Wait before signaling the group. With writer-based
+// stdout/stderr capture (cmd.Stdout/Stderr set to an io.Writer), cmd.Wait does
+// not return until Go's copy goroutines see EOF. A background descendant that
+// inherited those pipes keeps Wait stuck; signaling via drainGroup first closes
+// the pipes so the reaper can finish. Confirmed-dead still requires waitCh
+// completion inside drainGroup.
 func (h *Handle) Drain(ctx context.Context) error {
 	h.mu.Lock()
 	if h.confirmedDead {
@@ -408,12 +415,7 @@ func (h *Handle) Drain(ctx context.Context) error {
 	ctx, cancel := h.withDrainTimeout(ctx)
 	defer cancel()
 
-	if err := h.Wait(ctx); err != nil {
-		// Leader non-zero exit or signal death still reaps; only ctx failure aborts.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-			return h.failNotConfirmed(err)
-		}
-	}
+	h.armWait()
 	return h.drainGroup(ctx)
 }
 
