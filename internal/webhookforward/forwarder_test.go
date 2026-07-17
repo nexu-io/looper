@@ -25,10 +25,10 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 	fixerRunner := newFakeTargetedRunner(nil)
 	var executeCalls atomic.Int64
 	forwarder := New(Options{
-		Repos:     repos,
-		Config:    testConfig(t),
-		Reviewer:  reviewerRunner,
-		Fixer:     targetedFixerAdapter{runner: fixerRunner},
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
 		MaxConcurrent: 1,
 		QueueCapacity: 8,
 		AllowExecute: func() error {
