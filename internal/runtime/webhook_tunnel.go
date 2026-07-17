@@ -420,6 +420,21 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "repository mismatch", http.StatusBadRequest)
 		return
 	}
+	// Work-producing deliveries must consult admission. The tunnel listener
+	// starts before MarkReady and remains up during BeginShutdown→Stop drain,
+	// so without this gate Forward can enqueue discovery while admission is
+	// starting/stopping/degraded.
+	if err := s.runtime.allowTunnelForward(); err != nil {
+		if s.runtime.logger != nil {
+			s.runtime.logger.Warn("webhook.tunnel.admission_refused", map[string]any{
+				"repo":        repo,
+				"delivery_id": r.Header.Get("X-GitHub-Delivery"),
+				"error":       err.Error(),
+			})
+		}
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	forwarder := s.runtime.currentForwarder()
 	if forwarder == nil {
 		http.Error(w, "webhook forwarder unavailable", http.StatusServiceUnavailable)
@@ -442,6 +457,15 @@ func (w *webhookRuntime) currentForwarder() WebhookForwarder {
 		return nil
 	}
 	return w.forwarder()
+}
+
+// allowTunnelForward is the atomic admission gate for tunnel Forward.
+// Nil allowForward keeps open behavior for isolated unit tests.
+func (w *webhookRuntime) allowTunnelForward() error {
+	if w == nil || w.allowForward == nil {
+		return nil
+	}
+	return w.allowForward()
 }
 
 func (w *webhookRuntime) currentTunnelStore() *storage.WebhookTunnelHooksRepository {

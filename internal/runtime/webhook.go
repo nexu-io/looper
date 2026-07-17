@@ -120,8 +120,12 @@ type webhookRuntime struct {
 	allowedTunnelRepos map[string]struct{}
 	tunnelClient       webhookTunnelGitHubClient
 	forwarder          func() WebhookForwarder
-	tunnelServer       *webhookTunnelServer
-	bootstrapDone      bool
+	// allowForward is the admission projection for work-producing tunnel
+	// deliveries (Forward). Nil means open, matching unit tests that construct
+	// webhookRuntime without a Runtime admission Authority.
+	allowForward  func() error
+	tunnelServer  *webhookTunnelServer
+	bootstrapDone bool
 }
 
 func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() time.Time) *webhookRuntime {
