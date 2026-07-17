@@ -46,6 +46,32 @@ func TestFailNotConfirmedPreservesConfirmedDead(t *testing.T) {
 	}
 }
 
+// TestSignalGroupNoOpAfterConfirmedDead ensures the exported low-level path
+// does not signal -pgid after Kill/Drain confirmed death (reusable PGID guard).
+func TestSignalGroupNoOpAfterConfirmedDead(t *testing.T) {
+	signaled := 0
+	h := &Handle{
+		pgid:          12345,
+		confirmedDead: true,
+		signalFn: func(pid int, sig syscall.Signal) error {
+			signaled++
+			return nil
+		},
+	}
+	if err := h.SignalGroup(syscall.SIGKILL); err != nil {
+		t.Fatalf("SignalGroup(SIGKILL) error = %v, want nil after confirmed dead", err)
+	}
+	if err := h.SignalGroup(syscall.SIGTERM); err != nil {
+		t.Fatalf("SignalGroup(SIGTERM) error = %v, want nil after confirmed dead", err)
+	}
+	if signaled != 0 {
+		t.Fatalf("signalFn called %d times, want 0 after confirmed dead", signaled)
+	}
+	if h.termDelivered || h.killEscalated {
+		t.Fatal("termDelivered/killEscalated set after no-op SignalGroup, want unchanged")
+	}
+}
+
 func TestConfigureSetsProcessGroup(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "true")
 	Configure(cmd)

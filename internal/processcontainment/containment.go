@@ -227,7 +227,17 @@ func (h *Handle) ConfirmedDead() bool {
 
 // SignalGroup delivers sig to the owned process group.
 // Success of this call is never treated as confirmed-dead.
+// After confirmed-dead, returns nil without signaling: the leader was reaped
+// and the numeric pgid may later be reused, so late cleanup/retry must not
+// target -pgid (same reusable-ID guard as Kill/Drain).
 func (h *Handle) SignalGroup(sig syscall.Signal) error {
+	h.mu.Lock()
+	if h.confirmedDead {
+		h.mu.Unlock()
+		return nil
+	}
+	h.mu.Unlock()
+
 	if h.pgid <= 0 {
 		return fmt.Errorf("process containment: invalid pgid %d", h.pgid)
 	}
