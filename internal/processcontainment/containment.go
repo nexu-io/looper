@@ -255,8 +255,7 @@ func (h *Handle) SignalGroup(sig syscall.Signal) error {
 //
 // When waitCh is already closed and ctx is also canceled, prefer the completed
 // wait. Returning ctx.Err() after reap would make Drain treat a finished
-// stop as failNotConfirmed and clear confirmedDead, allowing a later Kill to
-// re-signal a reusable PGID.
+// stop as failNotConfirmed even though the leader is already reaped.
 func (h *Handle) Wait(ctx context.Context) error {
 	h.armWait()
 	// Fast path: already reaped.
@@ -519,10 +518,10 @@ func (h *Handle) isWaitDone() bool {
 	}
 }
 
+// failNotConfirmed wraps a stop failure with ErrNotConfirmedDead.
+// confirmedDead is monotonic: once another overlapping Kill/Drain sets it,
+// a later failure path must not flip it back to false (reusable PGID safety).
 func (h *Handle) failNotConfirmed(cause error) error {
-	h.mu.Lock()
-	h.confirmedDead = false
-	h.mu.Unlock()
 	if cause == nil {
 		return ErrNotConfirmedDead
 	}

@@ -15,7 +15,6 @@ import (
 
 // TestWaitPrefersCompletedReapOverCanceledContext ensures Wait does not return
 // ctx.Err() when the leader is already reaped (both select cases ready).
-// Returning cancel after reap makes Drain clear confirmedDead incorrectly.
 func TestWaitPrefersCompletedReapOverCanceledContext(t *testing.T) {
 	h := &Handle{
 		waitCh:  make(chan struct{}),
@@ -31,6 +30,19 @@ func TestWaitPrefersCompletedReapOverCanceledContext(t *testing.T) {
 	}
 	if !h.waitConsumed {
 		t.Fatal("waitConsumed = false after Wait on closed waitCh, want true")
+	}
+}
+
+// TestFailNotConfirmedPreservesConfirmedDead ensures overlapping cleanup
+// failures never clear a confirmed-dead latch once set (reusable PGID guard).
+func TestFailNotConfirmedPreservesConfirmedDead(t *testing.T) {
+	h := &Handle{confirmedDead: true}
+	err := h.failNotConfirmed(context.DeadlineExceeded)
+	if !errors.Is(err, ErrNotConfirmedDead) {
+		t.Fatalf("failNotConfirmed() error = %v, want ErrNotConfirmedDead", err)
+	}
+	if !h.ConfirmedDead() {
+		t.Fatal("ConfirmedDead() = false after failNotConfirmed, want true (monotonic)")
 	}
 }
 
