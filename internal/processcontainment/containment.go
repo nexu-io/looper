@@ -477,6 +477,18 @@ func (h *Handle) groupRunnable() bool {
 		// ESRCH / process done => no addressable group members.
 		return !isNoSuchProcess(err)
 	}
+	// After the leader is reaped, kill(-pgid, 0) may succeed because a new
+	// process group reused the numeric PGID. On Unix the leader PID is not
+	// recycled while the old group still has members, so a live process at
+	// pid==pgid after reap means the empty group's id was reassigned — not
+	// our ownership. Do not treat that as runnable (avoids TERM/KILL of an
+	// unrelated group from delayed drainGroup cleanup).
+	if h.isWaitDone() {
+		if err := h.signalFn(h.pgid, 0); err == nil {
+			return false
+		}
+		// +pgid gone (or unprobeable): -pgid live ⇒ orphaned descendants.
+	}
 	// kill(-pgid, 0) succeeds for zombie-only groups on Linux. Those are not
 	// runnable; confirmed-dead must not wait on init reaping them.
 	if live, ok := groupHasNonZombieMember(h.pgid); ok {
