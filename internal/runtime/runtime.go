@@ -371,6 +371,9 @@ func (r *Runtime) Stop(reason string) {
 // Also cancels the scheduler context so an in-flight full tick observes
 // cancellation during the HTTP drain window before Runtime.Stop closes the
 // loop; work-producing lanes still recheck AllowClaim as the Authority.
+// Cancels deferred reviewer recovery so a post-ready recovery goroutine cannot
+// still requeue loops/queue items after admission is already stopping; the
+// wait for recovery exit remains in Runtime.Stop via stopDeferredReviewerRecovery.
 // Cancels webhook-forward discovery so a worker that already passed
 // AllowExecute cannot finish CreateOrGetActiveByDedupe after admission closes.
 func (r *Runtime) BeginShutdown(reason string) {
@@ -380,10 +383,14 @@ func (r *Runtime) BeginShutdown(reason string) {
 	_ = r.admission.BeginShutdown(reason)
 	r.mu.Lock()
 	cancel := r.schedulerCancel
+	recoveryCancel := r.recoveryCancel
 	forwarder := r.webhookForwarder
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if recoveryCancel != nil {
+		recoveryCancel()
 	}
 	if forwarder != nil {
 		forwarder.CancelExecute()

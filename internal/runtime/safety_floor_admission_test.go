@@ -201,6 +201,69 @@ func TestSafetyFloorBeginShutdownCancelsSchedulerContext(t *testing.T) {
 	}
 }
 
+// Contract: BeginShutdown cancels deferred reviewer recovery at admission close
+// so requeueFailedReviewerWithSharedGuards cannot persist queued work while
+// admission is already stopping (HTTP drain window before Runtime.Stop).
+func TestSafetyFloorBeginShutdownCancelsDeferredReviewerRecovery(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	rt := New(Options{
+		Config:        cfg,
+		Logger:        &testLogger{},
+		DeferRecovery: true,
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	// Simulate a post-ready deferred recovery goroutine still in flight during
+	// the HTTP drain window (recoveryCancel is only waited on in Runtime.Stop).
+	recoveryCtx, recoveryCancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	rt.mu.Lock()
+	rt.recoveryCancel = recoveryCancel
+	rt.recoveryDone = done
+	rt.mu.Unlock()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	})
+
+	if err := recoveryCtx.Err(); err != nil {
+		t.Fatalf("recovery context already done before BeginShutdown: %v", err)
+	}
+
+	rt.BeginShutdown("test drain")
+	select {
+	case <-recoveryCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred recovery context was not canceled by BeginShutdown")
+	}
+	if rt.AdmissionState() != AdmissionStopping {
+		t.Fatalf("AdmissionState() = %q, want stopping", rt.AdmissionState())
+	}
+	// recoveryCancel must remain set so Runtime.Stop can still wait on done.
+	rt.mu.Lock()
+	stillSet := rt.recoveryCancel != nil
+	rt.mu.Unlock()
+	if !stillSet {
+		t.Fatal("recoveryCancel was cleared by BeginShutdown; Stop must retain it for wait")
+	}
+}
+
 // Contract: after MarkReady, CompleteStartup wakes the full scheduler so the
 // initial startSchedulerLoop tick (while admission was starting) is not the
 // only chance at immediate discovery.
