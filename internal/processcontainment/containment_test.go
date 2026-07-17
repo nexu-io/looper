@@ -144,9 +144,23 @@ func TestSignalOnlyIsNeverSuccess(t *testing.T) {
 func TestKillTimeoutFailsLoud(t *testing.T) {
 	requireUnixProcessGroup(t)
 
-	// Signal seam swallows KILL so the group stays runnable; Kill must not
-	// report success and must return ErrNotConfirmedDead.
-	cmd := exec.Command("/bin/sh", "-c", `while true; do sleep 0.05; done`)
+	// Leader ignores TERM so only KILL would stop it. The signal seam swallows
+	// SIGKILL delivery while leaving the process actually running so Linux
+	// /proc non-zombie probes still report groupRunnable (signal-0 alone is
+	// insufficient on Linux once the real group is empty). Kill must not
+	// report success and must return ErrNotConfirmedDead when drain times out.
+	// Ready-file handshake avoids racing SIGTERM before trap is installed.
+	workDir := t.TempDir()
+	readyPath := filepath.Join(workDir, "ready")
+	script := `
+set -e
+trap '' TERM
+echo ready > "$READY_FILE"
+while true; do sleep 0.05; done
+`
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(), "READY_FILE="+readyPath)
 	realKill := syscall.Kill
 	var handle *Handle
 	handle, err := Start(cmd, Options{
@@ -155,10 +169,6 @@ func TestKillTimeoutFailsLoud(t *testing.T) {
 		Signal: func(pid int, sig syscall.Signal) error {
 			if sig == syscall.SIGKILL {
 				return nil // pretend delivery succeeded without killing
-			}
-			if sig == 0 {
-				// Keep group "runnable" forever for this test.
-				return nil
 			}
 			return realKill(pid, sig)
 		},
@@ -173,6 +183,10 @@ func TestKillTimeoutFailsLoud(t *testing.T) {
 		_, _ = handle.cmd.Process.Wait()
 	})
 
+	waitForReadyFile(t, readyPath)
+	// Process must still be live so confirmed-dead cannot succeed via /proc.
+	assertProcessRunning(t, handle.PID())
+
 	err = handle.Kill(context.Background())
 	if err == nil {
 		t.Fatal("Kill() error = nil, want explicit failure when not confirmed dead")
@@ -183,6 +197,7 @@ func TestKillTimeoutFailsLoud(t *testing.T) {
 	if handle.ConfirmedDead() {
 		t.Fatal("ConfirmedDead() true after failed Kill")
 	}
+	assertProcessRunning(t, handle.PID())
 }
 
 func TestKillAfterNormalLifecycleConfirmsDead(t *testing.T) {
@@ -313,6 +328,18 @@ func waitForPIDFile(t *testing.T, path string) int {
 	}
 	t.Fatalf("timed out waiting for pid file %s", path)
 	return 0
+}
+
+func waitForReadyFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for ready file %s", path)
 }
 
 func parsePID(s string, pid *int) (int, error) {
