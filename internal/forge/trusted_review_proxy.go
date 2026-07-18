@@ -308,8 +308,13 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	case err = <-waitDone:
 		// Normal exit path: confirmed-drain descendants before answering.
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		if drainErr := handle.Drain(drainCtx); drainErr != nil && err == nil {
-			err = drainErr
+		if drainErr := handle.Drain(drainCtx); drainErr != nil {
+			// Join so non-zero child exits still surface ErrNotConfirmedDead.
+			if err == nil {
+				err = drainErr
+			} else {
+				err = errors.Join(err, drainErr)
+			}
 		}
 		drainCancel()
 	case <-ctx.Done():
@@ -337,22 +342,32 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 			} else {
 				err = ctx.Err()
 			}
-		} else if killErr != nil && errors.Is(err, context.Canceled) {
-			// Wait unblocked via waitCancel after Kill; surface kill outcome.
-			err = killErr
+		} else if killErr != nil {
+			if errors.Is(err, context.Canceled) {
+				// Wait unblocked via waitCancel after Kill; surface kill outcome.
+				err = killErr
+			} else {
+				// Child already exited non-zero (or other wait error); still
+				// surface containment failure so undrained descendants are not hidden.
+				err = errors.Join(err, killErr)
+			}
 		}
 	}
 	configWriteErr := <-configWriteDone
 	resp := trustedReviewProxyResponse{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
+			// Pure child exit: ordinary review-submit failure, no Error text.
 			resp.ExitCode = exitErr.ExitCode()
 		} else if state := handle.ProcessState(); state != nil {
 			resp.ExitCode = state.ExitCode()
 			if resp.ExitCode == 0 {
 				resp.ExitCode = 1
-				resp.Error = err.Error()
 			}
+			// Always set Error for non-ExitError outcomes (drain/kill/cancel,
+			// including errors.Join of exit + containment failure) so callers
+			// do not treat undrained process groups as ordinary submit failures.
+			resp.Error = err.Error()
 		} else {
 			resp.ExitCode = 1
 			resp.Error = err.Error()

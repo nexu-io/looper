@@ -93,6 +93,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	timedOut := false
 	var canceledErr error
 	var killErr error
+	var drainErr error
 
 	if waitErr != nil && isContextError(waitErr) {
 		// Prefer the parent context error when it was the cause.
@@ -112,9 +113,12 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	} else {
 		// Leader exited (zero or non-zero). Drain group members that outlived it.
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
-		if drainErr := handle.Drain(drainCtx); drainErr != nil {
+		if err := handle.Drain(drainCtx); err != nil {
 			// Surface drain failure after a finished leader so callers do not
 			// treat Run as successful while descendants remain runnable.
+			// Keep drainErr separate so non-zero exit paths can Join it and
+			// not drop ErrNotConfirmedDead behind CommandExecutionError.
+			drainErr = err
 			if waitErr == nil {
 				waitErr = drainErr
 			} else {
@@ -149,7 +153,13 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return result, canceledErr
 	}
 	if result.ExitCode != 0 {
-		return result, &CommandExecutionError{Message: commandFailureMessage(result), Result: result}
+		cmdErr := error(&CommandExecutionError{Message: commandFailureMessage(result), Result: result})
+		// Containment contract: drain failures must surface even when the
+		// leader already failed validation/tool exit.
+		if drainErr != nil {
+			return result, errors.Join(cmdErr, drainErr)
+		}
+		return result, cmdErr
 	}
 	if waitErr != nil && !isExitError(waitErr) {
 		return result, waitErr
