@@ -112,6 +112,7 @@ const (
 	processSkipAlreadyFinished     = "execution_already_finished"
 	processSkipAlreadyStopping     = "execution_already_stopping"
 	processSkipNoPID               = "pid_unavailable"
+	processSkipNoLiveHandle        = "live_handle_unavailable"
 	processSkipNoSignal            = "signal_unavailable"
 	processSkipVerifierNotRunning  = "pid_not_running"
 	processSkipVerifierRejectedPID = "pid_verification_rejected"
@@ -441,6 +442,14 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return nil, fmt.Errorf("loops service is not configured")
 	}
 
+	// Close spawn admission for this loop before kill so stop-vs-spawn races
+	// cannot return a live process after halt begins (#576).
+	releaseLoopStop := func() {}
+	if services.ActiveExecutions != nil {
+		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+	}
+	defer releaseLoopStop()
+
 	reasonCopy := reason
 	complete := func() (any, error) {
 		if !terminal {
@@ -518,7 +527,17 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			}
 			return complete()
 		}
+		// #576: agent live PID fallback removed after full in-scope agent coverage.
+		// In-scope agents are owned at the common executor boundary; do not
+		// reconstruct stop/kill from SQLite PID while the daemon is live.
+		if latestExecution.PID != nil && *latestExecution.PID > 0 {
+			result.PID = *latestExecution.PID
+		}
+		result.ProcessSkipReason = processSkipNoLiveHandle
+		return complete()
 	}
+	// ActiveExecutions unavailable (misconfigured daemon): keep historical PID
+	// signal path so stop does not silently lose the ability to kill.
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
 		result.ProcessSkipReason = processSkipNoPID
 		return complete()
@@ -986,6 +1005,9 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 		result.RunID = candidate.Run.ID
 	}
 	if services.ActiveExecutions != nil && runID != "" {
+		// Close loop spawn admission so a concurrent Start cannot return unowned.
+		release := services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
+		defer release()
 		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
 			return result, err
@@ -997,6 +1019,12 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 			}
 			return result, nil
 		}
+		// #576: no live SQLite-PID fallback when Supervisor registry is present.
+		if candidate.Execution.PID != nil && *candidate.Execution.PID > 0 {
+			result.PID = *candidate.Execution.PID
+		}
+		result.ProcessSkipReason = processSkipNoLiveHandle
+		return result, nil
 	}
 	if candidate.Execution.PID == nil || *candidate.Execution.PID <= 0 {
 		result.ProcessSkipReason = processSkipNoPID

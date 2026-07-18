@@ -20,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -99,6 +100,11 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// Owner, when set, admits every agent spawn under the Execution Supervisor
+	// before cmd.Start and binds the process containment handle before Start
+	// returns (ADR-0015 / #576). Daemon producers must wire Owner; unit tests
+	// may leave it nil and still get containment without Supervisor lease.
+	Owner SpawnOwner
 	// OnProgress, when set, is called (throttled) while an agent run streams
 	// output, so a transport can surface live progress. Vendor-agnostic: it works
 	// off the subprocess's stdout tail, whatever agent (codex/opencode/claude) runs.
@@ -173,6 +179,7 @@ type ConfiguredExecutor struct {
 	repos      *storage.Repositories
 	logDir     string
 	now        func() time.Time
+	owner      SpawnOwner
 	onProgress func(context.Context, ProgressUpdate)
 }
 
@@ -181,7 +188,7 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	if now == nil {
 		now = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, onProgress: options.OnProgress}
+	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, owner: options.Owner, onProgress: options.OnProgress}
 }
 
 // liveProgressInterval throttles OnProgress so a chatty agent doesn't hammer the
@@ -279,6 +286,35 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if err != nil {
 		return nil, err
 	}
+
+	// Supervisor lease before cmd.Start (#576). When Owner is nil (unit tests),
+	// containment still binds but there is no live registry entry for stop.
+	var lease SpawnLease
+	if e.owner != nil {
+		lease, err = e.owner.AdmitSpawn(ctx, SpawnMeta{
+			LoopID:      input.LoopID,
+			RunID:       input.RunID,
+			ExecutionID: executionID,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	releaseLease := func() {
+		if lease != nil {
+			lease.Release()
+			lease = nil
+		}
+	}
+	// If Start returns success, the execution owns release on terminal Wait.
+	// On any failure path below, release immediately.
+	defer func() {
+		if lease != nil {
+			// Only still set when we failed before transferring ownership to x.
+			releaseLease()
+		}
+	}()
+
 	spawnPrompt := input.Prompt
 	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
 		spawnPrompt = input.NativeResumePrompt
@@ -287,12 +323,16 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	processcontainment.Configure(cmd)
 	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = defaultMaxOutputBytes
+	}
+	grace := input.GracefulShutdown
+	if grace <= 0 {
+		grace = 5 * time.Second
 	}
 
 	x := &execution{
@@ -306,7 +346,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		process:            cmd,
 		timeout:            input.Timeout,
 		heartbeatTimeout:   input.HeartbeatTimeout,
-		gracefulShutdown:   input.GracefulShutdown,
+		gracefulShutdown:   grace,
 		maxOutputBytes:     maxOutputBytes,
 		lastHeartbeatAtISO: startedAtISO,
 		lastOutputAt:       startedAt,
@@ -316,20 +356,34 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		nativeResumeStatus: resume.Status,
 		killCh:             make(chan string, 1),
 		doneCh:             make(chan execOutcome, 1),
+		lease:              lease,
 	}
 	x.stdoutLogPath, x.stderrLogPath = e.executionLogPaths(input, executionID)
 	x.initializePersistedLogs()
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
+
+	spawnCtx := ctx
+	if lease != nil {
+		spawnCtx = lease.Context()
+	}
+	if err := spawnCtx.Err(); err != nil {
+		return nil, err
+	}
+
 	if err := cmd.Start(); err != nil {
 		if resume.Enabled {
+			// Cancellation must not start a fallback process (#576).
+			if err := spawnCtx.Err(); err != nil {
+				return nil, err
+			}
 			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
 			command, args = ResolveSpawn(e.config, input.WorkingDirectory, input.Prompt)
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			processcontainment.Configure(cmd)
 			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
@@ -342,6 +396,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			x.nativeResumeStatus = "fallback_started"
 			x.nativeResumeError = err.Error()
 			x.mu.Unlock()
+			if err := spawnCtx.Err(); err != nil {
+				return nil, err
+			}
 			if startErr := cmd.Start(); startErr != nil {
 				return nil, fmt.Errorf("start agent command: %w (native resume fallback after: %v)", startErr, err)
 			}
@@ -350,12 +407,45 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		}
 	}
 
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  grace,
+		DrainTimeout: grace + 15*time.Second,
+	})
+	if err != nil {
+		_ = killStartedCmd(cmd)
+		return nil, fmt.Errorf("bind agent containment handle: %w", err)
+	}
+	x.handle = handle
+
+	if lease != nil {
+		if err := lease.BindHandle(handle, x.Kill); err != nil {
+			// BindHandle already confirmed-drained on stop race.
+			return nil, err
+		}
+	}
+
+	// Transfer lease ownership to execution; defer must not Release on success.
+	lease = nil
+
 	resumeSessionID, resumeMode, resumeStatus, _ := x.nativeResumeSnapshot()
 	x.persistStatus("running", nil, nil, nil)
 	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
 
 	go x.run(ctx)
 	return x, nil
+}
+
+func killStartedCmd(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	pid := cmd.Process.Pid
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	return nil
 }
 
 type execOutcome struct {
@@ -372,6 +462,8 @@ type execution struct {
 	args               []string
 	startedAtISO       string
 	process            *exec.Cmd
+	handle             *processcontainment.Handle
+	lease              SpawnLease
 	timeout            time.Duration
 	heartbeatTimeout   time.Duration
 	gracefulShutdown   time.Duration
@@ -392,6 +484,7 @@ type execution struct {
 	nativeResumeMode        string
 	nativeResumeStatus      string
 	nativeResumeError       string
+	leaseReleased           bool
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -416,7 +509,10 @@ func (x *execution) Kill(reason string) error {
 }
 
 func (x *execution) signalProcessGroup(signal syscall.Signal) error {
-	if x.process.Process == nil {
+	if x.handle != nil {
+		return x.handle.SignalGroup(signal)
+	}
+	if x.process == nil || x.process.Process == nil {
 		return os.ErrProcessDone
 	}
 	pid := x.process.Process.Pid
@@ -433,7 +529,12 @@ func (x *execution) signalProcessGroup(signal syscall.Signal) error {
 }
 
 func (x *execution) killProcessGroup() error {
-	if x.process.Process == nil {
+	if x.handle != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), x.gracefulShutdown+15*time.Second)
+		defer cancel()
+		return x.handle.Kill(ctx)
+	}
+	if x.process == nil || x.process.Process == nil {
 		return os.ErrProcessDone
 	}
 	pid := x.process.Process.Pid
@@ -445,9 +546,48 @@ func (x *execution) killProcessGroup() error {
 	return x.process.Process.Kill()
 }
 
+func (x *execution) releaseLease() {
+	x.mu.Lock()
+	if x.leaseReleased || x.lease == nil {
+		x.mu.Unlock()
+		return
+	}
+	x.leaseReleased = true
+	lease := x.lease
+	x.mu.Unlock()
+	lease.Release()
+}
+
+func (x *execution) waitLeader() error {
+	if x.handle != nil {
+		return x.handle.Wait(context.Background())
+	}
+	if x.process == nil {
+		return os.ErrProcessDone
+	}
+	return x.process.Wait()
+}
+
 func (x *execution) run(ctx context.Context) {
+	defer x.releaseLease()
+
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- x.process.Wait() }()
+	go func() { waitCh <- x.waitLeader() }()
+
+	// Merge caller ctx with lease cancellation so stop during run is observed.
+	runCtx := ctx
+	if x.lease != nil {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-x.lease.Context().Done():
+				cancel()
+			case <-runCtx.Done():
+			}
+		}()
+		defer cancel()
+	}
 
 	var (
 		waitErr         error
@@ -462,7 +602,7 @@ func (x *execution) run(ctx context.Context) {
 		terminateOnce   sync.Once
 		terminateSignal = func() {
 			terminateOnce.Do(func() {
-				if x.process.Process == nil {
+				if x.handle == nil && (x.process == nil || x.process.Process == nil) {
 					return
 				}
 				if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
@@ -540,10 +680,14 @@ func (x *execution) run(ctx context.Context) {
 			killReason = reason
 			x.setStatus("killed")
 			terminateSignal()
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			killed = true
 			if killReason == "" {
-				killReason = ctx.Err().Error()
+				if runCtx.Err() != nil {
+					killReason = runCtx.Err().Error()
+				} else {
+					killReason = context.Canceled.Error()
+				}
 			}
 			x.setStatus("killed")
 			terminateSignal()
@@ -611,15 +755,18 @@ func (x *execution) run(ctx context.Context) {
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
-		PID:                          pidOrZero(x.process.Process),
+		PID:                          x.leaderPID(),
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
-		if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(ctx, errorMessage); ok {
-			result = fallbackResult
-			status = fallbackResult.Status
-			timeoutType = fallbackResult.TimeoutType
-			errorMessage = fallbackErrorMessage
-			endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+		// Cancellation / stop must not spawn a second process (#576).
+		if runCtx.Err() == nil && (x.lease == nil || x.lease.Context().Err() == nil) {
+			if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(runCtx, errorMessage); ok {
+				result = fallbackResult
+				status = fallbackResult.Status
+				timeoutType = fallbackResult.TimeoutType
+				errorMessage = fallbackErrorMessage
+				endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+			}
 		}
 	}
 
@@ -687,10 +834,22 @@ func normalizeNativeResumeErrorLine(line string) string {
 }
 
 func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
+	// Stop/cancel must not spawn a second process after the first failed attach.
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return Result{}, "", false
+		}
+	}
+	if x.lease != nil {
+		if err := x.lease.Context().Err(); err != nil {
+			return Result{}, "", false
+		}
+	}
+
 	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	processcontainment.Configure(cmd)
 	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
@@ -723,8 +882,45 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		return Result{}, "", false
 	}
 
+	grace := x.gracefulShutdown
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  grace,
+		DrainTimeout: grace + 15*time.Second,
+	})
+	if err != nil {
+		_ = killStartedCmd(cmd)
+		x.mu.Lock()
+		x.status = "failed"
+		x.nativeResumeStatus = "fallback_failed"
+		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
+		x.mu.Unlock()
+		return Result{}, "", false
+	}
+	// Prior handle already Wait'd in the outer run loop; replace for stop-kill.
+	x.mu.Lock()
+	x.handle = handle
+	x.mu.Unlock()
+	if x.lease != nil {
+		// Re-bind so haltLoop finds the live fallback process. Prior entry was
+		// released only on full execution end; update handle in place via a
+		// second BindHandle is not valid (lease left pending). Update registry
+		// through SoftKill path: re-register by calling BindHandle on a fresh
+		// rebind helper when available.
+		if rebind, ok := x.lease.(interface {
+			RebindHandle(*processcontainment.Handle, SoftKillFunc) error
+		}); ok {
+			if err := rebind.RebindHandle(handle, x.Kill); err != nil {
+				_ = handle.Kill(context.Background())
+				return Result{}, "", false
+			}
+		}
+	}
+
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
+	go func() { waitCh <- handle.Wait(context.Background()) }()
 	var (
 		waitErr        error
 		timedOut       bool
@@ -748,20 +944,18 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		defer idleTicker.Stop()
 	}
 	terminate := func() {
-		if cmd.Process == nil {
+		if handle == nil {
 			return
 		}
-		if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+		if err := handle.SignalGroup(syscall.SIGTERM); err != nil {
 			if err != os.ErrProcessDone {
-				_ = x.killProcessGroup()
+				ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+				_ = handle.Kill(ctx)
+				cancel()
 			}
 			return
 		}
 		termDelivered = true
-		grace := x.gracefulShutdown
-		if grace <= 0 {
-			grace = 5 * time.Second
-		}
 		graceKillTimer = time.After(grace)
 	}
 	waiting := true
@@ -795,11 +989,15 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			terminate()
 		case <-graceKillTimer:
 			graceKillTimer = nil
-			_ = x.killProcessGroup()
+			ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+			_ = handle.Kill(ctx)
+			cancel()
 		}
 	}
 	if termDelivered && (killed || timedOut) {
-		_ = x.killProcessGroup()
+		ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+		_ = handle.Kill(ctx)
+		cancel()
 	}
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
@@ -861,7 +1059,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
-		PID:                          pidOrZero(cmd.Process),
+		PID:                          x.leaderPID(),
 	}, errorMessage, true
 }
 
@@ -1998,6 +2196,19 @@ func int64PtrIfPositive(value int64) *int64 {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func (x *execution) leaderPID() int {
+	if x == nil {
+		return 0
+	}
+	if x.handle != nil {
+		return x.handle.PID()
+	}
+	if x.process != nil {
+		return pidOrZero(x.process.Process)
+	}
+	return 0
 }
 
 func pidOrZero(process *os.Process) int {

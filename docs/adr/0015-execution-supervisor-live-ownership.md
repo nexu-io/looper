@@ -117,7 +117,7 @@ to a slice while any open blocker remains.
 | R0 | #573 | Contract + inventory | Authority statement, matrix, producer inventory, mid-state rules, exit criteria | **Enforced** (docs-only; this document) |
 | R1 | #575 | Safety floor: one admission state; stop unsafe recovery PID action | Single admission Authority; no mutation/claim before ready; recovery no-act + quarantine; drain ingress before storage close | **Enforced** |
 | R2 | #574 | Process containment handle with confirmed drain | Containment API; kill success = confirmed drain; no production removal of PID fallback yet | **Enforced** |
-| R3 | #576 | Own all in-scope agent spawns at common executor boundary | Lease before `cmd.Start`; bind handle before return; stop-kill via handle; remove agent live PID fallback only after full agent coverage | **Deferred** |
+| R3 | #576 | Own all in-scope agent spawns at common executor boundary | Lease before `cmd.Start`; bind handle before return; stop-kill via handle; remove agent live PID fallback only after full agent coverage | **Enforced** |
 | R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Deferred** |
 | R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Deferred** |
 | R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Deferred** |
@@ -167,6 +167,35 @@ Timeouts fail loud (`ErrNotConfirmedDead`) rather than reporting false success.
 | **Why not simpler** | Reusing PID/PGID probe-then-signal without a wait/reap Authority reintroduces the reusable-ID and false-success failures this program forbids. |
 | **Deletion attempt** | Remove dual kill paths immediately — blocked until #576/#577 migrate producers; this slice stays additive so mid-rollout does not create partial cutover. |
 
+### Agent spawn ownership at common executor boundary (enforced by #576)
+
+All **Supervisor-owned agent** producers (Planner, Reviewer, Fixer, Worker,
+Coordinator triage, native-resume fallback) go through `agent.ConfiguredExecutor.Start`
+with a `SpawnOwner` (the daemon `ActiveExecutionRegistry`):
+
+1. **Admit spawn lease** before `cmd.Start` (also projects daemon `Admission.AllowClaim`).
+2. **Configure + Start + Bind** `processcontainment.Handle` before returning to role code.
+3. **Stop-vs-spawn / stop-vs-bind**: `BeginLoopStop` / `BeginShutdown` cancels pending
+   leases; `BindHandle` kills and confirmed-drains before Start can return success.
+4. **Stop/kill** uses the bound handle (confirmed drain). Live in-process SQLite PID
+   fallback is removed when the registry is present — not the recovery PID action
+   forbidden by #575.
+5. **Cancellation** of the lease context prevents native-resume fallback from
+   spawning a second process.
+
+This is intentionally **not** the #572 approach (post-spawn register in four role
+adapters with incomplete Coordinator coverage). Ownership is at the common executor
+boundary so there is no worker-only registry escape hatch.
+
+**Agent ownership concept trade-off (R3):**
+
+| | |
+|--|--|
+| **Failure prevented** | `looper stop` missing unregistered agents (Coordinator/planner/reviewer/fixer); stop-vs-spawn returning a live unowned process; dual kill via SQLite PID while a handle exists. |
+| **Costs** | Every agent Start path consults the registry; stop latency includes confirmed drain; unit tests need Owner nil or a registry; native-resume fallback must rebind handles. |
+| **Why not simpler** | Post-spawn adapter Register (#572) leaves Coordinator and race windows unowned. Keeping PID fallback after full coverage reintroduces reusable-ID Authority. |
+| **Deletion attempt** | Remove registry and trust only `exec.Cmd` + SQLite — fails stop when live handle is missing and reopens dual Authority. |
+
 ### Shutdown order (target; partial in #575, complete in #577/#580)
 
 Drain **admission → ingress → producers → handles/finalizers** before SQLite
@@ -187,16 +216,16 @@ Classification:
 
 | Producer | Current spawn path (main) | Notes / target cutover |
 |----------|---------------------------|------------------------|
-| **Planner agent** | `internal/runtime/scheduler.go` planner adapter → `agent.Executor.Start` | #576 via common executor boundary |
-| **Reviewer agent** | scheduler reviewer adapter → `agent.Executor.Start` (incl. native-resume fields) | #576 |
-| **Fixer agent** | scheduler fixer adapter → `agent.Executor.Start` | #576 |
-| **Worker agent** | scheduler worker adapter → `agent.Executor.Start` (incl. native-resume) | #576 |
-| **Coordinator agent** | `internal/coordinator/agent_llm.go` → `agent.Executor.Start` | #576; same executor, not a separate spawn stack |
-| **Native-resume fallback** | Same `agent.Executor.Start` with `NativeResumePrompt` / session; fallback to full prompt on resume failure | #576; cancellation must not spawn a second process after stop |
+| **Planner agent** | `internal/runtime/scheduler.go` planner adapter → `agent.Executor.Start` | **Enforced by #576** via common executor `SpawnOwner` |
+| **Reviewer agent** | scheduler reviewer adapter → `agent.Executor.Start` (incl. native-resume fields) | **Enforced by #576** |
+| **Fixer agent** | scheduler fixer adapter → `agent.Executor.Start` | **Enforced by #576** |
+| **Worker agent** | scheduler worker adapter → `agent.Executor.Start` (incl. native-resume) | **Enforced by #576** (not post-spawn adapter Register) |
+| **Coordinator agent** | `internal/coordinator/agent_llm.go` → shared `agent.Executor.Start` | **Enforced by #576**; same executor, not a separate spawn stack |
+| **Native-resume fallback** | Same `agent.Executor.Start` with `NativeResumePrompt` / session; fallback to full prompt on resume failure | **Enforced by #576**; cancellation must not spawn a second process after stop |
 | **Worker validation shell** | `internal/worker/runner.go` → `shell.Run` (`/bin/sh -c` validation commands) | #577 non-agent containment |
 | **Fixer (and other role) shell helpers** that run daemon-owned long/blocking shell for work steps | e.g. fixer `shell.Run` helpers used during run processing | #577; short tool calls may reclassify only if inventory is updated |
 | **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` spawns `looper review submit` child from daemon-bound proxy | #577; child is daemon-owned for stop/drain while proxy request is live |
-| **Active agent stop / loop halt / daemon shutdown kill of owned agents** | Today: registry `Kill` + PID fallback from `agent_executions` | #575 stops unsafe recovery PID action; #576 removes live agent PID fallback after ownership |
+| **Active agent stop / loop halt / daemon shutdown kill of owned agents** | Registry `Kill` via bound containment handle (confirmed drain); no live SQLite PID fallback when registry present | **Enforced by #576** after common-executor ownership; recovery still no raw PID action (#575) |
 
 Queue **claims** themselves are not process producers, but while the daemon is
 live a `queue_items.status=running` claim is an owned **operation** under #579
