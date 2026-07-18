@@ -563,7 +563,6 @@ func TestHandlerLoopRetryWithoutDiscardDoesNotReportDiscard(t *testing.T) {
 		t.Fatalf("worktreeDiscard present without flag: %#v", data["worktreeDiscard"])
 	}
 }
-
 func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeWhenAgentNotConfigured(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.Agent.Vendor = nil
@@ -763,11 +762,6 @@ func TestHandlerLoopRetryDiscardAllowsCompletedSiblingPRLoop(t *testing.T) {
 		t.Fatalf("dirty.txt still present after discard with completed sibling: %v", err)
 	}
 }
-
-// TestHandlerWorkersCreateReuseSharesRetryLockWithDiscard ensures POST /workers
-// issue-worker reuse takes the same per-loop mutex as discard+retry, so reuse
-// cannot enqueue between discard preflight and git reset (wiping the worktree
-// for the reuse-created queue item, then failing retry with active-queue conflict).
 func TestHandlerWorkersCreateReuseSharesRetryLockWithDiscard(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

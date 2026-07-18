@@ -276,6 +276,9 @@ func New(options Options) *Runtime {
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 		admission:                   NewAdmission(),
 	}
+	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
+	// while starting/stopping/degraded (#576 + #575).
+	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
 	if rt.webhook != nil {
 		rt.webhook.forwarder = rt.WebhookForwarder
 		// Tunnel listener is not behind the API mutation gate; consult the same
@@ -386,6 +389,10 @@ func (r *Runtime) BeginShutdown(reason string) {
 		return
 	}
 	_ = r.admission.BeginShutdown(reason)
+	// Close agent spawn admission and confirmed-drain live handles (#576).
+	if r.activeExecutions != nil {
+		r.activeExecutions.BeginShutdown(reason)
+	}
 	r.mu.Lock()
 	cancel := r.schedulerCancel
 	recoveryCancel := r.recoveryCancel

@@ -14,6 +14,7 @@
 // owned containment is confirmed non-runnable and the leader is reaped, or
 // they return an explicit failure/timeout.
 //
-// This package is additive until producers migrate (#576/#577). Do not remove
-// live PID fallback from production paths in this slice.
+// Agent producers migrate onto this handle via the common executor boundary
+// (#576). Non-agent daemon subprocesses remain for #577. Recovery must still
+// not treat raw PID/PGID as live Authority (#575).
 package processcontainment

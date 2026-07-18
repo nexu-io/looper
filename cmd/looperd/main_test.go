@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/loops"
@@ -476,7 +477,6 @@ func TestCloseLoopTerminatesLoopAndCancelsActiveQueue(t *testing.T) {
 		t.Fatalf("Queue.GetByID() = %#v, want cancelled queue item with close reason", storedQueue)
 	}
 }
-
 func TestCloseLoopDoesNotTerminateLoopWhenActiveKillFails(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
@@ -535,8 +535,17 @@ func TestCloseLoopDoesNotTerminateLoopWhenActiveKillFails(t *testing.T) {
 	if storedLoop == nil || storedLoop.Status != "running" {
 		t.Fatalf("Loops.GetByID() = %#v, want running loop after kill failure", storedLoop)
 	}
+	// Terminal close aborted after BeginLoopStop: release the sticky gate so the
+	// still-running loop can AdmitSpawn again.
+	if registry.LoopStopActive(loop.ID) {
+		t.Fatal("LoopStopActive = true after aborted closeLoop, want gate released")
+	}
+	if _, err := registry.AdmitSpawn(ctx, agent.SpawnMeta{
+		LoopID: loop.ID, RunID: "run_after_abort", ExecutionID: "exec_after_abort",
+	}); err != nil {
+		t.Fatalf("AdmitSpawn after aborted closeLoop error = %v, want success", err)
+	}
 }
-
 func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})

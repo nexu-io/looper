@@ -2831,13 +2831,14 @@ func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) erro
 
 type workerAgentExecutorAdapter struct {
 	executor *agent.ConfiguredExecutor
-	registry *ActiveExecutionRegistry
 }
 type workerAgentExecutionAdapter struct {
 	execution agent.Execution
 }
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
+	// Ownership is acquired at the common executor boundary (AdmitSpawn +
+	// BindHandle), not via post-spawn role-adapter registration (#576 / not #572).
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
@@ -2848,14 +2849,6 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 	if err != nil {
 		return nil, err
 	}
-	unregister := func() {}
-	if a.registry != nil {
-		unregister = a.registry.Register(input.LoopID, input.RunID, input.ExecutionID, execution)
-	}
-	go func() {
-		_, _ = execution.Wait(context.Background())
-		unregister()
-	}()
 	return workerAgentExecutionAdapter{execution: execution}, nil
 }
 
@@ -3112,9 +3105,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 				LiveToolEvents:      liveToolEvents,
 			},
-			Repos:      repos,
-			LogDir:     cfg.Daemon.LogDir,
-			Now:        now,
+			Repos:  repos,
+			LogDir: cfg.Daemon.LogDir,
+			Now:    now,
+			// Common executor boundary ownership for every in-scope agent role
+			// (planner/reviewer/fixer/worker/coordinator) — not post-spawn adapters (#576).
+			Owner:      activeExecutions,
 			OnProgress: onAgentProgress,
 		})
 	}
@@ -3195,6 +3191,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:      repos,
 			LogDir:     cfg.Daemon.LogDir,
 			Now:        now,
+			Owner:      activeExecutions,
 			OnProgress: onAgentProgress,
 		})
 		coordinatorOpts.TriageLLM = coordinatorrole.NewAgentLLM(globalExecutor, now,
@@ -3331,7 +3328,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
 			Git:             workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
-			AgentExecutor:   workerAgentExecutorAdapter{executor: workerExecutor, registry: activeExecutions},
+			AgentExecutor:   workerAgentExecutorAdapter{executor: workerExecutor},
 			Logger:          logger,
 			Now:             now,
 			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
@@ -4081,6 +4078,12 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			}
 			continue
 		}
+
+		// Do not ClearLoopStop here. A claim can race with looper stop: pass the
+		// parked check while still running, then BeginLoopStop closes admission
+		// before launch. Unconditional clear would reopen the sticky gate for
+		// that pre-stop claim. Intentional re-activation (API unpause/retry/
+		// handback) is the authority that clears the gate.
 
 		process, err := schedulerQueueProcessor(item, input)
 		if err != nil {

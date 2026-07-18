@@ -605,6 +605,39 @@ func TestRunScheduledQueueItemsDispatchesEachSupportedType(t *testing.T) {
 	}
 }
 
+// Claim dispatch must not ClearLoopStop: a pre-stop claim can race past the
+// parked check, and reopening admission would let AdmitSpawn succeed after
+// looper stop. Intentional reactivation (API) is the authority that clears.
+func TestRunScheduledQueueItemsDoesNotReopenStopGate(t *testing.T) {
+	t.Parallel()
+
+	reg := NewActiveExecutionRegistry()
+	loopID := "loop-pre-stop-claim"
+	if _, err := reg.BeginLoopStop(loopID, "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
+	workerRunner := &stubWorkerScheduler{}
+
+	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{
+		{ID: "worker-item", Type: "worker", LoopID: &loopID},
+	}, defaultSchedulerTickInput{Worker: workerRunner})
+	if err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	waitForSchedulerCondition(t, func() bool {
+		return workerRunner.processItemCount() == 1
+	})
+	if !reg.LoopStopActive(loopID) {
+		t.Fatal("LoopStopActive = false after claim dispatch, want sticky stop gate preserved")
+	}
+	_, err = reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: loopID, RunID: "run_late", ExecutionID: "exec_late",
+	})
+	if !errors.Is(err, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after claim dispatch error = %v, want ErrSpawnLoopStopping", err)
+	}
+}
+
 func TestRunScheduledQueueItemsProcessesItemsConcurrently(t *testing.T) {
 	t.Parallel()
 

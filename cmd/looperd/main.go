@@ -112,6 +112,7 @@ const (
 	processSkipAlreadyFinished     = "execution_already_finished"
 	processSkipAlreadyStopping     = "execution_already_stopping"
 	processSkipNoPID               = "pid_unavailable"
+	processSkipNoLiveHandle        = "live_handle_unavailable"
 	processSkipNoSignal            = "signal_unavailable"
 	processSkipVerifierNotRunning  = "pid_not_running"
 	processSkipVerifierRejectedPID = "pid_verification_rejected"
@@ -455,6 +456,10 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return result, nil
 	}
 
+	// Durable pause must succeed before lease cancel. BeginLoopStop cancels
+	// lease contexts wired into execution.run and cannot be undone; doing it
+	// before Pause would half-kill agents when a transient Pause error leaves
+	// the loop still running. Terminal close has no pre-kill status transition.
 	if !terminal {
 		paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
 		if err != nil {
@@ -464,11 +469,68 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		result.LoopID = paused.Loop.ID
 	}
 
-	if services.Repositories == nil || services.Repositories.Runs == nil {
-		result.ProcessSkipReason = processSkipNoRuns
-		return complete()
+	// Close spawn admission for this loop before kill so stop-vs-spawn races
+	// cannot return a live process after halt begins (#576). After a durable
+	// stop (successful pause/terminate), keep the gate closed: in-flight
+	// runners that already claimed work may still reach AgentExecutor.Start
+	// without re-reading loop status. ClearLoopStop runs only on intentional
+	// re-activation (API unpause/retry/handback).
+	//
+	// BeginLoopStop is irreversible for live agents (lease cancel + bound-handle
+	// drain). Non-terminal already paused, so open the gate immediately after
+	// Pause. Terminal close defers the gate until after abortable run/execution
+	// preflight: a transient lookup error must not kill agents while the loop
+	// stays open. releaseLoopStop reopens admission only and cannot undo a
+	// canceled lease.
+	//
+	// Terminal close has no durable status transition until complete(); if a
+	// later Kill/signal/terminate aborts after the gate opens, release the gate
+	// so the still-running loop can AdmitSpawn again. Non-terminal already
+	// paused durably, so the gate stays sticky even when later steps fail.
+	var releaseLoopStop func()
+	var loopStopDrainErr error
+	beginLoopStop := func() {
+		if releaseLoopStop != nil || services.ActiveExecutions == nil {
+			return
+		}
+		var err error
+		releaseLoopStop, err = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+		if err != nil {
+			loopStopDrainErr = err
+		}
+	}
+	if !terminal {
+		beginLoopStop()
+		if loopStopDrainErr != nil {
+			return nil, loopStopDrainErr
+		}
+	}
+	keepStopGateSticky := !terminal
+	defer func() {
+		if releaseLoopStop != nil && !keepStopGateSticky {
+			releaseLoopStop()
+		}
+	}()
+	finish := func() (any, error) {
+		// Ensure admission is closed before durable terminate (terminal) so the
+		// sticky gate applies even when there was no process to kill.
+		beginLoopStop()
+		if loopStopDrainErr != nil {
+			return nil, loopStopDrainErr
+		}
+		out, err := complete()
+		if err == nil {
+			keepStopGateSticky = true
+		}
+		return out, err
 	}
 
+	if services.Repositories == nil || services.Repositories.Runs == nil {
+		result.ProcessSkipReason = processSkipNoRuns
+		return finish()
+	}
+
+	// Abortable preflight for terminal close: do not BeginLoopStop yet.
 	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
 	if err != nil {
 		return nil, err
@@ -476,13 +538,13 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	if latestRun == nil || latestRun.Status != "running" {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipNoRuns
-		return complete()
+		return finish()
 	}
 	result.RunID = latestRun.ID
 
 	if services.Repositories.AgentExecutions == nil {
 		result.ProcessSkipReason = processSkipNoExecution
-		return complete()
+		return finish()
 	}
 
 	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
@@ -491,7 +553,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 	if latestExecution == nil {
 		result.ProcessSkipReason = processSkipNoExecution
-		return complete()
+		return finish()
 	}
 
 	result.ExecutionID = latestExecution.ID
@@ -499,11 +561,16 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	if !isStoppableExecutionStatus(latestExecution.Status) {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipAlreadyFinished
-		return complete()
+		return finish()
 	}
 	if latestExecution.Status == "cancelling" {
 		result.Outcome = stopOutcomeAlreadyStopping
 		result.ProcessSkipReason = processSkipAlreadyStopping
+	}
+	// Past abortable preflight: close admission and drain leases before kill.
+	beginLoopStop()
+	if loopStopDrainErr != nil {
+		return nil, loopStopDrainErr
 	}
 	if services.ActiveExecutions != nil {
 		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
@@ -516,12 +583,26 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 				return nil, err
 			}
-			return complete()
+			return finish()
 		}
+		// #576: agent live PID fallback removed after full in-scope agent coverage.
+		// In-scope agents are owned at the common executor boundary; do not
+		// reconstruct stop/kill from SQLite PID while the daemon is live.
+		// A stoppable execution with a persisted PID but no registry entry is an
+		// ownership invariant violation: fail loudly so stop/close cannot report
+		// success while leaving a live agent process behind.
+		if latestExecution.PID != nil && *latestExecution.PID > 0 {
+			result.PID = *latestExecution.PID
+			return nil, looperdruntime.ErrAgentLiveHandleMissing
+		}
+		result.ProcessSkipReason = processSkipNoLiveHandle
+		return finish()
 	}
+	// ActiveExecutions unavailable (misconfigured daemon): keep historical PID
+	// signal path so stop does not silently lose the ability to kill.
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
 		result.ProcessSkipReason = processSkipNoPID
-		return complete()
+		return finish()
 	}
 
 	pid := int(*latestExecution.PID)
@@ -537,7 +618,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			} else {
 				result.ProcessSkipReason = processSkipVerifierRejectedPID
 			}
-			return complete()
+			return finish()
 		}
 	}
 	result.PID = *latestExecution.PID
@@ -549,14 +630,14 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		result.ProcessSkipReason = ""
 	} else {
 		result.ProcessSkipReason = processSkipNoSignal
-		return complete()
+		return finish()
 	}
 
 	if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 		return nil, err
 	}
 
-	return complete()
+	return finish()
 }
 
 type stopAllResult string
@@ -986,6 +1067,18 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 		result.RunID = candidate.Run.ID
 	}
 	if services.ActiveExecutions != nil && runID != "" {
+		// Close loop spawn admission only for the kill window so a concurrent
+		// Start cannot return unowned. Always release on return: this helper
+		// does not perform durable pause/terminate. When haltLoop already kept
+		// a sticky gate (successful pause), BeginLoopStop is refcounted so our
+		// release leaves that sticky gate in place. When stopAll falls back
+		// here after a Pause failure, releasing reopens AdmitSpawn for the
+		// still-running loop (ClearLoopStop would never run otherwise).
+		releaseLoopStop, drainErr := services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
+		defer releaseLoopStop()
+		if drainErr != nil {
+			return result, drainErr
+		}
 		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
 			return result, err
@@ -997,6 +1090,14 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 			}
 			return result, nil
 		}
+		// #576: no live SQLite-PID fallback when Supervisor registry is present.
+		// Missing handle with a persisted PID is an ownership invariant violation.
+		if candidate.Execution.PID != nil && *candidate.Execution.PID > 0 {
+			result.PID = *candidate.Execution.PID
+			return result, looperdruntime.ErrAgentLiveHandleMissing
+		}
+		result.ProcessSkipReason = processSkipNoLiveHandle
+		return result, nil
 	}
 	if candidate.Execution.PID == nil || *candidate.Execution.PID <= 0 {
 		result.ProcessSkipReason = processSkipNoPID
