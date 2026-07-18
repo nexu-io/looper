@@ -1212,7 +1212,10 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	x.mu.Unlock()
 
 	outputJSON := x.outputJSON(stdout, stderr)
-	if err := x.persistStatus(context.Background(), x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON); err != nil {
+	// Mid-life output must not publish terminal observations: timeout/kill may
+	// already be set in-memory while the process group is still draining, and
+	// terminal rows are immutable (ADR-0015 R5 / ensureConfirmedDeadBeforeTerminal).
+	if err := x.persistStatus(context.Background(), x.liveObservationStatus(), &heartbeatCount, &nowISO, &outputJSON); err != nil {
 		if hard := x.classifyPersistError(err); hard != nil {
 			// First hard mid-life failure closes admission (degraded). Soft
 			// cancel/conflict/busy-after-retry do not sticky-degrade.
@@ -1570,6 +1573,27 @@ func (x *execution) currentStatus() string {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	return x.status
+}
+
+// liveObservationStatus maps in-memory lifecycle status to a non-terminal
+// durable observation for mid-life heartbeat/output writes. Terminal values
+// stay in memory for finalStatus/persistFinal after containment is confirmed
+// dead; publishing them early would freeze the durable row while the process
+// group can still be live.
+func (x *execution) liveObservationStatus() string {
+	status := x.currentStatus()
+	if !storage.IsTerminalAgentExecutionStatus(status) {
+		if status == "" {
+			return "running"
+		}
+		return status
+	}
+	switch status {
+	case "timeout", "killed":
+		return "cancelling"
+	default:
+		return "running"
+	}
 }
 
 func (x *execution) setStatus(status string) {

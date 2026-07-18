@@ -1515,6 +1515,61 @@ func TestPersistStatusNoOpAfterTerminalPersisted(t *testing.T) {
 	}
 }
 
+// Mid-life output after timeout/kill must keep the durable row active
+// (cancelling) until ensureConfirmedDeadBeforeTerminal + persistFinal.
+func TestOnOutputDoesNotPersistTerminalBeforeDrain(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorCodex}, Repos: repos})
+	x := &execution{
+		executor:       executor,
+		executionID:    "agent_midlife_no_terminal",
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "x"},
+		startedAt:      time.Now().UTC(),
+		startedAtISO:   "2026-07-18T00:00:00.000Z",
+		maxOutputBytes: defaultMaxOutputBytes,
+		status:         "running",
+		process:        exec.Command("/bin/true"),
+	}
+	if err := x.persistStatus(context.Background(), "running", nil, nil, nil); err != nil {
+		t.Fatalf("initial persistStatus error = %v", err)
+	}
+
+	for _, terminal := range []string{"timeout", "killed"} {
+		x.setStatus(terminal)
+		x.onOutput("stdout", []byte("final flush while draining\n"))
+
+		got, err := repos.AgentExecutions.GetByID(context.Background(), x.executionID)
+		if err != nil {
+			t.Fatalf("GetByID after %s flush error = %v", terminal, err)
+		}
+		if got == nil {
+			t.Fatalf("GetByID after %s flush = nil", terminal)
+		}
+		if got.Status != "cancelling" {
+			t.Fatalf("durable status after in-memory %s = %q, want cancelling (active until drain)", terminal, got.Status)
+		}
+		if !storage.IsActiveAgentExecutionStatus(got.Status) {
+			t.Fatalf("status %q is not active after mid-life flush under %s", got.Status, terminal)
+		}
+		if got.HeartbeatCount < 1 {
+			t.Fatalf("HeartbeatCount = %d after mid-life flush, want progress persisted", got.HeartbeatCount)
+		}
+	}
+
+	// Final path still publishes terminal after drain authority.
+	if err := x.persistFinal("killed", Result{Status: "killed", HeartbeatCount: x.heartbeatCountValue()}, "stop", "2026-07-18T00:02:00.000Z"); err != nil {
+		t.Fatalf("persistFinal error = %v", err)
+	}
+	got, err := repos.AgentExecutions.GetByID(context.Background(), x.executionID)
+	if err != nil {
+		t.Fatalf("GetByID after terminal error = %v", err)
+	}
+	if got == nil || got.Status != "killed" {
+		t.Fatalf("durable status after persistFinal = %#v, want killed", got)
+	}
+}
+
 func openAgentCoordinator(t *testing.T) *storage.SQLiteCoordinator {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "agent.sqlite")
