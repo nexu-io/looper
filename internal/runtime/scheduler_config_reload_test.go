@@ -118,11 +118,25 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 		t.Cleanup(handlers.webhook.Close)
 	}
 
+	// Without a live vendor, handlers still build so sticky snapshot retries can
+	// claim, but discovery stays off and webhook role runners stay nil.
 	if err := handlers.tick(context.Background(), Services{Repositories: repositories}); err != nil {
 		t.Fatalf("tick without vendor error = %v", err)
 	}
-	if schedulerLoggerContains(logger, "scheduler tick summary") {
-		t.Fatal("scheduler executed a configured pass before agent.vendor was set")
+	before := handlers.snapshot()
+	if before.input == nil {
+		t.Fatal("handlers.input = nil without vendor, want sticky-retry runners available")
+	}
+	beforeInput := before.input(Services{Repositories: repositories})
+	if beforeInput.Planner == nil || beforeInput.Worker == nil || beforeInput.Reviewer == nil || beforeInput.Fixer == nil {
+		t.Fatal("coding role runners nil without vendor, want present for sticky snapshot retries")
+	}
+	if discoveryEnabled(beforeInput.PlannerDiscoveryEnabled) || discoveryEnabled(beforeInput.WorkerDiscoveryEnabled) ||
+		discoveryEnabled(beforeInput.ReviewerDiscoveryEnabled) || discoveryEnabled(beforeInput.FixerDiscoveryEnabled) {
+		t.Fatal("discovery enabled without vendor, want gated until ResolveAgent succeeds")
+	}
+	if before.reviewer != nil || before.fixer != nil {
+		t.Fatal("webhook reviewer/fixer non-nil without vendor, want nil to block new webhook discovery")
 	}
 
 	next := config.CloneConfig(cfg)
@@ -134,6 +148,10 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 	}
 	if !schedulerLoggerContains(logger, "scheduler tick summary") {
 		t.Fatal("scheduler did not rebuild handlers after agent.vendor was published")
+	}
+	after := handlers.snapshot()
+	if after.reviewer == nil || after.fixer == nil {
+		t.Fatal("webhook reviewer/fixer nil after vendor publication, want configured")
 	}
 }
 
@@ -191,11 +209,18 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 	if input.Reviewer == nil {
 		t.Fatal("Reviewer runner = nil, want configured for role-only reviewer vendor")
 	}
-	if input.Planner != nil {
-		t.Fatal("Planner runner != nil, want nil when planner agent not configured")
+	// Unconfigured roles still get runners so sticky snapshot retries remain claimable.
+	if input.Planner == nil {
+		t.Fatal("Planner runner = nil, want present for sticky snapshot retries when planner agent not configured")
 	}
-	if input.Fixer != nil {
-		t.Fatal("Fixer runner != nil, want nil when fixer agent not configured")
+	if input.Fixer == nil {
+		t.Fatal("Fixer runner = nil, want present for sticky snapshot retries when fixer agent not configured")
+	}
+	if discoveryEnabled(input.PlannerDiscoveryEnabled) || discoveryEnabled(input.FixerDiscoveryEnabled) {
+		t.Fatal("planner/fixer discovery enabled without role agent, want gated")
+	}
+	if discoveryEnabled(input.WorkerDiscoveryEnabled) != config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker") {
+		t.Fatalf("worker discovery enabled = %v, want auto-discovery when role agent configured", discoveryEnabled(input.WorkerDiscoveryEnabled))
 	}
 	// ResolveAgent identity must differ for the two configured roles.
 	workerResolved, workerOK := config.ResolveAgent(cfg, "", config.CodingRoleWorker)
@@ -205,6 +230,15 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 	}
 	if workerResolved.Vendor == reviewerResolved.Vendor {
 		t.Fatalf("worker and reviewer vendors both %q, want different", workerResolved.Vendor)
+	}
+	// Claim path must keep unconfigured role queue types for sticky retries.
+	allowed := allowedQueueTypesFromRunners(input)
+	wantTypes := map[string]bool{"planner": true, "worker": true, "reviewer": true, "fixer": true}
+	for _, got := range allowed {
+		delete(wantTypes, got)
+	}
+	if len(wantTypes) != 0 {
+		t.Fatalf("allowedQueueTypesFromRunners missing %v; got %v", wantTypes, allowed)
 	}
 }
 

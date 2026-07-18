@@ -6699,8 +6699,8 @@ func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *stora
 			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
 		}
 	}
-	if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingRoleAgentConfigured(h.effectiveConfig(), loop.Type) {
-		return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
+	if err := h.assertCodingRoleRetryAgent(ctx, repos, loop); err != nil {
+		return err
 	}
 	runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
 	if err != nil {
@@ -7217,6 +7217,35 @@ func isCodingAgentConfigured(cfg config.Config) bool {
 
 func isCodingRoleAgentConfigured(cfg config.Config, role string) bool {
 	return config.CodingRoleAgentConfigured(cfg, role)
+}
+
+// assertCodingRoleRetryAgent allows sticky retries after vendor removal when the
+// predecessor failed/interrupted run still carries a durable agent_snapshot_json.
+// New loops without a live ResolveAgent identity remain blocked at create/start.
+func (h *Handler) assertCodingRoleRetryAgent(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) error {
+	switch loop.Type {
+	case string(domain.LoopTypeReviewer), string(domain.LoopTypeFixer), string(domain.LoopTypeWorker), string(domain.LoopTypePlanner):
+	default:
+		return nil
+	}
+	if isCodingRoleAgentConfigured(h.effectiveConfig(), loop.Type) {
+		return nil
+	}
+	if repos != nil && repos.Runs != nil {
+		latest, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		if latest != nil && (latest.Status == string(domain.RunStatusFailed) || latest.Status == string(domain.RunStatusInterrupted)) {
+			if latest.AgentSnapshotJSON != nil {
+				snapshot, parseErr := config.ParseAgentSnapshot(*latest.AgentSnapshotJSON)
+				if parseErr == nil && strings.TrimSpace(snapshot.Vendor) != "" {
+					return nil
+				}
+			}
+		}
+	}
+	return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
 }
 
 func urlPathSegment(parts []string, index int) (string, error) {
