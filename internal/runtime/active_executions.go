@@ -48,6 +48,12 @@ type ActiveExecutionRegistry struct {
 	// cancel these so native-resume fallback cannot re-spawn after drain.
 	active        map[uint64]*spawnLease
 	stoppingLoops map[string]int
+	// stopEpoch is bumped by ClearLoopStop so outstanding BeginLoopStop release
+	// closures captured before the clear become no-ops. Without this, a
+	// temporary release (e.g. stopCandidateExecution) that outlived ClearLoopStop
+	// could still decrement a later RestoreLoopStop sticky ref and reopen
+	// AdmitSpawn for pre-stop runners.
+	stopEpoch map[string]uint64
 	// stopDrained records execution keys confirmed-drained by BeginLoopStop
 	// (or Kill) while a loop stop gate is active. haltLoop looks up Kill by
 	// durable id after BeginLoopStop; concurrent releaseLease can delete the
@@ -77,6 +83,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 		pending:       make(map[uint64]*spawnLease),
 		active:        make(map[uint64]*spawnLease),
 		stoppingLoops: make(map[string]int),
+		stopEpoch:     make(map[string]uint64),
 		stopDrained:   make(map[string]struct{}),
 	}
 }
@@ -623,6 +630,9 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	}
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
+	// Capture epoch so a later ClearLoopStop can invalidate this release without
+	// needing to track each closure. Epoch is never reset; only bumped on clear.
+	epoch := r.stopEpoch[loopID]
 	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
 	drainErr := r.cancelAndDrainLoop(loopID, reason, targets)
@@ -630,6 +640,11 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	return func() {
 		once.Do(func() {
 			r.mu.Lock()
+			// ClearLoopStop bumped the epoch: this release no longer owns a ref.
+			if r.stopEpoch[loopID] != epoch {
+				r.mu.Unlock()
+				return
+			}
 			if r.stoppingLoops[loopID] <= 1 {
 				delete(r.stoppingLoops, loopID)
 				r.clearStopDrainedForLoopLocked(loopID)
@@ -649,6 +664,12 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 // LoopStopActive check: a concurrent BeginLoopStop between those two calls would
 // leave gateWasActive=false while this delete still removes the new gate, and a
 // failed start/retry/reuse TX would skip RestoreLoopStop.
+//
+// Outstanding BeginLoopStop release closures captured before this clear are
+// invalidated via stopEpoch: deleting the refcount alone is not enough, because
+// a temporary release (stopCandidateExecution) can still run after a failed
+// reactivation's RestoreLoopStop and would otherwise drop the restored sticky
+// gate when it sees count <= 1.
 func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) {
 	if r == nil || loopID == "" {
 		return false
@@ -656,6 +677,9 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) 
 	r.mu.Lock()
 	wasActive = r.stoppingLoops[loopID] > 0
 	delete(r.stoppingLoops, loopID)
+	// Bump even when wasActive is false so a concurrent BeginLoopStop that lost
+	// the race to this delete cannot leave a live release that still matches.
+	r.stopEpoch[loopID]++
 	r.clearStopDrainedForLoopLocked(loopID)
 	r.mu.Unlock()
 	return wasActive

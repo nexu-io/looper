@@ -167,3 +167,82 @@ func TestRestoreLoopStopSurvivesTemporaryBeginLoopStopRelease(t *testing.T) {
 		t.Fatalf("AdmitSpawn after temp release error = %v, want ErrSpawnLoopStopping", admitErr)
 	}
 }
+
+// ClearLoopStop must invalidate outstanding BeginLoopStop releases created
+// before the clear. Otherwise a temporary stopCandidateExecution release that
+// still runs after a failed reactivation's RestoreLoopStop can delete the
+// restored sticky gate (count <= 1) and reopen AdmitSpawn for pre-stop runners.
+func TestClearLoopStopInvalidatesOutstandingPreClearReleases(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+
+	// Durable sticky stop (haltLoop: BeginLoopStop without release).
+	if _, err := reg.BeginLoopStop("loop-pre-clear-release", "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop sticky: %v", err)
+	}
+	// Temporary nested stop already outstanding before intentional reactivation
+	// (stop-all kill window over a still-cancelling execution).
+	tempRelease, err := reg.BeginLoopStop("loop-pre-clear-release", "candidate kill window")
+	if err != nil {
+		t.Fatalf("BeginLoopStop temporary: %v", err)
+	}
+	if !reg.LoopStopActive("loop-pre-clear-release") {
+		t.Fatal("LoopStopActive = false with sticky+temporary refs, want closed")
+	}
+
+	// Intentional reactivation clears the whole gate while temp release lives.
+	if was := reg.ClearLoopStop("loop-pre-clear-release"); !was {
+		t.Fatal("ClearLoopStop wasActive = false, want true")
+	}
+	if reg.LoopStopActive("loop-pre-clear-release") {
+		t.Fatal("LoopStopActive = true after ClearLoopStop, want open")
+	}
+
+	// TX fails: restore sticky gate (single ref).
+	if err := reg.RestoreLoopStop("loop-pre-clear-release"); err != nil {
+		t.Fatalf("RestoreLoopStop: %v", err)
+	}
+	if !reg.LoopStopActive("loop-pre-clear-release") {
+		t.Fatal("LoopStopActive = false after RestoreLoopStop, want closed")
+	}
+
+	// Pre-clear temporary release must be a no-op; it must not drop the restore.
+	tempRelease()
+	if !reg.LoopStopActive("loop-pre-clear-release") {
+		t.Fatal("LoopStopActive = false after pre-clear temporary release, want restored sticky to remain")
+	}
+	_, admitErr := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-pre-clear-release", RunID: "run-late", ExecutionID: "exec-late",
+	})
+	if !errors.Is(admitErr, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after pre-clear temp release error = %v, want ErrSpawnLoopStopping", admitErr)
+	}
+}
+
+// A pre-clear temporary release must not re-close admission after a successful
+// ClearLoopStop that left the gate intentionally open.
+func TestClearLoopStopKeepsGateOpenAfterOutstandingPreClearRelease(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+
+	if _, err := reg.BeginLoopStop("loop-pre-clear-open", "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop sticky: %v", err)
+	}
+	tempRelease, err := reg.BeginLoopStop("loop-pre-clear-open", "candidate kill window")
+	if err != nil {
+		t.Fatalf("BeginLoopStop temporary: %v", err)
+	}
+	if was := reg.ClearLoopStop("loop-pre-clear-open"); !was {
+		t.Fatal("ClearLoopStop wasActive = false, want true")
+	}
+	// Successful reactivation: gate stays open; deferred temp release is no-op.
+	tempRelease()
+	if reg.LoopStopActive("loop-pre-clear-open") {
+		t.Fatal("LoopStopActive = true after ClearLoopStop + pre-clear release, want open")
+	}
+	if _, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-pre-clear-open", RunID: "run-ok", ExecutionID: "exec-ok",
+	}); err != nil {
+		t.Fatalf("AdmitSpawn after ClearLoopStop + pre-clear release error = %v, want success", err)
+	}
+}
