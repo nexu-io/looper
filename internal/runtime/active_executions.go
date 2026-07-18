@@ -42,8 +42,11 @@ type ownedExecution struct {
 type ActiveExecutionRegistry struct {
 	mu sync.Mutex
 
-	executions    map[string]*ownedExecution
-	pending       map[uint64]*spawnLease
+	executions map[string]*ownedExecution
+	pending    map[uint64]*spawnLease
+	// active holds leases after BindHandle succeeds until Release. Stop must
+	// cancel these so native-resume fallback cannot re-spawn after drain.
+	active        map[uint64]*spawnLease
 	stoppingLoops map[string]int
 	nextLeaseID   uint64
 
@@ -65,6 +68,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 	return &ActiveExecutionRegistry{
 		executions:    make(map[string]*ownedExecution),
 		pending:       make(map[uint64]*spawnLease),
+		active:        make(map[uint64]*spawnLease),
 		stoppingLoops: make(map[string]int),
 	}
 }
@@ -148,6 +152,9 @@ func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agen
 	l.softKill = softKill
 	l.mu.Unlock()
 	r.executions[key] = entry
+	// Keep the lease cancellable after bind: pending→active so loop stop can
+	// cancel x.lease.Context() and block native-resume fallback re-spawn.
+	r.active[l.id] = l
 	delete(r.pending, l.id)
 	r.mu.Unlock()
 	return nil
@@ -239,6 +246,7 @@ func (l *spawnLease) Release() {
 	}
 	r.mu.Lock()
 	delete(r.pending, l.id)
+	delete(r.active, l.id)
 	key := activeExecutionKey(l.meta.LoopID, l.meta.RunID, l.meta.ExecutionID)
 	if entry, ok := r.executions[key]; ok {
 		// Only drop if this lease still owns the entry (handle identity).
@@ -307,8 +315,10 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	return lease, nil
 }
 
-// BeginLoopStop closes spawn admission for one loop and cancels pending leases
-// for that loop. Registered live executions are Kill'd by the caller (haltLoop).
+// BeginLoopStop closes spawn admission for one loop and cancels both pending
+// and bound (active) leases for that loop. Bound-lease cancel is required so
+// native-resume fallback cannot re-spawn after haltLoop drains the old handle.
+// Registered live executions are Kill'd by the caller (haltLoop).
 // The returned release reopens loop admission after the durable stop transition.
 func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	if r == nil {
@@ -316,10 +326,15 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	}
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
-	pending := make([]*spawnLease, 0)
+	toCancel := make([]*spawnLease, 0)
 	for _, lease := range r.pending {
 		if lease.meta.LoopID == loopID {
-			pending = append(pending, lease)
+			toCancel = append(toCancel, lease)
+		}
+	}
+	for _, lease := range r.active {
+		if lease.meta.LoopID == loopID {
+			toCancel = append(toCancel, lease)
 		}
 	}
 	r.mu.Unlock()
@@ -327,7 +342,7 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	if reason == "" {
 		cause = agent.ErrSpawnLoopStopping
 	}
-	for _, lease := range pending {
+	for _, lease := range toCancel {
 		lease.cancel(cause)
 	}
 	var once sync.Once
@@ -344,8 +359,8 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	}
 }
 
-// BeginShutdown closes spawn admission, cancels pending leases, and confirmed-
-// drains every bound containment handle.
+// BeginShutdown closes spawn admission, cancels pending and bound (active)
+// leases, and confirmed-drains every bound containment handle.
 func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 	if r == nil {
 		return
@@ -355,9 +370,12 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 	if reason != "" {
 		r.shutdownReason = reason
 	}
-	pending := make([]*spawnLease, 0, len(r.pending))
+	toCancel := make([]*spawnLease, 0, len(r.pending)+len(r.active))
 	for _, lease := range r.pending {
-		pending = append(pending, lease)
+		toCancel = append(toCancel, lease)
+	}
+	for _, lease := range r.active {
+		toCancel = append(toCancel, lease)
 	}
 	entries := make([]*ownedExecution, 0, len(r.executions))
 	for _, entry := range r.executions {
@@ -369,7 +387,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 	if reason == "" {
 		cause = agent.ErrSpawnAdmissionClosed
 	}
-	for _, lease := range pending {
+	for _, lease := range toCancel {
 		lease.cancel(cause)
 	}
 	for _, entry := range entries {

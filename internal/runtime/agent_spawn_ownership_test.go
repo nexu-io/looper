@@ -247,6 +247,61 @@ func TestNativeResumeFallbackCancelledDoesNotSpawnSecondProcess(t *testing.T) {
 	}
 }
 
+// Contract: after BindHandle succeeds the lease leaves pending; BeginLoopStop
+// must still cancel that bound lease so executor native-resume fallback cannot
+// start/rebind a second process after haltLoop drained the first handle.
+func TestBeginLoopStopCancelsBoundActiveLease(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
+
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-bound", RunID: "run-bound", ExecutionID: "exec-bound",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := lease.BindHandle(handle, func(string) error { return nil }); err != nil {
+		t.Fatalf("BindHandle: %v", err)
+	}
+	if reg.PendingCount() != 0 {
+		t.Fatalf("PendingCount = %d after bind, want 0", reg.PendingCount())
+	}
+	if !reg.HasLiveHandle("loop-bound", "run-bound", "exec-bound") {
+		t.Fatal("expected live handle after successful bind")
+	}
+	if lease.Context().Err() != nil {
+		t.Fatalf("lease already cancelled before stop: %v", lease.Context().Err())
+	}
+
+	release := reg.BeginLoopStop("loop-bound", "halt")
+	defer release()
+
+	select {
+	case <-lease.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("bound lease context not cancelled by BeginLoopStop")
+	}
+	// Fallback guard used by executor: cancelled lease blocks second spawn.
+	if lease.Context().Err() == nil {
+		t.Fatal("lease.Context().Err() = nil after BeginLoopStop, want cancelled")
+	}
+}
+
 func TestConcurrentStopAndSpawnLinearized(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
