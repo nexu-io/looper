@@ -1185,7 +1185,14 @@ func markExecutionCancelling(ctx context.Context, services looperdruntime.Servic
 	if updated.ErrorMessage == nil {
 		updated.ErrorMessage = &reason
 	}
-	return services.Repositories.AgentExecutions.Upsert(ctx, updated)
+	if err := services.Repositories.AgentExecutions.Upsert(ctx, updated); err != nil {
+		// Terminal already won: stop path must not invent success-over-conflict.
+		if errors.Is(err, storage.ErrAgentExecutionConflict) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func hasVersionArg(args []string) bool {

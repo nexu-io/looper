@@ -3140,6 +3140,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// scheduler's loop/run writes.
 		notificationGateway.RefreshThreadHeader(ctx, p.LoopID, p.TailLines, p.ElapsedSeconds)
 	}
+	// Hard observation write failures degrade sticky admission (#578).
+	onHardPersistFailure := func(err error) {
+		if activeExecutions != nil {
+			activeExecutions.ReportHardPersistFailure(err)
+		}
+	}
 	newRoleAgentExecutor := func(resolved config.ResolvedAgent) *agent.ConfiguredExecutor {
 		// agent.params (especially command/args) belong to the global agent
 		// vendor. Keep the unstripped map and the owner vendor on the executor
@@ -3162,8 +3168,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Now:               now,
 			// Common executor boundary ownership for every in-scope agent role
 			// (planner/reviewer/fixer/worker/coordinator) — not post-spawn adapters (#576).
-			Owner:      activeExecutions,
-			OnProgress: onAgentProgress,
+			Owner:                activeExecutions,
+			OnHardPersistFailure: onHardPersistFailure,
+			OnProgress:           onAgentProgress,
 		})
 	}
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
@@ -3251,12 +3258,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 				LiveToolEvents:      liveToolEvents,
 			},
-			ParamsOwnerVendor: cfg.Agent.Vendor,
-			Repos:             repos,
-			LogDir:            cfg.Daemon.LogDir,
-			Now:               now,
-			Owner:             activeExecutions,
-			OnProgress:        onAgentProgress,
+			ParamsOwnerVendor:    cfg.Agent.Vendor,
+			Repos:                repos,
+			LogDir:               cfg.Daemon.LogDir,
+			Now:                  now,
+			Owner:                activeExecutions,
+			OnHardPersistFailure: onHardPersistFailure,
+			OnProgress:           onAgentProgress,
 		})
 		coordinatorOpts.TriageLLM = coordinatorrole.NewAgentLLM(globalExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,

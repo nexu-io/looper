@@ -108,3 +108,14 @@ Key daemon/runtime facts for webhook mode:
 - Webhook forwarders require a loopback daemon endpoint. Non-loopback `server.host` will degrade webhook mode.
 - If webhook runtime becomes degraded because stale remote GitHub CLI hooks already exist, prefer `looper webhook cleanup owner/repo` before restarting the daemon.
 - Restart is only the next step if status still shows degraded after cleanup or after fixing auth/path/config problems.
+
+### Admission degraded after agent execution persistence failure
+
+When SQLite cannot durable-publish `agent_executions` observations (initial ownership, mid-life heartbeat/output, or terminal), looperd closes the single sticky **admission** state (`degraded`) so new work cannot continue with split-brain observations (ADR-0015 / #578).
+
+Operator recovery:
+
+1. Read `looper daemon logs` / `looper daemon status --json` for admission `degraded` and a reason mentioning agent execution persistence.
+2. Repair storage under the runtime home (default `~/.looper/`): disk space, permissions, SQLite integrity.
+3. **Restart `looperd`** — normal recovery. Admission stays degraded until process restart (or an explicit clear hook used only in tests/ops tools).
+4. After restart, let startup recovery classify durable rows conservatively; do not force-requeue uncertain work.
