@@ -54,7 +54,18 @@ function metaIsEditable(meta: ConfigFieldMetadata | undefined): boolean {
   return meta.source !== "env" && meta.source !== "cli";
 }
 
-/** Prefer leaf metadata; curated role-agent leaves fall back to a hot default. */
+const hotDefaultMeta: ConfigFieldMetadata = {
+  source: "default",
+  editable: true,
+  applyMode: "hot",
+};
+
+/**
+ * Prefer leaf metadata. Curated role-agent and profile entry/leaves fall back
+ * to a hot default — never inherit the agent.profiles map-container metadata,
+ * which the daemon marks non-editable/restart-bound while still accepting
+ * profile leaf patches.
+ */
 function resolveFieldMeta(
   data: ConfigData,
   path: string,
@@ -62,18 +73,33 @@ function resolveFieldMeta(
   const direct = data.metadata.fields[path];
   if (direct) return direct;
   if (isRoleAgentLeafPath(path)) {
-    return { source: "default", editable: true, applyMode: "hot" };
+    return hotDefaultMeta;
   }
-  if (path.startsWith("agent.profiles.")) {
-    return (
-      data.metadata.fields["agent.profiles"] ?? {
-        source: "default",
-        editable: true,
-        applyMode: "hot",
-      }
-    );
+  if (isAgentProfileLeafPath(path) || isAgentProfileWholePath(path)) {
+    return hotDefaultMeta;
   }
   return undefined;
+}
+
+/**
+ * Profile add/remove is gated on entry/leaf editability, not the map container.
+ * Real daemon metadata exposes agent.profiles as non-editable/restart-bound
+ * while agent.profiles.<id>.vendor|model remain hot-editable.
+ */
+function agentProfilesEditableByAuthority(data: ConfigData): boolean {
+  const fields = data.metadata.fields ?? {};
+  let sawProfileEntryOrLeaf = false;
+  for (const [path, meta] of Object.entries(fields)) {
+    if (path === "agent.profiles" || !path.startsWith("agent.profiles.")) {
+      continue;
+    }
+    sawProfileEntryOrLeaf = true;
+    if (metaIsEditable(meta)) return true;
+  }
+  // No published entry/leaf metadata yet (empty map or only container listed):
+  // allow via the same hot fallback used for missing leaf meta.
+  if (!sawProfileEntryOrLeaf) return true;
+  return false;
 }
 
 function sourceIsConfigFile(source: string | undefined): boolean {
@@ -312,8 +338,10 @@ function AgentProfiles({
   const [newModel, setNewModel] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
 
-  const profilesMeta = resolveFieldMeta(data, "agent.profiles");
-  const editableByAuthority = metaIsEditable(profilesMeta);
+  // Section badge may still show map-container source; edit authority uses leaves.
+  const profilesMeta =
+    data.metadata.fields["agent.profiles"] ?? hotDefaultMeta;
+  const editableByAuthority = agentProfilesEditableByAuthority(data);
   const canEdit = editableByAuthority && !disabled;
 
   const publishedIds = Object.keys(data.agent?.profiles ?? {}).sort();
