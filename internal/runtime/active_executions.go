@@ -115,6 +115,12 @@ type spawnLease struct {
 	// while native-resume fallback has a live process not yet in the registry.
 	rebinding  bool
 	rebindDone chan struct{}
+
+	// unownedDrainErr is set when killUnowned fails for a refused BindHandle/
+	// RebindHandle. That handle is never inserted into r.executions, so
+	// cancelAndDrainLoop must join this error after the wait channel closes
+	// (the second registry drain pass cannot see it).
+	unownedDrainErr error
 }
 
 // closeSpawnDone marks the pending-spawn window finished. Safe to call multiple times.
@@ -325,6 +331,7 @@ func (l *spawnLease) killUnowned(handle *processcontainment.Handle, base error) 
 		ctx, cancel := context.WithTimeout(context.Background(), defaultKillTimeout)
 		defer cancel()
 		if err := handle.Kill(ctx); err != nil {
+			l.publishUnownedDrainErr(err)
 			return errors.Join(base, err)
 		}
 		return base
@@ -333,9 +340,37 @@ func (l *spawnLease) killUnowned(handle *processcontainment.Handle, base error) 
 	defer cancel()
 	killErr := handle.Kill(ctx)
 	if killErr != nil {
+		// Publish before closeSpawnDone/endRebindLocked so cancelAndDrainLoop
+		// can join this after the wait channel unblocks. Without this, stop
+		// treats a closed wait channel as success while the only owner of the
+		// just-started handle (killUnowned) already failed to confirm death.
+		l.publishUnownedDrainErr(killErr)
 		return errors.Join(base, killErr)
 	}
 	return base
+}
+
+// publishUnownedDrainErr records a failed refuse-path Handle.Kill for stop to
+// join. Safe under concurrent BindHandle/RebindHandle and cancelAndDrainLoop.
+func (l *spawnLease) publishUnownedDrainErr(err error) {
+	if l == nil || err == nil {
+		return
+	}
+	l.mu.Lock()
+	l.unownedDrainErr = errors.Join(l.unownedDrainErr, err)
+	l.mu.Unlock()
+}
+
+// takeUnownedDrainErr returns and clears any published refuse-path kill failure.
+func (l *spawnLease) takeUnownedDrainErr() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	err := l.unownedDrainErr
+	l.unownedDrainErr = nil
+	l.mu.Unlock()
+	return err
 }
 
 func (l *spawnLease) Release() {
@@ -518,6 +553,14 @@ func (r *ActiveExecutionRegistry) cancelAndDrainLoop(loopID, reason string, t lo
 			// Surface timeout as drain failure: the confirmation channel that
 			// proves no just-started process outlives stop never completed.
 			drainErr = errors.Join(drainErr, errLoopStopWaitTimeout)
+		}
+	}
+	// Join refuse-path killUnowned failures published on waited leases. Those
+	// handles never enter r.executions, so the second drain pass cannot see
+	// them; treating a closed wait channel as success would hide live agents.
+	for _, lease := range t.toCancel {
+		if err := lease.takeUnownedDrainErr(); err != nil {
+			drainErr = errors.Join(drainErr, err)
 		}
 	}
 	if len(waitChans) > 0 {
