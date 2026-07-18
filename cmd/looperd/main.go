@@ -442,14 +442,6 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return nil, fmt.Errorf("loops service is not configured")
 	}
 
-	// Close spawn admission for this loop before kill so stop-vs-spawn races
-	// cannot return a live process after halt begins (#576).
-	releaseLoopStop := func() {}
-	if services.ActiveExecutions != nil {
-		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID, reason)
-	}
-	defer releaseLoopStop()
-
 	reasonCopy := reason
 	complete := func() (any, error) {
 		if !terminal {
@@ -464,6 +456,10 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return result, nil
 	}
 
+	// Durable pause must succeed before lease cancel. BeginLoopStop cancels
+	// lease contexts wired into execution.run and cannot be undone; doing it
+	// before Pause would half-kill agents when a transient Pause error leaves
+	// the loop still running. Terminal close has no pre-kill status transition.
 	if !terminal {
 		paused, err := services.Loops.Pause(ctx, loopID, &reasonCopy)
 		if err != nil {
@@ -472,6 +468,14 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		result.Stopped = true
 		result.LoopID = paused.Loop.ID
 	}
+
+	// Close spawn admission for this loop before kill so stop-vs-spawn races
+	// cannot return a live process after halt begins (#576).
+	releaseLoopStop := func() {}
+	if services.ActiveExecutions != nil {
+		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+	}
+	defer releaseLoopStop()
 
 	if services.Repositories == nil || services.Repositories.Runs == nil {
 		result.ProcessSkipReason = processSkipNoRuns
