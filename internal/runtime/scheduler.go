@@ -3238,6 +3238,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
 	}
 	if cfg.Agent.Vendor != nil {
+		// Same ParamsOwnerVendor as coding-role executors: agent.params.command/args
+		// are owned by global agent.vendor. Without this, effectiveConfig's
+		// ParamsForRoleVendor nil-owner path strips wrappers and coordinator
+		// triage launches bare vendor defaults while role executors keep them.
 		globalExecutor := agent.New(agent.ExecutorOptions{
 			Config: agent.ExecutorConfig{
 				Vendor:              *cfg.Agent.Vendor,
@@ -3247,11 +3251,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 				LiveToolEvents:      liveToolEvents,
 			},
-			Repos:      repos,
-			LogDir:     cfg.Daemon.LogDir,
-			Now:        now,
-			Owner:      activeExecutions,
-			OnProgress: onAgentProgress,
+			ParamsOwnerVendor: cfg.Agent.Vendor,
+			Repos:             repos,
+			LogDir:            cfg.Daemon.LogDir,
+			Now:               now,
+			Owner:             activeExecutions,
+			OnProgress:        onAgentProgress,
 		})
 		coordinatorOpts.TriageLLM = coordinatorrole.NewAgentLLM(globalExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
