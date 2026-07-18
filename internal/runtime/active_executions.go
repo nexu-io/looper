@@ -315,10 +315,13 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	return lease, nil
 }
 
-// BeginLoopStop closes spawn admission for one loop and cancels both pending
-// and bound (active) leases for that loop. Bound-lease cancel is required so
-// native-resume fallback cannot re-spawn after haltLoop drains the old handle.
-// Registered live executions are Kill'd by the caller (haltLoop).
+// BeginLoopStop closes spawn admission for one loop, cancels both pending and
+// bound (active) leases for that loop, and confirmed-drains every bound
+// containment handle for the loop. Bound-lease cancel is required so
+// native-resume fallback cannot re-spawn after the old handle is drained.
+// Handle drain here covers the BindHandle→persistStatus window where the
+// registry owns a live process but haltLoop may not yet see a durable
+// AgentExecutionRecord to Kill by ID.
 //
 // After a durable stop (pause/terminate), callers must keep the gate closed:
 // do not invoke the returned release. In-flight runners that claimed work
@@ -349,6 +352,15 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 			toCancel = append(toCancel, lease)
 		}
 	}
+	// Only drain entries with a containment handle. SoftKill-only Register
+	// stubs (tests / transitional) stay for haltLoop Kill-by-id, which still
+	// consults durable execution status and must not half-kill stale rows.
+	toKill := make([]*ownedExecution, 0)
+	for _, entry := range r.executions {
+		if entry != nil && entry.loopID == loopID && entry.handle != nil {
+			toKill = append(toKill, entry)
+		}
+	}
 	r.mu.Unlock()
 	cause := errors.New(reason)
 	if reason == "" {
@@ -356,6 +368,12 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	}
 	for _, lease := range toCancel {
 		lease.cancel(cause)
+	}
+	// Confirmed-drain bound handles for this loop so stop does not return while
+	// a post-BindHandle process is only asynchronously killed via lease cancel
+	// after Start continues (BindHandle→persistStatus window).
+	for _, entry := range toKill {
+		_ = r.killOwned(entry, reason)
 	}
 	var once sync.Once
 	return func() {

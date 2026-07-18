@@ -274,6 +274,9 @@ func TestNativeResumeFallbackCancelledDoesNotSpawnSecondProcess(t *testing.T) {
 // Contract: after BindHandle succeeds the lease leaves pending; BeginLoopStop
 // must still cancel that bound lease so executor native-resume fallback cannot
 // start/rebind a second process after haltLoop drained the first handle.
+// BeginLoopStop must also confirmed-drain the bound handle so haltLoop does not
+// rely on a durable AgentExecutionRecord that may not exist yet
+// (BindHandle→persistStatus window).
 func TestBeginLoopStopCancelsBoundActiveLease(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
@@ -323,6 +326,50 @@ func TestBeginLoopStopCancelsBoundActiveLease(t *testing.T) {
 	// Fallback guard used by executor: cancelled lease blocks second spawn.
 	if lease.Context().Err() == nil {
 		t.Fatal("lease.Context().Err() = nil after BeginLoopStop, want cancelled")
+	}
+
+	// Confirmed drain of the post-BindHandle process (no separate Kill by ID).
+	if !handle.ConfirmedDead() {
+		t.Fatal("bound handle not confirmed-drained by BeginLoopStop")
+	}
+}
+
+// BeginLoopStop must drain handles for the loop even when haltLoop cannot look
+// up a durable execution id (registry-bound, not yet persisted).
+func TestBeginLoopStopDrainsBoundHandleWithoutKillByID(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
+
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-pre-persist", RunID: "run-pre", ExecutionID: "exec-pre",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := lease.BindHandle(handle, func(string) error { return nil }); err != nil {
+		t.Fatalf("BindHandle: %v", err)
+	}
+
+	// Simulate haltLoop with no durable execution: only BeginLoopStop, no Kill(id).
+	release := reg.BeginLoopStop("loop-pre-persist", "looper stop")
+	defer release()
+
+	if !handle.ConfirmedDead() {
+		t.Fatal("BeginLoopStop did not confirmed-drain handle without Kill-by-id")
 	}
 }
 

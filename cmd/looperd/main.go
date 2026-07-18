@@ -476,13 +476,26 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	// without re-reading loop status. ClearLoopStop runs only on intentional
 	// re-activation (API unpause/retry/handback).
 	//
+	// BeginLoopStop is irreversible for live agents (lease cancel + bound-handle
+	// drain). Non-terminal already paused, so open the gate immediately after
+	// Pause. Terminal close defers the gate until after abortable run/execution
+	// preflight: a transient lookup error must not kill agents while the loop
+	// stays open. releaseLoopStop reopens admission only and cannot undo a
+	// canceled lease.
+	//
 	// Terminal close has no durable status transition until complete(); if a
-	// later lookup/Kill/signal aborts, release the gate so the still-running
-	// loop can AdmitSpawn again. Non-terminal already paused durably, so the
-	// gate stays sticky even when later steps fail.
+	// later Kill/signal/terminate aborts after the gate opens, release the gate
+	// so the still-running loop can AdmitSpawn again. Non-terminal already
+	// paused durably, so the gate stays sticky even when later steps fail.
 	var releaseLoopStop func()
-	if services.ActiveExecutions != nil {
+	beginLoopStop := func() {
+		if releaseLoopStop != nil || services.ActiveExecutions == nil {
+			return
+		}
 		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+	}
+	if !terminal {
+		beginLoopStop()
 	}
 	keepStopGateSticky := !terminal
 	defer func() {
@@ -491,6 +504,9 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		}
 	}()
 	finish := func() (any, error) {
+		// Ensure admission is closed before durable terminate (terminal) so the
+		// sticky gate applies even when there was no process to kill.
+		beginLoopStop()
 		out, err := complete()
 		if err == nil {
 			keepStopGateSticky = true
@@ -503,6 +519,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return finish()
 	}
 
+	// Abortable preflight for terminal close: do not BeginLoopStop yet.
 	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
 	if err != nil {
 		return nil, err
@@ -539,6 +556,8 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		result.Outcome = stopOutcomeAlreadyStopping
 		result.ProcessSkipReason = processSkipAlreadyStopping
 	}
+	// Past abortable preflight: close admission and drain leases before kill.
+	beginLoopStop()
 	if services.ActiveExecutions != nil {
 		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
 		if err != nil {
