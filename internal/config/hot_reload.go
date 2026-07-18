@@ -257,9 +257,12 @@ func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
 	// unsafe, and silently carrying the same explicit model is almost always
 	// accidental. A paired model edit (including clearing it) is explicit.
 	//
-	// Guard each coding role's *resolved* vendor (global + profile + role overlay),
-	// which subsumes the historical global-only agent.vendor check when roles
-	// inherit the global binding.
+	// Guard the raw global agent.vendor leave/switch (coordinator triage +
+	// agent.params ownership) and each coding role's *resolved* vendor
+	// (global + profile + role overlay). The role loop alone is not enough:
+	// when every coding role overrides vendor via profile/inline binding,
+	// resolved vendors stay stable while a hot global vendor edit would still
+	// rebind coordinator and params under a new CLI.
 	appendResolvedVendorRestartGuards(oldConfig, newConfig, seen, &restartRequired)
 	sort.Strings(restartRequired)
 	return restartRequired
@@ -273,6 +276,10 @@ func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen 
 		seen[path] = struct{}{}
 		*restartRequired = append(*restartRequired, path)
 	}
+
+	// Global agent is independent of role-resolved identity: coordinator triage
+	// still uses it, and agent.params fan out as owned by the global vendor.
+	appendGlobalVendorLeaveSwitchGuard(oldConfig, newConfig, mark)
 
 	for _, role := range []string{CodingRolePlanner, CodingRoleWorker, CodingRoleReviewer, CodingRoleFixer} {
 		oldVendor, oldModel, _, oldOK := overlayAgentIdentity(oldConfig, role)
@@ -303,6 +310,26 @@ func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen 
 				mark(path)
 			}
 		}
+	}
+}
+
+// appendGlobalVendorLeaveSwitchGuard blocks hot leave/switch of agent.vendor when
+// companion global fields would be reused under a different CLI. First activation
+// (nil prior vendor) remains hot.
+func appendGlobalVendorLeaveSwitchGuard(oldConfig Config, newConfig Config, mark func(string)) {
+	if oldConfig.Agent.Vendor == nil {
+		return
+	}
+	if newConfig.Agent.Vendor != nil && *oldConfig.Agent.Vendor == *newConfig.Agent.Vendor {
+		return
+	}
+	if len(newConfig.Agent.Params) > 0 {
+		mark("agent.params")
+	}
+	oldModel := oldConfig.Agent.Model
+	newModel := newConfig.Agent.Model
+	if oldModel != nil && newModel != nil && *oldModel != "" && *oldModel == *newModel {
+		mark("agent.model")
 	}
 }
 

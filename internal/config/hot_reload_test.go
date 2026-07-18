@@ -373,6 +373,56 @@ func TestRestartRequiredChangesBlocksVendorResetModelLaundering(t *testing.T) {
 	}
 }
 
+func TestRestartRequiredChangesGuardsGlobalVendorWhenRolesOverride(t *testing.T) {
+	t.Parallel()
+
+	// Every coding role resolves vendor from a profile/inline binding, so the
+	// role-resolved loop sees no vendor change. Global agent.vendor still owns
+	// coordinator triage and agent.params and must be guarded independently.
+	oldConfig, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	globalVendor := AgentVendorCodex
+	roleVendor := AgentVendorClaudeCode
+	oldConfig.Agent.Vendor = &globalVendor
+	oldConfig.Agent.Model = stringPtr("gpt-5")
+	oldConfig.Agent.Params = map[string]any{"command": "/opt/codex-wrapper"}
+	oldConfig.Agent.Profiles = map[string]AgentBindingConfig{
+		"coding": {Vendor: &roleVendor, Model: stringPtr("claude-sonnet")},
+	}
+	oldConfig.Roles.Planner.Agent = &RoleAgentConfig{Profile: stringPtr("coding")}
+	oldConfig.Roles.Worker.Agent = &RoleAgentConfig{Profile: stringPtr("coding")}
+	oldConfig.Roles.Reviewer.Agent = &RoleAgentConfig{Profile: stringPtr("coding")}
+	oldConfig.Roles.Fixer.Agent = &RoleAgentConfig{Vendor: &roleVendor, Model: stringPtr("claude-sonnet")}
+
+	newConfig := CloneConfig(oldConfig)
+	switched := AgentVendorClaudeCode
+	newConfig.Agent.Vendor = &switched
+
+	if got, want := RestartRequiredChanges(oldConfig, newConfig), []string{"agent.model", "agent.params"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("global vendor switch with role overrides = %#v, want %#v", got, want)
+	}
+
+	// Paired global model clear makes the vendor switch explicit for model, but
+	// retained params still require restart.
+	clearedModel := CloneConfig(newConfig)
+	clearedModel.Agent.Model = stringPtr("")
+	if got, want := RestartRequiredChanges(oldConfig, clearedModel), []string{"agent.params"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("global vendor switch with model cleared = %#v, want %#v", got, want)
+	}
+
+	// Clean global switch (no params, paired model change) remains hot.
+	baseClean := CloneConfig(oldConfig)
+	baseClean.Agent.Params = map[string]any{}
+	clean := CloneConfig(baseClean)
+	clean.Agent.Vendor = &switched
+	clean.Agent.Model = stringPtr("claude-sonnet")
+	if got := RestartRequiredChanges(baseClean, clean); len(got) != 0 {
+		t.Fatalf("clean global vendor+model switch = %#v, want no blockers", got)
+	}
+}
+
 func agentVendorPtr(v AgentVendor) *AgentVendor {
 	return &v
 }
