@@ -4479,10 +4479,11 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			}
 		}
 	}
-	restoreReuseStopGate := func() {
+	restoreReuseStopGate := func() error {
 		if reuseGateWasActive && reuseStopGateLoopID != "" && services.ActiveExecutions != nil {
-			services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
+			return services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
 		}
+		return nil
 	}
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
@@ -4502,7 +4503,12 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 				if services.ActiveExecutions != nil {
 					if reuseStopGateLoopID == "" {
 						reuseStopGateLoopID = existingLoop.ID
-						reuseGateWasActive = services.ActiveExecutions.LoopStopActive(existingLoop.ID)
+					}
+					// Re-sample before this clear: looper stop may have established
+					// the gate after the pre-TX clear saw it inactive. Without
+					// re-sample, TX abort restore would skip (flag still false).
+					if services.ActiveExecutions.LoopStopActive(existingLoop.ID) {
+						reuseGateWasActive = true
 					}
 					services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
 				}
@@ -4580,7 +4586,14 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return record, nil
 	})
 	if err != nil {
-		restoreReuseStopGate()
+		if restoreErr := restoreReuseStopGate(); restoreErr != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				typed.message = errors.Join(err, restoreErr).Error()
+				return workerCreateResponse{}, typed
+			}
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return workerCreateResponse{}, typed
@@ -4589,7 +4602,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 	// Pre-cleared for a reuse that did not become claimable queued work: restore.
 	if !reusedWorkerLoop || record.Status != string(domain.LoopStatusQueued) {
-		restoreReuseStopGate()
+		if restoreErr := restoreReuseStopGate(); restoreErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: restoreErr.Error()}
+		}
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		if !reusedWorkerLoop || record.Status == string(domain.LoopStatusQueued) {
@@ -5324,10 +5339,11 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		gateWasActive = services.ActiveExecutions.LoopStopActive(loopID)
 		services.ActiveExecutions.ClearLoopStop(loopID)
 	}
-	restoreStopGate := func() {
+	restoreStopGate := func() error {
 		if gateWasActive && services.ActiveExecutions != nil {
-			services.ActiveExecutions.RestoreLoopStop(loopID)
+			return services.ActiveExecutions.RestoreLoopStop(loopID)
 		}
+		return nil
 	}
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
@@ -5451,7 +5467,14 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		return updated, nil
 	})
 	if err != nil {
-		restoreStopGate()
+		if restoreErr := restoreStopGate(); restoreErr != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				typed.message = errors.Join(err, restoreErr).Error()
+				return loopResponse{}, typed
+			}
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return loopResponse{}, typed
@@ -6018,10 +6041,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		gateWasActive = services.ActiveExecutions.LoopStopActive(loopID)
 		services.ActiveExecutions.ClearLoopStop(loopID)
 	}
-	restoreStopGate := func() {
+	restoreStopGate := func() error {
 		if gateWasActive && services.ActiveExecutions != nil {
-			services.ActiveExecutions.RestoreLoopStop(loopID)
+			return services.ActiveExecutions.RestoreLoopStop(loopID)
 		}
+		return nil
 	}
 	if h.retryAfterClearStopGateHook != nil {
 		h.retryAfterClearStopGateHook(loopID)
@@ -6120,7 +6144,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		return retryResult{loop: updated, queueItemID: &persisted.ID}, nil
 	})
 	if err != nil {
-		restoreStopGate()
+		if restoreErr := restoreStopGate(); restoreErr != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				typed.message = errors.Join(err, restoreErr).Error()
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
+		}
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return retryLoopResponse{}, typed
@@ -6129,7 +6160,9 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	}
 	if result.queueItemID == nil {
 		// No replacement work published; keep sticky stop closed if it was.
-		restoreStopGate()
+		if restoreErr := restoreStopGate(); restoreErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: restoreErr.Error()}
+		}
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()

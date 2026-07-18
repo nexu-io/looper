@@ -604,9 +604,13 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) {
 // leases and confirmed-drains bound handles admitted during the clear window
 // so a failed retry/start/worker-reuse cannot leave a live agent for a loop
 // that was never reactivated.
-func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) {
+//
+// Returns cancelAndDrainLoop's error when kill or confirmed-drain fails so
+// callers can join it with the original validation/TX failure; the gate is
+// still closed even when drain fails.
+func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) error {
 	if r == nil || loopID == "" {
-		return
+		return nil
 	}
 	r.mu.Lock()
 	if r.stoppingLoops[loopID] == 0 {
@@ -614,9 +618,10 @@ func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) {
 	}
 	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
-	// Best-effort: callers restore on TX failure and have no drain channel.
-	// Gate is closed; cancel+drain prevents orphan processes from the window.
-	_ = r.cancelAndDrainLoop(loopID, "restore loop stop after failed reactivation", targets)
+	// Gate is closed first; cancel+drain prevents orphan processes from the
+	// clear window. Surface drain failure so callers do not only report the
+	// original TX/validation error while a live agent may still be unconfirmed.
+	return r.cancelAndDrainLoop(loopID, "restore loop stop after failed reactivation", targets)
 }
 
 // LoopStopActive reports whether spawn admission is closed for loopID.

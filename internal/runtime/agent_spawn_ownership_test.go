@@ -141,7 +141,9 @@ func TestRestoreLoopStopDrainsLeasesAdmittedDuringClear(t *testing.T) {
 	}
 
 	// TX failed: restore sticky gate and drain anything admitted in the window.
-	reg.RestoreLoopStop("loop-restore")
+	if err := reg.RestoreLoopStop("loop-restore"); err != nil {
+		t.Fatalf("RestoreLoopStop: %v", err)
+	}
 	if !reg.LoopStopActive("loop-restore") {
 		t.Fatal("LoopStopActive = false after RestoreLoopStop")
 	}
