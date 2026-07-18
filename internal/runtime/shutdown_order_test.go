@@ -11,6 +11,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
@@ -187,6 +188,96 @@ func TestShutdownRetainsStorageWhenNonAgentDrainFailureReported(t *testing.T) {
 	}
 	if services := rt.Services(); services.Coordinator == nil {
 		t.Fatal("Services().Coordinator = nil after Stop with non-agent drain failure, want retained storage")
+	}
+}
+
+// Contract (#590 review): BeginShutdown cancels producer contexts before
+// waiting on tracked non-agent handles. Validation shell.Run only Kill/Drains
+// after its owner ctx is canceled; waiting first would burn killBudget then
+// force-kill instead of cancel/drain promptly.
+func TestBeginShutdownCancelsProducersBeforeNonAgentDrain(t *testing.T) {
+	t.Parallel()
+
+	reg := NewActiveExecutionRegistry()
+	// Long budget makes reverse-order bugs obvious: without producer cancel
+	// first, drainNonAgentHandles waits this long before force-kill.
+	reg.killTimeout = 3 * time.Second
+
+	producerCtx, producerCancel := context.WithCancel(context.Background())
+	rt := &Runtime{
+		admission:        NewAdmission(),
+		activeExecutions: reg,
+		schedulerCancel:  producerCancel,
+		shutdownCh:       make(chan struct{}),
+	}
+	if err := rt.admission.MarkReady("test"); err != nil {
+		t.Fatalf("MarkReady: %v", err)
+	}
+
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		// Signal once Track has a chance after Bind: poll registry LiveTracker
+		// by starting a long sleep that only exits via cancel → Kill.
+		close(started)
+		_, err := shell.Run(producerCtx, shell.Options{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "sleep 60"},
+			GracefulShutdown: 100 * time.Millisecond,
+			Tracker:          reg,
+		})
+		done <- err
+	}()
+	<-started
+
+	// Wait until the shell handle is tracked (or fail fast).
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		reg.mu.Lock()
+		n := len(reg.nonAgentHandles)
+		reg.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			producerCancel()
+			t.Fatal("timed out waiting for non-agent handle Track")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	start := time.Now()
+	rt.BeginShutdown("test cancel-before-non-agent-drain")
+	elapsed := time.Since(start)
+
+	// Prompt path must finish well under kill budget (cancel → shell Kill → release).
+	if elapsed >= reg.killTimeout {
+		t.Fatalf("BeginShutdown took %v (>= killTimeout %v); producer cancel likely ran after non-agent wait", elapsed, reg.killTimeout)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("BeginShutdown took %v, want prompt cancel/drain well under 1s", elapsed)
+	}
+	if rt.AdmissionState() != AdmissionStopping {
+		t.Fatalf("AdmissionState() = %q, want stopping", rt.AdmissionState())
+	}
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			// Kill join with cancel is acceptable; plain cancel is ideal.
+			if !strings.Contains(err.Error(), context.Canceled.Error()) {
+				t.Fatalf("shell.Run error = %v, want context.Canceled (prompt cancel path)", err)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shell.Run did not return after BeginShutdown")
+	}
+
+	reg.mu.Lock()
+	remaining := len(reg.nonAgentHandles)
+	reg.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("nonAgentHandles remaining = %d, want 0 after prompt drain", remaining)
 	}
 }
 

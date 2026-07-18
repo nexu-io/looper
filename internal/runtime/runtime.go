@@ -443,6 +443,10 @@ func (r *Runtime) Stop(reason string) {
 //
 // Shutdown order (ADR-0015 / #577): close admission → cancel producers →
 // confirmed-drain handles (agents + tracked non-agent shell/trusted-review).
+// Producer cancel must run before ActiveExecutionRegistry.BeginShutdown waits
+// on tracked non-agent handles: validation shell.Run only enters Kill after its
+// owner ctx is canceled. Waiting first would burn the full kill budget then
+// force-kill instead of cancel/drain promptly.
 // SQLite close happens only in Stop after drain succeeds; drain failure is
 // recorded for retain-storage. Non-agent Kill/Drain failures that finish after
 // this returns are re-collected in Stop via NonAgentDrainErr.
@@ -451,15 +455,9 @@ func (r *Runtime) BeginShutdown(reason string) {
 		return
 	}
 	_ = r.admission.BeginShutdown(reason)
-	// Close agent spawn admission and confirmed-drain live handles — agents and
-	// tracked Supervisor-owned non-agents (#576/#577).
-	if r.activeExecutions != nil {
-		if err := r.activeExecutions.BeginShutdown(reason); err != nil {
-			r.mu.Lock()
-			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
-			r.mu.Unlock()
-		}
-	}
+	// Cancel work-producing owners before waiting on tracked non-agent handles
+	// so shell validation / trusted-review Run paths observe cancel and enter
+	// their confirmed Kill path promptly (#590 review).
 	r.mu.Lock()
 	cancel := r.schedulerCancel
 	recoveryCancel := r.recoveryCancel
@@ -473,6 +471,16 @@ func (r *Runtime) BeginShutdown(reason string) {
 	}
 	if forwarder != nil {
 		forwarder.CancelExecute()
+	}
+	// Close agent spawn admission and confirmed-drain live handles — agents and
+	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
+	// registry; non-agent owners were canceled above.
+	if r.activeExecutions != nil {
+		if err := r.activeExecutions.BeginShutdown(reason); err != nil {
+			r.mu.Lock()
+			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
+			r.mu.Unlock()
+		}
 	}
 }
 
