@@ -272,17 +272,28 @@ func (l *spawnLease) RebindHandle(handle *processcontainment.Handle, softKill ag
 	}
 	r.mu.Lock()
 	if l.released {
+		// Keep rebindDone open across killUnowned: the refused fallback handle
+		// is never inserted into r.executions, so BeginLoopStop/BeginShutdown
+		// only wait on rebindDone (then re-drain registry handles). Closing the
+		// wait channel before confirmed drain lets stop return while TERM/grace/KILL
+		// is still in flight. Match BindHandle: signal done only after kill.
+		r.mu.Unlock()
+		err := l.killUnowned(handle, agent.ErrSpawnAdmissionClosed)
+		r.mu.Lock()
 		l.endRebindLocked()
 		r.mu.Unlock()
-		return l.killUnowned(handle, agent.ErrSpawnAdmissionClosed)
+		return err
 	}
 	closing := r.admissionClosed
 	stopping := r.stoppingLoops[l.meta.LoopID] > 0 && l.meta.LoopID != ""
 	if closing || stopping {
-		l.endRebindLocked()
 		r.mu.Unlock()
 		l.cancel(agent.ErrSpawnStoppedDuringBind)
-		return l.killUnowned(handle, agent.ErrSpawnStoppedDuringBind)
+		err := l.killUnowned(handle, agent.ErrSpawnStoppedDuringBind)
+		r.mu.Lock()
+		l.endRebindLocked()
+		r.mu.Unlock()
+		return err
 	}
 	key := activeExecutionKey(l.meta.LoopID, l.meta.RunID, l.meta.ExecutionID)
 	entry, ok := r.executions[key]
@@ -589,14 +600,22 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 
 // ClearLoopStop reopens spawn admission for a loop after intentional re-activation
 // (API unpause, retry, or handback). Not for scheduler claim dispatch.
-func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) {
+//
+// Returns whether a stop gate was active under the same lock that clears it.
+// Callers that restore on abort must use this return value instead of a separate
+// LoopStopActive check: a concurrent BeginLoopStop between those two calls would
+// leave gateWasActive=false while this delete still removes the new gate, and a
+// failed start/retry/reuse TX would skip RestoreLoopStop.
+func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) {
 	if r == nil || loopID == "" {
-		return
+		return false
 	}
 	r.mu.Lock()
+	wasActive = r.stoppingLoops[loopID] > 0
 	delete(r.stoppingLoops, loopID)
 	r.clearStopDrainedForLoopLocked(loopID)
 	r.mu.Unlock()
+	return wasActive
 }
 
 // RestoreLoopStop re-closes spawn admission after a failed intentional

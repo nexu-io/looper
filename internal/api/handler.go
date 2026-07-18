@@ -4473,8 +4473,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr == nil && ok {
 				reuseStopGateLoopID = existingLoop.ID
 				if services.ActiveExecutions != nil {
-					reuseGateWasActive = services.ActiveExecutions.LoopStopActive(existingLoop.ID)
-					services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
+					// Clear and sample under one lock so a concurrent BeginLoopStop
+					// cannot insert a gate that we delete without recording for restore.
+					reuseGateWasActive = services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
 				}
 			}
 		}
@@ -4504,13 +4505,12 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 					if reuseStopGateLoopID == "" {
 						reuseStopGateLoopID = existingLoop.ID
 					}
-					// Re-sample before this clear: looper stop may have established
-					// the gate after the pre-TX clear saw it inactive. Without
-					// re-sample, TX abort restore would skip (flag still false).
-					if services.ActiveExecutions.LoopStopActive(existingLoop.ID) {
+					// Clear+report under one lock: looper stop may establish the gate
+					// after the pre-TX clear saw it inactive. Without this return
+					// value, TX abort restore would skip (flag still false).
+					if services.ActiveExecutions.ClearLoopStop(existingLoop.ID) {
 						reuseGateWasActive = true
 					}
-					services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
 				}
 				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
 				if resumeErr != nil {
@@ -5336,8 +5336,9 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	// AgentExecutor.Start with ErrSpawnLoopStopping. Restore on TX failure like retryLoop.
 	gateWasActive := false
 	if status == domain.LoopStatusRunning && services.ActiveExecutions != nil {
-		gateWasActive = services.ActiveExecutions.LoopStopActive(loopID)
-		services.ActiveExecutions.ClearLoopStop(loopID)
+		// Clear and report under one lock so abort restore covers any gate this
+		// call removed (including one set by concurrent BeginLoopStop).
+		gateWasActive = services.ActiveExecutions.ClearLoopStop(loopID)
 	}
 	restoreStopGate := func() error {
 		if gateWasActive && services.ActiveExecutions != nil {
@@ -6038,8 +6039,9 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	// a failed retry cannot reopen AdmitSpawn for stale pre-stop runners.
 	gateWasActive := false
 	if services.ActiveExecutions != nil {
-		gateWasActive = services.ActiveExecutions.LoopStopActive(loopID)
-		services.ActiveExecutions.ClearLoopStop(loopID)
+		// Clear and report under one lock so abort restore covers any gate this
+		// call removed (including one set by concurrent BeginLoopStop).
+		gateWasActive = services.ActiveExecutions.ClearLoopStop(loopID)
 	}
 	restoreStopGate := func() error {
 		if gateWasActive && services.ActiveExecutions != nil {

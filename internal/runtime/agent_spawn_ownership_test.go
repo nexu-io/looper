@@ -94,12 +94,41 @@ func TestBeginLoopStopStickyWithoutReleaseBlocksLateAdmitSpawn(t *testing.T) {
 		t.Fatalf("AdmitSpawn after sticky stop error = %v, want ErrSpawnLoopStopping", err)
 	}
 	// Intentional re-activation reopens admission.
-	reg.ClearLoopStop("loop-1")
+	if was := reg.ClearLoopStop("loop-1"); !was {
+		t.Fatal("ClearLoopStop wasActive = false, want true for sticky gate")
+	}
 	if reg.LoopStopActive("loop-1") {
 		t.Fatal("LoopStopActive = true after ClearLoopStop")
 	}
 	if _, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "loop-1", RunID: "run-resume", ExecutionID: "exec-resume"}); err != nil {
 		t.Fatalf("AdmitSpawn after ClearLoopStop error = %v, want success", err)
+	}
+}
+
+// ClearLoopStop must report the gate state it removed under the same lock so
+// abort restore cannot miss a concurrent BeginLoopStop that raced a prior
+// LoopStopActive sample.
+func TestClearLoopStopReportsGateItRemoved(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	if was := reg.ClearLoopStop("loop-clear-report"); was {
+		t.Fatal("ClearLoopStop on inactive gate wasActive = true, want false")
+	}
+	if _, err := reg.BeginLoopStop("loop-clear-report", "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
+	if !reg.LoopStopActive("loop-clear-report") {
+		t.Fatal("LoopStopActive = false after BeginLoopStop")
+	}
+	if was := reg.ClearLoopStop("loop-clear-report"); !was {
+		t.Fatal("ClearLoopStop wasActive = false after BeginLoopStop, want true")
+	}
+	if reg.LoopStopActive("loop-clear-report") {
+		t.Fatal("LoopStopActive = true after ClearLoopStop, want open")
+	}
+	// Second clear of an already-open gate reports false.
+	if was := reg.ClearLoopStop("loop-clear-report"); was {
+		t.Fatal("ClearLoopStop second call wasActive = true, want false")
 	}
 }
 
@@ -115,7 +144,9 @@ func TestRestoreLoopStopDrainsLeasesAdmittedDuringClear(t *testing.T) {
 	}
 	// Intentional reactivation opens the gate before the TX; a stale runner can
 	// AdmitSpawn+BindHandle in this window if the TX later aborts.
-	reg.ClearLoopStop("loop-restore")
+	if was := reg.ClearLoopStop("loop-restore"); !was {
+		t.Fatal("ClearLoopStop wasActive = false before restore window, want true")
+	}
 
 	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
 		LoopID: "loop-restore", RunID: "run-stale", ExecutionID: "exec-stale",
@@ -715,6 +746,8 @@ func TestBeginLoopStopWaitsForPendingSpawn(t *testing.T) {
 
 // BeginLoopStop must wait for an in-flight BeginRebind window so stop cannot
 // return while fallback has started a process not yet refused/killed by RebindHandle.
+// The refuse path must keep rebindDone open until killUnowned confirms the
+// fallback handle is dead (it is never inserted into the registry).
 func TestBeginLoopStopWaitsForInFlightRebind(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
@@ -753,14 +786,16 @@ func TestBeginLoopStopWaitsForInFlightRebind(t *testing.T) {
 		t.Fatalf("BeginRebind: %v", err)
 	}
 
-	// Fallback process started while rebind is admitted; not yet in registry.
-	cmd2 := exec.Command("sleep", "60")
+	// Fallback ignores SIGTERM so Kill spends grace before SIGKILL — widens the
+	// window where a premature rebindDone close would let stop return early.
+	cmd2 := exec.Command("sh", "-c", "trap '' TERM; sleep 60")
 	processcontainment.Configure(cmd2)
 	if err := cmd2.Start(); err != nil {
 		t.Fatalf("cmd2.Start: %v", err)
 	}
+	const rebindGrace = 200 * time.Millisecond
 	handle2, err := processcontainment.Bind(cmd2, processcontainment.Options{
-		GracePeriod:  50 * time.Millisecond,
+		GracePeriod:  rebindGrace,
 		DrainTimeout: 3 * time.Second,
 	})
 	if err != nil {
@@ -782,24 +817,50 @@ func TestBeginLoopStopWaitsForInFlightRebind(t *testing.T) {
 	default:
 	}
 
-	rebindErr := sl.RebindHandle(handle2, func(string) error { return nil })
-	if !errors.Is(rebindErr, agent.ErrSpawnStoppedDuringBind) {
-		t.Fatalf("RebindHandle = %v, want ErrSpawnStoppedDuringBind", rebindErr)
-	}
-	if !handle2.ConfirmedDead() {
-		t.Fatal("fallback handle not confirmed-dead after refused RebindHandle")
-	}
+	rebindDone := make(chan error, 1)
+	go func() {
+		rebindDone <- sl.RebindHandle(handle2, func(string) error { return nil })
+	}()
 
+	// While refuse-kill is still in its TERM/grace window, stop must not return
+	// with the fallback handle still live (rebindDone closed too early).
 	select {
 	case err := <-stopDone:
-		if err != nil {
-			t.Fatalf("BeginLoopStop error = %v", err)
+		if !handle2.ConfirmedDead() {
+			t.Fatalf("BeginLoopStop returned while refused fallback still alive: %v", err)
+		}
+		// Stop finished only after confirmed drain; still collect rebind result.
+		select {
+		case rebindErr := <-rebindDone:
+			if !errors.Is(rebindErr, agent.ErrSpawnStoppedDuringBind) {
+				t.Fatalf("RebindHandle = %v, want ErrSpawnStoppedDuringBind", rebindErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("RebindHandle did not return after BeginLoopStop")
+		}
+	case rebindErr := <-rebindDone:
+		if !errors.Is(rebindErr, agent.ErrSpawnStoppedDuringBind) {
+			t.Fatalf("RebindHandle = %v, want ErrSpawnStoppedDuringBind", rebindErr)
+		}
+		if !handle2.ConfirmedDead() {
+			t.Fatal("fallback handle not confirmed-dead after refused RebindHandle")
+		}
+		select {
+		case err := <-stopDone:
+			if err != nil {
+				t.Fatalf("BeginLoopStop error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("BeginLoopStop did not return after rebind window ended")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("BeginLoopStop did not return after rebind window ended")
+		t.Fatal("timed out waiting for RebindHandle / BeginLoopStop")
 	}
 	if !handle1.ConfirmedDead() {
 		t.Fatal("original handle not drained by BeginLoopStop")
+	}
+	if !handle2.ConfirmedDead() {
+		t.Fatal("fallback handle not confirmed-dead after stop/rebind")
 	}
 }
 
