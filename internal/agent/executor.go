@@ -100,6 +100,13 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// ParamsOwnerVendor, when set, marks Config.Params as global agent.params
+	// owned by that vendor (typically agent.vendor). effectiveConfig then filters
+	// command/args against the effective identity (role or sticky snapshot) so
+	// cross-vendor roles strip wrappers while snapshot retries that restore the
+	// owner vendor keep them. When nil, Params are treated as already bound to
+	// Config.Vendor (tests and callers that pre-filter).
+	ParamsOwnerVendor *config.AgentVendor
 	// Owner, when set, admits every agent spawn under the Execution Supervisor
 	// before cmd.Start and binds the process containment handle before Start
 	// returns (ADR-0015 / #576). Daemon producers must wire Owner; unit tests
@@ -141,7 +148,9 @@ type RunInput struct {
 	// executor's configured vendor/model for this start only (spawn, native
 	// resume vendor checks, and persisted execution vendor). Env and
 	// NativeResumeEnabled still come from the executor config. Identity-bearing
-	// params (command, model flags in args) are stripped so frozen identity wins.
+	// params are filtered against the frozen vendor: wrappers are kept when the
+	// snapshot matches the params owner (or pre-bound base vendor), and model
+	// flags in args are stripped so SnapshotModel wins.
 	UseSnapshot    bool
 	SnapshotVendor string
 	// SnapshotModel is used only when UseSnapshot is true. nil means no model
@@ -185,12 +194,13 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
-	config     ExecutorConfig
-	repos      *storage.Repositories
-	logDir     string
-	now        func() time.Time
-	owner      SpawnOwner
-	onProgress func(context.Context, ProgressUpdate)
+	config      ExecutorConfig
+	paramsOwner *config.AgentVendor
+	repos       *storage.Repositories
+	logDir      string
+	now         func() time.Time
+	owner       SpawnOwner
+	onProgress  func(context.Context, ProgressUpdate)
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -198,7 +208,15 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	if now == nil {
 		now = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, owner: options.Owner, onProgress: options.OnProgress}
+	return &ConfiguredExecutor{
+		config:      options.Config,
+		paramsOwner: options.ParamsOwnerVendor,
+		repos:       options.Repos,
+		logDir:      options.LogDir,
+		now:         now,
+		owner:       options.Owner,
+		onProgress:  options.OnProgress,
+	}
 }
 
 // liveProgressInterval throttles OnProgress so a chatty agent doesn't hammer the
@@ -220,32 +238,49 @@ type nativeResumeInfo struct {
 // snapshot identity overrides when UseSnapshot is set.
 func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 	cfg := e.config
+	baseVendor := cfg.Vendor
+
+	if input.UseSnapshot {
+		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
+			cfg.Vendor = config.AgentVendor(vendor)
+			cfg.Model = input.SnapshotModel
+		}
+	}
+
+	// When Params are global agent.params owned by paramsOwner, filter against
+	// the effective identity (role vendor or sticky snapshot). Construction must
+	// not pre-strip against the live role alone: a failed Codex run that still
+	// owns params.command would otherwise lose its wrapper after the role is
+	// hot-switched and sticky retry restores the snapshot vendor.
+	if e.paramsOwner != nil {
+		cfg.Params = ParamsForRoleVendor(e.config.Params, e.paramsOwner, cfg.Vendor, cfg.Model)
+		return cfg
+	}
+
 	if !input.UseSnapshot {
 		return cfg
 	}
-	if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
-		baseVendor := cfg.Vendor
-		cfg.Vendor = config.AgentVendor(vendor)
-		cfg.Model = input.SnapshotModel
-		// Model flags in params.args can defeat frozen model — always strip under snapshot.
-		// params.command/args are vendor-owned: keep wrappers when snapshot vendor matches
-		// the handler executor vendor; drop command+args when identity diverges (sticky
-		// resume after a role vendor change would otherwise launch the wrong binary/shape).
+	if strings.TrimSpace(input.SnapshotVendor) != "" {
+		// Pre-bound params (no paramsOwner): keep wrappers only when snapshot
+		// vendor matches the executor base vendor; drop command+args when
+		// identity diverges so a foreign params.command cannot launch the wrong
+		// binary. Model flags are stripped so SnapshotModel wins.
 		stripVendorOwned := cfg.Vendor != baseVendor
-		cfg.Params = cloneParamsForSnapshot(cfg.Params, stripVendorOwned)
+		cfg.Params = cloneParamsForSnapshot(e.config.Params, stripVendorOwned)
 	}
 	return cfg
 }
 
-// ParamsForRoleVendor returns executor params for a coding-role vendor.
-// Global agent.params are owned by agent.vendor. When a role resolves to a
-// different vendor (or global vendor is unset while the role still resolves),
-// command and args are dropped so vendor-specific wrappers/flags cannot launch
-// the wrong binary or inject foreign CLI shape. Same-vendor roles keep command
-// and args; model flags in args are stripped only when roleModel is set so
-// roles.*.agent.model / profile / global agent.model can win via prependModelFlag.
-// When no resolved model is present, params.args --model/-m are preserved so
-// existing params-only model configs do not silently fall back to vendor defaults.
+// ParamsForRoleVendor returns executor params for an effective coding-role vendor.
+// Global agent.params are owned by agent.vendor. When the effective vendor
+// (resolved role or sticky snapshot) differs from that owner — or the owner is
+// unset while a role still resolves — command and args are dropped so
+// vendor-specific wrappers/flags cannot launch the wrong binary or inject
+// foreign CLI shape. Same-vendor identity keeps command and args; model flags
+// in args are stripped only when roleModel is set so roles.*.agent.model /
+// profile / global agent.model can win via prependModelFlag. When no resolved
+// model is present, params.args --model/-m are preserved so existing
+// params-only model configs do not silently fall back to vendor defaults.
 func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor, roleModel *string) map[string]any {
 	if params == nil {
 		return nil

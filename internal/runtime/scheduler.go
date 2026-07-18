@@ -3142,22 +3142,24 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	}
 	newRoleAgentExecutor := func(resolved config.ResolvedAgent) *agent.ConfiguredExecutor {
 		// agent.params (especially command/args) belong to the global agent
-		// vendor. Role executors that resolve to a different vendor must not
-		// inherit that command map — resolveCommand prefers params.command
-		// over vendor defaults, which would launch the wrong binary at startup
-		// (hot-reload only guards later vendor switches).
+		// vendor. Keep the unstripped map and the owner vendor on the executor
+		// so effectiveConfig can filter against the effective identity: live
+		// role claims strip cross-vendor wrappers, while sticky snapshot
+		// retries that restore the owner vendor keep command/args (resolveCommand
+		// prefers params.command over vendor defaults).
 		return agent.New(agent.ExecutorOptions{
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
-				Params:              agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, resolved.Vendor, resolved.Model),
+				Params:              cfg.Agent.Params,
 				Env:                 cfg.Agent.Env,
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 				LiveToolEvents:      liveToolEvents,
 			},
-			Repos:  repos,
-			LogDir: cfg.Daemon.LogDir,
-			Now:    now,
+			ParamsOwnerVendor: cfg.Agent.Vendor,
+			Repos:             repos,
+			LogDir:            cfg.Daemon.LogDir,
+			Now:               now,
 			// Common executor boundary ownership for every in-scope agent role
 			// (planner/reviewer/fixer/worker/coordinator) — not post-spawn adapters (#576).
 			Owner:      activeExecutions,

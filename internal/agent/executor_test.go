@@ -299,6 +299,89 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 	}
 }
 
+func TestEffectiveConfigKeepsGlobalParamsWhenSnapshotMatchesOwner(t *testing.T) {
+	t.Parallel()
+
+	// Global Codex owns params.command; the live role handler is Claude after a
+	// hot switch. Sticky retry still restores Codex from agent_snapshot_json.
+	global := config.AgentVendorCodex
+	roleModel := "role-claude-model"
+	snapshotModel := "frozen-codex-model"
+	params := map[string]any{
+		"command": "/opt/codex-wrapper",
+		"args":    []any{"exec", "--model", "params-model", "--sandbox", "workspace-write"},
+		"keep":    "yes",
+	}
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{
+			Vendor: config.AgentVendorClaudeCode,
+			Model:  &roleModel,
+			Params: params,
+		},
+		ParamsOwnerVendor: &global,
+	})
+
+	// Live role claim (no snapshot): strip Codex wrappers so Claude launches.
+	got := executor.effectiveConfig(RunInput{})
+	if _, ok := got.Params["command"]; ok {
+		t.Fatalf("live diverged role still has command: %#v", got.Params)
+	}
+	if _, ok := got.Params["args"]; ok {
+		t.Fatalf("live diverged role still has args: %#v", got.Params)
+	}
+	if got.Params["keep"] != "yes" {
+		t.Fatalf("live diverged role dropped non-identity param: %#v", got.Params)
+	}
+	if cmd := resolveCommand(got); cmd != "claude" {
+		t.Fatalf("resolveCommand(live role) = %q, want claude", cmd)
+	}
+
+	// Sticky snapshot restores Codex (params owner): keep wrapper + non-model args.
+	got = executor.effectiveConfig(RunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorCodex),
+		SnapshotModel:  &snapshotModel,
+	})
+	if got.Params["command"] != "/opt/codex-wrapper" {
+		t.Fatalf("snapshot matching owner lost command: %#v", got.Params)
+	}
+	if cmd := resolveCommand(got); cmd != "/opt/codex-wrapper" {
+		t.Fatalf("resolveCommand(snapshot owner) = %q, want /opt/codex-wrapper", cmd)
+	}
+	command, args := ResolveSpawn(got, "/tmp/wt", "hello")
+	if command != "/opt/codex-wrapper" {
+		t.Fatalf("command(snapshot owner) = %q, want /opt/codex-wrapper", command)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "params-model") || strings.Contains(joined, "--model params-model") {
+		t.Fatalf("args(snapshot owner) = %q, want params model flags stripped", joined)
+	}
+	if !strings.Contains(joined, "frozen-codex-model") {
+		t.Fatalf("args(snapshot owner) = %q, want frozen snapshot model", joined)
+	}
+	if !strings.Contains(joined, "exec") || !strings.Contains(joined, "--sandbox") {
+		t.Fatalf("args(snapshot owner) = %q, want non-model args preserved", joined)
+	}
+
+	// Snapshot to a third vendor still strips owner wrappers.
+	got = executor.effectiveConfig(RunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorOpenCode),
+		SnapshotModel:  &snapshotModel,
+	})
+	if _, ok := got.Params["command"]; ok {
+		t.Fatalf("third-vendor snapshot still has command: %#v", got.Params)
+	}
+	if cmd := resolveCommand(got); cmd != "opencode" {
+		t.Fatalf("resolveCommand(third-vendor snapshot) = %q, want opencode", cmd)
+	}
+
+	// Shared global params map must not be mutated.
+	if params["command"] != "/opt/codex-wrapper" {
+		t.Fatal("effectiveConfig mutated shared global params.command")
+	}
+}
+
 func TestStripModelFlags(t *testing.T) {
 	t.Parallel()
 
