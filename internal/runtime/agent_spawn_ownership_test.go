@@ -66,9 +66,12 @@ func TestAdmitSpawnRefusesWhenAdmissionClosed(t *testing.T) {
 func TestAdmitSpawnRefusesWhenLoopStopping(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
-	release := reg.BeginLoopStop("loop-1", "stop")
+	release, err := reg.BeginLoopStop("loop-1", "stop")
+	if err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
 	defer release()
-	_, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "loop-1", RunID: "run-1", ExecutionID: "exec-1"})
+	_, err = reg.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "loop-1", RunID: "run-1", ExecutionID: "exec-1"})
 	if !errors.Is(err, agent.ErrSpawnLoopStopping) {
 		t.Fatalf("AdmitSpawn error = %v, want ErrSpawnLoopStopping", err)
 	}
@@ -80,7 +83,9 @@ func TestBeginLoopStopStickyWithoutReleaseBlocksLateAdmitSpawn(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
 	// Simulate haltLoop: BeginLoopStop without invoking release.
-	_ = reg.BeginLoopStop("loop-1", "looper stop")
+	if _, err := reg.BeginLoopStop("loop-1", "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
 	if !reg.LoopStopActive("loop-1") {
 		t.Fatal("LoopStopActive = false after BeginLoopStop without release")
 	}
@@ -126,7 +131,10 @@ func TestStopVsBindKillsAndConfirmedDrainsBeforeStartSuccess(t *testing.T) {
 	}
 
 	// Race: close loop admission before BindHandle returns.
-	release := reg.BeginLoopStop("loop-1", "halt")
+	release, stopErr := reg.BeginLoopStop("loop-1", "halt")
+	if stopErr != nil {
+		t.Fatalf("BeginLoopStop: %v", stopErr)
+	}
 	defer release()
 
 	err = lease.BindHandle(handle, func(string) error { return nil })
@@ -240,7 +248,9 @@ func TestNativeResumeFallbackCancelledDoesNotSpawnSecondProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AdmitSpawn: %v", err)
 	}
-	reg.BeginLoopStop("loop-fb", "halt")
+	if _, err := reg.BeginLoopStop("loop-fb", "halt"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
 	// Wait until lease context is cancelled.
 	select {
 	case <-lease.Context().Done():
@@ -315,7 +325,10 @@ func TestBeginLoopStopCancelsBoundActiveLease(t *testing.T) {
 		t.Fatalf("lease already cancelled before stop: %v", lease.Context().Err())
 	}
 
-	release := reg.BeginLoopStop("loop-bound", "halt")
+	release, stopErr := reg.BeginLoopStop("loop-bound", "halt")
+	if stopErr != nil {
+		t.Fatalf("BeginLoopStop: %v", stopErr)
+	}
 	defer release()
 
 	select {
@@ -365,11 +378,64 @@ func TestBeginLoopStopDrainsBoundHandleWithoutKillByID(t *testing.T) {
 	}
 
 	// Simulate haltLoop with no durable execution: only BeginLoopStop, no Kill(id).
-	release := reg.BeginLoopStop("loop-pre-persist", "looper stop")
+	release, stopErr := reg.BeginLoopStop("loop-pre-persist", "looper stop")
+	if stopErr != nil {
+		t.Fatalf("BeginLoopStop: %v", stopErr)
+	}
 	defer release()
 
 	if !handle.ConfirmedDead() {
 		t.Fatal("BeginLoopStop did not confirmed-drain handle without Kill-by-id")
+	}
+}
+
+// Drain failures from killOwned must surface so haltLoop cannot report stop
+// success while a BindHandle→persistStatus process is unconfirmed/live.
+func TestBeginLoopStopPropagatesDrainFailure(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
+
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-drain-fail", RunID: "run-df", ExecutionID: "exec-df",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind: %v", err)
+	}
+	softFail := errors.New("soft kill failed")
+	if err := lease.BindHandle(handle, func(string) error { return softFail }); err != nil {
+		t.Fatalf("BindHandle: %v", err)
+	}
+
+	release, stopErr := reg.BeginLoopStop("loop-drain-fail", "looper stop")
+	if release != nil {
+		defer release()
+	}
+	if stopErr == nil {
+		t.Fatal("BeginLoopStop error = nil, want soft-kill drain failure propagated")
+	}
+	if !errors.Is(stopErr, softFail) {
+		t.Fatalf("BeginLoopStop error = %v, want softFail", stopErr)
+	}
+	// Handle drain still runs; soft failure alone must not hide gate/open release.
+	if !handle.ConfirmedDead() {
+		t.Fatal("handle not confirmed-dead after BeginLoopStop despite soft-kill error")
+	}
+	if !reg.LoopStopActive("loop-drain-fail") {
+		t.Fatal("LoopStopActive = false after drain-failure BeginLoopStop, want gate closed")
 	}
 }
 
@@ -431,7 +497,7 @@ func TestConcurrentStopAndSpawnLinearized(t *testing.T) {
 
 	// Concurrently stop the loop mid-spawn.
 	time.Sleep(5 * time.Millisecond)
-	release := reg.BeginLoopStop("loop-race", "halt")
+	release, _ := reg.BeginLoopStop("loop-race", "halt")
 	// Kill anything that made it into the registry.
 	for i := 0; i < n; i++ {
 		_, _ = reg.Kill("loop-race", "run-race", "exec-race-"+itoa(i), "halt")

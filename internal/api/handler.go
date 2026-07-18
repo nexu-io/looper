@@ -4549,6 +4549,14 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		}
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
+	// Issue-worker reuse reactivates paused/idle workers as queued without going
+	// through mutateLoopStatus(running). Clear sticky stop gate closed by
+	// haltLoop so AdmitSpawn succeeds after looper stop + recreate same issue.
+	if reusedWorkerLoop && record.Status == string(domain.LoopStatusQueued) {
+		if services := h.context.Runtime.Services(); services.ActiveExecutions != nil {
+			services.ActiveExecutions.ClearLoopStop(record.ID)
+		}
+	}
 	if h.context.TriggerSchedulerTick != nil {
 		if !reusedWorkerLoop || record.Status == string(domain.LoopStatusQueued) {
 			h.context.TriggerSchedulerTick()

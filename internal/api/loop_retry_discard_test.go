@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/domain"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
@@ -761,6 +762,67 @@ func TestHandlerLoopRetryDiscardAllowsCompletedSiblingPRLoop(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); !os.IsNotExist(err) {
 		t.Fatalf("dirty.txt still present after discard with completed sibling: %v", err)
+	}
+}
+
+// TestHandlerWorkersCreateReuseClearsStickyStopGate ensures issue-worker reuse
+// (paused → queued) reopens the sticky stop spawn gate closed by looper stop.
+// Without this, recreate-same-issue claims the queue then AgentExecutor.Start
+// fails with ErrSpawnLoopStopping forever.
+func TestHandlerWorkersCreateReuseClearsStickyStopGate(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	baseBranch := "main"
+	metadata := `{"repo":"acme/looper"}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_worker_reuse_stop_gate", Name: "Looper", RepoPath: "/tmp/repos/looper",
+		BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	loopID := "loop_worker_reuse_stop_gate"
+	targetID := "issue:acme/looper:99"
+	repo := "acme/looper"
+	workerMeta := `{"worker":{"title":"Stopped issue worker","repo":"acme/looper","baseBranch":"main","issueNumber":99}}`
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 3125, ProjectID: "project_worker_reuse_stop_gate", Type: "worker",
+		TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "paused",
+		MetadataJSON: &workerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	if services.ActiveExecutions == nil {
+		t.Fatal("ActiveExecutions is nil")
+	}
+	// Simulate sticky gate left by successful looper stop (pause without release).
+	if _, err := services.ActiveExecutions.BeginLoopStop(loopID, "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
+	if !services.ActiveExecutions.LoopStopActive(loopID) {
+		t.Fatal("LoopStopActive = false before reuse, want sticky closed")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", strings.NewReader(
+		`{"projectId":"project_worker_reuse_stop_gate","repo":"acme/looper","issueNumber":99,"baseBranch":"main"}`,
+	))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("worker reuse status = %d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if services.ActiveExecutions.LoopStopActive(loopID) {
+		t.Fatal("LoopStopActive = true after issue-worker reuse, want ClearLoopStop for queued reactivation")
+	}
+	if _, err := services.ActiveExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: loopID, RunID: "run_reuse", ExecutionID: "exec_reuse",
+	}); err != nil {
+		t.Fatalf("AdmitSpawn after worker reuse error = %v, want success", err)
 	}
 }
 

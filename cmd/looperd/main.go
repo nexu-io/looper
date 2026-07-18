@@ -488,14 +488,22 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	// so the still-running loop can AdmitSpawn again. Non-terminal already
 	// paused durably, so the gate stays sticky even when later steps fail.
 	var releaseLoopStop func()
+	var loopStopDrainErr error
 	beginLoopStop := func() {
 		if releaseLoopStop != nil || services.ActiveExecutions == nil {
 			return
 		}
-		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+		var err error
+		releaseLoopStop, err = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+		if err != nil {
+			loopStopDrainErr = err
+		}
 	}
 	if !terminal {
 		beginLoopStop()
+		if loopStopDrainErr != nil {
+			return nil, loopStopDrainErr
+		}
 	}
 	keepStopGateSticky := !terminal
 	defer func() {
@@ -507,6 +515,9 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		// Ensure admission is closed before durable terminate (terminal) so the
 		// sticky gate applies even when there was no process to kill.
 		beginLoopStop()
+		if loopStopDrainErr != nil {
+			return nil, loopStopDrainErr
+		}
 		out, err := complete()
 		if err == nil {
 			keepStopGateSticky = true
@@ -558,6 +569,9 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 	// Past abortable preflight: close admission and drain leases before kill.
 	beginLoopStop()
+	if loopStopDrainErr != nil {
+		return nil, loopStopDrainErr
+	}
 	if services.ActiveExecutions != nil {
 		killed, err := services.ActiveExecutions.Kill(result.LoopID, latestRun.ID, latestExecution.ID, reason)
 		if err != nil {
@@ -1060,8 +1074,11 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 		// release leaves that sticky gate in place. When stopAll falls back
 		// here after a Pause failure, releasing reopens AdmitSpawn for the
 		// still-running loop (ClearLoopStop would never run otherwise).
-		releaseLoopStop := services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
+		releaseLoopStop, drainErr := services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
 		defer releaseLoopStop()
+		if drainErr != nil {
+			return result, drainErr
+		}
 		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
 			return result, err

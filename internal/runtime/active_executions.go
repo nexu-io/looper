@@ -323,6 +323,11 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 // registry owns a live process but haltLoop may not yet see a durable
 // AgentExecutionRecord to Kill by ID.
 //
+// Drain failures from processcontainment.Handle.Kill are returned so stop/close
+// cannot report success when a just-bound agent is only unconfirmed or still
+// live. The release func is still returned on drain failure: the gate was
+// opened and callers manage sticky vs temporary windows as before.
+//
 // After a durable stop (pause/terminate), callers must keep the gate closed:
 // do not invoke the returned release. In-flight runners that claimed work
 // before stop may still reach AgentExecutor.Start after halt returns; reopening
@@ -335,9 +340,9 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 // invoke the returned release so a still-running loop can AdmitSpawn again.
 //
 // The returned release is also used in tests and temporary windows.
-func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
+func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release func(), err error) {
 	if r == nil {
-		return func() {}
+		return func() {}, nil
 	}
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
@@ -371,9 +376,14 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	}
 	// Confirmed-drain bound handles for this loop so stop does not return while
 	// a post-BindHandle process is only asynchronously killed via lease cancel
-	// after Start continues (BindHandle→persistStatus window).
+	// after Start continues (BindHandle→persistStatus window). Propagate kill
+	// failures: this may be the only path that confirms the process is dead
+	// when no durable AgentExecutionRecord exists yet.
+	var drainErr error
 	for _, entry := range toKill {
-		_ = r.killOwned(entry, reason)
+		if killErr := r.killOwned(entry, reason); killErr != nil {
+			drainErr = errors.Join(drainErr, killErr)
+		}
 	}
 	var once sync.Once
 	return func() {
@@ -386,7 +396,7 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 			}
 			r.mu.Unlock()
 		})
-	}
+	}, drainErr
 }
 
 // ClearLoopStop reopens spawn admission for a loop after intentional re-activation

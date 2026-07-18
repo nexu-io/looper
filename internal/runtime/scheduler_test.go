@@ -613,7 +613,9 @@ func TestRunScheduledQueueItemsDoesNotReopenStopGate(t *testing.T) {
 
 	reg := NewActiveExecutionRegistry()
 	loopID := "loop-pre-stop-claim"
-	_ = reg.BeginLoopStop(loopID, "looper stop")
+	if _, err := reg.BeginLoopStop(loopID, "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
 	workerRunner := &stubWorkerScheduler{}
 
 	err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{
