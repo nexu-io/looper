@@ -1747,6 +1747,13 @@ type reviewerAgentExecutorAdapter struct {
 	// config is used to gate trusted review-submit sockets on per-project
 	// publish mode (summary_comment must not mint a native review socket).
 	config *config.Config
+	// agentVendor/agentModel are the role-resolved reviewer identity captured
+	// when handlers are built. Trusted review proxy config materializes the
+	// run snapshot when present, otherwise these values, so review_submit's
+	// disclosure.FromConfig stamps agent=/model= from execution identity
+	// rather than the daemon's global agent.vendor.
+	agentVendor config.AgentVendor
+	agentModel  *string
 }
 type reviewerAgentExecutionAdapter struct {
 	execution agent.Execution
@@ -1906,6 +1913,38 @@ func metadataInt64(value any) (int64, bool) {
 	}
 }
 
+// reviewerTrustedReviewAgentIdentity returns vendor/model for the trusted
+// review-submit config snapshot. Run snapshot fields are authority when
+// UseSnapshot is set with a non-empty vendor; otherwise the role-resolved
+// adapter identity is used.
+func reviewerTrustedReviewAgentIdentity(input reviewer.AgentRunInput, fallbackVendor config.AgentVendor, fallbackModel *string) (config.AgentVendor, *string) {
+	if input.UseSnapshot {
+		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
+			return config.AgentVendor(vendor), input.SnapshotModel
+		}
+	}
+	return fallbackVendor, fallbackModel
+}
+
+// materializeTrustedReviewAgentIdentity copies cfg and overwrites
+// Agent.Vendor/Model so disclosure.FromConfig in the trusted review child
+// matches the reviewer execution identity.
+func materializeTrustedReviewAgentIdentity(cfg config.Config, vendor config.AgentVendor, model *string) config.Config {
+	if strings.TrimSpace(string(vendor)) != "" {
+		v := vendor
+		cfg.Agent.Vendor = &v
+	} else {
+		cfg.Agent.Vendor = nil
+	}
+	if model != nil {
+		m := *model
+		cfg.Agent.Model = &m
+	} else {
+		cfg.Agent.Model = nil
+	}
+	return cfg
+}
+
 func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
 	// Mint a per-run proxy only for review/publish phases on projects that
 	// publish native reviews, bound to the daemon-selected PR, worktree CWD,
@@ -1921,8 +1960,10 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
+		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
+		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
 		var err error
-		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, *a.config, policy)
+		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy)
 		if err != nil {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
 		}
@@ -3217,10 +3258,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: reviewerStamper, config: &cfg},
 			Git:    reviewerGitAdapter{gateway: gitGateway},
 			AgentExecutor: reviewerAgentExecutorAdapter{
-				executor:   reviewerExecutor,
-				realLooper: looperCLIPath,
-				trustedEnv: trustedReviewChildEnv(cfg),
-				config:     &cfg,
+				executor:    reviewerExecutor,
+				realLooper:  looperCLIPath,
+				trustedEnv:  trustedReviewChildEnv(cfg),
+				config:      &cfg,
+				agentVendor: resolved.Vendor,
+				agentModel:  agentModel,
 			},
 			Logger:           logger,
 			Now:              now,
