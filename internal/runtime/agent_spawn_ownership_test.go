@@ -456,6 +456,68 @@ func TestBeginLoopStopPropagatesDrainFailure(t *testing.T) {
 	}
 }
 
+// After BeginLoopStop confirmed-drains a bound handle, releaseLease may delete
+// the registry entry while handle.Kill waits. haltLoop's subsequent Kill-by-id
+// must still return killed=true so a persisted PID does not raise
+// ErrAgentLiveHandleMissing for a process stop already killed.
+func TestKillReportsDrainedAfterBeginLoopStopRelease(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
+
+	const (
+		loopID = "loop-kill-after-drain"
+		runID  = "run-kill-after-drain"
+		execID = "exec-kill-after-drain"
+	)
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: loopID, RunID: runID, ExecutionID: execID,
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := lease.BindHandle(handle, func(string) error { return nil }); err != nil {
+		t.Fatalf("BindHandle: %v", err)
+	}
+
+	release, stopErr := reg.BeginLoopStop(loopID, "looper stop")
+	if stopErr != nil {
+		t.Fatalf("BeginLoopStop: %v", stopErr)
+	}
+	defer release()
+
+	// Simulate execution.run finishing and releaseLease deleting the entry after
+	// the process dies under confirmed drain (entry may already be gone).
+	lease.Release()
+	if reg.HasLiveHandle(loopID, runID, execID) {
+		t.Fatal("HasLiveHandle = true after Release, want entry removed")
+	}
+	if !handle.ConfirmedDead() {
+		t.Fatal("handle not confirmed-dead after BeginLoopStop")
+	}
+
+	killed, killErr := reg.Kill(loopID, runID, execID, "looper stop")
+	if killErr != nil {
+		t.Fatalf("Kill after BeginLoopStop+Release error = %v", killErr)
+	}
+	if !killed {
+		t.Fatal("Kill after BeginLoopStop+Release = false, want true (carry drained result)")
+	}
+}
+
 // BeginRebind must refuse after BeginLoopStop so fallback cannot Start a second
 // process that stop already finished draining.
 func TestBeginRebindRefusesWhenLoopStopping(t *testing.T) {

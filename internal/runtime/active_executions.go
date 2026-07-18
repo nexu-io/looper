@@ -48,7 +48,14 @@ type ActiveExecutionRegistry struct {
 	// cancel these so native-resume fallback cannot re-spawn after drain.
 	active        map[uint64]*spawnLease
 	stoppingLoops map[string]int
-	nextLeaseID   uint64
+	// stopDrained records execution keys confirmed-drained by BeginLoopStop
+	// (or Kill) while a loop stop gate is active. haltLoop looks up Kill by
+	// durable id after BeginLoopStop; concurrent releaseLease can delete the
+	// live entry during handle.Kill, so Kill must still report killed=true
+	// when this stop already drained that key (avoids ErrAgentLiveHandleMissing
+	// with a PID that the stop just killed).
+	stopDrained map[string]struct{}
+	nextLeaseID uint64
 
 	admissionClosed bool
 	shutdownReason  string
@@ -70,6 +77,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 		pending:       make(map[uint64]*spawnLease),
 		active:        make(map[uint64]*spawnLease),
 		stoppingLoops: make(map[string]int),
+		stopDrained:   make(map[string]struct{}),
 	}
 }
 
@@ -418,6 +426,10 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 // registry owns a live process but haltLoop may not yet see a durable
 // AgentExecutionRecord to Kill by ID.
 //
+// Successfully drained keys are recorded in stopDrained so a subsequent
+// haltLoop Kill-by-id still returns killed=true when releaseLease removes the
+// registry entry while handle.Kill is waiting (process exit → run finish).
+//
 // Drain failures from processcontainment.Handle.Kill are returned so stop/close
 // cannot report success when a just-bound agent is only unconfirmed or still
 // live. The release func is still returned on drain failure: the gate was
@@ -493,9 +505,11 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	// when no durable AgentExecutionRecord exists yet.
 	var drainErr error
 	for _, entry := range toKill {
-		if killErr := r.killOwned(entry, reason); killErr != nil {
+		killErr := r.killOwned(entry, reason)
+		if killErr != nil {
 			drainErr = errors.Join(drainErr, killErr)
 		}
+		r.rememberStopDrain(entry, killErr)
 	}
 	// Wait for pending Start→BindHandle and rebind windows that began before we
 	// set stopping. BindHandle/RebindHandle refuse+kill once they see the gate;
@@ -523,9 +537,11 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 		}
 		r.mu.Unlock()
 		for _, entry := range second {
-			if killErr := r.killOwned(entry, reason); killErr != nil {
+			killErr := r.killOwned(entry, reason)
+			if killErr != nil {
 				drainErr = errors.Join(drainErr, killErr)
 			}
+			r.rememberStopDrain(entry, killErr)
 		}
 	}
 	var once sync.Once
@@ -534,6 +550,7 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 			r.mu.Lock()
 			if r.stoppingLoops[loopID] <= 1 {
 				delete(r.stoppingLoops, loopID)
+				r.clearStopDrainedForLoopLocked(loopID)
 			} else {
 				r.stoppingLoops[loopID]--
 			}
@@ -550,6 +567,7 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) {
 	}
 	r.mu.Lock()
 	delete(r.stoppingLoops, loopID)
+	r.clearStopDrainedForLoopLocked(loopID)
 	r.mu.Unlock()
 }
 
@@ -697,6 +715,10 @@ func (r *ActiveExecutionRegistry) Register(loopID, runID, executionID string, ex
 // Kill stops a live owned agent by containment handle (confirmed drain) when
 // bound, otherwise via softKill. Returns (false, nil) when no live ownership
 // entry exists — callers must not fall back to SQLite PID after #576.
+//
+// When BeginLoopStop already confirmed-drained this key and releaseLease removed
+// the entry during handle.Kill, returns (true, nil) so haltLoop does not treat
+// the missing entry as ErrAgentLiveHandleMissing for a process stop just killed.
 func (r *ActiveExecutionRegistry) Kill(loopID, runID, executionID, reason string) (bool, error) {
 	if r == nil {
 		return false, nil
@@ -704,11 +726,52 @@ func (r *ActiveExecutionRegistry) Kill(loopID, runID, executionID, reason string
 	key := activeExecutionKey(loopID, runID, executionID)
 	r.mu.Lock()
 	entry := r.executions[key]
-	r.mu.Unlock()
 	if entry == nil {
+		_, drained := r.stopDrained[key]
+		r.mu.Unlock()
+		if drained {
+			return true, nil
+		}
 		return false, nil
 	}
-	return true, r.killOwned(entry, reason)
+	r.mu.Unlock()
+	err := r.killOwned(entry, reason)
+	r.rememberStopDrain(entry, err)
+	return true, err
+}
+
+// rememberStopDrain records that stop already confirmed-drained this ownership
+// key so a later Kill-by-id still returns killed=true after releaseLease. Safe
+// when releaseLease concurrently deletes r.executions[key].
+func (r *ActiveExecutionRegistry) rememberStopDrain(entry *ownedExecution, killErr error) {
+	if r == nil || entry == nil {
+		return
+	}
+	// Record only when kill succeeded, or the containment handle is already dead
+	// (soft-kill error after confirmed handle drain must still count).
+	if killErr != nil && (entry.handle == nil || !entry.handle.ConfirmedDead()) {
+		return
+	}
+	key := activeExecutionKey(entry.loopID, entry.runID, entry.executionID)
+	r.mu.Lock()
+	if r.stopDrained == nil {
+		r.stopDrained = make(map[string]struct{})
+	}
+	r.stopDrained[key] = struct{}{}
+	r.mu.Unlock()
+}
+
+// clearStopDrainedForLoopLocked drops stopDrained keys for loopID. Caller holds r.mu.
+func (r *ActiveExecutionRegistry) clearStopDrainedForLoopLocked(loopID string) {
+	if r == nil || r.stopDrained == nil || loopID == "" {
+		return
+	}
+	prefix := loopID + "\x00"
+	for k := range r.stopDrained {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			delete(r.stopDrained, k)
+		}
+	}
 }
 
 // HasLiveHandle reports whether the registry holds a live entry for the key.

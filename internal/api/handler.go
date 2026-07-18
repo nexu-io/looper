@@ -4461,6 +4461,30 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	unlockWorkerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued)
 	defer unlockWorkerTarget()
 
+	// Issue-worker reuse publishes claimable queue work inside the TX. Clear the
+	// sticky stop gate before that TX so a concurrent scheduler tick cannot claim
+	// the reused worker and fail AgentExecutor.Start with ErrSpawnLoopStopping.
+	// Track for restore when the TX aborts or does not queue the reused loop.
+	reuseStopGateLoopID := ""
+	reuseGateWasActive := false
+	if issueNumber != nil && requestedIssueTarget != nil {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr == nil {
+			if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr == nil && ok {
+				reuseStopGateLoopID = existingLoop.ID
+				if services.ActiveExecutions != nil {
+					reuseGateWasActive = services.ActiveExecutions.LoopStopActive(existingLoop.ID)
+					services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
+				}
+			}
+		}
+	}
+	restoreReuseStopGate := func() {
+		if reuseGateWasActive && reuseStopGateLoopID != "" && services.ActiveExecutions != nil {
+			services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
+		}
+	}
+
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 
@@ -4473,6 +4497,15 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 				return storage.LoopRecord{}, reuseErr
 			} else if ok {
 				reusedWorkerLoop = true
+				// Ensure gate is open even when the pre-TX scan missed this loop;
+				// still before commit so the queue item is not yet claimable.
+				if services.ActiveExecutions != nil {
+					if reuseStopGateLoopID == "" {
+						reuseStopGateLoopID = existingLoop.ID
+						reuseGateWasActive = services.ActiveExecutions.LoopStopActive(existingLoop.ID)
+					}
+					services.ActiveExecutions.ClearLoopStop(existingLoop.ID)
+				}
 				resumed, resumeErr := h.resumeReusableWorkerLoopCompat(r.Context(), repos, existingLoop, existingTarget, nowISO, derefBool(body.Force))
 				if resumeErr != nil {
 					return storage.LoopRecord{}, resumeErr
@@ -4547,19 +4580,16 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return record, nil
 	})
 	if err != nil {
+		restoreReuseStopGate()
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return workerCreateResponse{}, typed
 		}
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
-	// Issue-worker reuse reactivates paused/idle workers as queued without going
-	// through mutateLoopStatus(running). Clear sticky stop gate closed by
-	// haltLoop so AdmitSpawn succeeds after looper stop + recreate same issue.
-	if reusedWorkerLoop && record.Status == string(domain.LoopStatusQueued) {
-		if services := h.context.Runtime.Services(); services.ActiveExecutions != nil {
-			services.ActiveExecutions.ClearLoopStop(record.ID)
-		}
+	// Pre-cleared for a reuse that did not become claimable queued work: restore.
+	if !reusedWorkerLoop || record.Status != string(domain.LoopStatusQueued) {
+		restoreReuseStopGate()
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		if !reusedWorkerLoop || record.Status == string(domain.LoopStatusQueued) {
@@ -5285,6 +5315,20 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 	}
 
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	// Intentional re-activation (unpause / start): clear sticky stop gate before
+	// the TX publishes claimable queue work. Clearing after commit races a
+	// concurrent scheduler tick that can claim, pass parked checks, then fail
+	// AgentExecutor.Start with ErrSpawnLoopStopping. Restore on TX failure like retryLoop.
+	gateWasActive := false
+	if status == domain.LoopStatusRunning && services.ActiveExecutions != nil {
+		gateWasActive = services.ActiveExecutions.LoopStopActive(loopID)
+		services.ActiveExecutions.ClearLoopStop(loopID)
+	}
+	restoreStopGate := func() {
+		if gateWasActive && services.ActiveExecutions != nil {
+			services.ActiveExecutions.RestoreLoopStop(loopID)
+		}
+	}
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -5407,16 +5451,12 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		return updated, nil
 	})
 	if err != nil {
+		restoreStopGate()
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return loopResponse{}, typed
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	// Intentional re-activation (unpause / start): reopen sticky stop spawn gate
-	// closed by haltLoop so the loop can AdmitSpawn again after looper stop.
-	if status == domain.LoopStatusRunning && services.ActiveExecutions != nil {
-		services.ActiveExecutions.ClearLoopStop(loopID)
 	}
 	if status == domain.LoopStatusRunning && h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
