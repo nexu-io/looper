@@ -5401,6 +5401,11 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
+	// Intentional re-activation (unpause / start): reopen sticky stop spawn gate
+	// closed by haltLoop so the loop can AdmitSpawn again after looper stop.
+	if status == domain.LoopStatusRunning && services.ActiveExecutions != nil {
+		services.ActiveExecutions.ClearLoopStop(loopID)
+	}
 	if status == domain.LoopStatusRunning && h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
@@ -6049,6 +6054,10 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, typed
 		}
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	// Retry/handback intentionally re-arms the loop after durable stop.
+	if services.ActiveExecutions != nil {
+		services.ActiveExecutions.ClearLoopStop(loopID)
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()

@@ -74,6 +74,30 @@ func TestAdmitSpawnRefusesWhenLoopStopping(t *testing.T) {
 	}
 }
 
+// Contract: durable stop must leave the per-loop gate closed after halt returns so
+// in-flight runners that reach AgentExecutor.Start late cannot AdmitSpawn.
+func TestBeginLoopStopStickyWithoutReleaseBlocksLateAdmitSpawn(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	// Simulate haltLoop: BeginLoopStop without invoking release.
+	_ = reg.BeginLoopStop("loop-1", "looper stop")
+	if !reg.LoopStopActive("loop-1") {
+		t.Fatal("LoopStopActive = false after BeginLoopStop without release")
+	}
+	_, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "loop-1", RunID: "run-late", ExecutionID: "exec-late"})
+	if !errors.Is(err, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after sticky stop error = %v, want ErrSpawnLoopStopping", err)
+	}
+	// Intentional re-activation reopens admission.
+	reg.ClearLoopStop("loop-1")
+	if reg.LoopStopActive("loop-1") {
+		t.Fatal("LoopStopActive = true after ClearLoopStop")
+	}
+	if _, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{LoopID: "loop-1", RunID: "run-resume", ExecutionID: "exec-resume"}); err != nil {
+		t.Fatalf("AdmitSpawn after ClearLoopStop error = %v, want success", err)
+	}
+}
+
 func TestStopVsBindKillsAndConfirmedDrainsBeforeStartSuccess(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()

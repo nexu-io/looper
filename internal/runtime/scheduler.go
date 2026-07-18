@@ -90,10 +90,13 @@ type defaultSchedulerTickInput struct {
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
-	AllowClaim               func() error
-	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
-	AsyncRunner              schedulerAsyncRunner
-	RequestSchedulerWake     func()
+	AllowClaim           func() error
+	ReconcileStaleRuns   func(context.Context) (StaleRunReconcileSummary, error)
+	AsyncRunner          schedulerAsyncRunner
+	RequestSchedulerWake func()
+	// ActiveExecutions is the Supervisor registry; used to ClearLoopStop when
+	// dispatching a fresh non-parked claim after durable stop.
+	ActiveExecutions         *ActiveExecutionRegistry
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
@@ -3272,6 +3275,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReconcileStaleRuns:       reconcileStaleRuns,
 			AsyncRunner:              runner,
 			RequestSchedulerWake:     requestWake,
+			ActiveExecutions:         services.ActiveExecutions,
 			Planner:                  plannerRunner,
 			Coordinator:              coordinatorRunner,
 			Reviewer:                 reviewerRunner,
@@ -3937,6 +3941,11 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 				input.Logger.Info("scheduler released claimed item for parked loop", map[string]any{"queueItemId": item.ID, "loopId": loopID})
 			}
 			continue
+		}
+
+		// Fresh non-parked claim after durable stop: reopen per-loop spawn admission.
+		if item.LoopID != nil && input.ActiveExecutions != nil {
+			input.ActiveExecutions.ClearLoopStop(*item.LoopID)
 		}
 
 		process, err := schedulerQueueProcessor(item, input)

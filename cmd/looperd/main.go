@@ -470,12 +470,14 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 
 	// Close spawn admission for this loop before kill so stop-vs-spawn races
-	// cannot return a live process after halt begins (#576).
-	releaseLoopStop := func() {}
+	// cannot return a live process after halt begins (#576). Keep the gate
+	// closed after halt returns: in-flight runners that already claimed work
+	// may still reach AgentExecutor.Start without re-reading loop status, and
+	// reopening would let AdmitSpawn start a process after looper stop.
+	// ClearLoopStop runs only on intentional re-activation.
 	if services.ActiveExecutions != nil {
-		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+		_ = services.ActiveExecutions.BeginLoopStop(loopID, reason)
 	}
-	defer releaseLoopStop()
 
 	if services.Repositories == nil || services.Repositories.Runs == nil {
 		result.ProcessSkipReason = processSkipNoRuns
@@ -1010,8 +1012,8 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 	}
 	if services.ActiveExecutions != nil && runID != "" {
 		// Close loop spawn admission so a concurrent Start cannot return unowned.
-		release := services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
-		defer release()
+		// Keep closed after return (same sticky stop gate as haltLoop).
+		_ = services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
 		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
 			return result, err

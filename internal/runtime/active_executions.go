@@ -319,7 +319,15 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 // and bound (active) leases for that loop. Bound-lease cancel is required so
 // native-resume fallback cannot re-spawn after haltLoop drains the old handle.
 // Registered live executions are Kill'd by the caller (haltLoop).
-// The returned release reopens loop admission after the durable stop transition.
+//
+// After a durable stop (pause/terminate), callers must keep the gate closed:
+// do not invoke the returned release. In-flight runners that claimed work
+// before stop may still reach AgentExecutor.Start after halt returns; reopening
+// would let AdmitSpawn succeed and start a process after looper stop. Clear the
+// gate only via ClearLoopStop when the loop is intentionally re-activated
+// (unpause/retry/handback or a fresh non-parked claim).
+//
+// The returned release is for tests and temporary windows only.
 func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	if r == nil {
 		return func() {}
@@ -357,6 +365,28 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 			r.mu.Unlock()
 		})
 	}
+}
+
+// ClearLoopStop reopens spawn admission for a loop after intentional re-activation
+// (unpause, retry, handback, or a fresh non-parked queue claim).
+func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) {
+	if r == nil || loopID == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.stoppingLoops, loopID)
+	r.mu.Unlock()
+}
+
+// LoopStopActive reports whether spawn admission is closed for loopID.
+func (r *ActiveExecutionRegistry) LoopStopActive(loopID string) bool {
+	if r == nil || loopID == "" {
+		return false
+	}
+	r.mu.Lock()
+	active := r.stoppingLoops[loopID] > 0
+	r.mu.Unlock()
+	return active
 }
 
 // BeginShutdown closes spawn admission, cancels pending and bound (active)
