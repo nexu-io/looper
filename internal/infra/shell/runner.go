@@ -92,6 +92,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	waitErr := handle.Wait(waitCtx)
 	timedOut := false
 	var canceledErr error
+	var killErr error
 
 	if waitErr != nil && isContextError(waitErr) {
 		// Prefer the parent context error when it was the cause.
@@ -103,8 +104,10 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			canceledErr = waitErr
 		}
 		// Confirmed drain is the only stop success path (#574 / #577).
+		// Propagate Kill failures (e.g. ErrNotConfirmedDead) so callers learn
+		// that process-group containment failed rather than only seeing cancel/timeout.
 		killCtx, killCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
-		_ = handle.Kill(killCtx)
+		killErr = handle.Kill(killCtx)
 		killCancel()
 	} else {
 		// Leader exited (zero or non-zero). Drain group members that outlived it.
@@ -133,9 +136,16 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 
 	if timedOut {
-		return result, &CommandExecutionError{Message: "Command timed out", Result: result}
+		timeoutErr := error(&CommandExecutionError{Message: "Command timed out", Result: result})
+		if killErr != nil {
+			return result, errors.Join(timeoutErr, killErr)
+		}
+		return result, timeoutErr
 	}
 	if canceledErr != nil {
+		if killErr != nil {
+			return result, errors.Join(canceledErr, killErr)
+		}
 		return result, canceledErr
 	}
 	if result.ExitCode != 0 {

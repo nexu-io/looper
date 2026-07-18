@@ -1,11 +1,14 @@
 package shell
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -239,12 +242,51 @@ sleep 60
 	}
 
 	// Child must not remain runnable after confirmed drain.
+	// Use zombie-aware liveness: on Linux kill(pid, 0) still succeeds for
+	// zombies, but containment treats zombie-only groups as non-runnable.
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(childPID, 0); err != nil {
+		if processIsNonRunnable(childPID) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("background child pid %d still runnable after shell cancel drain", childPID)
+}
+
+// processIsNonRunnable matches processcontainment confirmed-dead semantics:
+// ESRCH, or a Linux zombie that kill(0) still addresses.
+func processIsNonRunnable(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	if errors.Is(err, syscall.ESRCH) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	if runtime.GOOS == "linux" {
+		if zombie, ok := linuxPIDIsZombie(pid); ok {
+			return zombie
+		}
+	}
+	return false
+}
+
+// linuxPIDIsZombie reports whether /proc/pid is a zombie (state Z).
+// ok is false when the stat file cannot be read/parsed.
+func linuxPIDIsZombie(pid int) (zombie bool, ok bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return true, true
+		}
+		return false, false
+	}
+	// Format: pid (comm) state ... — state is the first field after the final ") ".
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 >= len(data) {
+		return false, false
+	}
+	state := data[i+2]
+	return state == 'Z' || state == 'X' || state == 'x', true
 }
