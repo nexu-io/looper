@@ -242,16 +242,21 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 // different vendor (or global vendor is unset while the role still resolves),
 // command and args are dropped so vendor-specific wrappers/flags cannot launch
 // the wrong binary or inject foreign CLI shape. Same-vendor roles keep command
-// and non-model args, but model flags are stripped so roles.*.agent.model /
-// profile model can win via prependModelFlag.
-func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor) map[string]any {
+// and args; model flags in args are stripped only when roleModel is set so
+// roles.*.agent.model / profile / global agent.model can win via prependModelFlag.
+// When no resolved model is present, params.args --model/-m are preserved so
+// existing params-only model configs do not silently fall back to vendor defaults.
+func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor, roleModel *string) map[string]any {
 	if params == nil {
 		return nil
 	}
 	if globalVendor != nil && *globalVendor == roleVendor {
-		// Clone + strip model flags; do not return the shared map so role model
-		// resolution cannot be defeated by global params.args --model/-m.
-		return cloneParamsForSnapshot(params, false)
+		// Clone so role resolution cannot mutate the shared global params map.
+		// Strip model flags only when a resolved model will replace them.
+		if roleModel != nil && strings.TrimSpace(*roleModel) != "" {
+			return cloneParamsForSnapshot(params, false)
+		}
+		return maps.Clone(params)
 	}
 	return cloneParamsForSnapshot(params, true)
 }

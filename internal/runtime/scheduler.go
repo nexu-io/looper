@@ -3150,7 +3150,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
-				Params:              agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, resolved.Vendor),
+				Params:              agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, resolved.Vendor, resolved.Model),
 				Env:                 cfg.Agent.Env,
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 				LiveToolEvents:      liveToolEvents,

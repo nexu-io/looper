@@ -76,21 +76,23 @@ func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
 	t.Parallel()
 
 	global := config.AgentVendorCodex
+	roleModel := "role-model"
 	params := map[string]any{
 		"command": "/opt/codex-wrapper",
 		"args":    []any{"exec", "--model", "params-model", "--sandbox", "workspace-write"},
 		"keep":    "yes",
 	}
 
-	// Same vendor: keep command wrapper and non-model args; strip model flags so
-	// role/profile model can win. Clone — do not mutate the global params map.
-	same := ParamsForRoleVendor(params, &global, config.AgentVendorCodex)
+	// Same vendor + resolved model: keep command wrapper and non-model args;
+	// strip model flags so role/profile model can win. Clone — do not mutate
+	// the global params map.
+	same := ParamsForRoleVendor(params, &global, config.AgentVendorCodex, &roleModel)
 	if same == nil || same["command"] != "/opt/codex-wrapper" {
 		t.Fatalf("same-vendor params = %#v, want original command", same)
 	}
 	sameJoined := strings.Join(stringArgs(same["args"]), " ")
 	if strings.Contains(sameJoined, "params-model") || strings.Contains(sameJoined, "--model") {
-		t.Fatalf("same-vendor args = %q, want model flags stripped", sameJoined)
+		t.Fatalf("same-vendor args = %q, want model flags stripped when role model set", sameJoined)
 	}
 	if !strings.Contains(sameJoined, "exec") || !strings.Contains(sameJoined, "--sandbox") {
 		t.Fatalf("same-vendor args = %q, want non-model args preserved", sameJoined)
@@ -105,8 +107,30 @@ func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
 		t.Fatal("ParamsForRoleVendor mutated source params.args model flags")
 	}
 
+	// Same vendor + no resolved model: preserve params.args model flags.
+	keepModel := ParamsForRoleVendor(params, &global, config.AgentVendorCodex, nil)
+	if keepModel == nil || keepModel["command"] != "/opt/codex-wrapper" {
+		t.Fatalf("no-model same-vendor params = %#v, want original command", keepModel)
+	}
+	keepJoined := strings.Join(stringArgs(keepModel["args"]), " ")
+	if !strings.Contains(keepJoined, "params-model") || !strings.Contains(keepJoined, "--model") {
+		t.Fatalf("no-model same-vendor args = %q, want params model preserved", keepJoined)
+	}
+	keepModel["probe2"] = true
+	if _, ok := params["probe2"]; ok {
+		t.Fatal("no-model same-vendor must clone params; mutated shared map")
+	}
+
+	// Empty resolved model string is treated as unset — keep params model.
+	emptyModel := ""
+	emptyKeep := ParamsForRoleVendor(params, &global, config.AgentVendorCodex, &emptyModel)
+	emptyJoined := strings.Join(stringArgs(emptyKeep["args"]), " ")
+	if !strings.Contains(emptyJoined, "params-model") {
+		t.Fatalf("empty-model same-vendor args = %q, want params model preserved", emptyJoined)
+	}
+
 	// Diverged role vendor: drop command + all args (vendor-shaped); keep other keys.
-	diverged := ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode)
+	diverged := ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode, &roleModel)
 	if _, ok := diverged["command"]; ok {
 		t.Fatalf("diverged role still has command: %#v", diverged)
 	}
@@ -122,7 +146,7 @@ func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
 	}
 
 	// No global vendor: params have no home vendor; strip vendor-owned for any role.
-	noGlobal := ParamsForRoleVendor(params, nil, config.AgentVendorClaudeCode)
+	noGlobal := ParamsForRoleVendor(params, nil, config.AgentVendorClaudeCode, nil)
 	if _, ok := noGlobal["command"]; ok {
 		t.Fatalf("nil global vendor still has command: %#v", noGlobal)
 	}
@@ -131,14 +155,14 @@ func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
 	}
 
 	// Nil params stay nil.
-	if ParamsForRoleVendor(nil, &global, config.AgentVendorClaudeCode) != nil {
+	if ParamsForRoleVendor(nil, &global, config.AgentVendorClaudeCode, nil) != nil {
 		t.Fatal("nil params should stay nil")
 	}
 
 	// Role with stripped params must resolve to the role vendor binary, not the wrapper.
 	cfg := ExecutorConfig{
 		Vendor: config.AgentVendorClaudeCode,
-		Params: ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode),
+		Params: ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode, nil),
 	}
 	if cmd := resolveCommand(cfg); cmd != "claude" {
 		t.Fatalf("resolveCommand(diverged role) = %q, want claude", cmd)
@@ -156,7 +180,7 @@ func TestParamsForRoleVendorSameVendorRoleModelWinsOverParamsModelFlag(t *testin
 	cfg := ExecutorConfig{
 		Vendor: config.AgentVendorCodex,
 		Model:  &roleModel,
-		Params: ParamsForRoleVendor(params, &global, config.AgentVendorCodex),
+		Params: ParamsForRoleVendor(params, &global, config.AgentVendorCodex, &roleModel),
 	}
 	_, args := ResolveSpawn(cfg, "/tmp/wt", "hello")
 	joined := strings.Join(args, " ")
@@ -165,6 +189,28 @@ func TestParamsForRoleVendorSameVendorRoleModelWinsOverParamsModelFlag(t *testin
 	}
 	if !strings.Contains(joined, "role-model") {
 		t.Fatalf("args = %q, want role model", joined)
+	}
+	if !strings.Contains(joined, "--sandbox") {
+		t.Fatalf("args = %q, want same-vendor non-model args preserved", joined)
+	}
+}
+
+func TestParamsForRoleVendorSameVendorPreservesParamsModelWhenNoResolvedModel(t *testing.T) {
+	t.Parallel()
+
+	global := config.AgentVendorCodex
+	params := map[string]any{
+		"args": []any{"exec", "--model", "params-model", "--sandbox", "workspace-write"},
+	}
+	cfg := ExecutorConfig{
+		Vendor: config.AgentVendorCodex,
+		Model:  nil,
+		Params: ParamsForRoleVendor(params, &global, config.AgentVendorCodex, nil),
+	}
+	_, args := ResolveSpawn(cfg, "/tmp/wt", "hello")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "params-model") {
+		t.Fatalf("args = %q, want params model preserved when no resolved model", joined)
 	}
 	if !strings.Contains(joined, "--sandbox") {
 		t.Fatalf("args = %q, want same-vendor non-model args preserved", joined)
