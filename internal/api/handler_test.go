@@ -2479,6 +2479,58 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 	})
 }
 
+func TestTakeoverLoopFiltersCrossVendorResumeParams(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	global := config.AgentVendorCodex
+	cfg.Agent.Vendor = &global
+	cfg.Agent.Params = map[string]any{
+		"command": "/opt/codex-wrapper",
+		"args":    []string{"--sandbox", "workspace-write"},
+	}
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		TakeoverLoop: func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
+			return TakeoverResult{
+				LoopID:       loopID,
+				Vendor:       string(config.AgentVendorClaudeCode),
+				SessionID:    "session_role_claude",
+				WorktreePath: "/tmp/wt-claude",
+			}, nil
+		},
+	})
+
+	resp, err := h.takeoverLoop(context.Background(), "loop_role")
+	if err != nil {
+		t.Fatalf("takeoverLoop error = %v", err)
+	}
+	if !resp.Supported {
+		t.Fatalf("supported = false, want true; message=%q", resp.Message)
+	}
+	want := "cd /tmp/wt-claude && claude --resume session_role_claude"
+	if resp.ResumeCommand != want {
+		t.Fatalf("resumeCommand = %q, want %q (global codex wrapper must not leak)", resp.ResumeCommand, want)
+	}
+
+	// Same-vendor takeover keeps the global wrapper binary.
+	h.context.TakeoverLoop = func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
+		return TakeoverResult{
+			LoopID:       loopID,
+			Vendor:       string(config.AgentVendorCodex),
+			SessionID:    "session_codex",
+			WorktreePath: "/tmp/wt-codex",
+		}, nil
+	}
+	resp, err = h.takeoverLoop(context.Background(), "loop_same")
+	if err != nil {
+		t.Fatalf("same-vendor takeoverLoop error = %v", err)
+	}
+	wantSame := "cd /tmp/wt-codex && /opt/codex-wrapper resume session_codex"
+	if !resp.Supported || resp.ResumeCommand != wantSame {
+		t.Fatalf("same-vendor resume = %q (supported=%v), want %q", resp.ResumeCommand, resp.Supported, wantSame)
+	}
+}
+
 func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 	requestArtifact := loadRequestArtifact(t)

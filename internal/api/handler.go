@@ -5553,7 +5553,11 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 		WorktreePath: result.WorktreePath,
 	}
 	vendor := config.AgentVendor(strings.TrimSpace(result.Vendor))
-	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: h.context.Config.Agent.Params}, result.WorktreePath, result.SessionID)
+	// Global agent.params (especially command/args) are owned by agent.vendor.
+	// Role runs already filter via ParamsForRoleVendor; takeover must do the same
+	// so a Claude role session is not handed a global Codex wrapper resume line.
+	params := agent.ParamsForRoleVendor(h.context.Config.Agent.Params, h.context.Config.Agent.Vendor, vendor, nil)
+	cmdLine, ok := agent.InteractiveResumeCommandLine(agent.ExecutorConfig{Vendor: vendor, Params: params}, result.WorktreePath, result.SessionID)
 	resp.Supported = ok
 	if ok {
 		resp.ResumeCommand = cmdLine

@@ -53,6 +53,37 @@ func TestInteractiveResumeCommandLine(t *testing.T) {
 	}
 }
 
+// Cross-vendor role takeover must not reuse global agent.params.command owned by
+// a different vendor (e.g. Codex wrapper handed to a Claude role session).
+func TestInteractiveResumeCommandLineFiltersCrossVendorParams(t *testing.T) {
+	sid := "019f2d12-279e-7a73-90fd-144e516028dc"
+	wt := "/Users/x/.looper/worktrees/repo-abc"
+	global := config.AgentVendorCodex
+	params := map[string]any{
+		"command": "/opt/codex-wrapper",
+		"args":    []string{"--sandbox", "workspace-write"},
+	}
+
+	// Same-vendor takeover keeps the global wrapper command.
+	same := ParamsForRoleVendor(params, &global, config.AgentVendorCodex, nil)
+	got, ok := InteractiveResumeCommandLine(ExecutorConfig{Vendor: config.AgentVendorCodex, Params: same}, wt, sid)
+	wantSame := "cd " + wt + " && /opt/codex-wrapper resume " + sid
+	if !ok || got != wantSame {
+		t.Fatalf("same-vendor resume = %q (ok=%v), want %q", got, ok, wantSame)
+	}
+
+	// Diverged role vendor strips command/args so resume uses the native binary.
+	filtered := ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode, nil)
+	got, ok = InteractiveResumeCommandLine(ExecutorConfig{Vendor: config.AgentVendorClaudeCode, Params: filtered}, wt, sid)
+	wantClaude := "cd " + wt + " && claude --resume " + sid
+	if !ok || got != wantClaude {
+		t.Fatalf("cross-vendor resume = %q (ok=%v), want %q", got, ok, wantClaude)
+	}
+	if _, hasCmd := filtered["command"]; hasCmd {
+		t.Fatalf("filtered params still contain command: %#v", filtered)
+	}
+}
+
 func TestShellSingleQuote(t *testing.T) {
 	// UUIDs and plain paths pass through untouched.
 	if got := shellSingleQuote("019f2d12-279e-7a73"); got != "019f2d12-279e-7a73" {
