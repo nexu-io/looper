@@ -327,6 +327,22 @@ describe("config form contract", () => {
     ]);
   });
 
+  it("treats empty role profile drafts as unset when sibling vendor/model remain", () => {
+    const data = fixture();
+    // Fixture worker has profile + vendor + model; clearing only profile must
+    // unset the leaf so backend does not reject "" under a kept agent object.
+    const result = buildConfigPatch(
+      data,
+      {
+        "roles.worker.agent.profile": "",
+      },
+      [],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual(["roles.worker.agent.profile"]);
+  });
+
   it("promotes dual profile leaf unsets to whole-profile removal", () => {
     const data = fixture();
     const result = buildConfigPatch(

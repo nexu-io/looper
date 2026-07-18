@@ -487,13 +487,15 @@ export function buildConfigPatch(
       errors[path] = parsed.error;
       continue;
     }
-    // Profile/role model: empty draft means inherit (omit leaf), not set "".
-    // Empty-string suppress is not staged from the text control; use an explicit
-    // future control if operators need vendor-default suppression from the UI.
+    // Profile/role identity text leaves: empty draft means inherit (omit leaf),
+    // not set "". Role .profile must unset rather than stage "" — backend
+    // validateRoleAgentBindings rejects empty profile when sibling vendor/model
+    // keeps the role agent object alive. Model empty-string suppress is not
+    // staged from the text control; use Unset or an explicit future control.
     if (
       parsed.value === "" &&
-      path.endsWith(".model") &&
-      (isAgentProfileLeafPath(path) || isRoleAgentLeafPath(path))
+      (isAgentProfileLeafPath(path) || isRoleAgentLeafPath(path)) &&
+      (path.endsWith(".model") || path.endsWith(".profile"))
     ) {
       const current = getConfigValue(data, path);
       if (current != null && current !== "") {
