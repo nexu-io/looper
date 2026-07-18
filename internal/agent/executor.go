@@ -448,29 +448,16 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 
 	// Initial ownership observation is hard: fail Start loud and do not leave
 	// an unowned live process (#578). Persist before transferring lease so the
-	// deferred Release still drains Supervisor ownership on failure.
+	// deferred Release still drains Supervisor ownership when reap confirms dead.
 	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
-		if hard := x.classifyPersistError(err); hard != nil {
-			x.reportHardPersistFailure(hard)
-			killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
-			if x.handle != nil {
-				_ = x.handle.Kill(killCtx)
-			} else {
-				_ = killStartedCmd(cmd)
-			}
-			cancel()
-			return nil, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist initial agent execution ownership: %w", hard))
+		outErr := x.reapOnOwnershipPersistFailure(cmd, grace, err, "persist initial agent execution ownership")
+		// When Kill cannot confirm death, keep the registry handle: dropping the
+		// lease here would leave a still-live agent with neither a durable row
+		// nor an owner (Start returns no Execution).
+		if x.handle != nil && !x.handle.ConfirmedDead() {
+			lease = nil
 		}
-		// Soft (cancel/conflict): still refuse Start without a durable observation
-		// when storage rejected or cancelled, but do not sticky-degrade.
-		killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
-		if x.handle != nil {
-			_ = x.handle.Kill(killCtx)
-		} else {
-			_ = killStartedCmd(cmd)
-		}
-		cancel()
-		return nil, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist initial agent execution ownership: %w", err))
+		return nil, outErr
 	}
 
 	// Transfer lease ownership to execution; defer must not Release on success.
@@ -600,6 +587,13 @@ func (x *execution) killProcessGroup() error {
 func (x *execution) releaseLease() {
 	x.mu.Lock()
 	if x.leaseReleased || x.lease == nil {
+		x.mu.Unlock()
+		return
+	}
+	// Prefer a durable registry orphan over an unowned live process: do not drop
+	// Supervisor ownership while containment may still be live (e.g. Kill timeout
+	// after failed ownership persist on native-resume fallback).
+	if x.handle != nil && !x.handle.ConfirmedDead() {
 		x.mu.Unlock()
 		return
 	}
@@ -818,7 +812,8 @@ func (x *execution) run(ctx context.Context) {
 				errorMessage = fallbackErrorMessage
 				endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 			} else if fallbackErr != nil {
-				// Fallback ownership persist failed after process reaped.
+				// Fallback ownership persist failed; process reaped only when
+				// Kill confirmed dead (releaseLease keeps ownership otherwise).
 				x.doneCh <- execOutcome{result: result, err: fallbackErr}
 				return
 			}
@@ -1030,15 +1025,10 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	}
 
 	// Ownership observation after spawn+bind: fail loud and reap if storage is broken.
+	// Join Kill failures and keep registry ownership unless ConfirmedDead so a
+	// deferred run releaseLease cannot drop the only live handle on drain timeout.
 	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
-		killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
-		_ = handle.Kill(killCtx)
-		cancel()
-		if hard := x.classifyPersistError(err); hard != nil {
-			x.reportHardPersistFailure(hard)
-			return Result{}, "", false, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist fallback agent execution ownership: %w", hard))
-		}
-		return Result{}, "", false, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist fallback agent execution ownership: %w", err))
+		return Result{}, "", false, x.reapOnOwnershipPersistFailure(cmd, grace, err, "persist fallback agent execution ownership")
 	}
 	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
@@ -1449,15 +1439,13 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	}
 	err := x.upsertAgentExecutionWithRetry(context.Background(), record)
 	// Mark terminal attempted so live writers stop; conflict after another
-	// terminal observation also counts as terminal settled.
+	// terminal observation also counts as terminal settled for mid-life writes.
 	if err == nil || errors.Is(err, storage.ErrAgentExecutionConflict) {
 		x.terminalPersisted = true
 	}
-	if errors.Is(err, storage.ErrAgentExecutionConflict) {
-		// Another writer already recorded a terminal observation — treat as
-		// durable success for this process lifetime (no silent overwrite).
-		return nil
-	}
+	// Surface terminal conflicts: a competing terminal with a different status
+	// is not durable finalize success (storage contract / #578). Callers fail
+	// loud without sticky-degrade (classifyPersistError treats conflict as soft).
 	return err
 }
 
@@ -1520,6 +1508,37 @@ func (x *execution) reportHardPersistFailure(err error) {
 	if fn != nil {
 		fn(err)
 	}
+}
+
+// reapOnOwnershipPersistFailure kills the just-started process after a failed
+// initial/fallback ownership observation, joins drain errors into the return,
+// and sticky-degrades on hard storage failure. Soft persist errors still fail
+// Start/fallback loud without degrade. Callers must keep Supervisor ownership
+// when the containment handle is not ConfirmedDead after this returns.
+func (x *execution) reapOnOwnershipPersistFailure(cmd *exec.Cmd, grace time.Duration, persistErr error, msg string) error {
+	hard := x.classifyPersistError(persistErr)
+	var base error
+	if hard != nil {
+		x.reportHardPersistFailure(hard)
+		base = errors.Join(ErrExecutionPersistence, fmt.Errorf("%s: %w", msg, hard))
+	} else {
+		base = errors.Join(ErrExecutionPersistence, fmt.Errorf("%s: %w", msg, persistErr))
+	}
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+	defer cancel()
+	var killErr error
+	if x.handle != nil {
+		killErr = x.handle.Kill(killCtx)
+	} else if cmd != nil {
+		killErr = killStartedCmd(cmd)
+	}
+	if killErr != nil {
+		return errors.Join(base, killErr)
+	}
+	return base
 }
 
 // ensureConfirmedDeadBeforeTerminal drains the containment handle when the
