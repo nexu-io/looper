@@ -228,11 +228,11 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 		cfg.Vendor = config.AgentVendor(vendor)
 		cfg.Model = input.SnapshotModel
 		// Model flags in params.args can defeat frozen model — always strip under snapshot.
-		// params.command is a supported vendor wrapper: keep it when snapshot vendor matches
-		// the handler executor vendor; strip only when vendor identity diverges (sticky
-		// resume after a role vendor change would otherwise launch the wrong binary).
-		stripCommand := cfg.Vendor != baseVendor
-		cfg.Params = cloneParamsForSnapshot(cfg.Params, stripCommand)
+		// params.command/args are vendor-owned: keep wrappers when snapshot vendor matches
+		// the handler executor vendor; drop command+args when identity diverges (sticky
+		// resume after a role vendor change would otherwise launch the wrong binary/shape).
+		stripVendorOwned := cfg.Vendor != baseVendor
+		cfg.Params = cloneParamsForSnapshot(cfg.Params, stripVendorOwned)
 	}
 	return cfg
 }
@@ -240,29 +240,36 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 // ParamsForRoleVendor returns executor params for a coding-role vendor.
 // Global agent.params are owned by agent.vendor. When a role resolves to a
 // different vendor (or global vendor is unset while the role still resolves),
-// identity-bearing overrides are stripped so params.command cannot override
-// resolveCommand's vendor binary and model flags cannot defeat the role model.
-// Same-vendor roles keep the shared params map (including command wrappers).
+// command and args are dropped so vendor-specific wrappers/flags cannot launch
+// the wrong binary or inject foreign CLI shape. Same-vendor roles keep command
+// and non-model args, but model flags are stripped so roles.*.agent.model /
+// profile model can win via prependModelFlag.
 func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor) map[string]any {
 	if params == nil {
 		return nil
 	}
 	if globalVendor != nil && *globalVendor == roleVendor {
-		return params
+		// Clone + strip model flags; do not return the shared map so role model
+		// resolution cannot be defeated by global params.args --model/-m.
+		return cloneParamsForSnapshot(params, false)
 	}
 	return cloneParamsForSnapshot(params, true)
 }
 
 // cloneParamsForSnapshot copies params and strips identity-bearing overrides.
-// When stripCommand is true, params.command is removed. Model flags in args are
-// always removed so SnapshotModel wins.
-func cloneParamsForSnapshot(params map[string]any, stripCommand bool) map[string]any {
+// When stripVendorOwned is true (diverged vendor), params.command and
+// params.args are removed entirely — global args are vendor-shaped and must
+// not follow a different binary. When false (same vendor), only model flags
+// in args are removed so SnapshotModel / role model can win.
+func cloneParamsForSnapshot(params map[string]any, stripVendorOwned bool) map[string]any {
 	if params == nil {
 		return nil
 	}
 	out := maps.Clone(params)
-	if stripCommand {
+	if stripVendorOwned {
 		delete(out, "command")
+		delete(out, "args")
+		return out
 	}
 	if args, ok := out["args"]; ok {
 		out["args"] = stripModelFlagsFromArgs(args)

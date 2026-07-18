@@ -78,45 +78,56 @@ func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
 	global := config.AgentVendorCodex
 	params := map[string]any{
 		"command": "/opt/codex-wrapper",
-		"args":    []any{"exec", "--model", "params-model", "--other"},
+		"args":    []any{"exec", "--model", "params-model", "--sandbox", "workspace-write"},
 		"keep":    "yes",
 	}
 
-	// Same vendor: shared params (including command wrapper) are preserved by reference.
+	// Same vendor: keep command wrapper and non-model args; strip model flags so
+	// role/profile model can win. Clone — do not mutate the global params map.
 	same := ParamsForRoleVendor(params, &global, config.AgentVendorCodex)
 	if same == nil || same["command"] != "/opt/codex-wrapper" {
 		t.Fatalf("same-vendor params = %#v, want original command", same)
 	}
-	same["probe"] = true
-	if params["probe"] != true {
-		t.Fatal("same-vendor should return the shared params map")
+	sameJoined := strings.Join(stringArgs(same["args"]), " ")
+	if strings.Contains(sameJoined, "params-model") || strings.Contains(sameJoined, "--model") {
+		t.Fatalf("same-vendor args = %q, want model flags stripped", sameJoined)
 	}
-	delete(same, "probe")
+	if !strings.Contains(sameJoined, "exec") || !strings.Contains(sameJoined, "--sandbox") {
+		t.Fatalf("same-vendor args = %q, want non-model args preserved", sameJoined)
+	}
+	same["probe"] = true
+	if _, ok := params["probe"]; ok {
+		t.Fatal("same-vendor must clone params; mutated shared map")
+	}
+	// Original map must retain model flags.
+	origJoined := strings.Join(stringArgs(params["args"]), " ")
+	if !strings.Contains(origJoined, "params-model") {
+		t.Fatal("ParamsForRoleVendor mutated source params.args model flags")
+	}
 
-	// Diverged role vendor: strip command + model flags; keep non-identity keys/args.
+	// Diverged role vendor: drop command + all args (vendor-shaped); keep other keys.
 	diverged := ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode)
 	if _, ok := diverged["command"]; ok {
 		t.Fatalf("diverged role still has command: %#v", diverged)
 	}
+	if _, ok := diverged["args"]; ok {
+		t.Fatalf("diverged role still has args: %#v", diverged)
+	}
 	if diverged["keep"] != "yes" {
 		t.Fatalf("diverged role dropped non-identity param: %#v", diverged)
-	}
-	joined := strings.Join(stringArgs(diverged["args"]), " ")
-	if strings.Contains(joined, "params-model") || strings.Contains(joined, "--model") {
-		t.Fatalf("diverged role args = %q, want model flags stripped", joined)
-	}
-	if !strings.Contains(joined, "--other") || !strings.Contains(joined, "exec") {
-		t.Fatalf("diverged role args = %q, want non-identity args preserved", joined)
 	}
 	// Original map must not be mutated.
 	if params["command"] != "/opt/codex-wrapper" {
 		t.Fatal("ParamsForRoleVendor mutated source params.command")
 	}
 
-	// No global vendor: params have no home vendor; strip identity for any role.
+	// No global vendor: params have no home vendor; strip vendor-owned for any role.
 	noGlobal := ParamsForRoleVendor(params, nil, config.AgentVendorClaudeCode)
 	if _, ok := noGlobal["command"]; ok {
 		t.Fatalf("nil global vendor still has command: %#v", noGlobal)
+	}
+	if _, ok := noGlobal["args"]; ok {
+		t.Fatalf("nil global vendor still has args: %#v", noGlobal)
 	}
 
 	// Nil params stay nil.
@@ -131,6 +142,32 @@ func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
 	}
 	if cmd := resolveCommand(cfg); cmd != "claude" {
 		t.Fatalf("resolveCommand(diverged role) = %q, want claude", cmd)
+	}
+}
+
+func TestParamsForRoleVendorSameVendorRoleModelWinsOverParamsModelFlag(t *testing.T) {
+	t.Parallel()
+
+	global := config.AgentVendorCodex
+	roleModel := "role-model"
+	params := map[string]any{
+		"args": []any{"exec", "--model", "params-model", "--sandbox", "workspace-write"},
+	}
+	cfg := ExecutorConfig{
+		Vendor: config.AgentVendorCodex,
+		Model:  &roleModel,
+		Params: ParamsForRoleVendor(params, &global, config.AgentVendorCodex),
+	}
+	_, args := ResolveSpawn(cfg, "/tmp/wt", "hello")
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "params-model") {
+		t.Fatalf("args = %q, want params model flag stripped so role model wins", joined)
+	}
+	if !strings.Contains(joined, "role-model") {
+		t.Fatalf("args = %q, want role model", joined)
+	}
+	if !strings.Contains(joined, "--sandbox") {
+		t.Fatalf("args = %q, want same-vendor non-model args preserved", joined)
 	}
 }
 
@@ -162,7 +199,7 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 		t.Fatalf("args(no snapshot) = %q, want params model flag preserved", joined)
 	}
 
-	// Snapshot vendor differs from executor: strip command + model flags.
+	// Snapshot vendor differs from executor: strip command + all vendor-owned args.
 	got = executor.effectiveConfig(RunInput{
 		UseSnapshot:    true,
 		SnapshotVendor: string(config.AgentVendorCodex),
@@ -170,6 +207,9 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 	})
 	if _, ok := got.Params["command"]; ok {
 		t.Fatalf("params still has command when snapshot vendor diverges: %#v", got.Params)
+	}
+	if _, ok := got.Params["args"]; ok {
+		t.Fatalf("params still has args when snapshot vendor diverges: %#v", got.Params)
 	}
 	if cmd := resolveCommand(got); cmd != "codex" {
 		t.Fatalf("resolveCommand(diverged snapshot) = %q, want codex", cmd)
@@ -179,14 +219,11 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 		t.Fatalf("command(diverged snapshot) = %q, want codex", command)
 	}
 	joined = strings.Join(args, " ")
-	if strings.Contains(joined, "params-model") || strings.Contains(joined, "also-params") {
-		t.Fatalf("args(snapshot) = %q, want params model flags stripped", joined)
+	if strings.Contains(joined, "params-model") || strings.Contains(joined, "also-params") || strings.Contains(joined, "--other") {
+		t.Fatalf("args(snapshot) = %q, want clean vendor defaults (no foreign params.args)", joined)
 	}
 	if !strings.Contains(joined, "frozen-model") {
 		t.Fatalf("args(snapshot) = %q, want frozen model", joined)
-	}
-	if !strings.Contains(joined, "--other") {
-		t.Fatalf("args(snapshot) = %q, want non-identity flags preserved", joined)
 	}
 
 	// Same vendor as executor: keep params.command wrapper, still strip model flags.

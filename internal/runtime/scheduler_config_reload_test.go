@@ -118,18 +118,18 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 		t.Cleanup(handlers.webhook.Close)
 	}
 
-	// Without a live vendor, handlers still build so sticky snapshot retries can
-	// claim, but discovery stays off and webhook role runners stay nil.
+	// Without a live vendor, coding-role runners stay nil so claim does not pick
+	// fresh work with empty agent identity; discovery and webhooks stay off too.
 	if err := handlers.tick(context.Background(), Services{Repositories: repositories}); err != nil {
 		t.Fatalf("tick without vendor error = %v", err)
 	}
 	before := handlers.snapshot()
 	if before.input == nil {
-		t.Fatal("handlers.input = nil without vendor, want sticky-retry runners available")
+		t.Fatal("handlers.input = nil without vendor, want handlers still built")
 	}
 	beforeInput := before.input(Services{Repositories: repositories})
-	if beforeInput.Planner == nil || beforeInput.Worker == nil || beforeInput.Reviewer == nil || beforeInput.Fixer == nil {
-		t.Fatal("coding role runners nil without vendor, want present for sticky snapshot retries")
+	if beforeInput.Planner != nil || beforeInput.Worker != nil || beforeInput.Reviewer != nil || beforeInput.Fixer != nil {
+		t.Fatal("coding role runners non-nil without vendor, want nil until ResolveAgent succeeds")
 	}
 	if discoveryEnabled(beforeInput.PlannerDiscoveryEnabled) || discoveryEnabled(beforeInput.WorkerDiscoveryEnabled) ||
 		discoveryEnabled(beforeInput.ReviewerDiscoveryEnabled) || discoveryEnabled(beforeInput.FixerDiscoveryEnabled) {
@@ -137,6 +137,9 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 	}
 	if before.reviewer != nil || before.fixer != nil {
 		t.Fatal("webhook reviewer/fixer non-nil without vendor, want nil to block new webhook discovery")
+	}
+	if allowed := allowedQueueTypesFromRunners(beforeInput); len(allowed) != 0 {
+		t.Fatalf("allowedQueueTypesFromRunners without vendor = %v, want empty", allowed)
 	}
 
 	next := config.CloneConfig(cfg)
@@ -209,12 +212,12 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 	if input.Reviewer == nil {
 		t.Fatal("Reviewer runner = nil, want configured for role-only reviewer vendor")
 	}
-	// Unconfigured roles still get runners so sticky snapshot retries remain claimable.
-	if input.Planner == nil {
-		t.Fatal("Planner runner = nil, want present for sticky snapshot retries when planner agent not configured")
+	// Unconfigured roles must not get runners (fresh claims would run without identity).
+	if input.Planner != nil {
+		t.Fatal("Planner runner non-nil, want nil when planner agent not configured")
 	}
-	if input.Fixer == nil {
-		t.Fatal("Fixer runner = nil, want present for sticky snapshot retries when fixer agent not configured")
+	if input.Fixer != nil {
+		t.Fatal("Fixer runner non-nil, want nil when fixer agent not configured")
 	}
 	if discoveryEnabled(input.PlannerDiscoveryEnabled) || discoveryEnabled(input.FixerDiscoveryEnabled) {
 		t.Fatal("planner/fixer discovery enabled without role agent, want gated")
@@ -231,14 +234,19 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 	if workerResolved.Vendor == reviewerResolved.Vendor {
 		t.Fatalf("worker and reviewer vendors both %q, want different", workerResolved.Vendor)
 	}
-	// Claim path must keep unconfigured role queue types for sticky retries.
+	// Claim path only includes live-configured roles.
 	allowed := allowedQueueTypesFromRunners(input)
-	wantTypes := map[string]bool{"planner": true, "worker": true, "reviewer": true, "fixer": true}
+	wantTypes := map[string]bool{"worker": true, "reviewer": true}
 	for _, got := range allowed {
 		delete(wantTypes, got)
 	}
 	if len(wantTypes) != 0 {
 		t.Fatalf("allowedQueueTypesFromRunners missing %v; got %v", wantTypes, allowed)
+	}
+	for _, got := range allowed {
+		if got == "planner" || got == "fixer" {
+			t.Fatalf("allowedQueueTypesFromRunners = %v, must not include unconfigured planner/fixer", allowed)
+		}
 	}
 }
 

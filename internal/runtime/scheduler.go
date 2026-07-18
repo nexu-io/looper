@@ -3010,12 +3010,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
-	// Always build coding-role runners below, even when live ResolveAgent fails.
-	// Sticky retries of failed/interrupted runs copy runs.agent_snapshot_json and
-	// execute via UseSnapshot; omitting runners would strand those queue items
-	// (allowedQueueTypesFromRunners) after vendor removal. New discovery stays
-	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and webhook
-	// nil-runner checks.
+	// Build coding-role runners only when live ResolveAgent succeeds. Always-on
+	// snapshot-only runners made allowedQueueTypesFromRunners claim every queued
+	// item for that role; fresh work without a predecessor snapshot then ran with
+	// empty vendor/command and burned retries. Sticky retries stay claimable once
+	// a live role agent is configured again (predecessor snapshot still wins).
 	notificationGateway := notificationGateways.New(notify.Options{
 		Config:        cfg.Notifications,
 		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
@@ -3176,9 +3175,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 	}
 
-	// Construct even when live config no longer resolves so sticky snapshot retries remain claimable.
 	resolvedPlanner, plannerConfigured := config.ResolveAgent(cfg, "", config.CodingRolePlanner)
-	{
+	if plannerConfigured {
 		resolved := resolvedPlanner
 		plannerExecutor := newRoleAgentExecutor(resolved)
 		var agentModel *string
@@ -3187,10 +3185,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		plannerStamper := roleStamper(resolved)
-		plannerAutoDiscovery := cfg.Roles.Planner.AutoDiscovery
-		if !plannerConfigured {
-			plannerAutoDiscovery = false
-		}
 		plannerRunner = planner.New(planner.Options{
 			DB:                 coordinator.DB(),
 			Repos:              repos,
@@ -3208,7 +3202,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
 			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
 			DiscoveryPolicy: planner.DiscoveryPolicy{
-				AutoDiscovery:              plannerAutoDiscovery,
+				AutoDiscovery:              cfg.Roles.Planner.AutoDiscovery,
 				Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
 				LabelMode:                  cfg.Roles.Planner.Triggers.LabelMode,
 				RequireAssigneeCurrentUser: cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser,
@@ -3259,7 +3253,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	coordinatorRunner = coordinatorrole.New(coordinatorOpts)
 
 	resolvedReviewer, reviewerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleReviewer)
-	{
+	if reviewerConfigured {
 		resolved := resolvedReviewer
 		reviewerExecutor := newRoleAgentExecutor(resolved)
 		var agentModel *string
@@ -3268,10 +3262,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		reviewerStamper := roleStamper(resolved)
-		reviewerAutoDiscovery := cfg.Roles.Reviewer.Discovery.AutoDiscovery
-		if !reviewerConfigured {
-			reviewerAutoDiscovery = false
-		}
 		reviewerRunner = reviewer.New(reviewer.Options{
 			DB:     coordinator.DB(),
 			Repos:  repos,
@@ -3291,7 +3281,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
 			LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
 			DiscoveryPolicy: reviewer.DiscoveryPolicy{
-				AutoDiscovery:             reviewerAutoDiscovery,
+				AutoDiscovery:             cfg.Roles.Reviewer.Discovery.AutoDiscovery,
 				IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
 				RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
 				EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
@@ -3322,7 +3312,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
-	{
+	if fixerConfigured {
 		resolved := resolvedFixer
 		fixerExecutor := newRoleAgentExecutor(resolved)
 		var agentModel *string
@@ -3331,10 +3321,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		fixerStamper := roleStamper(resolved)
-		fixerAutoDiscovery := cfg.Roles.Fixer.AutoDiscovery
-		if !fixerConfigured {
-			fixerAutoDiscovery = false
-		}
 		fixerRunner = fixer.New(fixer.Options{
 			DB:                 coordinator.DB(),
 			Repos:              repos,
@@ -3348,7 +3334,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
 			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
-				AutoDiscovery: fixerAutoDiscovery,
+				AutoDiscovery: cfg.Roles.Fixer.AutoDiscovery,
 				IncludeDrafts: cfg.Roles.Fixer.Triggers.IncludeDrafts,
 				AuthorFilter:  cfg.Roles.Fixer.Triggers.AuthorFilter,
 				Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
@@ -3382,7 +3368,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	resolvedWorker, workerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleWorker)
-	{
+	if workerConfigured {
 		resolved := resolvedWorker
 		workerExecutor := newRoleAgentExecutor(resolved)
 		var agentModel *string
@@ -3391,10 +3377,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			agentModel = &model
 		}
 		workerStamper := roleStamper(resolved)
-		workerAutoDiscovery := cfg.Roles.Worker.AutoDiscovery
-		if !workerConfigured {
-			workerAutoDiscovery = false
-		}
 		workerRunner = worker.New(worker.Options{
 			DB:     coordinator.DB(),
 			Repos:  repos,
@@ -3410,7 +3392,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoPush:   cfg.Defaults.AllowAutoPush,
 			OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
 			DiscoveryPolicy: worker.DiscoveryPolicy{
-				AutoDiscovery:              workerAutoDiscovery,
+				AutoDiscovery:              cfg.Roles.Worker.AutoDiscovery,
 				Labels:                     append([]string(nil), cfg.Roles.Worker.Triggers.Labels...),
 				LabelMode:                  cfg.Roles.Worker.Triggers.LabelMode,
 				RequireAssigneeCurrentUser: cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser,
@@ -3467,8 +3449,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Worker:               workerRunner,
 			Snapshotter:          snapshotter,
 			Config:               &cfg,
-			// Live discovery requires a currently resolvable agent; sticky retries
-			// still claim via always-present runners when vendor was removed.
+			// Live discovery and claim both require a currently resolvable agent.
 			PlannerDiscoveryEnabled:  boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
 			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
@@ -3480,7 +3461,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	}
 
 	// Webhook-driven discovery must not enroll new work without a live agent.
-	// Claim/tick still use the always-present runners for sticky snapshot retries.
 	var webhookReviewer reviewerScheduler
 	var webhookFixer fixerScheduler
 	if reviewerConfigured {
