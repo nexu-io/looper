@@ -727,11 +727,20 @@ func (r *ActiveExecutionRegistry) LoopStopActive(loopID string) bool {
 	return active
 }
 
+// errShutdownDrainTimeout is returned when BeginShutdown cannot confirm that a
+// pending spawn/rebind window closed within killBudget, or a bound handle did
+// not reach confirmed-dead. Callers must retain storage and fail loud (#577).
+var errShutdownDrainTimeout = errors.New("shutdown: containment drain timed out or failed")
+
 // BeginShutdown closes spawn admission, cancels pending and bound (active)
 // leases, and confirmed-drains every bound containment handle.
-func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
+//
+// Returns a non-nil error when any handle Kill fails or a spawn/rebind wait
+// times out. ADR-0015 / #577: drain failure must not be reported as graceful
+// success; Runtime.Stop retains SQLite when this returns an error.
+func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	if r == nil {
-		return
+		return nil
 	}
 	r.mu.Lock()
 	r.admissionClosed = true
@@ -769,8 +778,11 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 	for _, lease := range toCancel {
 		lease.cancel(cause)
 	}
+	var drainErr error
 	for _, entry := range entries {
-		_ = r.killOwned(entry, reason)
+		if err := r.killOwned(entry, reason); err != nil {
+			drainErr = errors.Join(drainErr, err)
+		}
 	}
 	budget := r.killBudget()
 	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait))
@@ -783,6 +795,13 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		select {
 		case <-done:
 		case <-time.After(budget):
+			drainErr = errors.Join(drainErr, errShutdownDrainTimeout)
+		}
+	}
+	// Join refuse-path killUnowned failures published on waited leases.
+	for _, lease := range toCancel {
+		if err := lease.takeUnownedDrainErr(); err != nil {
+			drainErr = errors.Join(drainErr, err)
 		}
 	}
 	if len(waitChans) > 0 {
@@ -795,9 +814,15 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		}
 		r.mu.Unlock()
 		for _, entry := range second {
-			_ = r.killOwned(entry, reason)
+			if err := r.killOwned(entry, reason); err != nil {
+				drainErr = errors.Join(drainErr, err)
+			}
 		}
 	}
+	if drainErr != nil {
+		return errors.Join(errShutdownDrainTimeout, drainErr)
+	}
+	return nil
 }
 
 // Register is retained for tests and transitional paths that hold an

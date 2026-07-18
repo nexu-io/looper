@@ -193,6 +193,13 @@ type Runtime struct {
 	// this flag is not a mutation/claim gate.
 	ownershipAcquired bool
 	admission         *Admission
+
+	// shutdownDrainErr is set by BeginShutdown when producer/handle drain fails.
+	// Stop retains SQLite when non-nil (ADR-0015 / #577).
+	shutdownDrainErr error
+	// storageRetained is true when Stop skipped coordinator.Close after a
+	// drain failure so undrained ownership is not closed under SQLite.
+	storageRetained bool
 }
 
 type runtimeNetworkManager interface {
@@ -342,6 +349,7 @@ func (r *Runtime) Stop(reason string) {
 		coordinator := r.services.Coordinator
 		repositories := r.services.Repositories
 		ownershipAcquired := r.ownershipAcquired
+		drainErr := r.shutdownDrainErr
 		r.mu.Unlock()
 
 		if ownershipAcquired && repositories != nil {
@@ -350,16 +358,35 @@ func (r *Runtime) Stop(reason string) {
 			}
 		}
 
-		r.mu.Lock()
-		r.services = Services{}
-		r.mu.Unlock()
-
+		// Independent infra (forwarder/network) still stop on drain failure;
+		// they are not Supervisor domain and must not block retain-storage.
 		if forwarder != nil {
 			forwarder.Close()
 		}
 		if networkManager != nil {
 			networkManager.Stop()
 		}
+
+		// #577: retain SQLite when containment drain failed. Never report
+		// graceful success with undrained ownership under a closed DB.
+		if drainErr != nil {
+			r.mu.Lock()
+			r.storageRetained = true
+			r.mu.Unlock()
+			close(r.shutdownCh)
+			if r.logger != nil {
+				r.logger.Error("looperd runtime stop retained storage after drain failure", map[string]any{
+					"reason": reason,
+					"error":  drainErr.Error(),
+				})
+			}
+			return
+		}
+
+		r.mu.Lock()
+		r.services = Services{}
+		r.mu.Unlock()
+
 		if coordinator != nil {
 			if err := coordinator.Close(); err != nil && r.logger != nil {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
@@ -384,14 +411,22 @@ func (r *Runtime) Stop(reason string) {
 // wait for recovery exit remains in Runtime.Stop via stopDeferredReviewerRecovery.
 // Cancels webhook-forward discovery so a worker that already passed
 // AllowExecute cannot finish CreateOrGetActiveByDedupe after admission closes.
+//
+// Shutdown order (ADR-0015 / #577): close admission → cancel producers →
+// confirmed-drain handles. SQLite close happens only in Stop after drain
+// succeeds; drain failure is recorded for retain-storage.
 func (r *Runtime) BeginShutdown(reason string) {
 	if r == nil {
 		return
 	}
 	_ = r.admission.BeginShutdown(reason)
-	// Close agent spawn admission and confirmed-drain live handles (#576).
+	// Close agent spawn admission and confirmed-drain live handles (#576/#577).
 	if r.activeExecutions != nil {
-		r.activeExecutions.BeginShutdown(reason)
+		if err := r.activeExecutions.BeginShutdown(reason); err != nil {
+			r.mu.Lock()
+			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
+			r.mu.Unlock()
+		}
 	}
 	r.mu.Lock()
 	cancel := r.schedulerCancel
@@ -407,6 +442,28 @@ func (r *Runtime) BeginShutdown(reason string) {
 	if forwarder != nil {
 		forwarder.CancelExecute()
 	}
+}
+
+// StorageRetained reports whether Stop skipped SQLite close after a drain
+// failure (ADR-0015 / #577). Operators must not treat stop as graceful success.
+func (r *Runtime) StorageRetained() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.storageRetained
+}
+
+// ShutdownDrainError returns the drain failure recorded during BeginShutdown,
+// if any.
+func (r *Runtime) ShutdownDrainError() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.shutdownDrainErr
 }
 
 // AdmissionState returns the authoritative live admission state.

@@ -118,7 +118,7 @@ to a slice while any open blocker remains.
 | R1 | #575 | Safety floor: one admission state; stop unsafe recovery PID action | Single admission Authority; no mutation/claim before ready; recovery no-act + quarantine; drain ingress before storage close | **Enforced** |
 | R2 | #574 | Process containment handle with confirmed drain | Containment API; kill success = confirmed drain; no production removal of PID fallback yet | **Enforced** |
 | R3 | #576 | Own all in-scope agent spawns at common executor boundary | Lease before `cmd.Start`; bind handle before return; stop-kill via handle; remove agent live PID fallback only after full agent coverage | **Enforced** |
-| R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Deferred** |
+| R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Enforced** |
 | R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Deferred** |
 | R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Deferred** |
 | R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Deferred** |
@@ -196,11 +196,25 @@ boundary so there is no worker-only registry escape hatch.
 | **Why not simpler** | Post-spawn adapter Register (#572) leaves Coordinator and race windows unowned. Keeping PID fallback after full coverage reintroduces reusable-ID Authority. |
 | **Deletion attempt** | Remove registry and trust only `exec.Cmd` + SQLite — fails stop when live handle is missing and reopens dual Authority. |
 
-### Shutdown order (target; partial in #575, complete in #577/#580)
+### Shutdown order (enforced by #575 admission close + #577 drain/retain)
 
 Drain **admission → ingress → producers → handles/finalizers** before SQLite
-close. On timeout: retain storage / fail loud — never report graceful success
-with undrained ownership.
+close. On timeout or confirmed-drain failure: **retain storage** and fail loud
+— never report graceful success with undrained ownership. `Runtime.Stop` skips
+`coordinator.Close` when `ActiveExecutionRegistry.BeginShutdown` returns a drain
+error; `StorageRetained()` is the operator-visible signal. Independent infra
+(webhook forwarder, network manager) still stop — they are not Supervisor domain.
+
+### Non-agent Supervisor-owned producers (enforced by #577)
+
+| Producer | Spawn boundary | Containment |
+|----------|----------------|-------------|
+| **Worker / Fixer validation shell** | `internal/infra/shell.Run` (`Configure` + `Start` + `Bind`) | Cancel/timeout → `Handle.Kill` confirmed drain; normal exit → `Handle.Drain` |
+| **Other daemon `shell.Run` work steps** on inventory-listed role helpers | same package boundary | Same as validation; short git/gh/tea remain independently lifecycle-owned (gateway Authority) but still get group containment when they share `shell.Run` |
+| **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` | `Configure` + `Bind` after Start; cancel → `Handle.Kill`; success path `Drain` |
+
+Raw PID signal-only stop is removed at these boundaries. Agent live SQLite-PID
+fallback was already removed when the registry is present (#576).
 
 ## Process-producer inventory
 
@@ -222,9 +236,9 @@ Classification:
 | **Worker agent** | scheduler worker adapter → `agent.Executor.Start` (incl. native-resume) | **Enforced by #576** (not post-spawn adapter Register) |
 | **Coordinator agent** | `internal/coordinator/agent_llm.go` → shared `agent.Executor.Start` | **Enforced by #576**; same executor, not a separate spawn stack |
 | **Native-resume fallback** | Same `agent.Executor.Start` with `NativeResumePrompt` / session; fallback to full prompt on resume failure | **Enforced by #576**; cancellation must not spawn a second process after stop |
-| **Worker validation shell** | `internal/worker/runner.go` → `shell.Run` (`/bin/sh -c` validation commands) | #577 non-agent containment |
-| **Fixer (and other role) shell helpers** that run daemon-owned long/blocking shell for work steps | e.g. fixer `shell.Run` helpers used during run processing | #577; short tool calls may reclassify only if inventory is updated |
-| **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` spawns `looper review submit` child from daemon-bound proxy | #577; child is daemon-owned for stop/drain while proxy request is live |
+| **Worker validation shell** | `internal/worker/runner.go` → `shell.Run` (`/bin/sh -c` validation commands) | **Enforced by #577** via `shell.Run` containment spawn boundary |
+| **Fixer (and other role) shell helpers** that run daemon-owned long/blocking shell for work steps | e.g. fixer `shell.Run` helpers used during run processing | **Enforced by #577** via same `shell.Run` boundary |
+| **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` spawns `looper review submit` child from daemon-bound proxy | **Enforced by #577**; handle Bind + confirmed Kill/Drain while proxy request is live |
 | **Active agent stop / loop halt / daemon shutdown kill of owned agents** | Registry `Kill` via bound containment handle (confirmed drain); no live SQLite PID fallback when registry present | **Enforced by #576** after common-executor ownership; recovery still no raw PID action (#575) |
 
 Queue **claims** themselves are not process producers, but while the daemon is

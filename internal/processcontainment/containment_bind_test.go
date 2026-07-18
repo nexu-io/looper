@@ -1,6 +1,8 @@
 package processcontainment
 
 import (
+	"context"
+	"errors"
 	"os/exec"
 	"runtime"
 	"testing"
@@ -41,5 +43,42 @@ func TestBindRejectsNonGroupLeader(t *testing.T) {
 	_, err := Bind(cmd, Options{})
 	if err == nil {
 		t.Fatal("Bind() error = nil, want error when command is not process group leader")
+	}
+}
+
+func TestBindAllowsFastExitAfterConfigure(t *testing.T) {
+	requireUnixProcessGroup(t)
+
+	// Short-lived commands can exit before Bind's getpgid. Configure guarantees
+	// the process was group leader while live, so Bind must still attach.
+	for i := 0; i < 20; i++ {
+		cmd := exec.Command("/bin/sh", "-c", "exit 7")
+		Configure(cmd)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		handle, err := Bind(cmd, Options{})
+		if err != nil {
+			t.Fatalf("Bind() after fast exit error = %v", err)
+		}
+		if err := handle.Wait(context.Background()); err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("Wait() error = %v, want ExitError", err)
+			}
+		}
+		if state := handle.ProcessState(); state == nil || state.ExitCode() != 7 {
+			code := -1
+			if state != nil {
+				code = state.ExitCode()
+			}
+			t.Fatalf("ExitCode = %d, want 7", code)
+		}
+		if err := handle.Drain(context.Background()); err != nil {
+			t.Fatalf("Drain() error = %v", err)
+		}
+		if !handle.ConfirmedDead() {
+			t.Fatal("ConfirmedDead() = false after Drain of fast-exit leader")
+		}
 	}
 }

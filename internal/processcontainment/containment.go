@@ -110,6 +110,12 @@ func Configure(cmd *exec.Cmd) {
 // The bound process must be its process-group leader (pgid == pid). Binding a
 // command that shares the caller's ambient group would make SignalGroup target
 // -pgid against Looper and sibling processes.
+//
+// When the leader exits between Start and Bind, getpgid may return ESRCH. If
+// Configure was used (Setpgid), the process was group leader while live, so
+// Bind assumes pgid == pid and still attaches a handle so Wait/Drain can reap
+// and confirm the group. Callers that did not Configure must not rely on this
+// path.
 func Bind(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, fmt.Errorf("process containment: started command with process is required")
@@ -120,6 +126,11 @@ func Bind(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	}
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
+		if isNoSuchProcess(err) {
+			// Fast-exit race after Configure+Start: leader is already gone.
+			// Configure sets Setpgid so the live process was group leader.
+			return newHandle(cmd, pid, pid, opts), nil
+		}
 		return nil, fmt.Errorf("process containment: getpgid(%d): %w", pid, err)
 	}
 	if pgid != pid {

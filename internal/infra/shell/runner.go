@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
 const (
@@ -20,6 +21,9 @@ const (
 	// installed (common when tests write a fake tool then exec it immediately).
 	startAttempts      = 8
 	startRetryBaseWait = 5 * time.Millisecond
+	// drainSlack is added to GracefulShutdown when building containment
+	// DrainTimeout so TERM grace plus descendant cleanup fit the budget.
+	drainSlack = 15 * time.Second
 )
 
 type Result struct {
@@ -50,6 +54,11 @@ type CommandExecutionError struct {
 
 func (e *CommandExecutionError) Error() string { return e.Message }
 
+// Run starts a command under process containment (ADR-0015 / #577).
+//
+// The spawn boundary is Configure + Start + Bind. Cancel and timeout use
+// Handle.Kill (confirmed drain), not raw PID signal-only success. Normal exit
+// still Drain so background process-group descendants cannot outlive Run.
 func Run(ctx context.Context, options Options) (Result, error) {
 	if strings.TrimSpace(options.Command) == "" {
 		return Result{}, fmt.Errorf("command is required")
@@ -68,71 +77,53 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	stdoutBuffer := newBoundedBuffer(maxCapturedBytes)
 	stderrBuffer := newBoundedBuffer(maxCapturedBytes)
 
-	cmd, err := startCommand(ctx, options, stdoutBuffer, stderrBuffer)
+	handle, err := startContainedCommand(ctx, options, gracefulShutdown, stdoutBuffer, stderrBuffer)
 	if err != nil {
 		return Result{}, fmt.Errorf("start command: %w", err)
 	}
 
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
-
-	var (
-		waitErr          error
-		timedOut         bool
-		canceledErr      error
-		terminationStart <-chan time.Time
-		killAt           <-chan time.Time
-		terminateOnce    sync.Once
-	)
-
-	terminate := func() {
-		terminateOnce.Do(func() {
-			if cmd.Process == nil {
-				return
-			}
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !isProcessDone(err) {
-				_ = cmd.Process.Kill()
-				return
-			}
-			if gracefulShutdown <= 0 {
-				_ = cmd.Process.Kill()
-				return
-			}
-			killAt = time.After(gracefulShutdown)
-		})
-	}
-
+	waitCtx := ctx
+	var timeoutCancel context.CancelFunc
 	if options.Timeout > 0 {
-		terminationStart = time.After(options.Timeout)
+		waitCtx, timeoutCancel = context.WithTimeout(ctx, options.Timeout)
+		defer timeoutCancel()
 	}
 
-	waiting := true
-	for waiting {
-		select {
-		case waitErr = <-waitCh:
-			waiting = false
-		case <-terminationStart:
+	waitErr := handle.Wait(waitCtx)
+	timedOut := false
+	var canceledErr error
+
+	if waitErr != nil && isContextError(waitErr) {
+		// Prefer the parent context error when it was the cause.
+		if ctx.Err() != nil {
+			canceledErr = ctx.Err()
+		} else if options.Timeout > 0 && errors.Is(waitErr, context.DeadlineExceeded) {
 			timedOut = true
-			terminationStart = nil
-			terminate()
-		case <-killAt:
-			killAt = nil
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		case <-ctx.Done():
-			if canceledErr == nil {
-				canceledErr = ctx.Err()
-				terminate()
+		} else {
+			canceledErr = waitErr
+		}
+		// Confirmed drain is the only stop success path (#574 / #577).
+		killCtx, killCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+		_ = handle.Kill(killCtx)
+		killCancel()
+	} else {
+		// Leader exited (zero or non-zero). Drain group members that outlived it.
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+		if drainErr := handle.Drain(drainCtx); drainErr != nil {
+			// Surface drain failure after a finished leader so callers do not
+			// treat Run as successful while descendants remain runnable.
+			if waitErr == nil {
+				waitErr = drainErr
+			} else {
+				waitErr = errors.Join(waitErr, drainErr)
 			}
 		}
+		drainCancel()
 	}
 
 	duration := time.Since(startedAt)
 	result := Result{
-		ExitCode:        exitCode(cmd),
+		ExitCode:        exitCode(handle),
 		Stdout:          stdoutBuffer.String(),
 		Stderr:          stderrBuffer.String(),
 		StdoutTruncated: stdoutBuffer.Truncated(),
@@ -150,13 +141,13 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	if result.ExitCode != 0 {
 		return result, &CommandExecutionError{Message: commandFailureMessage(result), Result: result}
 	}
-	if waitErr != nil {
+	if waitErr != nil && !isExitError(waitErr) {
 		return result, waitErr
 	}
 	return result, nil
 }
 
-func startCommand(ctx context.Context, options Options, stdout, stderr *boundedBuffer) (*exec.Cmd, error) {
+func startContainedCommand(ctx context.Context, options Options, gracefulShutdown time.Duration, stdout, stderr *boundedBuffer) (*processcontainment.Handle, error) {
 	var lastErr error
 	for attempt := 0; attempt < startAttempts; attempt++ {
 		if attempt > 0 {
@@ -184,6 +175,7 @@ func startCommand(ctx context.Context, options Options, stdout, stderr *boundedB
 		stderr.reset()
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
+		processcontainment.Configure(cmd)
 
 		if err := cmd.Start(); err != nil {
 			lastErr = err
@@ -192,13 +184,44 @@ func startCommand(ctx context.Context, options Options, stdout, stderr *boundedB
 			}
 			return nil, err
 		}
-		return cmd, nil
+		handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+			GracePeriod:  gracefulShutdown,
+			DrainTimeout: gracefulShutdown + drainSlack,
+		})
+		if err != nil {
+			killStartedWithoutHandle(cmd)
+			return nil, err
+		}
+		return handle, nil
 	}
 	return nil, lastErr
 }
 
+// killStartedWithoutHandle is only used when Bind fails after Start so the
+// orphaned process group is not left live. Production stop paths use Handle.Kill.
+func killStartedWithoutHandle(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+}
+
 func isTextFileBusy(err error) bool {
 	return errors.Is(err, syscall.ETXTBSY)
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isExitError(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
 }
 
 func commandFailureMessage(result Result) string {
@@ -231,15 +254,15 @@ func envSlice(env map[string]string) []string {
 	return values
 }
 
-func exitCode(cmd *exec.Cmd) int {
-	if cmd == nil || cmd.ProcessState == nil {
+func exitCode(handle *processcontainment.Handle) int {
+	if handle == nil {
 		return -1
 	}
-	return cmd.ProcessState.ExitCode()
-}
-
-func isProcessDone(err error) bool {
-	return err == nil || err == os.ErrProcessDone
+	state := handle.ProcessState()
+	if state == nil {
+		return -1
+	}
+	return state.ExitCode()
 }
 
 type boundedBuffer struct {

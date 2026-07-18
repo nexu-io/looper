@@ -3,6 +3,7 @@ package shell
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,9 +159,9 @@ func TestRunRetriesStartOnTextFileBusy(t *testing.T) {
 	}
 	// Confirm this platform produces ETXTBSY under a write hold; skip otherwise
 	// (some filesystems / kernels do not surface it for shell scripts).
-	if probe, probeErr := startCommand(context.Background(), Options{Command: script}, newBoundedBuffer(64), newBoundedBuffer(64)); probeErr == nil {
+	if probe, probeErr := startContainedCommand(context.Background(), Options{Command: script}, defaultGracefulStop, newBoundedBuffer(64), newBoundedBuffer(64)); probeErr == nil {
 		_ = holder.Close()
-		if waitErr := probe.Wait(); waitErr != nil {
+		if waitErr := probe.Wait(context.Background()); waitErr != nil {
 			t.Fatalf("probe Wait() error = %v", waitErr)
 		}
 		t.Skip("filesystem does not return ETXTBSY while script is open for write")
@@ -184,4 +185,66 @@ func TestRunRetriesStartOnTextFileBusy(t *testing.T) {
 	if result.Stdout != "ok" {
 		t.Fatalf("Stdout = %q, want ok", result.Stdout)
 	}
+}
+
+func TestRunCancelConfirmedDrainsBackgroundChild(t *testing.T) {
+	t.Parallel()
+	// Contract at the shell spawn boundary (#577): cancel must confirmed-drain
+	// process-group descendants, not treat SIGTERM delivery alone as success.
+	workDir := t.TempDir()
+	childPIDPath := filepath.Join(workDir, "child.pid")
+	script := `
+set -e
+(sleep 60) &
+echo $! > child.pid
+sleep 60
+`
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := Run(ctx, Options{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", script},
+			CWD:              workDir,
+			GracefulShutdown: 50 * time.Millisecond,
+		})
+		done <- err
+	}()
+
+	// Wait for background child PID file.
+	var childPID int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(childPIDPath)
+		if err == nil {
+			if _, scanErr := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &childPID); scanErr == nil && childPID > 0 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if childPID <= 0 {
+		cancel()
+		t.Fatal("child pid file not written")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after cancel")
+	}
+
+	// Child must not remain runnable after confirmed drain.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(childPID, 0); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("background child pid %d still runnable after shell cancel drain", childPID)
 }

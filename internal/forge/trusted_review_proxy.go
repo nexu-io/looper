@@ -13,10 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
 // TrustedReviewSockEnv is the agent-facing env key for the trusted review-submit
@@ -249,7 +249,8 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	// agent argv. Rewrite local policy flags after shape/PR validation.
 	childArgv := applyTrustedReviewProxyPolicy(req.Argv, policy)
 	cmd := exec.Command(realLooper, childArgv...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// #577: Supervisor-owned non-agent child uses processcontainment at spawn.
+	processcontainment.Configure(cmd)
 	configReader, configWriter, err := os.Pipe()
 	if err != nil {
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "create trusted review config pipe: " + err.Error()})
@@ -272,6 +273,22 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: err.Error()})
 		return
 	}
+	handle, bindErr := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  2 * time.Second,
+		DrainTimeout: 20 * time.Second,
+	})
+	if bindErr != nil {
+		_ = configReader.Close()
+		_ = configWriter.Close()
+		// Bind failed after Start: force-kill the orphaned process group so it
+		// does not outlive the proxy request (same emergency path as agent bind).
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "bind trusted review containment handle: " + bindErr.Error()})
+		return
+	}
 	_ = configReader.Close()
 	configWriteDone := make(chan error, 1)
 	go func() {
@@ -281,19 +298,42 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		}
 		configWriteDone <- writeErr
 	}()
+	// Handle owns exactly-once Wait; do not call cmd.Wait in parallel.
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- cmd.Wait() }()
+	go func() { waitDone <- handle.Wait(context.Background()) }()
 	select {
 	case err = <-waitDone:
+		// Normal exit path: confirmed-drain descendants before answering.
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if drainErr := handle.Drain(drainCtx); drainErr != nil && err == nil {
+			err = drainErr
+		}
+		drainCancel()
 	case <-ctx.Done():
-		_ = killTrustedReviewProxyChild(cmd)
+		// Cancel: confirmed Kill, never signal-only success (#577).
+		killCtx, killCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		killErr := handle.Kill(killCtx)
+		killCancel()
 		err = <-waitDone
+		if err == nil {
+			if killErr != nil {
+				err = killErr
+			} else {
+				err = ctx.Err()
+			}
+		}
 	}
 	configWriteErr := <-configWriteDone
 	resp := trustedReviewProxyResponse{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			resp.ExitCode = exitErr.ExitCode()
+		} else if state := handle.ProcessState(); state != nil {
+			resp.ExitCode = state.ExitCode()
+			if resp.ExitCode == 0 {
+				resp.ExitCode = 1
+				resp.Error = err.Error()
+			}
 		} else {
 			resp.ExitCode = 1
 			resp.Error = err.Error()
@@ -307,19 +347,6 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		resp.Error = "write trusted review config snapshot: " + configWriteErr.Error()
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
-}
-
-func killTrustedReviewProxyChild(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return os.ErrProcessDone
-	}
-	pid := cmd.Process.Pid
-	if pid > 0 {
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil || err == syscall.ESRCH {
-			return nil
-		}
-	}
-	return cmd.Process.Kill()
 }
 
 // trustedReviewProxyBlockedFlags are CLI overrides that must never be accepted

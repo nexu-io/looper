@@ -371,7 +371,8 @@ func stopServerWithTimeout(stop func(context.Context) error, timeout time.Durati
 
 func (d *daemonRuntime) Stop(reason string) {
 	d.stopOnce.Do(func() {
-		// Admission → HTTP ingress drain → runtime storage close (ADR-0015 / #575).
+		// Admission → HTTP ingress drain → cancel/drain producers → SQLite close
+		// (or retain storage on drain timeout) — ADR-0015 / #575 / #577.
 		if d.runtime != nil {
 			d.runtime.BeginShutdown(reason)
 		}
@@ -380,13 +381,22 @@ func (d *daemonRuntime) Stop(reason string) {
 			err := d.server.Stop(ctx)
 			cancel()
 			if err != nil {
-				// Fail loud when ingress drain is incomplete. Full producer drain
-				// is later slices; still close storage so stop cannot hang forever.
+				// Fail loud when ingress drain is incomplete; Runtime.Stop still
+				// decides storage close vs retain based on producer drain.
 				_, _ = fmt.Fprintf(os.Stderr, "looperd: HTTP ingress drain incomplete during shutdown: %v\n", err)
 			}
 		}
 		if d.runtime != nil {
 			d.runtime.Stop(reason)
+			if d.runtime.StorageRetained() {
+				// No false graceful success: undrained ownership keeps SQLite open.
+				drainErr := d.runtime.ShutdownDrainError()
+				if drainErr != nil {
+					_, _ = fmt.Fprintf(os.Stderr, "looperd: shutdown drain incomplete; storage retained: %v\n", drainErr)
+				} else {
+					_, _ = fmt.Fprintf(os.Stderr, "looperd: shutdown drain incomplete; storage retained\n")
+				}
+			}
 		}
 	})
 }
