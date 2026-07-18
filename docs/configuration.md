@@ -274,7 +274,7 @@ A role is runnable only when the overlay leaves a non-empty vendor. Missing glob
 | non-empty string | explicit model for that layer |
 | empty string `""` | suppress inherited model → vendor default |
 
-After the full overlay, an empty-string model is normalized to “no model” so the vendor CLI uses its own default.
+After the full overlay, an empty-string model is kept as an explicit empty binding (not the same as unset): the vendor CLI uses its own default, and any global `agent.params` `--model`/`-m` flags are stripped so they cannot override the suppression.
 
 ### Coordinator triage
 

@@ -194,8 +194,10 @@ func TestResolveAgent_EmptyModelSuppressesInherited(t *testing.T) {
 	if got.Vendor != globalVendor {
 		t.Fatalf("Vendor = %q, want %q", got.Vendor, globalVendor)
 	}
-	if got.Model != nil {
-		t.Fatalf("Model = %v, want nil after empty-string suppress", got.Model)
+	// Suppress stays a non-nil empty pointer so params filtering can strip
+	// --model flags; nil would mean "unset" and preserve params-only models.
+	if got.Model == nil || *got.Model != "" {
+		t.Fatalf("Model = %v, want non-nil empty after empty-string suppress", got.Model)
 	}
 }
 
@@ -253,8 +255,8 @@ func TestResolveAgent_ProfileEmptyModelSuppressesInherited(t *testing.T) {
 	if got.Vendor != globalVendor {
 		t.Fatalf("Vendor = %q, want %q", got.Vendor, globalVendor)
 	}
-	if got.Model != nil {
-		t.Fatalf("Model = %v, want nil after profile empty-string suppress", got.Model)
+	if got.Model == nil || *got.Model != "" {
+		t.Fatalf("Model = %v, want non-nil empty after profile empty-string suppress", got.Model)
 	}
 	if got.ProfileID != "suppress" {
 		t.Fatalf("ProfileID = %q, want suppress", got.ProfileID)

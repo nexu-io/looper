@@ -277,18 +277,21 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 // unset while a role still resolves — command and args are dropped so
 // vendor-specific wrappers/flags cannot launch the wrong binary or inject
 // foreign CLI shape. Same-vendor identity keeps command and args; model flags
-// in args are stripped only when roleModel is set so roles.*.agent.model /
-// profile / global agent.model can win via prependModelFlag. When no resolved
-// model is present, params.args --model/-m are preserved so existing
-// params-only model configs do not silently fall back to vendor defaults.
+// in args are stripped whenever roleModel is non-nil so roles.*.agent.model /
+// profile / global agent.model can win via prependModelFlag, and so an
+// explicit empty model binding (suppress → vendor default) does not leave
+// params --model/-m in place. When roleModel is nil (unset), params.args
+// --model/-m are preserved so existing params-only model configs do not
+// silently fall back to vendor defaults.
 func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor, roleModel *string) map[string]any {
 	if params == nil {
 		return nil
 	}
 	if globalVendor != nil && *globalVendor == roleVendor {
 		// Clone so role resolution cannot mutate the shared global params map.
-		// Strip model flags only when a resolved model will replace them.
-		if roleModel != nil && strings.TrimSpace(*roleModel) != "" {
+		// Strip model flags when a resolved model binding is present — including
+		// non-nil empty (explicit suppress to vendor default).
+		if roleModel != nil {
 			return cloneParamsForSnapshot(params, false)
 		}
 		return maps.Clone(params)

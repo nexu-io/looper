@@ -12,9 +12,13 @@ const (
 
 // ResolvedAgent is the effective vendor/model for a coding role after overlay.
 type ResolvedAgent struct {
-	Vendor    AgentVendor
-	Model     *string // nil if no model after resolve (including suppressed empty)
-	ProfileID string  // profile selected by the role binding; empty if none
+	Vendor AgentVendor
+	// Model is the post-overlay model binding:
+	//   nil            — unset (params-only --model/-m may still apply)
+	//   non-nil empty  — explicit suppress to vendor default (strip params model flags)
+	//   non-empty      — explicit model
+	Model     *string
+	ProfileID string // profile selected by the role binding; empty if none
 }
 
 // ResolveAgent overlays global agent vendor/model with the role binding.
@@ -38,7 +42,8 @@ func ResolveAgent(cfg Config, projectID string, role string) (ResolvedAgent, boo
 
 // overlayAgentIdentity returns the post-overlay vendor/model/profile for a coding
 // role without requiring vendor to be set. ok=false only for non-coding roles.
-// Empty-string model after overlay is normalized to nil (suppress).
+// Explicit empty-string model suppresses inherited model but stays a non-nil
+// empty pointer so params filtering can strip --model/-m (nil means unset).
 // Used by ResolveAgent and hot-reload restart guards.
 func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *string, profileID string, ok bool) {
 	if !isCodingRole(role) {
@@ -79,10 +84,9 @@ func overlayAgentIdentity(cfg Config, role string) (vendor *AgentVendor, model *
 		}
 	}
 
-	// Explicit empty string suppresses inherited model.
-	if model != nil && *model == "" {
-		model = nil
-	}
+	// Explicit empty string suppresses inherited model and is left as a non-nil
+	// empty pointer (not collapsed to nil) so ParamsForRoleVendor can strip
+	// params model flags and force the vendor default. nil means unset.
 	return vendor, model, profileID, true
 }
 

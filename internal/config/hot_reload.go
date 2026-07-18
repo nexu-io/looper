@@ -291,10 +291,11 @@ func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen 
 		if len(newConfig.Agent.Params) > 0 {
 			mark("agent.params")
 		}
-		// Retaining the same non-nil model across a vendor leave/switch is almost
+		// Retaining the same non-empty model across a vendor leave/switch is almost
 		// always accidental (and enables vendor-reset laundering: unset vendor,
-		// then set a different vendor while keeping the old model).
-		if oldModel != nil && newModel != nil && *oldModel == *newModel {
+		// then set a different vendor while keeping the old model). Non-nil empty
+		// is explicit suppress-to-vendor-default, not a portable model value.
+		if oldModel != nil && newModel != nil && *oldModel != "" && *oldModel == *newModel {
 			mark("agent.model")
 		}
 	}

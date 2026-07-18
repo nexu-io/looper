@@ -56,12 +56,16 @@ func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
 		t.Fatal("no-model same-vendor must clone params; mutated shared map")
 	}
 
-	// Empty resolved model string is treated as unset — keep params model.
+	// Empty resolved model string is explicit suppress → strip params model so
+	// the vendor default wins (do not treat the same as unset/nil).
 	emptyModel := ""
-	emptyKeep := ParamsForRoleVendor(params, &global, config.AgentVendorCodex, &emptyModel)
-	emptyJoined := strings.Join(stringArgs(emptyKeep["args"]), " ")
-	if !strings.Contains(emptyJoined, "params-model") {
-		t.Fatalf("empty-model same-vendor args = %q, want params model preserved", emptyJoined)
+	emptyStrip := ParamsForRoleVendor(params, &global, config.AgentVendorCodex, &emptyModel)
+	emptyJoined := strings.Join(stringArgs(emptyStrip["args"]), " ")
+	if strings.Contains(emptyJoined, "params-model") || strings.Contains(emptyJoined, "--model") {
+		t.Fatalf("empty-model same-vendor args = %q, want model flags stripped for suppress", emptyJoined)
+	}
+	if !strings.Contains(emptyJoined, "exec") || !strings.Contains(emptyJoined, "--sandbox") {
+		t.Fatalf("empty-model same-vendor args = %q, want non-model args preserved", emptyJoined)
 	}
 
 	// Diverged role vendor: drop command + all args (vendor-shaped); keep other keys.
@@ -146,6 +150,32 @@ func TestParamsForRoleVendorSameVendorPreservesParamsModelWhenNoResolvedModel(t 
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "params-model") {
 		t.Fatalf("args = %q, want params model preserved when no resolved model", joined)
+	}
+	if !strings.Contains(joined, "--sandbox") {
+		t.Fatalf("args = %q, want same-vendor non-model args preserved", joined)
+	}
+}
+
+func TestParamsForRoleVendorSameVendorEmptyModelSuppressesParamsModelFlag(t *testing.T) {
+	t.Parallel()
+
+	global := config.AgentVendorCodex
+	emptyModel := ""
+	params := map[string]any{
+		"args": []any{"exec", "--model", "params-model", "--sandbox", "workspace-write"},
+	}
+	cfg := ExecutorConfig{
+		Vendor: config.AgentVendorCodex,
+		Model:  &emptyModel,
+		Params: ParamsForRoleVendor(params, &global, config.AgentVendorCodex, &emptyModel),
+	}
+	_, args := ResolveSpawn(cfg, "/tmp/wt", "hello")
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "params-model") {
+		t.Fatalf("args = %q, want params model stripped so vendor default wins", joined)
+	}
+	if strings.Contains(joined, "--model") || strings.Contains(joined, "-m") {
+		t.Fatalf("args = %q, want no model flags after empty-model suppress", joined)
 	}
 	if !strings.Contains(joined, "--sandbox") {
 		t.Fatalf("args = %q, want same-vendor non-model args preserved", joined)
