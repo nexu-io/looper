@@ -1194,6 +1194,79 @@ describe("ConfigPage", () => {
     expect(JSON.stringify(body)).not.toMatch(/params/i);
   });
 
+  it("retains cleared role profile draft so Save sends unset", async () => {
+    // Clearing the text control stages only an unset (no set). onDraft must
+    // keep the empty draft; otherwise the field snaps back and Save is a no-op.
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      roles: {
+        worker: {
+          agent: { profile: "fast", vendor: "claude-code", model: "haiku" },
+        },
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "roles.worker.agent.profile": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    const profileInput = (await screen.findByLabelText(
+      "roles.worker.agent.profile",
+    )) as HTMLInputElement;
+    expect(profileInput.value).toBe("fast");
+    fireEvent.change(profileInput, { target: { value: "" } });
+    // Empty draft must stick (not snap back to published "fast").
+    expect(profileInput.value).toBe("");
+    expect(screen.getByText(/1\s*pending/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    // Unsetting a role profile is high-impact.
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({});
+    expect(body.unset).toEqual(["roles.worker.agent.profile"]);
+  });
+
   it("keeps profile controls editable when map container metadata is restart-bound", async () => {
     // Mirrors real daemon metadata: agent.profiles is a non-editable map
     // container while entry/leaf paths remain hot-editable.

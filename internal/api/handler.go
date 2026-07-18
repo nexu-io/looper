@@ -5396,8 +5396,15 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			}
 		}
 
-		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingRoleAgentConfigured(h.effectiveConfig(), loop.Type) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
+		// Live vendor may have been removed while a coding loop was parked
+		// (HITL awaiting_human, pause, etc.). Allow requeue when the latest
+		// failed/interrupted run still carries a frozen agent_snapshot_json —
+		// same sticky identity rule as retryLoop — so deliverHumanAnswer and
+		// /start can resume without reconfiguring a live role agent.
+		if status == domain.LoopStatusRunning {
+			if err := h.assertCodingRoleResumeAgent(ctx, repos, *loop, "start"); err != nil {
+				return storage.LoopRecord{}, err
+			}
 		}
 		if status == domain.LoopStatusRunning && loop.Type == string(domain.LoopTypeReviewer) && isTerminalReviewerLoopRecord(*loop) {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start terminal reviewer loop: %s", loop.ID)}
@@ -7225,8 +7232,16 @@ func isCodingRoleAgentConfigured(cfg config.Config, role string) bool {
 
 // assertCodingRoleRetryAgent allows sticky retries after vendor removal when the
 // predecessor failed/interrupted run still carries a durable agent_snapshot_json.
-// New loops without a live ResolveAgent identity remain blocked at create/start.
+// New loops without a live ResolveAgent identity remain blocked at create.
 func (h *Handler) assertCodingRoleRetryAgent(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) error {
+	return h.assertCodingRoleResumeAgent(ctx, repos, loop, "retry")
+}
+
+// assertCodingRoleResumeAgent gates coding-role requeue (retry, /start, HITL
+// deliverHumanAnswer → mutateLoopStatus Running). Live config.agent / roles.*.agent
+// vendor is preferred; otherwise a failed/interrupted predecessor run with a
+// parseable agent_snapshot_json vendor is enough for sticky continuation.
+func (h *Handler) assertCodingRoleResumeAgent(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, action string) error {
 	switch loop.Type {
 	case string(domain.LoopTypeReviewer), string(domain.LoopTypeFixer), string(domain.LoopTypeWorker), string(domain.LoopTypePlanner):
 	default:
@@ -7249,7 +7264,10 @@ func (h *Handler) assertCodingRoleRetryAgent(ctx context.Context, repos *storage
 			}
 		}
 	}
-	return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
+	if strings.TrimSpace(action) == "" {
+		action = "start"
+	}
+	return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot %s %s loop without config.agent.vendor", action, loop.Type)}
 }
 
 func urlPathSegment(parts []string, index int) (string, error) {

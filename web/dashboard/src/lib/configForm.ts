@@ -492,6 +492,10 @@ export function buildConfigPatch(
     // validateRoleAgentBindings rejects empty profile when sibling vendor/model
     // keeps the role agent object alive. Model empty-string suppress is not
     // staged from the text control; use Unset or an explicit future control.
+    //
+    // Callers that probe single-path drafts (Config onDraft / rebase) must treat
+    // an unset-only result as a staged change via draftStagesConfigChange so
+    // empty drafts are retained until Save — otherwise the field snaps back.
     if (
       parsed.value === "" &&
       (isAgentProfileLeafPath(path) || isRoleAgentLeafPath(path)) &&
@@ -519,6 +523,29 @@ export function buildConfigPatch(
     body: { revision: data.metadata.revision, set, unset: [...unset].sort() },
     errors,
   };
+}
+
+/**
+ * Whether a single-path draft would stage a set, unset (including whole-profile
+ * collapse of the last profile leaf), or validation error. Used by Config onDraft
+ * and pending-rebase reconciliation so unset-only empty profile/role drafts are
+ * retained instead of discarded when buildConfigPatch emits no set/error.
+ */
+export function draftStagesConfigChange(
+  data: ConfigData,
+  path: string,
+  draft: ConfigDraft,
+): boolean {
+  const candidate = buildConfigPatch(data, { [path]: draft }, []);
+  if (Object.hasOwn(candidate.errors, path)) return true;
+  if (Object.hasOwn(candidate.body.set, path)) return true;
+  if (candidate.body.unset.includes(path)) return true;
+  // Dual empty profile leaves collapse to agent.profiles.<id> unset.
+  if (isAgentProfileLeafPath(path)) {
+    const wholePath = path.replace(/\.(vendor|model)$/, "");
+    if (candidate.body.unset.includes(wholePath)) return true;
+  }
+  return false;
 }
 
 /**

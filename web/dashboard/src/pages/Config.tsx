@@ -29,6 +29,7 @@ import {
   configFieldPaths,
   configSelectOptions,
   draftFromValue,
+  draftStagesConfigChange,
   getConfigValue,
   highImpactChanges,
   isAgentProfileLeafPath,
@@ -1076,11 +1077,8 @@ function reconcilePendingAfterRebase(
       noLongerEditable += 1;
       continue;
     }
-    const candidate = buildConfigPatch(next, { [path]: draft }, []);
-    if (
-      !Object.hasOwn(candidate.body.set, path) &&
-      !Object.hasOwn(candidate.errors, path)
-    ) {
+    // Include unset-only empty profile/role drafts (no set/error).
+    if (!draftStagesConfigChange(next, path, draft)) {
       matchedPublished += 1;
       continue;
     }
@@ -1262,11 +1260,10 @@ export function ConfigPage() {
       retireLoad();
       setDrafts((current) => {
         if (data) {
-          const candidate = buildConfigPatch(data, { [path]: value }, []);
-          if (
-            !Object.hasOwn(candidate.body.set, path) &&
-            !Object.hasOwn(candidate.errors, path)
-          ) {
+          // Retain empty profile/role .model/.profile drafts that stage only an
+          // unset (no set/error). Dropping them snaps the control back and
+          // leaves Save with no unset until the separate Unset button is used.
+          if (!draftStagesConfigChange(data, path, value)) {
             if (!Object.hasOwn(current, path)) return current;
             const next = { ...current };
             delete next[path];

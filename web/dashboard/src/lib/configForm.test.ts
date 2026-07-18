@@ -7,6 +7,7 @@ import {
   configFieldErrors,
   configFieldPaths,
   configSelectOptions,
+  draftStagesConfigChange,
   highImpactChanges,
   roleAgentPath,
 } from "./configForm";
@@ -341,6 +342,29 @@ describe("config form contract", () => {
     expect(result.errors).toEqual({});
     expect(result.body.set).toEqual({});
     expect(result.body.unset).toEqual(["roles.worker.agent.profile"]);
+  });
+
+  it("draftStagesConfigChange keeps unset-only empty role and profile drafts", () => {
+    const data = fixture();
+    // Empty role profile/model: only unset, no set/error — onDraft must still
+    // retain the draft so Save can send the unset.
+    expect(
+      draftStagesConfigChange(data, "roles.worker.agent.profile", ""),
+    ).toBe(true);
+    expect(draftStagesConfigChange(data, "roles.worker.agent.model", "")).toBe(
+      true,
+    );
+    expect(
+      draftStagesConfigChange(data, "agent.profiles.fast.model", ""),
+    ).toBe(true);
+    // Clearing a model that is already absent is a no-op.
+    expect(
+      draftStagesConfigChange(data, "roles.planner.agent.model", ""),
+    ).toBe(false);
+    // Non-empty change still stages.
+    expect(
+      draftStagesConfigChange(data, "roles.worker.agent.profile", "other"),
+    ).toBe(true);
   });
 
   it("promotes dual profile leaf unsets to whole-profile removal", () => {
