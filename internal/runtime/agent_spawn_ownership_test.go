@@ -439,6 +439,119 @@ func TestBeginLoopStopPropagatesDrainFailure(t *testing.T) {
 	}
 }
 
+// BeginRebind must refuse after BeginLoopStop so fallback cannot Start a second
+// process that stop already finished draining.
+func TestBeginRebindRefusesWhenLoopStopping(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-rebind-refuse", RunID: "run-rr", ExecutionID: "exec-rr",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	sl, ok := lease.(*spawnLease)
+	if !ok {
+		t.Fatalf("lease type %T, want *spawnLease", lease)
+	}
+	if _, err := reg.BeginLoopStop("loop-rebind-refuse", "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
+	if err := sl.BeginRebind(); !errors.Is(err, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("BeginRebind error = %v, want ErrSpawnLoopStopping", err)
+	}
+}
+
+// BeginLoopStop must wait for an in-flight BeginRebind window so stop cannot
+// return while fallback has started a process not yet refused/killed by RebindHandle.
+func TestBeginLoopStopWaitsForInFlightRebind(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
+
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-rebind-wait", RunID: "run-rw", ExecutionID: "exec-rw",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	sl, ok := lease.(*spawnLease)
+	if !ok {
+		t.Fatalf("lease type %T, want *spawnLease", lease)
+	}
+
+	// Bind an initial handle so the lease is active (production path).
+	cmd1 := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd1)
+	if err := cmd1.Start(); err != nil {
+		t.Fatalf("cmd1.Start: %v", err)
+	}
+	handle1, err := processcontainment.Bind(cmd1, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd1.Process.Kill()
+		t.Fatalf("Bind1: %v", err)
+	}
+	if err := lease.BindHandle(handle1, func(string) error { return nil }); err != nil {
+		t.Fatalf("BindHandle: %v", err)
+	}
+
+	if err := sl.BeginRebind(); err != nil {
+		t.Fatalf("BeginRebind: %v", err)
+	}
+
+	// Fallback process started while rebind is admitted; not yet in registry.
+	cmd2 := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd2)
+	if err := cmd2.Start(); err != nil {
+		t.Fatalf("cmd2.Start: %v", err)
+	}
+	handle2, err := processcontainment.Bind(cmd2, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd2.Process.Kill()
+		t.Fatalf("Bind2: %v", err)
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := reg.BeginLoopStop("loop-rebind-wait", "looper stop")
+		stopDone <- err
+	}()
+
+	// Give BeginLoopStop time to set the gate and start waiting on rebindDone.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-stopDone:
+		t.Fatalf("BeginLoopStop returned early before RebindHandle: %v", err)
+	default:
+	}
+
+	rebindErr := sl.RebindHandle(handle2, func(string) error { return nil })
+	if !errors.Is(rebindErr, agent.ErrSpawnStoppedDuringBind) {
+		t.Fatalf("RebindHandle = %v, want ErrSpawnStoppedDuringBind", rebindErr)
+	}
+	if !handle2.ConfirmedDead() {
+		t.Fatal("fallback handle not confirmed-dead after refused RebindHandle")
+	}
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("BeginLoopStop error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BeginLoopStop did not return after rebind window ended")
+	}
+	if !handle1.ConfirmedDead() {
+		t.Fatal("original handle not drained by BeginLoopStop")
+	}
+}
+
 func TestConcurrentStopAndSpawnLinearized(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()

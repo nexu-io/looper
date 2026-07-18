@@ -846,6 +846,29 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		}
 	}
 
+	// Atomic rebind admission with the Supervisor registry: BeginRebind under
+	// the registry lock, then Start/Bind/RebindHandle. BeginLoopStop waits for
+	// this window so stop cannot return while a second process is live outside
+	// the registry between Start and RebindHandle.
+	type rebindLease interface {
+		BeginRebind() error
+		AbortRebind()
+		RebindHandle(*processcontainment.Handle, SoftKillFunc) error
+	}
+	var rebind rebindLease
+	if x.lease != nil {
+		if r, ok := x.lease.(rebindLease); ok {
+			if err := r.BeginRebind(); err != nil {
+				return Result{}, "", false
+			}
+			rebind = r
+			defer func() {
+				// No-op if RebindHandle already ended the window.
+				rebind.AbortRebind()
+			}()
+		}
+	}
+
 	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
@@ -903,19 +926,13 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.mu.Lock()
 	x.handle = handle
 	x.mu.Unlock()
-	if x.lease != nil {
+	if rebind != nil {
 		// Re-bind so haltLoop finds the live fallback process. Prior entry was
 		// released only on full execution end; update handle in place via a
-		// second BindHandle is not valid (lease left pending). Update registry
-		// through SoftKill path: re-register by calling BindHandle on a fresh
-		// rebind helper when available.
-		if rebind, ok := x.lease.(interface {
-			RebindHandle(*processcontainment.Handle, SoftKillFunc) error
-		}); ok {
-			if err := rebind.RebindHandle(handle, x.Kill); err != nil {
-				_ = handle.Kill(context.Background())
-				return Result{}, "", false
-			}
+		// second BindHandle is not valid (lease left pending).
+		if err := rebind.RebindHandle(handle, x.Kill); err != nil {
+			_ = handle.Kill(context.Background())
+			return Result{}, "", false
 		}
 	}
 

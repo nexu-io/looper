@@ -95,6 +95,12 @@ type spawnLease struct {
 	released bool
 	handle   *processcontainment.Handle
 	softKill agent.SoftKillFunc
+
+	// rebinding is true between BeginRebind and RebindHandle/AbortRebind.
+	// BeginLoopStop/BeginShutdown wait on rebindDone so stop cannot return
+	// while native-resume fallback has a live process not yet in the registry.
+	rebinding  bool
+	rebindDone chan struct{}
 }
 
 func (l *spawnLease) Context() context.Context {
@@ -160,9 +166,68 @@ func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agen
 	return nil
 }
 
+// BeginRebind admits a native-resume fallback re-spawn under the registry lock.
+// Call before cmd.Start; pair with RebindHandle (after bind) or AbortRebind
+// (start/bind failure). BeginLoopStop waits for in-flight rebind windows so
+// stop cannot return while a second process is live outside the registry.
+func (l *spawnLease) BeginRebind() error {
+	if l == nil {
+		return agent.ErrSpawnAdmissionClosed
+	}
+	r := l.registry
+	if r == nil {
+		return agent.ErrSpawnAdmissionClosed
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l.released {
+		return agent.ErrSpawnAdmissionClosed
+	}
+	if l.rebinding {
+		return errors.New("agent spawn: rebind already in progress")
+	}
+	closing := r.admissionClosed
+	stopping := l.meta.LoopID != "" && r.stoppingLoops[l.meta.LoopID] > 0
+	if closing {
+		return agent.ErrSpawnAdmissionClosed
+	}
+	if stopping {
+		return agent.ErrSpawnLoopStopping
+	}
+	if err := l.ctx.Err(); err != nil {
+		return agent.ErrSpawnLoopStopping
+	}
+	l.rebinding = true
+	l.rebindDone = make(chan struct{})
+	return nil
+}
+
+// AbortRebind ends a BeginRebind window without publishing a new handle
+// (cmd.Start / processcontainment.Bind failure). Safe after RebindHandle.
+func (l *spawnLease) AbortRebind() {
+	if l == nil || l.registry == nil {
+		return
+	}
+	r := l.registry
+	r.mu.Lock()
+	l.endRebindLocked()
+	r.mu.Unlock()
+}
+
+func (l *spawnLease) endRebindLocked() {
+	if !l.rebinding {
+		return
+	}
+	l.rebinding = false
+	if l.rebindDone != nil {
+		close(l.rebindDone)
+		l.rebindDone = nil
+	}
+}
+
 // RebindHandle replaces the live containment handle after native-resume
 // fallback starts a second process. The prior handle must already have been
-// waited/reaped by the executor run loop.
+// waited/reaped by the executor run loop. Ends a BeginRebind window.
 func (l *spawnLease) RebindHandle(handle *processcontainment.Handle, softKill agent.SoftKillFunc) error {
 	if l == nil {
 		return agent.ErrSpawnAdmissionClosed
@@ -176,12 +241,14 @@ func (l *spawnLease) RebindHandle(handle *processcontainment.Handle, softKill ag
 	}
 	r.mu.Lock()
 	if l.released {
+		l.endRebindLocked()
 		r.mu.Unlock()
 		return l.killUnowned(handle, agent.ErrSpawnAdmissionClosed)
 	}
 	closing := r.admissionClosed
 	stopping := r.stoppingLoops[l.meta.LoopID] > 0 && l.meta.LoopID != ""
 	if closing || stopping {
+		l.endRebindLocked()
 		r.mu.Unlock()
 		l.cancel(agent.ErrSpawnStoppedDuringBind)
 		return l.killUnowned(handle, agent.ErrSpawnStoppedDuringBind)
@@ -206,6 +273,7 @@ func (l *spawnLease) RebindHandle(handle *processcontainment.Handle, softKill ag
 		l.softKill = softKill
 	}
 	l.mu.Unlock()
+	l.endRebindLocked()
 	r.mu.Unlock()
 	return nil
 }
@@ -245,6 +313,7 @@ func (l *spawnLease) Release() {
 		return
 	}
 	r.mu.Lock()
+	l.endRebindLocked()
 	delete(r.pending, l.id)
 	delete(r.active, l.id)
 	key := activeExecutionKey(l.meta.LoopID, l.meta.RunID, l.meta.ExecutionID)
@@ -347,14 +416,21 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
 	toCancel := make([]*spawnLease, 0)
+	rebindWait := make([]<-chan struct{}, 0)
 	for _, lease := range r.pending {
 		if lease.meta.LoopID == loopID {
 			toCancel = append(toCancel, lease)
+			if lease.rebinding && lease.rebindDone != nil {
+				rebindWait = append(rebindWait, lease.rebindDone)
+			}
 		}
 	}
 	for _, lease := range r.active {
 		if lease.meta.LoopID == loopID {
 			toCancel = append(toCancel, lease)
+			if lease.rebinding && lease.rebindDone != nil {
+				rebindWait = append(rebindWait, lease.rebindDone)
+			}
 		}
 	}
 	// Only drain entries with a containment handle. SoftKill-only Register
@@ -383,6 +459,34 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	for _, entry := range toKill {
 		if killErr := r.killOwned(entry, reason); killErr != nil {
 			drainErr = errors.Join(drainErr, killErr)
+		}
+	}
+	// Wait for native-resume fallback rebind windows that admitted before we
+	// set stopping. RebindHandle will refuse+kill once it sees the gate; we
+	// must not return until that window ends and re-drain any published handle.
+	budget := r.killBudget()
+	for _, done := range rebindWait {
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-time.After(budget):
+		}
+	}
+	if len(rebindWait) > 0 {
+		r.mu.Lock()
+		second := make([]*ownedExecution, 0)
+		for _, entry := range r.executions {
+			if entry != nil && entry.loopID == loopID && entry.handle != nil {
+				second = append(second, entry)
+			}
+		}
+		r.mu.Unlock()
+		for _, entry := range second {
+			if killErr := r.killOwned(entry, reason); killErr != nil {
+				drainErr = errors.Join(drainErr, killErr)
+			}
 		}
 	}
 	var once sync.Once
@@ -433,11 +537,18 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		r.shutdownReason = reason
 	}
 	toCancel := make([]*spawnLease, 0, len(r.pending)+len(r.active))
+	rebindWait := make([]<-chan struct{}, 0)
 	for _, lease := range r.pending {
 		toCancel = append(toCancel, lease)
+		if lease.rebinding && lease.rebindDone != nil {
+			rebindWait = append(rebindWait, lease.rebindDone)
+		}
 	}
 	for _, lease := range r.active {
 		toCancel = append(toCancel, lease)
+		if lease.rebinding && lease.rebindDone != nil {
+			rebindWait = append(rebindWait, lease.rebindDone)
+		}
 	}
 	entries := make([]*ownedExecution, 0, len(r.executions))
 	for _, entry := range r.executions {
@@ -454,6 +565,29 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 	}
 	for _, entry := range entries {
 		_ = r.killOwned(entry, reason)
+	}
+	budget := r.killBudget()
+	for _, done := range rebindWait {
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-time.After(budget):
+		}
+	}
+	if len(rebindWait) > 0 {
+		r.mu.Lock()
+		second := make([]*ownedExecution, 0, len(r.executions))
+		for _, entry := range r.executions {
+			if entry != nil && entry.handle != nil {
+				second = append(second, entry)
+			}
+		}
+		r.mu.Unlock()
+		for _, entry := range second {
+			_ = r.killOwned(entry, reason)
+		}
 	}
 }
 

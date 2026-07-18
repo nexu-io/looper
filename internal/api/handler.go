@@ -5963,6 +5963,13 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		loop        storage.LoopRecord
 		queueItemID *string
 	}
+	// Clear the sticky stop gate before the queue item becomes claimable.
+	// Clearing after the TX commit races a concurrent scheduler tick that can
+	// claim the new item, pass the parked check (loop is queued), then fail
+	// AgentExecutor.Start with ErrSpawnLoopStopping and back off the retry.
+	if services.ActiveExecutions != nil {
+		services.ActiveExecutions.ClearLoopStop(loopID)
+	}
 	result, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (retryResult, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -6062,10 +6069,6 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, typed
 		}
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
-	}
-	// Retry/handback intentionally re-arms the loop after durable stop.
-	if services.ActiveExecutions != nil {
-		services.ActiveExecutions.ClearLoopStop(loopID)
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
