@@ -12,12 +12,16 @@ func TestEffectiveConfigUsesSnapshotOverrides(t *testing.T) {
 
 	configModel := "config-model"
 	snapshotModel := "snapshot-model"
-	executor := New(ExecutorOptions{Config: ExecutorConfig{
-		Vendor: config.AgentVendorClaudeCode,
-		Model:  &configModel,
-		Params: map[string]any{"args": []any{"--print"}},
-		Env:    map[string]string{"KEEP": "1"},
-	}})
+	owner := config.AgentVendorClaudeCode
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{
+			Vendor: config.AgentVendorClaudeCode,
+			Model:  &configModel,
+			Params: map[string]any{"args": []any{"--print"}},
+			Env:    map[string]string{"KEEP": "1"},
+		},
+		ParamsOwnerVendor: &owner,
+	})
 
 	// No snapshot: keep executor config.
 	got := executor.effectiveConfig(RunInput{})
@@ -67,16 +71,21 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 
 	configModel := "config-model"
 	snapshotModel := "frozen-model"
-	executor := New(ExecutorOptions{Config: ExecutorConfig{
-		Vendor: config.AgentVendorClaudeCode,
-		Model:  &configModel,
-		Params: map[string]any{
-			"command": "custom-agent-bin",
-			"args":    []any{"--model", "params-model", "--print", "-m", "also-params", "--other"},
+	owner := config.AgentVendorClaudeCode
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{
+			Vendor: config.AgentVendorClaudeCode,
+			Model:  &configModel,
+			Params: map[string]any{
+				"command": "custom-agent-bin",
+				"args":    []any{"--model", "params-model", "--print", "-m", "also-params", "--other"},
+			},
 		},
-	}})
+		ParamsOwnerVendor: &owner,
+	})
 
-	// Without snapshot: command/args params still apply.
+	// Without snapshot, same-vendor owner: command/args params still apply;
+	// resolved model strips params model flags.
 	got := executor.effectiveConfig(RunInput{})
 	if cmd := resolveCommand(got); cmd != "custom-agent-bin" {
 		t.Fatalf("resolveCommand(no snapshot) = %q, want custom-agent-bin", cmd)
@@ -86,11 +95,11 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 		t.Fatalf("command(no snapshot) = %q, want custom-agent-bin", command)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "params-model") {
-		t.Fatalf("args(no snapshot) = %q, want params model flag preserved", joined)
+	if strings.Contains(joined, "params-model") {
+		t.Fatalf("args(no snapshot) = %q, want params model stripped when role model set", joined)
 	}
 
-	// Snapshot vendor differs from executor: strip command + all vendor-owned args.
+	// Snapshot vendor differs from owner: strip command + all vendor-owned args.
 	got = executor.effectiveConfig(RunInput{
 		UseSnapshot:    true,
 		SnapshotVendor: string(config.AgentVendorCodex),
@@ -117,7 +126,7 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 		t.Fatalf("args(snapshot) = %q, want frozen model", joined)
 	}
 
-	// Same vendor as executor: keep params.command wrapper, still strip model flags.
+	// Same vendor as owner: keep params.command wrapper, still strip model flags.
 	got = executor.effectiveConfig(RunInput{
 		UseSnapshot:    true,
 		SnapshotVendor: string(config.AgentVendorClaudeCode),
@@ -141,6 +150,55 @@ func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 	// Original executor params must not be mutated.
 	if _, ok := executor.config.Params["command"]; !ok {
 		t.Fatal("executor config params.command was mutated")
+	}
+}
+
+func TestEffectiveConfigNilOwnerStripsVendorOwnedParams(t *testing.T) {
+	t.Parallel()
+
+	// Global agent.vendor unset (nil owner) but role resolves to Claude; leftover
+	// Codex wrappers in agent.params must not launch under the role vendor.
+	roleModel := "role-claude"
+	params := map[string]any{
+		"command": "/opt/codex-wrapper",
+		"args":    []any{"exec", "--model", "params-model", "--sandbox", "workspace-write"},
+		"keep":    "yes",
+	}
+	executor := New(ExecutorOptions{Config: ExecutorConfig{
+		Vendor: config.AgentVendorClaudeCode,
+		Model:  &roleModel,
+		Params: params,
+	}})
+
+	got := executor.effectiveConfig(RunInput{})
+	if _, ok := got.Params["command"]; ok {
+		t.Fatalf("nil owner still has command: %#v", got.Params)
+	}
+	if _, ok := got.Params["args"]; ok {
+		t.Fatalf("nil owner still has args: %#v", got.Params)
+	}
+	if got.Params["keep"] != "yes" {
+		t.Fatalf("nil owner dropped non-identity param: %#v", got.Params)
+	}
+	if cmd := resolveCommand(got); cmd != "claude" {
+		t.Fatalf("resolveCommand(nil owner) = %q, want claude", cmd)
+	}
+
+	// Snapshot path with nil owner also strips vendor-owned wrappers.
+	snapshotModel := "frozen-claude"
+	got = executor.effectiveConfig(RunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorClaudeCode),
+		SnapshotModel:  &snapshotModel,
+	})
+	if _, ok := got.Params["command"]; ok {
+		t.Fatalf("nil owner snapshot still has command: %#v", got.Params)
+	}
+	if cmd := resolveCommand(got); cmd != "claude" {
+		t.Fatalf("resolveCommand(nil owner snapshot) = %q, want claude", cmd)
+	}
+	if params["command"] != "/opt/codex-wrapper" {
+		t.Fatal("effectiveConfig mutated shared global params.command")
 	}
 }
 

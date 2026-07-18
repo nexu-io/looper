@@ -413,12 +413,14 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 
 	// Shared executor config deliberately omits the sock — only the reviewer
 	// adapter may inject LOOPER_TRUSTED_REVIEW_SOCK for review-submit capability.
+	customVendor := config.AgentVendor("custom")
 	executor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
-			Vendor: config.AgentVendor("custom"),
+			Vendor: customVendor,
 			Params: map[string]any{"command": scriptPath},
 			Env:    map[string]string{"SHARED": "1"},
 		},
+		ParamsOwnerVendor: &customVendor,
 	})
 	nativeCfg := &config.Config{
 		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},

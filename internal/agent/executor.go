@@ -100,12 +100,13 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
-	// ParamsOwnerVendor, when set, marks Config.Params as global agent.params
-	// owned by that vendor (typically agent.vendor). effectiveConfig then filters
-	// command/args against the effective identity (role or sticky snapshot) so
-	// cross-vendor roles strip wrappers while snapshot retries that restore the
-	// owner vendor keep them. When nil, Params are treated as already bound to
-	// Config.Vendor (tests and callers that pre-filter).
+	// ParamsOwnerVendor marks Config.Params as global agent.params owned by that
+	// vendor (typically agent.vendor). effectiveConfig always filters command/args
+	// via ParamsForRoleVendor against the effective identity (role or sticky
+	// snapshot): matching owner keeps wrappers, diverged or nil owner strips
+	// vendor-owned command/args so orphan global wrappers cannot ride a role-only
+	// vendor. Tests that intentionally pre-bind params.command should set the
+	// owner to Config.Vendor so the same-vendor path preserves them.
 	ParamsOwnerVendor *config.AgentVendor
 	// Owner, when set, admits every agent spawn under the Execution Supervisor
 	// before cmd.Start and binds the process containment handle before Start
@@ -238,7 +239,6 @@ type nativeResumeInfo struct {
 // snapshot identity overrides when UseSnapshot is set.
 func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 	cfg := e.config
-	baseVendor := cfg.Vendor
 
 	if input.UseSnapshot {
 		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
@@ -247,27 +247,14 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 		}
 	}
 
-	// When Params are global agent.params owned by paramsOwner, filter against
-	// the effective identity (role vendor or sticky snapshot). Construction must
-	// not pre-strip against the live role alone: a failed Codex run that still
-	// owns params.command would otherwise lose its wrapper after the role is
-	// hot-switched and sticky retry restores the snapshot vendor.
-	if e.paramsOwner != nil {
-		cfg.Params = ParamsForRoleVendor(e.config.Params, e.paramsOwner, cfg.Vendor, cfg.Model)
-		return cfg
-	}
-
-	if !input.UseSnapshot {
-		return cfg
-	}
-	if strings.TrimSpace(input.SnapshotVendor) != "" {
-		// Pre-bound params (no paramsOwner): keep wrappers only when snapshot
-		// vendor matches the executor base vendor; drop command+args when
-		// identity diverges so a foreign params.command cannot launch the wrong
-		// binary. Model flags are stripped so SnapshotModel wins.
-		stripVendorOwned := cfg.Vendor != baseVendor
-		cfg.Params = cloneParamsForSnapshot(e.config.Params, stripVendorOwned)
-	}
+	// Always filter global agent.params against the effective identity (role
+	// vendor or sticky snapshot). Construction must not pre-strip against the
+	// live role alone: a failed Codex run that still owns params.command would
+	// otherwise lose its wrapper after the role is hot-switched and sticky
+	// retry restores the snapshot vendor. Nil paramsOwner (agent.vendor unset)
+	// still runs ParamsForRoleVendor so orphan command/args cannot launch the
+	// wrong binary for a role-only vendor.
+	cfg.Params = ParamsForRoleVendor(e.config.Params, e.paramsOwner, cfg.Vendor, cfg.Model)
 	return cfg
 }
 

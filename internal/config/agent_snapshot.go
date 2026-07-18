@@ -24,12 +24,16 @@ func AgentSnapshotFromResolved(r ResolvedAgent) AgentSnapshot {
 }
 
 // AgentSnapshotFromIdentity builds a snapshot from frozen runner identity fields.
-func AgentSnapshotFromIdentity(vendor, model, profileID string) AgentSnapshot {
+// model is a pointer so nil (unset) and non-nil empty (explicit suppress to the
+// vendor default) stay distinct through freeze; collapsing empty to omitempty
+// nil would make ParamsForRoleVendor preserve params --model/-m on thaw.
+func AgentSnapshotFromIdentity(vendor string, model *string, profileID string) AgentSnapshot {
 	snapshot := AgentSnapshot{
 		Vendor:    strings.TrimSpace(vendor),
 		ProfileID: strings.TrimSpace(profileID),
 	}
-	if trimmed := strings.TrimSpace(model); trimmed != "" {
+	if model != nil {
+		trimmed := strings.TrimSpace(*model)
 		snapshot.Model = &trimmed
 	}
 	return snapshot
@@ -63,9 +67,10 @@ func ParseAgentSnapshot(raw string) (AgentSnapshot, error) {
 // copied so identity stays sticky across the retry lineage, but only after
 // parse + non-empty vendor validation (invalid predecessor fails loudly).
 // Otherwise the snapshot is built from the runner's frozen vendor/model/profile.
+// model is a pointer so explicit empty suppress survives freeze.
 // legacyResume is true when continuing a predecessor that had no snapshot (pre-migration).
 // Marshal failures return an error so callers can fail run creation loudly.
-func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendor, model, profileID string) (snapshotJSON *string, legacyResume bool, err error) {
+func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendor string, model *string, profileID string) (snapshotJSON *string, legacyResume bool, err error) {
 	if sticky {
 		if predecessorSnapshot != nil {
 			if trimmed := strings.TrimSpace(*predecessorSnapshot); trimmed != "" {
@@ -100,23 +105,24 @@ func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendo
 // vendor, return an error (do not fall back to live identity).
 // Only empty/null snapshots fall back to the runner's frozen identity
 // (fromSnapshot=false) for pre-migration legacy runs.
-func IdentityFromRunSnapshot(snapshotJSON *string, fallbackVendor, fallbackModel, fallbackProfile string) (vendor, model, profile string, fromSnapshot bool, err error) {
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func IdentityFromRunSnapshot(snapshotJSON *string, fallbackVendor string, fallbackModel *string, fallbackProfile string) (vendor string, model *string, profile string, fromSnapshot bool, err error) {
 	fallbackVendor = strings.TrimSpace(fallbackVendor)
-	fallbackModel = strings.TrimSpace(fallbackModel)
 	fallbackProfile = strings.TrimSpace(fallbackProfile)
 	if snapshotJSON == nil || strings.TrimSpace(*snapshotJSON) == "" {
 		return fallbackVendor, fallbackModel, fallbackProfile, false, nil
 	}
 	snapshot, parseErr := ParseAgentSnapshot(*snapshotJSON)
 	if parseErr != nil {
-		return "", "", "", false, parseErr
+		return "", nil, "", false, parseErr
 	}
 	vendor = strings.TrimSpace(snapshot.Vendor)
 	if vendor == "" {
-		return "", "", "", false, fmt.Errorf("agent snapshot missing vendor")
+		return "", nil, "", false, fmt.Errorf("agent snapshot missing vendor")
 	}
 	if snapshot.Model != nil {
-		model = strings.TrimSpace(*snapshot.Model)
+		m := strings.TrimSpace(*snapshot.Model)
+		model = &m
 	}
 	profile = strings.TrimSpace(snapshot.ProfileID)
 	return vendor, model, profile, true, nil

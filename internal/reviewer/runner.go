@@ -524,7 +524,7 @@ type Runner struct {
 	criteriaVerifier        criteria.Verifier
 	agentRuntime            string
 	agentProfileID          string
-	agentModel              string
+	agentModel              *string
 	looperCLIPath           string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -764,7 +764,7 @@ func New(options Options) *Runner {
 		criteriaVerifier:        options.CriteriaVerifier,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
 		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
-		agentModel:              derefString(options.AgentModel),
+		agentModel:              cloneStringPtr(options.AgentModel),
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
@@ -2851,7 +2851,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, agentModel, r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{
 		"loopType":            "reviewer",
@@ -7055,7 +7055,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 			"loopId": previous.LoopID,
 			"runId":  previous.ID,
 			"vendor": r.agentRuntime,
-			"model":  r.agentModel,
+			"model":  derefString(r.agentModel),
 		})
 	}
 	return snapshotJSON, nil
@@ -7063,7 +7063,8 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor, model, profile string, useSnapshot bool, err error) {
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
 	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 }
 
@@ -7071,26 +7072,32 @@ func (r *Runner) identityFromRun(run storage.RunRecord) (vendor, model, profile 
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, model, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
 	}
-	return vendor, model
+	return vendor, derefString(modelPtr)
 }
 
-func agentRunSnapshotFields(vendor, model string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
 	if !useSnapshot {
 		return false, "", nil
 	}
-	var snapshotModel *string
-	if strings.TrimSpace(model) != "" {
-		snapshotModel = &model
-	}
-	return true, vendor, snapshotModel
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
 }
 
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func derefString(value *string) string {
 	if value == nil {

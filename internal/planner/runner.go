@@ -338,7 +338,7 @@ type Runner struct {
 	agentProfileID          string
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
-	agentModel              string
+	agentModel              *string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -503,7 +503,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -994,7 +994,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, agentModel)
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1446,12 +1446,12 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, model, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
 	}
-	return vendor, model
+	return vendor, derefString(modelPtr)
 }
 
 func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree, pr checkpointPullRequest) error {
@@ -2431,7 +2431,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 			"loopId": previous.LoopID,
 			"runId":  previous.ID,
 			"vendor": r.agentRuntime,
-			"model":  r.agentModel,
+			"model":  derefString(r.agentModel),
 		})
 	}
 	return snapshotJSON, nil
@@ -2439,22 +2439,29 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor, model, profile string, useSnapshot bool, err error) {
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
 	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 }
 
-func agentRunSnapshotFields(vendor, model string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
 	if !useSnapshot {
 		return false, "", nil
 	}
-	var snapshotModel *string
-	if strings.TrimSpace(model) != "" {
-		snapshotModel = &model
-	}
-	return true, vendor, snapshotModel
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
 }
 
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func derefString(value *string) string {
 	if value == nil {

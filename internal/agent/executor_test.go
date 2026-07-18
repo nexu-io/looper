@@ -17,6 +17,31 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func customOwner() *config.AgentVendor {
+	v := config.AgentVendor("custom")
+	return &v
+}
+
+func codexOwner() *config.AgentVendor {
+	v := config.AgentVendorCodex
+	return &v
+}
+
+func grokBuildOwner() *config.AgentVendor {
+	v := config.AgentVendorGrokBuild
+	return &v
+}
+
+func withParamsOwner(cfg ExecutorConfig, owner config.AgentVendor) ExecutorOptions {
+	o := owner
+	return ExecutorOptions{Config: cfg, ParamsOwnerVendor: &o}
+}
+
+func withParamsOwnerRepos(cfg ExecutorConfig, owner config.AgentVendor, repos *storage.Repositories) ExecutorOptions {
+	o := owner
+	return ExecutorOptions{Config: cfg, ParamsOwnerVendor: &o, Repos: repos}
+}
+
 func TestResolveSpawnVendorParity(t *testing.T) {
 	t.Parallel()
 
@@ -237,7 +262,7 @@ func TestExecutorStartSanitizesChildEnvAndUsesWorkingDirectory(t *testing.T) {
 		t.Fatalf("WriteFile(scriptPath) error = %v", err)
 	}
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": scriptPath}}})
+	executor := New(withParamsOwner(ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": scriptPath}}, config.AgentVendor("custom")))
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_env", WorkingDirectory: workDir, Prompt: "ignored", Timeout: 5 * time.Second, Env: map[string]string{"OUTPUT_PATH": outputPath, "PWD": "/tmp/input-override", "GIT_DIR": "/tmp/input-git-dir", "OLDPWD": "/tmp/input-oldpwd"}})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -385,6 +410,7 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 			now = now.Add(10 * time.Millisecond)
 			return now
 		},
+		ParamsOwnerVendor: codexOwner(),
 	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resumed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 15 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
@@ -459,6 +485,7 @@ func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 			now = now.Add(10 * time.Millisecond)
 			return now
 		},
+		ParamsOwnerVendor: codexOwner(),
 	})
 
 	failedExec, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resume_failed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "full checkpoint prompt", NativeResumePrompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
@@ -534,6 +561,7 @@ func TestExecutorNativeResumeFailureAfterAttachDoesNotFallback(t *testing.T) {
 			now = now.Add(10 * time.Millisecond)
 			return now
 		},
+		ParamsOwnerVendor: codexOwner(),
 	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_resume_attached_failed", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 5 * time.Second, Env: map[string]string{"ARGS_PATH": argsPath}})
@@ -615,6 +643,7 @@ func TestExecutorRefusedFallbackRebindSurfacesKilled(t *testing.T) {
 			now = now.Add(10 * time.Millisecond)
 			return now
 		},
+		ParamsOwnerVendor: codexOwner(),
 	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{
@@ -732,6 +761,7 @@ func TestExecutorFallbackTimeoutPropagatesTimeoutTypeToLifecycle(t *testing.T) {
 			now = now.Add(10 * time.Millisecond)
 			return now
 		},
+		ParamsOwnerVendor: codexOwner(),
 	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_fallback_timeout", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: time.Second, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond})
@@ -767,6 +797,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 			now = now.Add(10 * time.Millisecond)
 			return now
 		},
+		ParamsOwnerVendor: customOwner(),
 	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_1", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
@@ -814,7 +845,9 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 func TestExecutorMissingCompletionFallsBackToLastLogLine(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'first\nsecond\n'"}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'first\nsecond\n'"}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_missing", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -831,7 +864,9 @@ func TestExecutorMissingCompletionFallsBackToLastLogLine(t *testing.T) {
 func TestExecutorInvalidJSONCompletionPreservesSignalAndFallsBackToLogs(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'before\n'; printf '__LOOPER_RESULT__={bad json}\n'`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'before\n'; printf '__LOOPER_RESULT__={bad json}\n'`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_invalid", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -848,7 +883,9 @@ func TestExecutorInvalidJSONCompletionPreservesSignalAndFallsBackToLogs(t *testi
 func TestExecutorMalformedLifecycleDoesNotInvalidateCompletion(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"done","commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","pr_number":"84"}}\n'`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"done","commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","pr_number":"84"}}\n'`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_bad_lifecycle", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -865,7 +902,9 @@ func TestExecutorMalformedLifecycleDoesNotInvalidateCompletion(t *testing.T) {
 func TestExecutorParsesNestedLifecycleActionSources(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"done","git_pr_lifecycle":{"branch":"looper/test","baseBranch":"main","prNumber":84,"prUrl":"https://github.com/nexu-io/looper/pull/84","actions":{"commit":{"source":"agent"},"push":{"source":"agent"},"pr":{"source":"agent"}}}}\n'`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"done","git_pr_lifecycle":{"branch":"looper/test","baseBranch":"main","prNumber":84,"prUrl":"https://github.com/nexu-io/looper/pull/84","actions":{"commit":{"source":"agent"},"push":{"source":"agent"},"pr":{"source":"agent"}}}}\n'`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_nested_lifecycle", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -886,7 +925,9 @@ func TestExecutorFailedCommandIgnoresEchoedTemplateCompletion(t *testing.T) {
 	t.Parallel()
 
 	realError := "The 'gpt-5.5' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"<one-sentence summary>"}\n'; printf "$REAL_ERROR\n" >&2; exit 1`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"<one-sentence summary>"}\n'; printf "$REAL_ERROR\n" >&2; exit 1`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_failed_template", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, Env: map[string]string{"REAL_ERROR": realError}})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -1017,7 +1058,9 @@ func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	// Emit several spaced lines so pipe-reader coalescing under parallel CI load
 	// still leaves enough distinct Write chunks for heartbeat progress updates.
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "for i in 1 2 3 4 5 6; do printf \"beat$i\\n\"; sleep 0.15; done"}}}, Repos: repos})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "for i in 1 2 3 4 5 6; do printf \"beat$i\\n\"; sleep 0.15; done"}}}, Repos: repos,
+		ParamsOwnerVendor: customOwner(),
+	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_hb", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 5 * time.Second})
 	if err != nil {
@@ -1038,7 +1081,9 @@ func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 func TestExecutorCapturesConcurrentStdoutAndStderr(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `for i in 1 2 3; do printf "out$i\n"; printf "err$i\n" >&2; sleep 0.02; done`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `for i in 1 2 3; do printf "out$i\n"; printf "err$i\n" >&2; sleep 0.02; done`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_streams", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 3 * time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -1069,7 +1114,9 @@ func TestExecutorCapturesConcurrentStdoutAndStderr(t *testing.T) {
 func TestExecutorBoundsCapturedOutputToTail(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'abcdefgh'; printf '12345678' >&2`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'abcdefgh'; printf '12345678' >&2`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_bounded", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, MaxOutputBytes: 4})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -1096,9 +1143,10 @@ func TestExecutorPersistsHistoricalLogsBeyondMaxOutputBytes(t *testing.T) {
 	fullStdout := strings.Repeat("out-", 16)
 	fullStderr := strings.Repeat("err-", 16)
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf "$FULL_STDOUT"; printf "$FULL_STDERR" >&2`}}},
-		Repos:  repos,
-		LogDir: logDir,
+		Config:            ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf "$FULL_STDOUT"; printf "$FULL_STDERR" >&2`}}},
+		Repos:             repos,
+		LogDir:            logDir,
+		ParamsOwnerVendor: customOwner(),
 	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_persisted_logs", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, MaxOutputBytes: 8, Env: map[string]string{"FULL_STDOUT": fullStdout, "FULL_STDERR": fullStderr}})
@@ -1164,7 +1212,9 @@ func TestExecutorTimeoutMarksTimeout(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 1"}}}, Repos: repos})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 1"}}}, Repos: repos,
+		ParamsOwnerVendor: customOwner(),
+	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 100 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond})
 	if err != nil {
@@ -1183,7 +1233,9 @@ func TestExecutorTimeoutMarksTimeout(t *testing.T) {
 func TestExecutorKillTerminatesChildProcessGroup(t *testing.T) {
 	workDir := t.TempDir()
 	childPIDPath := filepath.Join(workDir, "child.pid")
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `(trap '' TERM; while true; do sleep 1; done) & echo $! > "$CHILD_PID_FILE"; wait`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `(trap '' TERM; while true; do sleep 1; done) & echo $! > "$CHILD_PID_FILE"; wait`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_kill_group", WorkingDirectory: workDir, Prompt: "ignored", Timeout: 5 * time.Second, GracefulShutdown: 20 * time.Millisecond, Env: map[string]string{"CHILD_PID_FILE": childPIDPath}})
 	if err != nil {
@@ -1216,7 +1268,9 @@ func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'beat\n'; sleep 1"}}}, Repos: repos})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "printf 'beat\n'; sleep 1"}}}, Repos: repos,
+		ParamsOwnerVendor: customOwner(),
+	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, HeartbeatTimeout: 50 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond})
 	if err != nil {
@@ -1245,7 +1299,9 @@ func TestExecutorHeartbeatTimeoutMarksTimeout(t *testing.T) {
 func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutdown(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'beat\n'; trap '' TERM; while true; do sleep 0.05; done`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'beat\n'; trap '' TERM; while true; do sleep 0.05; done`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_heartbeat_timeout_grace", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 250 * time.Millisecond, HeartbeatTimeout: 100 * time.Millisecond, GracefulShutdown: 200 * time.Millisecond})
 	if err != nil {
@@ -1269,7 +1325,9 @@ func TestExecutorMaxRuntimeTimeoutIgnoresProgressResets(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "while true; do printf 'beat\n'; sleep 0.03; done"}}}, Repos: repos})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "while true; do printf 'beat\n'; sleep 0.03; done"}}}, Repos: repos,
+		ParamsOwnerVendor: customOwner(),
+	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_max_runtime_timeout", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 300 * time.Millisecond, HeartbeatTimeout: time.Second, GracefulShutdown: 10 * time.Millisecond})
 	if err != nil {
@@ -1298,7 +1356,9 @@ func TestExecutorMaxRuntimeTimeoutIgnoresProgressResets(t *testing.T) {
 func TestExecutorKillEscalationForcesExitAfterGracePeriod(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap '' TERM; while true; do sleep 0.05; done`}}}})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap '' TERM; while true; do sleep 0.05; done`}}},
+		ParamsOwnerVendor: customOwner(),
+	})
 	startedAt := time.Now()
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_kill_escalation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 50 * time.Millisecond, GracefulShutdown: 20 * time.Millisecond})
 	if err != nil {
@@ -1322,7 +1382,9 @@ func TestExecutorExplicitKillMarksKilled(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 2"}}}, Repos: repos})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 2"}}}, Repos: repos,
+		ParamsOwnerVendor: customOwner(),
+	})
 
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_kill", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 5 * time.Second})
 	if err != nil {

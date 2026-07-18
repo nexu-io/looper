@@ -70,7 +70,9 @@ func TestGrokBuildExecutionContractAndUnsupportedResume(t *testing.T) {
 		t.Fatalf("write script: %v", err)
 	}
 	repos := storage.NewRepositories(openAgentCoordinator(t).DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorGrokBuild, NativeResumeEnabled: true, Params: map[string]any{"command": scriptPath}}, Repos: repos})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorGrokBuild, NativeResumeEnabled: true, Params: map[string]any{"command": scriptPath}}, Repos: repos,
+		ParamsOwnerVendor: grokBuildOwner(),
+	})
 	execution, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_grok", WorkingDirectory: workdir, Prompt: "fresh prompt", NativeResumePrompt: "resume prompt", NativeSessionID: "session-1", Timeout: 10 * time.Second, Env: map[string]string{"OBSERVED_PATH": observedPath}})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)

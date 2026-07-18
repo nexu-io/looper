@@ -588,7 +588,7 @@ type Runner struct {
 	agentProfileID          string
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
-	agentModel              string
+	agentModel              *string
 	sleep                   func(time.Duration)
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -1299,7 +1299,7 @@ func New(options Options) *Runner {
 		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		projectRoleConfig:       options.CustomInstructions,
-		agentModel:              derefString(options.AgentModel),
+		agentModel:              cloneStringPtr(options.AgentModel),
 		sleep:                   sleep,
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
@@ -2720,7 +2720,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush, r.disclosure, agentVendor, agentModel)
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -8291,7 +8291,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 			"loopId": previous.LoopID,
 			"runId":  previous.ID,
 			"vendor": r.agentRuntime,
-			"model":  r.agentModel,
+			"model":  derefString(r.agentModel),
 		})
 	}
 	return snapshotJSON, nil
@@ -8299,7 +8299,8 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor, model, profile string, useSnapshot bool, err error) {
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
 	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 }
 
@@ -8307,26 +8308,32 @@ func (r *Runner) identityFromRun(run storage.RunRecord) (vendor, model, profile 
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, model, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
 	}
-	return vendor, model
+	return vendor, derefString(modelPtr)
 }
 
-func agentRunSnapshotFields(vendor, model string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
 	if !useSnapshot {
 		return false, "", nil
 	}
-	var snapshotModel *string
-	if strings.TrimSpace(model) != "" {
-		snapshotModel = &model
-	}
-	return true, vendor, snapshotModel
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
 }
 
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
 	if attempts <= 0 {

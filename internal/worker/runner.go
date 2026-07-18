@@ -555,7 +555,7 @@ type Runner struct {
 	agentProfileID          string
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
-	agentModel              string
+	agentModel              *string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -827,7 +827,7 @@ func New(options Options) *Runner {
 		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		projectRoleConfig:       options.CustomInstructions,
-		agentModel:              derefString(options.AgentModel),
+		agentModel:              cloneStringPtr(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
@@ -1727,7 +1727,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, agentVendor, agentModel)
+		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
 		if err != nil {
 			return checkpoint, err
 		}
@@ -3514,12 +3514,12 @@ func (r *Runner) stampPullRequestDisclosure(run storage.RunRecord, body string) 
 // snapshot when present; falls back to runner identity on empty snapshot or
 // parse errors (stamp-only paths must not fail the run).
 func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
-	vendor, model, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 	if err != nil {
 		// Present but invalid snapshot must not fall back to live runner identity.
 		return "", ""
 	}
-	return vendor, model
+	return vendor, derefString(modelPtr)
 }
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
@@ -4251,7 +4251,7 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 			"loopId": previous.LoopID,
 			"runId":  previous.ID,
 			"vendor": r.agentRuntime,
-			"model":  r.agentModel,
+			"model":  derefString(r.agentModel),
 		})
 	}
 	return snapshotJSON, nil
@@ -4259,22 +4259,29 @@ func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky 
 
 // identityFromRun returns the vendor/model/profile that must drive this run.
 // When the run has AgentSnapshotJSON, that identity is execution authority.
-func (r *Runner) identityFromRun(run storage.RunRecord) (vendor, model, profile string, useSnapshot bool, err error) {
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
 	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
 }
 
-func agentRunSnapshotFields(vendor, model string, useSnapshot bool) (bool, string, *string) {
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
 	if !useSnapshot {
 		return false, "", nil
 	}
-	var snapshotModel *string
-	if strings.TrimSpace(model) != "" {
-		snapshotModel = &model
-	}
-	return true, vendor, snapshotModel
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
 }
 
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func int64Ptr(value int64) *int64 { return &value }
 
