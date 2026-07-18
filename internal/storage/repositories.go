@@ -12,6 +12,36 @@ import (
 
 var ErrQueueItemNotActive = errors.New("queue item not active")
 
+// ErrAgentExecutionConflict is returned when an agent_executions upsert is
+// rejected by the terminal-observation immutability guard (zero rows updated).
+// Callers must not treat this as success.
+var ErrAgentExecutionConflict = errors.New("agent execution observation conflict")
+
+// IsActiveAgentExecutionStatus reports whether status is a live (non-terminal)
+// observation. Active statuses may be updated freely; terminal rows cannot
+// regress back into these values.
+func IsActiveAgentExecutionStatus(status string) bool {
+	switch status {
+	case "running", "cancelling":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsTerminalAgentExecutionStatus reports whether status is a durable terminal
+// observation. Terminal status is immutable once written: no terminal→active
+// and no terminal→other-terminal transitions. Same-terminal field enrichment
+// (e.g. native resume metadata) is allowed; see AgentExecutionsRepository.Upsert.
+func IsTerminalAgentExecutionStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "timeout", "killed", "success":
+		return true
+	default:
+		return false
+	}
+}
+
 type sqliteQuerier interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
@@ -995,8 +1025,22 @@ func (r *RunsRepository) ListByLoop(ctx context.Context, loopID string) ([]RunRe
 	return scanRuns(rows)
 }
 
+// Upsert writes a durable agent_executions observation (ADR-0015 R5 / #578).
+//
+// Terminal immutability policy (status column):
+//   - Active statuses: running, cancelling.
+//   - Terminal statuses: completed, failed, timeout, killed, success (legacy).
+//   - Active → active and active → terminal are allowed.
+//   - Terminal → active is forbidden (stale live writer cannot regress).
+//   - Terminal → different terminal is forbidden (first terminal wins).
+//   - Terminal → same terminal is allowed for non-status field enrichment
+//     (e.g. native-resume metadata) without changing the terminal outcome.
+//
+// Zero-row / rejected conflict updates return ErrAgentExecutionConflict, never
+// nil success. Callsites must surface conflict and must not treat it as durable
+// success for finalize/release paths.
 func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExecutionRecord) error {
-	_, err := r.q.ExecContext(ctx, `
+	result, err := r.q.ExecContext(ctx, `
 		INSERT INTO agent_executions (id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -1023,9 +1067,21 @@ func (r *AgentExecutionsRepository) Upsert(ctx context.Context, record AgentExec
 			ended_at=excluded.ended_at,
 			metadata_json=excluded.metadata_json,
 			updated_at=excluded.updated_at
+		WHERE agent_executions.status IN ('running', 'cancelling')
+		   OR (
+				agent_executions.status NOT IN ('running', 'cancelling')
+				AND excluded.status = agent_executions.status
+		   )
 	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.Vendor, record.Status, record.PID, record.CommandJSON, record.CWD, record.Summary, record.ParseStatus, record.CompletionSignal, record.HeartbeatCount, record.LastHeartbeatAt, record.OutputJSON, record.ErrorMessage, record.NativeSessionID, record.NativeResumeMode, record.NativeResumeStatus, record.NativeResumeError, record.StartedAt, record.EndedAt, record.MetadataJSON, record.CreatedAt, record.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("upsert agent execution: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("upsert agent execution rows affected: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%w: id=%s status=%s", ErrAgentExecutionConflict, record.ID, record.Status)
 	}
 
 	return nil

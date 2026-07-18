@@ -13,6 +13,151 @@ import (
 	"time"
 )
 
+func TestAgentExecutionTerminalObservationCannotRegressToActive(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	endedAt := "2026-07-16T12:01:00.000Z"
+	terminal := AgentExecutionRecord{
+		ID: "agent_terminal_monotonic", Vendor: "codex", Status: "completed",
+		StartedAt: startedAt, EndedAt: &endedAt, CreatedAt: startedAt, UpdatedAt: endedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, terminal); err != nil {
+		t.Fatalf("Upsert(terminal) error = %v", err)
+	}
+
+	staleLive := terminal
+	staleLive.Status = "running"
+	staleLive.EndedAt = nil
+	staleLive.UpdatedAt = startedAt
+	err := repos.AgentExecutions.Upsert(ctx, staleLive)
+	if !errors.Is(err, ErrAgentExecutionConflict) {
+		t.Fatalf("Upsert(stale live) error = %v, want ErrAgentExecutionConflict", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "completed" || got.EndedAt == nil {
+		t.Fatalf("execution = %#v, want completed terminal observation", got)
+	}
+}
+
+func TestAgentExecutionTerminalToDifferentTerminalIsConflict(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	endedAt := "2026-07-16T12:01:00.000Z"
+	terminal := AgentExecutionRecord{
+		ID: "agent_terminal_to_terminal", Vendor: "codex", Status: "completed",
+		StartedAt: startedAt, EndedAt: &endedAt, CreatedAt: startedAt, UpdatedAt: endedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, terminal); err != nil {
+		t.Fatalf("Upsert(completed) error = %v", err)
+	}
+
+	otherTerminal := terminal
+	otherTerminal.Status = "killed"
+	otherTerminal.UpdatedAt = "2026-07-16T12:02:00.000Z"
+	err := repos.AgentExecutions.Upsert(ctx, otherTerminal)
+	if !errors.Is(err, ErrAgentExecutionConflict) {
+		t.Fatalf("Upsert(killed over completed) error = %v, want ErrAgentExecutionConflict", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "completed" {
+		t.Fatalf("status = %q, want completed (first terminal wins)", got.Status)
+	}
+}
+
+func TestAgentExecutionSameTerminalFieldEnrichmentAllowed(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	endedAt := "2026-07-16T12:01:00.000Z"
+	terminal := AgentExecutionRecord{
+		ID: "agent_terminal_enrich", Vendor: "codex", Status: "completed",
+		StartedAt: startedAt, EndedAt: &endedAt, CreatedAt: startedAt, UpdatedAt: endedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, terminal); err != nil {
+		t.Fatalf("Upsert(completed) error = %v", err)
+	}
+
+	enriched := terminal
+	resumeStatus := "failed"
+	resumeErr := "native resume unavailable"
+	enriched.NativeResumeStatus = &resumeStatus
+	enriched.NativeResumeError = &resumeErr
+	enriched.UpdatedAt = "2026-07-16T12:02:00.000Z"
+	if err := repos.AgentExecutions.Upsert(ctx, enriched); err != nil {
+		t.Fatalf("Upsert(same terminal enrichment) error = %v", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, terminal.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "completed" {
+		t.Fatalf("status = %#v, want completed", got)
+	}
+	if got.NativeResumeStatus == nil || *got.NativeResumeStatus != "failed" {
+		t.Fatalf("NativeResumeStatus = %#v, want failed", got.NativeResumeStatus)
+	}
+}
+
+func TestAgentExecutionActiveToTerminalAndCancellingAllowed(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-16T12:00:00.000Z"
+	live := AgentExecutionRecord{
+		ID: "agent_active_transitions", Vendor: "codex", Status: "running",
+		StartedAt: startedAt, CreatedAt: startedAt, UpdatedAt: startedAt,
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, live); err != nil {
+		t.Fatalf("Upsert(running) error = %v", err)
+	}
+
+	cancelling := live
+	cancelling.Status = "cancelling"
+	cancelling.UpdatedAt = "2026-07-16T12:00:30.000Z"
+	if err := repos.AgentExecutions.Upsert(ctx, cancelling); err != nil {
+		t.Fatalf("Upsert(cancelling) error = %v", err)
+	}
+
+	endedAt := "2026-07-16T12:01:00.000Z"
+	killed := cancelling
+	killed.Status = "killed"
+	killed.EndedAt = &endedAt
+	killed.UpdatedAt = endedAt
+	if err := repos.AgentExecutions.Upsert(ctx, killed); err != nil {
+		t.Fatalf("Upsert(killed) error = %v", err)
+	}
+
+	got, err := repos.AgentExecutions.GetByID(ctx, live.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.Status != "killed" {
+		t.Fatalf("status = %#v, want killed", got)
+	}
+}
+
 func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.T) {
 	t.Parallel()
 

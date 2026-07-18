@@ -279,6 +279,24 @@ func New(options Options) *Runtime {
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
 	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
+	// Hard agent_executions observation failures close admission until
+	// restart/clear (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
+	rt.activeExecutions.SetOnHardPersistFailure(func(err error) {
+		reason := "agent execution persistence hard failure"
+		if err != nil {
+			reason = reason + ": " + err.Error()
+		}
+		if markErr := rt.MarkDegraded(reason); markErr != nil && rt.logger != nil {
+			rt.logger.Warn("failed to mark admission degraded after persistence failure", map[string]any{
+				"error":  markErr.Error(),
+				"reason": reason,
+			})
+		} else if rt.logger != nil {
+			rt.logger.Error("daemon admission degraded after agent execution persistence failure", map[string]any{
+				"reason": reason,
+			})
+		}
+	})
 	if rt.webhook != nil {
 		rt.webhook.forwarder = rt.WebhookForwarder
 		// Tunnel listener is not behind the API mutation gate; consult the same

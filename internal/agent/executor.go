@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
@@ -23,6 +25,12 @@ import (
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// ErrExecutionPersistence is returned when a hard agent_executions observation
+// write fails (initial ownership, mid-life heartbeat/output, or terminal).
+// Soft/transient failures (cancel, conflict after terminal won, one busy retry)
+// do not produce this error alone.
+var ErrExecutionPersistence = errors.New("agent execution persistence failed")
 
 const (
 	defaultMaxOutputBytes    = 256 * 1024
@@ -105,6 +113,11 @@ type ExecutorOptions struct {
 	// returns (ADR-0015 / #576). Daemon producers must wire Owner; unit tests
 	// may leave it nil and still get containment without Supervisor lease.
 	Owner SpawnOwner
+	// OnHardPersistFailure is invoked on the first hard agent_executions write
+	// failure for an execution path (heartbeat/output or terminal storage
+	// broken). Daemon wiring must map this to sticky admission degraded
+	// (ADR-0015 R5 / #578). Soft/transient errors and pure cancel do not call it.
+	OnHardPersistFailure func(error)
 	// OnProgress, when set, is called (throttled) while an agent run streams
 	// output, so a transport can surface live progress. Vendor-agnostic: it works
 	// off the subprocess's stdout tail, whatever agent (codex/opencode/claude) runs.
@@ -175,12 +188,13 @@ type Execution interface {
 }
 
 type ConfiguredExecutor struct {
-	config     ExecutorConfig
-	repos      *storage.Repositories
-	logDir     string
-	now        func() time.Time
-	owner      SpawnOwner
-	onProgress func(context.Context, ProgressUpdate)
+	config               ExecutorConfig
+	repos                *storage.Repositories
+	logDir               string
+	now                  func() time.Time
+	owner                SpawnOwner
+	onHardPersistFailure func(error)
+	onProgress           func(context.Context, ProgressUpdate)
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -188,7 +202,15 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	if now == nil {
 		now = time.Now
 	}
-	return &ConfiguredExecutor{config: options.Config, repos: options.Repos, logDir: options.LogDir, now: now, owner: options.Owner, onProgress: options.OnProgress}
+	return &ConfiguredExecutor{
+		config:               options.Config,
+		repos:                options.Repos,
+		logDir:               options.LogDir,
+		now:                  now,
+		owner:                options.Owner,
+		onHardPersistFailure: options.OnHardPersistFailure,
+		onProgress:           options.OnProgress,
+	}
 }
 
 // liveProgressInterval throttles OnProgress so a chatty agent doesn't hammer the
@@ -424,11 +446,37 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		}
 	}
 
+	// Initial ownership observation is hard: fail Start loud and do not leave
+	// an unowned live process (#578). Persist before transferring lease so the
+	// deferred Release still drains Supervisor ownership on failure.
+	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
+		if hard := x.classifyPersistError(err); hard != nil {
+			x.reportHardPersistFailure(hard)
+			killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+			if x.handle != nil {
+				_ = x.handle.Kill(killCtx)
+			} else {
+				_ = killStartedCmd(cmd)
+			}
+			cancel()
+			return nil, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist initial agent execution ownership: %w", hard))
+		}
+		// Soft (cancel/conflict): still refuse Start without a durable observation
+		// when storage rejected or cancelled, but do not sticky-degrade.
+		killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+		if x.handle != nil {
+			_ = x.handle.Kill(killCtx)
+		} else {
+			_ = killStartedCmd(cmd)
+		}
+		cancel()
+		return nil, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist initial agent execution ownership: %w", err))
+	}
+
 	// Transfer lease ownership to execution; defer must not Release on success.
 	lease = nil
 
 	resumeSessionID, resumeMode, resumeStatus, _ := x.nativeResumeSnapshot()
-	x.persistStatus("running", nil, nil, nil)
 	e.appendLifecycleEvent("agent.invoked", input, executionID, map[string]any{"command": command, "args": args, "cwd": input.WorkingDirectory, "nativeResumeMode": resumeMode, "nativeResumeStatus": resumeStatus, "nativeSessionId": resumeSessionID}, startedAtISO)
 
 	go x.run(ctx)
@@ -473,6 +521,9 @@ type execution struct {
 	lastProgressAt     time.Time
 
 	mu                      sync.Mutex
+	persistMu               sync.Mutex // one ordered writer per execution (#578)
+	terminalPersisted       bool
+	hardPersistReported     bool
 	status                  string
 	stdout                  []byte
 	stderr                  []byte
@@ -760,17 +811,40 @@ func (x *execution) run(ctx context.Context) {
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
 		// Cancellation / stop must not spawn a second process (#576).
 		if runCtx.Err() == nil && (x.lease == nil || x.lease.Context().Err() == nil) {
-			if fallbackResult, fallbackErrorMessage, ok := x.runCheckpointFallback(runCtx, errorMessage); ok {
+			if fallbackResult, fallbackErrorMessage, ok, fallbackErr := x.runCheckpointFallback(runCtx, errorMessage); ok {
 				result = fallbackResult
 				status = fallbackResult.Status
 				timeoutType = fallbackResult.TimeoutType
 				errorMessage = fallbackErrorMessage
 				endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
+			} else if fallbackErr != nil {
+				// Fallback ownership persist failed after process reaped.
+				x.doneCh <- execOutcome{result: result, err: fallbackErr}
+				return
 			}
 		}
 	}
 
-	x.persistFinal(status, result, errorMessage, endedAtISO)
+	// No terminal observation before containment is confirmed dead for owned
+	// executions (ties to #574/#576 / ADR-0015 R5).
+	if err := x.ensureConfirmedDeadBeforeTerminal(); err != nil {
+		x.reportHardPersistFailure(err)
+		x.doneCh <- execOutcome{
+			result: result,
+			err:    errors.Join(ErrExecutionPersistence, fmt.Errorf("containment not confirmed dead before terminal observation: %w", err)),
+		}
+		return
+	}
+
+	persistErr := x.persistFinal(status, result, errorMessage, endedAtISO)
+	if hard := x.classifyPersistError(persistErr); hard != nil {
+		x.reportHardPersistFailure(hard)
+		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", hard))
+	} else if persistErr != nil {
+		// Soft terminal write issues still fail loud (do not report success).
+		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", persistErr))
+	}
+
 	eventType := "agent.completed"
 	if status == "timeout" {
 		switch timeoutType {
@@ -784,19 +858,21 @@ func (x *execution) run(ctx context.Context) {
 	} else if status == "killed" {
 		eventType = "agent.killed"
 	}
-	x.executor.appendLifecycleEvent(eventType, x.input, x.executionID, map[string]any{
-		"status":                       status,
-		"timeoutType":                  timeoutType,
-		"configuredIdleTimeoutSeconds": result.ConfiguredIdleTimeoutSeconds,
-		"configuredMaxRuntimeSeconds":  result.ConfiguredMaxRuntimeSeconds,
-		"elapsedRuntimeSeconds":        result.ElapsedRuntimeSeconds,
-		"lastProgressAt":               result.LastProgressAt,
-		"parseStatus":                  result.ParseStatus,
-		"heartbeatCount":               result.HeartbeatCount,
-		"summary":                      result.Summary,
-	}, endedAtISO)
+	if persistErr == nil {
+		x.executor.appendLifecycleEvent(eventType, x.input, x.executionID, map[string]any{
+			"status":                       status,
+			"timeoutType":                  timeoutType,
+			"configuredIdleTimeoutSeconds": result.ConfiguredIdleTimeoutSeconds,
+			"configuredMaxRuntimeSeconds":  result.ConfiguredMaxRuntimeSeconds,
+			"elapsedRuntimeSeconds":        result.ElapsedRuntimeSeconds,
+			"lastProgressAt":               result.LastProgressAt,
+			"parseStatus":                  result.ParseStatus,
+			"heartbeatCount":               result.HeartbeatCount,
+			"summary":                      result.Summary,
+		}, endedAtISO)
+	}
 
-	x.doneCh <- execOutcome{result: result, err: nil}
+	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
 func (x *execution) shouldFallbackNativeResume(status string, stdout string, stderr string) bool {
@@ -833,16 +909,16 @@ func normalizeNativeResumeErrorLine(line string) string {
 	return strings.TrimSpace(line)
 }
 
-func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
+func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool, error) {
 	// Stop/cancel must not spawn a second process after the first failed attach.
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return Result{}, "", false
+			return Result{}, "", false, nil
 		}
 	}
 	if x.lease != nil {
 		if err := x.lease.Context().Err(); err != nil {
-			return Result{}, "", false
+			return Result{}, "", false, nil
 		}
 	}
 
@@ -859,7 +935,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	if x.lease != nil {
 		if r, ok := x.lease.(rebindLease); ok {
 			if err := r.BeginRebind(); err != nil {
-				return Result{}, "", false
+				return Result{}, "", false, nil
 			}
 			rebind = r
 			defer func() {
@@ -893,8 +969,6 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	x.lastHeartbeatAtISO = nowISO
 	x.lastOutputAt = now
 	x.mu.Unlock()
-	x.persistStatus("running", nil, nil, nil)
-	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
 	if err := cmd.Start(); err != nil {
 		x.mu.Lock()
@@ -902,7 +976,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.nativeResumeStatus = "fallback_failed"
 		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
 		x.mu.Unlock()
-		return Result{}, "", false
+		return Result{}, "", false, nil
 	}
 
 	grace := x.gracefulShutdown
@@ -920,7 +994,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		x.nativeResumeStatus = "fallback_failed"
 		x.nativeResumeError = firstNonEmpty(err.Error(), nativeError)
 		x.mu.Unlock()
-		return Result{}, "", false
+		return Result{}, "", false, nil
 	}
 	// Prior handle already Wait'd in the outer run loop; replace for stop-kill.
 	x.mu.Lock()
@@ -951,9 +1025,22 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 				ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 				LastProgressAt:               x.lastProgressAtISO(),
 				PID:                          x.leaderPID(),
-			}, errMsg, true
+			}, errMsg, true, nil
 		}
 	}
+
+	// Ownership observation after spawn+bind: fail loud and reap if storage is broken.
+	if err := x.persistStatus(ctx, "running", nil, nil, nil); err != nil {
+		killCtx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+		_ = handle.Kill(killCtx)
+		cancel()
+		if hard := x.classifyPersistError(err); hard != nil {
+			x.reportHardPersistFailure(hard)
+			return Result{}, "", false, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist fallback agent execution ownership: %w", hard))
+		}
+		return Result{}, "", false, errors.Join(ErrExecutionPersistence, fmt.Errorf("persist fallback agent execution ownership: %w", err))
+	}
+	x.executor.appendLifecycleEvent("agent.native_resume_fallback_started", x.input, x.executionID, map[string]any{"command": command, "args": args, "nativeResumeError": nativeError}, nowISO)
 
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- handle.Wait(context.Background()) }()
@@ -1096,7 +1183,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
 		PID:                          x.leaderPID(),
-	}, errorMessage, true
+	}, errorMessage, true, nil
 }
 
 func (x *execution) onOutput(stream string, chunk []byte) {
@@ -1135,7 +1222,13 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	x.mu.Unlock()
 
 	outputJSON := x.outputJSON(stdout, stderr)
-	x.persistStatus(x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON)
+	if err := x.persistStatus(context.Background(), x.currentStatus(), &heartbeatCount, &nowISO, &outputJSON); err != nil {
+		if hard := x.classifyPersistError(err); hard != nil {
+			// First hard mid-life failure closes admission (degraded). Soft
+			// cancel/conflict/busy-after-retry do not sticky-degrade.
+			x.reportHardPersistFailure(hard)
+		}
+	}
 	x.bumpRunHeartbeat(nowISO)
 	x.maybeEmitProgress(now, stdout, stderr)
 }
@@ -1243,9 +1336,20 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	_ = x.executor.repos.Runs.Upsert(ctx, updated)
 }
 
-func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) {
+// persistStatus writes a live (or initial) observation. One ordered writer per
+// execution (persistMu). After a terminal observation is recorded, live writes
+// are no-ops so a stale heartbeat cannot race terminal immutability.
+func (x *execution) persistStatus(ctx context.Context, status string, heartbeatCount *int64, heartbeatAt *string, outputJSON *string) error {
+	x.persistMu.Lock()
+	defer x.persistMu.Unlock()
+	if x.terminalPersisted {
+		return nil
+	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	metadata := mustJSON(x.executionMetadata(""))
@@ -1280,12 +1384,17 @@ func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbea
 	if outputJSON != nil {
 		record.OutputJSON = outputJSON
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	return x.upsertAgentExecutionWithRetry(ctx, record)
 }
 
-func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) {
+// persistFinal writes the terminal observation after containment is confirmed
+// dead. Failures must surface to Wait; callers degrade on hard storage errors.
+func (x *execution) persistFinal(status string, result Result, errorMessage, endedAtISO string) error {
+	x.persistMu.Lock()
+	defer x.persistMu.Unlock()
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
-		return
+		x.terminalPersisted = true
+		return nil
 	}
 	nativeSessionID, nativeResumeMode, nativeResumeStatus, nativeResumeError := x.nativeResumeSnapshot()
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
@@ -1338,7 +1447,104 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 		CreatedAt:          x.startedAtISO,
 		UpdatedAt:          endedAtISO,
 	}
-	_ = x.executor.repos.AgentExecutions.Upsert(context.Background(), record)
+	err := x.upsertAgentExecutionWithRetry(context.Background(), record)
+	// Mark terminal attempted so live writers stop; conflict after another
+	// terminal observation also counts as terminal settled.
+	if err == nil || errors.Is(err, storage.ErrAgentExecutionConflict) {
+		x.terminalPersisted = true
+	}
+	if errors.Is(err, storage.ErrAgentExecutionConflict) {
+		// Another writer already recorded a terminal observation — treat as
+		// durable success for this process lifetime (no silent overwrite).
+		return nil
+	}
+	return err
+}
+
+// upsertAgentExecutionWithRetry performs one soft retry on SQLITE_BUSY /
+// locked storage. Cancel/deadline are not retried.
+func (x *execution) upsertAgentExecutionWithRetry(ctx context.Context, record storage.AgentExecutionRecord) error {
+	err := x.executor.repos.AgentExecutions.Upsert(ctx, record)
+	if err == nil || !isSQLiteBusyPersistError(err) {
+		return err
+	}
+	// Soft/transient: single retry only. Do not sticky-degrade on pure busy.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(25 * time.Millisecond):
+	}
+	return x.executor.repos.AgentExecutions.Upsert(ctx, record)
+}
+
+// classifyPersistError returns a non-nil hard error when infrastructure must
+// fail loud and/or degrade. Soft errors (cancel, deadline, conflict after
+// terminal won) return nil so callers do not sticky-degrade.
+func (x *execution) classifyPersistError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	if errors.Is(err, storage.ErrAgentExecutionConflict) {
+		return nil
+	}
+	return err
+}
+
+func isSQLiteBusyPersistError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "sqlite_busy")
+}
+
+func (x *execution) reportHardPersistFailure(err error) {
+	if err == nil || x == nil || x.executor == nil {
+		return
+	}
+	x.mu.Lock()
+	if x.hardPersistReported {
+		x.mu.Unlock()
+		return
+	}
+	x.hardPersistReported = true
+	fn := x.executor.onHardPersistFailure
+	x.mu.Unlock()
+	if fn != nil {
+		fn(err)
+	}
+}
+
+// ensureConfirmedDeadBeforeTerminal drains the containment handle when the
+// leader has exited but descendants may still be runnable. Terminal status is
+// not published until ConfirmedDead for owned handles (#574/#578).
+func (x *execution) ensureConfirmedDeadBeforeTerminal() error {
+	if x == nil || x.handle == nil {
+		return nil
+	}
+	if x.handle.ConfirmedDead() {
+		return nil
+	}
+	grace := x.gracefulShutdown
+	if grace <= 0 {
+		grace = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+	defer cancel()
+	if err := x.handle.Drain(ctx); err != nil && !x.handle.ConfirmedDead() {
+		return err
+	}
+	if !x.handle.ConfirmedDead() {
+		return processcontainment.ErrNotConfirmedDead
+	}
+	return nil
 }
 
 func (x *execution) currentStatus() string {

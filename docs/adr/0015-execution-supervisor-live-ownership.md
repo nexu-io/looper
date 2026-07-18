@@ -119,7 +119,7 @@ to a slice while any open blocker remains.
 | R2 | #574 | Process containment handle with confirmed drain | Containment API; kill success = confirmed drain; no production removal of PID fallback yet | **Enforced** |
 | R3 | #576 | Own all in-scope agent spawns at common executor boundary | Lease before `cmd.Start`; bind handle before return; stop-kill via handle; remove agent live PID fallback only after full agent coverage | **Enforced** |
 | R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Deferred** |
-| R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Deferred** |
+| R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Enforced** |
 | R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Deferred** |
 | R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Deferred** |
 | R8 | #581 | Conservative startup recovery without PID Authority | confirmed dead / observed live / uncertain; uncertain cannot act; PID is evidence only | **Deferred** |
@@ -195,6 +195,52 @@ boundary so there is no worker-only registry escape hatch.
 | **Costs** | Every agent Start path consults the registry; stop latency includes confirmed drain; unit tests need Owner nil or a registry; native-resume fallback must rebind handles. |
 | **Why not simpler** | Post-spawn adapter Register (#572) leaves Coordinator and race windows unowned. Keeping PID fallback after full coverage reintroduces reusable-ID Authority. |
 | **Deletion attempt** | Remove registry and trust only `exec.Cmd` + SQLite — fails stop when live handle is missing and reopens dual Authority. |
+
+### Execution persistence Authority (enforced by #578)
+
+SQLite `agent_executions` is a **durable observation**, not a second live
+Authority. Each in-process execution serializes its own writes (`persistMu`);
+there is no general global writer subsystem.
+
+**Terminal immutability policy** (storage-level, `AgentExecutionsRepository.Upsert`):
+
+| From → To | Allowed? |
+|-----------|----------|
+| active (`running`, `cancelling`) → active | yes |
+| active → terminal (`completed`, `failed`, `timeout`, `killed`, legacy `success`) | yes |
+| terminal → active | **no** (conflict) |
+| terminal → different terminal | **no** (first terminal wins; conflict) |
+| terminal → same terminal (field enrichment) | yes (e.g. native-resume metadata) |
+
+Zero-row / rejected upserts return `ErrAgentExecutionConflict`, never success.
+
+**Hard persistence failure policy:**
+
+| Path | Behavior |
+|------|----------|
+| **Initial** ownership after spawn+bind | Fail `Start` loud; kill/confirmed-drain the process; do not leave unowned live process |
+| **Heartbeat / output** mid-life | Surface error; **first hard failure** closes admission (`degraded`) |
+| **Terminal** | Fail loud via `Wait` error; do not report successful completion; degrade if storage is broken |
+| Soft/transient | One retry on SQLITE_BUSY/locked; pure cancel/context death and conflict-after-terminal-won do **not** sticky-degrade |
+
+Terminal status is not published until containment is confirmed dead for owned
+handles (`Drain` when needed after leader `Wait`).
+
+**Operator recovery from degraded (persistence hard failure):**
+
+1. Inspect daemon logs for `daemon admission degraded after agent execution persistence failure` and the underlying storage error.
+2. Repair storage (disk space, permissions, SQLite integrity) under the configured runtime path (default `~/.looper/`).
+3. **Restart `looperd`** — the normal recovery path. Admission is sticky degraded until process restart (or an explicit `ClearDegraded` test/operator hook).
+4. After restart, startup recovery classifies durable observations conservatively (#581); do not manually requeue uncertain work.
+
+**Persistence concept trade-off (R5):**
+
+| | |
+|--|--|
+| **Failure prevented** | Stale live writers regressing terminal rows; silent upsert “success” when zero rows changed; split-brain observations while admission keeps accepting work; terminal status before containment confirmed dead. |
+| **Costs** | Sticky degrade stops new work until restart/clear; terminal conflict means first terminal wins even if a later writer had richer fields; per-execution serialization; hard fail paths kill on initial persist failure. |
+| **Why not simpler** | Trusting raw Upsert success leaves #579 release able to free claims on silent no-op writes. Global writer queues add complexity without fixing per-execution ordering. Soft-degrade on cancel creates sticky noise without recovery signal. |
+| **Deletion attempt** | Remove mid-life heartbeat persistence and keep only terminal — insufficient for operator progress and native-session capture while live. |
 
 ### Shutdown order (target; partial in #575, complete in #577/#580)
 
