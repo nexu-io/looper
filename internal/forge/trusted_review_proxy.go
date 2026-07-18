@@ -808,7 +808,12 @@ func trustedReviewProxyChildEnv(trustedEnv map[string]string, configFD int) []st
 	return out
 }
 
+// trustedReviewBoundedBuffer captures child stdout/stderr under a hard cap.
+// Methods are safe for concurrent use: cmd.Stdout/Stderr copy goroutines may
+// still Write after waitCtx cancel unblocks handle.Wait (containment-failure
+// path) while the proxy handler reads String/Truncated for the response.
 type trustedReviewBoundedBuffer struct {
+	mu        sync.Mutex
 	buffer    bytes.Buffer
 	limit     int
 	truncated bool
@@ -819,6 +824,8 @@ func newTrustedReviewBoundedBuffer(limit int) *trustedReviewBoundedBuffer {
 }
 
 func (b *trustedReviewBoundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	written := len(p)
 	remaining := b.limit - b.buffer.Len()
 	if remaining > 0 {
@@ -834,9 +841,17 @@ func (b *trustedReviewBoundedBuffer) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-func (b *trustedReviewBoundedBuffer) String() string { return b.buffer.String() }
+func (b *trustedReviewBoundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
 
-func (b *trustedReviewBoundedBuffer) Truncated() bool { return b.truncated }
+func (b *trustedReviewBoundedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
+}
 
 // TrustedReviewSockConfigured reports whether this process should proxy
 // `review submit` through the daemon-side trusted socket.

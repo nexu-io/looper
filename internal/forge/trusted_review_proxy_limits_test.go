@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -142,6 +143,44 @@ func TestTrustedReviewBoundedBufferTruncatesWithoutBackpressuringChild(t *testin
 	}
 	if got := buffer.String(); got != "abcd" || !buffer.Truncated() {
 		t.Fatalf("bounded buffer = (%q, %t), want (abcd, true)", got, buffer.Truncated())
+	}
+}
+
+// TestTrustedReviewBoundedBufferConcurrentWriteAndRead covers the proxy path
+// where waitCtx cancel unblocks handle.Wait while cmd stdout/stderr copy
+// goroutines may still Write; response assembly must read safely under race.
+func TestTrustedReviewBoundedBufferConcurrentWriteAndRead(t *testing.T) {
+	buffer := newTrustedReviewBoundedBuffer(1 << 20)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			chunk := []byte("concurrent-write-chunk\n")
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = buffer.Write(chunk)
+				}
+			}
+		}()
+	}
+	// Interleave String/Truncated with writers the way response assembly does
+	// after early wait cancellation on the containment-failure path.
+	deadline := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_ = buffer.String()
+		_ = buffer.Truncated()
+	}
+	close(stop)
+	wg.Wait()
+	// Final snapshot must be consistent (no panic / no race under -race).
+	got := buffer.String()
+	if len(got) == 0 {
+		t.Fatal("String() empty after concurrent writes")
 	}
 }
 
