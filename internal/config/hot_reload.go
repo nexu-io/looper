@@ -295,10 +295,38 @@ func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen 
 		// always accidental (and enables vendor-reset laundering: unset vendor,
 		// then set a different vendor while keeping the old model). Non-nil empty
 		// is explicit suppress-to-vendor-default, not a portable model value.
+		// Report the binding that actually owns the retained model (role inline,
+		// profile, or global) so PATCH rejection points at a field that changes
+		// the resolved value — not always agent.model.
 		if oldModel != nil && newModel != nil && *oldModel != "" && *oldModel == *newModel {
-			mark("agent.model")
+			if path := resolvedModelBindingPath(newConfig, role); path != "" {
+				mark(path)
+			}
 		}
 	}
+}
+
+// resolvedModelBindingPath returns the config path that owns the post-overlay
+// model for a coding role (last writer wins: role inline > profile > global).
+// Empty when no model is bound after overlay.
+func resolvedModelBindingPath(cfg Config, role string) string {
+	path := ""
+	if cfg.Agent.Model != nil {
+		path = "agent.model"
+	}
+	binding := codingRoleAgentBinding(cfg.Roles, role)
+	if binding != nil && binding.Profile != nil {
+		profileID := strings.TrimSpace(*binding.Profile)
+		if profileID != "" {
+			if profile, ok := cfg.Agent.Profiles[profileID]; ok && profile.Model != nil {
+				path = "agent.profiles." + profileID + ".model"
+			}
+		}
+	}
+	if binding != nil && binding.Model != nil {
+		path = "roles." + role + ".agent.model"
+	}
+	return path
 }
 
 // CloneConfig returns a complete detached copy. Config is a JSON configuration

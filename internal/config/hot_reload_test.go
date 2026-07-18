@@ -322,7 +322,7 @@ func TestRestartRequiredChangesResolvedVendorSameModelBlocks(t *testing.T) {
 	newVendor := AgentVendorCodex
 	newConfig.Roles.Worker.Agent = &RoleAgentConfig{Vendor: &newVendor, Model: stringPtr("shared-model")}
 
-	if got, want := RestartRequiredChanges(oldConfig, newConfig), []string{"agent.model"}; !reflect.DeepEqual(got, want) {
+	if got, want := RestartRequiredChanges(oldConfig, newConfig), []string{"roles.worker.agent.model"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("RestartRequiredChanges() = %#v, want %#v", got, want)
 	}
 }
@@ -341,7 +341,7 @@ func TestRestartRequiredChangesBlocksVendorResetModelLaundering(t *testing.T) {
 
 	unsetVendor := CloneConfig(oldConfig)
 	unsetVendor.Roles.Worker.Agent = &RoleAgentConfig{Model: stringPtr("gpt-5")}
-	if got, want := RestartRequiredChanges(oldConfig, unsetVendor), []string{"agent.model"}; !reflect.DeepEqual(got, want) {
+	if got, want := RestartRequiredChanges(oldConfig, unsetVendor), []string{"roles.worker.agent.model"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unset role vendor retaining model = %#v, want %#v", got, want)
 	}
 
@@ -349,7 +349,7 @@ func TestRestartRequiredChangesBlocksVendorResetModelLaundering(t *testing.T) {
 	switched := CloneConfig(oldConfig)
 	newVendor := AgentVendorClaudeCode
 	switched.Roles.Worker.Agent = &RoleAgentConfig{Vendor: &newVendor, Model: stringPtr("gpt-5")}
-	if got, want := RestartRequiredChanges(oldConfig, switched), []string{"agent.model"}; !reflect.DeepEqual(got, want) {
+	if got, want := RestartRequiredChanges(oldConfig, switched), []string{"roles.worker.agent.model"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("switch role vendor retaining model = %#v, want %#v", got, want)
 	}
 
@@ -368,7 +368,7 @@ func TestRestartRequiredChangesBlocksVendorResetModelLaundering(t *testing.T) {
 	profileUnset.Agent.Profiles = map[string]AgentBindingConfig{
 		"worker": {Model: stringPtr("gpt-5")},
 	}
-	if got, want := RestartRequiredChanges(profileOld, profileUnset), []string{"agent.model"}; !reflect.DeepEqual(got, want) {
+	if got, want := RestartRequiredChanges(profileOld, profileUnset), []string{"agent.profiles.worker.model"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unset profile vendor retaining model = %#v, want %#v", got, want)
 	}
 }
