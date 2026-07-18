@@ -103,6 +103,91 @@ func TestBeginLoopStopStickyWithoutReleaseBlocksLateAdmitSpawn(t *testing.T) {
 	}
 }
 
+// RestoreLoopStop must cancel/drain leases admitted while the gate was cleared
+// for a failed reactivation (retry/start/worker-reuse TX abort).
+func TestRestoreLoopStopDrainsLeasesAdmittedDuringClear(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
+
+	if _, err := reg.BeginLoopStop("loop-restore", "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
+	// Intentional reactivation opens the gate before the TX; a stale runner can
+	// AdmitSpawn+BindHandle in this window if the TX later aborts.
+	reg.ClearLoopStop("loop-restore")
+
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-restore", RunID: "run-stale", ExecutionID: "exec-stale",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn during clear window: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := lease.BindHandle(handle, func(string) error { return nil }); err != nil {
+		t.Fatalf("BindHandle during clear window: %v", err)
+	}
+
+	// TX failed: restore sticky gate and drain anything admitted in the window.
+	reg.RestoreLoopStop("loop-restore")
+	if !reg.LoopStopActive("loop-restore") {
+		t.Fatal("LoopStopActive = false after RestoreLoopStop")
+	}
+	if !handle.ConfirmedDead() {
+		t.Fatal("bound handle not confirmed-dead after RestoreLoopStop")
+	}
+	if lease.Context().Err() == nil {
+		t.Fatal("lease context not cancelled by RestoreLoopStop")
+	}
+	_, admitErr := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-restore", RunID: "run-late", ExecutionID: "exec-late",
+	})
+	if !errors.Is(admitErr, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after RestoreLoopStop error = %v, want ErrSpawnLoopStopping", admitErr)
+	}
+}
+
+// BeginLoopStop must report drain failure when a pending Start→BindHandle
+// window never closes within killBudget (wedged executor after cmd.Start).
+func TestBeginLoopStopReturnsErrorWhenPendingSpawnWaitTimesOut(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 40 * time.Millisecond
+
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-wait-timeout", RunID: "run-wt", ExecutionID: "exec-wt",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	// Leave the lease pending without BindHandle/Release so spawnDone never closes.
+
+	_, stopErr := reg.BeginLoopStop("loop-wait-timeout", "looper stop")
+	if stopErr == nil {
+		t.Fatal("BeginLoopStop error = nil, want pending spawn wait timeout")
+	}
+	if !errors.Is(stopErr, errLoopStopWaitTimeout) {
+		t.Fatalf("BeginLoopStop error = %v, want errLoopStopWaitTimeout", stopErr)
+	}
+	if !reg.LoopStopActive("loop-wait-timeout") {
+		t.Fatal("LoopStopActive = false after timed-out BeginLoopStop, want gate closed")
+	}
+	// Cleanup so the lease does not outlive the test.
+	lease.Release()
+}
+
 func TestStopVsBindKillsAndConfirmedDrainsBeforeStartSuccess(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
@@ -257,6 +342,11 @@ func TestExecutorStartRefusesWhenOwnerClosed(t *testing.T) {
 func TestNativeResumeFallbackCancelledDoesNotSpawnSecondProcess(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
+	// Short budget: this test intentionally leaves the pending lease open so a
+	// post-stop BindHandle can exercise refuse+kill. Production Start always
+	// Release/BindHandle on cancel and closes spawnDone; here BeginLoopStop's
+	// wait times out and must surface that as a drain error (not silent success).
+	reg.killTimeout = 40 * time.Millisecond
 
 	// Lease that is already cancelled simulates stop during attach-fail path.
 	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
@@ -265,7 +355,7 @@ func TestNativeResumeFallbackCancelledDoesNotSpawnSecondProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AdmitSpawn: %v", err)
 	}
-	if _, err := reg.BeginLoopStop("loop-fb", "halt"); err != nil {
+	if _, err := reg.BeginLoopStop("loop-fb", "halt"); err != nil && !errors.Is(err, errLoopStopWaitTimeout) {
 		t.Fatalf("BeginLoopStop: %v", err)
 	}
 	// Wait until lease context is cancelled.

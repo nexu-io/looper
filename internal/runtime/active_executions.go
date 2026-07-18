@@ -418,6 +418,117 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	return lease, nil
 }
 
+// errLoopStopWaitTimeout is returned when BeginLoopStop cannot confirm that a
+// pending Start→BindHandle or native rebind window closed within killBudget.
+// Without this, stop would report success while a just-started process may
+// still be live outside the registry.
+var errLoopStopWaitTimeout = errors.New("loop stop: pending spawn or rebind wait timed out")
+
+// loopStopTargets holds cancel/drain work collected under the registry lock.
+type loopStopTargets struct {
+	toCancel   []*spawnLease
+	spawnWait  []<-chan struct{}
+	rebindWait []<-chan struct{}
+	toKill     []*ownedExecution
+}
+
+// collectLoopStopTargetsLocked snapshots leases and bound handles for loopID.
+// Caller must hold r.mu.
+func (r *ActiveExecutionRegistry) collectLoopStopTargetsLocked(loopID string) loopStopTargets {
+	var t loopStopTargets
+	// spawnWait covers Start→BindHandle for still-pending leases.
+	// rebindWait covers native-resume fallback Start→RebindHandle.
+	for _, lease := range r.pending {
+		if lease.meta.LoopID == loopID {
+			t.toCancel = append(t.toCancel, lease)
+			if lease.spawnDone != nil {
+				t.spawnWait = append(t.spawnWait, lease.spawnDone)
+			}
+			if lease.rebinding && lease.rebindDone != nil {
+				t.rebindWait = append(t.rebindWait, lease.rebindDone)
+			}
+		}
+	}
+	for _, lease := range r.active {
+		if lease.meta.LoopID == loopID {
+			t.toCancel = append(t.toCancel, lease)
+			if lease.rebinding && lease.rebindDone != nil {
+				t.rebindWait = append(t.rebindWait, lease.rebindDone)
+			}
+		}
+	}
+	// Only drain entries with a containment handle. SoftKill-only Register
+	// stubs (tests / transitional) stay for haltLoop Kill-by-id, which still
+	// consults durable execution status and must not half-kill stale rows.
+	for _, entry := range r.executions {
+		if entry != nil && entry.loopID == loopID && entry.handle != nil {
+			t.toKill = append(t.toKill, entry)
+		}
+	}
+	return t
+}
+
+// cancelAndDrainLoop cancels leases, confirmed-drains bound handles, and waits
+// for pending spawn/rebind windows that began before the stop gate was set.
+// BindHandle/RebindHandle refuse+kill once they see the gate; we must not
+// return until those windows end (or time out) and re-drain any published handle.
+func (r *ActiveExecutionRegistry) cancelAndDrainLoop(loopID, reason string, t loopStopTargets) error {
+	cause := errors.New(reason)
+	if reason == "" {
+		cause = agent.ErrSpawnLoopStopping
+	}
+	for _, lease := range t.toCancel {
+		lease.cancel(cause)
+	}
+	// Confirmed-drain bound handles for this loop so stop does not return while
+	// a post-BindHandle process is only asynchronously killed via lease cancel
+	// after Start continues (BindHandle→persistStatus window). Propagate kill
+	// failures: this may be the only path that confirms the process is dead
+	// when no durable AgentExecutionRecord exists yet.
+	var drainErr error
+	for _, entry := range t.toKill {
+		killErr := r.killOwned(entry, reason)
+		if killErr != nil {
+			drainErr = errors.Join(drainErr, killErr)
+		}
+		r.rememberStopDrain(entry, killErr)
+	}
+	budget := r.killBudget()
+	waitChans := make([]<-chan struct{}, 0, len(t.spawnWait)+len(t.rebindWait))
+	waitChans = append(waitChans, t.spawnWait...)
+	waitChans = append(waitChans, t.rebindWait...)
+	for _, done := range waitChans {
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-time.After(budget):
+			// Surface timeout as drain failure: the confirmation channel that
+			// proves no just-started process outlives stop never completed.
+			drainErr = errors.Join(drainErr, errLoopStopWaitTimeout)
+		}
+	}
+	if len(waitChans) > 0 {
+		r.mu.Lock()
+		second := make([]*ownedExecution, 0)
+		for _, entry := range r.executions {
+			if entry != nil && entry.loopID == loopID && entry.handle != nil {
+				second = append(second, entry)
+			}
+		}
+		r.mu.Unlock()
+		for _, entry := range second {
+			killErr := r.killOwned(entry, reason)
+			if killErr != nil {
+				drainErr = errors.Join(drainErr, killErr)
+			}
+			r.rememberStopDrain(entry, killErr)
+		}
+	}
+	return drainErr
+}
+
 // BeginLoopStop closes spawn admission for one loop, cancels both pending and
 // bound (active) leases for that loop, and confirmed-drains every bound
 // containment handle for the loop. Bound-lease cancel is required so
@@ -430,10 +541,11 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 // haltLoop Kill-by-id still returns killed=true when releaseLease removes the
 // registry entry while handle.Kill is waiting (process exit → run finish).
 //
-// Drain failures from processcontainment.Handle.Kill are returned so stop/close
-// cannot report success when a just-bound agent is only unconfirmed or still
-// live. The release func is still returned on drain failure: the gate was
-// opened and callers manage sticky vs temporary windows as before.
+// Drain failures from processcontainment.Handle.Kill and pending spawn/rebind
+// wait timeouts are returned so stop/close cannot report success when a
+// just-started agent is only unconfirmed or still live. The release func is
+// still returned on drain failure: the gate was opened and callers manage
+// sticky vs temporary windows as before.
 //
 // After a durable stop (pause/terminate), callers must keep the gate closed:
 // do not invoke the returned release. In-flight runners that claimed work
@@ -457,93 +569,9 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	}
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
-	toCancel := make([]*spawnLease, 0)
-	// spawnWait covers Start→BindHandle for still-pending leases.
-	// rebindWait covers native-resume fallback Start→RebindHandle.
-	spawnWait := make([]<-chan struct{}, 0)
-	rebindWait := make([]<-chan struct{}, 0)
-	for _, lease := range r.pending {
-		if lease.meta.LoopID == loopID {
-			toCancel = append(toCancel, lease)
-			if lease.spawnDone != nil {
-				spawnWait = append(spawnWait, lease.spawnDone)
-			}
-			if lease.rebinding && lease.rebindDone != nil {
-				rebindWait = append(rebindWait, lease.rebindDone)
-			}
-		}
-	}
-	for _, lease := range r.active {
-		if lease.meta.LoopID == loopID {
-			toCancel = append(toCancel, lease)
-			if lease.rebinding && lease.rebindDone != nil {
-				rebindWait = append(rebindWait, lease.rebindDone)
-			}
-		}
-	}
-	// Only drain entries with a containment handle. SoftKill-only Register
-	// stubs (tests / transitional) stay for haltLoop Kill-by-id, which still
-	// consults durable execution status and must not half-kill stale rows.
-	toKill := make([]*ownedExecution, 0)
-	for _, entry := range r.executions {
-		if entry != nil && entry.loopID == loopID && entry.handle != nil {
-			toKill = append(toKill, entry)
-		}
-	}
+	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
-	cause := errors.New(reason)
-	if reason == "" {
-		cause = agent.ErrSpawnLoopStopping
-	}
-	for _, lease := range toCancel {
-		lease.cancel(cause)
-	}
-	// Confirmed-drain bound handles for this loop so stop does not return while
-	// a post-BindHandle process is only asynchronously killed via lease cancel
-	// after Start continues (BindHandle→persistStatus window). Propagate kill
-	// failures: this may be the only path that confirms the process is dead
-	// when no durable AgentExecutionRecord exists yet.
-	var drainErr error
-	for _, entry := range toKill {
-		killErr := r.killOwned(entry, reason)
-		if killErr != nil {
-			drainErr = errors.Join(drainErr, killErr)
-		}
-		r.rememberStopDrain(entry, killErr)
-	}
-	// Wait for pending Start→BindHandle and rebind windows that began before we
-	// set stopping. BindHandle/RebindHandle refuse+kill once they see the gate;
-	// we must not return until those windows end and re-drain any published handle.
-	budget := r.killBudget()
-	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait))
-	waitChans = append(waitChans, spawnWait...)
-	waitChans = append(waitChans, rebindWait...)
-	for _, done := range waitChans {
-		if done == nil {
-			continue
-		}
-		select {
-		case <-done:
-		case <-time.After(budget):
-		}
-	}
-	if len(waitChans) > 0 {
-		r.mu.Lock()
-		second := make([]*ownedExecution, 0)
-		for _, entry := range r.executions {
-			if entry != nil && entry.loopID == loopID && entry.handle != nil {
-				second = append(second, entry)
-			}
-		}
-		r.mu.Unlock()
-		for _, entry := range second {
-			killErr := r.killOwned(entry, reason)
-			if killErr != nil {
-				drainErr = errors.Join(drainErr, killErr)
-			}
-			r.rememberStopDrain(entry, killErr)
-		}
-	}
+	drainErr := r.cancelAndDrainLoop(loopID, reason, targets)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -572,8 +600,10 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) {
 }
 
 // RestoreLoopStop re-closes spawn admission after a failed intentional
-// reactivation that already called ClearLoopStop. Does not cancel leases or
-// drain handles — only restores the sticky AdmitSpawn gate.
+// reactivation that already called ClearLoopStop. Cancels pending/active
+// leases and confirmed-drains bound handles admitted during the clear window
+// so a failed retry/start/worker-reuse cannot leave a live agent for a loop
+// that was never reactivated.
 func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) {
 	if r == nil || loopID == "" {
 		return
@@ -582,7 +612,11 @@ func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) {
 	if r.stoppingLoops[loopID] == 0 {
 		r.stoppingLoops[loopID] = 1
 	}
+	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
+	// Best-effort: callers restore on TX failure and have no drain channel.
+	// Gate is closed; cancel+drain prevents orphan processes from the window.
+	_ = r.cancelAndDrainLoop(loopID, "restore loop stop after failed reactivation", targets)
 }
 
 // LoopStopActive reports whether spawn admission is closed for loopID.
