@@ -3067,6 +3067,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// Common executor boundary ownership for every in-scope agent role
 		// (planner/reviewer/fixer/worker/coordinator) — not post-spawn adapters (#576).
 		Owner: activeExecutions,
+		// Hard observation write failures degrade sticky admission (#578).
+		OnHardPersistFailure: func(err error) {
+			if activeExecutions != nil {
+				activeExecutions.ReportHardPersistFailure(err)
+			}
+		},
 		// Live progress → Feishu anchor card. Vendor-agnostic (works off the agent
 		// subprocess's stdout tail). Only wired when the Feishu app-bot transport is
 		// configured; a no-op otherwise.

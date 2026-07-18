@@ -71,6 +71,10 @@ type ActiveExecutionRegistry struct {
 	// (tests that do not wire Runtime admission).
 	allowSpawn func() error
 
+	// onHardPersistFailure maps hard agent_executions write failures into the
+	// single sticky admission degraded state (ADR-0015 R5 / #578).
+	onHardPersistFailure func(error)
+
 	// killTimeout bounds handle.Kill during stop. Zero uses defaultKillTimeout.
 	killTimeout time.Duration
 }
@@ -96,6 +100,32 @@ func (r *ActiveExecutionRegistry) SetAllowSpawn(fn func() error) {
 	r.mu.Lock()
 	r.allowSpawn = fn
 	r.mu.Unlock()
+}
+
+// SetOnHardPersistFailure wires sticky admission degrade for hard execution
+// observation write failures (initial/heartbeat/output/terminal). Soft cancel
+// and conflict after terminal won must not invoke this callback.
+func (r *ActiveExecutionRegistry) SetOnHardPersistFailure(fn func(error)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.onHardPersistFailure = fn
+	r.mu.Unlock()
+}
+
+// ReportHardPersistFailure surfaces a hard agent_executions write failure into
+// daemon admission. Safe to call from agent executor mid-life paths.
+func (r *ActiveExecutionRegistry) ReportHardPersistFailure(err error) {
+	if r == nil || err == nil {
+		return
+	}
+	r.mu.Lock()
+	fn := r.onHardPersistFailure
+	r.mu.Unlock()
+	if fn != nil {
+		fn(err)
+	}
 }
 
 // spawnLease implements agent.SpawnLease.

@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1339,6 +1341,232 @@ func TestExecutorExplicitKillMarksKilled(t *testing.T) {
 	}
 	if result.Status != "killed" {
 		t.Fatalf("result status = %q, want killed", result.Status)
+	}
+}
+
+func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "agent.pid")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
+	}}, Repos: repos})
+
+	handle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: workDir, Prompt: "ignored",
+		Timeout: time.Second, Env: map[string]string{"PID_FILE": pidPath},
+	})
+	if err == nil {
+		t.Fatal("Start() error = nil, want initial persistence failure")
+	}
+	if !errors.Is(err, ErrExecutionPersistence) {
+		t.Fatalf("Start() error = %v, want ErrExecutionPersistence", err)
+	}
+	if handle != nil {
+		t.Fatalf("Start() handle = %#v, want nil", handle)
+	}
+	if data, readErr := os.ReadFile(pidPath); readErr == nil {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr != nil {
+			t.Fatalf("parse pid: %v", parseErr)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("spawned process %d survived failed Start", pid)
+	}
+}
+
+func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	var degraded []error
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+			"command": "/bin/sh", "args": []any{"-c", "sleep 0.05; printf 'done\\n'"},
+		}},
+		Repos:                repos,
+		OnHardPersistFailure: func(err error) { degraded = append(degraded, err) },
+	})
+	handle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID: "agent_terminal_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+
+	_, err = handle.Wait(context.Background())
+	if err == nil || !errors.Is(err, ErrExecutionPersistence) {
+		t.Fatalf("Wait() error = %v, want ErrExecutionPersistence", err)
+	}
+	if !strings.Contains(err.Error(), "persist terminal agent execution") {
+		t.Fatalf("Wait() error = %v, want terminal persistence message", err)
+	}
+	if len(degraded) == 0 {
+		t.Fatal("OnHardPersistFailure was not called for terminal hard failure")
+	}
+}
+
+func TestExecutorMidLifeHardPersistFailureReportsDegradeHook(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	var degraded []error
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+			"command": "/bin/sh", "args": []any{"-c", `i=0; while [ $i -lt 50 ]; do printf 'tick %s\n' "$i"; i=$((i+1)); sleep 0.02; done`},
+		}},
+		Repos:                repos,
+		OnHardPersistFailure: func(err error) { degraded = append(degraded, err) },
+	})
+	handle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID: "agent_midlife_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	// Close storage after initial ownership so the first mid-life output write hard-fails.
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(degraded) == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(degraded) == 0 {
+		_ = handle.Kill("test cleanup")
+		_, _ = handle.Wait(context.Background())
+		t.Fatal("OnHardPersistFailure was not called for mid-life hard failure")
+	}
+	_ = handle.Kill("test cleanup")
+	_, _ = handle.Wait(context.Background())
+}
+
+func TestCheckpointFallbackReapsSpawnWhenOwnershipPersistenceFails(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() error = %v", err)
+	}
+	configured := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		"command": "/bin/sh", "args": []any{"-c", "trap '' TERM; while true; do sleep 1; done"},
+	}}, Repos: repos})
+	x := &execution{
+		executor:       configured,
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "retry", Timeout: time.Second},
+		executionID:    "agent_fallback_persist_failure",
+		startedAt:      time.Now(),
+		startedAtISO:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		maxOutputBytes: defaultMaxOutputBytes,
+	}
+
+	_, _, ok, err := x.runCheckpointFallback(context.Background(), "resume failed")
+	if ok {
+		t.Fatal("runCheckpointFallback() ok = true, want infrastructure failure")
+	}
+	if err == nil || !errors.Is(err, ErrExecutionPersistence) {
+		t.Fatalf("runCheckpointFallback() error = %v, want ErrExecutionPersistence", err)
+	}
+	if !strings.Contains(err.Error(), "persist fallback agent execution ownership") {
+		t.Fatalf("runCheckpointFallback() error = %v, want ownership persistence message", err)
+	}
+}
+
+func TestPersistStatusNoOpAfterTerminalPersisted(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorCodex}, Repos: repos})
+	x := &execution{
+		executor:       executor,
+		executionID:    "agent_persist_mu",
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "x"},
+		startedAtISO:   "2026-07-18T00:00:00.000Z",
+		maxOutputBytes: defaultMaxOutputBytes,
+		process:        exec.Command("/bin/true"),
+	}
+	if err := x.persistStatus(context.Background(), "running", nil, nil, nil); err != nil {
+		t.Fatalf("initial persistStatus error = %v", err)
+	}
+	ended := "2026-07-18T00:01:00.000Z"
+	if err := x.persistFinal("completed", Result{Status: "completed", HeartbeatCount: 1}, "", ended); err != nil {
+		t.Fatalf("persistFinal error = %v", err)
+	}
+	hb := int64(99)
+	at := "2026-07-18T00:02:00.000Z"
+	if err := x.persistStatus(context.Background(), "running", &hb, &at, nil); err != nil {
+		t.Fatalf("post-terminal persistStatus error = %v", err)
+	}
+	got, err := repos.AgentExecutions.GetByID(context.Background(), x.executionID)
+	if err != nil {
+		t.Fatalf("GetByID error = %v", err)
+	}
+	if got == nil || got.Status != "completed" || got.HeartbeatCount != 1 {
+		t.Fatalf("got %#v, want completed with heartbeat 1 (no active regress)", got)
+	}
+}
+
+// Mid-life output after timeout/kill must keep the durable row active
+// (cancelling) until ensureConfirmedDeadBeforeTerminal + persistFinal.
+func TestOnOutputDoesNotPersistTerminalBeforeDrain(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorCodex}, Repos: repos})
+	x := &execution{
+		executor:       executor,
+		executionID:    "agent_midlife_no_terminal",
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "x"},
+		startedAt:      time.Now().UTC(),
+		startedAtISO:   "2026-07-18T00:00:00.000Z",
+		maxOutputBytes: defaultMaxOutputBytes,
+		status:         "running",
+		process:        exec.Command("/bin/true"),
+	}
+	if err := x.persistStatus(context.Background(), "running", nil, nil, nil); err != nil {
+		t.Fatalf("initial persistStatus error = %v", err)
+	}
+
+	for _, terminal := range []string{"timeout", "killed"} {
+		x.setStatus(terminal)
+		x.onOutput("stdout", []byte("final flush while draining\n"))
+
+		got, err := repos.AgentExecutions.GetByID(context.Background(), x.executionID)
+		if err != nil {
+			t.Fatalf("GetByID after %s flush error = %v", terminal, err)
+		}
+		if got == nil {
+			t.Fatalf("GetByID after %s flush = nil", terminal)
+		}
+		if got.Status != "cancelling" {
+			t.Fatalf("durable status after in-memory %s = %q, want cancelling (active until drain)", terminal, got.Status)
+		}
+		if !storage.IsActiveAgentExecutionStatus(got.Status) {
+			t.Fatalf("status %q is not active after mid-life flush under %s", got.Status, terminal)
+		}
+		if got.HeartbeatCount < 1 {
+			t.Fatalf("HeartbeatCount = %d after mid-life flush, want progress persisted", got.HeartbeatCount)
+		}
+	}
+
+	// Final path still publishes terminal after drain authority.
+	if err := x.persistFinal("killed", Result{Status: "killed", HeartbeatCount: x.heartbeatCountValue()}, "stop", "2026-07-18T00:02:00.000Z"); err != nil {
+		t.Fatalf("persistFinal error = %v", err)
+	}
+	got, err := repos.AgentExecutions.GetByID(context.Background(), x.executionID)
+	if err != nil {
+		t.Fatalf("GetByID after terminal error = %v", err)
+	}
+	if got == nil || got.Status != "killed" {
+		t.Fatalf("durable status after persistFinal = %#v, want killed", got)
 	}
 }
 
