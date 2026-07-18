@@ -72,6 +72,68 @@ func TestEffectiveConfigUsesSnapshotOverrides(t *testing.T) {
 	}
 }
 
+func TestParamsForRoleVendorStripsCrossVendorIdentity(t *testing.T) {
+	t.Parallel()
+
+	global := config.AgentVendorCodex
+	params := map[string]any{
+		"command": "/opt/codex-wrapper",
+		"args":    []any{"exec", "--model", "params-model", "--other"},
+		"keep":    "yes",
+	}
+
+	// Same vendor: shared params (including command wrapper) are preserved by reference.
+	same := ParamsForRoleVendor(params, &global, config.AgentVendorCodex)
+	if same == nil || same["command"] != "/opt/codex-wrapper" {
+		t.Fatalf("same-vendor params = %#v, want original command", same)
+	}
+	same["probe"] = true
+	if params["probe"] != true {
+		t.Fatal("same-vendor should return the shared params map")
+	}
+	delete(same, "probe")
+
+	// Diverged role vendor: strip command + model flags; keep non-identity keys/args.
+	diverged := ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode)
+	if _, ok := diverged["command"]; ok {
+		t.Fatalf("diverged role still has command: %#v", diverged)
+	}
+	if diverged["keep"] != "yes" {
+		t.Fatalf("diverged role dropped non-identity param: %#v", diverged)
+	}
+	joined := strings.Join(stringArgs(diverged["args"]), " ")
+	if strings.Contains(joined, "params-model") || strings.Contains(joined, "--model") {
+		t.Fatalf("diverged role args = %q, want model flags stripped", joined)
+	}
+	if !strings.Contains(joined, "--other") || !strings.Contains(joined, "exec") {
+		t.Fatalf("diverged role args = %q, want non-identity args preserved", joined)
+	}
+	// Original map must not be mutated.
+	if params["command"] != "/opt/codex-wrapper" {
+		t.Fatal("ParamsForRoleVendor mutated source params.command")
+	}
+
+	// No global vendor: params have no home vendor; strip identity for any role.
+	noGlobal := ParamsForRoleVendor(params, nil, config.AgentVendorClaudeCode)
+	if _, ok := noGlobal["command"]; ok {
+		t.Fatalf("nil global vendor still has command: %#v", noGlobal)
+	}
+
+	// Nil params stay nil.
+	if ParamsForRoleVendor(nil, &global, config.AgentVendorClaudeCode) != nil {
+		t.Fatal("nil params should stay nil")
+	}
+
+	// Role with stripped params must resolve to the role vendor binary, not the wrapper.
+	cfg := ExecutorConfig{
+		Vendor: config.AgentVendorClaudeCode,
+		Params: ParamsForRoleVendor(params, &global, config.AgentVendorClaudeCode),
+	}
+	if cmd := resolveCommand(cfg); cmd != "claude" {
+		t.Fatalf("resolveCommand(diverged role) = %q, want claude", cmd)
+	}
+}
+
 func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
 	t.Parallel()
 

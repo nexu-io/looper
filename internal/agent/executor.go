@@ -237,6 +237,22 @@ func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
 	return cfg
 }
 
+// ParamsForRoleVendor returns executor params for a coding-role vendor.
+// Global agent.params are owned by agent.vendor. When a role resolves to a
+// different vendor (or global vendor is unset while the role still resolves),
+// identity-bearing overrides are stripped so params.command cannot override
+// resolveCommand's vendor binary and model flags cannot defeat the role model.
+// Same-vendor roles keep the shared params map (including command wrappers).
+func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor) map[string]any {
+	if params == nil {
+		return nil
+	}
+	if globalVendor != nil && *globalVendor == roleVendor {
+		return params
+	}
+	return cloneParamsForSnapshot(params, true)
+}
+
 // cloneParamsForSnapshot copies params and strips identity-bearing overrides.
 // When stripCommand is true, params.command is removed. Model flags in args are
 // always removed so SnapshotModel wins.

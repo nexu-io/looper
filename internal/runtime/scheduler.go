@@ -3137,11 +3137,16 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		notificationGateway.RefreshThreadHeader(ctx, p.LoopID, p.TailLines, p.ElapsedSeconds)
 	}
 	newRoleAgentExecutor := func(resolved config.ResolvedAgent) *agent.ConfiguredExecutor {
+		// agent.params (especially command/args) belong to the global agent
+		// vendor. Role executors that resolve to a different vendor must not
+		// inherit that command map — resolveCommand prefers params.command
+		// over vendor defaults, which would launch the wrong binary at startup
+		// (hot-reload only guards later vendor switches).
 		return agent.New(agent.ExecutorOptions{
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
-				Params:              cfg.Agent.Params,
+				Params:              agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, resolved.Vendor),
 				Env:                 cfg.Agent.Env,
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
 				LiveToolEvents:      liveToolEvents,
