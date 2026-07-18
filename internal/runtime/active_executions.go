@@ -624,6 +624,11 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) 
 // so a failed retry/start/worker-reuse cannot leave a live agent for a loop
 // that was never reactivated.
 //
+// Always increments the stop-gate refcount (sticky restore reference) even when
+// a temporary BeginLoopStop is already active for the same loop. Leaving the
+// count unchanged would let that temporary release reopen AdmitSpawn after the
+// failed reactivation; restore must outlive unrelated releases.
+//
 // Returns cancelAndDrainLoop's error when kill or confirmed-drain fails so
 // callers can join it with the original validation/TX failure; the gate is
 // still closed even when drain fails.
@@ -632,9 +637,10 @@ func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) error {
 		return nil
 	}
 	r.mu.Lock()
-	if r.stoppingLoops[loopID] == 0 {
-		r.stoppingLoops[loopID] = 1
-	}
+	// Sticky restore always owns a reference. Temporary BeginLoopStop (for
+	// example stopCandidateExecution's kill window) may already hold a count;
+	// incrementing ensures its deferred release cannot clear the restored gate.
+	r.stoppingLoops[loopID]++
 	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
 	// Gate is closed first; cancel+drain prevents orphan processes from the

@@ -931,8 +931,27 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		// released only on full execution end; update handle in place via a
 		// second BindHandle is not valid (lease left pending).
 		if err := rebind.RebindHandle(handle, x.Kill); err != nil {
+			// Registry already killUnowned'd on stop/admission refuse; ensure
+			// local cleanup and surface killed so persistFinal does not keep
+			// the stale native-resume attach "failed" over markExecutionCancelling.
 			_ = handle.Kill(context.Background())
-			return Result{}, "", false
+			errMsg := firstNonEmpty(err.Error(), nativeError)
+			x.mu.Lock()
+			x.status = "killed"
+			x.nativeResumeStatus = "fallback_failed"
+			x.nativeResumeError = errMsg
+			x.mu.Unlock()
+			return Result{
+				Status:                       "killed",
+				Summary:                      firstNonEmpty(errMsg, "native resume fallback refused during stop"),
+				ParseStatus:                  "missing",
+				HeartbeatCount:               x.heartbeatCountValue(),
+				ConfiguredIdleTimeoutSeconds: durationSeconds(x.heartbeatTimeout),
+				ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
+				ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
+				LastProgressAt:               x.lastProgressAtISO(),
+				PID:                          x.leaderPID(),
+			}, errMsg, true
 		}
 	}
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -561,6 +562,130 @@ func TestExecutorNativeResumeFailureAfterAttachDoesNotFallback(t *testing.T) {
 	if len(lines) != 1 || lines[0] != "exec resume codex-session-1 continue work" {
 		t.Fatalf("spawned args = %#v, want only native resume invocation", lines)
 	}
+}
+
+// When stop refuses RebindHandle after native-resume fallback has already
+// started, the execution must finish as killed (not the stale attach failure)
+// so persistFinal does not overwrite a cancelling stop with failed.
+func TestExecutorRefusedFallbackRebindSurfacesKilled(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	sessionID := "codex-session-1"
+	mode := "native_resume"
+	status := "pending"
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:                 "agent_previous",
+		ProjectID:          strPtr("project_1"),
+		LoopID:             strPtr("loop_1"),
+		Vendor:             string(config.AgentVendorCodex),
+		Status:             "killed",
+		NativeSessionID:    &sessionID,
+		NativeResumeMode:   &mode,
+		NativeResumeStatus: &status,
+		StartedAt:          nowISO,
+		CreatedAt:          nowISO,
+		UpdatedAt:          nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	scriptPath := filepath.Join(t.TempDir(), "mock-codex")
+	// Native resume fails attach; fallback would start and sleep unless rebind refuses.
+	script := "#!/bin/sh\ncase \"$*\" in *resume*) printf '%s\\n' 'resume failed' >&2; exit 2;; esac\nprintf '%s\\n' 'fallback started'\nsleep 30\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+
+	owner := &refuseRebindOwner{}
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:  repos,
+		Owner:  owner,
+		Now: func() time.Time {
+			now = now.Add(10 * time.Millisecond)
+			return now
+		},
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      "agent_fallback_rebind_refused",
+		LoopID:           "loop_1",
+		WorkingDirectory: t.TempDir(),
+		Prompt:           "continue work",
+		Timeout:          5 * time.Second,
+		GracefulShutdown: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "killed" {
+		t.Fatalf("result.Status = %q, want killed after refused fallback rebind", result.Status)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_fallback_rebind_refused")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.Status != "killed" {
+		t.Fatalf("persisted status = %#v, want killed", record)
+	}
+	if record.NativeResumeStatus == nil || *record.NativeResumeStatus != "fallback_failed" {
+		t.Fatalf("NativeResumeStatus = %#v, want fallback_failed", record.NativeResumeStatus)
+	}
+	if owner.lease == nil || !owner.lease.rebindAttempted {
+		t.Fatal("expected RebindHandle to be attempted on fallback")
+	}
+}
+
+// refuseRebindOwner admits one lease that allows the first BindHandle but
+// refuses RebindHandle (stop won during native-resume fallback).
+type refuseRebindOwner struct {
+	lease *refuseRebindLease
+}
+
+func (o *refuseRebindOwner) AdmitSpawn(ctx context.Context, meta SpawnMeta) (SpawnLease, error) {
+	leaseCtx, cancel := context.WithCancel(ctx)
+	o.lease = &refuseRebindLease{ctx: leaseCtx, cancel: cancel}
+	return o.lease, nil
+}
+
+type refuseRebindLease struct {
+	ctx             context.Context
+	cancel          context.CancelFunc
+	rebindAttempted bool
+}
+
+func (l *refuseRebindLease) Context() context.Context { return l.ctx }
+func (l *refuseRebindLease) BindHandle(handle *processcontainment.Handle, softKill SoftKillFunc) error {
+	return nil
+}
+func (l *refuseRebindLease) Release() {
+	if l.cancel != nil {
+		l.cancel()
+	}
+}
+func (l *refuseRebindLease) BeginRebind() error { return nil }
+func (l *refuseRebindLease) AbortRebind()       {}
+func (l *refuseRebindLease) RebindHandle(handle *processcontainment.Handle, softKill SoftKillFunc) error {
+	l.rebindAttempted = true
+	// Mimic registry refuse: kill the unowned fallback handle.
+	if handle != nil {
+		_ = handle.Kill(context.Background())
+	}
+	return ErrSpawnStoppedDuringBind
 }
 
 func TestExecutorFallbackTimeoutPropagatesTimeoutTypeToLifecycle(t *testing.T) {

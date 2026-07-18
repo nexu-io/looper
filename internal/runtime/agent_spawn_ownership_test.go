@@ -192,6 +192,48 @@ func TestRestoreLoopStopDrainsLeasesAdmittedDuringClear(t *testing.T) {
 	}
 }
 
+// RestoreLoopStop must add its own sticky ref even when a temporary
+// BeginLoopStop already holds a count, so the temporary release cannot reopen
+// AdmitSpawn after a failed reactivation.
+func TestRestoreLoopStopSurvivesTemporaryBeginLoopStopRelease(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+
+	// Durable sticky stop (haltLoop style: BeginLoopStop without release).
+	if _, err := reg.BeginLoopStop("loop-restore-sticky", "looper stop"); err != nil {
+		t.Fatalf("BeginLoopStop sticky: %v", err)
+	}
+	if was := reg.ClearLoopStop("loop-restore-sticky"); !was {
+		t.Fatal("ClearLoopStop wasActive = false, want true")
+	}
+
+	// Concurrent temporary stop window (e.g. stopCandidateExecution kill path).
+	tempRelease, err := reg.BeginLoopStop("loop-restore-sticky", "candidate kill window")
+	if err != nil {
+		t.Fatalf("BeginLoopStop temporary: %v", err)
+	}
+
+	// Failed reactivation restores the sticky gate while temp is still active.
+	if err := reg.RestoreLoopStop("loop-restore-sticky"); err != nil {
+		t.Fatalf("RestoreLoopStop: %v", err)
+	}
+	if !reg.LoopStopActive("loop-restore-sticky") {
+		t.Fatal("LoopStopActive = false after RestoreLoopStop, want closed")
+	}
+
+	// Temporary release must not clear the restored sticky reference.
+	tempRelease()
+	if !reg.LoopStopActive("loop-restore-sticky") {
+		t.Fatal("LoopStopActive = false after temporary release, want sticky restore to remain")
+	}
+	_, admitErr := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-restore-sticky", RunID: "run-late", ExecutionID: "exec-late",
+	})
+	if !errors.Is(admitErr, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after temp release error = %v, want ErrSpawnLoopStopping", admitErr)
+	}
+}
+
 // BeginLoopStop must report drain failure when a pending Start→BindHandle
 // window never closes within killBudget (wedged executor after cmd.Start).
 func TestBeginLoopStopReturnsErrorWhenPendingSpawnWaitTimesOut(t *testing.T) {
