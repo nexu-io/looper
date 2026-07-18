@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -281,11 +283,8 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		_ = configReader.Close()
 		_ = configWriter.Close()
 		// Bind failed after Start: force-kill the orphaned process group so it
-		// does not outlive the proxy request (same emergency path as agent bind).
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-		}
+		// does not outlive the proxy request (same emergency path as shell bind).
+		killTrustedReviewStartedWithoutHandle(cmd)
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "bind trusted review containment handle: " + bindErr.Error()})
 		return
 	}
@@ -299,8 +298,12 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		configWriteDone <- writeErr
 	}()
 	// Handle owns exactly-once Wait; do not call cmd.Wait in parallel.
+	// waitCtx is cancelable so post-Kill Wait cannot hang forever when an
+	// escaped descendant keeps stdio open and cmd.Wait never reaps.
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	defer waitCancel()
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- handle.Wait(context.Background()) }()
+	go func() { waitDone <- handle.Wait(waitCtx) }()
 	select {
 	case err = <-waitDone:
 		// Normal exit path: confirmed-drain descendants before answering.
@@ -314,13 +317,29 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		killCtx, killCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		killErr := handle.Kill(killCtx)
 		killCancel()
-		err = <-waitDone
+		// Unstick Wait if Kill timed out without reaping the leader, then
+		// bound the receive so cleanup cannot hang on an open waitDone.
+		waitCancel()
+		select {
+		case err = <-waitDone:
+		case <-time.After(time.Second):
+			// Wait still blocked (should not happen once waitCtx is canceled);
+			// fail loud so cleanup cannot hang in wg.Wait.
+			if killErr != nil {
+				err = killErr
+			} else {
+				err = fmt.Errorf("trusted review child wait did not complete after cancel: %w", ctx.Err())
+			}
+		}
 		if err == nil {
 			if killErr != nil {
 				err = killErr
 			} else {
 				err = ctx.Err()
 			}
+		} else if killErr != nil && errors.Is(err, context.Canceled) {
+			// Wait unblocked via waitCancel after Kill; surface kill outcome.
+			err = killErr
 		}
 	}
 	configWriteErr := <-configWriteDone
@@ -347,6 +366,22 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		resp.Error = "write trusted review config snapshot: " + configWriteErr.Error()
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+// killTrustedReviewStartedWithoutHandle is only used when Bind fails after
+// Start so the orphaned process group is not left live. Production stop paths
+// use Handle.Kill. Mirrors shell.killStartedWithoutHandle: SIGKILL the group
+// first, then fall back to Process.Kill + Wait on the leader.
+func killTrustedReviewStartedWithoutHandle(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
 }
 
 // trustedReviewProxyBlockedFlags are CLI overrides that must never be accepted
