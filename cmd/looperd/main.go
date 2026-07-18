@@ -555,8 +555,12 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		// #576: agent live PID fallback removed after full in-scope agent coverage.
 		// In-scope agents are owned at the common executor boundary; do not
 		// reconstruct stop/kill from SQLite PID while the daemon is live.
+		// A stoppable execution with a persisted PID but no registry entry is an
+		// ownership invariant violation: fail loudly so stop/close cannot report
+		// success while leaving a live agent process behind.
 		if latestExecution.PID != nil && *latestExecution.PID > 0 {
 			result.PID = *latestExecution.PID
+			return nil, looperdruntime.ErrAgentLiveHandleMissing
 		}
 		result.ProcessSkipReason = processSkipNoLiveHandle
 		return finish()
@@ -1051,8 +1055,10 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 			return result, nil
 		}
 		// #576: no live SQLite-PID fallback when Supervisor registry is present.
+		// Missing handle with a persisted PID is an ownership invariant violation.
 		if candidate.Execution.PID != nil && *candidate.Execution.PID > 0 {
 			result.PID = *candidate.Execution.PID
+			return result, looperdruntime.ErrAgentLiveHandleMissing
 		}
 		result.ProcessSkipReason = processSkipNoLiveHandle
 		return result, nil
