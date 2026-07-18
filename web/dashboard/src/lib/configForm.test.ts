@@ -9,6 +9,7 @@ import {
   configSelectOptions,
   draftStagesConfigChange,
   highImpactChanges,
+  profileLeafUnsetWouldEmpty,
   roleAgentPath,
 } from "./configForm";
 
@@ -402,6 +403,34 @@ describe("config form contract", () => {
     expect(result.errors).toEqual({});
     expect(result.body.set).toEqual({});
     expect(result.body.unset).toEqual(["agent.profiles.fast.model"]);
+  });
+
+  it("preserves empty-string model suppression when unsetting profile vendor", () => {
+    const data = fixture();
+    data.agent.profiles = { suppress: { vendor: "codex", model: "" } };
+
+    // Dashboard must not promote vendor unset to whole-profile removal.
+    expect(
+      profileLeafUnsetWouldEmpty(data, {}, [], "suppress", "vendor"),
+    ).toBe(false);
+
+    // Save must leave {model: ""} rather than unsetting agent.profiles.suppress.
+    const result = buildConfigPatch(
+      data,
+      {},
+      ["agent.profiles.suppress.vendor"],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual(["agent.profiles.suppress.vendor"]);
+  });
+
+  it("still promotes vendor unset when model is truly absent", () => {
+    const data = fixture();
+    data.agent.profiles = { cheap: { vendor: "opencode" } };
+    expect(
+      profileLeafUnsetWouldEmpty(data, {}, [], "cheap", "vendor"),
+    ).toBe(true);
   });
 
   it("confirms automatic commit only when the change can enable it", () => {

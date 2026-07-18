@@ -387,8 +387,23 @@ function valuesEqual(a: unknown, b: unknown): boolean {
 }
 
 /**
- * True when a non-empty identity leaf would remain after applying set/unset.
- * Empty string and nullish values do not count as present.
+ * Whether a profile identity leaf value counts as present.
+ * Vendor: nullish/empty means absent.
+ * Model: empty string is a valid suppression binding (backend non-nil empty);
+ * only nullish means absent.
+ */
+function profileIdentityValuePresent(
+  field: "vendor" | "model",
+  value: unknown,
+): boolean {
+  if (value == null) return false;
+  if (field === "model") return true;
+  return String(value).trim() !== "";
+}
+
+/**
+ * True when an identity leaf would remain after applying set/unset.
+ * Empty model strings count as present (model-suppression binding).
  */
 function profileLeafPresentAfterPatch(
   data: ConfigData,
@@ -402,11 +417,9 @@ function profileLeafPresentAfterPatch(
   const path = agentProfilePath(profileId, field);
   if (unset.has(path)) return false;
   if (Object.hasOwn(set, path)) {
-    const value = set[path];
-    return value != null && value !== "";
+    return profileIdentityValuePresent(field, set[path]);
   }
-  const current = getConfigValue(data, path);
-  return current != null && current !== "";
+  return profileIdentityValuePresent(field, getConfigValue(data, path));
 }
 
 /**
@@ -552,6 +565,10 @@ export function draftStagesConfigChange(
  * Whether unsetting (or clearing) this profile leaf would leave the profile
  * with no vendor and no model. Used by the dashboard to promote last-leaf
  * unsets to whole-profile removal instead of staging a doomed empty object.
+ *
+ * Empty-string model is treated as present: backend non-nil empty model
+ * suppresses inherited/params models, so unsetting only vendor must leave
+ * `{model: ""}` rather than removing the whole profile.
  */
 export function profileLeafUnsetWouldEmpty(
   data: ConfigData,
@@ -571,13 +588,22 @@ export function profileLeafUnsetWouldEmpty(
 
   if (Object.hasOwn(drafts, otherPath)) {
     const draft = drafts[otherPath];
-    return String(draft ?? "").trim() === "";
+    const trimmed = String(draft ?? "").trim();
+    if (otherField === "model") {
+      // Non-empty draft keeps a model. Empty draft stages inherit-unset only
+      // when the published model is non-empty; published "" suppress remains.
+      if (trimmed !== "") return false;
+      return !profileIdentityValuePresent(
+        "model",
+        getConfigValue(data, otherPath),
+      );
+    }
+    return trimmed === "";
   }
-  const otherCurrent = getConfigValue(
-    data,
-    agentProfilePath(profileId, otherField),
+  return !profileIdentityValuePresent(
+    otherField,
+    getConfigValue(data, otherPath),
   );
-  return otherCurrent == null || otherCurrent === "";
 }
 
 export type HighImpactChange = { path: string; label: string };
