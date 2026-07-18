@@ -304,53 +304,95 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	defer waitCancel()
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- handle.Wait(waitCtx) }()
-	select {
-	case err = <-waitDone:
-		// Normal exit path: confirmed-drain descendants before answering.
-		drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		if drainErr := handle.Drain(drainCtx); drainErr != nil {
-			// Join so non-zero child exits still surface ErrNotConfirmedDead.
-			if err == nil {
-				err = drainErr
-			} else {
-				err = errors.Join(err, drainErr)
-			}
-		}
-		drainCancel()
-	case <-ctx.Done():
-		// Cancel: confirmed Kill, never signal-only success (#577).
-		killCtx, killCancel := context.WithTimeout(context.Background(), 20*time.Second)
-		killErr := handle.Kill(killCtx)
-		killCancel()
-		// Unstick Wait if Kill timed out without reaping the leader, then
-		// bound the receive so cleanup cannot hang on an open waitDone.
-		waitCancel()
+	// Poll leader liveness: if the leader is reaped but Wait is still blocked
+	// on stdout/stderr copy (descendant holds pipes), Drain before the
+	// connection deadline — ctx is not canceled by the conn deadline alone.
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	alreadyDrained := false
+loop:
+	for {
 		select {
 		case err = <-waitDone:
-		case <-time.After(time.Second):
-			// Wait still blocked (should not happen once waitCtx is canceled);
-			// fail loud so cleanup cannot hang in wg.Wait.
-			if killErr != nil {
-				err = killErr
-			} else {
-				err = fmt.Errorf("trusted review child wait did not complete after cancel: %w", ctx.Err())
+			if !alreadyDrained {
+				// Normal exit path: confirmed-drain descendants before answering.
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
+				if drainErr := handle.Drain(drainCtx); drainErr != nil {
+					// Join so non-zero child exits still surface ErrNotConfirmedDead.
+					if err == nil {
+						err = drainErr
+					} else {
+						err = errors.Join(err, drainErr)
+					}
+				}
+				drainCancel()
 			}
-		}
-		if err == nil {
-			if killErr != nil {
-				err = killErr
-			} else {
-				err = ctx.Err()
+			break loop
+		case <-ctx.Done():
+			// Cancel: confirmed Kill, never signal-only success (#577).
+			killCtx, killCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			killErr := handle.Kill(killCtx)
+			killCancel()
+			// Unstick Wait if Kill timed out without reaping the leader, then
+			// bound the receive so cleanup cannot hang on an open waitDone.
+			waitCancel()
+			select {
+			case err = <-waitDone:
+			case <-time.After(time.Second):
+				// Wait still blocked (should not happen once waitCtx is canceled);
+				// fail loud so cleanup cannot hang in wg.Wait.
+				if killErr != nil {
+					err = killErr
+				} else {
+					err = fmt.Errorf("trusted review child wait did not complete after cancel: %w", ctx.Err())
+				}
 			}
-		} else if killErr != nil {
-			if errors.Is(err, context.Canceled) {
-				// Wait unblocked via waitCancel after Kill; surface kill outcome.
-				err = killErr
-			} else {
-				// Child already exited non-zero (or other wait error); still
-				// surface containment failure so undrained descendants are not hidden.
-				err = errors.Join(err, killErr)
+			if err == nil {
+				if killErr != nil {
+					err = killErr
+				} else {
+					err = ctx.Err()
+				}
+			} else if killErr != nil {
+				if errors.Is(err, context.Canceled) {
+					// Wait unblocked via waitCancel after Kill; surface kill outcome.
+					err = killErr
+				} else {
+					// Child already exited non-zero (or other wait error); still
+					// surface containment failure so undrained descendants are not hidden.
+					err = errors.Join(err, killErr)
+				}
 			}
+			break loop
+		case <-poll.C:
+			if alreadyDrained || !trustedReviewLeaderPIDGone(handle.PID()) {
+				continue
+			}
+			// Leader reaped; Drain kills pipe-holding descendants and unblocks Wait.
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if drainErr := handle.Drain(drainCtx); drainErr != nil {
+				if err == nil {
+					err = drainErr
+				} else {
+					err = errors.Join(err, drainErr)
+				}
+			}
+			drainCancel()
+			alreadyDrained = true
+			select {
+			case waitErr := <-waitDone:
+				if err == nil {
+					err = waitErr
+				} else if waitErr != nil {
+					// Keep containment drain failure and child exit together.
+					err = errors.Join(waitErr, err)
+				}
+			case <-time.After(time.Second):
+				if err == nil {
+					err = fmt.Errorf("trusted review child wait did not complete after drain")
+				}
+			}
+			break loop
 		}
 	}
 	configWriteErr := <-configWriteDone
@@ -375,12 +417,35 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	}
 	if stdout.Truncated() || stderr.Truncated() {
 		resp.ExitCode = 1
-		resp.Error = "trusted review proxy child output exceeds size limit"
+		// Preserve prior containment/kill/drain Error so ErrNotConfirmedDead is
+		// not replaced by truncation-only text when both apply.
+		resp.Error = mergeTrustedReviewTruncationError(resp.Error)
 	} else if configWriteErr != nil && err == nil {
 		resp.ExitCode = 1
 		resp.Error = "write trusted review config snapshot: " + configWriteErr.Error()
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
+}
+
+// trustedReviewLeaderPIDGone reports whether the leader pid has been reaped.
+// Used to detect Wait stuck on pipe-copy after Process.Wait completed.
+func trustedReviewLeaderPIDGone(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return errors.Is(err, syscall.ESRCH)
+}
+
+const trustedReviewOutputTruncatedMsg = "trusted review proxy child output exceeds size limit"
+
+// mergeTrustedReviewTruncationError keeps an existing containment/kill/drain
+// error when output also exceeded the capture cap.
+func mergeTrustedReviewTruncationError(existing string) string {
+	if existing == "" {
+		return trustedReviewOutputTruncatedMsg
+	}
+	return existing + "; " + trustedReviewOutputTruncatedMsg
 }
 
 // killTrustedReviewStartedWithoutHandle is only used when Bind fails after

@@ -39,6 +39,46 @@ func TestTrustedReviewProxyRejectsOversizedStdinBeforeStartingChild(t *testing.T
 	}
 }
 
+func TestTrustedReviewProxyDrainsBackgroundChildAfterLeaderExitsWithPipes(t *testing.T) {
+	// Child leader exits 0 after spawning a same-group background sleeper that
+	// inherits stdout. Wait would hang on pipe copy; proxy must Drain and return.
+	dir := t.TempDir()
+	realLooper := filepath.Join(dir, "real-looper")
+	childPIDPath := filepath.Join(dir, "child.pid")
+	script := trustedReviewProxyStubScript(`
+(sleep 60) &
+echo $! > "` + childPIDPath + `"
+exit 0
+`)
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	if err != nil {
+		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	t.Setenv(TrustedReviewSockEnv, sockPath)
+	t.Setenv(trustedReviewProxySkipEnv, "")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ProxyReviewSubmit(
+			[]string{"review", "submit", "acme/looper#1", "--event", "COMMENT"},
+			nil,
+			dir,
+		)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ProxyReviewSubmit() error = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ProxyReviewSubmit hung after leader exit with background pipe-holding child")
+	}
+}
+
 func TestTrustedReviewProxyCleanupClosesPartialConnectionsAndKillsChildGroup(t *testing.T) {
 	dir := t.TempDir()
 	realLooper := filepath.Join(dir, "real-looper")
@@ -102,5 +142,20 @@ func TestTrustedReviewBoundedBufferTruncatesWithoutBackpressuringChild(t *testin
 	}
 	if got := buffer.String(); got != "abcd" || !buffer.Truncated() {
 		t.Fatalf("bounded buffer = (%q, %t), want (abcd, true)", got, buffer.Truncated())
+	}
+}
+
+func TestMergeTrustedReviewTruncationErrorPreservesContainment(t *testing.T) {
+	t.Parallel()
+	if got := mergeTrustedReviewTruncationError(""); got != trustedReviewOutputTruncatedMsg {
+		t.Fatalf("empty existing = %q, want truncation-only", got)
+	}
+	existing := "process containment: not confirmed dead"
+	got := mergeTrustedReviewTruncationError(existing)
+	if !strings.Contains(got, existing) {
+		t.Fatalf("merged = %q, want to keep containment error", got)
+	}
+	if !strings.Contains(got, trustedReviewOutputTruncatedMsg) {
+		t.Fatalf("merged = %q, want truncation message", got)
 	}
 }

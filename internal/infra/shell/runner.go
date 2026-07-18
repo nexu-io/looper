@@ -89,44 +89,15 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		defer timeoutCancel()
 	}
 
-	waitErr := handle.Wait(waitCtx)
-	timedOut := false
-	var canceledErr error
-	var killErr error
-	var drainErr error
+	// Wait in a goroutine so we can Drain when the leader is reaped but
+	// cmd.Wait is still blocked on stdout/stderr copy (background child still
+	// holds the writer ends). Blocking only on Wait never reaches Drain.
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- handle.Wait(waitCtx) }()
 
-	if waitErr != nil && isContextError(waitErr) {
-		// Prefer the parent context error when it was the cause.
-		if ctx.Err() != nil {
-			canceledErr = ctx.Err()
-		} else if options.Timeout > 0 && errors.Is(waitErr, context.DeadlineExceeded) {
-			timedOut = true
-		} else {
-			canceledErr = waitErr
-		}
-		// Confirmed drain is the only stop success path (#574 / #577).
-		// Propagate Kill failures (e.g. ErrNotConfirmedDead) so callers learn
-		// that process-group containment failed rather than only seeing cancel/timeout.
-		killCtx, killCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
-		killErr = handle.Kill(killCtx)
-		killCancel()
-	} else {
-		// Leader exited (zero or non-zero). Drain group members that outlived it.
-		drainCtx, drainCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
-		if err := handle.Drain(drainCtx); err != nil {
-			// Surface drain failure after a finished leader so callers do not
-			// treat Run as successful while descendants remain runnable.
-			// Keep drainErr separate so non-zero exit paths can Join it and
-			// not drop ErrNotConfirmedDead behind CommandExecutionError.
-			drainErr = err
-			if waitErr == nil {
-				waitErr = drainErr
-			} else {
-				waitErr = errors.Join(waitErr, drainErr)
-			}
-		}
-		drainCancel()
-	}
+	waitErr, timedOut, canceledErr, killErr, drainErr := awaitContainedCommand(
+		handle, waitCtx, ctx, options.Timeout > 0, gracefulShutdown, waitDone,
+	)
 
 	duration := time.Since(startedAt)
 	result := Result{
@@ -165,6 +136,110 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return result, waitErr
 	}
 	return result, nil
+}
+
+// awaitContainedCommand finishes a contained shell command without hanging on
+// cmd.Wait's pipe-copy phase. When a same-process-group descendant inherits
+// stdout/stderr and outlives the leader, Process.Wait reaps the leader (PID
+// goes ESRCH) while Wait is still blocked on copy EOF — poll that case and
+// Drain so containment can kill the descendant and unstick Wait.
+func awaitContainedCommand(
+	handle *processcontainment.Handle,
+	waitCtx, parentCtx context.Context,
+	hasTimeout bool,
+	gracefulShutdown time.Duration,
+	waitDone <-chan error,
+) (waitErr error, timedOut bool, canceledErr error, killErr error, drainErr error) {
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+
+	var alreadyDrained bool
+	for {
+		select {
+		case waitErr = <-waitDone:
+			if waitErr != nil && isContextError(waitErr) {
+				// Prefer the parent context error when it was the cause.
+				if parentCtx.Err() != nil {
+					canceledErr = parentCtx.Err()
+				} else if hasTimeout && errors.Is(waitErr, context.DeadlineExceeded) {
+					timedOut = true
+				} else {
+					canceledErr = waitErr
+				}
+				// Confirmed drain is the only stop success path (#574 / #577).
+				// Propagate Kill failures (e.g. ErrNotConfirmedDead) so callers learn
+				// that process-group containment failed rather than only seeing cancel/timeout.
+				killCtx, killCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+				killErr = handle.Kill(killCtx)
+				killCancel()
+				return waitErr, timedOut, canceledErr, killErr, drainErr
+			}
+			if !alreadyDrained {
+				// Leader exited (zero or non-zero). Drain group members that outlived it.
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+				if err := handle.Drain(drainCtx); err != nil {
+					// Surface drain failure after a finished leader so callers do not
+					// treat Run as successful while descendants remain runnable.
+					// Keep drainErr separate so non-zero exit paths can Join it and
+					// not drop ErrNotConfirmedDead behind CommandExecutionError.
+					drainErr = err
+					if waitErr == nil {
+						waitErr = drainErr
+					} else {
+						waitErr = errors.Join(waitErr, drainErr)
+					}
+				}
+				drainCancel()
+			}
+			return waitErr, timedOut, canceledErr, killErr, drainErr
+
+		case <-poll.C:
+			if alreadyDrained || !processPIDGone(handle.PID()) {
+				continue
+			}
+			// Leader reaped by cmd.Wait's Process.Wait, but pipe copy still
+			// blocks Wait. Drain kills pipe-holding descendants and unblocks it.
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+			if err := handle.Drain(drainCtx); err != nil {
+				drainErr = err
+			}
+			drainCancel()
+			alreadyDrained = true
+			// Wait should complete once pipes close; bound the receive.
+			select {
+			case waitErr = <-waitDone:
+				if drainErr != nil {
+					if waitErr == nil {
+						waitErr = drainErr
+					} else if !isExitError(waitErr) {
+						waitErr = errors.Join(waitErr, drainErr)
+					}
+					// ExitError + drainErr: keep drainErr separate for Join below.
+				}
+				return waitErr, timedOut, canceledErr, killErr, drainErr
+			case <-time.After(gracefulShutdown + drainSlack):
+				if waitErr == nil {
+					if drainErr != nil {
+						waitErr = drainErr
+					} else {
+						waitErr = fmt.Errorf("shell wait did not complete after drain")
+					}
+				}
+				return waitErr, timedOut, canceledErr, killErr, drainErr
+			}
+		}
+	}
+}
+
+// processPIDGone reports whether pid is no longer addressable (reaped).
+// Used to detect the stuck-pipe Wait case: cmd.Wait reaped the leader via
+// Process.Wait but is still blocked on stdout/stderr copy goroutines.
+func processPIDGone(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return errors.Is(err, syscall.ESRCH)
 }
 
 func startContainedCommand(ctx context.Context, options Options, gracefulShutdown time.Duration, stdout, stderr *boundedBuffer) (*processcontainment.Handle, error) {
