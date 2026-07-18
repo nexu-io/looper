@@ -1777,28 +1777,42 @@ func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, cl
 // ClaimNextNonLongTermRetryAmongTypes claims the next non-long-term-retry item
 // whose type is in types. Empty types claims nothing.
 func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
-	if len(types) == 0 {
-		return nil, nil
-	}
-	placeholders, args := queueTypeInClause(types)
-	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, args...)
-	return r.claimNextMatching(ctx, nowISO, claimedBy, `
-		AND NOT (`+longTermRetryPredicateParam+`)
-		AND qi.type IN (`+placeholders+`)
-	`, extraArgs)
+	return r.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, types, nil)
 }
 
 // ClaimNextLongTermRetryAmongTypes claims the next long-term-retry item whose
 // type is in types. Empty types claims nothing.
 func (r *QueueRepository) ClaimNextLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
-	if len(types) == 0 {
+	return r.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, types, nil)
+}
+
+// ClaimNextNonLongTermRetryAmongTypeSets claims the next non-long-term-retry item
+// that is either unrestricted by type or sticky-snapshot-only (latest run is
+// failed/interrupted with a non-empty agent_snapshot_json vendor). Both type
+// slices empty claims nothing.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
 		return nil, nil
 	}
-	placeholders, args := queueTypeInClause(types)
-	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, args...)
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND NOT (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+	`, extraArgs)
+}
+
+// ClaimNextLongTermRetryAmongTypeSets is the long-term-retry counterpart of
+// ClaimNextNonLongTermRetryAmongTypeSets.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
+		return nil, nil
+	}
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
 		AND (`+longTermRetryPredicateParam+`)
-		AND qi.type IN (`+placeholders+`)
+		`+typePred+`
 	`, extraArgs)
 }
 
@@ -1810,6 +1824,45 @@ func queueTypeInClause(types []string) (placeholders string, args []any) {
 		args = append(args, t)
 	}
 	return strings.Join(parts, ", "), args
+}
+
+// queueClaimTypePredicate builds the AND (...) filter for unrestricted types
+// and sticky-snapshot-only types. Sticky types require the loop's latest run
+// (started_at DESC, created_at DESC — matching Runs.GetLatestByLoopID) to be
+// failed/interrupted with a non-empty agent_snapshot_json vendor so fresh work
+// for unconfigured roles is never claimed while sticky retries still are.
+func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (predicate string, args []any) {
+	parts := make([]string, 0, 2)
+	if len(unrestrictedTypes) > 0 {
+		placeholders, typeArgs := queueTypeInClause(unrestrictedTypes)
+		parts = append(parts, "qi.type IN ("+placeholders+")")
+		args = append(args, typeArgs...)
+	}
+	if len(stickySnapshotTypes) > 0 {
+		placeholders, typeArgs := queueTypeInClause(stickySnapshotTypes)
+		// EXISTS over the single latest run row for the queue item's loop.
+		parts = append(parts, `(qi.type IN (`+placeholders+`)
+			AND qi.loop_id IS NOT NULL
+			AND EXISTS (
+				SELECT 1
+				FROM (
+					SELECT status, agent_snapshot_json
+					FROM runs
+					WHERE loop_id = qi.loop_id
+					ORDER BY started_at DESC, created_at DESC
+					LIMIT 1
+				) latest
+				WHERE latest.status IN ('failed', 'interrupted')
+					AND latest.agent_snapshot_json IS NOT NULL
+					AND length(trim(latest.agent_snapshot_json)) > 0
+					AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0
+			))`)
+		args = append(args, typeArgs...)
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return "AND (" + strings.Join(parts, " OR ") + ")", args
 }
 
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
