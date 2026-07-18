@@ -325,9 +325,13 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 // before stop may still reach AgentExecutor.Start after halt returns; reopening
 // would let AdmitSpawn succeed and start a process after looper stop. Clear the
 // gate only via ClearLoopStop when the loop is intentionally re-activated
-// (unpause/retry/handback or a fresh non-parked claim).
+// (API unpause/retry/handback). Do not clear from scheduler claim dispatch: a
+// pre-stop claim can race past parked checks and would reopen admission.
 //
-// The returned release is for tests and temporary windows only.
+// For terminal close abort paths (before durable terminate), callers should
+// invoke the returned release so a still-running loop can AdmitSpawn again.
+//
+// The returned release is also used in tests and temporary windows.
 func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 	if r == nil {
 		return func() {}
@@ -368,7 +372,7 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) func() {
 }
 
 // ClearLoopStop reopens spawn admission for a loop after intentional re-activation
-// (unpause, retry, handback, or a fresh non-parked queue claim).
+// (API unpause, retry, or handback). Not for scheduler claim dispatch.
 func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) {
 	if r == nil || loopID == "" {
 		return

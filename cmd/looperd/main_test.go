@@ -478,6 +478,53 @@ func TestCloseLoopTerminatesLoopAndCancelsActiveQueue(t *testing.T) {
 	}
 }
 
+// After a successful terminal close, per-loop spawn admission stays closed so
+// in-flight runners cannot AdmitSpawn past the durable terminate.
+func TestCloseLoopKeepsSpawnAdmissionClosedAfterSuccess(t *testing.T) {
+	ctx := context.Background()
+	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(ctx); err != nil {
+		t.Fatalf("MigrationRunner().RunPending() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 12, 0, 0, 0, time.UTC)
+	nowISO := "2026-04-21T12:00:00.000Z"
+	project := storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_close_sticky", Seq: 32, ProjectID: project.ID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	registry := looperdruntime.NewActiveExecutionRegistry()
+	services := looperdruntime.Services{
+		Coordinator:      coordinator,
+		Repositories:     repos,
+		Loops:            &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }},
+		ActiveExecutions: registry,
+	}
+
+	if _, err := closeLoop(ctx, services, loop.ID, "Closed by test", func() time.Time { return now }, nil, nil); err != nil {
+		t.Fatalf("closeLoop() error = %v", err)
+	}
+	if !registry.LoopStopActive(loop.ID) {
+		t.Fatal("LoopStopActive = false after successful closeLoop, want sticky closed gate")
+	}
+	_, err = registry.AdmitSpawn(ctx, agent.SpawnMeta{
+		LoopID: loop.ID, RunID: "run_late", ExecutionID: "exec_late",
+	})
+	if !errors.Is(err, agent.ErrSpawnLoopStopping) {
+		t.Fatalf("AdmitSpawn after closeLoop error = %v, want ErrSpawnLoopStopping", err)
+	}
+}
+
 // After a successful stop, per-loop spawn admission stays closed so an in-flight
 // runner that reaches AgentExecutor.Start after halt returns cannot AdmitSpawn.
 func TestStopLoopKeepsSpawnAdmissionClosedAfterReturn(t *testing.T) {
@@ -648,6 +695,16 @@ func TestCloseLoopDoesNotTerminateLoopWhenActiveKillFails(t *testing.T) {
 	}
 	if storedLoop == nil || storedLoop.Status != "running" {
 		t.Fatalf("Loops.GetByID() = %#v, want running loop after kill failure", storedLoop)
+	}
+	// Terminal close aborted after BeginLoopStop: release the sticky gate so the
+	// still-running loop can AdmitSpawn again.
+	if registry.LoopStopActive(loop.ID) {
+		t.Fatal("LoopStopActive = true after aborted closeLoop, want gate released")
+	}
+	if _, err := registry.AdmitSpawn(ctx, agent.SpawnMeta{
+		LoopID: loop.ID, RunID: "run_after_abort", ExecutionID: "exec_after_abort",
+	}); err != nil {
+		t.Fatalf("AdmitSpawn after aborted closeLoop error = %v, want success", err)
 	}
 }
 

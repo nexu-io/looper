@@ -470,18 +470,37 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 
 	// Close spawn admission for this loop before kill so stop-vs-spawn races
-	// cannot return a live process after halt begins (#576). Keep the gate
-	// closed after halt returns: in-flight runners that already claimed work
-	// may still reach AgentExecutor.Start without re-reading loop status, and
-	// reopening would let AdmitSpawn start a process after looper stop.
-	// ClearLoopStop runs only on intentional re-activation.
+	// cannot return a live process after halt begins (#576). After a durable
+	// stop (successful pause/terminate), keep the gate closed: in-flight
+	// runners that already claimed work may still reach AgentExecutor.Start
+	// without re-reading loop status. ClearLoopStop runs only on intentional
+	// re-activation (API unpause/retry/handback).
+	//
+	// Terminal close has no durable status transition until complete(); if a
+	// later lookup/Kill/signal aborts, release the gate so the still-running
+	// loop can AdmitSpawn again. Non-terminal already paused durably, so the
+	// gate stays sticky even when later steps fail.
+	var releaseLoopStop func()
 	if services.ActiveExecutions != nil {
-		_ = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+		releaseLoopStop = services.ActiveExecutions.BeginLoopStop(loopID, reason)
+	}
+	keepStopGateSticky := !terminal
+	defer func() {
+		if releaseLoopStop != nil && !keepStopGateSticky {
+			releaseLoopStop()
+		}
+	}()
+	finish := func() (any, error) {
+		out, err := complete()
+		if err == nil {
+			keepStopGateSticky = true
+		}
+		return out, err
 	}
 
 	if services.Repositories == nil || services.Repositories.Runs == nil {
 		result.ProcessSkipReason = processSkipNoRuns
-		return complete()
+		return finish()
 	}
 
 	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
@@ -491,13 +510,13 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	if latestRun == nil || latestRun.Status != "running" {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipNoRuns
-		return complete()
+		return finish()
 	}
 	result.RunID = latestRun.ID
 
 	if services.Repositories.AgentExecutions == nil {
 		result.ProcessSkipReason = processSkipNoExecution
-		return complete()
+		return finish()
 	}
 
 	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
@@ -506,7 +525,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	}
 	if latestExecution == nil {
 		result.ProcessSkipReason = processSkipNoExecution
-		return complete()
+		return finish()
 	}
 
 	result.ExecutionID = latestExecution.ID
@@ -514,7 +533,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	if !isStoppableExecutionStatus(latestExecution.Status) {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipAlreadyFinished
-		return complete()
+		return finish()
 	}
 	if latestExecution.Status == "cancelling" {
 		result.Outcome = stopOutcomeAlreadyStopping
@@ -531,7 +550,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 				return nil, err
 			}
-			return complete()
+			return finish()
 		}
 		// #576: agent live PID fallback removed after full in-scope agent coverage.
 		// In-scope agents are owned at the common executor boundary; do not
@@ -540,13 +559,13 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			result.PID = *latestExecution.PID
 		}
 		result.ProcessSkipReason = processSkipNoLiveHandle
-		return complete()
+		return finish()
 	}
 	// ActiveExecutions unavailable (misconfigured daemon): keep historical PID
 	// signal path so stop does not silently lose the ability to kill.
 	if latestExecution.PID == nil || *latestExecution.PID <= 0 {
 		result.ProcessSkipReason = processSkipNoPID
-		return complete()
+		return finish()
 	}
 
 	pid := int(*latestExecution.PID)
@@ -562,7 +581,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 			} else {
 				result.ProcessSkipReason = processSkipVerifierRejectedPID
 			}
-			return complete()
+			return finish()
 		}
 	}
 	result.PID = *latestExecution.PID
@@ -574,14 +593,14 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		result.ProcessSkipReason = ""
 	} else {
 		result.ProcessSkipReason = processSkipNoSignal
-		return complete()
+		return finish()
 	}
 
 	if err := markExecutionCancelling(ctx, services, *latestExecution, reasonCopy, now); err != nil {
 		return nil, err
 	}
 
-	return complete()
+	return finish()
 }
 
 type stopAllResult string

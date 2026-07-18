@@ -90,13 +90,10 @@ type defaultSchedulerTickInput struct {
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
-	AllowClaim           func() error
-	ReconcileStaleRuns   func(context.Context) (StaleRunReconcileSummary, error)
-	AsyncRunner          schedulerAsyncRunner
-	RequestSchedulerWake func()
-	// ActiveExecutions is the Supervisor registry; used to ClearLoopStop when
-	// dispatching a fresh non-parked claim after durable stop.
-	ActiveExecutions         *ActiveExecutionRegistry
+	AllowClaim               func() error
+	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
+	AsyncRunner              schedulerAsyncRunner
+	RequestSchedulerWake     func()
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
@@ -3275,7 +3272,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReconcileStaleRuns:       reconcileStaleRuns,
 			AsyncRunner:              runner,
 			RequestSchedulerWake:     requestWake,
-			ActiveExecutions:         services.ActiveExecutions,
 			Planner:                  plannerRunner,
 			Coordinator:              coordinatorRunner,
 			Reviewer:                 reviewerRunner,
@@ -3943,10 +3939,11 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			continue
 		}
 
-		// Fresh non-parked claim after durable stop: reopen per-loop spawn admission.
-		if item.LoopID != nil && input.ActiveExecutions != nil {
-			input.ActiveExecutions.ClearLoopStop(*item.LoopID)
-		}
+		// Do not ClearLoopStop here. A claim can race with looper stop: pass the
+		// parked check while still running, then BeginLoopStop closes admission
+		// before launch. Unconditional clear would reopen the sticky gate for
+		// that pre-stop claim. Intentional re-activation (API unpause/retry/
+		// handback) is the authority that clears the gate.
 
 		process, err := schedulerQueueProcessor(item, input)
 		if err != nil {
