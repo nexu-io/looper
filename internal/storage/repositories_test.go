@@ -2049,6 +2049,61 @@ func loopIDs(items []LoopRecord) []string {
 	return ids
 }
 
+func TestRunsUpsertPreservesAgentSnapshotOnUpdate(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-18T12:00:00.000Z"
+	baseBranch := "main"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{
+		ID: "project_snapshot", Name: "Snapshot", RepoPath: "/tmp/snapshot", BaseBranch: &baseBranch,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{
+		ID: "loop_snapshot", Seq: 1, ProjectID: "project_snapshot", Type: "worker",
+		TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	snapshot := `{"vendor":"codex","model":"gpt-5","profileId":"fast"}`
+	if err := repos.Runs.Upsert(ctx, RunRecord{
+		ID: "run_snapshot", LoopID: "loop_snapshot", Status: "running",
+		StartedAt: now, CreatedAt: now, UpdatedAt: now, AgentSnapshotJSON: &snapshot,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(insert) error = %v", err)
+	}
+	got, err := repos.Runs.GetByID(ctx, "run_snapshot")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got == nil || got.AgentSnapshotJSON == nil || *got.AgentSnapshotJSON != snapshot {
+		t.Fatalf("after insert AgentSnapshotJSON = %#v, want %q", got, snapshot)
+	}
+
+	// Subsequent upsert without snapshot must not clobber the insert-only column.
+	if err := repos.Runs.Upsert(ctx, RunRecord{
+		ID: "run_snapshot", LoopID: "loop_snapshot", Status: "success",
+		StartedAt: now, CreatedAt: now, UpdatedAt: now, Summary: strPtr("done"),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(update) error = %v", err)
+	}
+	got, err = repos.Runs.GetByID(ctx, "run_snapshot")
+	if err != nil {
+		t.Fatalf("GetByID() after update error = %v", err)
+	}
+	if got == nil || got.Status != "success" {
+		t.Fatalf("after update status = %#v, want success", got)
+	}
+	if got.AgentSnapshotJSON == nil || *got.AgentSnapshotJSON != snapshot {
+		t.Fatalf("after update AgentSnapshotJSON = %#v, want preserved %q", got.AgentSnapshotJSON, snapshot)
+	}
+}
+
 func strPtr(value string) *string {
 	return &value
 }

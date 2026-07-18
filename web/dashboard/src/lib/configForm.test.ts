@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { ApiError, type ConfigData } from "./api";
 import {
+  AGENT_VENDOR_OPTIONS,
   buildConfigPatch,
   CONFIG_GROUPS,
   configFieldErrors,
   configFieldPaths,
+  configSelectOptions,
   highImpactChanges,
+  roleAgentPath,
 } from "./configForm";
 
 function fixture(): ConfigData {
@@ -20,6 +23,9 @@ function fixture(): ConfigData {
     agent: {
       vendor: "codex",
       envKeys: ["OPENAI_API_KEY"],
+      profiles: {
+        fast: { vendor: "codex", model: "gpt-5-mini" },
+      },
       nativeResume: { enabled: true },
       timeouts: { plannerIdleTimeoutSeconds: 300 },
     },
@@ -40,6 +46,7 @@ function fixture(): ConfigData {
       },
       worker: {
         triggers: { planeAssigneeId: "worker-member" },
+        agent: { profile: "fast", vendor: "claude-code", model: "haiku" },
       },
       reviewer: {
         behavior: {
@@ -142,6 +149,60 @@ describe("config form contract", () => {
     expect(configFieldPaths(data, roles)).toContain(
       "roles.worker.triggers.planeAssigneeId",
     );
+    // Profiles are curated (add/remove UI), not free-form leaf fields.
+    expect(configFieldPaths(data, agent)).not.toContain(
+      "agent.profiles.fast.vendor",
+    );
+    expect(configFieldPaths(data, agent)).not.toContain("agent.profiles");
+    // Coding-role agent bindings are always exposed as curated leaves.
+    expect(configFieldPaths(data, roles)).toContain(
+      roleAgentPath("worker", "profile"),
+    );
+    expect(configFieldPaths(data, roles)).toContain(
+      roleAgentPath("planner", "vendor"),
+    );
+    expect(configFieldPaths(data, roles)).toContain(
+      roleAgentPath("reviewer", "model"),
+    );
+    expect(configFieldPaths(data, roles)).toContain(
+      roleAgentPath("fixer", "profile"),
+    );
+    expect(configFieldPaths(data, roles)).not.toContain("roles.worker.agent");
+    expect(configSelectOptions("agent.vendor")).toEqual([
+      ...AGENT_VENDOR_OPTIONS,
+    ]);
+    expect(configSelectOptions(roleAgentPath("worker", "vendor"))).toEqual([
+      ...AGENT_VENDOR_OPTIONS,
+    ]);
+    expect(configSelectOptions("agent.profiles.fast.vendor")).toEqual([
+      ...AGENT_VENDOR_OPTIONS,
+    ]);
+  });
+
+  it("builds patches for agent profiles and role agent bindings without params", () => {
+    const data = fixture();
+    const result = buildConfigPatch(
+      data,
+      {
+        "agent.profiles.fast.model": "gpt-5",
+        "agent.profiles.cheap.vendor": "opencode",
+        "roles.worker.agent.profile": "cheap",
+        "roles.planner.agent.model": "o3",
+      },
+      ["agent.profiles.fast", "roles.reviewer.agent.vendor"],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({
+      "agent.profiles.fast.model": "gpt-5",
+      "agent.profiles.cheap.vendor": "opencode",
+      "roles.worker.agent.profile": "cheap",
+      "roles.planner.agent.model": "o3",
+    });
+    expect(result.body.unset).toEqual([
+      "agent.profiles.fast",
+      "roles.reviewer.agent.vendor",
+    ]);
+    expect(JSON.stringify(result.body)).not.toMatch(/params/i);
   });
 
   it("builds a dirty-only typed patch and validates integer controls", () => {
@@ -215,6 +276,54 @@ describe("config form contract", () => {
       "roles.reviewer.behavior.threadResolution.mode",
       "roles.fixer.triggers.authorFilter",
       "roles.reviewer.behavior.threadResolution.requireNewHeadSinceThread",
+    ]);
+  });
+
+  it("requires confirmation for role/profile vendor and profile switches", () => {
+    const data = fixture();
+    const changes = highImpactChanges(
+      data,
+      {
+        "roles.worker.agent.vendor": "opencode",
+        "roles.reviewer.agent.profile": "fast",
+        "agent.profiles.fast.vendor": "claude-code",
+      },
+      [
+        "roles.worker.agent.vendor",
+        "roles.worker.agent.profile",
+        "agent.profiles.fast.vendor",
+        "agent.profiles.fast",
+      ],
+    );
+    expect(changes.map((change) => change.path)).toEqual([
+      "roles.worker.agent.vendor",
+      "roles.reviewer.agent.profile",
+      "agent.profiles.fast.vendor",
+      "roles.worker.agent.vendor",
+      "roles.worker.agent.profile",
+      "agent.profiles.fast.vendor",
+      "agent.profiles.fast",
+    ]);
+    expect(
+      changes.find((change) => change.path === "agent.profiles.fast")?.label,
+    ).toMatch(/referenced by worker/i);
+  });
+
+  it("treats empty profile/role model drafts as unset inherit, not empty-string set", () => {
+    const data = fixture();
+    const result = buildConfigPatch(
+      data,
+      {
+        "agent.profiles.fast.model": "",
+        "roles.worker.agent.model": "",
+      },
+      [],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual([
+      "agent.profiles.fast.model",
+      "roles.worker.agent.model",
     ]);
   });
 

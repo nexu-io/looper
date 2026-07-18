@@ -167,6 +167,17 @@ type Handler struct {
 	discardBeforeGitHook func(loopID string)
 }
 
+// effectiveConfig returns the live config when ConfigSnapshot is wired, else
+// the request/handler context config. Agent gates (create/start/retry) must use
+// this so role bindings reloaded after daemon start are visible.
+func (h *Handler) effectiveConfig() config.Config {
+	if h.context.ConfigSnapshot != nil {
+		cfg, _ := h.context.ConfigSnapshot()
+		return cfg
+	}
+	return h.context.Config
+}
+
 func NewHandler(context Context) *Handler {
 	now := context.Now
 	if now == nil {
@@ -1365,13 +1376,14 @@ type configServerResponse struct {
 }
 
 type configAgentResponse struct {
-	Vendor       *config.AgentVendor            `json:"vendor,omitempty"`
-	Model        *string                        `json:"model,omitempty"`
-	Params       map[string]any                 `json:"params"`
-	Env          map[string]string              `json:"env"`
-	EnvKeys      []string                       `json:"envKeys"`
-	Timeouts     config.AgentTimeoutConfig      `json:"timeouts"`
-	NativeResume config.AgentNativeResumeConfig `json:"nativeResume"`
+	Vendor       *config.AgentVendor                  `json:"vendor,omitempty"`
+	Model        *string                              `json:"model,omitempty"`
+	Profiles     map[string]config.AgentBindingConfig `json:"profiles,omitempty"`
+	Params       map[string]any                       `json:"params"`
+	Env          map[string]string                    `json:"env"`
+	EnvKeys      []string                             `json:"envKeys"`
+	Timeouts     config.AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume config.AgentNativeResumeConfig       `json:"nativeResume"`
 }
 
 type configDaemonResponse struct {
@@ -1402,6 +1414,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Agent: configAgentResponse{
 			Vendor:       cfg.Agent.Vendor,
 			Model:        cfg.Agent.Model,
+			Profiles:     cloneAgentProfiles(cfg.Agent.Profiles),
 			Params:       map[string]any{},
 			Env:          map[string]string{},
 			EnvKeys:      sortedMapKeys(cfg.Agent.Env),
@@ -1454,6 +1467,28 @@ func sortedMapKeys[T any](values map[string]T) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// cloneAgentProfiles copies profile bindings for the secret-safe config projection.
+// Empty maps become nil so json omitempty matches zero-diff style.
+func cloneAgentProfiles(profiles map[string]config.AgentBindingConfig) map[string]config.AgentBindingConfig {
+	if len(profiles) == 0 {
+		return nil
+	}
+	cloned := make(map[string]config.AgentBindingConfig, len(profiles))
+	for id, binding := range profiles {
+		entry := config.AgentBindingConfig{}
+		if binding.Vendor != nil {
+			vendor := *binding.Vendor
+			entry.Vendor = &vendor
+		}
+		if binding.Model != nil {
+			model := *binding.Model
+			entry.Model = &model
+		}
+		cloned[id] = entry
+	}
+	return cloned
 }
 
 func (h *Handler) buildWebhookStatusResponse() looperdruntime.WebhookStatus {
@@ -4127,7 +4162,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 	}
 
-	if (loopType == string(domain.LoopTypeReviewer) || loopType == string(domain.LoopTypeFixer) || loopType == string(domain.LoopTypeWorker) || loopType == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
+	if (loopType == string(domain.LoopTypeReviewer) || loopType == string(domain.LoopTypeFixer) || loopType == string(domain.LoopTypeWorker) || loopType == string(domain.LoopTypePlanner)) && !isCodingRoleAgentConfigured(h.effectiveConfig(), loopType) {
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot create %s loop without config.agent.vendor", loopType)}
 	}
 
@@ -4280,7 +4315,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if r.Method != http.MethodPost {
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/workers")}
 	}
-	if !isCodingAgentConfigured(h.context.Config) {
+	if !isCodingRoleAgentConfigured(h.effectiveConfig(), config.CodingRoleWorker) {
 		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: "Cannot create worker loop without config.agent.vendor"}
 	}
 
@@ -4876,7 +4911,7 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	if r.Method != http.MethodPost {
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/planners")}
 	}
-	if !isCodingAgentConfigured(h.context.Config) {
+	if !isCodingRoleAgentConfigured(h.effectiveConfig(), config.CodingRolePlanner) {
 		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: "Cannot create planner loop without config.agent.vendor"}
 	}
 
@@ -5288,7 +5323,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			}
 		}
 
-		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
+		if status == domain.LoopStatusRunning && (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingRoleAgentConfigured(h.effectiveConfig(), loop.Type) {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot start %s loop without config.agent.vendor", loop.Type)}
 		}
 		if status == domain.LoopStatusRunning && loop.Type == string(domain.LoopTypeReviewer) && isTerminalReviewerLoopRecord(*loop) {
@@ -6548,7 +6583,7 @@ func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *stora
 			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
 		}
 	}
-	if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
+	if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingRoleAgentConfigured(h.effectiveConfig(), loop.Type) {
 		return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
 	}
 	runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
@@ -7061,7 +7096,11 @@ func stringPtrOrNil(value string) *string {
 }
 
 func isCodingAgentConfigured(cfg config.Config) bool {
-	return cfg.Agent.Vendor != nil && strings.TrimSpace(string(*cfg.Agent.Vendor)) != ""
+	return config.AnyCodingRoleAgentConfigured(cfg)
+}
+
+func isCodingRoleAgentConfigured(cfg config.Config, role string) bool {
+	return config.CodingRoleAgentConfigured(cfg, role)
 }
 
 func urlPathSegment(parts []string, index int) (string, error) {

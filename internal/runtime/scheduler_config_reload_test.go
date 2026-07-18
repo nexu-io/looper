@@ -137,6 +137,77 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 	}
 }
 
+func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// No global vendor: only worker + reviewer resolve via role bindings.
+	cfg.Agent.Vendor = nil
+	workerVendor := config.AgentVendorCodex
+	reviewerVendor := config.AgentVendorClaudeCode
+	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &workerVendor}
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &reviewerVendor}
+
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repositories := storage.NewRepositories(coordinator.DB())
+
+	handlers := buildDefaultSchedulerHandlersWithOptions(
+		cfg,
+		"",
+		&capturingSchedulerLogger{},
+		coordinator,
+		repositories,
+		nil,
+		nil,
+		NewActiveExecutionRegistry(),
+		nil,
+		nil,
+		time.Now,
+		nil,
+		false,
+		nil,
+		nil,
+		newSchedulerNotificationGatewayFactory(),
+		coordinatorrole.NewRuntimeState(),
+	)
+	if handlers.input == nil {
+		t.Fatal("handlers.input = nil")
+	}
+	input := handlers.input(Services{Repositories: repositories})
+	if input.Worker == nil {
+		t.Fatal("Worker runner = nil, want configured for role-only worker vendor")
+	}
+	if input.Reviewer == nil {
+		t.Fatal("Reviewer runner = nil, want configured for role-only reviewer vendor")
+	}
+	if input.Planner != nil {
+		t.Fatal("Planner runner != nil, want nil when planner agent not configured")
+	}
+	if input.Fixer != nil {
+		t.Fatal("Fixer runner != nil, want nil when fixer agent not configured")
+	}
+	// ResolveAgent identity must differ for the two configured roles.
+	workerResolved, workerOK := config.ResolveAgent(cfg, "", config.CodingRoleWorker)
+	reviewerResolved, reviewerOK := config.ResolveAgent(cfg, "", config.CodingRoleReviewer)
+	if !workerOK || !reviewerOK {
+		t.Fatalf("ResolveAgent ok worker=%v reviewer=%v", workerOK, reviewerOK)
+	}
+	if workerResolved.Vendor == reviewerResolved.Vendor {
+		t.Fatalf("worker and reviewer vendors both %q, want different", workerResolved.Vendor)
+	}
+}
+
 func TestCatalogSchedulerPreservesCoordinatorThrottleAcrossConfigSnapshots(t *testing.T) {
 	t.Parallel()
 

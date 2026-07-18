@@ -32,6 +32,7 @@ import (
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	"github.com/nexu-io/looper/internal/worker"
 )
@@ -136,7 +137,7 @@ func (r catalogWebhookReviewer) DiscoverPullRequest(ctx context.Context, input r
 	}
 	reviewerRunner := r.snapshot()
 	if reviewerRunner == nil {
-		return reviewer.DiscoveryResult{}, fmt.Errorf("agent.vendor is not configured")
+		return reviewer.DiscoveryResult{}, fmt.Errorf("reviewer agent is not configured")
 	}
 	return reviewerRunner.DiscoverPullRequest(ctx, input)
 }
@@ -151,7 +152,7 @@ func (f catalogWebhookFixer) DiscoverPullRequest(ctx context.Context, input fixe
 	}
 	fixerRunner := f.snapshot()
 	if fixerRunner == nil {
-		return fixer.DiscoveryResult{}, fmt.Errorf("agent.vendor is not configured")
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer agent is not configured")
 	}
 	return fixerRunner.DiscoverPullRequest(ctx, input)
 }
@@ -162,7 +163,7 @@ func (f catalogWebhookFixer) DiscoverPullRequestsForBaseBranchUpdate(ctx context
 	}
 	fixerRunner := f.snapshot()
 	if fixerRunner == nil {
-		return fixer.DiscoveryResult{}, fmt.Errorf("agent.vendor is not configured")
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer agent is not configured")
 	}
 	return fixerRunner.DiscoverPullRequestsForBaseBranchUpdate(ctx, input)
 }
@@ -967,7 +968,7 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 }
 
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
-	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.CreatePullRequestResult{}, err
@@ -989,7 +990,7 @@ func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input plann
 }
 
 func (a plannerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input planner.UpdatePullRequestBodyInput) error {
-	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -1052,7 +1053,7 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 }
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
-	message := a.stamper.CommitMessage(input.Message, "planner")
+	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "planner")
 	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return planner.CommitResult{}, err
@@ -1068,7 +1069,12 @@ type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type plannerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
+		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1525,7 +1531,7 @@ func forgejoReviewMarkerAllowed(outcome string, allowed []reviewer.ReviewEvent, 
 }
 
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return reviewer.IssueCommentResult{}, err
@@ -1576,7 +1582,7 @@ func (a reviewerGitHubAdapter) ListIssueComments(ctx context.Context, input revi
 }
 
 func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input reviewer.UpdateIssueCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -1591,20 +1597,31 @@ func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input rev
 }
 
 func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
+	stamper := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
 		comments := make([]forge.PullRequestReviewCommentInput, 0, len(input.Comments))
 		for _, comment := range input.Comments {
-			comments = append(comments, forge.PullRequestReviewCommentInput{Body: a.stamper.ReviewComment(comment.Body, "reviewer"), Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+			comments = append(comments, forge.PullRequestReviewCommentInput{Body: stamper.ReviewComment(comment.Body, "reviewer"), Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 		}
-		body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
+		body := stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
 		_, err = client.CreatePullRequestReview(ctx, forge.CreatePullRequestReviewInput{Number: input.PRNumber, Body: body, Event: input.Event, CommitID: input.CommitID, Comments: comments})
 		return err
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
+	}
+	// Stamp with run snapshot identity before GitHub submit (Forgejo path stamps above).
+	input.Body = stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
+	if len(input.Comments) > 0 {
+		comments := make([]githubinfra.ReviewComment, len(input.Comments))
+		copy(comments, input.Comments)
+		for i := range comments {
+			comments[i].Body = stamper.ReviewComment(comments[i].Body, "reviewer")
+		}
+		input.Comments = comments
 	}
 	return a.gateway.SubmitReview(ctx, input)
 }
@@ -1709,7 +1726,7 @@ func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input r
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
 	}
-	body := a.stamper.ReviewComment(input.Body, "reviewer")
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "reviewer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
@@ -1923,6 +1940,9 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		Metadata:           input.Metadata,
 		IdempotencyKey:     input.IdempotencyKey,
 		Env:                reviewerTrustedReviewEnv(sock),
+		UseSnapshot:        input.UseSnapshot,
+		SnapshotVendor:     input.SnapshotVendor,
+		SnapshotModel:      input.SnapshotModel,
 	})
 	if err != nil {
 		proxyCleanup()
@@ -2191,7 +2211,7 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 		}
 		return fmt.Errorf("forgejo fixer does not support native review thread replies")
 	}
-	body := a.stamper.ReviewComment(input.Body, "fixer")
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "fixer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
@@ -2214,7 +2234,7 @@ func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.Comp
 }
 
 func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
-	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.IssueCommentResult{}, err
@@ -2233,7 +2253,7 @@ func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.
 }
 
 func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.UpdateIssueCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -2320,7 +2340,7 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 }
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
-	message := a.stamper.CommitMessage(input.Message, "fixer")
+	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "fixer")
 	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return fixer.CommitResult{}, err
@@ -2356,7 +2376,12 @@ type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
+		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2555,7 +2580,7 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 }
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
 	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueCommentResult{}, err
@@ -2589,7 +2614,7 @@ func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worke
 }
 
 func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
 	if _, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -2615,7 +2640,7 @@ func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worke
 }
 
 func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.CreatePullRequestResult{}, err
@@ -2695,7 +2720,7 @@ func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.C
 }
 
 func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
@@ -2792,7 +2817,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 }
 
 func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
-	message := a.stamper.CommitMessage(input.Message, "worker")
+	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "worker")
 	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return worker.CommitResult{}, err
@@ -2813,7 +2838,13 @@ type workerAgentExecutionAdapter struct {
 }
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
+		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
+		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2945,7 +2976,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
-	if cfg.Agent.Vendor == nil {
+	if !config.AnyCodingRoleAgentConfigured(cfg) {
 		noop := func(context.Context, Services) error { return nil }
 		return defaultSchedulerHandlers{tick: noop, claim: noop}
 	}
@@ -3054,70 +3085,95 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var workerRunner workerScheduler
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
-	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of the shared agent executor env so
+	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of shared agent executor env so
 	// planner/worker/fixer cannot publish reviews. Inject only via the
 	// reviewer adapter, which mints a per-run proxy bound to the selected PR.
-	agentExecutor := agent.New(agent.ExecutorOptions{
-		Config: agent.ExecutorConfig{
-			Vendor:              *cfg.Agent.Vendor,
-			Model:               cfg.Agent.Model,
-			Params:              cfg.Agent.Params,
-			Env:                 cfg.Agent.Env,
-			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
-			// Env-gated (not a config field yet) so it stays zero-risk to the schema
-			// / parity fixtures until the codex --json path is proven end-to-end.
-			LiveToolEvents: strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPER_CODEX_JSON_EVENTS")), "1"),
-		},
-		Repos:  repos,
-		LogDir: cfg.Daemon.LogDir,
-		Now:    now,
-		// Live progress → Feishu anchor card. Vendor-agnostic (works off the agent
-		// subprocess's stdout tail). Only wired when the Feishu app-bot transport is
-		// configured; a no-op otherwise.
-		OnProgress: func(ctx context.Context, p agent.ProgressUpdate) {
-			if p.LoopID == "" || !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
-				return
-			}
-			// In-memory only — never writes the loop record, so it can't race the
-			// scheduler's loop/run writes.
-			notificationGateway.RefreshThreadHeader(ctx, p.LoopID, p.TailLines, p.ElapsedSeconds)
-		},
-	})
-	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
-	stamper := disclosure.FromConfig(cfg)
-	agentRuntime := ""
-	if cfg.Agent.Vendor != nil {
-		agentRuntime = string(*cfg.Agent.Vendor)
+	// Env-gated (not a config field yet) so it stays zero-risk to the schema
+	// / parity fixtures until the codex --json path is proven end-to-end.
+	liveToolEvents := strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPER_CODEX_JSON_EVENTS")), "1")
+	// Live progress → Feishu anchor card. Vendor-agnostic (works off the agent
+	// subprocess's stdout tail). Only wired when the Feishu app-bot transport is
+	// configured; a no-op otherwise.
+	onAgentProgress := func(ctx context.Context, p agent.ProgressUpdate) {
+		if p.LoopID == "" || !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+			return
+		}
+		// In-memory only — never writes the loop record, so it can't race the
+		// scheduler's loop/run writes.
+		notificationGateway.RefreshThreadHeader(ctx, p.LoopID, p.TailLines, p.ElapsedSeconds)
 	}
-	plannerRunner = planner.New(planner.Options{
-		DB:                 coordinator.DB(),
-		Repos:              repos,
-		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:             logger,
-		Now:                now,
-		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
-		Disclosure:         &cfg.Disclosure,
-		AgentRuntime:       agentRuntime,
-		CustomInstructions: &cfg,
-		AgentModel:         cfg.Agent.Model,
-		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
-		DiscoveryPolicy: planner.DiscoveryPolicy{
-			AutoDiscovery:              cfg.Roles.Planner.AutoDiscovery,
-			Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
-			LabelMode:                  cfg.Roles.Planner.Triggers.LabelMode,
-			RequireAssigneeCurrentUser: cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser,
-		},
-		RetryBaseDelay:      retryBaseDelay,
-		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-		OnQueueItemEnqueued: requestWake,
-		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
-			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
-		},
-	})
-	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
+	newRoleAgentExecutor := func(resolved config.ResolvedAgent) *agent.ConfiguredExecutor {
+		return agent.New(agent.ExecutorOptions{
+			Config: agent.ExecutorConfig{
+				Vendor:              resolved.Vendor,
+				Model:               resolved.Model,
+				Params:              cfg.Agent.Params,
+				Env:                 cfg.Agent.Env,
+				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+				LiveToolEvents:      liveToolEvents,
+			},
+			Repos:      repos,
+			LogDir:     cfg.Daemon.LogDir,
+			Now:        now,
+			OnProgress: onAgentProgress,
+		})
+	}
+	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
+	roleStamper := func(resolved config.ResolvedAgent) disclosure.Stamper {
+		model := ""
+		if resolved.Model != nil {
+			model = *resolved.Model
+		}
+		return disclosure.Stamper{
+			Config:  cfg.Disclosure,
+			Version: version.Current().Version,
+			Agent:   string(resolved.Vendor),
+			Model:   model,
+		}
+	}
+
+	if resolved, ok := config.ResolveAgent(cfg, "", config.CodingRolePlanner); ok {
+		plannerExecutor := newRoleAgentExecutor(resolved)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		plannerStamper := roleStamper(resolved)
+		plannerRunner = planner.New(planner.Options{
+			DB:                 coordinator.DB(),
+			Repos:              repos,
+			GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
+			Git:                plannerGitAdapter{gateway: gitGateway, stamper: plannerStamper},
+			AgentExecutor:      plannerAgentExecutorAdapter{executor: plannerExecutor},
+			Logger:             logger,
+			Now:                now,
+			AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
+			Disclosure:         &cfg.Disclosure,
+			AgentRuntime:       string(resolved.Vendor),
+			AgentProfileID:     resolved.ProfileID,
+			CustomInstructions: &cfg,
+			AgentModel:         agentModel,
+			AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
+			DiscoveryPolicy: planner.DiscoveryPolicy{
+				AutoDiscovery:              cfg.Roles.Planner.AutoDiscovery,
+				Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
+				LabelMode:                  cfg.Roles.Planner.Triggers.LabelMode,
+				RequireAssigneeCurrentUser: cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser,
+			},
+			RetryBaseDelay:      retryBaseDelay,
+			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued: requestWake,
+			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
+				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+			},
+		})
+	}
+
+	// Coordinator triage LLM uses the global agent only; missing global vendor
+	// must not disable coding roles that resolve via role/profile bindings.
+	coordinatorOpts := coordinatorrole.Options{
 		Repos:   repos,
 		GitHub:  githubGateway,
 		Config:  &cfg,
@@ -3125,88 +3181,128 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Now:     now,
 		State:   coordinatorState,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
-		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
+	}
+	if cfg.Agent.Vendor != nil {
+		globalExecutor := agent.New(agent.ExecutorOptions{
+			Config: agent.ExecutorConfig{
+				Vendor:              *cfg.Agent.Vendor,
+				Model:               cfg.Agent.Model,
+				Params:              cfg.Agent.Params,
+				Env:                 cfg.Agent.Env,
+				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+				LiveToolEvents:      liveToolEvents,
+			},
+			Repos:      repos,
+			LogDir:     cfg.Daemon.LogDir,
+			Now:        now,
+			OnProgress: onAgentProgress,
+		})
+		coordinatorOpts.TriageLLM = coordinatorrole.NewAgentLLM(globalExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
 			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
-		),
-	})
-	reviewerRunner = reviewer.New(reviewer.Options{
-		DB:     coordinator.DB(),
-		Repos:  repos,
-		GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:    reviewerGitAdapter{gateway: gitGateway},
-		AgentExecutor: reviewerAgentExecutorAdapter{
-			executor:   agentExecutor,
-			realLooper: looperCLIPath,
-			trustedEnv: trustedReviewChildEnv(cfg),
-			config:     &cfg,
-		},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
-		ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
-		LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
-		DiscoveryPolicy: reviewer.DiscoveryPolicy{
-			AutoDiscovery:             cfg.Roles.Reviewer.Discovery.AutoDiscovery,
-			IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
-			RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
-			EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
-			Labels:                    append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
-			LabelMode:                 cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
-			IncludeSpecReviewingLabel: cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
-			SpecReviewingLabel:        cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
-		},
-		Scope:                   cfg.Roles.Reviewer.Behavior.Scope,
-		DetectDuplicateFindings: cfg.Roles.Reviewer.Behavior.DetectDuplicateFindings,
-		NativeResume:            cfg.Roles.Reviewer.Behavior.NativeResume,
-		ThreadResolution:        cfg.Roles.Reviewer.Behavior.ThreadResolution,
-		Disclosure:              &cfg.Disclosure,
-		AgentRuntime:            agentRuntime,
-		CustomInstructions:      &cfg,
-		LooperCLIPath:           looperCLIPath,
-		AgentModel:              cfg.Agent.Model,
-		AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:          retryBaseDelay,
-		RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
-		RetryPolicy:             cfg.Roles.Reviewer.Behavior.Retry,
-		OnQueueItemEnqueued:     requestWake,
-		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
-			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
-		},
-	})
-	fixerRunner = fixer.New(fixer.Options{
-		DB:                 coordinator.DB(),
-		Repos:              repos,
-		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:             logger,
-		Now:                now,
-		AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-		AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-		AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
-		FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
-		DiscoveryPolicy: fixer.DiscoveryPolicy{
-			AutoDiscovery: cfg.Roles.Fixer.AutoDiscovery,
-			IncludeDrafts: cfg.Roles.Fixer.Triggers.IncludeDrafts,
-			AuthorFilter:  cfg.Roles.Fixer.Triggers.AuthorFilter,
-			Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
-			LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
-		},
-		Disclosure:          &cfg.Disclosure,
-		AgentRuntime:        agentRuntime,
-		CustomInstructions:  &cfg,
-		AgentModel:          cfg.Agent.Model,
-		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:      retryBaseDelay,
-		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-		OnQueueItemEnqueued: requestWake,
-		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
-			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
-		},
-	})
+		)
+	} else if logger != nil {
+		logger.Warn("coordinator triage LLM skipped: global agent.vendor is not configured", nil)
+	}
+	coordinatorRunner = coordinatorrole.New(coordinatorOpts)
+
+	if resolved, ok := config.ResolveAgent(cfg, "", config.CodingRoleReviewer); ok {
+		reviewerExecutor := newRoleAgentExecutor(resolved)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		reviewerStamper := roleStamper(resolved)
+		reviewerRunner = reviewer.New(reviewer.Options{
+			DB:     coordinator.DB(),
+			Repos:  repos,
+			GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: reviewerStamper, config: &cfg},
+			Git:    reviewerGitAdapter{gateway: gitGateway},
+			AgentExecutor: reviewerAgentExecutorAdapter{
+				executor:   reviewerExecutor,
+				realLooper: looperCLIPath,
+				trustedEnv: trustedReviewChildEnv(cfg),
+				config:     &cfg,
+			},
+			Logger:           logger,
+			Now:              now,
+			AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
+			ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
+			LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
+			DiscoveryPolicy: reviewer.DiscoveryPolicy{
+				AutoDiscovery:             cfg.Roles.Reviewer.Discovery.AutoDiscovery,
+				IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+				RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
+				EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+				Labels:                    append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
+				LabelMode:                 cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
+				IncludeSpecReviewingLabel: cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
+				SpecReviewingLabel:        cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
+			},
+			Scope:                   cfg.Roles.Reviewer.Behavior.Scope,
+			DetectDuplicateFindings: cfg.Roles.Reviewer.Behavior.DetectDuplicateFindings,
+			NativeResume:            cfg.Roles.Reviewer.Behavior.NativeResume,
+			ThreadResolution:        cfg.Roles.Reviewer.Behavior.ThreadResolution,
+			Disclosure:              &cfg.Disclosure,
+			AgentRuntime:            string(resolved.Vendor),
+			AgentProfileID:          resolved.ProfileID,
+			CustomInstructions:      &cfg,
+			LooperCLIPath:           looperCLIPath,
+			AgentModel:              agentModel,
+			AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:          retryBaseDelay,
+			RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
+			RetryPolicy:             cfg.Roles.Reviewer.Behavior.Retry,
+			OnQueueItemEnqueued:     requestWake,
+			OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
+				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+			},
+		})
+	}
+	if resolved, ok := config.ResolveAgent(cfg, "", config.CodingRoleFixer); ok {
+		fixerExecutor := newRoleAgentExecutor(resolved)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		fixerStamper := roleStamper(resolved)
+		fixerRunner = fixer.New(fixer.Options{
+			DB:                 coordinator.DB(),
+			Repos:              repos,
+			GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
+			Git:                fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
+			AgentExecutor:      fixerAgentExecutorAdapter{executor: fixerExecutor},
+			Logger:             logger,
+			Now:                now,
+			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
+			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
+			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
+			DiscoveryPolicy: fixer.DiscoveryPolicy{
+				AutoDiscovery: cfg.Roles.Fixer.AutoDiscovery,
+				IncludeDrafts: cfg.Roles.Fixer.Triggers.IncludeDrafts,
+				AuthorFilter:  cfg.Roles.Fixer.Triggers.AuthorFilter,
+				Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
+				LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
+			},
+			Disclosure:          &cfg.Disclosure,
+			AgentRuntime:        string(resolved.Vendor),
+			AgentProfileID:      resolved.ProfileID,
+			CustomInstructions:  &cfg,
+			AgentModel:          agentModel,
+			AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:      retryBaseDelay,
+			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued: requestWake,
+			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
+				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+			},
+		})
+	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
 		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
 			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
@@ -3219,44 +3315,54 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Confidence:        ask.Confidence,
 		})
 	}
-	workerRunner = worker.New(worker.Options{
-		DB:     coordinator.DB(),
-		Repos:  repos,
-		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
-			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
-		},
-		Git:             workerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:   workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
-		Logger:          logger,
-		Now:             now,
-		AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
-		AllowAutoPush:   cfg.Defaults.AllowAutoPush,
-		OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
-		DiscoveryPolicy: worker.DiscoveryPolicy{
-			AutoDiscovery:              cfg.Roles.Worker.AutoDiscovery,
-			Labels:                     append([]string(nil), cfg.Roles.Worker.Triggers.Labels...),
-			LabelMode:                  cfg.Roles.Worker.Triggers.LabelMode,
-			RequireAssigneeCurrentUser: cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser,
-		},
-		Disclosure:          &cfg.Disclosure,
-		AgentRuntime:        agentRuntime,
-		CustomInstructions:  &cfg,
-		Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
-		AgentModel:          cfg.Agent.Model,
-		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:      retryBaseDelay,
-		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-		OnQueueItemEnqueued: requestWake,
-		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
-			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
-		},
-		HITLEnabled:         cfg.HITL.Enabled,
-		HITLAnswerTransport: cfg.HITL.AnswerTransport,
-		HITLGitHub:          hitlGitHubSettings(cfg.HITL.GitHub),
-		HITLNotify:          notifyHITLAsk,
-	})
+	if resolved, ok := config.ResolveAgent(cfg, "", config.CodingRoleWorker); ok {
+		workerExecutor := newRoleAgentExecutor(resolved)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		workerStamper := roleStamper(resolved)
+		workerRunner = worker.New(worker.Options{
+			DB:     coordinator.DB(),
+			Repos:  repos,
+			GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: workerStamper, config: &cfg},
+			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
+				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
+			},
+			Git:             workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
+			AgentExecutor:   workerAgentExecutorAdapter{executor: workerExecutor, registry: activeExecutions},
+			Logger:          logger,
+			Now:             now,
+			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:   cfg.Defaults.AllowAutoPush,
+			OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
+			DiscoveryPolicy: worker.DiscoveryPolicy{
+				AutoDiscovery:              cfg.Roles.Worker.AutoDiscovery,
+				Labels:                     append([]string(nil), cfg.Roles.Worker.Triggers.Labels...),
+				LabelMode:                  cfg.Roles.Worker.Triggers.LabelMode,
+				RequireAssigneeCurrentUser: cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser,
+			},
+			Disclosure:          &cfg.Disclosure,
+			AgentRuntime:        string(resolved.Vendor),
+			AgentProfileID:      resolved.ProfileID,
+			CustomInstructions:  &cfg,
+			Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
+			AgentModel:          agentModel,
+			AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:      retryBaseDelay,
+			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued: requestWake,
+			OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
+				return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
+			},
+			HITLEnabled:         cfg.HITL.Enabled,
+			HITLAnswerTransport: cfg.HITL.AnswerTransport,
+			HITLGitHub:          hitlGitHubSettings(cfg.HITL.GitHub),
+			HITLNotify:          notifyHITLAsk,
+		})
+	}
 	if claimMu == nil {
 		claimMu = &sync.Mutex{}
 	}
@@ -3265,6 +3371,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		var runner schedulerAsyncRunner
 		if asyncRunner != nil {
 			runner = asyncRunner()
+		}
+		// Avoid typed-nil interface: (*githubinfra.Gateway)(nil) assigned to
+		// snapshotScheduler is a non-nil interface value and would enable snapshot claims.
+		var snapshotter snapshotScheduler
+		if githubGateway != nil {
+			snapshotter = githubGateway
 		}
 		return defaultSchedulerTickInput{
 			Repos:                    services.Repositories,
@@ -3281,7 +3393,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Reviewer:                 reviewerRunner,
 			Fixer:                    fixerRunner,
 			Worker:                   workerRunner,
-			Snapshotter:              githubGateway,
+			Snapshotter:              snapshotter,
 			Config:                   &cfg,
 			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
@@ -3804,8 +3916,35 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	return available, nil
 }
 
+// allowedQueueTypesFromRunners returns queue item types that have a configured
+// runner. Claiming is restricted to these types so unconfigured roles are never
+// claimed then failed with "runner is not configured".
+func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
+	types := make([]string, 0, 5)
+	if input.Planner != nil {
+		types = append(types, "planner")
+	}
+	if input.Reviewer != nil {
+		types = append(types, "reviewer")
+	}
+	if input.Fixer != nil {
+		types = append(types, "fixer")
+	}
+	if input.Worker != nil {
+		types = append(types, "worker")
+	}
+	if input.Snapshotter != nil {
+		types = append(types, "snapshot")
+	}
+	return types
+}
+
 func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {
 	if availableSlots <= 0 || input.Repos == nil || input.Repos.Queue == nil {
+		return nil, nil
+	}
+	allowedTypes := allowedQueueTypesFromRunners(input)
+	if len(allowedTypes) == 0 {
 		return nil, nil
 	}
 	now := input.Now
@@ -3839,7 +3978,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			stopClaiming = true
 			break
 		}
-		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
+		item, err := input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypes(ctx, nowISO, "scheduler", allowedTypes)
 		if err != nil {
 			// BeginShutdown may cancel mid-ClaimNext after earlier slots succeeded.
 			// Stop claiming and dispatch already-durable claims instead of stranding.
@@ -3860,7 +3999,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		if err := admitClaim(); err != nil {
 			break
 		}
-		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
+		item, err := input.Repos.Queue.ClaimNextLongTermRetryAmongTypes(ctx, nowISO, "scheduler", allowedTypes)
 		if err != nil {
 			if ctx.Err() != nil {
 				break

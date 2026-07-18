@@ -33,7 +33,7 @@ Also make sure:
 - your local repo can `git fetch` and `git push`
 - GitHub projects: `gh` is authenticated with the target GitHub account
 - Forgejo projects: for `token-env` auth, the configured provider `tokenEnv` is exported in the daemon environment; for `tea` auth, the selected tea login must already be available to the daemon user
-- `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
+- each coding role you want to run can resolve a vendor: either set global `config.agent.vendor` (for example via `looper bootstrap --agent-vendor opencode`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
 
 Forgejo projects can be onboarded with `looper bootstrap --provider forgejo`, managed with `looper provider add|list|test|remove`, or added to a running installation with `looper project add --forgejo-url ...` plus either `--forgejo-token-env` or `--auth tea --tea-login`. Tea-backed providers reuse an explicit `tea` login for the provider host and do not require a second token environment variable. For configured providers, pass the provider id explicitly; `--provider forgejo` selects it only when the origin has one unambiguous match. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
 

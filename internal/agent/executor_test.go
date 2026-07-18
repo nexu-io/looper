@@ -16,6 +16,153 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func TestEffectiveConfigUsesSnapshotOverrides(t *testing.T) {
+	t.Parallel()
+
+	configModel := "config-model"
+	snapshotModel := "snapshot-model"
+	executor := New(ExecutorOptions{Config: ExecutorConfig{
+		Vendor: config.AgentVendorClaudeCode,
+		Model:  &configModel,
+		Params: map[string]any{"args": []any{"--print"}},
+		Env:    map[string]string{"KEEP": "1"},
+	}})
+
+	// No snapshot: keep executor config.
+	got := executor.effectiveConfig(RunInput{})
+	if got.Vendor != config.AgentVendorClaudeCode || got.Model == nil || *got.Model != configModel {
+		t.Fatalf("effectiveConfig(no snapshot) = %#v", got)
+	}
+
+	// Snapshot overrides vendor/model for spawn only; env stays from config.
+	got = executor.effectiveConfig(RunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorCodex),
+		SnapshotModel:  &snapshotModel,
+	})
+	if got.Vendor != config.AgentVendorCodex {
+		t.Fatalf("Vendor = %q, want codex", got.Vendor)
+	}
+	if got.Model == nil || *got.Model != snapshotModel {
+		t.Fatalf("Model = %v, want %q", got.Model, snapshotModel)
+	}
+	if got.Env["KEEP"] != "1" {
+		t.Fatalf("Env not preserved: %#v", got.Env)
+	}
+
+	// Snapshot with nil model clears model (no model flag).
+	got = executor.effectiveConfig(RunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorOpenCode),
+		SnapshotModel:  nil,
+	})
+	if got.Vendor != config.AgentVendorOpenCode || got.Model != nil {
+		t.Fatalf("effectiveConfig(nil model) = %#v", got)
+	}
+
+	// ResolveSpawn path uses override vendor/model.
+	command, args := ResolveSpawn(got, "/tmp/wt", "hello")
+	if command != "opencode" {
+		t.Fatalf("command = %q, want opencode", command)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--model") {
+		t.Fatalf("args = %q, want no --model when snapshot model is nil", joined)
+	}
+}
+
+func TestEffectiveConfigStripsIdentityParamsUnderSnapshot(t *testing.T) {
+	t.Parallel()
+
+	configModel := "config-model"
+	snapshotModel := "frozen-model"
+	executor := New(ExecutorOptions{Config: ExecutorConfig{
+		Vendor: config.AgentVendorClaudeCode,
+		Model:  &configModel,
+		Params: map[string]any{
+			"command": "custom-agent-bin",
+			"args":    []any{"--model", "params-model", "--print", "-m", "also-params", "--other"},
+		},
+	}})
+
+	// Without snapshot: command/args params still apply.
+	got := executor.effectiveConfig(RunInput{})
+	if cmd := resolveCommand(got); cmd != "custom-agent-bin" {
+		t.Fatalf("resolveCommand(no snapshot) = %q, want custom-agent-bin", cmd)
+	}
+	command, args := ResolveSpawn(got, "/tmp/wt", "hello")
+	if command != "custom-agent-bin" {
+		t.Fatalf("command(no snapshot) = %q, want custom-agent-bin", command)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "params-model") {
+		t.Fatalf("args(no snapshot) = %q, want params model flag preserved", joined)
+	}
+
+	// Snapshot vendor differs from executor: strip command + model flags.
+	got = executor.effectiveConfig(RunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorCodex),
+		SnapshotModel:  &snapshotModel,
+	})
+	if _, ok := got.Params["command"]; ok {
+		t.Fatalf("params still has command when snapshot vendor diverges: %#v", got.Params)
+	}
+	if cmd := resolveCommand(got); cmd != "codex" {
+		t.Fatalf("resolveCommand(diverged snapshot) = %q, want codex", cmd)
+	}
+	command, args = ResolveSpawn(got, "/tmp/wt", "hello")
+	if command != "codex" {
+		t.Fatalf("command(diverged snapshot) = %q, want codex", command)
+	}
+	joined = strings.Join(args, " ")
+	if strings.Contains(joined, "params-model") || strings.Contains(joined, "also-params") {
+		t.Fatalf("args(snapshot) = %q, want params model flags stripped", joined)
+	}
+	if !strings.Contains(joined, "frozen-model") {
+		t.Fatalf("args(snapshot) = %q, want frozen model", joined)
+	}
+	if !strings.Contains(joined, "--other") {
+		t.Fatalf("args(snapshot) = %q, want non-identity flags preserved", joined)
+	}
+
+	// Same vendor as executor: keep params.command wrapper, still strip model flags.
+	got = executor.effectiveConfig(RunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorClaudeCode),
+		SnapshotModel:  &snapshotModel,
+	})
+	if cmd := resolveCommand(got); cmd != "custom-agent-bin" {
+		t.Fatalf("resolveCommand(same-vendor snapshot) = %q, want custom-agent-bin wrapper", cmd)
+	}
+	command, args = ResolveSpawn(got, "/tmp/wt", "hello")
+	if command != "custom-agent-bin" {
+		t.Fatalf("command(same-vendor snapshot) = %q, want custom-agent-bin", command)
+	}
+	joined = strings.Join(args, " ")
+	if strings.Contains(joined, "params-model") || strings.Contains(joined, "also-params") {
+		t.Fatalf("args(same-vendor snapshot) = %q, want model flags stripped", joined)
+	}
+	if !strings.Contains(joined, "frozen-model") {
+		t.Fatalf("args(same-vendor snapshot) = %q, want frozen model", joined)
+	}
+
+	// Original executor params must not be mutated.
+	if _, ok := executor.config.Params["command"]; !ok {
+		t.Fatal("executor config params.command was mutated")
+	}
+}
+
+func TestStripModelFlags(t *testing.T) {
+	t.Parallel()
+
+	got := stripModelFlags([]string{"--model", "x", "-m", "y", "--model=z", "-m=w", "-mMODEL", "--keep", "v"})
+	want := []string{"--keep", "v"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("stripModelFlags = %v, want %v", got, want)
+	}
+}
+
 func TestResolveSpawnVendorParity(t *testing.T) {
 	t.Parallel()
 

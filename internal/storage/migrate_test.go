@@ -553,16 +553,23 @@ func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) 
 			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
 		}
 	}
-	for _, run := range []RunRecord{
-		{ID: "run_older_running", LoopID: "loop_older_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
-		{ID: "run_newer_success", LoopID: "loop_older_running", Status: "success", StartedAt: newAt, EndedAt: &newAt, CreatedAt: newAt, UpdatedAt: newAt},
-		{ID: "run_terminal_running", LoopID: "loop_terminal_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
-		{ID: "run_duplicate_old", LoopID: "loop_duplicate_running", Status: "running", StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt},
-		{ID: "run_duplicate_new", LoopID: "loop_duplicate_running", Status: "running", StartedAt: newAt, CreatedAt: newAt, UpdatedAt: newAt},
-		{ID: "run_duplicate_created_later", LoopID: "loop_duplicate_running", Status: "running", StartedAt: newAt, CreatedAt: newerCreatedAt, UpdatedAt: newerCreatedAt},
+	// Seed runs with pre-0019 DDL via raw SQL: RunsRepository targets the latest schema.
+	for _, run := range []struct {
+		id, loopID, status, startedAt, createdAt, updatedAt string
+		endedAt                                             *string
+	}{
+		{id: "run_older_running", loopID: "loop_older_running", status: "running", startedAt: oldAt, createdAt: oldAt, updatedAt: oldAt},
+		{id: "run_newer_success", loopID: "loop_older_running", status: "success", startedAt: newAt, createdAt: newAt, updatedAt: newAt, endedAt: &newAt},
+		{id: "run_terminal_running", loopID: "loop_terminal_running", status: "running", startedAt: oldAt, createdAt: oldAt, updatedAt: oldAt},
+		{id: "run_duplicate_old", loopID: "loop_duplicate_running", status: "running", startedAt: oldAt, createdAt: oldAt, updatedAt: oldAt},
+		{id: "run_duplicate_new", loopID: "loop_duplicate_running", status: "running", startedAt: newAt, createdAt: newAt, updatedAt: newAt},
+		{id: "run_duplicate_created_later", loopID: "loop_duplicate_running", status: "running", startedAt: newAt, createdAt: newerCreatedAt, updatedAt: newerCreatedAt},
 	} {
-		if err := repos.Runs.Upsert(ctx, run); err != nil {
-			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO runs (id, loop_id, status, started_at, ended_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, run.id, run.loopID, run.status, run.startedAt, run.endedAt, run.createdAt, run.updatedAt); err != nil {
+			t.Fatalf("insert run %s error = %v", run.id, err)
 		}
 	}
 
@@ -575,31 +582,32 @@ func TestMigration0008InterruptsStaleRunningRunsBeforeUniqueIndex(t *testing.T) 
 		t.Fatalf("RunPending().AppliedIDs = %v, want [0008_one_running_run_per_loop]", result.AppliedIDs)
 	}
 
+	readRunStatus := func(runID string) (status string, endedAt sql.NullString) {
+		t.Helper()
+		if err := db.QueryRowContext(ctx, `SELECT status, ended_at FROM runs WHERE id = ?`, runID).Scan(&status, &endedAt); err != nil {
+			t.Fatalf("SELECT run %s error = %v", runID, err)
+		}
+		return status, endedAt
+	}
 	for _, runID := range []string{"run_older_running", "run_terminal_running", "run_duplicate_old"} {
-		run, err := repos.Runs.GetByID(ctx, runID)
-		if err != nil {
-			t.Fatalf("Runs.GetByID(%s) error = %v", runID, err)
-		}
-		if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
-			t.Fatalf("Runs.GetByID(%s) = %#v, want interrupted with ended_at", runID, run)
+		status, endedAt := readRunStatus(runID)
+		if status != "interrupted" || !endedAt.Valid {
+			t.Fatalf("run %s status=%q ended_at=%v, want interrupted with ended_at", runID, status, endedAt)
 		}
 	}
-	run, err := repos.Runs.GetByID(ctx, "run_duplicate_new")
-	if err != nil {
-		t.Fatalf("Runs.GetByID(run_duplicate_new) error = %v", err)
+	status, endedAt := readRunStatus("run_duplicate_new")
+	if status != "interrupted" || !endedAt.Valid {
+		t.Fatalf("run_duplicate_new status=%q ended_at=%v, want interrupted with ended_at", status, endedAt)
 	}
-	if run == nil || run.Status != "interrupted" || run.EndedAt == nil {
-		t.Fatalf("run_duplicate_new = %#v, want interrupted with ended_at", run)
+	status, _ = readRunStatus("run_duplicate_created_later")
+	if status != "running" {
+		t.Fatalf("run_duplicate_created_later status=%q, want remaining running run", status)
 	}
-	run, err = repos.Runs.GetByID(ctx, "run_duplicate_created_later")
-	if err != nil {
-		t.Fatalf("Runs.GetByID(run_duplicate_created_later) error = %v", err)
-	}
-	if run == nil || run.Status != "running" {
-		t.Fatalf("run_duplicate_created_later = %#v, want remaining running run", run)
-	}
-	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_duplicate_extra", LoopID: "loop_duplicate_running", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err == nil {
-		t.Fatal("Runs.Upsert(extra running) error = nil, want unique index failure")
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO runs (id, loop_id, status, started_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, "run_duplicate_extra", "loop_duplicate_running", "running", now, now, now); err == nil {
+		t.Fatal("insert extra running run error = nil, want unique index failure")
 	}
 }
 

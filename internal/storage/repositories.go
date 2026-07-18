@@ -95,6 +95,7 @@ type RunRecord struct {
 	EndedAt           *string
 	CreatedAt         string
 	UpdatedAt         string
+	AgentSnapshotJSON *string // durable agent identity; set on create, immutable after insert
 }
 
 type AgentExecutionRecord struct {
@@ -773,9 +774,10 @@ type LocksRepository struct {
 const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
 
 func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
+	// agent_snapshot_json is insert-only: ON CONFLICT must not overwrite an existing snapshot.
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at, agent_snapshot_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			status=excluded.status,
 			current_step=excluded.current_step,
@@ -787,7 +789,7 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 			last_heartbeat_at=excluded.last_heartbeat_at,
 			ended_at=excluded.ended_at,
 			updated_at=excluded.updated_at
-	`, record.ID, record.LoopID, record.Status, record.CurrentStep, record.LastCompletedStep, record.CheckpointJSON, record.Summary, record.ErrorMessage, record.StartedAt, record.LastHeartbeatAt, record.EndedAt, record.CreatedAt, record.UpdatedAt)
+	`, record.ID, record.LoopID, record.Status, record.CurrentStep, record.LastCompletedStep, record.CheckpointJSON, record.Summary, record.ErrorMessage, record.StartedAt, record.LastHeartbeatAt, record.EndedAt, record.CreatedAt, record.UpdatedAt, record.AgentSnapshotJSON)
 	if err != nil {
 		return fmt.Errorf("upsert run: %w", err)
 	}
@@ -1772,6 +1774,44 @@ func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, cl
 	`, []any{QueueLongTermRetryAttemptThreshold})
 }
 
+// ClaimNextNonLongTermRetryAmongTypes claims the next non-long-term-retry item
+// whose type is in types. Empty types claims nothing.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
+	if len(types) == 0 {
+		return nil, nil
+	}
+	placeholders, args := queueTypeInClause(types)
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, args...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND NOT (`+longTermRetryPredicateParam+`)
+		AND qi.type IN (`+placeholders+`)
+	`, extraArgs)
+}
+
+// ClaimNextLongTermRetryAmongTypes claims the next long-term-retry item whose
+// type is in types. Empty types claims nothing.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
+	if len(types) == 0 {
+		return nil, nil
+	}
+	placeholders, args := queueTypeInClause(types)
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, args...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND (`+longTermRetryPredicateParam+`)
+		AND qi.type IN (`+placeholders+`)
+	`, extraArgs)
+}
+
+func queueTypeInClause(types []string) (placeholders string, args []any) {
+	parts := make([]string, 0, len(types))
+	args = make([]any, 0, len(types))
+	for _, t := range types {
+		parts = append(parts, "?")
+		args = append(args, t)
+	}
+	return strings.Join(parts, ", "), args
+}
+
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
 		WITH candidate AS (
@@ -2601,9 +2641,10 @@ func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {
 		errorMessage      sql.NullString
 		lastHeartbeatAt   sql.NullString
 		endedAt           sql.NullString
+		agentSnapshotJSON sql.NullString
 	)
 
-	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt)
+	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt, &agentSnapshotJSON)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2614,6 +2655,7 @@ func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {
 	record.ErrorMessage = nullableString(errorMessage)
 	record.LastHeartbeatAt = nullableString(lastHeartbeatAt)
 	record.EndedAt = nullableString(endedAt)
+	record.AgentSnapshotJSON = nullableString(agentSnapshotJSON)
 
 	return record, nil
 }

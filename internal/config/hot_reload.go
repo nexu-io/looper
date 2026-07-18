@@ -143,7 +143,66 @@ func IsHotEditablePath(path string) bool {
 	if _, ok := hotEditablePaths[path]; ok {
 		return true
 	}
-	return strings.HasPrefix(path, "agent.env.") && len(strings.TrimPrefix(path, "agent.env.")) > 0
+	if strings.HasPrefix(path, "agent.env.") && len(strings.TrimPrefix(path, "agent.env.")) > 0 {
+		return true
+	}
+	if isHotAgentProfilePath(path) {
+		return true
+	}
+	if isHotRoleAgentPath(path) {
+		return true
+	}
+	return false
+}
+
+// isHotAgentProfilePath allows shape-aware leaves under agent.profiles:
+//   - agent.profiles.<id>           (whole profile set/unset)
+//   - agent.profiles.<id>.vendor
+//   - agent.profiles.<id>.model
+//
+// Whole-map agent.profiles and unknown nested fields are rejected.
+func isHotAgentProfilePath(path string) bool {
+	segments := strings.Split(path, ".")
+	if len(segments) < 3 || len(segments) > 4 {
+		return false
+	}
+	if segments[0] != "agent" || segments[1] != "profiles" {
+		return false
+	}
+	id := segments[2]
+	if !agentProfileIDPattern.MatchString(id) {
+		return false
+	}
+	if len(segments) == 3 {
+		return true
+	}
+	switch segments[3] {
+	case "vendor", "model":
+		return true
+	default:
+		return false
+	}
+}
+
+// isHotRoleAgentPath allows coding-role agent binding leaves:
+// roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}
+func isHotRoleAgentPath(path string) bool {
+	segments := strings.Split(path, ".")
+	if len(segments) != 4 {
+		return false
+	}
+	if segments[0] != "roles" || segments[2] != "agent" {
+		return false
+	}
+	if !isCodingRole(segments[1]) {
+		return false
+	}
+	switch segments[3] {
+	case "profile", "vendor", "model":
+		return true
+	default:
+		return false
+	}
 }
 
 func isHotReloadablePath(path string) bool {
@@ -197,23 +256,48 @@ func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
 	// are unambiguous. Reusing a command/args map under another executable is
 	// unsafe, and silently carrying the same explicit model is almost always
 	// accidental. A paired model edit (including clearing it) is explicit.
-	leavingConfiguredVendor := oldConfig.Agent.Vendor != nil && (newConfig.Agent.Vendor == nil || *oldConfig.Agent.Vendor != *newConfig.Agent.Vendor)
-	if leavingConfiguredVendor {
-		if len(newConfig.Agent.Params) > 0 {
-			if _, exists := seen["agent.params"]; !exists {
-				seen["agent.params"] = struct{}{}
-				restartRequired = append(restartRequired, "agent.params")
-			}
-		}
-		if newConfig.Agent.Model != nil && reflect.DeepEqual(oldConfig.Agent.Model, newConfig.Agent.Model) {
-			if _, exists := seen["agent.model"]; !exists {
-				seen["agent.model"] = struct{}{}
-				restartRequired = append(restartRequired, "agent.model")
-			}
-		}
-	}
+	//
+	// Guard each coding role's *resolved* vendor (global + profile + role overlay),
+	// which subsumes the historical global-only agent.vendor check when roles
+	// inherit the global binding.
+	appendResolvedVendorRestartGuards(oldConfig, newConfig, seen, &restartRequired)
 	sort.Strings(restartRequired)
 	return restartRequired
+}
+
+func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {
+	mark := func(path string) {
+		if _, exists := seen[path]; exists {
+			return
+		}
+		seen[path] = struct{}{}
+		*restartRequired = append(*restartRequired, path)
+	}
+
+	for _, role := range []string{CodingRolePlanner, CodingRoleWorker, CodingRoleReviewer, CodingRoleFixer} {
+		oldVendor, oldModel, _, oldOK := overlayAgentIdentity(oldConfig, role)
+		if !oldOK || oldVendor == nil {
+			// First activation (no prior vendor) remains hot, including prepared models.
+			continue
+		}
+		newVendor, newModel, _, newOK := overlayAgentIdentity(newConfig, role)
+		if !newOK {
+			continue
+		}
+		if newVendor != nil && *oldVendor == *newVendor {
+			continue
+		}
+		// Prior vendor left or changed (including unset). Global params fan out.
+		if len(newConfig.Agent.Params) > 0 {
+			mark("agent.params")
+		}
+		// Retaining the same non-nil model across a vendor leave/switch is almost
+		// always accidental (and enables vendor-reset laundering: unset vendor,
+		// then set a different vendor while keeping the old model).
+		if oldModel != nil && newModel != nil && *oldModel == *newModel {
+			mark("agent.model")
+		}
+	}
 }
 
 // CloneConfig returns a complete detached copy. Config is a JSON configuration

@@ -131,6 +131,16 @@ type RunInput struct {
 	IdempotencyKey     string
 	Env                map[string]string
 	NativeSessionID    string
+	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
+	// executor's configured vendor/model for this start only (spawn, native
+	// resume vendor checks, and persisted execution vendor). Env and
+	// NativeResumeEnabled still come from the executor config. Identity-bearing
+	// params (command, model flags in args) are stripped so frozen identity wins.
+	UseSnapshot    bool
+	SnapshotVendor string
+	// SnapshotModel is used only when UseSnapshot is true. nil means no model
+	// flag; a non-nil value (including empty) sets the model override.
+	SnapshotModel *string
 }
 
 type Result struct {
@@ -199,12 +209,108 @@ type nativeResumeInfo struct {
 	SourceExecutionID string
 }
 
+// effectiveConfig returns the executor config for this start, applying run
+// snapshot identity overrides when UseSnapshot is set.
+func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
+	cfg := e.config
+	if !input.UseSnapshot {
+		return cfg
+	}
+	if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
+		baseVendor := cfg.Vendor
+		cfg.Vendor = config.AgentVendor(vendor)
+		cfg.Model = input.SnapshotModel
+		// Model flags in params.args can defeat frozen model — always strip under snapshot.
+		// params.command is a supported vendor wrapper: keep it when snapshot vendor matches
+		// the handler executor vendor; strip only when vendor identity diverges (sticky
+		// resume after a role vendor change would otherwise launch the wrong binary).
+		stripCommand := cfg.Vendor != baseVendor
+		cfg.Params = cloneParamsForSnapshot(cfg.Params, stripCommand)
+	}
+	return cfg
+}
+
+// cloneParamsForSnapshot copies params and strips identity-bearing overrides.
+// When stripCommand is true, params.command is removed. Model flags in args are
+// always removed so SnapshotModel wins.
+func cloneParamsForSnapshot(params map[string]any, stripCommand bool) map[string]any {
+	if params == nil {
+		return nil
+	}
+	out := maps.Clone(params)
+	if stripCommand {
+		delete(out, "command")
+	}
+	if args, ok := out["args"]; ok {
+		out["args"] = stripModelFlagsFromArgs(args)
+	}
+	return out
+}
+
+// stripModelFlagsFromArgs removes -m / --model and --model=* style flags (and
+// their values when separate) from params args. Supports []string and []any.
+func stripModelFlagsFromArgs(args any) any {
+	switch typed := args.(type) {
+	case []string:
+		return stripModelFlags(typed)
+	case []any:
+		asStrings := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				// Preserve non-string entries by converting via stringArgs path later;
+				// only strip when the whole list is string-compatible.
+				return args
+			}
+			asStrings = append(asStrings, text)
+		}
+		stripped := stripModelFlags(asStrings)
+		out := make([]any, len(stripped))
+		for i, s := range stripped {
+			out[i] = s
+		}
+		return out
+	default:
+		return args
+	}
+}
+
+func stripModelFlags(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(args))
+	skipNext := false
+	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if arg == "-m" || arg == "--model" {
+			if i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "-m=") {
+			continue
+		}
+		// Attached short form: -mMODEL (not -m=MODEL, already handled).
+		if strings.HasPrefix(arg, "-m") && !strings.HasPrefix(arg, "-m=") && arg != "-m" {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
 func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunInput) (nativeResumeInfo, error) {
-	if !e.config.NativeResumeEnabled {
+	cfg := e.effectiveConfig(input)
+	if !cfg.NativeResumeEnabled {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "disabled"}, nil
 	}
 	if sessionID := strings.TrimSpace(input.NativeSessionID); sessionID != "" {
-		if nativeResumeSupported(e.config.Vendor) {
+		if nativeResumeSupported(cfg.Vendor) {
 			return nativeResumeInfo{Enabled: true, SessionID: sessionID, Mode: "native_resume", Status: "started"}, nil
 		}
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unsupported"}, nil
@@ -219,7 +325,7 @@ func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunI
 	if latest == nil || latest.NativeSessionID == nil || strings.TrimSpace(*latest.NativeSessionID) == "" {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
-	if latest.Vendor != string(e.config.Vendor) || !nativeResumeSupported(e.config.Vendor) || !isRecoverableNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
+	if latest.Vendor != string(cfg.Vendor) || !nativeResumeSupported(cfg.Vendor) || !isRecoverableNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
 	return nativeResumeInfo{Enabled: true, SessionID: strings.TrimSpace(*latest.NativeSessionID), Mode: "native_resume", Status: "started", SourceExecutionID: latest.ID}, nil
@@ -275,6 +381,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
+	cfg := e.effectiveConfig(input)
 	resume, err := e.resolveNativeResume(ctx, input)
 	if err != nil {
 		return nil, err
@@ -283,12 +390,12 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
 		spawnPrompt = input.NativeResumePrompt
 	}
-	command, args := ResolveSpawnWithNativeResume(e.config, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
+	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
+	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, cfg.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -326,11 +433,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
-			command, args = ResolveSpawn(e.config, input.WorkingDirectory, input.Prompt)
+			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
+			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, cfg.Env, input.Env)
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 			x.mu.Lock()
@@ -687,11 +794,12 @@ func normalizeNativeResumeErrorLine(line string) string {
 }
 
 func (x *execution) runCheckpointFallback(ctx context.Context, nativeError string) (Result, string, bool) {
-	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
+	cfg := x.executor.effectiveConfig(x.input)
+	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
+	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, cfg.Env, x.input.Env)
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 
@@ -944,7 +1052,11 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 
 // jsonMode reports whether this run is a codex `--json` run (structured events).
 func (x *execution) jsonMode() bool {
-	return x.executor != nil && x.executor.config.LiveToolEvents && x.executor.config.Vendor == config.AgentVendorCodex
+	if x.executor == nil {
+		return false
+	}
+	cfg := x.executor.effectiveConfig(x.input)
+	return cfg.LiveToolEvents && cfg.Vendor == config.AgentVendorCodex
 }
 
 // codexToolTail renders the last n command executions from a codex JSONL blob.
@@ -1017,12 +1129,13 @@ func (x *execution) persistStatus(status string, heartbeatCount *int64, heartbea
 	metadata := mustJSON(x.executionMetadata(""))
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	pid := int64(pidOrZero(x.process.Process))
+	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
 		ProjectID:          emptyToNil(x.input.ProjectID),
 		LoopID:             emptyToNil(x.input.LoopID),
 		RunID:              emptyToNil(x.input.RunID),
-		Vendor:             string(x.executor.config.Vendor),
+		Vendor:             string(cfg.Vendor),
 		Status:             status,
 		PID:                int64PtrIfPositive(pid),
 		CommandJSON:        &commandJSON,
@@ -1077,12 +1190,13 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
 		nativeResumeStatus = "captured"
 	}
+	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
 		ProjectID:          emptyToNil(x.input.ProjectID),
 		LoopID:             emptyToNil(x.input.LoopID),
 		RunID:              emptyToNil(x.input.RunID),
-		Vendor:             string(x.executor.config.Vendor),
+		Vendor:             string(cfg.Vendor),
 		Status:             status,
 		PID:                int64PtrIfPositive(pid),
 		CommandJSON:        &commandJSON,
@@ -1956,6 +2070,7 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 	if e.repos == nil || e.repos.Events == nil {
 		return
 	}
+	vendor := string(e.effectiveConfig(input).Vendor)
 	_ = e.repos.Events.Append(context.Background(), storage.EventLogRecord{
 		ID:               eventlog.NewEventID("event"),
 		EventType:        eventType,
@@ -1965,8 +2080,8 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 		EntityType:       stringPtr("agent_execution"),
 		EntityID:         &executionID,
 		ActorType:        stringPtr("agent"),
-		ActorID:          stringPtr(string(e.config.Vendor)),
-		ActorDisplayName: stringPtr(string(e.config.Vendor)),
+		ActorID:          stringPtr(vendor),
+		ActorDisplayName: stringPtr(vendor),
 		PayloadJSON:      mustJSON(payload),
 		CreatedAt:        createdAt,
 	})

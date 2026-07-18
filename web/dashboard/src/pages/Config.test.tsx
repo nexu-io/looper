@@ -845,4 +845,310 @@ describe("ConfigPage", () => {
       );
     });
   });
+
+  it("unsets profile vendor and model leaves independently", async () => {
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unset agent.profiles.fast.model" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unset agent.profiles.fast.vendor" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    // Profile vendor unset is high-impact; confirm before PATCH.
+    const dialog = await screen.findByRole("dialog", {
+      name: "Confirm high-impact configuration",
+    });
+    expect(dialog.textContent).toMatch(/profiles.*fast.*vendor/i);
+    fireEvent.click(screen.getByRole("button", { name: "Apply changes" }));
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({});
+    expect(body.unset).toEqual([
+      "agent.profiles.fast.model",
+      "agent.profiles.fast.vendor",
+    ]);
+  });
+
+  it("keeps staged profile leaf edits when rebasing after a conflict", async () => {
+    const baseMeta = {
+      ...configFixture().metadata.fields,
+      "agent.profiles": {
+        source: "config-file" as const,
+        editable: true,
+        applyMode: "hot" as const,
+      },
+    };
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: baseMeta,
+      },
+    });
+    const refreshed = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        revision: "sha256:external",
+        // Leaf metadata intentionally omitted — only the map entry exists.
+        fields: baseMeta,
+      },
+    });
+    const applied = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        revision: "sha256:applied",
+        fields: baseMeta,
+      },
+    });
+    let getCount = 0;
+    let patchCount = 0;
+    const fetchMock = vi.fn(
+      (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (String(input) !== "/api/v1/config") {
+          return Promise.reject(new Error(`unexpected request: ${String(input)}`));
+        }
+        if (init?.method === "PATCH") {
+          patchCount += 1;
+          if (patchCount === 1) {
+            return Promise.resolve(
+              response(
+                { code: "CONFIG_CONFLICT", message: "configuration changed on disk" },
+                409,
+              ),
+            );
+          }
+          return Promise.resolve(response(applied));
+        }
+        getCount += 1;
+        return Promise.resolve(response(getCount === 1 ? initial : refreshed));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    fireEvent.change(await screen.findByLabelText("agent.profiles.fast.model"), {
+      target: { value: "gpt-5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Reload latest and keep edits",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(
+        (screen.getByLabelText("agent.profiles.fast.model") as HTMLInputElement).value,
+      ).toBe("gpt-5");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(patchCount).toBe(2));
+    const patchCalls = fetchMock.mock.calls.filter(
+      ([, init]) => init?.method === "PATCH",
+    );
+    expect(JSON.parse(String(patchCalls[1]?.[1]?.body))).toMatchObject({
+      revision: "sha256:external",
+      set: { "agent.profiles.fast.model": "gpt-5" },
+    });
+  });
+
+  it("confirms high-impact role agent vendor changes before PATCH", async () => {
+    const initial = configFixture({
+      roles: {
+        worker: { agent: { vendor: "codex" } },
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "roles.worker.agent.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    fireEvent.change(await screen.findByLabelText("roles.worker.agent.vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(
+      await screen.findByRole("dialog", {
+        name: "Confirm high-impact configuration",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText(/worker agent vendor → opencode/i)).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+      false,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply changes" }));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+  });
+
+  it("edits agent profiles and role agent bindings without a params editor", async () => {
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      roles: {
+        worker: {
+          agent: { profile: "fast", model: "haiku" },
+        },
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.profile": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.vendor": {
+            source: "default",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    expect(screen.queryByLabelText(/params/i)).toBeNull();
+    expect(screen.queryByText(/params map/i)).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("agent.profiles.fast.model"), {
+      target: { value: "gpt-5" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile id"), {
+      target: { value: "cheap" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
+    fireEvent.change(screen.getByLabelText("roles.worker.agent.profile"), {
+      target: { value: "cheap" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    // Profile switch is high-impact (can change resolved vendor).
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set["agent.profiles.fast.model"]).toBe("gpt-5");
+    expect(body.set["agent.profiles.cheap.vendor"]).toBe("opencode");
+    expect(body.set["roles.worker.agent.profile"]).toBe("cheap");
+    expect(JSON.stringify(body)).not.toMatch(/params/i);
+  });
 });

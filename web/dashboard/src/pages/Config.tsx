@@ -19,6 +19,8 @@ import {
   type PatchConfigBody,
 } from "@/lib/api";
 import {
+  AGENT_VENDOR_OPTIONS,
+  agentProfilePath,
   buildConfigPatch,
   CONFIG_GROUPS,
   configFieldErrors,
@@ -29,6 +31,11 @@ import {
   draftFromValue,
   getConfigValue,
   highImpactChanges,
+  isAgentProfileLeafPath,
+  isAgentProfileWholePath,
+  isCuratedAgentIdentityPath,
+  isRoleAgentLeafPath,
+  isValidAgentProfileId,
   type ConfigDraft,
   type ConfigFieldKind,
   type ConfigGroup,
@@ -45,6 +52,28 @@ const controlClass =
 function metaIsEditable(meta: ConfigFieldMetadata | undefined): boolean {
   if (!meta?.editable) return false;
   return meta.source !== "env" && meta.source !== "cli";
+}
+
+/** Prefer leaf metadata; curated role-agent leaves fall back to a hot default. */
+function resolveFieldMeta(
+  data: ConfigData,
+  path: string,
+): ConfigFieldMetadata | undefined {
+  const direct = data.metadata.fields[path];
+  if (direct) return direct;
+  if (isRoleAgentLeafPath(path)) {
+    return { source: "default", editable: true, applyMode: "hot" };
+  }
+  if (path.startsWith("agent.profiles.")) {
+    return (
+      data.metadata.fields["agent.profiles"] ?? {
+        source: "default",
+        editable: true,
+        applyMode: "hot",
+      }
+    );
+  }
+  return undefined;
 }
 
 function sourceIsConfigFile(source: string | undefined): boolean {
@@ -254,6 +283,350 @@ function ConfigControl({
       disabled={controlDisabled}
       onChange={(event) => onChange(event.currentTarget.value)}
     />
+  );
+}
+
+function AgentProfiles({
+  data,
+  drafts,
+  unsetPaths,
+  errors,
+  onDraft,
+  onToggleUnset,
+  onRemoveProfile,
+  onUndoRemoveProfile,
+  disabled,
+}: {
+  data: ConfigData;
+  drafts: Record<string, ConfigDraft>;
+  unsetPaths: Set<string>;
+  errors: ErrorMap;
+  onDraft: (path: string, value: ConfigDraft) => void;
+  onToggleUnset: (path: string) => void;
+  onRemoveProfile: (id: string, existed: boolean) => void;
+  onUndoRemoveProfile: (id: string) => void;
+  disabled: boolean;
+}) {
+  const [newId, setNewId] = useState("");
+  const [newVendor, setNewVendor] = useState("");
+  const [newModel, setNewModel] = useState("");
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const profilesMeta = resolveFieldMeta(data, "agent.profiles");
+  const editableByAuthority = metaIsEditable(profilesMeta);
+  const canEdit = editableByAuthority && !disabled;
+
+  const publishedIds = Object.keys(data.agent?.profiles ?? {}).sort();
+  const stagedIds = new Set<string>();
+  for (const path of Object.keys(drafts)) {
+    const match = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model)$/.exec(
+      path,
+    );
+    if (match) stagedIds.add(match[1]);
+  }
+  for (const path of unsetPaths) {
+    const whole = /^agent\.profiles\.([A-Za-z0-9_-]+)$/.exec(path);
+    if (whole) stagedIds.add(whole[1]);
+    const leaf = /^agent\.profiles\.([A-Za-z0-9_-]+)\./.exec(path);
+    if (leaf) stagedIds.add(leaf[1]);
+  }
+  const ids = [...new Set([...publishedIds, ...stagedIds])].sort();
+
+  const stageNew = () => {
+    const id = newId.trim();
+    if (!isValidAgentProfileId(id)) {
+      setLocalError("Profile id must match [A-Za-z0-9_-]+.");
+      return;
+    }
+    if (ids.includes(id) && !unsetPaths.has(`agent.profiles.${id}`)) {
+      setLocalError(`Profile "${id}" already exists.`);
+      return;
+    }
+    const vendor = newVendor.trim();
+    const model = newModel.trim();
+    if (!vendor && !model) {
+      setLocalError("Set at least vendor or model for the profile.");
+      return;
+    }
+    // Clear whole-profile unset if re-adding after remove.
+    if (unsetPaths.has(`agent.profiles.${id}`)) {
+      onUndoRemoveProfile(id);
+    }
+    if (vendor) onDraft(agentProfilePath(id, "vendor"), vendor);
+    if (model) onDraft(agentProfilePath(id, "model"), model);
+    setNewId("");
+    setNewVendor("");
+    setNewModel("");
+    setLocalError(null);
+  };
+
+  return (
+    <div
+      className="mt-2 border-t border-[var(--border)] pt-2"
+      data-testid="agent-profiles"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <h3 className="m-0 text-[12px] font-medium">Agent profiles</h3>
+          <p className="m-0 text-[10px] text-[var(--text-muted)]">
+            Named vendor/model presets referenced by coding-role agent bindings.
+            Params are not editable here.
+          </p>
+        </div>
+        <SourceBadge meta={profilesMeta} />
+      </div>
+
+      <div className="mt-2 flex flex-col gap-2">
+        {ids.length === 0 ? (
+          <span className="text-[11px] text-[var(--text-muted)]">
+            No agent profiles configured.
+          </span>
+        ) : null}
+        {ids.map((id) => {
+          const wholePath = `agent.profiles.${id}`;
+          const vendorPath = agentProfilePath(id, "vendor");
+          const modelPath = agentProfilePath(id, "model");
+          const pendingRemoval = unsetPaths.has(wholePath);
+          const exists = publishedIds.includes(id);
+          const vendorMeta = resolveFieldMeta(data, vendorPath);
+          const modelMeta = resolveFieldMeta(data, modelPath);
+          const vendorEditable = metaIsEditable(vendorMeta) && canEdit;
+          const modelEditable = metaIsEditable(modelMeta) && canEdit;
+          const published = data.agent?.profiles?.[id];
+          const vendorUnset = unsetPaths.has(vendorPath);
+          const modelUnset = unsetPaths.has(modelPath);
+          const vendorValue =
+            vendorUnset || pendingRemoval
+              ? ""
+              : Object.hasOwn(drafts, vendorPath)
+                ? String(drafts[vendorPath] ?? "")
+                : published?.vendor == null
+                  ? ""
+                  : String(published.vendor);
+          const modelValue =
+            modelUnset || pendingRemoval
+              ? ""
+              : Object.hasOwn(drafts, modelPath)
+                ? String(drafts[modelPath] ?? "")
+                : published?.model == null
+                  ? ""
+                  : String(published.model);
+          const canUnsetVendor =
+            vendorEditable &&
+            !pendingRemoval &&
+            (sourceIsConfigFile(vendorMeta?.source) ||
+              vendorUnset ||
+              published?.vendor != null);
+          const canUnsetModel =
+            modelEditable &&
+            !pendingRemoval &&
+            (sourceIsConfigFile(modelMeta?.source) ||
+              modelUnset ||
+              published?.model != null);
+
+          return (
+            <div
+              key={id}
+              className={`rounded border border-[var(--border)] px-2 py-1.5 ${
+                pendingRemoval ? "opacity-60" : ""
+              }`}
+              data-config-path={wholePath}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <code
+                  className={`text-[11px] ${pendingRemoval ? "line-through" : ""}`}
+                >
+                  {id}
+                </code>
+                <div className="flex items-center gap-1">
+                  {pendingRemoval ? (
+                    <button
+                      type="button"
+                      className="border-0 bg-transparent p-0 text-[10px] text-[var(--accent)]"
+                      disabled={disabled}
+                      onClick={() => onUndoRemoveProfile(id)}
+                    >
+                      undo remove
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      aria-label={`Remove profile ${id}`}
+                      className="border-0 bg-transparent p-0 text-[12px] text-[var(--danger)] disabled:opacity-40"
+                      disabled={!canEdit}
+                      onClick={() => onRemoveProfile(id, exists)}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="mt-1.5 grid gap-1.5 sm:grid-cols-2">
+                <div className="min-w-0">
+                  <div className="flex items-start gap-1.5">
+                    <label className="min-w-0 flex-1 text-[11px]">
+                      <span className="text-[var(--text-muted)]">Vendor</span>
+                      <select
+                        aria-label={vendorPath}
+                        className={`${controlClass} mt-0.5 ${vendorUnset ? "opacity-50" : ""}`}
+                        value={vendorValue}
+                        disabled={
+                          !vendorEditable || pendingRemoval || vendorUnset
+                        }
+                        onChange={(event) =>
+                          onDraft(vendorPath, event.currentTarget.value)
+                        }
+                      >
+                        {vendorValue === "" ? (
+                          <option value="" disabled>
+                            Not configured
+                          </option>
+                        ) : null}
+                        {AGENT_VENDOR_OPTIONS.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {canUnsetVendor ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="mt-4 shrink-0"
+                        disabled={disabled}
+                        aria-label={
+                          vendorUnset
+                            ? `Undo unset ${vendorPath}`
+                            : `Unset ${vendorPath}`
+                        }
+                        title={
+                          vendorUnset
+                            ? "Keep the current file value"
+                            : "Remove this value from the config file (inherit)"
+                        }
+                        onClick={() => onToggleUnset(vendorPath)}
+                      >
+                        {vendorUnset ? "Undo" : "Unset"}
+                      </Button>
+                    ) : null}
+                  </div>
+                  {vendorUnset ? (
+                    <p className="m-0 mt-1 text-[10px] text-[var(--warn)]">
+                      Pending: remove profile vendor (inherit global).
+                    </p>
+                  ) : null}
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-start gap-1.5">
+                    <label className="min-w-0 flex-1 text-[11px]">
+                      <span className="text-[var(--text-muted)]">Model</span>
+                      <input
+                        aria-label={modelPath}
+                        className={`${controlClass} mt-0.5 mono ${modelUnset ? "opacity-50" : ""}`}
+                        value={modelValue}
+                        disabled={
+                          !modelEditable || pendingRemoval || modelUnset
+                        }
+                        placeholder="optional model (empty = inherit)"
+                        onChange={(event) => {
+                          const next = event.currentTarget.value;
+                          // Clearing the field unsets the leaf (inherit). Empty
+                          // string suppress is not staged from this control.
+                          if (next === "" && published?.model != null) {
+                            if (!modelUnset) onToggleUnset(modelPath);
+                            return;
+                          }
+                          onDraft(modelPath, next);
+                        }}
+                      />
+                    </label>
+                    {canUnsetModel ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="mt-4 shrink-0"
+                        disabled={disabled}
+                        aria-label={
+                          modelUnset
+                            ? `Undo unset ${modelPath}`
+                            : `Unset ${modelPath}`
+                        }
+                        title={
+                          modelUnset
+                            ? "Keep the current file value"
+                            : "Remove this value from the config file (inherit)"
+                        }
+                        onClick={() => onToggleUnset(modelPath)}
+                      >
+                        {modelUnset ? "Undo" : "Unset"}
+                      </Button>
+                    ) : null}
+                  </div>
+                  {modelUnset ? (
+                    <p className="m-0 mt-1 text-[10px] text-[var(--warn)]">
+                      Pending: remove profile model (inherit previous layer).
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+              {(errors[vendorPath] || errors[modelPath] || errors[wholePath]) && (
+                <p className="m-0 mt-1 text-[11px] text-[var(--danger)]" role="alert">
+                  {errors[wholePath] || errors[vendorPath] || errors[modelPath]}
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-2 grid gap-1.5 sm:grid-cols-[minmax(120px,0.6fr)_minmax(140px,0.7fr)_minmax(140px,1fr)_auto]">
+        <input
+          aria-label="New profile id"
+          className={`${controlClass} mono`}
+          value={newId}
+          disabled={!canEdit}
+          placeholder="profile-id"
+          spellCheck={false}
+          onChange={(event) => setNewId(event.currentTarget.value)}
+        />
+        <select
+          aria-label="New profile vendor"
+          className={controlClass}
+          value={newVendor}
+          disabled={!canEdit}
+          onChange={(event) => setNewVendor(event.currentTarget.value)}
+        >
+          <option value="">Vendor (optional)</option>
+          {AGENT_VENDOR_OPTIONS.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+        <input
+          aria-label="New profile model"
+          className={`${controlClass} mono`}
+          value={newModel}
+          disabled={!canEdit}
+          placeholder="Model (optional)"
+          onChange={(event) => setNewModel(event.currentTarget.value)}
+        />
+        <Button variant="ghost" size="sm" disabled={!canEdit} onClick={stageNew}>
+          Add profile
+        </Button>
+      </div>
+      {!editableByAuthority ? (
+        <p className="m-0 mt-1 text-[10px] text-[var(--text-muted)]">
+          Agent profiles are read-only under the active config authority.
+        </p>
+      ) : null}
+      {localError ? (
+        <p className="m-0 mt-1 text-[11px] text-[var(--danger)]" role="alert">
+          {localError}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -504,6 +877,8 @@ function ConfigGroupCard({
   onSecretSet,
   onSecretRemove,
   onSecretUndoRemove,
+  onProfileRemove,
+  onProfileUndoRemove,
   environmentResetToken,
   onEnvironmentInputDirtyChange,
   disabled,
@@ -519,6 +894,8 @@ function ConfigGroupCard({
   onSecretSet: (key: string, value: string) => void;
   onSecretRemove: (key: string, existed: boolean) => void;
   onSecretUndoRemove: (key: string) => void;
+  onProfileRemove: (id: string, existed: boolean) => void;
+  onProfileUndoRemove: (id: string) => void;
   environmentResetToken: number;
   onEnvironmentInputDirtyChange: (dirty: boolean) => void;
   disabled: boolean;
@@ -541,7 +918,7 @@ function ConfigGroupCard({
           const value = Object.hasOwn(drafts, path)
             ? drafts[path]
             : draftFromValue(kind, effective);
-          const meta = data.metadata.fields[path];
+          const meta = resolveFieldMeta(data, path);
           const dirty = Object.hasOwn(drafts, path);
           const unset = unsetPaths.has(path);
           return (
@@ -570,21 +947,52 @@ function ConfigGroupCard({
         })}
       </div>
       {group.id === "agent" ? (
-        <AgentEnvironment
-          key={environmentResetToken}
-          data={data}
-          secretSet={secretSet}
-          unsetPaths={unsetPaths}
-          errors={errors}
-          onSet={onSecretSet}
-          onRemove={onSecretRemove}
-          onUndoRemove={onSecretUndoRemove}
-          onInputDirtyChange={onEnvironmentInputDirtyChange}
-          disabled={disabled}
-        />
+        <>
+          <AgentProfiles
+            data={data}
+            drafts={drafts}
+            unsetPaths={unsetPaths}
+            errors={errors}
+            onDraft={onDraft}
+            onToggleUnset={onToggleUnset}
+            onRemoveProfile={onProfileRemove}
+            onUndoRemoveProfile={onProfileUndoRemove}
+            disabled={disabled}
+          />
+          <AgentEnvironment
+            key={environmentResetToken}
+            data={data}
+            secretSet={secretSet}
+            unsetPaths={unsetPaths}
+            errors={errors}
+            onSet={onSecretSet}
+            onRemove={onSecretRemove}
+            onUndoRemove={onSecretUndoRemove}
+            onInputDirtyChange={onEnvironmentInputDirtyChange}
+            disabled={disabled}
+          />
+        </>
       ) : null}
     </Card>
   );
+}
+
+function canKeepStagedUnset(
+  data: ConfigData,
+  path: string,
+  meta: ConfigFieldMetadata | undefined,
+): boolean {
+  if (sourceIsConfigFile(meta?.source)) return true;
+  // Curated profile/role-agent paths may lack direct metadata entries and fall
+  // back to default/hot meta; keep unsets when the published value still exists.
+  if (isAgentProfileWholePath(path)) {
+    const id = path.slice("agent.profiles.".length);
+    return data.agent?.profiles?.[id] != null;
+  }
+  if (isAgentProfileLeafPath(path) || isRoleAgentLeafPath(path)) {
+    return getConfigValue(data, path) !== undefined;
+  }
+  return false;
 }
 
 function reconcilePendingAfterRebase(
@@ -597,7 +1005,8 @@ function reconcilePendingAfterRebase(
   let matchedPublished = 0;
   let noLongerEditable = 0;
   for (const [path, draft] of Object.entries(drafts)) {
-    if (!metaIsEditable(next.metadata.fields[path])) {
+    const meta = resolveFieldMeta(next, path);
+    if (!metaIsEditable(meta)) {
       noLongerEditable += 1;
       continue;
     }
@@ -619,8 +1028,14 @@ function reconcilePendingAfterRebase(
       clearedWriteOnly += 1;
       continue;
     }
-    const meta = next.metadata.fields[path];
-    if (!metaIsEditable(meta) || !sourceIsConfigFile(meta?.source)) {
+    const meta = resolveFieldMeta(next, path);
+    if (!metaIsEditable(meta) || !canKeepStagedUnset(next, path, meta)) {
+      // Whole-profile and curated identity unsets without a live value are
+      // treated as matched/cleared rather than "no longer editable".
+      if (isCuratedAgentIdentityPath(path) && !canKeepStagedUnset(next, path, meta)) {
+        matchedPublished += 1;
+        continue;
+      }
       noLongerEditable += 1;
       continue;
     }
@@ -873,6 +1288,54 @@ export function ConfigPage() {
     [clearPathError, retireLoad],
   );
 
+  const onProfileRemove = useCallback(
+    (id: string, existed: boolean) => {
+      retireLoad();
+      const wholePath = `agent.profiles.${id}`;
+      const vendorPath = agentProfilePath(id, "vendor");
+      const modelPath = agentProfilePath(id, "model");
+      setDrafts((current) => {
+        if (
+          !Object.hasOwn(current, vendorPath) &&
+          !Object.hasOwn(current, modelPath)
+        ) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[vendorPath];
+        delete next[modelPath];
+        return next;
+      });
+      setUnsetPaths((current) => {
+        const next = new Set(current);
+        next.delete(vendorPath);
+        next.delete(modelPath);
+        if (existed) next.add(wholePath);
+        else next.delete(wholePath);
+        return next;
+      });
+      clearPathError(wholePath);
+      clearPathError(vendorPath);
+      clearPathError(modelPath);
+    },
+    [clearPathError, retireLoad],
+  );
+
+  const onProfileUndoRemove = useCallback(
+    (id: string) => {
+      retireLoad();
+      const wholePath = `agent.profiles.${id}`;
+      setUnsetPaths((current) => {
+        if (!current.has(wholePath)) return current;
+        const next = new Set(current);
+        next.delete(wholePath);
+        return next;
+      });
+      clearPathError(wholePath);
+    },
+    [clearPathError, retireLoad],
+  );
+
   const persist = useCallback(
     async (body: PatchConfigBody) => {
       // A refresh started while the form was still clean may still be in flight
@@ -1090,6 +1553,8 @@ export function ConfigPage() {
             onSecretSet={onSecretSet}
             onSecretRemove={onSecretRemove}
             onSecretUndoRemove={onSecretUndoRemove}
+            onProfileRemove={onProfileRemove}
+            onProfileUndoRemove={onProfileUndoRemove}
             environmentResetToken={environmentResetToken}
             onEnvironmentInputDirtyChange={onEnvironmentInputDirtyChange}
             disabled={editorLocked}

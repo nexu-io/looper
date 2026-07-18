@@ -15,6 +15,7 @@ import (
 
 var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var agentProfileIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 type ValidationIssue struct {
 	Path    string
@@ -107,8 +108,10 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
-		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild)})
+		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
 	}
+	validateAgentProfiles(config.Agent.Profiles, &issues)
+	validateRoleAgentBindings(config, &issues)
 	validateEnvironmentNames(config.Agent.Env, "agent.env", &issues)
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
 
@@ -423,6 +426,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
+		validateProjectRoleAgentBindings(project.Roles, prefix+".roles", &issues)
 		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
 		for _, roleInstruction := range roleInstructions(effectiveProjectRoles) {
 			if !projectRoleInstructionsConfigured(project.Roles, roleInstruction.role) {
@@ -886,6 +890,105 @@ func isValidAgentVendor(vendor AgentVendor) bool {
 	default:
 		return false
 	}
+}
+
+func agentVendorValidationMessage() string {
+	return fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild)
+}
+
+func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]ValidationIssue) {
+	if len(profiles) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(profiles))
+	for id := range profiles {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		path := "agent.profiles." + id
+		if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || !agentProfileIDPattern.MatchString(id) {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "profile id must be non-empty, trimmed, and match [A-Za-z0-9_-]+"})
+			continue
+		}
+		binding := profiles[id]
+		if binding.Vendor == nil && binding.Model == nil {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "must set at least one of vendor or model"})
+		}
+		if binding.Vendor != nil && !isValidAgentVendor(*binding.Vendor) {
+			*issues = append(*issues, ValidationIssue{Path: path + ".vendor", Message: agentVendorValidationMessage()})
+		}
+	}
+}
+
+func validateRoleAgentBindings(config Config, issues *[]ValidationIssue) {
+	type roleBinding struct {
+		role  string
+		agent *RoleAgentConfig
+	}
+	bindings := []roleBinding{
+		{role: CodingRolePlanner, agent: config.Roles.Planner.Agent},
+		{role: CodingRoleWorker, agent: config.Roles.Worker.Agent},
+		{role: CodingRoleReviewer, agent: config.Roles.Reviewer.Agent},
+		{role: CodingRoleFixer, agent: config.Roles.Fixer.Agent},
+	}
+	for _, binding := range bindings {
+		if binding.agent == nil {
+			continue
+		}
+		prefix := "roles." + binding.role + ".agent"
+		if binding.agent.Profile != nil {
+			profileID := *binding.agent.Profile
+			trimmed := strings.TrimSpace(profileID)
+			if trimmed == "" || profileID != trimmed {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: "must be a non-empty trimmed profile id"})
+			} else if _, exists := config.Agent.Profiles[trimmed]; !exists {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: fmt.Sprintf("references unknown agent profile: %s", trimmed)})
+			}
+		}
+		if binding.agent.Vendor != nil && !isValidAgentVendor(*binding.agent.Vendor) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
+		}
+	}
+}
+
+func validateProjectRoleAgentBindings(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if roles == nil {
+		return
+	}
+	type roleBinding struct {
+		role  string
+		agent *RoleAgentConfig
+	}
+	var bindings []roleBinding
+	if roles.Planner != nil {
+		bindings = append(bindings, roleBinding{role: CodingRolePlanner, agent: roles.Planner.Agent})
+	}
+	if roles.Worker != nil {
+		bindings = append(bindings, roleBinding{role: CodingRoleWorker, agent: roles.Worker.Agent})
+	}
+	if roles.Reviewer != nil {
+		bindings = append(bindings, roleBinding{role: CodingRoleReviewer, agent: roles.Reviewer.Agent})
+	}
+	if roles.Fixer != nil {
+		bindings = append(bindings, roleBinding{role: CodingRoleFixer, agent: roles.Fixer.Agent})
+	}
+	for _, binding := range bindings {
+		if !roleAgentBindingSet(binding.agent) {
+			continue
+		}
+		*issues = append(*issues, ValidationIssue{
+			Path:    prefix + "." + binding.role + ".agent",
+			Message: "project-level agent bindings are not supported",
+		})
+	}
+}
+
+func roleAgentBindingSet(agent *RoleAgentConfig) bool {
+	if agent == nil {
+		return false
+	}
+	return agent.Profile != nil || agent.Vendor != nil || agent.Model != nil
 }
 
 func isValidAuthMode(mode AuthMode) bool {

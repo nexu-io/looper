@@ -85,24 +85,24 @@ func TestWorkerDoesNotAttachOldVendorSessionsAfterVendorChange(t *testing.T) {
 	}
 
 	sameVendor := New(Options{Repos: fixture.repos, AgentRuntime: "codex"})
-	if prompt, gotSession := sameVendor.pendingHumanAnswer(ctx, loop); !strings.Contains(prompt, "postgres") || gotSession != sessionID {
+	if prompt, gotSession := sameVendor.pendingHumanAnswer(ctx, loop, "codex"); !strings.Contains(prompt, "postgres") || gotSession != sessionID {
 		t.Fatalf("same-vendor HITL resume = (%q, %q), want decision prompt + %q", prompt, gotSession, sessionID)
 	}
-	if prompt, gotSession := sameVendor.pendingTakeoverResume(ctx, loop); prompt == "" || gotSession != sessionID {
+	if prompt, gotSession := sameVendor.pendingTakeoverResume(ctx, loop, "codex"); prompt == "" || gotSession != sessionID {
 		t.Fatalf("same-vendor takeover resume = (%q, %q), want prompt + %q", prompt, gotSession, sessionID)
 	}
-	if got := sameVendor.latestNativeSessionID(ctx, loop.ID); got != sessionID {
+	if got := sameVendor.latestNativeSessionID(ctx, loop.ID, "codex"); got != sessionID {
 		t.Fatalf("same-vendor mailbox session = %q, want %q", got, sessionID)
 	}
 
 	newVendor := New(Options{Repos: fixture.repos, AgentRuntime: "claude-code"})
-	if prompt, gotSession := newVendor.pendingHumanAnswer(ctx, loop); !strings.Contains(prompt, "postgres") || !strings.Contains(prompt, "vendor changed") || gotSession != "" {
+	if prompt, gotSession := newVendor.pendingHumanAnswer(ctx, loop, "claude-code"); !strings.Contains(prompt, "postgres") || !strings.Contains(prompt, "vendor changed") || gotSession != "" {
 		t.Fatalf("cross-vendor HITL resume = (%q, %q), want decision prompt + fresh session", prompt, gotSession)
 	}
-	if prompt, gotSession := newVendor.pendingTakeoverResume(ctx, loop); !strings.Contains(prompt, "fresh session") || gotSession != "" {
+	if prompt, gotSession := newVendor.pendingTakeoverResume(ctx, loop, "claude-code"); !strings.Contains(prompt, "fresh session") || gotSession != "" {
 		t.Fatalf("cross-vendor takeover resume = (%q, %q), want checkpoint prompt + fresh session", prompt, gotSession)
 	}
-	if got := newVendor.latestNativeSessionID(ctx, loop.ID); got != "" {
+	if got := newVendor.latestNativeSessionID(ctx, loop.ID, "claude-code"); got != "" {
 		t.Fatalf("cross-vendor mailbox session = %q, want fresh session", got)
 	}
 }

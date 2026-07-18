@@ -28,10 +28,14 @@ restart-bound change rejects the entire candidate and leaves the last-known-good
 snapshot active.
 
 The hot-safe allowlist contains agent vendor/model/environment and canonical
-idle/max-runtime timeouts, selected scheduler concurrency/slow-lane
+idle/max-runtime timeouts, named `agent.profiles.<id>` vendor/model identity
+(and whole-profile set/unset of a single id), coding-role
+`roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}` bindings,
+selected scheduler concurrency/slow-lane
 fields, in-app and osascript notifications, disclosure, selected default-policy
 fields, `instructions.enabled`, curated role policy, and the Looper/osascript
-tool paths. Deprecated timeout and default-policy aliases remain watcher-hot
+tool paths. Profile and role agent vendor/model are hot-safe curated identity
+fields for new claims; in-flight runs keep their frozen snapshot. Deprecated timeout and default-policy aliases remain watcher-hot
 file-only compatibility representations of those canonical fields; they are
 not dashboard-editable. Durable queue scheduling inputs—including the scheduler
 retry budget/base delay, Reviewer quiet/minimum-publish timing, and Reviewer
