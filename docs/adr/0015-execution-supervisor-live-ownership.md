@@ -248,19 +248,24 @@ Drain **admission → ingress → producers → handles/finalizers** before SQLi
 close. On timeout or confirmed-drain failure: **retain storage** and fail loud
 — never report graceful success with undrained ownership. `Runtime.Stop` skips
 `coordinator.Close` when `ActiveExecutionRegistry.BeginShutdown` returns a drain
-error; `StorageRetained()` is the operator-visible signal. Independent infra
-(webhook forwarder, network manager) still stop — they are not Supervisor domain.
+error (agents **and** tracked Supervisor-owned non-agent handles); late
+`ReportDrainFailure` from shell/trusted-review cancel paths is re-collected
+after producer waits. `StorageRetained()` is the operator-visible signal.
+Independent infra (webhook forwarder, network manager) still stop — they are
+not Supervisor domain.
 
 ### Non-agent Supervisor-owned producers (enforced by #577)
 
 | Producer | Spawn boundary | Containment |
 |----------|----------------|-------------|
-| **Worker / Fixer validation shell** | `internal/infra/shell.Run` (`Configure` + `Start` + `Bind`) | Cancel/timeout → `Handle.Kill` confirmed drain; normal exit → `Handle.Drain` |
-| **Other daemon `shell.Run` work steps** on inventory-listed role helpers | same package boundary | Same as validation; short git/gh/tea remain independently lifecycle-owned (gateway Authority) but still get group containment when they share `shell.Run` |
-| **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` | `Configure` + `Bind` after Start; cancel → `Handle.Kill`; success path `Drain` |
+| **Worker / Fixer validation shell** | `internal/infra/shell.Run` (`Configure` + `Start` + `Bind`) + `LiveTracker` | Cancel/timeout → `Handle.Kill` confirmed drain; normal exit → `Handle.Drain`; track + `ReportDrainFailure` for retain-storage |
+| **Other daemon `shell.Run` work steps** on inventory-listed role helpers | same package boundary | Same as validation when Supervisor-owned; short git/gh/tea remain independently lifecycle-owned (gateway Authority, Tracker nil) but still get group containment when they share `shell.Run` |
+| **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` + `LiveTracker` | `Configure` + `Bind` after Start; cancel → `Handle.Kill`; success path `Drain`; track + report for retain-storage |
 
 Raw PID signal-only stop is removed at these boundaries. Agent live SQLite-PID
-fallback was already removed when the registry is present (#576).
+fallback was already removed when the registry is present (#576). Non-agent
+tracking registers only the live handle (not agent spawn leases) so short jobs
+do not grow a second full registry while still feeding shutdown retain-storage.
 
 ## Process-producer inventory
 

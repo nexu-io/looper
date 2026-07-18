@@ -128,7 +128,7 @@ func TestStartTrustedReviewProxyAllowsEmptyTrustedEnv(t *testing.T) {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -171,7 +171,7 @@ func TestStartTrustedReviewProxyInjectsTokensIntoChild(t *testing.T) {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -221,7 +221,7 @@ func TestStartTrustedReviewProxyRewritesPolicyFlags(t *testing.T) {
 	}
 
 	policy := TrustedReviewProxyPolicy{Clean: "APPROVE", Blocking: "REQUEST_CHANGES", ExpectedCommitID: "bound-head", ReviewerManual: true, ReviewerRunID: "run_bound"}
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir, config.Config{}, policy)
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir, config.Config{}, policy, nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -283,7 +283,7 @@ func TestStartTrustedReviewProxyRejectsUnboundPR(t *testing.T) {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"}, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -309,22 +309,22 @@ func TestStartTrustedReviewProxyRequiresAllowedPR(t *testing.T) {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
 	policy := testTrustedReviewPolicy()
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "", dir, config.Config{}, policy); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "", dir, config.Config{}, policy, nil); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with empty allowed PR = nil, want error")
 	}
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "not-a-ref", dir, config.Config{}, policy); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "not-a-ref", dir, config.Config{}, policy, nil); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with invalid allowed PR = nil, want error")
 	}
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", "", config.Config{}, policy); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", "", config.Config{}, policy, nil); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with empty allowed CWD = nil, want error")
 	}
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", "relative/path", config.Config{}, policy); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", "relative/path", config.Config{}, policy, nil); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with relative allowed CWD = nil, want error")
 	}
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", dir, config.Config{}, TrustedReviewProxyPolicy{}); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", dir, config.Config{}, TrustedReviewProxyPolicy{}, nil); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with empty policy = nil, want error")
 	}
-	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", dir, config.Config{}, TrustedReviewProxyPolicy{Clean: "APPROVE", Blocking: "APPROVE"}); err == nil {
+	if _, _, err := StartTrustedReviewProxy(realLooper, map[string]string{"FORGEJO_TOKEN": "x"}, "acme/looper#1", dir, config.Config{}, TrustedReviewProxyPolicy{Clean: "APPROVE", Blocking: "APPROVE"}, nil); err == nil {
 		t.Fatal("StartTrustedReviewProxy() with invalid blocking policy = nil, want error")
 	}
 }
@@ -491,7 +491,7 @@ func TestTrustedReviewProxyKeepsRunConfigWhenLiveFileChanges(t *testing.T) {
 		t.Fatalf("WriteFile(initial live config) error = %v", err)
 	}
 
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, runConfig, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, runConfig, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}

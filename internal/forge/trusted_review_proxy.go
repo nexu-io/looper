@@ -109,7 +109,11 @@ type TrustedReviewProxyPolicy struct {
 // overrides). Agent argv may still include local flags for the prompted command
 // shape, but the proxy always rewrites them to this bound authority before
 // spawning the credential-injected child.
-func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
+//
+// tracker, when non-nil, registers each Supervisor-owned review-submit child
+// handle so daemon shutdown can wait for confirmed drain and retain storage on
+// Kill/Drain failure (ADR-0015 / #577).
+func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy TrustedReviewProxyPolicy, tracker processcontainment.LiveTracker) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	if realLooper == "" {
 		return "", nil, fmt.Errorf("real looper path is required for trusted review proxy")
@@ -198,7 +202,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 				defer wg.Done()
 				defer func() { <-slots }()
 				defer unregister(c)
-				handleTrustedReviewProxyConn(proxyContext, c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfig, boundPolicy)
+				handleTrustedReviewProxyConn(proxyContext, c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfig, boundPolicy, tracker)
 			}(conn)
 		}
 	}()
@@ -222,7 +226,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot []byte, policy TrustedReviewProxyPolicy) {
+func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot []byte, policy TrustedReviewProxyPolicy, tracker processcontainment.LiveTracker) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
@@ -288,6 +292,12 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "bind trusted review containment handle: " + bindErr.Error()})
 		return
 	}
+	if tracker != nil {
+		release := tracker.Track(handle)
+		if release != nil {
+			defer release()
+		}
+	}
 	_ = configReader.Close()
 	configWriteDone := make(chan error, 1)
 	go func() {
@@ -318,6 +328,7 @@ loop:
 				// Normal exit path: confirmed-drain descendants before answering.
 				drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
 				if drainErr := handle.Drain(drainCtx); drainErr != nil {
+					reportTrustedReviewDrainFailure(tracker, drainErr)
 					// Join so non-zero child exits still surface ErrNotConfirmedDead.
 					if err == nil {
 						err = drainErr
@@ -333,6 +344,9 @@ loop:
 			killCtx, killCancel := context.WithTimeout(context.Background(), 20*time.Second)
 			killErr := handle.Kill(killCtx)
 			killCancel()
+			if killErr != nil {
+				reportTrustedReviewDrainFailure(tracker, killErr)
+			}
 			// Unstick Wait if Kill timed out without reaping the leader, then
 			// bound the receive so cleanup cannot hang on an open waitDone.
 			waitCancel()
@@ -371,6 +385,7 @@ loop:
 			// Leader reaped; Drain kills pipe-holding descendants and unblocks Wait.
 			drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
 			if drainErr := handle.Drain(drainCtx); drainErr != nil {
+				reportTrustedReviewDrainFailure(tracker, drainErr)
 				if err == nil {
 					err = drainErr
 				} else {
@@ -435,6 +450,13 @@ func trustedReviewLeaderPIDGone(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return errors.Is(err, syscall.ESRCH)
+}
+
+func reportTrustedReviewDrainFailure(tracker processcontainment.LiveTracker, err error) {
+	if tracker == nil || err == nil {
+		return
+	}
+	tracker.ReportDrainFailure(err)
 }
 
 const trustedReviewOutputTruncatedMsg = "trusted review proxy child output exceeds size limit"

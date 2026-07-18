@@ -30,6 +30,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -442,20 +443,24 @@ type Options struct {
 	ClaimTTL                        time.Duration
 	ValidationCommands              []string
 	ValidationRunner                ValidationRunner
-	AllowAutoCommit                 bool
-	AllowAutoPush                   bool
-	OpenPRStrategy                  config.OpenPRStrategy
-	Disclosure                      *config.DisclosureConfig
-	AgentRuntime                    string
-	CustomInstructions              *config.Config
-	AgentModel                      *string
-	RetryBaseDelay                  time.Duration
-	RetryMaxAttempts                int64
-	OnAgentExecutionStarted         AgentExecutionStartedFunc
-	OnRunCompleted                  RunCompletedFunc
-	DiscoveryPolicy                 DiscoveryPolicy
-	OnQueueItemEnqueued             func()
-	Network                         NetworkStatusGateway
+	// ContainmentTracker registers validation shell handles with the Execution
+	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
+	// when the runner is not daemon-owned.
+	ContainmentTracker      processcontainment.LiveTracker
+	AllowAutoCommit         bool
+	AllowAutoPush           bool
+	OpenPRStrategy          config.OpenPRStrategy
+	Disclosure              *config.DisclosureConfig
+	AgentRuntime            string
+	CustomInstructions      *config.Config
+	AgentModel              *string
+	RetryBaseDelay          time.Duration
+	RetryMaxAttempts        int64
+	OnAgentExecutionStarted AgentExecutionStartedFunc
+	OnRunCompleted          RunCompletedFunc
+	DiscoveryPolicy         DiscoveryPolicy
+	OnQueueItemEnqueued     func()
+	Network                 NetworkStatusGateway
 	// HITLEnabled gates the mid-run human-in-the-loop feature. When false (the
 	// default) none of the HITL code paths run and the worker behaves exactly as
 	// before. HITLNotify, when set, sends the ask-card to the human channel.
@@ -529,6 +534,7 @@ type Runner struct {
 	claimTTL                time.Duration
 	validationCommands      []string
 	validationRunner        ValidationRunner
+	containmentTracker      processcontainment.LiveTracker
 	allowAutoCommit         bool
 	allowAutoPush           bool
 	githubCLIAvailable      bool
@@ -800,6 +806,7 @@ func New(options Options) *Runner {
 		claimTTL:                claimTTL,
 		validationCommands:      append([]string(nil), options.ValidationCommands...),
 		validationRunner:        options.ValidationRunner,
+		containmentTracker:      options.ContainmentTracker,
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
 		githubCLIAvailable:      githubCLIAvailable,
@@ -2564,7 +2571,14 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{Command: "/bin/sh", Args: []string{"-c", command}, CWD: input.CWD})
+		result, err := shell.Run(ctx, shell.Options{
+			Command: "/bin/sh",
+			Args:    []string{"-c", command},
+			CWD:     input.CWD,
+			// Supervisor-owned validation: track handle so shutdown retain-storage
+			// sees Kill/Drain failures even when validation collapses them to Passed=false.
+			Tracker: r.containmentTracker,
+		})
 		if err != nil {
 			output := "Unknown validation failure"
 			var commandErr *shell.CommandExecutionError

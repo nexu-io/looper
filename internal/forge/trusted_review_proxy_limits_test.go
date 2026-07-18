@@ -20,7 +20,7 @@ func TestTrustedReviewProxyRejectsOversizedStdinBeforeStartingChild(t *testing.T
 	if err := os.WriteFile(realLooper, []byte(trustedReviewProxyStubScript("touch \""+marker+"\"\n")), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -54,7 +54,7 @@ exit 0
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -88,7 +88,7 @@ func TestTrustedReviewProxyCleanupClosesPartialConnectionsAndKillsChildGroup(t *
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}

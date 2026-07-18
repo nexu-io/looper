@@ -358,6 +358,17 @@ func (r *Runtime) Stop(reason string) {
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
 
+		// Re-collect non-agent containment drain failures reported while
+		// producers finished after BeginShutdown (shell validation / trusted
+		// review cancel paths). Agent failures were already joined above.
+		if r.activeExecutions != nil {
+			if err := r.activeExecutions.NonAgentDrainErr(); err != nil {
+				r.mu.Lock()
+				r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
+				r.mu.Unlock()
+			}
+		}
+
 		r.mu.Lock()
 		r.stopped = true
 		forwarder := r.webhookForwarder
@@ -431,14 +442,17 @@ func (r *Runtime) Stop(reason string) {
 // AllowExecute cannot finish CreateOrGetActiveByDedupe after admission closes.
 //
 // Shutdown order (ADR-0015 / #577): close admission → cancel producers →
-// confirmed-drain handles. SQLite close happens only in Stop after drain
-// succeeds; drain failure is recorded for retain-storage.
+// confirmed-drain handles (agents + tracked non-agent shell/trusted-review).
+// SQLite close happens only in Stop after drain succeeds; drain failure is
+// recorded for retain-storage. Non-agent Kill/Drain failures that finish after
+// this returns are re-collected in Stop via NonAgentDrainErr.
 func (r *Runtime) BeginShutdown(reason string) {
 	if r == nil {
 		return
 	}
 	_ = r.admission.BeginShutdown(reason)
-	// Close agent spawn admission and confirmed-drain live handles (#576/#577).
+	// Close agent spawn admission and confirmed-drain live handles — agents and
+	// tracked Supervisor-owned non-agents (#576/#577).
 	if r.activeExecutions != nil {
 		if err := r.activeExecutions.BeginShutdown(reason); err != nil {
 			r.mu.Lock()

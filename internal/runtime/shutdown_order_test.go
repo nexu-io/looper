@@ -150,6 +150,46 @@ func TestShutdownClosesStorageWhenDrainSucceeds(t *testing.T) {
 	}
 }
 
+// Contract (#577): non-agent Supervisor-owned containment failures (shell /
+// trusted-review) must feed retain-storage, not only agent-registry drains.
+func TestShutdownRetainsStorageWhenNonAgentDrainFailureReported(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// Simulate validation/trusted-review reporting ErrNotConfirmedDead outside
+	// ActiveExecutionRegistry agent leases (the gap fixed for #590 review).
+	force := errors.New("non-agent shell drain not confirmed")
+	rt.activeExecutions.ReportDrainFailure(force)
+
+	rt.BeginShutdown("test non-agent drain fail")
+	if err := rt.ShutdownDrainError(); err == nil {
+		t.Fatal("ShutdownDrainError() = nil after non-agent drain failure report, want error")
+	} else if !errors.Is(err, force) && !strings.Contains(err.Error(), force.Error()) {
+		t.Fatalf("ShutdownDrainError() = %v, want non-agent failure", err)
+	}
+
+	rt.Stop("test non-agent drain fail")
+	if !rt.StorageRetained() {
+		t.Fatal("StorageRetained() = false, want true after non-agent drain failure")
+	}
+	if services := rt.Services(); services.Coordinator == nil {
+		t.Fatal("Services().Coordinator = nil after Stop with non-agent drain failure, want retained storage")
+	}
+}
+
 // Registry contract: BeginShutdown surfaces kill/drain failures (#577).
 func TestActiveExecutionRegistryBeginShutdownReturnsDrainFailure(t *testing.T) {
 	t.Parallel()

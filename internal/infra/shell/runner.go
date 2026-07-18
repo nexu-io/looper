@@ -45,6 +45,11 @@ type Options struct {
 	Timeout          time.Duration
 	GracefulShutdown time.Duration
 	MaxCapturedBytes int
+	// Tracker registers the live containment handle with the Execution
+	// Supervisor for shutdown drain / retain-storage (ADR-0015 / #577).
+	// Set only for Supervisor-owned paths (worker/fixer validation). Leave nil
+	// for independently lifecycle-owned gateways (git/gh/tea, osascript).
+	Tracker processcontainment.LiveTracker
 }
 
 type CommandExecutionError struct {
@@ -81,6 +86,12 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("start command: %w", err)
 	}
+	if options.Tracker != nil {
+		release := options.Tracker.Track(handle)
+		if release != nil {
+			defer release()
+		}
+	}
 
 	waitCtx := ctx
 	var timeoutCancel context.CancelFunc
@@ -98,6 +109,9 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	waitErr, timedOut, canceledErr, killErr, drainErr := awaitContainedCommand(
 		handle, waitCtx, ctx, options.Timeout > 0, gracefulShutdown, waitDone,
 	)
+	// Surface containment failures to the Supervisor for retain-storage even
+	// when callers (e.g. validation) collapse Run errors into a failed result.
+	reportContainmentFailure(options.Tracker, killErr, drainErr)
 
 	duration := time.Since(startedAt)
 	result := Result{
@@ -136,6 +150,17 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return result, waitErr
 	}
 	return result, nil
+}
+
+func reportContainmentFailure(tracker processcontainment.LiveTracker, errs ...error) {
+	if tracker == nil {
+		return
+	}
+	for _, err := range errs {
+		if err != nil {
+			tracker.ReportDrainFailure(err)
+		}
+	}
 }
 
 // awaitContainedCommand finishes a contained shell command without hanging on

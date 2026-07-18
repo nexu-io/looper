@@ -32,6 +32,7 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -515,18 +516,22 @@ type AgentExecutionStartedInput struct {
 type AgentExecutionStartedFunc func(context.Context, AgentExecutionStartedInput) error
 
 type Options struct {
-	DB                      *sql.DB
-	Repos                   *storage.Repositories
-	GitHub                  GitHubGateway
-	Git                     GitGateway
-	AgentExecutor           AgentExecutor
-	Logger                  bootstrap.Logger
-	Now                     func() time.Time
-	AgentTimeout            time.Duration
-	AgentIdleTimeout        time.Duration
-	ClaimTTL                time.Duration
-	ValidationCommands      []string
-	ValidationRunner        ValidationRunner
+	DB                 *sql.DB
+	Repos              *storage.Repositories
+	GitHub             GitHubGateway
+	Git                GitGateway
+	AgentExecutor      AgentExecutor
+	Logger             bootstrap.Logger
+	Now                func() time.Time
+	AgentTimeout       time.Duration
+	AgentIdleTimeout   time.Duration
+	ClaimTTL           time.Duration
+	ValidationCommands []string
+	ValidationRunner   ValidationRunner
+	// ContainmentTracker registers validation shell handles with the Execution
+	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
+	// when the runner is not daemon-owned.
+	ContainmentTracker      processcontainment.LiveTracker
 	AllowAutoCommit         bool
 	AllowAutoPush           bool
 	AllowRiskyFixes         bool
@@ -564,6 +569,7 @@ type Runner struct {
 	claimTTL                time.Duration
 	validationCommands      []string
 	validationRunner        ValidationRunner
+	containmentTracker      processcontainment.LiveTracker
 	allowAutoCommit         bool
 	allowAutoPush           bool
 	allowRiskyFixes         bool
@@ -1274,6 +1280,7 @@ func New(options Options) *Runner {
 		claimTTL:                claimTTL,
 		validationCommands:      append([]string(nil), options.ValidationCommands...),
 		validationRunner:        options.ValidationRunner,
+		containmentTracker:      options.ContainmentTracker,
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
 		allowRiskyFixes:         options.AllowRiskyFixes,
@@ -5937,7 +5944,14 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 	outputs := make([]string, 0, len(input.Commands)*2)
 	for _, command := range input.Commands {
-		result, err := shell.Run(ctx, shell.Options{Command: "/bin/sh", Args: []string{"-c", command}, CWD: input.CWD})
+		result, err := shell.Run(ctx, shell.Options{
+			Command: "/bin/sh",
+			Args:    []string{"-c", command},
+			CWD:     input.CWD,
+			// Supervisor-owned validation: track handle so shutdown retain-storage
+			// sees Kill/Drain failures even when validation collapses them to Passed=false.
+			Tracker: r.containmentTracker,
+		})
 		if err != nil {
 			output := "Unknown validation failure"
 			var commandErr *shell.CommandExecutionError
