@@ -165,6 +165,10 @@ type Handler struct {
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
 	discardBeforeGitHook func(loopID string)
+	// retryAfterClearStopGateHook is test-only: invoked after ClearLoopStop and
+	// before the requeue transaction so tests can inject a TX-time conflict
+	// after the sticky stop gate was already cleared.
+	retryAfterClearStopGateHook func(loopID string)
 }
 
 func NewHandler(context Context) *Handler {
@@ -5967,8 +5971,20 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	// Clearing after the TX commit races a concurrent scheduler tick that can
 	// claim the new item, pass the parked check (loop is queued), then fail
 	// AgentExecutor.Start with ErrSpawnLoopStopping and back off the retry.
+	// If the TX fails (or publishes no replacement work), restore the gate so
+	// a failed retry cannot reopen AdmitSpawn for stale pre-stop runners.
+	gateWasActive := false
 	if services.ActiveExecutions != nil {
+		gateWasActive = services.ActiveExecutions.LoopStopActive(loopID)
 		services.ActiveExecutions.ClearLoopStop(loopID)
+	}
+	restoreStopGate := func() {
+		if gateWasActive && services.ActiveExecutions != nil {
+			services.ActiveExecutions.RestoreLoopStop(loopID)
+		}
+	}
+	if h.retryAfterClearStopGateHook != nil {
+		h.retryAfterClearStopGateHook(loopID)
 	}
 	result, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (retryResult, error) {
 		repos := storage.NewRepositories(tx)
@@ -6064,11 +6080,16 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		return retryResult{loop: updated, queueItemID: &persisted.ID}, nil
 	})
 	if err != nil {
+		restoreStopGate()
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return retryLoopResponse{}, typed
 		}
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if result.queueItemID == nil {
+		// No replacement work published; keep sticky stop closed if it was.
+		restoreStopGate()
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()

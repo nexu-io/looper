@@ -130,12 +130,21 @@ func TestStopVsBindKillsAndConfirmedDrainsBeforeStartSuccess(t *testing.T) {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	// Race: close loop admission before BindHandle returns.
-	release, stopErr := reg.BeginLoopStop("loop-1", "halt")
-	if stopErr != nil {
-		t.Fatalf("BeginLoopStop: %v", stopErr)
+	// Race: close loop admission while BindHandle is still pending. BeginLoopStop
+	// waits for the pending spawn window, so BindHandle must run concurrently.
+	stopDone := make(chan error, 1)
+	go func() {
+		// Intentionally keep the sticky gate (do not invoke release).
+		_, stopErr := reg.BeginLoopStop("loop-1", "halt")
+		stopDone <- stopErr
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for !reg.LoopStopActive("loop-1") {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for BeginLoopStop to set gate")
+		}
+		time.Sleep(time.Millisecond)
 	}
-	defer release()
 
 	err = lease.BindHandle(handle, func(string) error { return nil })
 	if !errors.Is(err, agent.ErrSpawnStoppedDuringBind) {
@@ -143,6 +152,14 @@ func TestStopVsBindKillsAndConfirmedDrainsBeforeStartSuccess(t *testing.T) {
 	}
 	if !handle.ConfirmedDead() {
 		t.Fatal("handle must be confirmed-dead after stop-vs-bind race")
+	}
+	select {
+	case stopErr := <-stopDone:
+		if stopErr != nil {
+			t.Fatalf("BeginLoopStop: %v", stopErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BeginLoopStop did not return after BindHandle ended the pending window")
 	}
 	if reg.LiveCount() != 0 {
 		t.Fatalf("LiveCount = %d, want 0 after rejected bind", reg.LiveCount())
@@ -444,6 +461,7 @@ func TestBeginLoopStopPropagatesDrainFailure(t *testing.T) {
 func TestBeginRebindRefusesWhenLoopStopping(t *testing.T) {
 	t.Parallel()
 	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
 	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
 		LoopID: "loop-rebind-refuse", RunID: "run-rr", ExecutionID: "exec-rr",
 	})
@@ -454,11 +472,90 @@ func TestBeginRebindRefusesWhenLoopStopping(t *testing.T) {
 	if !ok {
 		t.Fatalf("lease type %T, want *spawnLease", lease)
 	}
+	// Bind so the lease leaves pending; BeginLoopStop then cancels the active lease.
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := lease.BindHandle(handle, func(string) error { return nil }); err != nil {
+		t.Fatalf("BindHandle: %v", err)
+	}
 	if _, err := reg.BeginLoopStop("loop-rebind-refuse", "looper stop"); err != nil {
 		t.Fatalf("BeginLoopStop: %v", err)
 	}
 	if err := sl.BeginRebind(); !errors.Is(err, agent.ErrSpawnLoopStopping) {
 		t.Fatalf("BeginRebind error = %v, want ErrSpawnLoopStopping", err)
+	}
+}
+
+// BeginLoopStop must wait for a pending Start→BindHandle window so stop cannot
+// return while a just-started process is live outside the registry.
+func TestBeginLoopStopWaitsForPendingSpawn(t *testing.T) {
+	t.Parallel()
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 5 * time.Second
+
+	lease, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-pending-wait", RunID: "run-pw", ExecutionID: "exec-pw",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+
+	// Process started after AdmitSpawn; BindHandle not yet called — registry
+	// has no containment handle for BeginLoopStop's first drain pass.
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  50 * time.Millisecond,
+		DrainTimeout: 3 * time.Second,
+	})
+	if err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Bind: %v", err)
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := reg.BeginLoopStop("loop-pending-wait", "looper stop")
+		stopDone <- err
+	}()
+
+	// Give BeginLoopStop time to set the gate and start waiting on spawnDone.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-stopDone:
+		t.Fatalf("BeginLoopStop returned early before BindHandle: %v", err)
+	default:
+	}
+
+	bindErr := lease.BindHandle(handle, func(string) error { return nil })
+	if !errors.Is(bindErr, agent.ErrSpawnStoppedDuringBind) {
+		t.Fatalf("BindHandle = %v, want ErrSpawnStoppedDuringBind", bindErr)
+	}
+	if !handle.ConfirmedDead() {
+		t.Fatal("pending spawn handle not confirmed-dead after refused BindHandle")
+	}
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("BeginLoopStop error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BeginLoopStop did not return after pending spawn window ended")
 	}
 }
 

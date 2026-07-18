@@ -96,11 +96,29 @@ type spawnLease struct {
 	handle   *processcontainment.Handle
 	softKill agent.SoftKillFunc
 
+	// spawnDone is closed when the lease leaves pending (BindHandle or Release).
+	// BeginLoopStop/BeginShutdown wait on it so stop cannot return while a
+	// process has been cmd.Start'd but is not yet bound/drained in the registry.
+	spawnDone     chan struct{}
+	spawnDoneOnce sync.Once
+
 	// rebinding is true between BeginRebind and RebindHandle/AbortRebind.
 	// BeginLoopStop/BeginShutdown wait on rebindDone so stop cannot return
 	// while native-resume fallback has a live process not yet in the registry.
 	rebinding  bool
 	rebindDone chan struct{}
+}
+
+// closeSpawnDone marks the pending-spawn window finished. Safe to call multiple times.
+func (l *spawnLease) closeSpawnDone() {
+	if l == nil {
+		return
+	}
+	l.spawnDoneOnce.Do(func() {
+		if l.spawnDone != nil {
+			close(l.spawnDone)
+		}
+	})
 }
 
 func (l *spawnLease) Context() context.Context {
@@ -139,10 +157,14 @@ func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agen
 	}
 	if closing || stopping {
 		// Linearize stop-vs-bind: drop pending, kill+drain before Start returns success.
+		// Close spawnDone only after confirmed drain so BeginLoopStop cannot
+		// unblock while the just-started process is still live.
 		delete(r.pending, l.id)
 		r.mu.Unlock()
 		l.cancel(errors.New(reason))
-		return l.killUnowned(handle, agent.ErrSpawnStoppedDuringBind)
+		err := l.killUnowned(handle, agent.ErrSpawnStoppedDuringBind)
+		l.closeSpawnDone()
+		return err
 	}
 
 	key := activeExecutionKey(l.meta.LoopID, l.meta.RunID, l.meta.ExecutionID)
@@ -162,6 +184,7 @@ func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agen
 	// cancel x.lease.Context() and block native-resume fallback re-spawn.
 	r.active[l.id] = l
 	delete(r.pending, l.id)
+	l.closeSpawnDone()
 	r.mu.Unlock()
 	return nil
 }
@@ -310,12 +333,14 @@ func (l *spawnLease) Release() {
 	l.cancel(nil)
 	r := l.registry
 	if r == nil {
+		l.closeSpawnDone()
 		return
 	}
 	r.mu.Lock()
 	l.endRebindLocked()
 	delete(r.pending, l.id)
 	delete(r.active, l.id)
+	l.closeSpawnDone()
 	key := activeExecutionKey(l.meta.LoopID, l.meta.RunID, l.meta.ExecutionID)
 	if entry, ok := r.executions[key]; ok {
 		// Only drop if this lease still owns the entry (handle identity).
@@ -373,11 +398,12 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	id := r.nextLeaseID
 	leaseCtx, cancel := context.WithCancelCause(ctx)
 	lease := &spawnLease{
-		registry: r,
-		id:       id,
-		meta:     meta,
-		ctx:      leaseCtx,
-		cancel:   cancel,
+		registry:  r,
+		id:        id,
+		meta:      meta,
+		ctx:       leaseCtx,
+		cancel:    cancel,
+		spawnDone: make(chan struct{}),
 	}
 	r.pending[id] = lease
 	r.mu.Unlock()
@@ -408,6 +434,10 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 // For terminal close abort paths (before durable terminate), callers should
 // invoke the returned release so a still-running loop can AdmitSpawn again.
 //
+// Pending spawn windows (AdmitSpawn through BindHandle/Release) and native
+// rebind windows are waited with the same handshake before stop returns, so a
+// just-started process cannot outlive the stop response without confirmed drain.
+//
 // The returned release is also used in tests and temporary windows.
 func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release func(), err error) {
 	if r == nil {
@@ -416,10 +446,16 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
 	toCancel := make([]*spawnLease, 0)
+	// spawnWait covers Start→BindHandle for still-pending leases.
+	// rebindWait covers native-resume fallback Start→RebindHandle.
+	spawnWait := make([]<-chan struct{}, 0)
 	rebindWait := make([]<-chan struct{}, 0)
 	for _, lease := range r.pending {
 		if lease.meta.LoopID == loopID {
 			toCancel = append(toCancel, lease)
+			if lease.spawnDone != nil {
+				spawnWait = append(spawnWait, lease.spawnDone)
+			}
 			if lease.rebinding && lease.rebindDone != nil {
 				rebindWait = append(rebindWait, lease.rebindDone)
 			}
@@ -461,11 +497,14 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 			drainErr = errors.Join(drainErr, killErr)
 		}
 	}
-	// Wait for native-resume fallback rebind windows that admitted before we
-	// set stopping. RebindHandle will refuse+kill once it sees the gate; we
-	// must not return until that window ends and re-drain any published handle.
+	// Wait for pending Start→BindHandle and rebind windows that began before we
+	// set stopping. BindHandle/RebindHandle refuse+kill once they see the gate;
+	// we must not return until those windows end and re-drain any published handle.
 	budget := r.killBudget()
-	for _, done := range rebindWait {
+	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait))
+	waitChans = append(waitChans, spawnWait...)
+	waitChans = append(waitChans, rebindWait...)
+	for _, done := range waitChans {
 		if done == nil {
 			continue
 		}
@@ -474,7 +513,7 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 		case <-time.After(budget):
 		}
 	}
-	if len(rebindWait) > 0 {
+	if len(waitChans) > 0 {
 		r.mu.Lock()
 		second := make([]*ownedExecution, 0)
 		for _, entry := range r.executions {
@@ -514,6 +553,20 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) {
 	r.mu.Unlock()
 }
 
+// RestoreLoopStop re-closes spawn admission after a failed intentional
+// reactivation that already called ClearLoopStop. Does not cancel leases or
+// drain handles — only restores the sticky AdmitSpawn gate.
+func (r *ActiveExecutionRegistry) RestoreLoopStop(loopID string) {
+	if r == nil || loopID == "" {
+		return
+	}
+	r.mu.Lock()
+	if r.stoppingLoops[loopID] == 0 {
+		r.stoppingLoops[loopID] = 1
+	}
+	r.mu.Unlock()
+}
+
 // LoopStopActive reports whether spawn admission is closed for loopID.
 func (r *ActiveExecutionRegistry) LoopStopActive(loopID string) bool {
 	if r == nil || loopID == "" {
@@ -537,9 +590,13 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		r.shutdownReason = reason
 	}
 	toCancel := make([]*spawnLease, 0, len(r.pending)+len(r.active))
+	spawnWait := make([]<-chan struct{}, 0)
 	rebindWait := make([]<-chan struct{}, 0)
 	for _, lease := range r.pending {
 		toCancel = append(toCancel, lease)
+		if lease.spawnDone != nil {
+			spawnWait = append(spawnWait, lease.spawnDone)
+		}
 		if lease.rebinding && lease.rebindDone != nil {
 			rebindWait = append(rebindWait, lease.rebindDone)
 		}
@@ -567,7 +624,10 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		_ = r.killOwned(entry, reason)
 	}
 	budget := r.killBudget()
-	for _, done := range rebindWait {
+	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait))
+	waitChans = append(waitChans, spawnWait...)
+	waitChans = append(waitChans, rebindWait...)
+	for _, done := range waitChans {
 		if done == nil {
 			continue
 		}
@@ -576,7 +636,7 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		case <-time.After(budget):
 		}
 	}
-	if len(rebindWait) > 0 {
+	if len(waitChans) > 0 {
 		r.mu.Lock()
 		second := make([]*ownedExecution, 0, len(r.executions))
 		for _, entry := range r.executions {
