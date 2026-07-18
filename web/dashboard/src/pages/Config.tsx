@@ -36,6 +36,7 @@ import {
   isCuratedAgentIdentityPath,
   isRoleAgentLeafPath,
   isValidAgentProfileId,
+  profileLeafUnsetWouldEmpty,
   type ConfigDraft,
   type ConfigFieldKind,
   type ConfigGroup,
@@ -452,6 +453,24 @@ function AgentProfiles({
               modelUnset ||
               published?.model != null);
 
+          // Last remaining identity leaf (or both) must remove the profile —
+          // leaf-only unsets leave agent.profiles.<id>={} which the daemon rejects.
+          const toggleProfileLeafUnset = (field: "vendor" | "model") => {
+            const path = agentProfilePath(id, field);
+            if (unsetPaths.has(path)) {
+              onToggleUnset(path);
+              return;
+            }
+            if (
+              exists &&
+              profileLeafUnsetWouldEmpty(data, drafts, unsetPaths, id, field)
+            ) {
+              onRemoveProfile(id, true);
+              return;
+            }
+            onToggleUnset(path);
+          };
+
           return (
             <div
               key={id}
@@ -531,9 +550,18 @@ function AgentProfiles({
                         title={
                           vendorUnset
                             ? "Keep the current file value"
-                            : "Remove this value from the config file (inherit)"
+                            : exists &&
+                                profileLeafUnsetWouldEmpty(
+                                  data,
+                                  drafts,
+                                  unsetPaths,
+                                  id,
+                                  "vendor",
+                                )
+                              ? "Remove profile (last identity leaf)"
+                              : "Remove this value from the config file (inherit)"
                         }
-                        onClick={() => onToggleUnset(vendorPath)}
+                        onClick={() => toggleProfileLeafUnset("vendor")}
                       >
                         {vendorUnset ? "Undo" : "Unset"}
                       </Button>
@@ -561,8 +589,9 @@ function AgentProfiles({
                           const next = event.currentTarget.value;
                           // Clearing the field unsets the leaf (inherit). Empty
                           // string suppress is not staged from this control.
+                          // Last remaining leaf promotes to whole-profile remove.
                           if (next === "" && published?.model != null) {
-                            if (!modelUnset) onToggleUnset(modelPath);
+                            if (!modelUnset) toggleProfileLeafUnset("model");
                             return;
                           }
                           onDraft(modelPath, next);
@@ -583,9 +612,18 @@ function AgentProfiles({
                         title={
                           modelUnset
                             ? "Keep the current file value"
-                            : "Remove this value from the config file (inherit)"
+                            : exists &&
+                                profileLeafUnsetWouldEmpty(
+                                  data,
+                                  drafts,
+                                  unsetPaths,
+                                  id,
+                                  "model",
+                                )
+                              ? "Remove profile (last identity leaf)"
+                              : "Remove this value from the config file (inherit)"
                         }
-                        onClick={() => onToggleUnset(modelPath)}
+                        onClick={() => toggleProfileLeafUnset("model")}
                       >
                         {modelUnset ? "Undo" : "Unset"}
                       </Button>

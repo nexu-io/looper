@@ -386,6 +386,89 @@ function valuesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/**
+ * True when a non-empty identity leaf would remain after applying set/unset.
+ * Empty string and nullish values do not count as present.
+ */
+function profileLeafPresentAfterPatch(
+  data: ConfigData,
+  set: Record<string, ConfigValue>,
+  unset: Set<string>,
+  profileId: string,
+  field: "vendor" | "model",
+): boolean {
+  const wholePath = `agent.profiles.${profileId}`;
+  if (unset.has(wholePath)) return false;
+  const path = agentProfilePath(profileId, field);
+  if (unset.has(path)) return false;
+  if (Object.hasOwn(set, path)) {
+    const value = set[path];
+    return value != null && value !== "";
+  }
+  const current = getConfigValue(data, path);
+  return current != null && current !== "";
+}
+
+/**
+ * Backend validateAgentProfiles rejects agent.profiles.<id> = {}. Promote leaf
+ * unsets that would empty a published profile into whole-profile removal, and
+ * drop leaf ops for unpublished empty profiles so the patch never stages {}.
+ */
+function collapseEmptyProfileLeafOps(
+  data: ConfigData,
+  set: Record<string, ConfigValue>,
+  unset: Set<string>,
+): void {
+  const profileIds = new Set<string>();
+  for (const path of unset) {
+    const whole = /^agent\.profiles\.([A-Za-z0-9_-]+)$/.exec(path);
+    if (whole) profileIds.add(whole[1]);
+    const leaf = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model)$/.exec(path);
+    if (leaf) profileIds.add(leaf[1]);
+  }
+  for (const path of Object.keys(set)) {
+    const leaf = /^agent\.profiles\.([A-Za-z0-9_-]+)\.(vendor|model)$/.exec(path);
+    if (leaf) profileIds.add(leaf[1]);
+  }
+  for (const id of profileIds) {
+    const wholePath = `agent.profiles.${id}`;
+    const vendorPath = agentProfilePath(id, "vendor");
+    const modelPath = agentProfilePath(id, "model");
+    if (unset.has(wholePath)) {
+      unset.delete(vendorPath);
+      unset.delete(modelPath);
+      delete set[vendorPath];
+      delete set[modelPath];
+      continue;
+    }
+    const hasVendor = profileLeafPresentAfterPatch(
+      data,
+      set,
+      unset,
+      id,
+      "vendor",
+    );
+    const hasModel = profileLeafPresentAfterPatch(
+      data,
+      set,
+      unset,
+      id,
+      "model",
+    );
+    if (hasVendor || hasModel) continue;
+
+    const published = data.agent?.profiles?.[id];
+    const profileExists = published != null && typeof published === "object";
+    unset.delete(vendorPath);
+    unset.delete(modelPath);
+    delete set[vendorPath];
+    delete set[modelPath];
+    if (profileExists) {
+      unset.add(wholePath);
+    }
+  }
+}
+
 export function buildConfigPatch(
   data: ConfigData,
   drafts: Record<string, ConfigDraft>,
@@ -427,10 +510,45 @@ export function buildConfigPatch(
     if (!unset.has(path)) set[path] = value;
   }
 
+  // Avoid agent.profiles.<id>={} which validateAgentProfiles rejects.
+  collapseEmptyProfileLeafOps(data, set, unset);
+
   return {
     body: { revision: data.metadata.revision, set, unset: [...unset].sort() },
     errors,
   };
+}
+
+/**
+ * Whether unsetting (or clearing) this profile leaf would leave the profile
+ * with no vendor and no model. Used by the dashboard to promote last-leaf
+ * unsets to whole-profile removal instead of staging a doomed empty object.
+ */
+export function profileLeafUnsetWouldEmpty(
+  data: ConfigData,
+  drafts: Record<string, ConfigDraft>,
+  unsetPaths: Iterable<string>,
+  profileId: string,
+  field: "vendor" | "model",
+): boolean {
+  const wholePath = `agent.profiles.${profileId}`;
+  const unset = new Set(unsetPaths);
+  if (unset.has(wholePath)) return false;
+
+  const otherField: "vendor" | "model" =
+    field === "vendor" ? "model" : "vendor";
+  const otherPath = agentProfilePath(profileId, otherField);
+  if (unset.has(otherPath)) return true;
+
+  if (Object.hasOwn(drafts, otherPath)) {
+    const draft = drafts[otherPath];
+    return String(draft ?? "").trim() === "";
+  }
+  const otherCurrent = getConfigValue(
+    data,
+    agentProfilePath(profileId, otherField),
+  );
+  return otherCurrent == null || otherCurrent === "";
 }
 
 export type HighImpactChange = { path: string; label: string };

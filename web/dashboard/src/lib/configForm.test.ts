@@ -184,6 +184,7 @@ describe("config form contract", () => {
     const result = buildConfigPatch(
       data,
       {
+        // Leaf set on a whole-profile unset is dropped (removal wins).
         "agent.profiles.fast.model": "gpt-5",
         "agent.profiles.cheap.vendor": "opencode",
         "roles.worker.agent.profile": "cheap",
@@ -193,7 +194,6 @@ describe("config form contract", () => {
     );
     expect(result.errors).toEqual({});
     expect(result.body.set).toEqual({
-      "agent.profiles.fast.model": "gpt-5",
       "agent.profiles.cheap.vendor": "opencode",
       "roles.worker.agent.profile": "cheap",
       "roles.planner.agent.model": "o3",
@@ -325,6 +325,43 @@ describe("config form contract", () => {
       "agent.profiles.fast.model",
       "roles.worker.agent.model",
     ]);
+  });
+
+  it("promotes dual profile leaf unsets to whole-profile removal", () => {
+    const data = fixture();
+    const result = buildConfigPatch(
+      data,
+      {},
+      ["agent.profiles.fast.vendor", "agent.profiles.fast.model"],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual(["agent.profiles.fast"]);
+  });
+
+  it("promotes unsetting the only published profile leaf to whole-profile removal", () => {
+    const data = fixture();
+    data.agent.profiles = { cheap: { vendor: "opencode" } };
+    const result = buildConfigPatch(
+      data,
+      {},
+      ["agent.profiles.cheap.vendor"],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual(["agent.profiles.cheap"]);
+  });
+
+  it("keeps a single profile leaf unset when the other identity remains", () => {
+    const data = fixture();
+    const result = buildConfigPatch(
+      data,
+      {},
+      ["agent.profiles.fast.model"],
+    );
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual(["agent.profiles.fast.model"]);
   });
 
   it("confirms automatic commit only when the change can enable it", () => {

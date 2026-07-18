@@ -846,7 +846,62 @@ describe("ConfigPage", () => {
     });
   });
 
-  it("unsets profile vendor and model leaves independently", async () => {
+  it("promotes unsetting both profile leaves to whole-profile removal", async () => {
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    // First leaf unset stays leaf-level while the other identity remains.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unset agent.profiles.fast.model" }),
+    );
+    // Last remaining leaf promotes to whole-profile removal (avoids empty {}).
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unset agent.profiles.fast.vendor" }),
+    );
+    // Profile shows as pending removal, not dual leaf unsets.
+    expect(screen.getByText("undo remove")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    // Unreferenced whole-profile remove is not high-impact; PATCH immediately.
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({});
+    expect(body.unset).toEqual(["agent.profiles.fast"]);
+  });
+
+  it("unsets a single profile model leaf without removing the profile", async () => {
     const initial = configFixture({
       agent: {
         vendor: "codex",
@@ -880,17 +935,7 @@ describe("ConfigPage", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Unset agent.profiles.fast.model" }),
     );
-    fireEvent.click(
-      screen.getByRole("button", { name: "Unset agent.profiles.fast.vendor" }),
-    );
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-
-    // Profile vendor unset is high-impact; confirm before PATCH.
-    const dialog = await screen.findByRole("dialog", {
-      name: "Confirm high-impact configuration",
-    });
-    expect(dialog.textContent).toMatch(/profiles.*fast.*vendor/i);
-    fireEvent.click(screen.getByRole("button", { name: "Apply changes" }));
 
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
@@ -900,10 +945,7 @@ describe("ConfigPage", () => {
     const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
     const body = JSON.parse(String(patchCall?.[1]?.body));
     expect(body.set).toEqual({});
-    expect(body.unset).toEqual([
-      "agent.profiles.fast.model",
-      "agent.profiles.fast.vendor",
-    ]);
+    expect(body.unset).toEqual(["agent.profiles.fast.model"]);
   });
 
   it("keeps staged profile leaf edits when rebasing after a conflict", async () => {
