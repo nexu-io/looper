@@ -1030,9 +1030,15 @@ func stopCandidateExecution(ctx context.Context, services looperdruntime.Service
 		result.RunID = candidate.Run.ID
 	}
 	if services.ActiveExecutions != nil && runID != "" {
-		// Close loop spawn admission so a concurrent Start cannot return unowned.
-		// Keep closed after return (same sticky stop gate as haltLoop).
-		_ = services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
+		// Close loop spawn admission only for the kill window so a concurrent
+		// Start cannot return unowned. Always release on return: this helper
+		// does not perform durable pause/terminate. When haltLoop already kept
+		// a sticky gate (successful pause), BeginLoopStop is refcounted so our
+		// release leaves that sticky gate in place. When stopAll falls back
+		// here after a Pause failure, releasing reopens AdmitSpawn for the
+		// still-running loop (ClearLoopStop would never run otherwise).
+		releaseLoopStop := services.ActiveExecutions.BeginLoopStop(candidate.Loop.ID, reason)
+		defer releaseLoopStop()
 		killed, err := services.ActiveExecutions.Kill(candidate.Loop.ID, runID, candidate.Execution.ID, reason)
 		if err != nil {
 			return result, err
