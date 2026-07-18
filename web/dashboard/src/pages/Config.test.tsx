@@ -901,6 +901,78 @@ describe("ConfigPage", () => {
     expect(body.unset).toEqual(["agent.profiles.fast"]);
   });
 
+  it("does not retain omitted profile leaves when re-adding after remove", async () => {
+    // remove+recreate with only vendor must unset the old model rather than
+    // restoring the whole profile and silently keeping the previous model leaf.
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Remove profile fast" }));
+    expect(screen.getByText("undo remove")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("New profile id"), {
+      target: { value: "fast" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    // Vendor change is high-impact (resolved-vendor companion guard).
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({ "agent.profiles.fast.vendor": "opencode" });
+    expect(body.unset).toEqual(["agent.profiles.fast.model"]);
+    expect(body.unset).not.toContain("agent.profiles.fast");
+  });
+
   it("unsets a single profile model leaf without removing the profile", async () => {
     const initial = configFixture({
       agent: {

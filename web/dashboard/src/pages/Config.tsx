@@ -378,12 +378,26 @@ function AgentProfiles({
       setLocalError("Set at least vendor or model for the profile.");
       return;
     }
-    // Clear whole-profile unset if re-adding after remove.
-    if (unsetPaths.has(`agent.profiles.${id}`)) {
+    // Clear whole-profile unset if re-adding after remove. Then stage only the
+    // form leaves and unset any omitted published leaf so remove+recreate does
+    // not silently keep the previous vendor/model.
+    const reAddingAfterRemove = unsetPaths.has(`agent.profiles.${id}`);
+    if (reAddingAfterRemove) {
       onUndoRemoveProfile(id);
     }
-    if (vendor) onDraft(agentProfilePath(id, "vendor"), vendor);
-    if (model) onDraft(agentProfilePath(id, "model"), model);
+    const vendorPath = agentProfilePath(id, "vendor");
+    const modelPath = agentProfilePath(id, "model");
+    if (vendor) onDraft(vendorPath, vendor);
+    if (model) onDraft(modelPath, model);
+    if (reAddingAfterRemove) {
+      const published = data.agent?.profiles?.[id];
+      if (!vendor && published?.vendor != null && String(published.vendor) !== "") {
+        onToggleUnset(vendorPath);
+      }
+      if (!model && published?.model != null && String(published.model) !== "") {
+        onToggleUnset(modelPath);
+      }
+    }
     setNewId("");
     setNewVendor("");
     setNewModel("");
