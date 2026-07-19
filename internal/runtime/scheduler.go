@@ -4094,15 +4094,34 @@ func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerT
 	return found, nil
 }
 
+// cancelledClaimFinalizeTimeout bounds MarkRetryIfRunning/GetByID after a
+// stop/bind refuse. Finalize must detach the caller cancel/deadline (shutdown
+// or a timed tick can still require durable requeue) without hanging forever if
+// SQLite is blocked while the operation lease remains pending.
+const cancelledClaimFinalizeTimeout = 5 * time.Second
+
+// newCancelledClaimFinalizeContext returns a cancel-detached context with a
+// fresh timeout. Parent values are preserved when parent is non-nil; cancel and
+// deadline from the parent are not inherited.
+func newCancelledClaimFinalizeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, cancelledClaimFinalizeTimeout)
+}
+
 // finalizeCancelledClaim durable-requeues a claim that cannot start because the
 // operation lease was cancelled (stop/bind race). Keeps the claim out of the
 // stranded running state without starting a processor.
 //
-// Uses a cancellation-detached context: Runtime.BeginShutdown cancels the
-// scheduler context before the registry drain, so a bind refused after ClaimNext*
-// must still requeue under retained ownership (same pattern as
-// dispatchOwnedQueueClaims). Passing the cancelled scheduler ctx would make
-// MarkRetry fail immediately, report hard persist failure, and strand the claim.
+// Uses a cancellation-detached, time-bounded context: Runtime.BeginShutdown
+// cancels the scheduler context before the registry drain, so a bind refused
+// after ClaimNext* must still requeue under retained ownership (same pattern as
+// dispatchOwnedQueueClaims / ambiguous-claim recovery). Passing the cancelled
+// scheduler ctx would make MarkRetry fail immediately, report hard persist
+// failure, and strand the claim. WithoutCancel alone would drop a caller
+// deadline and wait indefinitely on blocked SQLite while the lease stays pending.
 //
 // Pause/terminal stop may CancelByLoop the claim to cancelled after ClaimNext*
 // and before BindClaim refuses. Use MarkRetryIfRunning so concurrent
@@ -4113,11 +4132,11 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return errors.New("queue repository is not configured for cancelled-claim finalize")
 	}
-	if ctx != nil {
-		ctx = context.WithoutCancel(ctx)
-	} else {
-		ctx = context.Background()
-	}
+	// Bound finalization: detach cancel/deadline then apply a fresh timeout so
+	// shutdown/timed ticks still requeue without unbounded DB waits under a
+	// retained operation lease.
+	ctx, cancel := newCancelledClaimFinalizeContext(ctx)
+	defer cancel()
 	if now == nil {
 		now = time.Now
 	}
