@@ -12,6 +12,40 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func TestAmbiguousClaimRecoveryContextIsBounded(t *testing.T) {
+	t.Parallel()
+
+	// Expired parent deadline must not become unbounded recovery, and must not
+	// leave recovery already cancelled.
+	parent, parentCancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer parentCancel()
+	time.Sleep(2 * time.Millisecond)
+	if parent.Err() == nil {
+		t.Fatal("parent context should already be expired")
+	}
+
+	recoverCtx, cancel := newAmbiguousClaimRecoveryContext(parent)
+	defer cancel()
+
+	deadline, ok := recoverCtx.Deadline()
+	if !ok {
+		t.Fatal("recovery context missing deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > ambiguousClaimRecoveryTimeout {
+		t.Fatalf("remaining = %v, want (0, %v]", remaining, ambiguousClaimRecoveryTimeout)
+	}
+	if err := recoverCtx.Err(); err != nil {
+		t.Fatalf("recovery ctx.Err() = %v, want nil despite expired parent", err)
+	}
+
+	nilParent, nilCancel := newAmbiguousClaimRecoveryContext(nil)
+	defer nilCancel()
+	if _, ok := nilParent.Deadline(); !ok {
+		t.Fatal("nil-parent recovery context missing deadline")
+	}
+}
+
 func TestRecoverAmbiguousCancelledClaimFindsUnownedRunning(t *testing.T) {
 	t.Parallel()
 

@@ -4027,6 +4027,23 @@ func claimErrorIsAmbiguousCancel(ctx context.Context, err error) bool {
 	return ctx != nil && ctx.Err() != nil
 }
 
+// ambiguousClaimRecoveryTimeout bounds ListRunningClaimedBy after ClaimNext
+// cancel/deadline. Recovery must detach the caller deadline (an expired tick can
+// still observe a committed claim) without hanging forever if SQLite is blocked
+// while the operation lease remains pending.
+const ambiguousClaimRecoveryTimeout = 5 * time.Second
+
+// newAmbiguousClaimRecoveryContext returns a cancel-detached context with a
+// fresh timeout. Parent values are preserved when parent is non-nil; cancel and
+// deadline from the parent are not inherited.
+func newAmbiguousClaimRecoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, ambiguousClaimRecoveryTimeout)
+}
+
 // recoverAmbiguousCancelledClaim looks up running claims made by the scheduler
 // at nowISO that are not already owned by this tick. Zero matches means the
 // cancel happened before any durable claim (safe to release). One match is the
@@ -4035,10 +4052,10 @@ func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerT
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return nil, errors.New("queue repository is not configured for ambiguous claim recovery")
 	}
-	recoverCtx := context.Background()
-	if ctx != nil {
-		recoverCtx = context.WithoutCancel(ctx)
-	}
+	// Bound recovery: WithoutCancel alone would wait indefinitely on blocked
+	// SQLite while the lease stays pending and shutdown times out retaining storage.
+	recoverCtx, cancel := newAmbiguousClaimRecoveryContext(ctx)
+	defer cancel()
 	items, err := input.Repos.Queue.ListRunningClaimedBy(recoverCtx, "scheduler", nowISO)
 	if err != nil {
 		return nil, err
