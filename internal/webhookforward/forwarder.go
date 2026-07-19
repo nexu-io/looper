@@ -45,6 +45,11 @@ type ForwardResult struct {
 	WorkItems int    `json:"workItems"`
 }
 
+// ErrAdmissionRefused is returned when AllowExecute refuses at Forward accept
+// time. HTTP and tunnel callers must map this to 503 SERVICE_UNAVAILABLE, not
+// 400 validation failure — temporary admission closed is not an invalid delivery.
+var ErrAdmissionRefused = errors.New("webhook forward admission refused")
+
 type Outcome struct {
 	At         string   `json:"at"`
 	ProjectID  string   `json:"projectId"`
@@ -297,10 +302,11 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	}
 	// Refuse new discovery enqueue while admission is closed. HTTP and tunnel
 	// listeners also project AllowMutations, but Forward is the shared enqueue
-	// boundary for both paths (#580).
+	// boundary for both paths (#580). Wrap as ErrAdmissionRefused so post-gate
+	// callers map temporary refusal to 503 rather than 400 validation.
 	if f.allowExecute != nil {
 		if err := f.allowExecute(); err != nil {
-			return ForwardResult{}, err
+			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
 		}
 	}
 	now := f.now().UTC()

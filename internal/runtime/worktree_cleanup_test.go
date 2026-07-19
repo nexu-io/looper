@@ -334,6 +334,11 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	}
 	t.Cleanup(func() { _ = coordinator.Close() })
 	rt := New(Options{Config: cfg, Now: func() time.Time { return now }, WorktreeCleanupInitialDelay: -1})
+	// Mid-pass AllowClaim rechecks require ready admission; unit tests exercise
+	// candidate mutations, not the starting-state no-op path.
+	if err := rt.admission.MarkReady("worktree cleanup fixture"); err != nil {
+		t.Fatalf("admission.MarkReady() error = %v", err)
+	}
 	return worktreeCleanupFixture{
 		runtime: rt,
 		config:  cfg,
@@ -341,6 +346,92 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 		project: project,
 		root:    worktreeRoot,
 		now:     now,
+	}
+}
+
+// Contract (#580 / review): MarkDegraded mid-pass must cancel remaining cleanup
+// mutations so no further worktree delete/record writes run after admission closes.
+func TestWorktreeCleanupPassCancelsWhenAdmissionClosesMidPass(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	// Stagger UpdatedAt so plan order is stable (older first).
+	first := fixture.seedWorktreeAt(t, "wt_first", "feature/first", true, fixture.now.Add(-2*time.Hour))
+	second := fixture.seedWorktreeAt(t, "wt_second", "feature/second", true, fixture.now.Add(-time.Hour))
+	byPath := map[string]string{first.WorktreePath: first.ID, second.WorktreePath: second.ID}
+	var cleaned []string
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
+			{Path: first.WorktreePath, Branch: first.Branch},
+			{Path: second.WorktreePath, Branch: second.Branch},
+		}},
+		clean: map[string]bool{first.WorktreePath: true, second.WorktreePath: true},
+		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
+			cleaned = append(cleaned, input.WorktreePath)
+			if len(cleaned) > 1 {
+				t.Fatalf("CleanupWorktree called for %q after admission degraded", input.WorktreePath)
+			}
+			if err := fixture.runtime.admission.MarkDegraded("mid-pass degrade"); err != nil {
+				t.Fatalf("MarkDegraded() error = %v", err)
+			}
+			id := byPath[input.WorktreePath]
+			updated, err := fixture.repos.Worktrees.GetByID(context.Background(), id)
+			if err != nil {
+				return err
+			}
+			nowISO := fixture.now.Format("2006-01-02T15:04:05.000Z")
+			updated.Status = "cleaned"
+			updated.CleanedAt = &nowISO
+			updated.UpdatedAt = nowISO
+			return fixture.repos.Worktrees.Upsert(context.Background(), *updated)
+		},
+	}
+
+	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+
+	if len(cleaned) != 1 {
+		t.Fatalf("cleaned paths = %#v, want exactly one candidate before cancel", cleaned)
+	}
+	if summary.Cleaned != 1 {
+		t.Fatalf("summary.Cleaned = %d, want 1", summary.Cleaned)
+	}
+	if !strings.Contains(summary.LastError, "degraded") {
+		t.Fatalf("summary.LastError = %q, want admission degraded", summary.LastError)
+	}
+	remainingID := second.ID
+	if cleaned[0] == second.WorktreePath {
+		remainingID = first.ID
+	}
+	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), remainingID)
+	if err != nil {
+		t.Fatalf("Worktrees.GetByID(remaining) error = %v", err)
+	}
+	if stored == nil || stored.Status != "active" {
+		t.Fatalf("remaining worktree = %#v, want still active after mid-pass cancel", stored)
+	}
+}
+
+// Contract: destructive CleanupWorktree is refused when admission closes after
+// eligibility checks but before the delete.
+func TestCleanWorktreeCandidateRefusesWhenAdmissionClosed(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_closed", "feature/closed", true)
+	if err := fixture.runtime.admission.MarkDegraded("before delete"); err != nil {
+		t.Fatalf("MarkDegraded() error = %v", err)
+	}
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {{Path: worktree.WorktreePath, Branch: worktree.Branch}}},
+		clean:  map[string]bool{worktree.WorktreePath: true},
+	}
+
+	result := fixture.runtime.cleanWorktreeCandidate(context.Background(), fixture.repos, git, fixture.config, fixture.project, worktree, fixture.root, "clean")
+	if result.status != "skipped" || !strings.Contains(result.message, "degraded") {
+		t.Fatalf("result = %#v, want skipped admission degraded", result)
+	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("cleanupCalls = %#v, want none while degraded", git.cleanupCalls)
 	}
 }
 

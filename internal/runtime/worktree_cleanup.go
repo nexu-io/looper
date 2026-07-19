@@ -200,25 +200,37 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	summary.Scanned = plan.Summary.Scanned
 	summary.Candidates = plan.Summary.Candidates
 
-	for _, decision := range plan.Decisions {
-		if ctx.Err() != nil {
-			summary.LastError = ctx.Err().Error()
-			break
-		}
-		if decision.Action != worktreecleanup.ActionWouldClean {
-			r.recordWorktreeCleanupPlanSkip(ctx, repos, decision.Worktree, decision.Reason)
-			summary.Skipped++
-			continue
-		}
-		result := r.cleanupWorktreeCandidate(ctx, repos, gitGateway, cfg, decision.Worktree)
-		switch result.status {
-		case "cleaned":
-			summary.Cleaned++
-		case "skipped":
-			summary.Skipped++
-		default:
-			summary.Failed++
-			summary.LastError = result.message
+	// Recheck after planning: MarkDegraded can close admission while Plan runs,
+	// and a pass that already started must not continue into candidate mutations.
+	if err := r.AllowClaim(); err != nil {
+		summary.LastError = err.Error()
+	} else {
+		for _, decision := range plan.Decisions {
+			if ctx.Err() != nil {
+				summary.LastError = ctx.Err().Error()
+				break
+			}
+			// Recheck before each candidate so degradation mid-pass cancels remaining
+			// worktree/record mutations instead of finishing the planned batch.
+			if err := r.AllowClaim(); err != nil {
+				summary.LastError = err.Error()
+				break
+			}
+			if decision.Action != worktreecleanup.ActionWouldClean {
+				r.recordWorktreeCleanupPlanSkip(ctx, repos, decision.Worktree, decision.Reason)
+				summary.Skipped++
+				continue
+			}
+			result := r.cleanupWorktreeCandidate(ctx, repos, gitGateway, cfg, decision.Worktree)
+			switch result.status {
+			case "cleaned":
+				summary.Cleaned++
+			case "skipped":
+				summary.Skipped++
+			default:
+				summary.Failed++
+				summary.LastError = result.message
+			}
 		}
 	}
 
@@ -247,6 +259,11 @@ type worktreeCleanupCandidateResult struct {
 }
 
 func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, candidate storage.WorktreeRecord) worktreeCleanupCandidateResult {
+	// Per-candidate gate: admission can close after the pass/loop recheck and
+	// before this candidate mutates records or deletes a checkout.
+	if err := r.AllowClaim(); err != nil {
+		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
+	}
 	current, err := repos.Worktrees.GetByID(ctx, candidate.ID)
 	if err != nil {
 		return r.recordWorktreeCleanupFailure(ctx, repos, candidate, err)
@@ -317,6 +334,12 @@ func (r *Runtime) recordWorktreeCleanupPlanSkip(ctx context.Context, repos *stor
 func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, project storage.ProjectRecord, candidate storage.WorktreeRecord, worktreeRoot, reason string) worktreeCleanupCandidateResult {
 	if cfg.Daemon.WorktreeCleanup.DryRun {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dry_run")
+	}
+	// Final recheck immediately before the destructive worktree delete so a
+	// MarkDegraded between eligibility checks and CleanupWorktree cannot delete
+	// while admission is closed.
+	if err := r.AllowClaim(); err != nil {
+		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
 	}
 	if err := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); err != nil {
 		return r.recordWorktreeCleanupFailure(ctx, repos, candidate, err)

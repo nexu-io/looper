@@ -43,8 +43,8 @@ func TestForwardRefusesWhenAllowExecuteClosedAtAccept(t *testing.T) {
 		EventType:  "pull_request",
 		Payload:    pullRequestPayload("opened", "acme/looper", 99),
 	})
-	if err == nil || !strings.Contains(err.Error(), "admission is stopping") {
-		t.Fatalf("Forward() error = %v, want admission refusal", err)
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "admission is stopping") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping admission refusal", err)
 	}
 	if executeCalls.Load() == 0 {
 		t.Fatal("AllowExecute was not consulted at Forward accept time")

@@ -1240,6 +1240,36 @@ func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.
 	}
 }
 
+// Contract (#580 / review): Forward post-gate admission refusal maps to 503
+// SERVICE_UNAVAILABLE, not 400 validation (temporary shutdown/degraded).
+func TestHandlerWebhookForwardMapsAdmissionRefusedTo503(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{err: webhookforward.ErrAdmissionRefused}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader([]byte(`{"action":"opened"}`)))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-GitHub-Delivery", "delivery-admission-refused")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s, want 503", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "SERVICE_UNAVAILABLE")
+	if forwarder.calls != 1 {
+		t.Fatalf("forwarder calls = %d, want 1", forwarder.calls)
+	}
+}
+
 func TestHandlerWebhookForwardRejectsNonLoopbackEvenWithBearerToken(t *testing.T) {
 	fixture := newTestFixture(t)
 	token := "secret-token"

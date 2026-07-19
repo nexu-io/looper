@@ -647,12 +647,19 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 		status := http.StatusBadRequest
 		code := pkgapi.ErrorCodeValidationFailed
 		message := err.Error()
-		lower := strings.ToLower(message)
-		if strings.Contains(lower, "not configured") {
-			status = http.StatusInternalServerError
-			code = pkgapi.ErrorCodeInternalError
-		} else if strings.Contains(lower, "queue is full") {
+		// Post-gate admission refusal (race after outer AllowMutations) is temporary
+		// unavailability, not a bad delivery payload.
+		if errors.Is(err, webhookforward.ErrAdmissionRefused) {
 			status = http.StatusServiceUnavailable
+			code = pkgapi.ErrorCodeServiceUnavailable
+		} else {
+			lower := strings.ToLower(message)
+			if strings.Contains(lower, "not configured") {
+				status = http.StatusInternalServerError
+				code = pkgapi.ErrorCodeInternalError
+			} else if strings.Contains(lower, "queue is full") {
+				status = http.StatusServiceUnavailable
+			}
 		}
 		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
 	}

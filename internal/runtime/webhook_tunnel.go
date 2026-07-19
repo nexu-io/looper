@@ -442,7 +442,13 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	result, err := forwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Post-gate admission refusal (race after allowTunnelForward) is temporary
+		// unavailability; do not treat as an invalid delivery (400).
+		status := http.StatusBadRequest
+		if errors.Is(err, webhookforward.ErrAdmissionRefused) {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	if strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0 {
