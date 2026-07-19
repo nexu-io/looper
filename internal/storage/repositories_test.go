@@ -1563,7 +1563,7 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 		t.Fatalf("Queue.GetByID(qi_retry) after markRetry = %#v, want queued attempts=2 unclaimed", gotRetry)
 	}
 
-	// MarkRetry must not resurrect a terminal cancellation (status-guarded on running).
+	// MarkRetryIfRunning must not resurrect a terminal cancellation.
 	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
 		ID:          "qi_retry_cancelled",
 		LoopID:      &loopID,
@@ -1581,15 +1581,26 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Queue.Upsert(qi_retry_cancelled) error = %v", err)
 	}
-	if err := repos.Queue.MarkRetry(ctx, QueueMarkRetryInput{ID: "qi_retry_cancelled", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
-		t.Fatalf("Queue.MarkRetry(cancelled) error = %v", err)
+	if err := repos.Queue.MarkRetryIfRunning(ctx, QueueMarkRetryInput{ID: "qi_retry_cancelled", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
+		t.Fatalf("Queue.MarkRetryIfRunning(cancelled) error = %v", err)
 	}
 	gotCancelled, err := repos.Queue.GetByID(ctx, "qi_retry_cancelled")
 	if err != nil {
 		t.Fatalf("Queue.GetByID(qi_retry_cancelled) error = %v", err)
 	}
 	if gotCancelled == nil || gotCancelled.Status != "cancelled" {
-		t.Fatalf("Queue.MarkRetry on cancelled = %#v, want status still cancelled (zero-row no-op)", gotCancelled)
+		t.Fatalf("Queue.MarkRetryIfRunning on cancelled = %#v, want status still cancelled (zero-row no-op)", gotCancelled)
+	}
+	// Unrestricted MarkRetry remains runner authority: may requeue after mid-run pause cancel.
+	if err := repos.Queue.MarkRetry(ctx, QueueMarkRetryInput{ID: "qi_retry_cancelled", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
+		t.Fatalf("Queue.MarkRetry(cancelled) error = %v", err)
+	}
+	gotResurrected, err := repos.Queue.GetByID(ctx, "qi_retry_cancelled")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_retry_cancelled) after MarkRetry error = %v", err)
+	}
+	if gotResurrected == nil || gotResurrected.Status != "queued" || gotResurrected.Attempts != 2 {
+		t.Fatalf("Queue.MarkRetry on cancelled = %#v, want queued attempts=2", gotResurrected)
 	}
 
 	finished := "2026-04-11T12:06:00.000Z"

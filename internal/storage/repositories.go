@@ -1920,9 +1920,38 @@ func (r *QueueRepository) UpdateLockKey(ctx context.Context, id, lockKey, update
 }
 
 func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInput) error {
-	// Status-guarded: only requeue a live running claim. Concurrent CancelByLoop
-	// (or Complete/Fail) that already left running yields zero rows and is a
-	// no-op success so terminal cancellation is never resurrected to queued.
+	// Runner authority after processing: may requeue even when concurrent pause
+	// CancelByLoop already terminalized the claim mid-run (resume later). Do not
+	// status-guard here — stop/bind refuse uses MarkRetryIfRunning instead.
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			attempts = ?,
+			last_error = ?,
+			last_error_kind = ?,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			finished_at = NULL,
+			updated_at = ?
+		WHERE id = ?
+			AND NOT EXISTS (
+				SELECT 1
+				FROM projects p
+				WHERE p.id = queue_items.project_id AND p.archived = 1
+			)
+	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
+	if err != nil {
+		return fmt.Errorf("mark queue item for retry: %w", err)
+	}
+
+	return nil
+}
+
+// MarkRetryIfRunning requeues only while status is still running. Zero rows
+// (already cancelled/completed/failed) is a no-op success so stop/bind refuse
+// cannot resurrect terminal cancellation. Prefer MarkRetry for runner finalize.
+func (r *QueueRepository) MarkRetryIfRunning(ctx context.Context, input QueueMarkRetryInput) error {
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = 'queued',
@@ -1943,7 +1972,7 @@ func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInp
 			)
 	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
-		return fmt.Errorf("mark queue item for retry: %w", err)
+		return fmt.Errorf("mark queue item for retry if running: %w", err)
 	}
 
 	return nil

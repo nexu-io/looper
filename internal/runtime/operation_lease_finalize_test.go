@@ -157,12 +157,8 @@ func TestFinalizeCancelledClaimUsesDetachedContext(t *testing.T) {
 }
 
 // Contract: when CancelByLoop terminalizes a claim after ClaimNext* and before
-// BindClaim refuse handling, finalizeCancelledClaim must not MarkRetry the
-// cancelled row back to queued (stop must not resurrect cancelled work).
-
-// Contract: when CancelByLoop terminalizes a claim after ClaimNext* and before
-// BindClaim refuse handling, finalizeCancelledClaim's status-guarded MarkRetry
-// must no-op (zero rows) and leave the row cancelled — stop must not resurrect
+// BindClaim refuse handling, finalizeCancelledClaim's MarkRetryIfRunning must
+// no-op (zero rows) and leave the row cancelled — stop must not resurrect
 // cancelled work even if a pre-read would have raced.
 func TestFinalizeCancelledClaimPreservesExternalCancellation(t *testing.T) {
 	t.Parallel()

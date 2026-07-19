@@ -3992,9 +3992,10 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 // MarkRetry fail immediately, report hard persist failure, and strand the claim.
 //
 // Pause/terminal stop may CancelByLoop the claim to cancelled after ClaimNext*
-// and before BindClaim refuses. MarkRetry is status-guarded on running, so a
-// concurrent terminalization yields a zero-row no-op treated as durable success
-// (stop must not resurrect cancelled work).
+// and before BindClaim refuses. Use MarkRetryIfRunning so concurrent
+// terminalization yields a zero-row no-op treated as durable success (stop must
+// not resurrect cancelled work). Unrestricted MarkRetry is reserved for runner
+// finalize after processing, which may requeue after mid-run pause cancel.
 func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return errors.New("queue repository is not configured for cancelled-claim finalize")
@@ -4011,7 +4012,7 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 	msg := "operation lease cancelled before queue processor start"
 	// Atomic status-guarded requeue: only updates while still running. Zero rows
 	// (already cancelled/completed/failed) is success — do not resurrect.
-	if err := input.Repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{
+	if err := input.Repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{
 		ID:           item.ID,
 		AvailableAt:  nowISO,
 		Attempts:     item.Attempts,
@@ -4021,7 +4022,7 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 	}); err != nil {
 		return err
 	}
-	// Verify durable observation: still-running after guarded MarkRetry means
+	// Verify durable observation: still-running after guarded requeue means
 	// the write did not take effect (e.g. archived project) and ownership must
 	// not pretend finalize succeeded.
 	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
