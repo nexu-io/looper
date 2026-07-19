@@ -362,14 +362,14 @@ func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.R
 }
 
 // recordWorktreeCleanupPlanSkip writes a durable skip event only while admission
-// still allows claims. Returns the admission error when closed so callers stop
-// without counting a skip that was never recorded.
+// still allows claims. Hold WithAllowClaim across the append so MarkDegraded
+// cannot close admission between a point-in-time AllowClaim and the event write.
+// Returns the admission error when closed so callers stop without counting a
+// skip that was never recorded.
 func (r *Runtime) recordWorktreeCleanupPlanSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) error {
-	if err := r.AllowClaim(); err != nil {
-		return err
-	}
-	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.skipped", &candidate, map[string]any{"reason": reason})
-	return nil
+	return r.WithAllowClaim(func() {
+		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.skipped", &candidate, map[string]any{"reason": reason})
+	})
 }
 
 func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, project storage.ProjectRecord, candidate storage.WorktreeRecord, worktreeRoot, reason string) worktreeCleanupCandidateResult {
@@ -386,7 +386,9 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	var result worktreeCleanupCandidateResult
 	err := r.WithAllowClaim(func() {
 		if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); cleanErr != nil {
-			result = r.recordWorktreeCleanupFailure(ctx, repos, candidate, cleanErr)
+			// Already holding admission — use the unlocked write helper to avoid
+			// re-entering WithAllowClaim (would deadlock on admission.mu).
+			result = r.writeWorktreeCleanupFailure(ctx, repos, candidate, cleanErr)
 			return
 		}
 		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.cleaned", &candidate, map[string]any{"reason": reason})
@@ -398,7 +400,21 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	return result
 }
 
+// recordWorktreeCleanupSkip holds admission across the worktrees touch and skip
+// event so degradation after eligibility checks cannot commit durable cleanup
+// mutations after close. Callers that already hold WithAllowClaim must use
+// writeWorktreeCleanupSkip instead.
 func (r *Runtime) recordWorktreeCleanupSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) worktreeCleanupCandidateResult {
+	var result worktreeCleanupCandidateResult
+	if err := r.WithAllowClaim(func() {
+		result = r.writeWorktreeCleanupSkip(ctx, repos, candidate, reason)
+	}); err != nil {
+		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
+	}
+	return result
+}
+
+func (r *Runtime) writeWorktreeCleanupSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) worktreeCleanupCandidateResult {
 	if err := r.touchWorktreeCleanupAttempt(ctx, repos, candidate); err != nil {
 		message := err.Error()
 		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.failed", &candidate, map[string]any{"message": message})
@@ -408,8 +424,21 @@ func (r *Runtime) recordWorktreeCleanupSkip(ctx context.Context, repos *storage.
 	return worktreeCleanupCandidateResult{status: "skipped", message: reason}
 }
 
-func (r *Runtime) recordWorktreeCleanupFailure(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, err error) worktreeCleanupCandidateResult {
-	message := err.Error()
+// recordWorktreeCleanupFailure holds admission across the worktrees touch and
+// failure event (same write-boundary contract as recordWorktreeCleanupSkip).
+// Callers already inside WithAllowClaim must use writeWorktreeCleanupFailure.
+func (r *Runtime) recordWorktreeCleanupFailure(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, cause error) worktreeCleanupCandidateResult {
+	var result worktreeCleanupCandidateResult
+	if err := r.WithAllowClaim(func() {
+		result = r.writeWorktreeCleanupFailure(ctx, repos, candidate, cause)
+	}); err != nil {
+		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
+	}
+	return result
+}
+
+func (r *Runtime) writeWorktreeCleanupFailure(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, cause error) worktreeCleanupCandidateResult {
+	message := cause.Error()
 	if touchErr := r.touchWorktreeCleanupAttempt(ctx, repos, candidate); touchErr != nil {
 		message = message + "; " + touchErr.Error()
 	}

@@ -612,6 +612,61 @@ func TestCleanWorktreeCandidateRefusesWhenAdmissionClosed(t *testing.T) {
 	}
 }
 
+// Contract (#580 review): plan-skip event append is under WithAllowClaim so a
+// closed admission cannot persist worktree.cleanup.skipped after close.
+func TestWorktreeCleanupPlanSkipHoldsAdmission(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_plan_skip", "feature/plan-skip", true)
+	if err := fixture.runtime.admission.MarkDegraded("before plan skip"); err != nil {
+		t.Fatalf("MarkDegraded() error = %v", err)
+	}
+
+	err := fixture.runtime.recordWorktreeCleanupPlanSkip(context.Background(), fixture.repos, worktree, "below_min_age")
+	if !errors.Is(err, ErrAdmissionDegraded) {
+		t.Fatalf("recordWorktreeCleanupPlanSkip() = %v, want ErrAdmissionDegraded", err)
+	}
+	events := fixture.events(t)
+	if containsWorktreeCleanupEvent(events, "worktree.cleanup.skipped") {
+		t.Fatalf("events = %#v, want no skip event when admission closed at write boundary", events)
+	}
+}
+
+// Contract (#580 review): candidate skip/failure record helpers hold admission
+// across worktrees touch + event append so degradation after eligibility checks
+// cannot commit durable cleanup mutations after close.
+func TestWorktreeCleanupRecordHelpersHoldAdmission(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_record_gate", "feature/record-gate", true)
+	if err := fixture.runtime.admission.MarkDegraded("before record write"); err != nil {
+		t.Fatalf("MarkDegraded() error = %v", err)
+	}
+
+	skip := fixture.runtime.recordWorktreeCleanupSkip(context.Background(), fixture.repos, worktree, "dirty_git_status")
+	if skip.status != "skipped" || !strings.Contains(skip.message, "degraded") {
+		t.Fatalf("recordWorktreeCleanupSkip() = %#v, want skipped admission degraded", skip)
+	}
+	failure := fixture.runtime.recordWorktreeCleanupFailure(context.Background(), fixture.repos, worktree, errors.New("git list failed"))
+	if failure.status != "skipped" || !strings.Contains(failure.message, "degraded") {
+		t.Fatalf("recordWorktreeCleanupFailure() = %#v, want skipped admission degraded", failure)
+	}
+
+	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), worktree.ID)
+	if err != nil {
+		t.Fatalf("Worktrees.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.UpdatedAt != worktree.UpdatedAt {
+		t.Fatalf("stored worktree = %#v, want UpdatedAt unchanged after admission closed (no touch)", stored)
+	}
+	events := fixture.events(t)
+	if containsWorktreeCleanupEvent(events, "worktree.cleanup.skipped") || containsWorktreeCleanupEvent(events, "worktree.cleanup.failed") {
+		t.Fatalf("events = %#v, want no skip/failed events when admission closed at write boundary", events)
+	}
+}
+
 func (f worktreeCleanupFixture) seedWorktree(t *testing.T, id, branch string, createDir bool) storage.WorktreeRecord {
 	t.Helper()
 	return f.seedWorktreeAt(t, id, branch, createDir, f.now)
