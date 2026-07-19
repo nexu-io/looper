@@ -3984,9 +3984,20 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 // finalizeCancelledClaim durable-requeues a claim that cannot start because the
 // operation lease was cancelled (stop/bind race). Keeps the claim out of the
 // stranded running state without starting a processor.
+//
+// Uses a cancellation-detached context: Runtime.BeginShutdown cancels the
+// scheduler context before the registry drain, so a bind refused after ClaimNext*
+// must still requeue under retained ownership (same pattern as
+// dispatchOwnedQueueClaims). Passing the cancelled scheduler ctx would make
+// MarkRetry fail immediately, report hard persist failure, and strand the claim.
 func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return errors.New("queue repository is not configured for cancelled-claim finalize")
+	}
+	if ctx != nil {
+		ctx = context.WithoutCancel(ctx)
+	} else {
+		ctx = context.Background()
 	}
 	if now == nil {
 		now = time.Now
@@ -4190,6 +4201,12 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 
 // durableCompleteClaim writes queue status completed and verifies the durable
 // observation left the running state.
+//
+// ErrQueueItemNotActive is not a hard persistence failure when the row is
+// already non-running: pause/terminate CancelByLoop can concurrent-terminalize
+// a claim to cancelled while the scheduler observes a parked loop and tries to
+// Complete. That race must free the operation lease rather than degrade and
+// retain ownership forever.
 func durableCompleteClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return errors.New("queue repository is not configured")
@@ -4199,7 +4216,19 @@ func durableCompleteClaim(ctx context.Context, item storage.QueueItemRecord, inp
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	if err := input.Repos.Queue.Complete(ctx, item.ID, nowISO); err != nil {
-		return err
+		if !errors.Is(err, storage.ErrQueueItemNotActive) {
+			return err
+		}
+		// Concurrent terminalization (e.g. CancelByLoop) already moved the claim
+		// off running — verify and treat as durable success for lease release.
+		got, getErr := input.Repos.Queue.GetByID(ctx, item.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if got == nil || got.Status != "running" {
+			return nil
+		}
+		return fmt.Errorf("%w: claim %s still running after complete conflict", ErrOperationFinalizeFailed, item.ID)
 	}
 	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
 	if err != nil {

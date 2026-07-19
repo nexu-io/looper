@@ -69,6 +69,11 @@ type OperationLease interface {
 }
 
 // operationLease implements OperationLease under ActiveExecutionRegistry.
+//
+// Lock order when both are needed: registry.mu (r.mu) before lease.mu (l.mu).
+// Release, BindClaim, OwnsQueueClaim, and stop/shutdown scans all follow this
+// order so a finalize-path Release cannot deadlock with BeginLoopStop /
+// BeginShutdown inspecting bound operations.
 type operationLease struct {
 	registry *ActiveExecutionRegistry
 	id       uint64
@@ -176,22 +181,35 @@ func (l *operationLease) Release() {
 	if l == nil {
 		return
 	}
+	r := l.registry
+	if r == nil {
+		l.mu.Lock()
+		if l.released {
+			l.mu.Unlock()
+			return
+		}
+		l.released = true
+		l.mu.Unlock()
+		if l.cancel != nil {
+			l.cancel(nil)
+		}
+		l.closePendingDone()
+		return
+	}
+
+	// Lock order: registry.mu before lease.mu (must match BindClaim / stop scans).
+	// Taking lease.mu first would ABBA-deadlock with cancelBoundOperationsLocked
+	// and BeginLoopStop bound-op inspection, which hold r.mu then l.mu.
+	r.mu.Lock()
 	l.mu.Lock()
 	if l.released {
 		l.mu.Unlock()
+		r.mu.Unlock()
 		return
 	}
 	l.released = true
 	queueItemID := l.queueItemID
 	l.mu.Unlock()
-	l.cancel(nil)
-
-	r := l.registry
-	if r == nil {
-		l.closePendingDone()
-		return
-	}
-	r.mu.Lock()
 	delete(r.pendingOps, l.id)
 	delete(r.boundOps, l.id)
 	if queueItemID != "" {
@@ -200,6 +218,10 @@ func (l *operationLease) Release() {
 		}
 	}
 	r.mu.Unlock()
+
+	if l.cancel != nil {
+		l.cancel(nil)
+	}
 	l.closePendingDone()
 }
 

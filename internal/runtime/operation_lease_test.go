@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -360,6 +361,182 @@ func TestRunnerErrorStillFinalizesThenReleases(t *testing.T) {
 	}
 	if reg.BoundOperationCount() != 0 {
 		t.Fatalf("bound ops = %d, want 0 after typed finalize + Release", reg.BoundOperationCount())
+	}
+}
+
+func TestFinalizeCancelledClaimUsesDetachedContext(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos := storage.NewRepositories(coordinator.DB())
+	projectID := "project_fin_cancel_ctx"
+	loopID := "loop_fin_cancel_ctx"
+	queueID := "queue_fin_cancel_ctx"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "FinCancel", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 4, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:fin_cancel_ctx", Priority: storage.QueuePriorityWorker, Status: "running",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert: %v", err)
+	}
+
+	// Simulate BeginShutdown cancelling the scheduler context before requeue.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	item := storage.QueueItemRecord{ID: queueID, Attempts: 0, Status: "running"}
+	if err := finalizeCancelledClaim(ctx, item, defaultSchedulerTickInput{
+		Repos: repos,
+		Now:   func() time.Time { return now },
+	}, func() time.Time { return now }); err != nil {
+		t.Fatalf("finalizeCancelledClaim with cancelled ctx: %v", err)
+	}
+	got, err := repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.Status != "queued" {
+		t.Fatalf("after finalize with cancelled ctx = %#v, want requeued", got)
+	}
+}
+
+func TestDurableCompleteClaimReleasesWhenExternallyCancelled(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos := storage.NewRepositories(coordinator.DB())
+	projectID := "project_parked_cancel"
+	loopID := "loop_parked_cancel"
+	queueID := "queue_parked_cancel"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "ParkedCancel", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	// Parked loop status (human_takeover) matches schedulerLoopParked observation.
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 5, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:parked_cancel", Priority: storage.QueuePriorityWorker, Status: "running",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert: %v", err)
+	}
+
+	reg := NewActiveExecutionRegistry()
+	lease, err := reg.AdmitOperation(context.Background(), OperationMeta{ClaimedBy: "scheduler"})
+	if err != nil {
+		t.Fatalf("AdmitOperation: %v", err)
+	}
+	item := storage.QueueItemRecord{ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", Status: "running"}
+	permit, err := lease.BindClaim(item)
+	if err != nil || !permit.Valid() {
+		t.Fatalf("BindClaim = (%#v, %v)", permit, err)
+	}
+
+	// Concurrent pause/terminate: CancelByLoop moves the claim to cancelled.
+	reason := "human takeover"
+	if _, err := repos.Queue.CancelByLoop(context.Background(), loopID, nowISO, &reason); err != nil {
+		t.Fatalf("CancelByLoop: %v", err)
+	}
+
+	// Parked path must durable-complete (or observe already terminal) then Release.
+	if err := durableCompleteClaim(context.Background(), item, defaultSchedulerTickInput{
+		Repos: repos,
+		Now:   func() time.Time { return now },
+	}, func() time.Time { return now }); err != nil {
+		t.Fatalf("durableCompleteClaim after external cancel: %v", err)
+	}
+	lease.Release()
+	if reg.OwnsQueueClaim(queueID) {
+		t.Fatal("lease must release after externally cancelled claim is observed terminal")
+	}
+	got, err := repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.Status != "cancelled" {
+		t.Fatalf("queue status = %#v, want cancelled", got)
+	}
+}
+
+func TestReleaseAndBoundCancelShareLockOrder(t *testing.T) {
+	t.Parallel()
+	// Concurrent Release (finalize) with BeginLoopStop bound-op scan must not
+	// deadlock under the registry-then-lease lock order.
+	reg := NewActiveExecutionRegistry()
+	const n = 32
+	leases := make([]OperationLease, 0, n)
+	loopID := "loop-lock-order"
+	for i := 0; i < n; i++ {
+		lease, err := reg.AdmitOperation(context.Background(), OperationMeta{ClaimedBy: "scheduler"})
+		if err != nil {
+			t.Fatalf("AdmitOperation: %v", err)
+		}
+		item := storage.QueueItemRecord{
+			ID:     "qi-lock-" + strconv.Itoa(i),
+			Type:   "worker",
+			LoopID: &loopID,
+			Status: "running",
+		}
+		permit, err := lease.BindClaim(item)
+		if err != nil || !permit.Valid() {
+			t.Fatalf("BindClaim: %v permit=%v", err, permit.Valid())
+		}
+		leases = append(leases, lease)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, lease := range leases {
+			lease.Release()
+		}
+	}()
+	// Interleave stop scans that take r.mu then l.mu.
+	for i := 0; i < n; i++ {
+		release, err := reg.BeginLoopStop("loop-lock-order", "halt")
+		if err != nil {
+			t.Fatalf("BeginLoopStop: %v", err)
+		}
+		release()
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Release goroutine deadlocked with BeginLoopStop bound-op scan")
+	}
+	if reg.BoundOperationCount() != 0 {
+		t.Fatalf("bound ops = %d, want 0 after all Release", reg.BoundOperationCount())
 	}
 }
 
