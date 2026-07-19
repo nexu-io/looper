@@ -207,8 +207,13 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		summary.LastStatus = "failed"
 		summary.LastError = err.Error()
 		summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
-		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.failed", nil, map[string]any{"message": err.Error()})
-		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{"status": summary.LastStatus, "failed": summary.Failed, "lastError": summary.LastError})
+		// MarkDegraded cancels the cleanup context during Plan; that surfaces as
+		// a Plan error after admission is already closed. Hold WithAllowClaim so
+		// terminal failed/completed events cannot append after closure.
+		_ = r.WithAllowClaim(func() {
+			_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.failed", nil, map[string]any{"message": err.Error()})
+			_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{"status": summary.LastStatus, "failed": summary.Failed, "lastError": summary.LastError})
+		})
 		return summary
 	}
 	summary.Scanned = plan.Summary.Scanned
@@ -228,7 +233,28 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	for _, decision := range plan.Decisions {
 		if ctx.Err() != nil {
 			summary.LastError = ctx.Err().Error()
-			break
+			// cancelWorkProducers (via MarkDegraded/BeginShutdown) cancels ctx
+			// after admission is already closed. Do not fall through to a
+			// terminal completed event without rechecking admission.
+			summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
+			if summary.Failed > 0 {
+				summary.LastStatus = "failed"
+			} else {
+				summary.LastStatus = "completed"
+			}
+			_ = r.WithAllowClaim(func() {
+				_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{
+					"status":      summary.LastStatus,
+					"scanned":     summary.Scanned,
+					"candidates":  summary.Candidates,
+					"cleaned":     summary.Cleaned,
+					"skipped":     summary.Skipped,
+					"failed":      summary.Failed,
+					"lastError":   summary.LastError,
+					"completedAt": derefString(summary.LastCompletedAt),
+				})
+			})
+			return summary
 		}
 		// Recheck before each candidate so degradation mid-pass cancels remaining
 		// worktree/record mutations instead of finishing the planned batch.
@@ -274,15 +300,19 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	} else {
 		summary.LastStatus = "completed"
 	}
-	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{
-		"status":      summary.LastStatus,
-		"scanned":     summary.Scanned,
-		"candidates":  summary.Candidates,
-		"cleaned":     summary.Cleaned,
-		"skipped":     summary.Skipped,
-		"failed":      summary.Failed,
-		"lastError":   summary.LastError,
-		"completedAt": derefString(summary.LastCompletedAt),
+	// Terminal completed is a durable cleanup mutation: hold admission so a
+	// concurrent MarkDegraded/cancel cannot append after closure.
+	_ = r.WithAllowClaim(func() {
+		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{
+			"status":      summary.LastStatus,
+			"scanned":     summary.Scanned,
+			"candidates":  summary.Candidates,
+			"cleaned":     summary.Cleaned,
+			"skipped":     summary.Skipped,
+			"failed":      summary.Failed,
+			"lastError":   summary.LastError,
+			"completedAt": derefString(summary.LastCompletedAt),
+		})
 	})
 	return summary
 }
