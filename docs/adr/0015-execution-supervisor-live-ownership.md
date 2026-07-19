@@ -292,14 +292,14 @@ projections under the same mutex. `ownershipAcquired` is **not** a gate.
 |---------|------|-----------------|
 | HTTP mutating methods (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/v1/*`, `/webhook/forward`) | `Handler` → `AllowMutations` | Explicit **503** `SERVICE_UNAVAILABLE` (not silent no-op). Bootstrap mint/exchange exempt. Feishu `url_verification` handshake exempt; card actions gated. |
 | Read-only HTTP (`GET` health/status/config/lists/…) | none (reads always allowed) | Available in starting / ready / stopping / degraded |
-| Scheduler full tick (planner/coordinator/reviewer/fixer/worker discovery, HITL polls, claim phases, stale-reconcile) | `AllowClaim` at tick entry + mid-tick rechecks per project/lane | Entire work-producing tick no-ops (prefer pause over “read-only discovery”) |
+| Scheduler full tick (planner/coordinator/reviewer/fixer/worker discovery, HITL polls, claim phases, stale-reconcile) | `AllowClaim` at tick entry + mid-tick rechecks per project/lane; `MarkDegraded`/`BeginShutdown` cancel scheduler context | Entire work-producing tick no-ops (prefer pause over “read-only discovery”); in-flight ticks observe cancel |
 | Durable `ClaimNext*` / operation-lease admit | `AllowClaim` immediately before each claim | No new claims |
 | Agent spawn leases | registry `allowSpawn` → `AllowClaim` | No new agent starts |
 | Webhook tunnel deliveries | `allowForward` → `AllowMutations` before Forward | **503** |
-| Webhook forwarder accept + worker discovery | `AllowExecute` → same projection; accept-time refuse + execute-time recheck | No discovery enqueue / no `CreateOrGetActiveByDedupe` after close |
+| Webhook forwarder accept + worker discovery | `AllowExecute` → same projection; accept-time refuse + execute-time recheck; `MarkDegraded`/`BeginShutdown` call `CancelExecute` | No discovery enqueue / no `CreateOrGetActiveByDedupe` after close (including mid-discovery that already passed AllowExecute) |
 | Worktree cleanup pass | `AllowClaim` before pass | No filesystem/DB cleanup mutations while closed |
 | Config file hot-reload loop | not gated (policy Authority ADR-0014) | May refresh hot-safe fields; work-producing side effects still hit scheduler/HTTP gates |
-| Deferred reviewer recovery requeue | `AllowClaim` before requeue | No requeue after close |
+| Deferred reviewer recovery requeue | `AllowClaim` before requeue; `MarkDegraded`/`BeginShutdown` cancel recovery context | No requeue after close |
 | Shutdown order | `daemonRuntime.Stop`: `BeginShutdown` → HTTP `Server.Stop` drain → `Runtime.Stop` | Aligns with #577: admission → ingress → producers → handles; retain storage / fail loud on incomplete drain |
 
 **Non-mutating coverage concept trade-off (R7):**

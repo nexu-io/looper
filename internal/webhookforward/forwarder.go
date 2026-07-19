@@ -88,8 +88,9 @@ type Forwarder interface {
 	Forward(context.Context, DeliveryRequest) (ForwardResult, error)
 	Stats() Stats
 	// CancelExecute aborts in-flight discovery without waiting for workers to
-	// exit. BeginShutdown should call this so admission-closed races cannot
-	// finish CreateOrGetActiveByDedupe after a one-time AllowExecute pass.
+	// exit. BeginShutdown and MarkDegraded should call this so admission-closed
+	// races cannot finish CreateOrGetActiveByDedupe after a one-time
+	// AllowExecute pass.
 	CancelExecute()
 	Close()
 }
@@ -369,9 +370,9 @@ func (f *forwarder) Stats() Stats {
 }
 
 // CancelExecute aborts in-flight worker discovery without waiting for drain.
-// Runtime.BeginShutdown must call this so a worker that already passed
-// AllowExecute cannot finish CreateOrGetActiveByDedupe after admission closes.
-// Safe to call multiple times; Close also cancels.
+// Runtime.BeginShutdown and Runtime.MarkDegraded must call this so a worker
+// that already passed AllowExecute cannot finish CreateOrGetActiveByDedupe
+// after admission closes. Safe to call multiple times; Close also cancels.
 func (f *forwarder) CancelExecute() {
 	if f == nil || f.execCancel == nil {
 		return

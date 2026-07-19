@@ -123,7 +123,8 @@ type WebhookForwarder interface {
 	Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error)
 	Stats() webhookforward.Stats
 	// CancelExecute aborts in-flight webhook discovery without waiting for drain.
-	// BeginShutdown calls this so admission-closed races cannot still enqueue.
+	// BeginShutdown and MarkDegraded call this so admission-closed races cannot
+	// still enqueue after a one-time AllowExecute pass.
 	CancelExecute()
 	Close()
 }
@@ -458,6 +459,27 @@ func (r *Runtime) BeginShutdown(reason string) {
 	// Cancel work-producing owners before waiting on tracked non-agent handles
 	// so shell validation / trusted-review Run paths observe cancel and enter
 	// their confirmed Kill path promptly (#590 review).
+	r.cancelWorkProducers()
+	// Close agent spawn admission and confirmed-drain live handles — agents and
+	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
+	// registry; non-agent owners were canceled above.
+	if r.activeExecutions != nil {
+		if err := r.activeExecutions.BeginShutdown(reason); err != nil {
+			r.mu.Lock()
+			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
+			r.mu.Unlock()
+		}
+	}
+}
+
+// cancelWorkProducers aborts in-flight scheduler ticks, deferred recovery, and
+// webhook discovery without waiting for drain or killing agent handles.
+// Used by BeginShutdown and MarkDegraded so a producer that already passed
+// AllowClaim/AllowExecute cannot finish CreateOrGetActiveByDedupe after close.
+func (r *Runtime) cancelWorkProducers() {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
 	cancel := r.schedulerCancel
 	recoveryCancel := r.recoveryCancel
@@ -471,16 +493,6 @@ func (r *Runtime) BeginShutdown(reason string) {
 	}
 	if forwarder != nil {
 		forwarder.CancelExecute()
-	}
-	// Close agent spawn admission and confirmed-drain live handles — agents and
-	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
-	// registry; non-agent owners were canceled above.
-	if r.activeExecutions != nil {
-		if err := r.activeExecutions.BeginShutdown(reason); err != nil {
-			r.mu.Lock()
-			r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, err)
-			r.mu.Unlock()
-		}
 	}
 }
 
@@ -531,12 +543,20 @@ func (r *Runtime) AllowClaim() error {
 	return r.admission.AllowClaim()
 }
 
-// MarkDegraded sticks admission until restart/clear.
+// MarkDegraded sticks admission until restart/clear and cancels work-producing
+// contexts so in-flight discovery/enqueue that already passed AllowClaim or
+// AllowExecute cannot complete CreateOrGetActiveByDedupe after the transition.
+// Unlike BeginShutdown, this does not drain active agent handles — existing
+// executions continue; only producers of new work are aborted.
 func (r *Runtime) MarkDegraded(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
 	}
-	return r.admission.MarkDegraded(reason)
+	if err := r.admission.MarkDegraded(reason); err != nil {
+		return err
+	}
+	r.cancelWorkProducers()
+	return nil
 }
 
 func (r *Runtime) WaitForShutdown() {
