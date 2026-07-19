@@ -394,7 +394,9 @@ function AgentProfiles({
       if (!vendor && published?.vendor != null && String(published.vendor) !== "") {
         onToggleUnset(vendorPath);
       }
-      if (!model && published?.model != null && String(published.model) !== "") {
+      // Empty model ("") is a meaningful binding (suppresses inherited/params
+      // models), so omit-on-recreate must unset it too — not only non-empty.
+      if (!model && published?.model != null) {
         onToggleUnset(modelPath);
       }
     }
