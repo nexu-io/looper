@@ -195,12 +195,36 @@ func (a *Admission) AllowClaim() error {
 	return a.allowWork()
 }
 
+// WithAllowWork runs fn only when admission currently allows work, holding the
+// same mutex as AllowMutations/AllowClaim for the full duration of fn. Use this
+// for check-then-act sections (e.g. webhook accept + enqueue) so MarkDegraded
+// and BeginShutdown cannot interleave between the gate and the mutation.
+// fn must not call back into Admission methods that take a.mu (would deadlock).
+func (a *Admission) WithAllowWork(fn func()) error {
+	if a == nil {
+		return ErrAdmissionStopping
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.allowWorkLocked(); err != nil {
+		return err
+	}
+	if fn != nil {
+		fn()
+	}
+	return nil
+}
+
 func (a *Admission) allowWork() error {
 	if a == nil {
 		return ErrAdmissionStopping
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.allowWorkLocked()
+}
+
+func (a *Admission) allowWorkLocked() error {
 	switch a.state {
 	case AdmissionReady:
 		return nil

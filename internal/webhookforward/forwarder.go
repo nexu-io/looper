@@ -127,6 +127,13 @@ type Options struct {
 	// execute-time recheck covers the race where BeginShutdown closes
 	// admission after Forward already accepted. Nil means ungated (tests).
 	AllowExecute func() error
+	// AllowExecuteWhile, when set, runs the accept-time enqueue critical
+	// section only while admission remains held (wire to Admission.WithAllowWork).
+	// Holding the same mutex as MarkDegraded/BeginShutdown makes check+enqueue
+	// atomic so Forward cannot return 202 for work that CancelExecute will drop
+	// before it is recorded. When nil, Accept falls back to a point-in-time
+	// AllowExecute recheck then enqueue (tests).
+	AllowExecuteWhile func(fn func()) error
 }
 
 type deliveryRecord struct {
@@ -227,6 +234,7 @@ type forwarder struct {
 	retryDelay         time.Duration
 	recentOutcomeLimit int
 	allowExecute       func() error
+	allowExecuteWhile  func(fn func()) error
 	// execCtx is canceled by CancelExecute / Close so discovery that already
 	// passed AllowExecute still observes shutdown and cannot enqueue late.
 	execCtx    context.Context
@@ -284,6 +292,7 @@ func New(options Options) Forwarder {
 		retryDelay:         retryDelay,
 		recentOutcomeLimit: recentOutcomeLimit,
 		allowExecute:       options.AllowExecute,
+		allowExecuteWhile:  options.AllowExecuteWhile,
 		execCtx:            execCtx,
 		execCancel:         execCancel,
 		works:              map[string]*workItem{},
@@ -344,16 +353,30 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	if projectErr != nil {
 		return ForwardResult{}, projectErr
 	}
-	// Authoritative recheck under the enqueue lock: MarkDegraded can close
-	// admission (and CancelExecute) after the pre-lock allowExecute pass. If we
-	// accepted here, GitHub would not retry while the canceled worker drops the
-	// delivery — refuse with ErrAdmissionRefused so callers map to 503.
-	if f.allowExecute != nil {
-		if err := f.allowExecute(); err != nil {
+	// Accept-time enqueue must be atomic with admission: allowExecute only
+	// holds the Admission mutex while reading state, and MarkDegraded does not
+	// take f.mu — so a point-in-time recheck under f.mu still races before
+	// enqueue records the delivery. Prefer AllowExecuteWhile (Admission.WithAllowWork)
+	// so check+enqueue share the admission mutex; MarkDegraded blocks until
+	// enqueue finishes, then CancelExecute cannot drop an accepted-but-unrecorded
+	// delivery. Fall back to point-in-time AllowExecute for ungated tests.
+	meta := workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID}
+	var workItems int
+	var enqueueErr error
+	if f.allowExecuteWhile != nil {
+		if err := f.allowExecuteWhile(func() {
+			workItems, enqueueErr = f.enqueueLocked(projects, routed, meta)
+		}); err != nil {
 			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
 		}
+	} else {
+		if f.allowExecute != nil {
+			if err := f.allowExecute(); err != nil {
+				return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+			}
+		}
+		workItems, enqueueErr = f.enqueueLocked(projects, routed, meta)
 	}
-	workItems, enqueueErr := f.enqueueLocked(projects, routed, workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID})
 	if enqueueErr != nil {
 		return ForwardResult{}, enqueueErr
 	}

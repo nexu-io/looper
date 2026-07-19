@@ -3,6 +3,7 @@ package runtime
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestAdmissionLegalTransitions(t *testing.T) {
@@ -87,6 +88,54 @@ func TestAdmissionStartingToDegradedAndStopping(t *testing.T) {
 	}
 	if got := b.State(); got != AdmissionStopping {
 		t.Fatalf("State() = %q, want stopping", got)
+	}
+}
+
+// Contract: WithAllowWork holds admission.mu across fn so MarkDegraded cannot
+// interleave between the allow check and the critical section body.
+func TestAdmissionWithAllowWorkHoldsMutexAcrossFn(t *testing.T) {
+	t.Parallel()
+
+	a := NewAdmission()
+	if err := a.MarkReady("ready"); err != nil {
+		t.Fatalf("MarkReady() error = %v", err)
+	}
+
+	started := make(chan struct{})
+	degradeDone := make(chan error, 1)
+
+	go func() {
+		<-started
+		degradeDone <- a.MarkDegraded("concurrent degrade")
+	}()
+
+	err := a.WithAllowWork(func() {
+		close(started)
+		// MarkDegraded must block until we leave WithAllowWork.
+		select {
+		case err := <-degradeDone:
+			t.Errorf("MarkDegraded completed while WithAllowWork held admission: %v", err)
+		case <-time.After(30 * time.Millisecond):
+		}
+	})
+	if err != nil {
+		t.Fatalf("WithAllowWork() error = %v", err)
+	}
+	select {
+	case err := <-degradeDone:
+		if err != nil {
+			t.Fatalf("MarkDegraded() after release error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkDegraded did not complete after WithAllowWork released")
+	}
+	if got := a.State(); got != AdmissionDegraded {
+		t.Fatalf("State() after concurrent MarkDegraded = %q, want degraded", got)
+	}
+	if err := a.WithAllowWork(func() {
+		t.Error("fn must not run when admission is degraded")
+	}); !errors.Is(err, ErrAdmissionDegraded) {
+		t.Fatalf("WithAllowWork() while degraded = %v, want ErrAdmissionDegraded", err)
 	}
 }
 

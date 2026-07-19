@@ -548,6 +548,16 @@ func (r *Runtime) AllowClaim() error {
 	return r.admission.AllowClaim()
 }
 
+// WithAllowClaim runs fn only while claim admission is open, holding the
+// admission mutex for the full duration of fn so MarkDegraded/BeginShutdown
+// cannot interleave with the critical section (webhook accept + enqueue).
+func (r *Runtime) WithAllowClaim(fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.WithAllowWork(fn)
+}
+
 // MarkDegraded sticks admission until restart/clear and cancels work-producing
 // contexts so in-flight discovery/enqueue/cleanup that already passed AllowClaim
 // or AllowExecute cannot complete CreateOrGetActiveByDedupe or CleanupWorktree
@@ -917,7 +927,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
