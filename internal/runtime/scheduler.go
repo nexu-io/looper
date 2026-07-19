@@ -3847,6 +3847,11 @@ type ownedQueueClaim struct {
 	permit OperationPermit
 }
 
+// testAfterClaimHook, when set by tests, rewrites ClaimNext* results so the
+// ambiguous cancel path (durable claim committed, error returned) can be
+// exercised without racing SQLite QueryRowContext cancellation.
+var testAfterClaimHook func(item *storage.QueueItemRecord, err error) (*storage.QueueItemRecord, error)
+
 func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {
 	if availableSlots <= 0 || input.Repos == nil || input.Repos.Queue == nil {
 		return nil, nil
@@ -3901,6 +3906,34 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			}
 		}
 		item, err := claimFn(ctx, nowISO, "scheduler")
+		if testAfterClaimHook != nil {
+			item, err = testAfterClaimHook(item, err)
+		}
+		if err != nil {
+			// Context cancel mid-ClaimNext can leave UPDATE...RETURNING committed
+			// without a returned item. Recover (or retain/degrade) before Release
+			// so a durable running claim is never left unowned (#579 / ADR-0015 R6).
+			if lease != nil && claimErrorIsAmbiguousCancel(ctx, err) {
+				recovered, recErr := recoverAmbiguousCancelledClaim(ctx, input, nowISO, owned)
+				if recErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(recErr)
+					}
+					// Retain lease — do not Release; BeginShutdown still observes it.
+					return claimStop, errors.Join(ErrOperationFinalizeFailed, recErr)
+				}
+				if recovered != nil {
+					item = recovered
+					err = nil
+				} else {
+					// Confirmed no durable claim under this tick — safe to drop lease.
+					lease.Release()
+					// BeginShutdown may cancel mid-ClaimNext after earlier slots
+					// succeeded. Stop claiming; dispatch already-durable claims.
+					return claimStop, nil
+				}
+			}
+		}
 		if err != nil {
 			if lease != nil {
 				lease.Release()
@@ -3979,6 +4012,55 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		}
 	}
 	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
+}
+
+// claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have
+// already committed a durable running claim that was not returned to the caller
+// (context cancelled during UPDATE...RETURNING scan).
+func claimErrorIsAmbiguousCancel(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
+}
+
+// recoverAmbiguousCancelledClaim looks up running claims made by the scheduler
+// at nowISO that are not already owned by this tick. Zero matches means the
+// cancel happened before any durable claim (safe to release). One match is the
+// recovered item. Multiple unowned matches cannot be bound to a single lease.
+func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerTickInput, nowISO string, owned []ownedQueueClaim) (*storage.QueueItemRecord, error) {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		return nil, errors.New("queue repository is not configured for ambiguous claim recovery")
+	}
+	recoverCtx := context.Background()
+	if ctx != nil {
+		recoverCtx = context.WithoutCancel(ctx)
+	}
+	items, err := input.Repos.Queue.ListRunningClaimedBy(recoverCtx, "scheduler", nowISO)
+	if err != nil {
+		return nil, err
+	}
+	ownedIDs := make(map[string]struct{}, len(owned))
+	for _, o := range owned {
+		if o.item.ID != "" {
+			ownedIDs[o.item.ID] = struct{}{}
+		}
+	}
+	var found *storage.QueueItemRecord
+	for i := range items {
+		if _, ok := ownedIDs[items[i].ID]; ok {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("%w: multiple unowned running claims after cancelled ClaimNext", ErrOperationFinalizeFailed)
+		}
+		item := items[i]
+		found = &item
+	}
+	return found, nil
 }
 
 // finalizeCancelledClaim durable-requeues a claim that cannot start because the

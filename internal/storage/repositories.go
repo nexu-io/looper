@@ -1828,8 +1828,27 @@ func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, cl
 	`, []any{QueueLongTermRetryAttemptThreshold})
 }
 
+// claimCtxForDurableClaim refuses already-cancelled callers, then detaches
+// cancellation from the UPDATE...RETURNING. If the parent context is cancelled
+// after SQLite commits the claim but before the row is scanned, QueryRowContext
+// would return ctx.Err without the claimed item and strand a durable running
+// row with no owner (ADR-0015 R6 / #579).
+func claimCtxForDurableClaim(ctx context.Context) (context.Context, error) {
+	if ctx == nil {
+		return context.Background(), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return context.WithoutCancel(ctx), nil
+}
+
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
+	claimCtx, err := claimCtxForDurableClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+extraPredicate+scheduledQueueOrderBy+`
 			LIMIT 1
@@ -1857,7 +1876,11 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 }
 
 func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy, queueType string) (*QueueItemRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
+	claimCtx, err := claimCtxForDurableClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+`
 			AND qi.type = ?
@@ -1884,6 +1907,29 @@ func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy
 	}
 
 	return &record, nil
+}
+
+// ListRunningClaimedBy returns running queue items claimed by claimedBy at
+// claimedAt. Used to recover from ambiguous ClaimNext failures after context
+// cancellation when the durable UPDATE may have committed without returning
+// the row to the caller.
+func (r *QueueRepository) ListRunningClaimedBy(ctx context.Context, claimedBy, claimedAt string) ([]QueueItemRecord, error) {
+	if claimedBy == "" {
+		return []QueueItemRecord{}, nil
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM queue_items
+		WHERE status = 'running'
+			AND claimed_by = ?
+			AND claimed_at = ?
+		ORDER BY id ASC
+	`, claimedBy, claimedAt)
+	if err != nil {
+		return nil, fmt.Errorf("list running queue items by claimed_by: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
 }
 
 func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) error {

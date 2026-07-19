@@ -2051,6 +2051,100 @@ func TestQueueClaimNextSkipsArchivedProjects(t *testing.T) {
 	}
 }
 
+func TestQueueClaimNextRefusesAlreadyCancelledContextWithoutMutating(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-19T12:00:00.000Z"
+	projectID := "project_claim_cancel"
+	loopID := "loop_claim_cancel"
+	queueID := "queue_claim_cancel"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "ClaimCancel", RepoPath: "/tmp/claim-cancel", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:claim_cancel", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert: %v", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	claimed, err := repos.Queue.ClaimNext(cancelCtx, now, "scheduler")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ClaimNext error = %v, want context.Canceled", err)
+	}
+	if claimed != nil {
+		t.Fatalf("ClaimNext = %#v, want nil when context already cancelled", claimed)
+	}
+	got, err := repos.Queue.GetByID(ctx, queueID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.Status != "queued" {
+		t.Fatalf("queue item = %#v, want still queued (no durable claim)", got)
+	}
+
+	// Live context still claims successfully (WithoutCancel path returns the row).
+	claimed, err = repos.Queue.ClaimNext(ctx, now, "scheduler")
+	if err != nil || claimed == nil || claimed.ID != queueID {
+		t.Fatalf("ClaimNext live = (%#v, %v), want %s", claimed, err, queueID)
+	}
+}
+
+func TestQueueListRunningClaimedBy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-19T12:00:00.000Z"
+	projectID := "project_list_claimed"
+	loopID := "loop_list_claimed"
+	claimedBy := "scheduler"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "ListClaimed", RepoPath: "/tmp/list-claimed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	for _, id := range []string{"qi_list_a", "qi_list_b"} {
+		if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+			ID: id, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+			DedupeKey: id, Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3,
+			ClaimedBy: &claimedBy, ClaimedAt: &now, StartedAt: &now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("Queue.Upsert(%s): %v", id, err)
+		}
+	}
+	// Different claimed_at must not match.
+	otherAt := "2026-07-19T11:00:00.000Z"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID: "qi_list_other", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "qi_list_other", Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3,
+		ClaimedBy: &claimedBy, ClaimedAt: &otherAt, StartedAt: &otherAt, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(other): %v", err)
+	}
+
+	items, err := repos.Queue.ListRunningClaimedBy(ctx, claimedBy, now)
+	if err != nil {
+		t.Fatalf("ListRunningClaimedBy: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len = %d, want 2; items=%#v", len(items), items)
+	}
+	if items[0].ID != "qi_list_a" || items[1].ID != "qi_list_b" {
+		t.Fatalf("order = %s,%s want qi_list_a,qi_list_b", items[0].ID, items[1].ID)
+	}
+}
+
 func TestQueueStatsAndCleanupStaleQueued(t *testing.T) {
 	t.Parallel()
 
