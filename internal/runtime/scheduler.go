@@ -4045,9 +4045,17 @@ func newAmbiguousClaimRecoveryContext(parent context.Context) (context.Context, 
 }
 
 // recoverAmbiguousCancelledClaim looks up running claims made by the scheduler
-// at nowISO that are not already owned by this tick. Zero matches means the
-// cancel happened before any durable claim (safe to release). One match is the
-// recovered item. Multiple unowned matches cannot be bound to a single lease.
+// at nowISO that are not already owned by this tick or by any live registry
+// operation lease. Zero matches means the cancel happened before any durable
+// claim (safe to release). One match is the recovered item. Multiple unowned
+// matches cannot be bound to a single lease.
+//
+// Filtering only the current batch's owned slice is insufficient: two claim
+// batches can share the same formatted nowISO (back-to-back wakeups within one
+// millisecond) and both use claimed_by="scheduler", so ListRunningClaimedBy
+// also returns earlier still-running claims. Those must be excluded via
+// OperationOwner.OwnsQueueClaim so recovery never adopts a registry-owned row
+// or degrades on a multi-match that includes live ownership.
 func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerTickInput, nowISO string, owned []ownedQueueClaim) (*storage.QueueItemRecord, error) {
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return nil, errors.New("queue repository is not configured for ambiguous claim recovery")
@@ -4068,7 +4076,13 @@ func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerT
 	}
 	var found *storage.QueueItemRecord
 	for i := range items {
-		if _, ok := ownedIDs[items[i].ID]; ok {
+		id := items[i].ID
+		if _, ok := ownedIDs[id]; ok {
+			continue
+		}
+		// Prior-batch claims with the same claimed_at share this query result;
+		// skip any still bound to a live operation lease in the registry.
+		if input.OperationOwner != nil && input.OperationOwner.OwnsQueueClaim(id) {
 			continue
 		}
 		if found != nil {
@@ -4308,7 +4322,21 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 				// complete/cancel/requeue (or typed Fail recovery). Keep using
 				// the detached dispatch ctx so durable writes still succeed
 				// when the lease was cancelled mid-run.
-				if finErr := ensureClaimFinalized(ctx, item, runErr, input, now); finErr != nil {
+				//
+				// When the lease was cancelled mid-run (BeginLoopStop before
+				// CancelByLoop / Terminate), do not Fail→manual_intervention.
+				// That status is outside CancelByLoop's WHERE (queued|running),
+				// so haltLoop would leave work on a terminated loop in a
+				// non-cancelled terminal state. Status-guarded requeue preserves
+				// concurrent CancelByLoop (zero-row no-op if already cancelled)
+				// and keeps the row cancellable until Terminate runs.
+				var finErr error
+				if lease.Context().Err() != nil {
+					finErr = finalizeCancelledClaim(ctx, item, input, now)
+				} else {
+					finErr = ensureClaimFinalized(ctx, item, runErr, input, now)
+				}
+				if finErr != nil {
 					if input.OperationOwner != nil {
 						input.OperationOwner.ReportHardPersistFailure(finErr)
 					}
