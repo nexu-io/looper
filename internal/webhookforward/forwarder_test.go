@@ -57,9 +57,10 @@ func TestForwardRefusesWhenAllowExecuteClosedAtAccept(t *testing.T) {
 	fixerRunner.assertCallCount(t, 0)
 }
 
-// Contract: Forward may accept while admission is open; worker discovery must
-// still refuse when AllowExecute closes before executeWithRetry runs.
-func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
+// Contract (#592 review): Forward may accept while admission is open; once
+// accepted/202, worker discovery must still complete even if AllowExecute later
+// refuses. Post-accept admission recheck would drop work GitHub will not retry.
+func TestWorkerCompletesDiscoveryWhenAdmissionClosesAfterAccept(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
 	reviewerRunner := newFakeTargetedRunner(nil)
@@ -73,12 +74,12 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 		MaxConcurrent: 1,
 		QueueCapacity: 8,
 		AllowExecute: func() error {
-			// First two calls: Forward pre-lock + under-enqueue-lock accept.
-			// Later calls: worker execute recheck.
+			// Accept-time calls succeed; any later worker recheck would refuse
+			// (and must not be consulted after accepted/202).
 			if executeCalls.Add(1) <= 2 {
 				return nil
 			}
-			return errors.New("daemon admission is stopping")
+			return errors.New("daemon admission is degraded")
 		},
 	})
 	defer forwarder.Close()
@@ -98,23 +99,24 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		stats := forwarder.Stats()
-		if stats.ExecutionsFailed >= 1 && stats.InFlight == 0 && stats.Queued == 0 {
+		if stats.ExecutionsSucceeded >= 1 && stats.InFlight == 0 && stats.Queued == 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	stats := forwarder.Stats()
-	if stats.ExecutionsFailed < 1 {
-		t.Fatalf("ExecutionsFailed = %d, want >= 1 after admission refuse", stats.ExecutionsFailed)
+	if stats.ExecutionsSucceeded < 1 {
+		t.Fatalf("ExecutionsSucceeded = %d, want >= 1 after post-accept admission close", stats.ExecutionsSucceeded)
 	}
-	if executeCalls.Load() < 3 {
-		t.Fatalf("AllowExecute calls = %d, want >= 3 (accept x2 + execute recheck)", executeCalls.Load())
+	if stats.ExecutionsFailed != 0 {
+		t.Fatalf("ExecutionsFailed = %d, want 0 when accepted work still discovers", stats.ExecutionsFailed)
 	}
-	reviewerRunner.assertCallCount(t, 0)
-	fixerRunner.assertCallCount(t, 0)
-	if stats.ExecutionsSucceeded != 0 {
-		t.Fatalf("ExecutionsSucceeded = %d, want 0 when admission refuses discovery", stats.ExecutionsSucceeded)
+	// Only accept-time AllowExecute calls (pre-lock + under-lock fallback path).
+	if executeCalls.Load() != 2 {
+		t.Fatalf("AllowExecute calls = %d, want 2 (accept only; no worker recheck)", executeCalls.Load())
 	}
+	reviewerRunner.assertCallCount(t, 1)
+	fixerRunner.assertCallCount(t, 1)
 }
 
 // Contract (#580 review): admission closed after the pre-lock allowExecute pass

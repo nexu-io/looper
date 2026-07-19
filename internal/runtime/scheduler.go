@@ -2965,12 +2965,12 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			}},
 			Logger: logger,
 			Now:    now,
-			// Worker discovery must recheck the same admission Authority as
-			// scheduler claims: Forward can accept just before BeginShutdown,
-			// then drain after admission is already stopping (#583).
+			// Accept-time gate only: once Forward returns accepted/202 the
+			// delivery is committed and workers complete discovery even if
+			// admission later degrades. BeginShutdown/Stop aborts via CancelExecute.
 			AllowExecute: allowClaim,
 			// Hold admission across accept+enqueue so MarkDegraded cannot
-			// return 202 for work CancelExecute will drop before recording.
+			// flip closed mid-section before the accepted-delivery record.
 			AllowExecuteWhile: withAllowClaim,
 		})
 	}

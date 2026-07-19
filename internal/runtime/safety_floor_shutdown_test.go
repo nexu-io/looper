@@ -195,10 +195,10 @@ func TestSafetyFloorMarkDegradedCancelsWorktreeCleanupContext(t *testing.T) {
 	}
 }
 
-// Contract (#580 review): MarkDegraded cancels in-flight webhook discovery so
-// a worker that already passed AllowExecute cannot CreateOrGetActiveByDedupe
-// after sticky degrade.
-func TestSafetyFloorMarkDegradedCancelsWebhookExecute(t *testing.T) {
+// Contract (#592 review): sticky MarkDegraded must not CancelExecute webhook
+// workers. Accepted/202 deliveries still need CreateOrGetActiveByDedupe under a
+// live daemon; GitHub will not retry. New accepts are refused at Forward.
+func TestSafetyFloorMarkDegradedDoesNotCancelWebhookExecute(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -232,8 +232,8 @@ func TestSafetyFloorMarkDegradedCancelsWebhookExecute(t *testing.T) {
 	if err := rt.MarkDegraded("test hard persist failure"); err != nil {
 		t.Fatalf("MarkDegraded() error = %v", err)
 	}
-	if cancelCalls.Load() < 1 {
-		t.Fatalf("CancelExecute calls = %d, want >= 1 from MarkDegraded", cancelCalls.Load())
+	if cancelCalls.Load() != 0 {
+		t.Fatalf("CancelExecute calls = %d, want 0 from MarkDegraded", cancelCalls.Load())
 	}
 	if rt.AdmissionState() != AdmissionDegraded {
 		t.Fatalf("AdmissionState() = %q, want degraded", rt.AdmissionState())

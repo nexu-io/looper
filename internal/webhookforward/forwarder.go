@@ -88,9 +88,11 @@ type Forwarder interface {
 	Forward(context.Context, DeliveryRequest) (ForwardResult, error)
 	Stats() Stats
 	// CancelExecute aborts in-flight discovery without waiting for workers to
-	// exit. BeginShutdown and MarkDegraded should call this so admission-closed
-	// races cannot finish CreateOrGetActiveByDedupe after a one-time
-	// AllowExecute pass.
+	// exit. BeginShutdown / Runtime.Stop should call this so process exit can
+	// abort discovery promptly. MarkDegraded must NOT call this: Forward may
+	// already have returned accepted/202 for in-memory queue entries, and
+	// sticky degrade leaves the daemon up with no GitHub retry for that
+	// delivery.
 	CancelExecute()
 	Close()
 }
@@ -121,19 +123,20 @@ type Options struct {
 	DeliveryTTL        time.Duration
 	RetryDelay         time.Duration
 	RecentOutcomeLimit int
-	// AllowExecute, when set, is checked at Forward accept time and rechecked
-	// immediately before each worker discovery attempt (#580). Accept-time
-	// refuse prevents in-memory discovery enqueue while admission is closed;
-	// execute-time recheck covers the race where BeginShutdown closes
-	// admission after Forward already accepted. Nil means ungated (tests).
+	// AllowExecute, when set, is checked at Forward accept time only (#580).
+	// Accept-time refuse prevents in-memory discovery enqueue while admission is
+	// closed (HTTP/tunnel map ErrAdmissionRefused to 503 so GitHub can retry).
+	// Worker discovery does not recheck AllowExecute: once Forward returns
+	// accepted/202 the delivery is committed and must reach CreateOrGetActiveByDedupe
+	// even if admission later degrades. BeginShutdown aborts via CancelExecute
+	// (execCtx). Nil means ungated (tests).
 	AllowExecute func() error
 	// AllowExecuteWhile, when set, runs the accept-time enqueue + delivery
 	// bookkeeping critical section only while admission remains held (wire to
 	// Admission.WithAllowWork). Holding the same mutex as MarkDegraded/
 	// BeginShutdown makes check+enqueue+record atomic so Forward cannot return
-	// 202 for work that CancelExecute will drop before the delivery is recorded.
-	// When nil, Accept falls back to a point-in-time AllowExecute recheck then
-	// enqueue (tests).
+	// 202 while admission is already closed. When nil, Accept falls back to a
+	// point-in-time AllowExecute recheck then enqueue (tests).
 	AllowExecuteWhile func(fn func()) error
 }
 
@@ -236,8 +239,9 @@ type forwarder struct {
 	recentOutcomeLimit int
 	allowExecute       func() error
 	allowExecuteWhile  func(fn func()) error
-	// execCtx is canceled by CancelExecute / Close so discovery that already
-	// passed AllowExecute still observes shutdown and cannot enqueue late.
+	// execCtx is canceled by CancelExecute / Close so process-exit shutdown can
+	// abort in-flight discovery. Sticky MarkDegraded must not cancel this —
+	// accepted deliveries still need to complete under a live daemon.
 	execCtx    context.Context
 	execCancel context.CancelFunc
 
@@ -359,10 +363,10 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	// MarkDegraded does not take f.mu — so a point-in-time recheck under f.mu
 	// still races before the delivery is recorded. Prefer AllowExecuteWhile
 	// (Admission.WithAllowWork) so check+enqueue+record share the admission
-	// mutex; MarkDegraded blocks until the accepted-delivery outcome is written,
-	// so CancelExecute cannot drop discovery that Forward is about to report as
-	// 202 with no retryable delivery record. Fall back to point-in-time
-	// AllowExecute for ungated tests.
+	// mutex; MarkDegraded blocks until the accepted-delivery outcome is written.
+	// After this section returns accepted/202, worker discovery must still run
+	// even if admission later degrades (no GitHub retry for 202). Fall back to
+	// point-in-time AllowExecute for ungated tests.
 	meta := workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID}
 	var result ForwardResult
 	var enqueueErr error
@@ -418,9 +422,10 @@ func (f *forwarder) Stats() Stats {
 }
 
 // CancelExecute aborts in-flight worker discovery without waiting for drain.
-// Runtime.BeginShutdown and Runtime.MarkDegraded must call this so a worker
-// that already passed AllowExecute cannot finish CreateOrGetActiveByDedupe
-// after admission closes. Safe to call multiple times; Close also cancels.
+// Runtime.BeginShutdown / Runtime.Stop call this for process-exit promptness.
+// Runtime.MarkDegraded must not call this: accepted/202 deliveries still need
+// discovery under a live daemon (GitHub will not retry). Safe to call multiple
+// times; Close also cancels.
 func (f *forwarder) CancelExecute() {
 	if f == nil || f.execCancel == nil {
 		return
@@ -538,8 +543,8 @@ func (f *forwarder) worker() {
 		if !ok {
 			return
 		}
-		// Use the cancelable exec context so BeginShutdown aborts discovery that
-		// already passed AllowExecute (context.Background would keep enqueueing).
+		// Use the cancelable exec context so BeginShutdown/Stop can abort
+		// discovery on process exit. MarkDegraded must not cancel execCtx.
 		outcome := f.executeWithRetry(f.execCtx, key, item)
 		f.finishWork(key, outcome)
 	}
@@ -644,13 +649,10 @@ func (f *forwarder) executeWithRetry(ctx context.Context, key workKey, item work
 }
 
 func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem) error {
-	// Recheck admission at discovery time: Forward may have accepted this work
-	// while ready, but BeginShutdown can close admission before the worker runs.
-	if f.allowExecute != nil {
-		if err := f.allowExecute(); err != nil {
-			return err
-		}
-	}
+	// Admission was already checked at Forward accept time. Do not recheck
+	// AllowExecute here: dropping queued work after accepted/202 loses the
+	// delivery (in-memory dedupe only; GitHub will not retry). Process-exit
+	// shutdown aborts via canceled execCtx from CancelExecute.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -664,11 +666,6 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if f.allowExecute != nil {
-		if err := f.allowExecute(); err != nil {
-			return err
-		}
 	}
 	if _, ok := item.lanes[LaneFixer]; ok {
 		if f.fixer == nil {

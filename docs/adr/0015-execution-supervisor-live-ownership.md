@@ -231,7 +231,7 @@ handles (`Drain` when needed after leader `Wait`).
 
 1. Inspect daemon logs for `daemon admission degraded after agent execution persistence failure` and the underlying storage error.
 2. Repair storage (disk space, permissions, SQLite integrity) under the configured runtime path (default `~/.looper/`).
-3. **Restart `looperd`** — the only recovery path. Admission is sticky degraded until process restart; there is no in-process clear. `MarkDegraded` cancels work-producer contexts (scheduler, cleanup, webhook execute), so reopening admission without restart would leave a ready-looking daemon with dead producers.
+3. **Restart `looperd`** — the only recovery path. Admission is sticky degraded until process restart; there is no in-process clear. `MarkDegraded` cancels work-producer contexts (scheduler, cleanup, recovery) but leaves webhook execute live so already-accepted/202 deliveries can still finish discovery; reopening admission without restart would leave a ready-looking daemon with dead scheduler/cleanup producers.
 4. After restart, startup recovery classifies durable observations conservatively (#581); do not manually requeue uncertain work.
 
 **Persistence concept trade-off (R5):**
@@ -283,8 +283,9 @@ mid-state named in #580).
 
 **Authority (no dual ready):** `Admission` is the only readiness Authority.
 `AllowMutations` (HTTP + tunnel accept) and `AllowClaim` (scheduler tick,
-durable claims, spawn leases, worktree cleanup, webhook worker discovery) are
-projections under the same mutex. `ownershipAcquired` is **not** a gate.
+durable claims, spawn leases, worktree cleanup, webhook **accept**) are
+projections under the same mutex. Already-accepted webhook worker discovery is
+a post-202 commitment and is not re-gated. `ownershipAcquired` is **not** a gate.
 
 **Mutation surface matrix (not-ready / degraded / stopping):**
 
@@ -296,7 +297,7 @@ projections under the same mutex. `ownershipAcquired` is **not** a gate.
 | Durable `ClaimNext*` / operation-lease admit | `AllowClaim` immediately before each claim | No new claims |
 | Agent spawn leases | registry `allowSpawn` → `AllowClaim` | No new agent starts |
 | Webhook tunnel deliveries | `allowForward` → `AllowMutations` before Forward | **503** |
-| Webhook forwarder accept + worker discovery | `AllowExecute` → same projection; accept-time refuse + execute-time recheck; `MarkDegraded`/`BeginShutdown` call `CancelExecute` | No discovery enqueue / no `CreateOrGetActiveByDedupe` after close (including mid-discovery that already passed AllowExecute) |
+| Webhook forwarder accept + worker discovery | `AllowExecute` / `AllowExecuteWhile` at **accept only** (same claim projection); `BeginShutdown`/`Stop` call `CancelExecute`; sticky `MarkDegraded` does **not** cancel accepted discovery | New accepts refuse (**503**); already-accepted/202 queue still completes `CreateOrGetActiveByDedupe` after degrade (no GitHub retry for 202); process-exit aborts in-flight discovery |
 | Worktree cleanup pass | `AllowClaim` before pass | No filesystem/DB cleanup mutations while closed |
 | Config file hot-reload loop | not gated (policy Authority ADR-0014) | May refresh hot-safe fields; work-producing side effects still hit scheduler/HTTP gates |
 | Deferred reviewer recovery requeue | `AllowClaim` before requeue; `MarkDegraded`/`BeginShutdown` cancel recovery context | No requeue after close |

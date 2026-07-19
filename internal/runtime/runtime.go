@@ -439,8 +439,9 @@ func (r *Runtime) Stop(reason string) {
 // Cancels deferred reviewer recovery so a post-ready recovery goroutine cannot
 // still requeue loops/queue items after admission is already stopping; the
 // wait for recovery exit remains in Runtime.Stop via stopDeferredReviewerRecovery.
-// Cancels webhook-forward discovery so a worker that already passed
-// AllowExecute cannot finish CreateOrGetActiveByDedupe after admission closes.
+// Cancels webhook-forward discovery so process exit can abort in-flight
+// CreateOrGetActiveByDedupe promptly (sticky MarkDegraded does not cancel
+// webhook execute — accepted/202 deliveries must still complete).
 //
 // Shutdown order (ADR-0015 / #577): close admission → cancel producers →
 // confirmed-drain handles (agents + tracked non-agent shell/trusted-review).
@@ -459,7 +460,7 @@ func (r *Runtime) BeginShutdown(reason string) {
 	// cancels under admission.mu. Do not take r.mu while holding admission.mu
 	// (other paths lock r.mu then read admission — that order would deadlock).
 	cancels := r.snapshotWorkProducerCancels()
-	_ = r.admission.BeginShutdownThen(reason, cancels.invoke)
+	_ = r.admission.BeginShutdownThen(reason, cancels.invokeForShutdown)
 	// Close agent spawn admission and confirmed-drain live handles — agents and
 	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
 	// registry; non-agent owners were canceled above.
@@ -482,7 +483,10 @@ type workProducerCancels struct {
 	forwarder interface{ CancelExecute() }
 }
 
-func (c workProducerCancels) invoke() {
+// invokeForDegrade cancels sticky-degrade producers but leaves webhook execute
+// live: Forward may already have returned accepted/202 for queued discovery,
+// and GitHub will not retry that delivery while the daemon stays up.
+func (c workProducerCancels) invokeForDegrade() {
 	if c.scheduler != nil {
 		c.scheduler()
 	}
@@ -492,6 +496,12 @@ func (c workProducerCancels) invoke() {
 	if c.cleanup != nil {
 		c.cleanup()
 	}
+}
+
+// invokeForShutdown cancels all work producers including webhook discovery so
+// process exit can abort in-flight CreateOrGetActiveByDedupe promptly.
+func (c workProducerCancels) invokeForShutdown() {
+	c.invokeForDegrade()
 	if c.forwarder != nil {
 		c.forwarder.CancelExecute()
 	}
@@ -512,12 +522,11 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 }
 
 // cancelWorkProducers aborts in-flight scheduler ticks, deferred recovery,
-// webhook discovery, and worktree cleanup without waiting for drain or killing
-// agent handles. Used by BeginShutdown and MarkDegraded so a producer that
-// already passed AllowClaim/AllowExecute cannot finish CreateOrGetActiveByDedupe
-// or CleanupWorktree (plus cleaned-record/event writes) after close.
+// worktree cleanup, and (for process-exit paths) webhook discovery. Prefer
+// invokeForDegrade vs invokeForShutdown at the call site: sticky degrade must
+// not CancelExecute accepted webhook work.
 func (r *Runtime) cancelWorkProducers() {
-	r.snapshotWorkProducerCancels().invoke()
+	r.snapshotWorkProducerCancels().invokeForShutdown()
 }
 
 // StorageRetained reports whether Stop skipped SQLite close after a drain
@@ -578,24 +587,27 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 }
 
 // MarkDegraded sticks admission until process restart and cancels work-producing
-// contexts so in-flight discovery/enqueue/cleanup that already passed AllowClaim
-// or AllowExecute cannot complete CreateOrGetActiveByDedupe or CleanupWorktree
-// after the transition. Unlike BeginShutdown, this does not drain active agent
-// handles — existing executions continue; only producers of new work (and
-// cleanup mutations) are aborted. There is no clear-and-resume path: canceled
-// producer contexts are not recreated; operators must restart looperd.
+// contexts (scheduler, recovery, cleanup) so new discovery/claims/cleanup that
+// already passed AllowClaim cannot complete after the transition. Unlike
+// BeginShutdown, this does not drain active agent handles and does not
+// CancelExecute webhook workers: Forward may already have returned accepted/202
+// for in-memory queue entries, and sticky degrade leaves the daemon up with no
+// GitHub retry. New webhook accepts are still refused via AllowExecute /
+// AllowExecuteWhile. There is no clear-and-resume path: canceled producer
+// contexts are not recreated; operators must restart looperd.
 func (r *Runtime) MarkDegraded(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
 	}
 	// Snapshot cancel targets under r.mu, then hold admission.mu across the
 	// degraded transition + cancel invoke so there is no window where admission
-	// is already closed but cleanup/webhook contexts are still live. A
+	// is already closed but cleanup/scheduler contexts are still live. A
 	// point-in-time AllowClaim winner must either start remove while still
 	// ready, or observe cancel after close — never start git worktree remove
-	// after close with a live context.
+	// after close with a live context. Webhook execCtx stays live so accepted
+	// deliveries can still finish CreateOrGetActiveByDedupe.
 	cancels := r.snapshotWorkProducerCancels()
-	return r.admission.TransitionThen(AdmissionDegraded, reason, cancels.invoke)
+	return r.admission.TransitionThen(AdmissionDegraded, reason, cancels.invokeForDegrade)
 }
 
 func (r *Runtime) WaitForShutdown() {
