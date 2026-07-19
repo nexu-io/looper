@@ -177,18 +177,13 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		LastStartedAt: stringPtr(startedAt),
 		LastStatus:    "running",
 	}
-	// Synchronize the start-event write with admission. executeWorktreeCleanupPass
-	// only has a point-in-time AllowClaim; if MarkDegraded wins after that check
-	// and before this write, cancelWorkProducers runs too late to prevent a
-	// durable worktree.cleanup.started event after close. Hold the admission
-	// mutex across the emission boundary (same primitive as CleanupWorktree).
-	if err := r.WithAllowClaim(func() {
-		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.started", nil, map[string]any{
-			"dryRun":     summary.DryRun,
-			"maxPerTick": worktreeCleanupMaxPerTick(cfg),
-			"startedAt":  startedAt,
-		})
-	}); err != nil {
+	// Gate the start event with a point-in-time AllowClaim, then append outside
+	// admission.mu. Holding WithAllowClaim across the SQLite write stalls
+	// MarkDegraded/BeginShutdown (they need that mutex to cancel producers), so
+	// the cancellation that would unblock a busy ExecContext cannot run.
+	// Already-closed admission still omits durable events; a concurrent close
+	// during the write is accepted for telemetry rather than deadlocking drain.
+	if err := r.AllowClaim(); err != nil {
 		summary.LastError = err.Error()
 		summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
 		summary.LastStatus = "completed"
@@ -196,6 +191,11 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		// in-memory summary for status surfaces.
 		return summary
 	}
+	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.started", nil, map[string]any{
+		"dryRun":     summary.DryRun,
+		"maxPerTick": worktreeCleanupMaxPerTick(cfg),
+		"startedAt":  startedAt,
+	})
 
 	plan, err := (&worktreecleanup.Service{
 		Repos:  repos,
