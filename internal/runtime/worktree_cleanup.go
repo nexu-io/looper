@@ -406,26 +406,27 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	if cfg.Daemon.WorktreeCleanup.DryRun {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dry_run")
 	}
-	// Hold admission across destructive CleanupWorktree + durable cleaned/failure
-	// records so MarkDegraded/BeginShutdown cannot close admission between the
-	// gate and the filesystem/DB mutation (same WithAllowWork primitive as
-	// webhook accept+enqueue). A point-in-time AllowClaim leaves a window where
-	// MarkDegraded wins, then cancelWorkProducers runs, but this goroutine still
-	// enters CleanupWorktree after close — and context cancel cannot undo a git
-	// remove that has already started.
+	// Point-in-time gate only — do NOT hold admission.mu across CleanupWorktree.
+	// BeginShutdown/MarkDegraded must acquire that mutex before cancelWorkProducers;
+	// holding it for a cancellable git remove deadlocks degrade/shutdown on a
+	// stalled `git worktree remove` (cleanup waits for cancel; transition waits
+	// for cleanup). Context cancel after admission close still aborts in-flight
+	// git; durable cleaned/failure writes recheck admission under a short hold.
+	if err := r.AllowClaim(); err != nil {
+		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
+	}
+	if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); cleanErr != nil {
+		return r.recordWorktreeCleanupFailure(ctx, repos, candidate, cleanErr)
+	}
 	var result worktreeCleanupCandidateResult
-	err := r.WithAllowClaim(func() {
-		if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); cleanErr != nil {
-			// Already holding admission — use the unlocked write helper to avoid
-			// re-entering WithAllowClaim (would deadlock on admission.mu).
-			result = r.writeWorktreeCleanupFailure(ctx, repos, candidate, cleanErr)
-			return
-		}
+	if err := r.WithAllowClaim(func() {
 		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.cleaned", &candidate, map[string]any{"reason": reason})
 		result = worktreeCleanupCandidateResult{status: "cleaned"}
-	})
-	if err != nil {
-		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
+	}); err != nil {
+		// Filesystem remove may have completed after admission closed; do not
+		// append durable cleaned after close. Surface cleaned for in-memory
+		// summary so operators see the mutation that already happened.
+		return worktreeCleanupCandidateResult{status: "cleaned", message: err.Error()}
 	}
 	return result
 }
