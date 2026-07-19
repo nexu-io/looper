@@ -2091,10 +2091,68 @@ func TestQueueClaimNextRefusesAlreadyCancelledContextWithoutMutating(t *testing.
 		t.Fatalf("queue item = %#v, want still queued (no durable claim)", got)
 	}
 
-	// Live context still claims successfully (WithoutCancel path returns the row).
+	// Live context still claims successfully (detached path returns the row).
 	claimed, err = repos.Queue.ClaimNext(ctx, now, "scheduler")
 	if err != nil || claimed == nil || claimed.ID != queueID {
 		t.Fatalf("ClaimNext live = (%#v, %v), want %s", claimed, err, queueID)
+	}
+}
+
+func TestClaimCtxForDurableClaimPreservesDeadlineAndDetachesCancel(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Now().Add(150 * time.Millisecond)
+	parent, cancelParent := context.WithDeadline(context.Background(), deadline)
+	defer cancelParent()
+
+	claimCtx, stop, err := claimCtxForDurableClaim(parent)
+	if err != nil {
+		t.Fatalf("claimCtxForDurableClaim: %v", err)
+	}
+	defer stop()
+
+	gotDeadline, ok := claimCtx.Deadline()
+	if !ok {
+		t.Fatal("claim context must retain the caller deadline")
+	}
+	if !gotDeadline.Equal(deadline) {
+		t.Fatalf("deadline = %v, want %v", gotDeadline, deadline)
+	}
+
+	// Parent cancel must not cancel the claim context (committed-but-unscanned case).
+	cancelParent()
+	if err := claimCtx.Err(); err != nil {
+		t.Fatalf("claimCtx.Err after parent cancel = %v, want nil", err)
+	}
+
+	// Deadline must still fire on the detached claim context.
+	select {
+	case <-claimCtx.Done():
+		if !errors.Is(claimCtx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("claimCtx.Err = %v, want DeadlineExceeded", claimCtx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("claim context did not honor retained deadline")
+	}
+}
+
+func TestClaimCtxForDurableClaimNoDeadlineWithoutParentDeadline(t *testing.T) {
+	t.Parallel()
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	claimCtx, stop, err := claimCtxForDurableClaim(parent)
+	if err != nil {
+		t.Fatalf("claimCtxForDurableClaim: %v", err)
+	}
+	defer stop()
+	if _, ok := claimCtx.Deadline(); ok {
+		t.Fatal("claim context must not invent a deadline when parent has none")
+	}
+	cancelParent()
+	if err := claimCtx.Err(); err != nil {
+		t.Fatalf("claimCtx.Err after parent cancel = %v, want nil", err)
 	}
 }
 

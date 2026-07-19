@@ -1829,25 +1829,37 @@ func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, cl
 }
 
 // claimCtxForDurableClaim refuses already-cancelled callers, then detaches
-// cancellation from the UPDATE...RETURNING. If the parent context is cancelled
-// after SQLite commits the claim but before the row is scanned, QueryRowContext
-// would return ctx.Err without the claimed item and strand a durable running
-// row with no owner (ADR-0015 R6 / #579).
-func claimCtxForDurableClaim(ctx context.Context) (context.Context, error) {
+// cancellation from the UPDATE...RETURNING while preserving any caller
+// deadline. If the parent context is cancelled after SQLite commits the claim
+// but before the row is scanned, QueryRowContext would return ctx.Err without
+// the claimed item and strand a durable running row with no owner
+// (ADR-0015 R6 / #579). context.WithoutCancel also strips Deadline, so a
+// WithTimeout caller would otherwise hang indefinitely on a blocked SQLite
+// claim; re-apply the deadline on the detached context. The returned cancel
+// must be deferred by the caller to free the deadline timer.
+func claimCtxForDurableClaim(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	noop := func() {}
 	if ctx == nil {
-		return context.Background(), nil
+		return context.Background(), noop, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return context.WithoutCancel(ctx), nil
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		// WithoutCancel strips Deadline; re-apply so QueryRowContext still bounds.
+		withDeadline, cancel := context.WithDeadline(detached, deadline)
+		return withDeadline, cancel, nil
+	}
+	return detached, noop, nil
 }
 
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
-	claimCtx, err := claimCtxForDurableClaim(ctx)
+	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+extraPredicate+scheduledQueueOrderBy+`
@@ -1876,10 +1888,11 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 }
 
 func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy, queueType string) (*QueueItemRecord, error) {
-	claimCtx, err := claimCtxForDurableClaim(ctx)
+	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+`
