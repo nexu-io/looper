@@ -4131,8 +4131,12 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 		// handback) is the authority that clears the gate.
 
 		// Stop/bind race: never start the processor without an explicit permit
-		// when OperationOwner is wired. (Tests without owner skip this gate.)
-		if input.OperationOwner != nil && !permit.Valid() {
+		// when OperationOwner is wired. Also refuse when the live lease was
+		// cancelled after BindClaim (BeginLoopStop / BeginShutdown): permit
+		// remains Valid() but the operation must not start. (Tests without
+		// owner skip this gate.)
+		leaseCancelled := lease != nil && lease.Context().Err() != nil
+		if input.OperationOwner != nil && (!permit.Valid() || leaseCancelled) {
 			if finErr := finalizeCancelledClaim(ctx, item, input, now); finErr != nil {
 				errList = append(errList, finErr)
 				if input.OperationOwner != nil {
@@ -4164,10 +4168,37 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 		}
 		processFn := process
 		run := func() {
-			runErr := processFn(ctx)
+			// Processor work is owned by the operation lease, not the detached
+			// scheduler dispatch context. dispatchOwnedQueueClaims uses
+			// context.WithoutCancel so finalize survives BeginShutdown, but
+			// that must not keep the processor alive after the lease is
+			// cancelled (post-bind stop race, including delayed AsyncRunner).
+			processCtx := ctx
+			if lease != nil {
+				processCtx = lease.Context()
+				if processCtx.Err() != nil {
+					if finErr := finalizeCancelledClaim(ctx, item, input, now); finErr != nil {
+						if input.OperationOwner != nil {
+							input.OperationOwner.ReportHardPersistFailure(finErr)
+						}
+						if input.Logger != nil {
+							input.Logger.Warn("scheduler queue finalize failed; retaining operation lease", map[string]any{
+								"type": item.Type, "queueItemId": item.ID, "error": finErr.Error(),
+							})
+						}
+						// Retain ownership — do not Release.
+						return
+					}
+					lease.Release()
+					return
+				}
+			}
+			runErr := processFn(processCtx)
 			if lease != nil {
 				// Finalize-before-release: only drop ownership after durable
-				// complete/cancel/requeue (or typed Fail recovery).
+				// complete/cancel/requeue (or typed Fail recovery). Keep using
+				// the detached dispatch ctx so durable writes still succeed
+				// when the lease was cancelled mid-run.
 				if finErr := ensureClaimFinalized(ctx, item, runErr, input, now); finErr != nil {
 					if input.OperationOwner != nil {
 						input.OperationOwner.ReportHardPersistFailure(finErr)
