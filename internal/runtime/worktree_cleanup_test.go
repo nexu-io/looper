@@ -349,7 +349,6 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	}
 }
 
-
 func (f worktreeCleanupFixture) seedWorktree(t *testing.T, id, branch string, createDir bool) storage.WorktreeRecord {
 	t.Helper()
 	return f.seedWorktreeAt(t, id, branch, createDir, f.now)
