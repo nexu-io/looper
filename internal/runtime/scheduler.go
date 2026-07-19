@@ -3990,6 +3990,11 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 // must still requeue under retained ownership (same pattern as
 // dispatchOwnedQueueClaims). Passing the cancelled scheduler ctx would make
 // MarkRetry fail immediately, report hard persist failure, and strand the claim.
+//
+// Pause/terminal stop may CancelByLoop the claim to cancelled after ClaimNext*
+// and before BindClaim refuses. MarkRetry has no status predicate, so requeue
+// must only run while the row is still running — an already terminal row is
+// treated as durable success so stop cannot resurrect cancelled work.
 func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return errors.New("queue repository is not configured for cancelled-claim finalize")
@@ -3998,6 +4003,15 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 		ctx = context.WithoutCancel(ctx)
 	} else {
 		ctx = context.Background()
+	}
+	// Concurrent CancelByLoop (pause/terminate) may already have left running.
+	// Do not MarkRetry a terminal row — that would resurrect it to queued.
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if got == nil || got.Status != "running" {
+		return nil
 	}
 	if now == nil {
 		now = time.Now
@@ -4015,7 +4029,7 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 		return err
 	}
 	// Verify durable observation: MarkRetry does not return conflict on no-op.
-	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	got, err = input.Repos.Queue.GetByID(ctx, item.ID)
 	if err != nil {
 		return err
 	}

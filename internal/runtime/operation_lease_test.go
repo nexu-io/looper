@@ -619,6 +619,88 @@ func TestFinalizeCancelledClaimUsesDetachedContext(t *testing.T) {
 	}
 }
 
+// Contract: when CancelByLoop terminalizes a claim after ClaimNext* and before
+// BindClaim refuse handling, finalizeCancelledClaim must not MarkRetry the
+// cancelled row back to queued (stop must not resurrect cancelled work).
+func TestFinalizeCancelledClaimPreservesExternalCancellation(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos := storage.NewRepositories(coordinator.DB())
+	projectID := "project_fin_cancel_term"
+	loopID := "loop_fin_cancel_term"
+	queueID := "queue_fin_cancel_term"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "FinCancelTerm", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 6, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "stopping", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:fin_cancel_term", Priority: storage.QueuePriorityWorker, Status: "running",
+		AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert: %v", err)
+	}
+
+	reg := NewActiveExecutionRegistry()
+	lease, err := reg.AdmitOperation(context.Background(), OperationMeta{ClaimedBy: "scheduler"})
+	if err != nil {
+		t.Fatalf("AdmitOperation: %v", err)
+	}
+	item := storage.QueueItemRecord{ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", Status: "running", Attempts: 1}
+	// Claim is bound ownership-wise only after BindClaim; here CancelByLoop races
+	// before bind, then BindClaim refuses — the refuse path calls finalizeCancelledClaim.
+	reason := "loop terminated"
+	if _, err := repos.Queue.CancelByLoop(context.Background(), loopID, nowISO, &reason); err != nil {
+		t.Fatalf("CancelByLoop: %v", err)
+	}
+	release, err := reg.BeginLoopStop(loopID, "terminal stop")
+	if err != nil {
+		t.Fatalf("BeginLoopStop: %v", err)
+	}
+	defer release()
+	permit, bindErr := lease.BindClaim(item)
+	if !errors.Is(bindErr, ErrOperationLeaseCancelled) {
+		t.Fatalf("BindClaim = %v, want ErrOperationLeaseCancelled", bindErr)
+	}
+	if permit.Valid() {
+		t.Fatal("processor must not receive a valid permit after cancelled lease")
+	}
+
+	if err := finalizeCancelledClaim(context.Background(), item, defaultSchedulerTickInput{
+		Repos: repos,
+		Now:   func() time.Time { return now },
+	}, func() time.Time { return now }); err != nil {
+		t.Fatalf("finalizeCancelledClaim after external cancel: %v", err)
+	}
+	lease.Release()
+
+	got, err := repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.Status != "cancelled" {
+		t.Fatalf("after refused bind finalize = %#v, want cancelled (not resurrected to queued)", got)
+	}
+	if reg.OwnsQueueClaim(queueID) {
+		t.Fatal("ownership must drop after terminal cancel observed + Release")
+	}
+}
+
 func TestDurableCompleteClaimReleasesWhenExternallyCancelled(t *testing.T) {
 	t.Parallel()
 
