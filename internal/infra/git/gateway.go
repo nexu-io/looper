@@ -113,6 +113,11 @@ type CleanupWorktreeInput struct {
 	WorktreePath      string
 	Branch            string
 	ProtectedBranches []string
+	// AdmitStart, when set, wraps the destructive `git worktree remove`
+	// process Start so callers can hold admission across Start only (not
+	// Wait). Runtime cleanup uses this for R7 atomicity with MarkDegraded:
+	// point-in-time AllowClaim leaves a window before cmd.Start.
+	AdmitStart func(start func() error) error
 }
 
 // DiscardWorktreeChangesInput discards tracked and untracked local changes in a
@@ -489,6 +494,8 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInput) error {
 	// Refuse before any filesystem mutation when the cleanup context was
 	// canceled (MarkDegraded/BeginShutdown cancel under admission.mu).
+	// When AdmitStart is set, Start is rechecked under that gate; this is the
+	// pre-validation fast path only.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -498,7 +505,7 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: input.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
 		return err
 	}
-	if err := g.runGit(ctx, input.RepoPath, nil, "worktree", "remove", "--force", input.WorktreePath); err != nil {
+	if err := g.runGitWithStartGate(ctx, input.RepoPath, nil, input.AdmitStart, "worktree", "remove", "--force", input.WorktreePath); err != nil {
 		if !missingWorktreeErrorPattern.MatchString(err.Error()) {
 			return err
 		}
@@ -1201,6 +1208,11 @@ func (g *Gateway) runGit(ctx context.Context, cwd string, env map[string]string,
 	return err
 }
 
+func (g *Gateway) runGitWithStartGate(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, args ...string) error {
+	_, err := g.runGitResultOnceWithStartGate(ctx, cwd, env, startGate, args...)
+	return err
+}
+
 func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
 	var result shell.Result
 	var err error
@@ -1221,7 +1233,11 @@ func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]s
 }
 
 func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
-	result, err := shell.Run(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env})
+	return g.runGitResultOnceWithStartGate(ctx, cwd, env, nil, args...)
+}
+
+func (g *Gateway) runGitResultOnceWithStartGate(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, args ...string) (shell.Result, error) {
+	result, err := shell.Run(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env, StartGate: startGate})
 	if err == nil {
 		return result, nil
 	}

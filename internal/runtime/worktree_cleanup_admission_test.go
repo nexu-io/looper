@@ -66,8 +66,10 @@ func TestCleanWorktreeCandidateRefusesWhenAdmissionClosed(t *testing.T) {
 	if result.status != "skipped" || !strings.Contains(result.message, "degraded") {
 		t.Fatalf("result = %#v, want skipped admission degraded", result)
 	}
-	if len(git.cleanupCalls) != 0 {
-		t.Fatalf("cleanupCalls = %#v, want none while degraded", git.cleanupCalls)
+	// CleanupWorktree is entered so AdmitStart can refuse under the gate; the
+	// fake records the attempt, but onCleanup must not run (no mutation body).
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("cleanupCalls = %#v, want one AdmitStart-refused attempt", git.cleanupCalls)
 	}
 }
 

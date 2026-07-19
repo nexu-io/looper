@@ -9,16 +9,16 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 )
 
-// Contract (#592 review): cleanWorktreeCandidate must not start CleanupWorktree
-// after admission closes — MarkDegraded cancels producers under the same
-// admission.mu as the state flip, and the candidate rechecks ctx after AllowClaim.
+// Contract (#592 review): cleanWorktreeCandidate must not start the remove
+// after the cleanup context is canceled — AdmitStart rechecks ctx under the
+// same WithAllowClaim hold as process Start.
 func TestCleanWorktreeCandidateSkipsWhenContextCanceledAfterAllowClaim(t *testing.T) {
 	t.Parallel()
 
 	fixture := newWorktreeCleanupFixture(t)
 	worktree := fixture.seedWorktree(t, "wt_ctx_skip", "feature/ctx-skip", true)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // simulate MarkDegraded cancelWorkProducers after AllowClaim passed
+	cancel() // simulate MarkDegraded cancelWorkProducers before Start
 
 	git := &fakeWorktreeCleanupGit{
 		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
@@ -31,9 +31,142 @@ func TestCleanWorktreeCandidateSkipsWhenContextCanceledAfterAllowClaim(t *testin
 	if result.status != "skipped" {
 		t.Fatalf("result = %#v, want skipped when ctx already canceled", result)
 	}
-	if len(git.cleanupCalls) != 0 {
-		t.Fatalf("cleanupCalls = %#v, want none when ctx canceled before remove", git.cleanupCalls)
+	// AdmitStart refuses before onCleanup; CleanupWorktree may still be entered
+	// for validation, but the fake records the call only after append — the
+	// important contract is no onCleanup mutation (cleanupCalls with AdmitStart
+	// failure returns before onCleanup; call is still appended for observability).
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("cleanupCalls = %#v, want one attempt that refused at AdmitStart", git.cleanupCalls)
 	}
+}
+
+// Contract (#592 review): AdmitStart holds admission.mu across the Start gate
+// so MarkDegraded cannot close admission between allow and process launch.
+// The long remove body stays outside the hold (no degrade deadlock).
+func TestCleanWorktreeCandidateAdmitStartHoldsAdmissionAcrossStart(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_admit_start", "feature/admit-start", true)
+
+	enteredStart := make(chan struct{})
+	releaseStart := make(chan struct{})
+	bodyStarted := make(chan struct{})
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
+			{Path: worktree.WorktreePath, Branch: worktree.Branch},
+		}},
+		clean: map[string]bool{worktree.WorktreePath: true},
+		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
+			close(bodyStarted)
+			updated, err := fixture.repos.Worktrees.GetByID(context.Background(), worktree.ID)
+			if err != nil {
+				return err
+			}
+			nowISO := fixture.now.Format("2006-01-02T15:04:05.000Z")
+			updated.Status = "cleaned"
+			updated.CleanedAt = &nowISO
+			updated.UpdatedAt = nowISO
+			return fixture.repos.Worktrees.Upsert(context.Background(), *updated)
+		},
+	}
+	// Override CleanupWorktree path via onCleanup alone is insufficient: inject
+	// a blocking AdmitStart by wrapping through a custom git that holds during start.
+	blockingGit := &admitStartHoldGit{
+		fake:         git,
+		enteredStart: enteredStart,
+		releaseStart: releaseStart,
+		wantWorktree: worktree.WorktreePath,
+	}
+
+	done := make(chan worktreeCleanupCandidateResult, 1)
+	go func() {
+		done <- fixture.runtime.cleanWorktreeCandidate(context.Background(), fixture.repos, blockingGit, fixture.config, fixture.project, worktree, fixture.root, "clean")
+	}()
+
+	select {
+	case <-enteredStart:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for AdmitStart critical section")
+	}
+
+	// MarkDegraded must block while AdmitStart holds admission.mu.
+	degradeDone := make(chan error, 1)
+	go func() {
+		degradeDone <- fixture.runtime.MarkDegraded("during admit start")
+	}()
+	select {
+	case err := <-degradeDone:
+		t.Fatalf("MarkDegraded completed while AdmitStart held admission: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// expected: still blocked
+	}
+
+	// Body must not run until Start gate releases (Start-only hold).
+	select {
+	case <-bodyStarted:
+		t.Fatal("remove body started while AdmitStart still held")
+	default:
+	}
+
+	close(releaseStart)
+
+	select {
+	case err := <-degradeDone:
+		if err != nil {
+			t.Fatalf("MarkDegraded() after AdmitStart released error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkDegraded did not complete after AdmitStart released")
+	}
+
+	select {
+	case result := <-done:
+		if result.status != "cleaned" {
+			t.Fatalf("result = %#v, want cleaned after admitted start", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanWorktreeCandidate did not return")
+	}
+	if fixture.runtime.admission.State() != AdmissionDegraded {
+		t.Fatalf("admission.State() = %q, want degraded", fixture.runtime.admission.State())
+	}
+}
+
+// admitStartHoldGit blocks inside AdmitStart to prove the hold covers Start only.
+type admitStartHoldGit struct {
+	fake         *fakeWorktreeCleanupGit
+	enteredStart chan struct{}
+	releaseStart chan struct{}
+	wantWorktree string
+}
+
+func (g *admitStartHoldGit) ListWorktrees(ctx context.Context, repoPath string) ([]gitinfra.WorktreeListEntry, error) {
+	return g.fake.ListWorktrees(ctx, repoPath)
+}
+
+func (g *admitStartHoldGit) WorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
+	return g.fake.WorktreeClean(ctx, worktreePath)
+}
+
+func (g *admitStartHoldGit) CleanupWorktree(ctx context.Context, input gitinfra.CleanupWorktreeInput) error {
+	if input.AdmitStart == nil {
+		return g.fake.CleanupWorktree(ctx, input)
+	}
+	// Replace AdmitStart with one that blocks while still invoking the real
+	// runtime gate first would double-hold; instead nest: runtime's AdmitStart
+	// is already the outer hold. We need to block *inside* that hold.
+	// cleanWorktreeCandidate always sets AdmitStart; wrap it so the hold body
+	// blocks before calling start.
+	inner := input.AdmitStart
+	input.AdmitStart = func(start func() error) error {
+		return inner(func() error {
+			close(g.enteredStart)
+			<-g.releaseStart
+			return start()
+		})
+	}
+	return g.fake.CleanupWorktree(ctx, input)
 }
 
 // Contract (#580 / #592 review): MarkDegraded mid-pass must refuse remaining

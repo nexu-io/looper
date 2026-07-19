@@ -35,6 +35,48 @@ func TestRunCapturesStdoutAndStderr(t *testing.T) {
 	}
 }
 
+// Contract (#592 review): StartGate wraps cmd.Start so callers can hold an
+// external critical section across process launch only (not Wait).
+func TestRunStartGateWrapsProcessStart(t *testing.T) {
+	t.Parallel()
+
+	var gateCalls, startCalls int
+	result, err := Run(context.Background(), Options{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf gated`},
+		StartGate: func(start func() error) error {
+			gateCalls++
+			startCalls++
+			return start()
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if gateCalls != 1 || startCalls != 1 {
+		t.Fatalf("gateCalls=%d startCalls=%d, want 1 each", gateCalls, startCalls)
+	}
+	if result.Stdout != "gated" {
+		t.Fatalf("Stdout = %q, want gated", result.Stdout)
+	}
+}
+
+func TestRunStartGateRefusalDoesNotStartProcess(t *testing.T) {
+	t.Parallel()
+
+	refuse := errors.New("admission closed")
+	_, err := Run(context.Background(), Options{
+		Command: "/bin/sh",
+		Args:    []string{"-c", `printf should-not-run`},
+		StartGate: func(start func() error) error {
+			return refuse
+		},
+	})
+	if !errors.Is(err, refuse) {
+		t.Fatalf("Run() error = %v, want refuse", err)
+	}
+}
+
 func TestRunReturnsCommandExecutionErrorOnNonZeroExit(t *testing.T) {
 	t.Parallel()
 	result, err := Run(context.Background(), Options{

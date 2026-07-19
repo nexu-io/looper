@@ -406,23 +406,29 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	if cfg.Daemon.WorktreeCleanup.DryRun {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dry_run")
 	}
-	// Do NOT hold admission.mu across CleanupWorktree: BeginShutdown/MarkDegraded
-	// take that mutex for the closed transition + cancelWorkProducers; holding it
-	// for a stalled `git worktree remove` deadlocks degrade/shutdown.
+	// Do NOT hold admission.mu across the full CleanupWorktree Wait: BeginShutdown/
+	// MarkDegraded take that mutex for the closed transition + cancelWorkProducers;
+	// holding it for a stalled `git worktree remove` deadlocks degrade/shutdown.
 	//
-	// Synchronization with admission closure: MarkDegraded/BeginShutdown cancel
-	// producers under the same admission.mu as the state flip, so a successful
-	// AllowClaim that is followed by a live ctx means either remove starts while
-	// still ready, or the concurrent close already canceled ctx. Recheck both
-	// before starting the filesystem remove — cancel cannot undo a remove that
-	// has begun (ADR-0015 R7: no filesystem cleanup mutations after close).
-	if err := r.AllowClaim(); err != nil {
-		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
-	}
-	if err := ctx.Err(); err != nil {
-		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
-	}
-	if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); cleanErr != nil {
+	// R7 atomicity with admission closure: point-in-time AllowClaim + ctx.Err
+	// leave a window before cmd.Start where MarkDegraded can close admission and
+	// cancel, yet git worktree remove can still Start (cancellation is not a
+	// reservation synchronized with process start). AdmitStart holds WithAllowClaim
+	// only across Start; retry waits and Wait/Drain stay outside so cancel can run.
+	if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{
+		ProjectID:         candidate.ProjectID,
+		RepoPath:          project.RepoPath,
+		WorktreeRoot:      worktreeRoot,
+		WorktreePath:      candidate.WorktreePath,
+		Branch:            candidate.Branch,
+		ProtectedBranches: []string{derefString(project.BaseBranch)},
+		AdmitStart:        r.admitWorktreeCleanupStart(ctx),
+	}); cleanErr != nil {
+		// AdmitStart refusals (closed admission or canceled ctx before Start)
+		// are skips, not durable cleanup failures — no remove began.
+		if isWorktreeCleanupStartRefused(cleanErr) {
+			return worktreeCleanupCandidateResult{status: "skipped", message: cleanErr.Error()}
+		}
 		return r.recordWorktreeCleanupFailure(ctx, repos, candidate, cleanErr)
 	}
 	var result worktreeCleanupCandidateResult
@@ -436,6 +442,41 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 		return worktreeCleanupCandidateResult{status: "cleaned", message: err.Error()}
 	}
 	return result
+}
+
+// admitWorktreeCleanupStart returns a StartGate that holds claim admission across
+// cmd.Start only. MarkDegraded cannot transition between the allow check and
+// process launch; the hold is released before Wait so degrade can still cancel.
+func (r *Runtime) admitWorktreeCleanupStart(ctx context.Context) func(start func() error) error {
+	return func(start func() error) error {
+		var startErr error
+		if err := r.WithAllowClaim(func() {
+			if err := ctx.Err(); err != nil {
+				startErr = err
+				return
+			}
+			if start != nil {
+				startErr = start()
+			}
+		}); err != nil {
+			return err
+		}
+		return startErr
+	}
+}
+
+// isWorktreeCleanupStartRefused reports errors from AdmitStart that mean the
+// destructive remove never launched (admission closed or context canceled).
+func isWorktreeCleanupStartRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return errors.Is(err, ErrAdmissionNotReady) ||
+		errors.Is(err, ErrAdmissionStopping) ||
+		errors.Is(err, ErrAdmissionDegraded)
 }
 
 // recordWorktreeCleanupSkip holds admission across the worktrees touch and skip

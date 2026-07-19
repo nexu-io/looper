@@ -429,6 +429,14 @@ func (f *fakeWorktreeCleanupGit) WorktreeClean(_ context.Context, worktreePath s
 
 func (f *fakeWorktreeCleanupGit) CleanupWorktree(_ context.Context, input gitinfra.CleanupWorktreeInput) error {
 	f.cleanupCalls = append(f.cleanupCalls, input)
+	// Mirror production: AdmitStart gates process Start only; the long remove
+	// body (onCleanup) runs outside the admission hold so MarkDegraded can
+	// cancel while remove is in flight.
+	if input.AdmitStart != nil {
+		if err := input.AdmitStart(func() error { return nil }); err != nil {
+			return err
+		}
+	}
 	if f.onCleanup != nil {
 		return f.onCleanup(input)
 	}
