@@ -145,6 +145,56 @@ func TestSafetyFloorMarkDegradedCancelsSchedulerContext(t *testing.T) {
 	}
 }
 
+// Contract (#580 review): MarkDegraded cancels the worktree cleanup context so
+// an in-flight CleanupWorktree that already passed AllowClaim observes cancel
+// and cannot finish git remove plus cleaned-record/event writes after close.
+func TestSafetyFloorMarkDegradedCancelsWorktreeCleanupContext(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	rt := New(Options{
+		Config:        cfg,
+		Logger:        &testLogger{},
+		DeferRecovery: true,
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("CompleteStartup() error = %v", err)
+	}
+
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	rt.mu.Lock()
+	rt.worktreeCleanupCancel = cleanupCancel
+	rt.mu.Unlock()
+
+	if err := cleanupCtx.Err(); err != nil {
+		t.Fatalf("cleanup context already done before MarkDegraded: %v", err)
+	}
+
+	if err := rt.MarkDegraded("test hard persist failure"); err != nil {
+		t.Fatalf("MarkDegraded() error = %v", err)
+	}
+	select {
+	case <-cleanupCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("worktree cleanup context was not canceled by MarkDegraded")
+	}
+	if rt.AdmissionState() != AdmissionDegraded {
+		t.Fatalf("AdmissionState() = %q, want degraded", rt.AdmissionState())
+	}
+}
+
 // Contract (#580 review): MarkDegraded cancels in-flight webhook discovery so
 // a worker that already passed AllowExecute cannot CreateOrGetActiveByDedupe
 // after sticky degrade.

@@ -472,10 +472,11 @@ func (r *Runtime) BeginShutdown(reason string) {
 	}
 }
 
-// cancelWorkProducers aborts in-flight scheduler ticks, deferred recovery, and
-// webhook discovery without waiting for drain or killing agent handles.
-// Used by BeginShutdown and MarkDegraded so a producer that already passed
-// AllowClaim/AllowExecute cannot finish CreateOrGetActiveByDedupe after close.
+// cancelWorkProducers aborts in-flight scheduler ticks, deferred recovery,
+// webhook discovery, and worktree cleanup without waiting for drain or killing
+// agent handles. Used by BeginShutdown and MarkDegraded so a producer that
+// already passed AllowClaim/AllowExecute cannot finish CreateOrGetActiveByDedupe
+// or CleanupWorktree (plus cleaned-record/event writes) after close.
 func (r *Runtime) cancelWorkProducers() {
 	if r == nil {
 		return
@@ -483,6 +484,7 @@ func (r *Runtime) cancelWorkProducers() {
 	r.mu.Lock()
 	cancel := r.schedulerCancel
 	recoveryCancel := r.recoveryCancel
+	cleanupCancel := r.worktreeCleanupCancel
 	forwarder := r.webhookForwarder
 	r.mu.Unlock()
 	if cancel != nil {
@@ -490,6 +492,9 @@ func (r *Runtime) cancelWorkProducers() {
 	}
 	if recoveryCancel != nil {
 		recoveryCancel()
+	}
+	if cleanupCancel != nil {
+		cleanupCancel()
 	}
 	if forwarder != nil {
 		forwarder.CancelExecute()
@@ -544,10 +549,11 @@ func (r *Runtime) AllowClaim() error {
 }
 
 // MarkDegraded sticks admission until restart/clear and cancels work-producing
-// contexts so in-flight discovery/enqueue that already passed AllowClaim or
-// AllowExecute cannot complete CreateOrGetActiveByDedupe after the transition.
-// Unlike BeginShutdown, this does not drain active agent handles — existing
-// executions continue; only producers of new work are aborted.
+// contexts so in-flight discovery/enqueue/cleanup that already passed AllowClaim
+// or AllowExecute cannot complete CreateOrGetActiveByDedupe or CleanupWorktree
+// after the transition. Unlike BeginShutdown, this does not drain active agent
+// handles — existing executions continue; only producers of new work (and
+// cleanup mutations) are aborted.
 func (r *Runtime) MarkDegraded(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
