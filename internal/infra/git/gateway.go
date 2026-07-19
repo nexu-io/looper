@@ -487,6 +487,11 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 }
 
 func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInput) error {
+	// Refuse before any filesystem mutation when the cleanup context was
+	// canceled (MarkDegraded/BeginShutdown cancel under admission.mu).
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := g.AssertWritableBranch(input.Branch, input.ProtectedBranches); err != nil {
 		return err
 	}

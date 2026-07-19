@@ -168,6 +168,64 @@ func (a *Admission) MarkDegraded(reason string) error {
 	return a.Transition(AdmissionDegraded, reason)
 }
 
+// TransitionThen applies a legal state change and runs then while still holding
+// a.mu. Runtime.MarkDegraded / BeginShutdown use this so cancelWorkProducers
+// runs in the same critical section as the closed transition — there is no
+// window where admission is already closed but producer cancel has not run yet
+// (worktree cleanup could otherwise start git worktree remove after close).
+// then must not call back into Admission methods that take a.mu (would deadlock).
+func (a *Admission) TransitionThen(to AdmissionState, reason string, then func()) error {
+	if a == nil {
+		return ErrAdmissionStopping
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !legalAdmissionTransition(a.state, to) {
+		return fmt.Errorf("%w: %s → %s", ErrAdmissionIllegalMove, a.state, to)
+	}
+	a.state = to
+	if reason != "" {
+		a.reason = reason
+	}
+	if then != nil {
+		then()
+	}
+	return nil
+}
+
+// BeginShutdownThen is BeginShutdown plus a then callback still holding a.mu
+// after the stopping transition (or when already stopping).
+func (a *Admission) BeginShutdownThen(reason string, then func()) error {
+	if a == nil {
+		if then != nil {
+			then()
+		}
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == AdmissionStopping {
+		if reason != "" {
+			a.reason = reason
+		}
+		if then != nil {
+			then()
+		}
+		return nil
+	}
+	if !legalAdmissionTransition(a.state, AdmissionStopping) {
+		return fmt.Errorf("%w: %s → %s", ErrAdmissionIllegalMove, a.state, AdmissionStopping)
+	}
+	a.state = AdmissionStopping
+	if reason != "" {
+		a.reason = reason
+	}
+	if then != nil {
+		then()
+	}
+	return nil
+}
+
 // AllowMutations is the atomic gate for HTTP mutating ingress. Callers must
 // treat a nil error as admission to mutate; there is no separate ready flag.
 func (a *Admission) AllowMutations() error {

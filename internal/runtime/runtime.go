@@ -455,11 +455,11 @@ func (r *Runtime) BeginShutdown(reason string) {
 	if r == nil {
 		return
 	}
-	_ = r.admission.BeginShutdown(reason)
-	// Cancel work-producing owners before waiting on tracked non-agent handles
-	// so shell validation / trusted-review Run paths observe cancel and enter
-	// their confirmed Kill path promptly (#590 review).
-	r.cancelWorkProducers()
+	// Snapshot cancel targets under r.mu first, then flip stopping + invoke
+	// cancels under admission.mu. Do not take r.mu while holding admission.mu
+	// (other paths lock r.mu then read admission — that order would deadlock).
+	cancels := r.snapshotWorkProducerCancels()
+	_ = r.admission.BeginShutdownThen(reason, cancels.invoke)
 	// Close agent spawn admission and confirmed-drain live handles — agents and
 	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
 	// registry; non-agent owners were canceled above.
@@ -472,33 +472,52 @@ func (r *Runtime) BeginShutdown(reason string) {
 	}
 }
 
+// workProducerCancels is a lock-free snapshot of cancel targets so
+// MarkDegraded/BeginShutdown can invoke them while holding admission.mu
+// without re-entering r.mu (lock-order safety).
+type workProducerCancels struct {
+	scheduler context.CancelFunc
+	recovery  context.CancelFunc
+	cleanup   context.CancelFunc
+	forwarder interface{ CancelExecute() }
+}
+
+func (c workProducerCancels) invoke() {
+	if c.scheduler != nil {
+		c.scheduler()
+	}
+	if c.recovery != nil {
+		c.recovery()
+	}
+	if c.cleanup != nil {
+		c.cleanup()
+	}
+	if c.forwarder != nil {
+		c.forwarder.CancelExecute()
+	}
+}
+
+func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
+	if r == nil {
+		return workProducerCancels{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return workProducerCancels{
+		scheduler: r.schedulerCancel,
+		recovery:  r.recoveryCancel,
+		cleanup:   r.worktreeCleanupCancel,
+		forwarder: r.webhookForwarder,
+	}
+}
+
 // cancelWorkProducers aborts in-flight scheduler ticks, deferred recovery,
 // webhook discovery, and worktree cleanup without waiting for drain or killing
 // agent handles. Used by BeginShutdown and MarkDegraded so a producer that
 // already passed AllowClaim/AllowExecute cannot finish CreateOrGetActiveByDedupe
 // or CleanupWorktree (plus cleaned-record/event writes) after close.
 func (r *Runtime) cancelWorkProducers() {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	cancel := r.schedulerCancel
-	recoveryCancel := r.recoveryCancel
-	cleanupCancel := r.worktreeCleanupCancel
-	forwarder := r.webhookForwarder
-	r.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	if recoveryCancel != nil {
-		recoveryCancel()
-	}
-	if cleanupCancel != nil {
-		cleanupCancel()
-	}
-	if forwarder != nil {
-		forwarder.CancelExecute()
-	}
+	r.snapshotWorkProducerCancels().invoke()
 }
 
 // StorageRetained reports whether Stop skipped SQLite close after a drain
@@ -569,11 +588,14 @@ func (r *Runtime) MarkDegraded(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
 	}
-	if err := r.admission.MarkDegraded(reason); err != nil {
-		return err
-	}
-	r.cancelWorkProducers()
-	return nil
+	// Snapshot cancel targets under r.mu, then hold admission.mu across the
+	// degraded transition + cancel invoke so there is no window where admission
+	// is already closed but cleanup/webhook contexts are still live. A
+	// point-in-time AllowClaim winner must either start remove while still
+	// ready, or observe cancel after close — never start git worktree remove
+	// after close with a live context.
+	cancels := r.snapshotWorkProducerCancels()
+	return r.admission.TransitionThen(AdmissionDegraded, reason, cancels.invoke)
 }
 
 func (r *Runtime) WaitForShutdown() {

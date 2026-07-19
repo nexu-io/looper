@@ -127,12 +127,13 @@ type Options struct {
 	// execute-time recheck covers the race where BeginShutdown closes
 	// admission after Forward already accepted. Nil means ungated (tests).
 	AllowExecute func() error
-	// AllowExecuteWhile, when set, runs the accept-time enqueue critical
-	// section only while admission remains held (wire to Admission.WithAllowWork).
-	// Holding the same mutex as MarkDegraded/BeginShutdown makes check+enqueue
-	// atomic so Forward cannot return 202 for work that CancelExecute will drop
-	// before it is recorded. When nil, Accept falls back to a point-in-time
-	// AllowExecute recheck then enqueue (tests).
+	// AllowExecuteWhile, when set, runs the accept-time enqueue + delivery
+	// bookkeeping critical section only while admission remains held (wire to
+	// Admission.WithAllowWork). Holding the same mutex as MarkDegraded/
+	// BeginShutdown makes check+enqueue+record atomic so Forward cannot return
+	// 202 for work that CancelExecute will drop before the delivery is recorded.
+	// When nil, Accept falls back to a point-in-time AllowExecute recheck then
+	// enqueue (tests).
 	AllowExecuteWhile func(fn func()) error
 }
 
@@ -353,19 +354,36 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	if projectErr != nil {
 		return ForwardResult{}, projectErr
 	}
-	// Accept-time enqueue must be atomic with admission: allowExecute only
-	// holds the Admission mutex while reading state, and MarkDegraded does not
-	// take f.mu — so a point-in-time recheck under f.mu still races before
-	// enqueue records the delivery. Prefer AllowExecuteWhile (Admission.WithAllowWork)
-	// so check+enqueue share the admission mutex; MarkDegraded blocks until
-	// enqueue finishes, then CancelExecute cannot drop an accepted-but-unrecorded
-	// delivery. Fall back to point-in-time AllowExecute for ungated tests.
+	// Accept-time enqueue + delivery bookkeeping must be atomic with admission.
+	// allowExecute only holds the Admission mutex while reading state, and
+	// MarkDegraded does not take f.mu — so a point-in-time recheck under f.mu
+	// still races before the delivery is recorded. Prefer AllowExecuteWhile
+	// (Admission.WithAllowWork) so check+enqueue+record share the admission
+	// mutex; MarkDegraded blocks until the accepted-delivery outcome is written,
+	// so CancelExecute cannot drop discovery that Forward is about to report as
+	// 202 with no retryable delivery record. Fall back to point-in-time
+	// AllowExecute for ungated tests.
 	meta := workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID}
-	var workItems int
+	var result ForwardResult
 	var enqueueErr error
+	recordAcceptedLocked := func(workItems int) {
+		f.deliveries[deliveryID] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
+		if workItems == 0 {
+			f.stats.DeliveriesIgnored++
+			result = ForwardResult{Status: "ignored", Reason: "no_matching_projects", WorkItems: 0}
+			return
+		}
+		f.stats.DeliveriesAccepted++
+		result = ForwardResult{Status: "accepted", WorkItems: workItems}
+	}
 	if f.allowExecuteWhile != nil {
 		if err := f.allowExecuteWhile(func() {
-			workItems, enqueueErr = f.enqueueLocked(projects, routed, meta)
+			workItems, err := f.enqueueLocked(projects, routed, meta)
+			enqueueErr = err
+			if enqueueErr != nil {
+				return
+			}
+			recordAcceptedLocked(workItems)
 		}); err != nil {
 			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
 		}
@@ -375,18 +393,16 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 				return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
 			}
 		}
-		workItems, enqueueErr = f.enqueueLocked(projects, routed, meta)
+		workItems, err := f.enqueueLocked(projects, routed, meta)
+		enqueueErr = err
+		if enqueueErr == nil {
+			recordAcceptedLocked(workItems)
+		}
 	}
 	if enqueueErr != nil {
 		return ForwardResult{}, enqueueErr
 	}
-	f.deliveries[deliveryID] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
-	if workItems == 0 {
-		f.stats.DeliveriesIgnored++
-		return ForwardResult{Status: "ignored", Reason: "no_matching_projects", WorkItems: 0}, nil
-	}
-	f.stats.DeliveriesAccepted++
-	return ForwardResult{Status: "accepted", WorkItems: workItems}, nil
+	return result, nil
 }
 
 func (f *forwarder) Stats() Stats {

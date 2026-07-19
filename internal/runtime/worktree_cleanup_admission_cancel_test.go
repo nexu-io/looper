@@ -9,6 +9,33 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 )
 
+// Contract (#592 review): cleanWorktreeCandidate must not start CleanupWorktree
+// after admission closes — MarkDegraded cancels producers under the same
+// admission.mu as the state flip, and the candidate rechecks ctx after AllowClaim.
+func TestCleanWorktreeCandidateSkipsWhenContextCanceledAfterAllowClaim(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	worktree := fixture.seedWorktree(t, "wt_ctx_skip", "feature/ctx-skip", true)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate MarkDegraded cancelWorkProducers after AllowClaim passed
+
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
+			{Path: worktree.WorktreePath, Branch: worktree.Branch},
+		}},
+		clean: map[string]bool{worktree.WorktreePath: true},
+	}
+
+	result := fixture.runtime.cleanWorktreeCandidate(ctx, fixture.repos, git, fixture.config, fixture.project, worktree, fixture.root, "clean")
+	if result.status != "skipped" {
+		t.Fatalf("result = %#v, want skipped when ctx already canceled", result)
+	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("cleanupCalls = %#v, want none when ctx canceled before remove", git.cleanupCalls)
+	}
+}
+
 // Contract (#580 / #592 review): MarkDegraded mid-pass must refuse remaining
 // cleanup mutations without holding admission.mu across CleanupWorktree.
 // Concurrent MarkDegraded must complete while the cancellable git remove is

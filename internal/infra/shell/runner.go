@@ -270,6 +270,12 @@ func processPIDGone(pid int) bool {
 func startContainedCommand(ctx context.Context, options Options, gracefulShutdown time.Duration, stdout, stderr *boundedBuffer) (*processcontainment.Handle, error) {
 	var lastErr error
 	for attempt := 0; attempt < startAttempts; attempt++ {
+		// Honor cancel before Start so producers that closed admission and
+		// canceled the work context cannot launch a new process (e.g. git
+		// worktree remove) after close — Wait-only cancel cannot undo Start.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if attempt > 0 {
 			wait := startRetryBaseWait * time.Duration(attempt)
 			timer := time.NewTimer(wait)

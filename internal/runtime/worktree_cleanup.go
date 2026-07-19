@@ -406,13 +406,20 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	if cfg.Daemon.WorktreeCleanup.DryRun {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dry_run")
 	}
-	// Point-in-time gate only — do NOT hold admission.mu across CleanupWorktree.
-	// BeginShutdown/MarkDegraded must acquire that mutex before cancelWorkProducers;
-	// holding it for a cancellable git remove deadlocks degrade/shutdown on a
-	// stalled `git worktree remove` (cleanup waits for cancel; transition waits
-	// for cleanup). Context cancel after admission close still aborts in-flight
-	// git; durable cleaned/failure writes recheck admission under a short hold.
+	// Do NOT hold admission.mu across CleanupWorktree: BeginShutdown/MarkDegraded
+	// take that mutex for the closed transition + cancelWorkProducers; holding it
+	// for a stalled `git worktree remove` deadlocks degrade/shutdown.
+	//
+	// Synchronization with admission closure: MarkDegraded/BeginShutdown cancel
+	// producers under the same admission.mu as the state flip, so a successful
+	// AllowClaim that is followed by a live ctx means either remove starts while
+	// still ready, or the concurrent close already canceled ctx. Recheck both
+	// before starting the filesystem remove — cancel cannot undo a remove that
+	// has begun (ADR-0015 R7: no filesystem cleanup mutations after close).
 	if err := r.AllowClaim(); err != nil {
+		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
+	}
+	if err := ctx.Err(); err != nil {
 		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
 	}
 	if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); cleanErr != nil {

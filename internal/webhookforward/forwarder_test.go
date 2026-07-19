@@ -161,9 +161,10 @@ func TestForwardRefusesWhenAllowExecuteClosesBeforeEnqueue(t *testing.T) {
 	fixerRunner.assertCallCount(t, 0)
 }
 
-// Contract (#580 review): AllowExecuteWhile must hold admission across enqueue
-// so MarkDegraded cannot interleave between the gate and recording the delivery.
-// A concurrent closer blocked on the same mutex cannot flip state mid-enqueue.
+// Contract (#580/#592 review): AllowExecuteWhile must hold admission across
+// enqueue AND delivery bookkeeping so MarkDegraded cannot interleave between
+// the gate and the accepted-delivery record (202 without a retryable record).
+// A concurrent closer blocked on the same mutex cannot flip state mid-section.
 func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
@@ -195,7 +196,8 @@ func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
 				return errors.New("daemon admission is degraded")
 			}
 			whileEntered.Store(true)
-			// Concurrent MarkDegraded must block on mu until fn returns.
+			// Concurrent MarkDegraded must block on mu until fn returns
+			// (including delivery bookkeeping written inside fn).
 			close(started)
 			select {
 			case <-degradeDone:
@@ -232,6 +234,30 @@ func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
 	}
 	if !whileEntered.Load() {
 		t.Fatal("AllowExecuteWhile was not used for accept-time enqueue")
+	}
+	// Accepted outcome implies delivery bookkeeping completed inside While fn
+	// (recordAcceptedLocked runs before AllowExecuteWhile returns).
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 1 {
+		t.Fatalf("DeliveriesAccepted = %d, want 1 after atomic accept record", stats.DeliveriesAccepted)
+	}
+	// Duplicate of the same delivery must be observed as deduped (record written).
+	dup, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-atomic",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	// After concurrent degrade flipped ready=false, further While calls refuse.
+	// Dedup is checked before AllowExecuteWhile, so this still returns duplicate
+	// when the delivery was recorded inside the first While hold.
+	if err != nil {
+		// If degrade flipped the pre-lock AllowExecute path... we only set While.
+		// Pre-lock AllowExecute is always nil-error here; While refuses new IDs.
+		// Same delivery ID hits dedup before While.
+		t.Fatalf("duplicate Forward() error = %v, want deduped success after recorded accept", err)
+	}
+	if dup.Status != "duplicate" {
+		t.Fatalf("duplicate Forward() = %#v, want duplicate after accept recorded under hold", dup)
 	}
 	select {
 	case <-degradeDone:
