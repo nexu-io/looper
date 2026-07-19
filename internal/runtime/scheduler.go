@@ -3992,9 +3992,9 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 // MarkRetry fail immediately, report hard persist failure, and strand the claim.
 //
 // Pause/terminal stop may CancelByLoop the claim to cancelled after ClaimNext*
-// and before BindClaim refuses. MarkRetry has no status predicate, so requeue
-// must only run while the row is still running — an already terminal row is
-// treated as durable success so stop cannot resurrect cancelled work.
+// and before BindClaim refuses. MarkRetry is status-guarded on running, so a
+// concurrent terminalization yields a zero-row no-op treated as durable success
+// (stop must not resurrect cancelled work).
 func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
 	if input.Repos == nil || input.Repos.Queue == nil {
 		return errors.New("queue repository is not configured for cancelled-claim finalize")
@@ -4004,20 +4004,13 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 	} else {
 		ctx = context.Background()
 	}
-	// Concurrent CancelByLoop (pause/terminate) may already have left running.
-	// Do not MarkRetry a terminal row — that would resurrect it to queued.
-	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
-	if err != nil {
-		return err
-	}
-	if got == nil || got.Status != "running" {
-		return nil
-	}
 	if now == nil {
 		now = time.Now
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	msg := "operation lease cancelled before queue processor start"
+	// Atomic status-guarded requeue: only updates while still running. Zero rows
+	// (already cancelled/completed/failed) is success — do not resurrect.
 	if err := input.Repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{
 		ID:           item.ID,
 		AvailableAt:  nowISO,
@@ -4028,8 +4021,10 @@ func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, i
 	}); err != nil {
 		return err
 	}
-	// Verify durable observation: MarkRetry does not return conflict on no-op.
-	got, err = input.Repos.Queue.GetByID(ctx, item.ID)
+	// Verify durable observation: still-running after guarded MarkRetry means
+	// the write did not take effect (e.g. archived project) and ownership must
+	// not pretend finalize succeeded.
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
 	if err != nil {
 		return err
 	}

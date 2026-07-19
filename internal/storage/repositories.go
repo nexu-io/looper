@@ -1920,6 +1920,9 @@ func (r *QueueRepository) UpdateLockKey(ctx context.Context, id, lockKey, update
 }
 
 func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInput) error {
+	// Status-guarded: only requeue a live running claim. Concurrent CancelByLoop
+	// (or Complete/Fail) that already left running yields zero rows and is a
+	// no-op success so terminal cancellation is never resurrected to queued.
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = 'queued',
@@ -1932,6 +1935,7 @@ func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInp
 			finished_at = NULL,
 			updated_at = ?
 		WHERE id = ?
+			AND status = 'running'
 			AND NOT EXISTS (
 				SELECT 1
 				FROM projects p
