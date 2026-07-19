@@ -173,7 +173,11 @@ func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
 	var mu sync.Mutex
 	ready := true
 	var whileEntered atomic.Bool
-	releaseDegrade := make(chan struct{})
+	// Unbuffered handoff: close(started) is observed by the concurrent closer
+	// only after AllowExecuteWhile holds mu. Do not use select+default on a
+	// send — under CI load the receiver may not be scheduled yet and the
+	// signal is lost, leaving degradeDone forever open (CI flake).
+	started := make(chan struct{})
 	degradeDone := make(chan struct{})
 
 	forwarder := New(Options{
@@ -191,15 +195,13 @@ func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
 				return errors.New("daemon admission is degraded")
 			}
 			whileEntered.Store(true)
-			// Signal a concurrent MarkDegraded attempt while we still hold the
-			// admission mutex through enqueue — it must not observe ready flip
-			// until fn returns.
+			// Concurrent MarkDegraded must block on mu until fn returns.
+			close(started)
 			select {
-			case releaseDegrade <- struct{}{}:
-			default:
+			case <-degradeDone:
+				t.Error("admission flipped to not-ready while AllowExecuteWhile held the mutex")
+			case <-time.After(30 * time.Millisecond):
 			}
-			// Give the concurrent closer a chance to block on mu.
-			time.Sleep(20 * time.Millisecond)
 			fn()
 			if !ready {
 				t.Error("admission flipped to not-ready while AllowExecuteWhile held the mutex")
@@ -210,7 +212,7 @@ func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
 	defer forwarder.Close()
 
 	go func() {
-		<-releaseDegrade
+		<-started
 		mu.Lock()
 		ready = false
 		mu.Unlock()
