@@ -8,6 +8,17 @@ import (
 
 // AgentSnapshot is the durable identity of the agent used for a run.
 // It stores only vendor/model/profile identity — never params or env.
+//
+// Authority: when runs.agent_snapshot_json is non-empty with a vendor, this
+// snapshot is execution authority for spawn, prompts, HITL, and disclosure on
+// that run lineage. It is not the agent's structured output: vendor/model is
+// operator/config policy captured at run create, not something the agent emits.
+//
+// Trade-off: costs a persisted column, sticky copy across failed/interrupted
+// retries, parse validation, and a legacy-null fallback path. Simpler options
+// fail the sticky-identity contract — re-resolving live config mid-lineage can
+// switch CLI vendor after hot reload (breaking native resume and params
+// ownership), and agent output cannot authoritatively choose the executable.
 type AgentSnapshot struct {
 	Vendor    string  `json:"vendor"`
 	Model     *string `json:"model,omitempty"`
