@@ -344,6 +344,15 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	if projectErr != nil {
 		return ForwardResult{}, projectErr
 	}
+	// Authoritative recheck under the enqueue lock: MarkDegraded can close
+	// admission (and CancelExecute) after the pre-lock allowExecute pass. If we
+	// accepted here, GitHub would not retry while the canceled worker drops the
+	// delivery — refuse with ErrAdmissionRefused so callers map to 503.
+	if f.allowExecute != nil {
+		if err := f.allowExecute(); err != nil {
+			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+		}
+	}
 	workItems, enqueueErr := f.enqueueLocked(projects, routed, workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID})
 	if enqueueErr != nil {
 		return ForwardResult{}, enqueueErr

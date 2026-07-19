@@ -73,8 +73,9 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 		MaxConcurrent: 1,
 		QueueCapacity: 8,
 		AllowExecute: func() error {
-			// First call: Forward accept. Later calls: worker execute recheck.
-			if executeCalls.Add(1) == 1 {
+			// First two calls: Forward pre-lock + under-enqueue-lock accept.
+			// Later calls: worker execute recheck.
+			if executeCalls.Add(1) <= 2 {
 				return nil
 			}
 			return errors.New("daemon admission is stopping")
@@ -106,14 +107,58 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 	if stats.ExecutionsFailed < 1 {
 		t.Fatalf("ExecutionsFailed = %d, want >= 1 after admission refuse", stats.ExecutionsFailed)
 	}
-	if executeCalls.Load() < 2 {
-		t.Fatalf("AllowExecute calls = %d, want >= 2 (accept + execute recheck)", executeCalls.Load())
+	if executeCalls.Load() < 3 {
+		t.Fatalf("AllowExecute calls = %d, want >= 3 (accept x2 + execute recheck)", executeCalls.Load())
 	}
 	reviewerRunner.assertCallCount(t, 0)
 	fixerRunner.assertCallCount(t, 0)
 	if stats.ExecutionsSucceeded != 0 {
 		t.Fatalf("ExecutionsSucceeded = %d, want 0 when admission refuses discovery", stats.ExecutionsSucceeded)
 	}
+}
+
+// Contract (#580 review): admission closed after the pre-lock allowExecute pass
+// but before enqueue must refuse with ErrAdmissionRefused (503), not accept (202).
+func TestForwardRefusesWhenAllowExecuteClosesBeforeEnqueue(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			// Pre-lock pass succeeds; under-enqueue-lock recheck refuses.
+			if executeCalls.Add(1) == 1 {
+				return nil
+			}
+			return errors.New("daemon admission is degraded")
+		},
+	})
+	defer forwarder.Close()
+
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-race-enqueue",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "degraded") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping degraded", err)
+	}
+	if executeCalls.Load() < 2 {
+		t.Fatalf("AllowExecute calls = %d, want >= 2 (pre-lock + under-lock recheck)", executeCalls.Load())
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue after under-lock admission refuse", stats)
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
 }
 
 // Contract: CancelExecute aborts in-flight discovery that already passed

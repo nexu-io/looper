@@ -349,6 +349,45 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	}
 }
 
+// Contract (#580 review): when AllowClaim refuses after Plan, do not emit
+// durable cleanup events (completed/skip/cleaned) — only in-memory summary.
+func TestWorktreeCleanupPassOmitsEventsWhenAdmissionClosesAfterPlan(t *testing.T) {
+	t.Parallel()
+
+	fixture := newWorktreeCleanupFixture(t)
+	_ = fixture.seedWorktree(t, "wt_planned", "feature/planned", true)
+	// runWorktreeCleanupPass always Plans then rechecks AllowClaim. Degrade
+	// before the pass so the post-plan gate refuses without candidate work.
+	if err := fixture.runtime.admission.MarkDegraded("after plan"); err != nil {
+		t.Fatalf("MarkDegraded() error = %v", err)
+	}
+
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {}},
+		clean:  map[string]bool{},
+	}
+	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+
+	if !strings.Contains(summary.LastError, "degraded") {
+		t.Fatalf("summary.LastError = %q, want admission degraded", summary.LastError)
+	}
+	if summary.Cleaned != 0 || summary.Skipped != 0 || summary.Failed != 0 {
+		t.Fatalf("summary = %#v, want no candidate mutations after admission closed", summary)
+	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("cleanupCalls = %#v, want none while degraded", git.cleanupCalls)
+	}
+	events := fixture.events(t)
+	// started may still be recorded before Plan; refuse path must not add
+	// completed/skipped/cleaned cleanup mutations after closure.
+	if containsWorktreeCleanupEvent(events, "worktree.cleanup.completed") {
+		t.Fatalf("events = %#v, want no completed event after admission closed post-plan", events)
+	}
+	if containsWorktreeCleanupEvent(events, "worktree.cleanup.skipped") || containsWorktreeCleanupEvent(events, "worktree.cleanup.cleaned") {
+		t.Fatalf("events = %#v, want no skip/cleaned events after admission closed", events)
+	}
+}
+
 // Contract (#580 / review): MarkDegraded mid-pass must cancel remaining cleanup
 // mutations so no further worktree delete/record writes run after admission closes.
 func TestWorktreeCleanupPassCancelsWhenAdmissionClosesMidPass(t *testing.T) {

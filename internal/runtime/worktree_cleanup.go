@@ -201,36 +201,56 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	summary.Candidates = plan.Summary.Candidates
 
 	// Recheck after planning: MarkDegraded can close admission while Plan runs,
-	// and a pass that already started must not continue into candidate mutations.
+	// and a pass that already started must not continue into candidate mutations
+	// or emit durable cleanup events while closed.
 	if err := r.AllowClaim(); err != nil {
 		summary.LastError = err.Error()
-	} else {
-		for _, decision := range plan.Decisions {
-			if ctx.Err() != nil {
-				summary.LastError = ctx.Err().Error()
-				break
+		summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
+		summary.LastStatus = "completed"
+		// No worktree/record mutations and no cleanup DB events after admission
+		// closed — leave only the in-memory summary for status surfaces.
+		return summary
+	}
+	for _, decision := range plan.Decisions {
+		if ctx.Err() != nil {
+			summary.LastError = ctx.Err().Error()
+			break
+		}
+		// Recheck before each candidate so degradation mid-pass cancels remaining
+		// worktree/record mutations instead of finishing the planned batch.
+		if err := r.AllowClaim(); err != nil {
+			summary.LastError = err.Error()
+			// Admission closed mid-pass: stop candidate work and do not append
+			// further durable cleanup events (including completed) after close.
+			summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
+			if summary.Failed > 0 {
+				summary.LastStatus = "failed"
+			} else {
+				summary.LastStatus = "completed"
 			}
-			// Recheck before each candidate so degradation mid-pass cancels remaining
-			// worktree/record mutations instead of finishing the planned batch.
-			if err := r.AllowClaim(); err != nil {
+			return summary
+		}
+		if decision.Action != worktreecleanup.ActionWouldClean {
+			if err := r.recordWorktreeCleanupPlanSkip(ctx, repos, decision.Worktree, decision.Reason); err != nil {
+				// Admission closed between the loop recheck and the skip record —
+				// stop without durable skip/completed events after closure.
 				summary.LastError = err.Error()
-				break
+				summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
+				summary.LastStatus = "completed"
+				return summary
 			}
-			if decision.Action != worktreecleanup.ActionWouldClean {
-				r.recordWorktreeCleanupPlanSkip(ctx, repos, decision.Worktree, decision.Reason)
-				summary.Skipped++
-				continue
-			}
-			result := r.cleanupWorktreeCandidate(ctx, repos, gitGateway, cfg, decision.Worktree)
-			switch result.status {
-			case "cleaned":
-				summary.Cleaned++
-			case "skipped":
-				summary.Skipped++
-			default:
-				summary.Failed++
-				summary.LastError = result.message
-			}
+			summary.Skipped++
+			continue
+		}
+		result := r.cleanupWorktreeCandidate(ctx, repos, gitGateway, cfg, decision.Worktree)
+		switch result.status {
+		case "cleaned":
+			summary.Cleaned++
+		case "skipped":
+			summary.Skipped++
+		default:
+			summary.Failed++
+			summary.LastError = result.message
 		}
 	}
 
@@ -327,8 +347,15 @@ func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.R
 	return r.cleanWorktreeCandidate(ctx, repos, gitGateway, cfg, *project, candidate, worktreeRoot, "clean")
 }
 
-func (r *Runtime) recordWorktreeCleanupPlanSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) {
+// recordWorktreeCleanupPlanSkip writes a durable skip event only while admission
+// still allows claims. Returns the admission error when closed so callers stop
+// without counting a skip that was never recorded.
+func (r *Runtime) recordWorktreeCleanupPlanSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) error {
+	if err := r.AllowClaim(); err != nil {
+		return err
+	}
 	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.skipped", &candidate, map[string]any{"reason": reason})
+	return nil
 }
 
 func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, project storage.ProjectRecord, candidate storage.WorktreeRecord, worktreeRoot, reason string) worktreeCleanupCandidateResult {
