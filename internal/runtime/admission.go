@@ -21,7 +21,7 @@ import (
 // Costs / new edge cases: sticky degraded until restart/clear; startup window
 // where reads work but all mutations and work-producing ticks no-op; shutdown
 // must BeginShutdown before storage close; every new work-producing path must
-// call AllowMutations/AllowClaim (easy to miss → #580 audit); more
+// call AllowMutations/AllowClaim (audited under #580); more
 // manual_intervention quarantine instead of aggressive auto-clean.
 //
 // Why simpler alternatives are insufficient: a boolean ready flag next to

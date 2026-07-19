@@ -121,7 +121,7 @@ to a slice while any open blocker remains.
 | R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Enforced** |
 | R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Enforced** |
 | R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Enforced** |
-| R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Deferred** |
+| R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Enforced** |
 | R8 | #581 | Conservative startup recovery without PID Authority | confirmed dead / observed live / uncertain; uncertain cannot act; PID is evidence only | **Deferred** |
 
 Update the **Enforcement** column as each issue closes (move the slice from
@@ -136,7 +136,8 @@ Authoritative live states: `starting | ready | stopping | degraded`.
   sticky `degraded` until restart/clear). Documented in `internal/runtime/admission.go`.
 - HTTP mutation readiness and the work-producing **scheduler tick** (discovery,
   HITL, claims, stale-reconcile) are **projections** of this state, not a second
-  Authority. Exhaustive non-claim mutation surface audit remains #580.
+  Authority. Exhaustive non-claim mutation surface audit is enforced by #580
+  (see “Full non-mutating coverage” below).
 - Admission decisions must be atomic with the action they gate (single `Admission`
   mutex; no dual ready flag that can disagree).
 
@@ -273,6 +274,43 @@ record; the lease is in-memory Supervisor Authority for the live daemon only.
 | **Why not simpler** | Compensating “reservation” flags and growing claim state machines reintroduce dual Authority. Trusting runner return alone leaves stranded `running` under a released lease. Releasing before verified durable finalize reopens the unowned-claim window #578 was ordered to close first. |
 | **Deletion attempt** | Drop lease and trust process handles only — fails for the claim-before-process interval and for roles that finalize without a live agent handle. |
 
+### Full non-mutating coverage when not-ready or degraded (enforced by #580)
+
+R1 landed the admission Authority and known HTTP/claim gates. After producer
+cutover (#576–#579), R7 completes the **exhaustive mutation-surface audit** so
+HTTP cannot be gated while the scheduler still discovers/enqueues (the dangerous
+mid-state named in #580).
+
+**Authority (no dual ready):** `Admission` is the only readiness Authority.
+`AllowMutations` (HTTP + tunnel accept) and `AllowClaim` (scheduler tick,
+durable claims, spawn leases, worktree cleanup, webhook worker discovery) are
+projections under the same mutex. `ownershipAcquired` is **not** a gate.
+
+**Mutation surface matrix (not-ready / degraded / stopping):**
+
+| Surface | Gate | Closed behavior |
+|---------|------|-----------------|
+| HTTP mutating methods (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/v1/*`, `/webhook/forward`) | `Handler` → `AllowMutations` | Explicit **503** `SERVICE_UNAVAILABLE` (not silent no-op). Bootstrap mint/exchange exempt. Feishu `url_verification` handshake exempt; card actions gated. |
+| Read-only HTTP (`GET` health/status/config/lists/…) | none (reads always allowed) | Available in starting / ready / stopping / degraded |
+| Scheduler full tick (planner/coordinator/reviewer/fixer/worker discovery, HITL polls, claim phases, stale-reconcile) | `AllowClaim` at tick entry + mid-tick rechecks per project/lane | Entire work-producing tick no-ops (prefer pause over “read-only discovery”) |
+| Durable `ClaimNext*` / operation-lease admit | `AllowClaim` immediately before each claim | No new claims |
+| Agent spawn leases | registry `allowSpawn` → `AllowClaim` | No new agent starts |
+| Webhook tunnel deliveries | `allowForward` → `AllowMutations` before Forward | **503** |
+| Webhook forwarder accept + worker discovery | `AllowExecute` → same projection; accept-time refuse + execute-time recheck | No discovery enqueue / no `CreateOrGetActiveByDedupe` after close |
+| Worktree cleanup pass | `AllowClaim` before pass | No filesystem/DB cleanup mutations while closed |
+| Config file hot-reload loop | not gated (policy Authority ADR-0014) | May refresh hot-safe fields; work-producing side effects still hit scheduler/HTTP gates |
+| Deferred reviewer recovery requeue | `AllowClaim` before requeue | No requeue after close |
+| Shutdown order | `daemonRuntime.Stop`: `BeginShutdown` → HTTP `Server.Stop` drain → `Runtime.Stop` | Aligns with #577: admission → ingress → producers → handles; retain storage / fail loud on incomplete drain |
+
+**Non-mutating coverage concept trade-off (R7):**
+
+| | |
+|--|--|
+| **Failure prevented** | Partial #575: HTTP 503 while scheduler still discovers/enqueues; webhook Forward queueing work after admission closed; cleanup/spawn paths acting during degraded. |
+| **Costs** | Every new work-producing path must call `AllowMutations`/`AllowClaim`; sticky degraded refuses operator mutations until restart/clear; cleanup and discovery pause during starting. |
+| **Why not simpler** | Gating only HTTP leaves producer cutover paths free. Gating only claims leaves discovery/HITL free. Silent no-op HTTP hides unavailability from operators/CLI. |
+| **Deletion attempt** | Remove per-surface gates and trust scheduler pause alone — insufficient for tunnel/HTTP/webhook worker and for direct service entrypoints after producer migration. |
+
 ### Shutdown order (enforced by #575 admission close + #577 drain/retain)
 
 Drain **admission → ingress → producers → handles/finalizers** before SQLite
@@ -283,7 +321,9 @@ error (agents **and** tracked Supervisor-owned non-agent handles); late
 `ReportDrainFailure` from shell/trusted-review cancel paths is re-collected
 after producer waits. `StorageRetained()` is the operator-visible signal.
 Independent infra (webhook forwarder, network manager) still stop — they are
-not Supervisor domain.
+not Supervisor domain. Daemon stop order is also `BeginShutdown` → HTTP ingress
+`Server.Stop` → `Runtime.Stop` so in-flight mutations drain or fail-loud before
+storage close (#580 aligns with #577).
 
 ### Non-agent Supervisor-owned producers (enforced by #577)
 

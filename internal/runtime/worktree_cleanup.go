@@ -130,6 +130,13 @@ func (r *Runtime) stopWorktreeCleanupLoop() {
 }
 
 func (r *Runtime) executeWorktreeCleanupPass(ctx context.Context) {
+	// Cleanup deletes managed worktrees and touches durable records — treat it
+	// as a mutation surface under the same admission Authority as claims
+	// (#580). Loop starts before MarkReady; without this gate a first pass can
+	// run while starting, or continue while degraded/stopping.
+	if err := r.AllowClaim(); err != nil {
+		return
+	}
 	r.mu.Lock()
 	if r.worktreeCleanupRunning {
 		r.mu.Unlock()

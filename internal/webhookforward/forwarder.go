@@ -115,10 +115,11 @@ type Options struct {
 	DeliveryTTL        time.Duration
 	RetryDelay         time.Duration
 	RecentOutcomeLimit int
-	// AllowExecute, when set, is rechecked immediately before each worker
-	// discovery attempt. Forward may accept a delivery while admission is
-	// still open; the background worker drains later and must refuse to
-	// persist queue work after BeginShutdown. Nil means ungated (tests).
+	// AllowExecute, when set, is checked at Forward accept time and rechecked
+	// immediately before each worker discovery attempt (#580). Accept-time
+	// refuse prevents in-memory discovery enqueue while admission is closed;
+	// execute-time recheck covers the race where BeginShutdown closes
+	// admission after Forward already accepted. Nil means ungated (tests).
 	AllowExecute func() error
 }
 
@@ -293,6 +294,14 @@ func New(options Options) Forwarder {
 func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (ForwardResult, error) {
 	if f.repos == nil || f.repos.Projects == nil {
 		return ForwardResult{}, fmt.Errorf("webhook forwarder repositories are not configured")
+	}
+	// Refuse new discovery enqueue while admission is closed. HTTP and tunnel
+	// listeners also project AllowMutations, but Forward is the shared enqueue
+	// boundary for both paths (#580).
+	if f.allowExecute != nil {
+		if err := f.allowExecute(); err != nil {
+			return ForwardResult{}, err
+		}
 	}
 	now := f.now().UTC()
 	deliveryID := strings.TrimSpace(request.DeliveryID)

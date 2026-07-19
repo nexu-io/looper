@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,46 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// Contract (#580): Forward refuses accept-time enqueue when admission is already closed.
+func TestForwardRefusesWhenAllowExecuteClosedAtAccept(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			executeCalls.Add(1)
+			return errors.New("daemon admission is stopping")
+		},
+	})
+	defer forwarder.Close()
+
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-closed-accept",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !strings.Contains(err.Error(), "admission is stopping") {
+		t.Fatalf("Forward() error = %v, want admission refusal", err)
+	}
+	if executeCalls.Load() == 0 {
+		t.Fatal("AllowExecute was not consulted at Forward accept time")
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue while admission closed", stats)
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
+}
 
 // Contract: Forward may accept while admission is open; worker discovery must
 // still refuse when AllowExecute closes before executeWithRetry runs.
@@ -32,7 +73,10 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 		MaxConcurrent: 1,
 		QueueCapacity: 8,
 		AllowExecute: func() error {
-			executeCalls.Add(1)
+			// First call: Forward accept. Later calls: worker execute recheck.
+			if executeCalls.Add(1) == 1 {
+				return nil
+			}
 			return errors.New("daemon admission is stopping")
 		},
 	})
@@ -62,8 +106,8 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 	if stats.ExecutionsFailed < 1 {
 		t.Fatalf("ExecutionsFailed = %d, want >= 1 after admission refuse", stats.ExecutionsFailed)
 	}
-	if executeCalls.Load() == 0 {
-		t.Fatal("AllowExecute was not consulted at worker discovery time")
+	if executeCalls.Load() < 2 {
+		t.Fatalf("AllowExecute calls = %d, want >= 2 (accept + execute recheck)", executeCalls.Load())
 	}
 	reviewerRunner.assertCallCount(t, 0)
 	fixerRunner.assertCallCount(t, 0)
