@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
 // TrustedReviewSockEnv is the agent-facing env key for the trusted review-submit
@@ -107,7 +109,11 @@ type TrustedReviewProxyPolicy struct {
 // overrides). Agent argv may still include local flags for the prompted command
 // shape, but the proxy always rewrites them to this bound authority before
 // spawning the credential-injected child.
-func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
+//
+// tracker, when non-nil, registers each Supervisor-owned review-submit child
+// handle so daemon shutdown can wait for confirmed drain and retain storage on
+// Kill/Drain failure (ADR-0015 / #577).
+func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy TrustedReviewProxyPolicy, tracker processcontainment.LiveTracker) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	if realLooper == "" {
 		return "", nil, fmt.Errorf("real looper path is required for trusted review proxy")
@@ -196,7 +202,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 				defer wg.Done()
 				defer func() { <-slots }()
 				defer unregister(c)
-				handleTrustedReviewProxyConn(proxyContext, c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfig, boundPolicy)
+				handleTrustedReviewProxyConn(proxyContext, c, realLooper, trustedEnv, normalizedAllowed, boundCwd, boundConfig, boundPolicy, tracker)
 			}(conn)
 		}
 	}()
@@ -220,7 +226,7 @@ func StartTrustedReviewProxy(realLooper string, trustedEnv map[string]string, al
 	return sockPath, cleanup, nil
 }
 
-func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot []byte, policy TrustedReviewProxyPolicy) {
+func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot []byte, policy TrustedReviewProxyPolicy, tracker processcontainment.LiveTracker) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
@@ -249,7 +255,8 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	// agent argv. Rewrite local policy flags after shape/PR validation.
 	childArgv := applyTrustedReviewProxyPolicy(req.Argv, policy)
 	cmd := exec.Command(realLooper, childArgv...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// #577: Supervisor-owned non-agent child uses processcontainment at spawn.
+	processcontainment.Configure(cmd)
 	configReader, configWriter, err := os.Pipe()
 	if err != nil {
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "create trusted review config pipe: " + err.Error()})
@@ -272,6 +279,25 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: err.Error()})
 		return
 	}
+	handle, bindErr := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  2 * time.Second,
+		DrainTimeout: 20 * time.Second,
+	})
+	if bindErr != nil {
+		_ = configReader.Close()
+		_ = configWriter.Close()
+		// Bind failed after Start: force-kill the orphaned process group so it
+		// does not outlive the proxy request (same emergency path as shell bind).
+		killTrustedReviewStartedWithoutHandle(cmd)
+		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "bind trusted review containment handle: " + bindErr.Error()})
+		return
+	}
+	if tracker != nil {
+		release := tracker.Track(handle)
+		if release != nil {
+			defer release()
+		}
+	}
 	_ = configReader.Close()
 	configWriteDone := make(chan error, 1)
 	go func() {
@@ -281,19 +307,124 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		}
 		configWriteDone <- writeErr
 	}()
+	// Handle owns exactly-once Wait; do not call cmd.Wait in parallel.
+	// waitCtx is cancelable so post-Kill Wait cannot hang forever when an
+	// escaped descendant keeps stdio open and cmd.Wait never reaps.
+	waitCtx, waitCancel := context.WithCancel(context.Background())
+	defer waitCancel()
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- cmd.Wait() }()
-	select {
-	case err = <-waitDone:
-	case <-ctx.Done():
-		_ = killTrustedReviewProxyChild(cmd)
-		err = <-waitDone
+	go func() { waitDone <- handle.Wait(waitCtx) }()
+	// Poll leader liveness: if the leader is reaped but Wait is still blocked
+	// on stdout/stderr copy (descendant holds pipes), Drain before the
+	// connection deadline — ctx is not canceled by the conn deadline alone.
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	alreadyDrained := false
+loop:
+	for {
+		select {
+		case err = <-waitDone:
+			if !alreadyDrained {
+				// Normal exit path: confirmed-drain descendants before answering.
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
+				if drainErr := handle.Drain(drainCtx); drainErr != nil {
+					reportTrustedReviewDrainFailure(tracker, drainErr)
+					// Join so non-zero child exits still surface ErrNotConfirmedDead.
+					if err == nil {
+						err = drainErr
+					} else {
+						err = errors.Join(err, drainErr)
+					}
+				}
+				drainCancel()
+			}
+			break loop
+		case <-ctx.Done():
+			// Cancel: confirmed Kill, never signal-only success (#577).
+			killCtx, killCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			killErr := handle.Kill(killCtx)
+			killCancel()
+			if killErr != nil {
+				reportTrustedReviewDrainFailure(tracker, killErr)
+			}
+			// Unstick Wait if Kill timed out without reaping the leader, then
+			// bound the receive so cleanup cannot hang on an open waitDone.
+			waitCancel()
+			select {
+			case err = <-waitDone:
+			case <-time.After(time.Second):
+				// Wait still blocked (should not happen once waitCtx is canceled);
+				// fail loud so cleanup cannot hang in wg.Wait.
+				if killErr != nil {
+					err = killErr
+				} else {
+					err = fmt.Errorf("trusted review child wait did not complete after cancel: %w", ctx.Err())
+				}
+			}
+			if err == nil {
+				if killErr != nil {
+					err = killErr
+				} else {
+					err = ctx.Err()
+				}
+			} else if killErr != nil {
+				if errors.Is(err, context.Canceled) {
+					// Wait unblocked via waitCancel after Kill; surface kill outcome.
+					err = killErr
+				} else {
+					// Child already exited non-zero (or other wait error); still
+					// surface containment failure so undrained descendants are not hidden.
+					err = errors.Join(err, killErr)
+				}
+			}
+			break loop
+		case <-poll.C:
+			if alreadyDrained || !trustedReviewLeaderPIDGone(handle.PID()) {
+				continue
+			}
+			// Leader reaped; Drain kills pipe-holding descendants and unblocks Wait.
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if drainErr := handle.Drain(drainCtx); drainErr != nil {
+				reportTrustedReviewDrainFailure(tracker, drainErr)
+				if err == nil {
+					err = drainErr
+				} else {
+					err = errors.Join(err, drainErr)
+				}
+			}
+			drainCancel()
+			alreadyDrained = true
+			select {
+			case waitErr := <-waitDone:
+				if err == nil {
+					err = waitErr
+				} else if waitErr != nil {
+					// Keep containment drain failure and child exit together.
+					err = errors.Join(waitErr, err)
+				}
+			case <-time.After(time.Second):
+				if err == nil {
+					err = fmt.Errorf("trusted review child wait did not complete after drain")
+				}
+			}
+			break loop
+		}
 	}
 	configWriteErr := <-configWriteDone
 	resp := trustedReviewProxyResponse{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
+			// Pure child exit: ordinary review-submit failure, no Error text.
 			resp.ExitCode = exitErr.ExitCode()
+		} else if state := handle.ProcessState(); state != nil {
+			resp.ExitCode = state.ExitCode()
+			if resp.ExitCode == 0 {
+				resp.ExitCode = 1
+			}
+			// Always set Error for non-ExitError outcomes (drain/kill/cancel,
+			// including errors.Join of exit + containment failure) so callers
+			// do not treat undrained process groups as ordinary submit failures.
+			resp.Error = err.Error()
 		} else {
 			resp.ExitCode = 1
 			resp.Error = err.Error()
@@ -301,7 +432,9 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	}
 	if stdout.Truncated() || stderr.Truncated() {
 		resp.ExitCode = 1
-		resp.Error = "trusted review proxy child output exceeds size limit"
+		// Preserve prior containment/kill/drain Error so ErrNotConfirmedDead is
+		// not replaced by truncation-only text when both apply.
+		resp.Error = mergeTrustedReviewTruncationError(resp.Error)
 	} else if configWriteErr != nil && err == nil {
 		resp.ExitCode = 1
 		resp.Error = "write trusted review config snapshot: " + configWriteErr.Error()
@@ -309,17 +442,48 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	_ = json.NewEncoder(conn).Encode(resp)
 }
 
-func killTrustedReviewProxyChild(cmd *exec.Cmd) error {
+// trustedReviewLeaderPIDGone reports whether the leader pid has been reaped.
+// Used to detect Wait stuck on pipe-copy after Process.Wait completed.
+func trustedReviewLeaderPIDGone(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return errors.Is(err, syscall.ESRCH)
+}
+
+func reportTrustedReviewDrainFailure(tracker processcontainment.LiveTracker, err error) {
+	if tracker == nil || err == nil {
+		return
+	}
+	tracker.ReportDrainFailure(err)
+}
+
+const trustedReviewOutputTruncatedMsg = "trusted review proxy child output exceeds size limit"
+
+// mergeTrustedReviewTruncationError keeps an existing containment/kill/drain
+// error when output also exceeded the capture cap.
+func mergeTrustedReviewTruncationError(existing string) string {
+	if existing == "" {
+		return trustedReviewOutputTruncatedMsg
+	}
+	return existing + "; " + trustedReviewOutputTruncatedMsg
+}
+
+// killTrustedReviewStartedWithoutHandle is only used when Bind fails after
+// Start so the orphaned process group is not left live. Production stop paths
+// use Handle.Kill. Mirrors shell.killStartedWithoutHandle: SIGKILL the group
+// first, then fall back to Process.Kill + Wait on the leader.
+func killTrustedReviewStartedWithoutHandle(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
-		return os.ErrProcessDone
+		return
 	}
 	pid := cmd.Process.Pid
 	if pid > 0 {
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil || err == syscall.ESRCH {
-			return nil
-		}
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	}
-	return cmd.Process.Kill()
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
 }
 
 // trustedReviewProxyBlockedFlags are CLI overrides that must never be accepted
@@ -666,7 +830,12 @@ func trustedReviewProxyChildEnv(trustedEnv map[string]string, configFD int) []st
 	return out
 }
 
+// trustedReviewBoundedBuffer captures child stdout/stderr under a hard cap.
+// Methods are safe for concurrent use: cmd.Stdout/Stderr copy goroutines may
+// still Write after waitCtx cancel unblocks handle.Wait (containment-failure
+// path) while the proxy handler reads String/Truncated for the response.
 type trustedReviewBoundedBuffer struct {
+	mu        sync.Mutex
 	buffer    bytes.Buffer
 	limit     int
 	truncated bool
@@ -677,6 +846,8 @@ func newTrustedReviewBoundedBuffer(limit int) *trustedReviewBoundedBuffer {
 }
 
 func (b *trustedReviewBoundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	written := len(p)
 	remaining := b.limit - b.buffer.Len()
 	if remaining > 0 {
@@ -692,9 +863,17 @@ func (b *trustedReviewBoundedBuffer) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-func (b *trustedReviewBoundedBuffer) String() string { return b.buffer.String() }
+func (b *trustedReviewBoundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
 
-func (b *trustedReviewBoundedBuffer) Truncated() bool { return b.truncated }
+func (b *trustedReviewBoundedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
+}
 
 // TrustedReviewSockConfigured reports whether this process should proxy
 // `review submit` through the daemon-side trusted socket.

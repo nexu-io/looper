@@ -28,6 +28,7 @@ func TestMintTrustedReviewProxyResolvesConfiguredLooperCommandFromPATH(t *testin
 			Blocking:         "REQUEST_CHANGES",
 			ExpectedCommitID: "head-42",
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("mintTrustedReviewProxyForPR() error = %v", err)

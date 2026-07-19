@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ func TestTrustedReviewProxyRejectsOversizedStdinBeforeStartingChild(t *testing.T
 	if err := os.WriteFile(realLooper, []byte(trustedReviewProxyStubScript("touch \""+marker+"\"\n")), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -39,6 +40,46 @@ func TestTrustedReviewProxyRejectsOversizedStdinBeforeStartingChild(t *testing.T
 	}
 }
 
+func TestTrustedReviewProxyDrainsBackgroundChildAfterLeaderExitsWithPipes(t *testing.T) {
+	// Child leader exits 0 after spawning a same-group background sleeper that
+	// inherits stdout. Wait would hang on pipe copy; proxy must Drain and return.
+	dir := t.TempDir()
+	realLooper := filepath.Join(dir, "real-looper")
+	childPIDPath := filepath.Join(dir, "child.pid")
+	script := trustedReviewProxyStubScript(`
+(sleep 60) &
+echo $! > "` + childPIDPath + `"
+exit 0
+`)
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
+	if err != nil {
+		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	t.Setenv(TrustedReviewSockEnv, sockPath)
+	t.Setenv(trustedReviewProxySkipEnv, "")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ProxyReviewSubmit(
+			[]string{"review", "submit", "acme/looper#1", "--event", "COMMENT"},
+			nil,
+			dir,
+		)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ProxyReviewSubmit() error = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ProxyReviewSubmit hung after leader exit with background pipe-holding child")
+	}
+}
+
 func TestTrustedReviewProxyCleanupClosesPartialConnectionsAndKillsChildGroup(t *testing.T) {
 	dir := t.TempDir()
 	realLooper := filepath.Join(dir, "real-looper")
@@ -47,7 +88,7 @@ func TestTrustedReviewProxyCleanupClosesPartialConnectionsAndKillsChildGroup(t *
 	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(realLooper) error = %v", err)
 	}
-	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy())
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), nil)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
@@ -102,5 +143,58 @@ func TestTrustedReviewBoundedBufferTruncatesWithoutBackpressuringChild(t *testin
 	}
 	if got := buffer.String(); got != "abcd" || !buffer.Truncated() {
 		t.Fatalf("bounded buffer = (%q, %t), want (abcd, true)", got, buffer.Truncated())
+	}
+}
+
+// TestTrustedReviewBoundedBufferConcurrentWriteAndRead covers the proxy path
+// where waitCtx cancel unblocks handle.Wait while cmd stdout/stderr copy
+// goroutines may still Write; response assembly must read safely under race.
+func TestTrustedReviewBoundedBufferConcurrentWriteAndRead(t *testing.T) {
+	buffer := newTrustedReviewBoundedBuffer(1 << 20)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			chunk := []byte("concurrent-write-chunk\n")
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = buffer.Write(chunk)
+				}
+			}
+		}()
+	}
+	// Interleave String/Truncated with writers the way response assembly does
+	// after early wait cancellation on the containment-failure path.
+	deadline := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_ = buffer.String()
+		_ = buffer.Truncated()
+	}
+	close(stop)
+	wg.Wait()
+	// Final snapshot must be consistent (no panic / no race under -race).
+	got := buffer.String()
+	if len(got) == 0 {
+		t.Fatal("String() empty after concurrent writes")
+	}
+}
+
+func TestMergeTrustedReviewTruncationErrorPreservesContainment(t *testing.T) {
+	t.Parallel()
+	if got := mergeTrustedReviewTruncationError(""); got != trustedReviewOutputTruncatedMsg {
+		t.Fatalf("empty existing = %q, want truncation-only", got)
+	}
+	existing := "process containment: not confirmed dead"
+	got := mergeTrustedReviewTruncationError(existing)
+	if !strings.Contains(got, existing) {
+		t.Fatalf("merged = %q, want to keep containment error", got)
+	}
+	if !strings.Contains(got, trustedReviewOutputTruncatedMsg) {
+		t.Fatalf("merged = %q, want truncation message", got)
 	}
 }

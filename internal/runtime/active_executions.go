@@ -29,6 +29,14 @@ type ownedExecution struct {
 	handle *processcontainment.Handle
 }
 
+// nonAgentTracked is one Supervisor-owned non-agent containment handle
+// (shell validation, trusted review child). Owners register while the handle
+// is live and release after their confirmed Kill/Drain path finishes.
+type nonAgentTracked struct {
+	handle *processcontainment.Handle
+	done   chan struct{}
+}
+
 // ActiveExecutionRegistry is the in-process Supervisor registry for live agent
 // executions (ADR-0015 R3 / #576). It owns:
 //
@@ -36,9 +44,13 @@ type ownedExecution struct {
 //   - containment handle binding after spawn
 //   - stop/shutdown race linearization (kill+confirmed drain before Start success)
 //   - Kill via bound handle for looper stop / haltLoop
+//   - non-agent handle tracking for shutdown drain / retain-storage (#577)
 //
 // This is intentionally narrower than the #572 draft ExecutionSupervisor
 // (queue reservations, persistence Authority, etc.). Those land in later slices.
+// Non-agent tracking is not a second agent lease registry: short shell/proxy
+// jobs only register the live containment handle so BeginShutdown can wait or
+// force-drain and surface failures for retain-storage.
 type ActiveExecutionRegistry struct {
 	mu sync.Mutex
 
@@ -63,6 +75,14 @@ type ActiveExecutionRegistry struct {
 	stopDrained map[string]struct{}
 	nextLeaseID uint64
 
+	// nonAgentHandles tracks Supervisor-owned non-agent containment handles
+	// registered via Track (processcontainment.LiveTracker).
+	nonAgentHandles map[uint64]*nonAgentTracked
+	nextNonAgentID  uint64
+	// nonAgentDrainErr accumulates ReportDrainFailure and force-kill failures
+	// from non-agent handles so Runtime.Stop can retain SQLite.
+	nonAgentDrainErr error
+
 	admissionClosed bool
 	shutdownReason  string
 
@@ -83,12 +103,13 @@ const defaultKillTimeout = 20 * time.Second
 
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 	return &ActiveExecutionRegistry{
-		executions:    make(map[string]*ownedExecution),
-		pending:       make(map[uint64]*spawnLease),
-		active:        make(map[uint64]*spawnLease),
-		stoppingLoops: make(map[string]int),
-		stopEpoch:     make(map[string]uint64),
-		stopDrained:   make(map[string]struct{}),
+		executions:      make(map[string]*ownedExecution),
+		pending:         make(map[uint64]*spawnLease),
+		active:          make(map[uint64]*spawnLease),
+		stoppingLoops:   make(map[string]int),
+		stopEpoch:       make(map[string]uint64),
+		stopDrained:     make(map[string]struct{}),
+		nonAgentHandles: make(map[uint64]*nonAgentTracked),
 	}
 }
 
@@ -757,11 +778,77 @@ func (r *ActiveExecutionRegistry) LoopStopActive(loopID string) bool {
 	return active
 }
 
+// errShutdownDrainTimeout is returned when BeginShutdown cannot confirm that a
+// pending spawn/rebind window closed within killBudget, or a bound handle did
+// not reach confirmed-dead. Callers must retain storage and fail loud (#577).
+var errShutdownDrainTimeout = errors.New("shutdown: containment drain timed out or failed")
+
+// Track implements processcontainment.LiveTracker for Supervisor-owned non-agent
+// handles (validation/shell, trusted review). release is idempotent.
+func (r *ActiveExecutionRegistry) Track(handle *processcontainment.Handle) (release func()) {
+	if r == nil || handle == nil {
+		return func() {}
+	}
+	entry := &nonAgentTracked{handle: handle, done: make(chan struct{})}
+	r.mu.Lock()
+	if r.nonAgentHandles == nil {
+		r.nonAgentHandles = make(map[uint64]*nonAgentTracked)
+	}
+	r.nextNonAgentID++
+	id := r.nextNonAgentID
+	r.nonAgentHandles[id] = entry
+	r.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if _, ok := r.nonAgentHandles[id]; ok {
+				delete(r.nonAgentHandles, id)
+			}
+			r.mu.Unlock()
+			close(entry.done)
+		})
+	}
+}
+
+// ReportDrainFailure implements processcontainment.LiveTracker. Callers report
+// Kill/Drain failures from their ownership path so late cancel drains still
+// feed retain-storage even when BeginShutdown already returned.
+func (r *ActiveExecutionRegistry) ReportDrainFailure(err error) {
+	if r == nil || err == nil {
+		return
+	}
+	r.mu.Lock()
+	r.nonAgentDrainErr = errors.Join(r.nonAgentDrainErr, err)
+	r.mu.Unlock()
+}
+
+// NonAgentDrainErr returns accumulated non-agent containment drain failures.
+// Runtime.Stop re-reads this after producer waits so late shell/proxy reports
+// still retain storage.
+func (r *ActiveExecutionRegistry) NonAgentDrainErr() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nonAgentDrainErr
+}
+
 // BeginShutdown closes spawn admission, cancels pending and bound (active)
 // leases, and confirmed-drains every bound containment handle.
-func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
+//
+// Also waits for Supervisor-owned non-agent handles (shell/trusted-review) to
+// release after cancel, force-kills stragglers, and joins ReportDrainFailure
+// results so retain-storage covers non-agent containment failures (#577).
+//
+// Returns a non-nil error when any handle Kill fails or a spawn/rebind wait
+// times out. ADR-0015 / #577: drain failure must not be reported as graceful
+// success; Runtime.Stop retains SQLite when this returns an error.
+func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	if r == nil {
-		return
+		return nil
 	}
 	r.mu.Lock()
 	r.admissionClosed = true
@@ -799,8 +886,11 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 	for _, lease := range toCancel {
 		lease.cancel(cause)
 	}
+	var drainErr error
 	for _, entry := range entries {
-		_ = r.killOwned(entry, reason)
+		if err := r.killOwned(entry, reason); err != nil {
+			drainErr = errors.Join(drainErr, err)
+		}
 	}
 	budget := r.killBudget()
 	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait))
@@ -813,6 +903,13 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		select {
 		case <-done:
 		case <-time.After(budget):
+			drainErr = errors.Join(drainErr, errShutdownDrainTimeout)
+		}
+	}
+	// Join refuse-path killUnowned failures published on waited leases.
+	for _, lease := range toCancel {
+		if err := lease.takeUnownedDrainErr(); err != nil {
+			drainErr = errors.Join(drainErr, err)
 		}
 	}
 	if len(waitChans) > 0 {
@@ -825,9 +922,85 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) {
 		}
 		r.mu.Unlock()
 		for _, entry := range second {
-			_ = r.killOwned(entry, reason)
+			if err := r.killOwned(entry, reason); err != nil {
+				drainErr = errors.Join(drainErr, err)
+			}
 		}
 	}
+
+	// Non-agent Supervisor-owned handles: prefer owner cancel path (shell.Run /
+	// trusted-review Kill) so we do not race concurrent Kill. Wait for release,
+	// then force-kill stragglers and join reported drain failures.
+	if err := r.drainNonAgentHandles(budget); err != nil {
+		drainErr = errors.Join(drainErr, err)
+	}
+
+	if drainErr != nil {
+		return errors.Join(errShutdownDrainTimeout, drainErr)
+	}
+	return nil
+}
+
+// drainNonAgentHandles waits for tracked non-agent handles to release (owner
+// confirmed-drain path), force-kills any that outlive the budget, and joins
+// ReportDrainFailure results.
+func (r *ActiveExecutionRegistry) drainNonAgentHandles(budget time.Duration) error {
+	if r == nil {
+		return nil
+	}
+	type pendingNonAgent struct {
+		handle *processcontainment.Handle
+		done   <-chan struct{}
+	}
+	r.mu.Lock()
+	pending := make([]pendingNonAgent, 0, len(r.nonAgentHandles))
+	for _, entry := range r.nonAgentHandles {
+		if entry == nil || entry.handle == nil {
+			continue
+		}
+		pending = append(pending, pendingNonAgent{handle: entry.handle, done: entry.done})
+	}
+	r.mu.Unlock()
+
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	timedOut := false
+	for _, p := range pending {
+		if timedOut {
+			break
+		}
+		select {
+		case <-p.done:
+		case <-deadline.C:
+			timedOut = true
+		}
+	}
+
+	var drainErr error
+	if timedOut {
+		drainErr = errors.Join(drainErr, errShutdownDrainTimeout)
+		r.mu.Lock()
+		stragglers := make([]*processcontainment.Handle, 0, len(r.nonAgentHandles))
+		for _, entry := range r.nonAgentHandles {
+			if entry != nil && entry.handle != nil {
+				stragglers = append(stragglers, entry.handle)
+			}
+		}
+		r.mu.Unlock()
+		for _, handle := range stragglers {
+			ctx, cancel := context.WithTimeout(context.Background(), r.killBudget())
+			if err := handle.Kill(ctx); err != nil {
+				drainErr = errors.Join(drainErr, err)
+				r.ReportDrainFailure(err)
+			}
+			cancel()
+		}
+	}
+
+	if err := r.NonAgentDrainErr(); err != nil {
+		drainErr = errors.Join(drainErr, err)
+	}
+	return drainErr
 }
 
 // Register is retained for tests and transitional paths that hold an
@@ -1000,3 +1173,6 @@ func activeExecutionKey(loopID, runID, executionID string) string {
 
 // Compile-time check: registry is the agent.SpawnOwner for daemon producers.
 var _ agent.SpawnOwner = (*ActiveExecutionRegistry)(nil)
+
+// Compile-time check: registry tracks Supervisor-owned non-agent handles (#577).
+var _ processcontainment.LiveTracker = (*ActiveExecutionRegistry)(nil)

@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
@@ -299,7 +300,10 @@ func resolveTrustedLooperCLIPath(cfg config.Config) string {
 // trustedEnv may be empty when ambient credential stores suffice. Setup fails
 // closed: callers must not fall back to direct review submit. cleanup stops the
 // listener and must run when the agent execution ends.
-func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy forge.TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
+//
+// tracker registers Supervisor-owned review-submit children for shutdown drain
+// / retain-storage (#577). Nil is allowed only in tests.
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy forge.TrustedReviewProxyPolicy, tracker processcontainment.LiveTracker) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	allowedPRRef = strings.TrimSpace(allowedPRRef)
 	allowedCwd = strings.TrimSpace(allowedCwd)
@@ -320,7 +324,7 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	if err != nil {
 		return "", nil, fmt.Errorf("make trusted looper path absolute: %w", err)
 	}
-	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy)
+	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy, tracker)
 }
 
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
@@ -1754,6 +1758,9 @@ type reviewerAgentExecutorAdapter struct {
 	// rather than the daemon's global agent.vendor.
 	agentVendor config.AgentVendor
 	agentModel  *string
+	// tracker registers Supervisor-owned review-submit children for shutdown
+	// drain / retain-storage (#577).
+	tracker processcontainment.LiveTracker
 }
 type reviewerAgentExecutionAdapter struct {
 	execution agent.Execution
@@ -1963,7 +1970,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
 		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
 		var err error
-		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy)
+		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
 		if err != nil {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
 		}
@@ -3301,6 +3308,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				config:      &cfg,
 				agentVendor: resolved.Vendor,
 				agentModel:  agentModel,
+				tracker:     activeExecutions,
 			},
 			Logger:           logger,
 			Now:              now,
@@ -3364,6 +3372,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
 			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
 			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
+			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
+			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
 				AutoDiscovery: fixerAutoDiscovery,
 				IncludeDrafts: cfg.Roles.Fixer.Triggers.IncludeDrafts,
@@ -3426,6 +3436,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
 			AllowAutoPush:   cfg.Defaults.AllowAutoPush,
 			OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
+			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
+			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: worker.DiscoveryPolicy{
 				AutoDiscovery:              workerAutoDiscovery,
 				Labels:                     append([]string(nil), cfg.Roles.Worker.Triggers.Labels...),
