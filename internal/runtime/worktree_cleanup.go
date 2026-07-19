@@ -362,17 +362,26 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	if cfg.Daemon.WorktreeCleanup.DryRun {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dry_run")
 	}
-	// Final recheck immediately before the destructive worktree delete so a
-	// MarkDegraded between eligibility checks and CleanupWorktree cannot delete
-	// while admission is closed.
-	if err := r.AllowClaim(); err != nil {
+	// Hold admission across destructive CleanupWorktree + durable cleaned/failure
+	// records so MarkDegraded/BeginShutdown cannot close admission between the
+	// gate and the filesystem/DB mutation (same WithAllowWork primitive as
+	// webhook accept+enqueue). A point-in-time AllowClaim leaves a window where
+	// MarkDegraded wins, then cancelWorkProducers runs, but this goroutine still
+	// enters CleanupWorktree after close — and context cancel cannot undo a git
+	// remove that has already started.
+	var result worktreeCleanupCandidateResult
+	err := r.WithAllowClaim(func() {
+		if cleanErr := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); cleanErr != nil {
+			result = r.recordWorktreeCleanupFailure(ctx, repos, candidate, cleanErr)
+			return
+		}
+		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.cleaned", &candidate, map[string]any{"reason": reason})
+		result = worktreeCleanupCandidateResult{status: "cleaned"}
+	})
+	if err != nil {
 		return worktreeCleanupCandidateResult{status: "skipped", message: err.Error()}
 	}
-	if err := gitGateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: candidate.ProjectID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: candidate.WorktreePath, Branch: candidate.Branch, ProtectedBranches: []string{derefString(project.BaseBranch)}}); err != nil {
-		return r.recordWorktreeCleanupFailure(ctx, repos, candidate, err)
-	}
-	_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.cleaned", &candidate, map[string]any{"reason": reason})
-	return worktreeCleanupCandidateResult{status: "cleaned"}
+	return result
 }
 
 func (r *Runtime) recordWorktreeCleanupSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) worktreeCleanupCandidateResult {

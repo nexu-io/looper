@@ -388,8 +388,10 @@ func TestWorktreeCleanupPassOmitsEventsWhenAdmissionClosesAfterPlan(t *testing.T
 	}
 }
 
-// Contract (#580 / review): MarkDegraded mid-pass must cancel remaining cleanup
-// mutations so no further worktree delete/record writes run after admission closes.
+// Contract (#580 / review): MarkDegraded mid-pass must refuse remaining cleanup
+// mutations. Concurrent MarkDegraded blocks on WithAllowClaim during the first
+// delete (cannot close admission mid-remove), then closes after the hold so the
+// second candidate never reaches CleanupWorktree.
 func TestWorktreeCleanupPassCancelsWhenAdmissionClosesMidPass(t *testing.T) {
 	t.Parallel()
 
@@ -397,7 +399,8 @@ func TestWorktreeCleanupPassCancelsWhenAdmissionClosesMidPass(t *testing.T) {
 	// Stagger UpdatedAt so plan order is stable (older first).
 	first := fixture.seedWorktreeAt(t, "wt_first", "feature/first", true, fixture.now.Add(-2*time.Hour))
 	second := fixture.seedWorktreeAt(t, "wt_second", "feature/second", true, fixture.now.Add(-time.Hour))
-	byPath := map[string]string{first.WorktreePath: first.ID, second.WorktreePath: second.ID}
+	enteredFirst := make(chan struct{})
+	releaseFirst := make(chan struct{})
 	var cleaned []string
 	git := &fakeWorktreeCleanupGit{
 		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
@@ -407,14 +410,12 @@ func TestWorktreeCleanupPassCancelsWhenAdmissionClosesMidPass(t *testing.T) {
 		clean: map[string]bool{first.WorktreePath: true, second.WorktreePath: true},
 		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
 			cleaned = append(cleaned, input.WorktreePath)
-			if len(cleaned) > 1 {
-				t.Fatalf("CleanupWorktree called for %q after admission degraded", input.WorktreePath)
+			if input.WorktreePath != first.WorktreePath {
+				t.Fatalf("CleanupWorktree called for %q after admission should be closed", input.WorktreePath)
 			}
-			if err := fixture.runtime.admission.MarkDegraded("mid-pass degrade"); err != nil {
-				t.Fatalf("MarkDegraded() error = %v", err)
-			}
-			id := byPath[input.WorktreePath]
-			updated, err := fixture.repos.Worktrees.GetByID(context.Background(), id)
+			close(enteredFirst)
+			<-releaseFirst
+			updated, err := fixture.repos.Worktrees.GetByID(context.Background(), first.ID)
 			if err != nil {
 				return err
 			}
@@ -426,45 +427,85 @@ func TestWorktreeCleanupPassCancelsWhenAdmissionClosesMidPass(t *testing.T) {
 		},
 	}
 
-	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+	done := make(chan WorktreeCleanupStatus, 1)
+	go func() {
+		done <- fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+	}()
+
+	select {
+	case <-enteredFirst:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first CleanupWorktree under admission hold")
+	}
+
+	degradeDone := make(chan error, 1)
+	go func() {
+		degradeDone <- fixture.runtime.MarkDegraded("mid-pass degrade")
+	}()
+	// MarkDegraded must block while WithAllowClaim holds admission during delete.
+	select {
+	case err := <-degradeDone:
+		t.Fatalf("MarkDegraded completed while CleanupWorktree held admission: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+
+	select {
+	case err := <-degradeDone:
+		if err != nil {
+			t.Fatalf("MarkDegraded() after hold release error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkDegraded did not complete after CleanupWorktree released admission")
+	}
+
+	var summary WorktreeCleanupStatus
+	select {
+	case summary = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup pass did not return after mid-pass degrade")
+	}
 
 	if len(cleaned) != 1 {
-		t.Fatalf("cleaned paths = %#v, want exactly one candidate before cancel", cleaned)
+		t.Fatalf("cleaned paths = %#v, want exactly one candidate before admission closed", cleaned)
 	}
 	if summary.Cleaned != 1 {
 		t.Fatalf("summary.Cleaned = %d, want 1", summary.Cleaned)
 	}
-	if !strings.Contains(summary.LastError, "degraded") {
-		t.Fatalf("summary.LastError = %q, want admission degraded", summary.LastError)
+	if fixture.runtime.admission.State() != AdmissionDegraded {
+		t.Fatalf("admission.State() = %q, want degraded after mid-pass MarkDegraded", fixture.runtime.admission.State())
 	}
-	remainingID := second.ID
-	if cleaned[0] == second.WorktreePath {
-		remainingID = first.ID
+	// LastError is set when the loop-level AllowClaim refuses; a later
+	// per-candidate WithAllowClaim skip may only increment Skipped.
+	if summary.LastError != "" && !strings.Contains(summary.LastError, "degraded") {
+		t.Fatalf("summary.LastError = %q, want empty or admission degraded", summary.LastError)
 	}
-	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), remainingID)
+	if summary.LastError == "" && summary.Skipped < 1 {
+		t.Fatalf("summary = %#v, want LastError degraded or at least one skipped candidate", summary)
+	}
+	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), second.ID)
 	if err != nil {
 		t.Fatalf("Worktrees.GetByID(remaining) error = %v", err)
 	}
 	if stored == nil || stored.Status != "active" {
-		t.Fatalf("remaining worktree = %#v, want still active after mid-pass cancel", stored)
+		t.Fatalf("remaining worktree = %#v, want still active after mid-pass admission close", stored)
 	}
 }
 
-// Contract (#580 review): Runtime.MarkDegraded cancels the pass context while
-// CleanupWorktree is already running after AllowClaim, so the in-flight pass
-// cannot finish remove + cleaned-record/event writes after admission closed.
-func TestWorktreeCleanupInFlightCanceledByMarkDegraded(t *testing.T) {
+// Contract (#580 review): CleanupWorktree runs under WithAllowClaim so
+// MarkDegraded cannot close admission mid-remove. The in-flight delete may
+// finish under open admission (closer blocked on the same mutex); after the
+// hold releases, MarkDegraded proceeds and cancelWorkProducers runs too late
+// to retroactively forbid a remove that already completed under the hold.
+func TestWorktreeCleanupInFlightHoldsAdmissionAcrossCleanup(t *testing.T) {
 	t.Parallel()
 
 	fixture := newWorktreeCleanupFixture(t)
 	worktree := fixture.seedWorktree(t, "wt_inflight", "feature/inflight", true)
 
-	passCtx, passCancel := context.WithCancel(context.Background())
-	fixture.runtime.mu.Lock()
-	fixture.runtime.worktreeCleanupCancel = passCancel
-	fixture.runtime.mu.Unlock()
-
 	entered := make(chan struct{})
+	release := make(chan struct{})
 	git := &fakeWorktreeCleanupGit{
 		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {
 			{Path: worktree.WorktreePath, Branch: worktree.Branch},
@@ -472,58 +513,77 @@ func TestWorktreeCleanupInFlightCanceledByMarkDegraded(t *testing.T) {
 		clean: map[string]bool{worktree.WorktreePath: true},
 		onCleanup: func(input gitinfra.CleanupWorktreeInput) error {
 			close(entered)
-			// Simulate a live git remove that only stops when the pass context
-			// is canceled (cancelWorkProducers → worktreeCleanupCancel).
-			select {
-			case <-passCtx.Done():
-				return passCtx.Err()
-			case <-time.After(5 * time.Second):
-				return errors.New("CleanupWorktree was not canceled by MarkDegraded")
+			<-release
+			updated, err := fixture.repos.Worktrees.GetByID(context.Background(), worktree.ID)
+			if err != nil {
+				return err
 			}
+			nowISO := fixture.now.Format("2006-01-02T15:04:05.000Z")
+			updated.Status = "cleaned"
+			updated.CleanedAt = &nowISO
+			updated.UpdatedAt = nowISO
+			return fixture.repos.Worktrees.Upsert(context.Background(), *updated)
 		},
 	}
 
 	done := make(chan WorktreeCleanupStatus, 1)
 	go func() {
-		done <- fixture.runtime.runWorktreeCleanupPass(passCtx, fixture.repos, git, fixture.config)
+		done <- fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
 	}()
 
 	select {
 	case <-entered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for in-flight CleanupWorktree")
+		t.Fatal("timed out waiting for in-flight CleanupWorktree under admission hold")
 	}
 
-	if err := fixture.runtime.MarkDegraded("mid cleanup pass"); err != nil {
-		t.Fatalf("MarkDegraded() error = %v", err)
+	degradeDone := make(chan error, 1)
+	go func() {
+		degradeDone <- fixture.runtime.MarkDegraded("mid cleanup pass")
+	}()
+	// Do not call admission.State() here: it takes the same mutex WithAllowClaim
+	// holds for CleanupWorktree and would deadlock the test.
+	select {
+	case err := <-degradeDone:
+		t.Fatalf("MarkDegraded completed while CleanupWorktree held admission: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-degradeDone:
+		if err != nil {
+			t.Fatalf("MarkDegraded() after hold release error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkDegraded did not complete after CleanupWorktree released admission")
 	}
 
 	var summary WorktreeCleanupStatus
 	select {
 	case summary = <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("cleanup pass did not return after MarkDegraded canceled the context")
+		t.Fatal("cleanup pass did not return after held cleanup finished")
 	}
 
-	if summary.Cleaned != 0 {
-		t.Fatalf("summary.Cleaned = %d, want 0 after in-flight cancel", summary.Cleaned)
+	// Delete completed under open admission (closer was blocked); cleaned=1 is correct.
+	if summary.Cleaned != 1 {
+		t.Fatalf("summary.Cleaned = %d, want 1 (delete finished under held open admission)", summary.Cleaned)
 	}
-	if summary.Failed != 1 {
-		t.Fatalf("summary.Failed = %d, want 1 from canceled CleanupWorktree", summary.Failed)
-	}
-	if !errors.Is(passCtx.Err(), context.Canceled) {
-		t.Fatalf("passCtx.Err() = %v, want context.Canceled", passCtx.Err())
+	if state := fixture.runtime.admission.State(); state != AdmissionDegraded {
+		t.Fatalf("admission.State() after pass = %q, want degraded", state)
 	}
 	stored, err := fixture.repos.Worktrees.GetByID(context.Background(), worktree.ID)
 	if err != nil {
 		t.Fatalf("Worktrees.GetByID() error = %v", err)
 	}
-	if stored == nil || stored.Status != "active" {
-		t.Fatalf("stored worktree = %#v, want still active after canceled cleanup", stored)
+	if stored == nil || stored.Status != "cleaned" {
+		t.Fatalf("stored worktree = %#v, want cleaned after held cleanup completed", stored)
 	}
 	events := fixture.events(t)
-	if containsWorktreeCleanupEvent(events, "worktree.cleanup.cleaned") {
-		t.Fatalf("events = %#v, want no cleaned event after in-flight cancel", events)
+	if !containsWorktreeCleanupEvent(events, "worktree.cleanup.cleaned") {
+		t.Fatalf("events = %#v, want cleaned event under held admission", events)
 	}
 }
 
