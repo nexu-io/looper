@@ -38,16 +38,15 @@ type nonAgentTracked struct {
 }
 
 // ActiveExecutionRegistry is the in-process Supervisor registry for live agent
-// executions (ADR-0015 R3 / #576). It owns:
+// executions and queue operation leases (ADR-0015 R3 / R6 / #576 / #579). It owns:
 //
 //   - spawn admission leases before cmd.Start
 //   - containment handle binding after spawn
 //   - stop/shutdown race linearization (kill+confirmed drain before Start success)
 //   - Kill via bound handle for looper stop / haltLoop
 //   - non-agent handle tracking for shutdown drain / retain-storage (#577)
+//   - operation leases that span durable queue claims until durable finalize (#579)
 //
-// This is intentionally narrower than the #572 draft ExecutionSupervisor
-// (queue reservations, persistence Authority, etc.). Those land in later slices.
 // Non-agent tracking is not a second agent lease registry: short shell/proxy
 // jobs only register the live containment handle so BeginShutdown can wait or
 // force-drain and surface failures for retain-storage.
@@ -75,6 +74,15 @@ type ActiveExecutionRegistry struct {
 	stopDrained map[string]struct{}
 	nextLeaseID uint64
 
+	// pendingOps holds operation leases from AdmitOperation until BindClaim or
+	// Release (claim miss/error). boundOps holds leases after a durable claim
+	// until finalize-before-release. boundByQueueItem indexes ownership for
+	// the live-daemon invariant: no running claim without an owned lease.
+	pendingOps       map[uint64]*operationLease
+	boundOps         map[uint64]*operationLease
+	boundByQueueItem map[string]uint64
+	nextOpLeaseID    uint64
+
 	// nonAgentHandles tracks Supervisor-owned non-agent containment handles
 	// registered via Track (processcontainment.LiveTracker).
 	nonAgentHandles map[uint64]*nonAgentTracked
@@ -92,7 +100,8 @@ type ActiveExecutionRegistry struct {
 	allowSpawn func() error
 
 	// onHardPersistFailure maps hard agent_executions write failures into the
-	// single sticky admission degraded state (ADR-0015 R5 / #578).
+	// single sticky admission degraded state (ADR-0015 R5 / #578). Also used
+	// for queue finalize persistence failures that retain operation ownership.
 	onHardPersistFailure func(error)
 
 	// killTimeout bounds handle.Kill during stop. Zero uses defaultKillTimeout.
@@ -103,13 +112,16 @@ const defaultKillTimeout = 20 * time.Second
 
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 	return &ActiveExecutionRegistry{
-		executions:      make(map[string]*ownedExecution),
-		pending:         make(map[uint64]*spawnLease),
-		active:          make(map[uint64]*spawnLease),
-		stoppingLoops:   make(map[string]int),
-		stopEpoch:       make(map[string]uint64),
-		stopDrained:     make(map[string]struct{}),
-		nonAgentHandles: make(map[uint64]*nonAgentTracked),
+		executions:       make(map[string]*ownedExecution),
+		pending:          make(map[uint64]*spawnLease),
+		active:           make(map[uint64]*spawnLease),
+		stoppingLoops:    make(map[string]int),
+		stopEpoch:        make(map[string]uint64),
+		stopDrained:      make(map[string]struct{}),
+		pendingOps:       make(map[uint64]*operationLease),
+		boundOps:         make(map[uint64]*operationLease),
+		boundByQueueItem: make(map[string]uint64),
+		nonAgentHandles:  make(map[uint64]*nonAgentTracked),
 	}
 }
 
@@ -569,6 +581,21 @@ func (r *ActiveExecutionRegistry) collectLoopStopTargetsLocked(loopID string) lo
 			t.toKill = append(t.toKill, entry)
 		}
 	}
+	// Bound operation leases for this loop: cancel context as a stop signal.
+	// Do not release — finalize-before-release still applies. Pending (unbound)
+	// operations keep their lease; BindClaim refuses when item.LoopID is in
+	// stoppingLoops, so unrelated loops are not requeued by this stop.
+	for _, lease := range r.boundOps {
+		if lease == nil {
+			continue
+		}
+		lease.mu.Lock()
+		match := lease.loopID == loopID
+		lease.mu.Unlock()
+		if match {
+			lease.cancel(agent.ErrSpawnLoopStopping)
+		}
+	}
 	return t
 }
 
@@ -843,6 +870,11 @@ func (r *ActiveExecutionRegistry) NonAgentDrainErr() error {
 // release after cancel, force-kills stragglers, and joins ReportDrainFailure
 // results so retain-storage covers non-agent containment failures (#577).
 //
+// Cancels pending queue operation leases so BindClaim cannot start processors
+// after shutdown, and waits for bound operation leases to Release after durable
+// finalize (ADR-0015 R6 / #579). Does not force-release operation leases on
+// timeout — that would create unowned durable running claims.
+//
 // Returns a non-nil error when any handle Kill fails or a spawn/rebind wait
 // times out. ADR-0015 / #577: drain failure must not be reported as graceful
 // success; Runtime.Stop retains SQLite when this returns an error.
@@ -877,12 +909,14 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	for _, entry := range r.executions {
 		entries = append(entries, entry)
 	}
-	r.mu.Unlock()
-
 	cause := errors.New(reason)
 	if reason == "" {
 		cause = agent.ErrSpawnAdmissionClosed
 	}
+	opWait := r.cancelPendingOperationsLocked(cause)
+	r.cancelBoundOperationsLocked(cause, "")
+	r.mu.Unlock()
+
 	for _, lease := range toCancel {
 		lease.cancel(cause)
 	}
@@ -893,9 +927,10 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 		}
 	}
 	budget := r.killBudget()
-	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait))
+	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait)+len(opWait))
 	waitChans = append(waitChans, spawnWait...)
 	waitChans = append(waitChans, rebindWait...)
+	waitChans = append(waitChans, opWait...)
 	for _, done := range waitChans {
 		if done == nil {
 			continue
@@ -932,6 +967,13 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	// trusted-review Kill) so we do not race concurrent Kill. Wait for release,
 	// then force-kill stragglers and join reported drain failures.
 	if err := r.drainNonAgentHandles(budget); err != nil {
+		drainErr = errors.Join(drainErr, err)
+	}
+
+	// Finalizers: bound operation leases release only after durable queue
+	// finalize. Wait (do not force-release) so shutdown does not close storage
+	// under an unowned running claim while ownership is still live.
+	if err := r.waitBoundOperations(budget); err != nil {
 		drainErr = errors.Join(drainErr, err)
 	}
 

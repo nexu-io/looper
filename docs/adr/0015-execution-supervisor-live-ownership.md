@@ -120,7 +120,7 @@ to a slice while any open blocker remains.
 | R3 | #576 | Own all in-scope agent spawns at common executor boundary | Lease before `cmd.Start`; bind handle before return; stop-kill via handle; remove agent live PID fallback only after full agent coverage | **Enforced** |
 | R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Enforced** |
 | R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Enforced** |
-| R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Deferred** |
+| R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Enforced** |
 | R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Deferred** |
 | R8 | #581 | Conservative startup recovery without PID Authority | confirmed dead / observed live / uncertain; uncertain cannot act; PID is evidence only | **Deferred** |
 
@@ -242,6 +242,37 @@ handles (`Drain` when needed after leader `Wait`).
 | **Why not simpler** | Trusting raw Upsert success leaves #579 release able to free claims on silent no-op writes. Global writer queues add complexity without fixing per-execution ordering. Soft-degrade on cancel creates sticky noise without recovery signal. |
 | **Deletion attempt** | Remove mid-life heartbeat persistence and keep only terminal — insufficient for operator progress and native-session capture while live. |
 
+### Operation lease owns queue claims until durable finalize (enforced by #579)
+
+While the daemon is live, a `queue_items.status=running` claim must hold a
+Supervisor **operation lease**. One lease spans admit → durable claim → run →
+durable complete/cancel/requeue; it is not a growing reservation state machine.
+
+1. **AdmitOperation** before each durable `ClaimNext*` (projects the same admission
+   Authority as spawns/claims).
+2. Successful claim **BindClaim** returns an explicit **OperationPermit** or
+   `ErrOperationLeaseCancelled` (context cancel alone is insufficient).
+3. Cancelled lease **never** starts the queue processor / agent spawn; the claim is
+   durable-requeued under retained ownership, then released only after requeue commits.
+4. **No Release** until complete / cancel / requeue is **durably committed** (and
+   verified not still `running`).
+5. Claim miss/error **Releases immediately**.
+6. Runner error still produces typed durable finalization (`Fail` recovery) before release.
+7. Finalization persistence failure **degrades** (#578) and **retains ownership** —
+   never pretends release succeeded.
+
+No persisted reservation IDs: SQLite remains the durable observation/finalization
+record; the lease is in-memory Supervisor Authority for the live daemon only.
+
+**Operation lease concept trade-off (R6):**
+
+| | |
+|--|--|
+| **Failure prevented** | Durable `running` claims with no live owner (including the pre-process window); stop/bind races starting a processor after cancel; silent finalize failure + Release leaving unowned claims. |
+| **Costs** | Every scheduler claim path admits/binds a lease; stop/shutdown cancel pending binds; finalize failure sticks degrade and retains in-memory ownership until restart; extra GetByID verification after finalize. |
+| **Why not simpler** | Compensating “reservation” flags and growing claim state machines reintroduce dual Authority. Trusting runner return alone leaves stranded `running` under a released lease. Releasing before verified durable finalize reopens the unowned-claim window #578 was ordered to close first. |
+| **Deletion attempt** | Drop lease and trust process handles only — fails for the claim-before-process interval and for roles that finalize without a live agent handle. |
+
 ### Shutdown order (enforced by #575 admission close + #577 drain/retain)
 
 Drain **admission → ingress → producers → handles/finalizers** before SQLite
@@ -294,7 +325,8 @@ Classification:
 
 Queue **claims** themselves are not process producers, but while the daemon is
 live a `queue_items.status=running` claim is an owned **operation** under #579
-and must not exist without a Supervisor lease.
+(**Enforced**): scheduler `AdmitOperation` → durable claim → `BindClaim` permit
+→ processor → durable finalize → `Release`. Must not exist without a Supervisor lease.
 
 ### Independently lifecycle-owned (documented separate Authority)
 
@@ -353,7 +385,7 @@ These rules apply during multi-PR rollout and are part of this contract:
 - [ ] Producer inventory reconciled: every in-scope path Supervisor-owned; independent/out-of-scope documented
 - [ ] No unowned in-scope agent or subprocess producer remains
 - [ ] No live stop/shutdown/recovery path uses raw PID/PGID as Authority
-- [ ] No running queue claim without an owned operation lease while daemon is live
+- [x] No running queue claim without an owned operation lease while daemon is live (#579)
 - [ ] Uncertain recovery evidence cannot signal, mark terminal, requeue, or overlap work
 - [ ] Shutdown drains admission → ingress → producers → handles/finalizers before SQLite close (or retains storage / fails loud on timeout)
 
