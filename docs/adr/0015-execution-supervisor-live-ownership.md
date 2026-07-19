@@ -122,7 +122,7 @@ to a slice while any open blocker remains.
 | R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Enforced** |
 | R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Enforced** |
 | R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Enforced** |
-| R8 | #581 | Conservative startup recovery without PID Authority | confirmed dead / observed live / uncertain; uncertain cannot act; PID is evidence only | **Deferred** |
+| R8 | #581 | Conservative startup recovery without PID Authority | confirmed dead / observed live / uncertain; uncertain cannot act; PID is evidence only | **Enforced** |
 
 Update the **Enforcement** column as each issue closes (move the slice from
 Deferred → Enforced). ADR Accepted only when the matrix has no deferred
@@ -274,6 +274,40 @@ record; the lease is in-memory Supervisor Authority for the live daemon only.
 | **Why not simpler** | Compensating “reservation” flags and growing claim state machines reintroduce dual Authority. Trusting runner return alone leaves stranded `running` under a released lease. Releasing before verified durable finalize reopens the unowned-claim window #578 was ordered to close first. |
 | **Deletion attempt** | Drop lease and trust process handles only — fails for the claim-before-process interval and for roles that finalize without a live agent handle. |
 
+### Conservative startup recovery classification (enforced by #581)
+
+After a daemon restart, pre-crash containment handles **no longer exist**. Startup
+recovery classifies each durable `agent_executions` observation as one of:
+
+| Class | Meaning | Recovery action |
+|-------|---------|-----------------|
+| **confirmed_dead** | Authority exists to treat the execution as non-runnable | Only when Authority holds (below) |
+| **observed_live** | Process probe matched the durable row | Evidence only — never adopt live ownership; quarantine |
+| **uncertain** | Everything else (PID absent, not running, mismatch, probe error, leader-exit-only) | Quarantine; no raw PID/PGID action |
+
+**Authority for `confirmed_dead` after restart:**
+
+| May authorize confirmed-dead | Must not authorize confirmed-dead |
+|------------------------------|-----------------------------------|
+| Durable terminal finalization already committed before crash | PID/PGID missing or not running |
+| A **current-daemon** owned handle that has completed confirmed drain | Probe-then-signal on raw PID/PGID |
+| | Leader exit alone without descendant/containment proof |
+
+Otherwise the row remains **uncertain** (or **observed_live**) and is parked via
+existing `manual_intervention` / `paused` states — no new quarantine ledger.
+Running claims after restart have no live operation lease; reconcile them via
+durable finalize semantics (#578/#579), never by inferring death from PID absence.
+Mutations stay closed until classification finishes (#575/#580).
+
+**Startup recovery concept trade-off (R8):**
+
+| | |
+|--|--|
+| **Failure prevented** | False cleanliness and PID-reuse kills after crash; marking terminal / requeue / overlap from leader exit or PID absence alone; treating observed-live orphans as Supervisor-owned. |
+| **Costs** | More quarantine/`manual_intervention` and less aggressive auto-clean after restart; operators must unstick parked work deliberately. |
+| **Why not simpler** | Trusting PID/PGID probes as Authority reopens reusable-ID kills. Requeueing “dead” leaders without descendant proof leaves live children and starts overlapping work. |
+| **Deletion attempt** | Drop classification and always quarantine — correct but loses the durable-terminal / current-daemon-drain paths that already have Authority; classification keeps those paths explicit and tested. |
+
 ### Full non-mutating coverage when not-ready or degraded (enforced by #580)
 
 R1 landed the admission Authority and known HTTP/claim gates. After producer
@@ -421,14 +455,19 @@ These rules apply during multi-PR rollout and are part of this contract:
 
 ## Full-program exit criteria (ADR Accepted only when all hold)
 
-- [ ] R1–R8 issues (#575–#581) closed with their acceptance criteria met
-- [ ] Enforcement matrix fully enforced (no deferred in-scope items left open)
-- [ ] Producer inventory reconciled: every in-scope path Supervisor-owned; independent/out-of-scope documented
-- [ ] No unowned in-scope agent or subprocess producer remains
-- [ ] No live stop/shutdown/recovery path uses raw PID/PGID as Authority
+- [x] R1–R8 issues (#575–#581) implementation acceptance criteria met (matrix Enforced; GitHub close is process)
+- [x] Enforcement matrix fully enforced (no deferred in-scope items left open)
+- [x] Producer inventory reconciled: every in-scope path Supervisor-owned; independent/out-of-scope documented
+- [x] No unowned in-scope agent or subprocess producer remains
+- [x] No live stop/shutdown/recovery path uses raw PID/PGID as Authority
 - [x] No running queue claim without an owned operation lease while daemon is live (#579)
-- [ ] Uncertain recovery evidence cannot signal, mark terminal, requeue, or overlap work
-- [ ] Shutdown drains admission → ingress → producers → handles/finalizers before SQLite close (or retains storage / fails loud on timeout)
+- [x] Uncertain recovery evidence cannot signal, mark terminal, requeue, or overlap work
+- [x] Shutdown drains admission → ingress → producers → handles/finalizers before SQLite close (or retains storage / fails loud on timeout)
+
+**Status note:** With R0–R8 enforced and the exit checklist above complete, this ADR
+may move to **Accepted** when the program owner closes the contract issue (#573)
+and the implementation issues. Do not flip Status in an intermediate slice PR
+without that process close-out.
 
 ## Follow-on implementation issues
 

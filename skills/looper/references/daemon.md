@@ -120,4 +120,4 @@ Operator recovery:
 1. Read `looper daemon logs` / `looper daemon status --json` for admission `degraded` and a reason mentioning agent execution persistence or queue finalize failure.
 2. Repair storage under the runtime home (default `~/.looper/`): disk space, permissions, SQLite integrity.
 3. **Restart `looperd`** — normal recovery. Admission stays degraded until process restart (or an explicit clear hook used only in tests/ops tools).
-4. After restart, let startup recovery classify durable rows conservatively; do not force-requeue uncertain work.
+4. After restart, startup recovery classifies durable rows as **confirmed_dead** / **observed_live** / **uncertain** (ADR-0015 / #581). PID/PGID probes are evidence only — never confirmed-dead Authority. Uncertain and observed-live work is quarantined (`manual_intervention` / paused); do not force-requeue it.

@@ -2885,21 +2885,29 @@ func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testi
 	if err != nil {
 		t.Fatalf("second reconcile error = %v", err)
 	}
-	if first.SkippedUncertainRuns != 1 || first.EventsWritten != 1 {
-		t.Fatalf("first summary = %#v, want one uncertain event written", first)
+	// First pass writes containment_classified + process_identity_uncertain.
+	if first.SkippedUncertainRuns != 1 || first.EventsWritten != 2 {
+		t.Fatalf("first summary = %#v, want two events (classified + identity uncertain)", first)
 	}
 	if second.SkippedUncertainRuns != 1 || second.EventsWritten != 0 {
-		t.Fatalf("second summary = %#v, want deduped uncertain event without new writes", second)
+		t.Fatalf("second summary = %#v, want deduped events without new writes", second)
 	}
 	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "exec_uncertain_event_dedupe")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
 	}
 	count := 0
+	classified := 0
 	for _, event := range events {
 		if event.EventType == "looperd.recovery.process_identity_uncertain" {
 			count += 1
 		}
+		if event.EventType == "looperd.recovery.containment_classified" {
+			classified += 1
+		}
+	}
+	if classified != 1 {
+		t.Fatalf("containment_classified events = %d, want 1", classified)
 	}
 	if count != 1 {
 		t.Fatalf("uncertain event count = %d, want 1; events = %#v", count, events)
