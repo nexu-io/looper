@@ -30,13 +30,13 @@ func TestHardPersistFailureDegradesAdmission(t *testing.T) {
 		t.Fatalf("AllowMutations() error = %v, want ErrAdmissionDegraded", err)
 	}
 
-	// Operator recovery: restart is the normal path; ClearDegraded exists for
-	// tests and explicit clear hooks.
-	if err := rt.admission.ClearDegraded("operator cleared after storage repair"); err != nil {
-		t.Fatalf("ClearDegraded() error = %v", err)
+	// Operator recovery is process restart only: degraded cannot reopen in-process
+	// because MarkDegraded cancels work-producer contexts permanently.
+	if err := rt.admission.MarkReady("illegal clear after storage repair"); !errors.Is(err, ErrAdmissionIllegalMove) {
+		t.Fatalf("MarkReady() from degraded = %v, want illegal (restart-only recovery)", err)
 	}
-	if err := rt.AllowClaim(); err != nil {
-		t.Fatalf("AllowClaim() after clear error = %v", err)
+	if err := rt.AllowClaim(); !errors.Is(err, ErrAdmissionDegraded) {
+		t.Fatalf("AllowClaim() after illegal reopen attempt = %v, want ErrAdmissionDegraded", err)
 	}
 }
 

@@ -18,7 +18,7 @@ import (
 // recovery is incomplete or shutdown has begun; recovery inventing cleanliness
 // from reusable PIDs without a single closed admission Authority.
 //
-// Costs / new edge cases: sticky degraded until restart/clear; startup window
+// Costs / new edge cases: sticky degraded until process restart; startup window
 // where reads work but all mutations and work-producing ticks no-op; shutdown
 // must BeginShutdown before storage close; every new work-producing path must
 // call AllowMutations/AllowClaim (audited under #580); more
@@ -34,10 +34,13 @@ import (
 //
 //	starting  → ready | stopping | degraded
 //	ready     → stopping | degraded
-//	degraded  → stopping          (sticky until restart/clear; no ready)
+//	degraded  → stopping          (sticky until process restart; no ready)
 //	stopping  → (none)            (terminal for this process lifetime)
 //
-// any → degraded is sticky until restart or an explicit ClearDegraded.
+// any → degraded is sticky until process restart. There is no ClearDegraded:
+// Runtime.MarkDegraded cancels producer contexts (scheduler, cleanup, webhook
+// execute), so reopening admission without restart would leave a ready-looking
+// daemon with permanently dead work producers.
 type AdmissionState string
 
 const (
@@ -104,7 +107,7 @@ func legalAdmissionTransition(from, to AdmissionState) bool {
 	case AdmissionReady:
 		return to == AdmissionStopping || to == AdmissionDegraded
 	case AdmissionDegraded:
-		// Sticky until restart/clear: only stopping (or explicit clear → ready).
+		// Sticky until process restart: only stopping is legal (no ready reopen).
 		return to == AdmissionStopping
 	case AdmissionStopping:
 		return false
@@ -159,27 +162,10 @@ func (a *Admission) BeginShutdown(reason string) error {
 	return nil
 }
 
-// MarkDegraded is sticky until restart or ClearDegraded.
+// MarkDegraded is sticky until process restart (degraded → ready is illegal).
+// Recovery is restart looperd; Runtime.MarkDegraded also cancels work producers.
 func (a *Admission) MarkDegraded(reason string) error {
 	return a.Transition(AdmissionDegraded, reason)
-}
-
-// ClearDegraded reopens admission after an operator/runtime-clear path
-// (restart is the normal path; this exists for tests and future clear hooks).
-func (a *Admission) ClearDegraded(reason string) error {
-	if a == nil {
-		return ErrAdmissionStopping
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.state != AdmissionDegraded {
-		return fmt.Errorf("%w: clear degraded from %s", ErrAdmissionIllegalMove, a.state)
-	}
-	a.state = AdmissionReady
-	if reason != "" {
-		a.reason = reason
-	}
-	return nil
 }
 
 // AllowMutations is the atomic gate for HTTP mutating ingress. Callers must

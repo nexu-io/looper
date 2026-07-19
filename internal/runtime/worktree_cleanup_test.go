@@ -349,16 +349,16 @@ func newWorktreeCleanupFixture(t *testing.T) worktreeCleanupFixture {
 	}
 }
 
-// Contract (#580 review): when AllowClaim refuses after Plan, do not emit
-// durable cleanup events (completed/skip/cleaned) — only in-memory summary.
-func TestWorktreeCleanupPassOmitsEventsWhenAdmissionClosesAfterPlan(t *testing.T) {
+// Contract (#580 review): when admission is already closed, do not emit durable
+// cleanup events (including started) — only in-memory summary.
+func TestWorktreeCleanupPassOmitsEventsWhenAdmissionClosed(t *testing.T) {
 	t.Parallel()
 
 	fixture := newWorktreeCleanupFixture(t)
 	_ = fixture.seedWorktree(t, "wt_planned", "feature/planned", true)
-	// runWorktreeCleanupPass always Plans then rechecks AllowClaim. Degrade
-	// before the pass so the post-plan gate refuses without candidate work.
-	if err := fixture.runtime.admission.MarkDegraded("after plan"); err != nil {
+	// Gate start-event emission under WithAllowClaim so a closed admission
+	// cannot persist worktree.cleanup.started (or later cleanup events).
+	if err := fixture.runtime.admission.MarkDegraded("before start event"); err != nil {
 		t.Fatalf("MarkDegraded() error = %v", err)
 	}
 
@@ -378,10 +378,11 @@ func TestWorktreeCleanupPassOmitsEventsWhenAdmissionClosesAfterPlan(t *testing.T
 		t.Fatalf("cleanupCalls = %#v, want none while degraded", git.cleanupCalls)
 	}
 	events := fixture.events(t)
-	// started may still be recorded before Plan; refuse path must not add
-	// completed/skipped/cleaned cleanup mutations after closure.
+	if containsWorktreeCleanupEvent(events, "worktree.cleanup.started") {
+		t.Fatalf("events = %#v, want no started event when admission closed at emission", events)
+	}
 	if containsWorktreeCleanupEvent(events, "worktree.cleanup.completed") {
-		t.Fatalf("events = %#v, want no completed event after admission closed post-plan", events)
+		t.Fatalf("events = %#v, want no completed event after admission closed", events)
 	}
 	if containsWorktreeCleanupEvent(events, "worktree.cleanup.skipped") || containsWorktreeCleanupEvent(events, "worktree.cleanup.cleaned") {
 		t.Fatalf("events = %#v, want no skip/cleaned events after admission closed", events)

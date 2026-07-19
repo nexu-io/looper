@@ -287,8 +287,8 @@ func New(options Options) *Runtime {
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
 	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
-	// Hard agent_executions observation failures close admission until
-	// restart/clear (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
+	// Hard agent_executions observation failures close admission until process
+	// restart (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
 	rt.activeExecutions.SetOnHardPersistFailure(func(err error) {
 		reason := "agent execution persistence hard failure"
 		if err != nil {
@@ -558,12 +558,13 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 	return r.admission.WithAllowWork(fn)
 }
 
-// MarkDegraded sticks admission until restart/clear and cancels work-producing
+// MarkDegraded sticks admission until process restart and cancels work-producing
 // contexts so in-flight discovery/enqueue/cleanup that already passed AllowClaim
 // or AllowExecute cannot complete CreateOrGetActiveByDedupe or CleanupWorktree
 // after the transition. Unlike BeginShutdown, this does not drain active agent
 // handles — existing executions continue; only producers of new work (and
-// cleanup mutations) are aborted.
+// cleanup mutations) are aborted. There is no clear-and-resume path: canceled
+// producer contexts are not recreated; operators must restart looperd.
 func (r *Runtime) MarkDegraded(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping

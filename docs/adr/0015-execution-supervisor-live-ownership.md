@@ -79,7 +79,7 @@ reused PID/PGID; dual ready flags that disagree with admission.
 
 **Costs:** one in-memory Supervisor lifecycle; explicit lease release; serialized
 per-execution persistence; platform-specific containment adapters; sticky
-`degraded` until restart/clear; more quarantine / manual-intervention during
+`degraded` until process restart; more quarantine / manual-intervention during
 uncertain recovery instead of aggressive auto-clean.
 
 **Why simpler alternatives are insufficient:**
@@ -133,7 +133,7 @@ in-scope items and full-program exit criteria hold.
 Authoritative live states: `starting | ready | stopping | degraded`.
 
 - Transitions are monotonic / legal only (e.g. `starting→ready`, `ready→stopping`,
-  sticky `degraded` until restart/clear). Documented in `internal/runtime/admission.go`.
+  sticky `degraded` until process restart). Documented in `internal/runtime/admission.go`.
 - HTTP mutation readiness and the work-producing **scheduler tick** (discovery,
   HITL, claims, stale-reconcile) are **projections** of this state, not a second
   Authority. Exhaustive non-claim mutation surface audit is enforced by #580
@@ -231,7 +231,7 @@ handles (`Drain` when needed after leader `Wait`).
 
 1. Inspect daemon logs for `daemon admission degraded after agent execution persistence failure` and the underlying storage error.
 2. Repair storage (disk space, permissions, SQLite integrity) under the configured runtime path (default `~/.looper/`).
-3. **Restart `looperd`** — the normal recovery path. Admission is sticky degraded until process restart (or an explicit `ClearDegraded` test/operator hook).
+3. **Restart `looperd`** — the only recovery path. Admission is sticky degraded until process restart; there is no in-process clear. `MarkDegraded` cancels work-producer contexts (scheduler, cleanup, webhook execute), so reopening admission without restart would leave a ready-looking daemon with dead producers.
 4. After restart, startup recovery classifies durable observations conservatively (#581); do not manually requeue uncertain work.
 
 **Persistence concept trade-off (R5):**
@@ -239,7 +239,7 @@ handles (`Drain` when needed after leader `Wait`).
 | | |
 |--|--|
 | **Failure prevented** | Stale live writers regressing terminal rows; silent upsert “success” when zero rows changed; split-brain observations while admission keeps accepting work; terminal status before containment confirmed dead. |
-| **Costs** | Sticky degrade stops new work until restart/clear; terminal conflict means first terminal wins even if a later writer had richer fields; per-execution serialization; hard fail paths kill on initial persist failure. |
+| **Costs** | Sticky degrade stops new work until process restart; terminal conflict means first terminal wins even if a later writer had richer fields; per-execution serialization; hard fail paths kill on initial persist failure. |
 | **Why not simpler** | Trusting raw Upsert success leaves #579 release able to free claims on silent no-op writes. Global writer queues add complexity without fixing per-execution ordering. Soft-degrade on cancel creates sticky noise without recovery signal. |
 | **Deletion attempt** | Remove mid-life heartbeat persistence and keep only terminal — insufficient for operator progress and native-session capture while live. |
 
@@ -307,7 +307,7 @@ projections under the same mutex. `ownershipAcquired` is **not** a gate.
 | | |
 |--|--|
 | **Failure prevented** | Partial #575: HTTP 503 while scheduler still discovers/enqueues; webhook Forward queueing work after admission closed; cleanup/spawn paths acting during degraded. |
-| **Costs** | Every new work-producing path must call `AllowMutations`/`AllowClaim`; sticky degraded refuses operator mutations until restart/clear; cleanup and discovery pause during starting. |
+| **Costs** | Every new work-producing path must call `AllowMutations`/`AllowClaim`; sticky degraded refuses operator mutations until process restart; cleanup and discovery pause during starting. |
 | **Why not simpler** | Gating only HTTP leaves producer cutover paths free. Gating only claims leaves discovery/HITL free. Silent no-op HTTP hides unavailability from operators/CLI. |
 | **Deletion attempt** | Remove per-surface gates and trust scheduler pause alone — insufficient for tunnel/HTTP/webhook worker and for direct service entrypoints after producer migration. |
 

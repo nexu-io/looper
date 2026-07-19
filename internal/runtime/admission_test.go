@@ -44,15 +44,15 @@ func TestAdmissionLegalTransitions(t *testing.T) {
 	if err := a.AllowMutations(); !errors.Is(err, ErrAdmissionDegraded) {
 		t.Fatalf("AllowMutations() while degraded = %v, want ErrAdmissionDegraded", err)
 	}
-	// degraded is sticky: cannot go back to ready via Transition.
+	// degraded is sticky until process restart: cannot go back to ready.
 	if err := a.Transition(AdmissionReady, "nope"); !errors.Is(err, ErrAdmissionIllegalMove) {
 		t.Fatalf("Transition(ready) from degraded = %v, want illegal", err)
 	}
-	if err := a.ClearDegraded("operator clear"); err != nil {
-		t.Fatalf("ClearDegraded() error = %v", err)
+	if err := a.MarkReady("no clear path"); !errors.Is(err, ErrAdmissionIllegalMove) {
+		t.Fatalf("MarkReady() from degraded = %v, want illegal (restart-only recovery)", err)
 	}
-	if err := a.AllowClaim(); err != nil {
-		t.Fatalf("AllowClaim() after clear = %v, want nil", err)
+	if err := a.AllowClaim(); !errors.Is(err, ErrAdmissionDegraded) {
+		t.Fatalf("AllowClaim() while degraded = %v, want ErrAdmissionDegraded", err)
 	}
 
 	if err := a.BeginShutdown("signal"); err != nil {
