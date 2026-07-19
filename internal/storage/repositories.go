@@ -125,6 +125,7 @@ type RunRecord struct {
 	EndedAt           *string
 	CreatedAt         string
 	UpdatedAt         string
+	AgentSnapshotJSON *string // durable agent identity; set on create, immutable after insert
 }
 
 type AgentExecutionRecord struct {
@@ -803,9 +804,10 @@ type LocksRepository struct {
 const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
 
 func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
+	// agent_snapshot_json is insert-only: ON CONFLICT must not overwrite an existing snapshot.
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO runs (id, loop_id, status, current_step, last_completed_step, checkpoint_json, summary, error_message, started_at, last_heartbeat_at, ended_at, created_at, updated_at, agent_snapshot_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			status=excluded.status,
 			current_step=excluded.current_step,
@@ -817,7 +819,7 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 			last_heartbeat_at=excluded.last_heartbeat_at,
 			ended_at=excluded.ended_at,
 			updated_at=excluded.updated_at
-	`, record.ID, record.LoopID, record.Status, record.CurrentStep, record.LastCompletedStep, record.CheckpointJSON, record.Summary, record.ErrorMessage, record.StartedAt, record.LastHeartbeatAt, record.EndedAt, record.CreatedAt, record.UpdatedAt)
+	`, record.ID, record.LoopID, record.Status, record.CurrentStep, record.LastCompletedStep, record.CheckpointJSON, record.Summary, record.ErrorMessage, record.StartedAt, record.LastHeartbeatAt, record.EndedAt, record.CreatedAt, record.UpdatedAt, record.AgentSnapshotJSON)
 	if err != nil {
 		return fmt.Errorf("upsert run: %w", err)
 	}
@@ -1854,6 +1856,97 @@ func claimCtxForDurableClaim(ctx context.Context) (context.Context, context.Canc
 	return detached, noop, nil
 }
 
+// ClaimNextNonLongTermRetryAmongTypes claims the next non-long-term-retry item
+// whose type is in types. Empty types claims nothing.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
+	return r.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, types, nil)
+}
+
+// ClaimNextLongTermRetryAmongTypes claims the next long-term-retry item whose
+// type is in types. Empty types claims nothing.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
+	return r.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, types, nil)
+}
+
+// ClaimNextNonLongTermRetryAmongTypeSets claims the next non-long-term-retry item
+// that is either unrestricted by type or sticky-snapshot-only (latest run is
+// failed/interrupted with a non-empty agent_snapshot_json vendor). Both type
+// slices empty claims nothing.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
+		return nil, nil
+	}
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND NOT (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+	`, extraArgs)
+}
+
+// ClaimNextLongTermRetryAmongTypeSets is the long-term-retry counterpart of
+// ClaimNextNonLongTermRetryAmongTypeSets.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+	if typePred == "" {
+		return nil, nil
+	}
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+	`, extraArgs)
+}
+
+func queueTypeInClause(types []string) (placeholders string, args []any) {
+	parts := make([]string, 0, len(types))
+	args = make([]any, 0, len(types))
+	for _, t := range types {
+		parts = append(parts, "?")
+		args = append(args, t)
+	}
+	return strings.Join(parts, ", "), args
+}
+
+// queueClaimTypePredicate builds the AND (...) filter for unrestricted types
+// and sticky-snapshot-only types. Sticky types require the loop's latest run
+// (started_at DESC, created_at DESC — matching Runs.GetLatestByLoopID) to be
+// failed/interrupted with a non-empty agent_snapshot_json vendor so fresh work
+// for unconfigured roles is never claimed while sticky retries still are.
+func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (predicate string, args []any) {
+	parts := make([]string, 0, 2)
+	if len(unrestrictedTypes) > 0 {
+		placeholders, typeArgs := queueTypeInClause(unrestrictedTypes)
+		parts = append(parts, "qi.type IN ("+placeholders+")")
+		args = append(args, typeArgs...)
+	}
+	if len(stickySnapshotTypes) > 0 {
+		placeholders, typeArgs := queueTypeInClause(stickySnapshotTypes)
+		// EXISTS over the single latest run row for the queue item's loop.
+		parts = append(parts, `(qi.type IN (`+placeholders+`)
+			AND qi.loop_id IS NOT NULL
+			AND EXISTS (
+				SELECT 1
+				FROM (
+					SELECT status, agent_snapshot_json
+					FROM runs
+					WHERE loop_id = qi.loop_id
+					ORDER BY started_at DESC, created_at DESC
+					LIMIT 1
+				) latest
+				WHERE latest.status IN ('failed', 'interrupted')
+					AND latest.agent_snapshot_json IS NOT NULL
+					AND length(trim(latest.agent_snapshot_json)) > 0
+					AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0
+			))`)
+		args = append(args, typeArgs...)
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return "AND (" + strings.Join(parts, " OR ") + ")", args
+}
+
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
 	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
 	if err != nil {
@@ -2749,9 +2842,10 @@ func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {
 		errorMessage      sql.NullString
 		lastHeartbeatAt   sql.NullString
 		endedAt           sql.NullString
+		agentSnapshotJSON sql.NullString
 	)
 
-	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt)
+	err := row.Scan(&record.ID, &record.LoopID, &record.Status, &currentStep, &lastCompletedStep, &checkpointJSON, &summary, &errorMessage, &record.StartedAt, &lastHeartbeatAt, &endedAt, &record.CreatedAt, &record.UpdatedAt, &agentSnapshotJSON)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -2762,6 +2856,7 @@ func scanRun(row interface{ Scan(...any) error }) (RunRecord, error) {
 	record.ErrorMessage = nullableString(errorMessage)
 	record.LastHeartbeatAt = nullableString(lastHeartbeatAt)
 	record.EndedAt = nullableString(endedAt)
+	record.AgentSnapshotJSON = nullableString(agentSnapshotJSON)
 
 	return record, nil
 }

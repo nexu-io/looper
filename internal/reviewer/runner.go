@@ -288,10 +288,12 @@ type PullRequestReactionInput struct {
 }
 
 type IssueCommentInput struct {
-	Repo        string
-	IssueNumber int64
-	Body        string
-	CWD         string
+	Repo            string
+	IssueNumber     int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type IssueCommentResult struct {
@@ -305,10 +307,12 @@ type IssueComment struct {
 }
 
 type UpdateIssueCommentInput struct {
-	Repo      string
-	CommentID int64
-	Body      string
-	CWD       string
+	Repo            string
+	CommentID       int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type PullRequestLabelsInput struct {
@@ -348,10 +352,12 @@ type ReviewThreadComment struct {
 }
 
 type AddReviewThreadReplyInput struct {
-	Repo     string
-	ThreadID string
-	Body     string
-	CWD      string
+	Repo            string
+	ThreadID        string
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type ResolveReviewThreadInput struct {
@@ -404,6 +410,11 @@ type AgentRunInput struct {
 	HeartbeatTimeout   time.Duration
 	Metadata           map[string]any
 	IdempotencyKey     string
+	// UseSnapshot + SnapshotVendor/Model override the executor config for this
+	// start when the run has a durable agent snapshot (execution authority).
+	UseSnapshot    bool
+	SnapshotVendor string
+	SnapshotModel  *string
 }
 
 type AgentResult struct {
@@ -463,6 +474,7 @@ type Options struct {
 	CustomInstructions      *config.Config
 	CriteriaVerifier        criteria.Verifier
 	AgentRuntime            string
+	AgentProfileID          string
 	AgentModel              *string
 	LooperCLIPath           string
 	RetryBaseDelay          time.Duration
@@ -511,7 +523,8 @@ type Runner struct {
 	projectRoleConfig       *config.Config
 	criteriaVerifier        criteria.Verifier
 	agentRuntime            string
-	agentModel              string
+	agentProfileID          string
+	agentModel              *string
 	looperCLIPath           string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -750,7 +763,8 @@ func New(options Options) *Runner {
 		projectRoleConfig:       options.CustomInstructions,
 		criteriaVerifier:        options.CriteriaVerifier,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
-		agentModel:              derefString(options.AgentModel),
+		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
+		agentModel:              cloneStringPtr(options.AgentModel),
 		looperCLIPath:           normalizeLooperCLIPath(options.LooperCLIPath),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
@@ -2134,7 +2148,8 @@ func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInpu
 		return r.repos.Notifications.Upsert(ctx, sent)
 	}
 
-	comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath})
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 	if err != nil {
 		failed := pending
 		failed.Status = "failed"
@@ -2396,7 +2411,8 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			body := r.buildThreadResolutionReply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
-			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+			disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 			}
 			result.Commented++
@@ -2543,7 +2559,18 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
 		prompt = nativeResumeContinuationPrompt("thread-resolution", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return nil, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+		Metadata:       map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber},
+		IdempotencyKey: idempotencyKey,
+		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2820,7 +2847,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	commentOnlyCompletion := r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents)
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{
 		"loopType":            "reviewer",
@@ -2844,7 +2875,13 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
+	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
+		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
+		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+	})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -3766,7 +3803,8 @@ func (r *Runner) submitOrReuseReview(ctx context.Context, input stepInput, detai
 	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "submitting review"); err != nil {
 		return ReviewMarkerResult{}, err
 	}
-	if err := r.github.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(submitEvent), Body: body, CommitID: pending.HeadSHA, Disclosure: r.disclosure, CWD: input.Project.RepoPath}); err != nil {
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	if err := r.github.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(submitEvent), Body: body, CommitID: pending.HeadSHA, Disclosure: r.disclosure, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel, CWD: input.Project.RepoPath}); err != nil {
 		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	marker, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(reviewerCheckpoint{Detail: checkpointDetailFromDetail(detail)}, detail))
@@ -3799,7 +3837,8 @@ func (r *Runner) postStampedPRCommentIfMissing(ctx context.Context, input stepIn
 		return err
 	}
 	body := stampIssueComment(r.disclosure, visible+"\n\n"+marker, "reviewer")
-	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	return nil
@@ -3832,11 +3871,12 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	body = stampIssueComment(r.disclosure, body, "reviewer")
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if existingComment.ID != 0 {
 		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "updating comment-only review"); err != nil {
 			return err
 		}
-		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 			return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		return nil
@@ -3844,7 +3884,7 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "creating comment-only review"); err != nil {
 		return err
 	}
-	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath}); err != nil {
+	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	return nil
@@ -4558,6 +4598,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		restartFromDiscover = true
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscover
+	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
+	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
 	initialCheckpoint := reviewerCheckpoint{ResumePolicy: "replay_step"}
 	if resumed {
 		initialCheckpoint = checkpoint
@@ -4572,6 +4614,14 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), CheckpointJSON: stringPtr(mustMarshalJSON(initialCheckpoint)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	if err != nil {
+		return resumedRunContext{}, err
+	}
+	if snapshotJSON == nil && strings.TrimSpace(r.agentRuntime) != "" {
+		return resumedRunContext{}, fmt.Errorf("agent snapshot required for vendor %q but was not produced", r.agentRuntime)
+	}
+	run.AgentSnapshotJSON = snapshotJSON
 	if resumed && !restartFromDiscover && lastCompleted != "" {
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
@@ -5293,6 +5343,13 @@ func (r *Runner) markAgentExecutionNativeResumePendingForHeadChange(ctx context.
 		return false
 	}
 	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if record.RunID != nil {
+		if run, runErr := r.repos.Runs.GetByID(ctx, *record.RunID); runErr == nil && run != nil {
+			if vendor, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
+				currentVendor = config.AgentVendor(strings.TrimSpace(vendor))
+			}
+		}
+	}
 	if currentVendor != "" && (!nativeResumeSupportedForReviewer(currentVendor) || record.Vendor != string(currentVendor)) {
 		return false
 	}
@@ -5408,6 +5465,13 @@ func (r *Runner) isResumableNativeSession(latest *storage.AgentExecutionRecord) 
 		return false
 	}
 	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if latest.RunID != nil && r.repos != nil && r.repos.Runs != nil {
+		if run, err := r.repos.Runs.GetByID(context.Background(), *latest.RunID); err == nil && run != nil {
+			if vendor, _, _, fromSnapshot, idErr := r.identityFromRun(*run); idErr == nil && fromSnapshot {
+				currentVendor = config.AgentVendor(strings.TrimSpace(vendor))
+			}
+		}
+	}
 	if currentVendor == "" {
 		return true
 	}
@@ -6977,7 +7041,63 @@ func optionalString(value string) *string {
 	return &value
 }
 
+func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky bool) (*string, error) {
+	var previousSnapshot *string
+	if previous != nil {
+		previousSnapshot = previous.AgentSnapshotJSON
+	}
+	snapshotJSON, legacyResume, err := config.ResolveRunAgentSnapshotJSON(previousSnapshot, sticky, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if legacyResume && r.logger != nil && previous != nil {
+		r.logger.Warn("resuming run without agent_snapshot_json; using current runner agent identity", map[string]any{
+			"loopId": previous.LoopID,
+			"runId":  previous.ID,
+			"vendor": r.agentRuntime,
+			"model":  derefString(r.agentModel),
+		})
+	}
+	return snapshotJSON, nil
+}
+
+// identityFromRun returns the vendor/model/profile that must drive this run.
+// When the run has AgentSnapshotJSON, that identity is execution authority.
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+}
+
+// disclosureIdentity returns agent/model for disclosure stamps from the run
+// snapshot when present; falls back to runner identity on empty snapshot or
+// parse errors (stamp-only paths must not fail the run).
+func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		// Present but invalid snapshot must not fall back to live runner identity.
+		return "", ""
+	}
+	return vendor, derefString(modelPtr)
+}
+
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+	if !useSnapshot {
+		return false, "", nil
+	}
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
+}
+
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func derefString(value *string) string {
 	if value == nil {

@@ -194,6 +194,7 @@ CREATE TABLE runs (
   ended_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  agent_snapshot_json TEXT,
   FOREIGN KEY (loop_id) REFERENCES loops (id) ON DELETE CASCADE
 );
 

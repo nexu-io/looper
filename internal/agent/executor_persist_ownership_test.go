@@ -54,12 +54,14 @@ func TestStartOwnershipAfterInitialPersistFailure(t *testing.T) {
 	}
 
 	owner := &trackingOwner{}
+	custom := config.AgentVendor("custom")
 	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		Config: ExecutorConfig{Vendor: custom, Params: map[string]any{
 			"command": "/bin/sh", "args": []any{"-c", "trap '' TERM; while true; do sleep 1; done"},
 		}},
-		Repos: repos,
-		Owner: owner,
+		Repos:             repos,
+		ParamsOwnerVendor: &custom,
+		Owner:             owner,
 	})
 
 	handle, err := executor.Start(context.Background(), RunInput{

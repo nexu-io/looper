@@ -5888,7 +5888,7 @@ func TestReconcileCommitsRequiresManualInterventionWhenAutoCommitDisabledAndDirt
 
 	runner := New(Options{Git: &fakeGitGateway{inspectResults: []InspectHeadResult{{HeadSHA: "head-1", HasUncommittedChanges: true, ChangedFiles: []string{"file.txt"}}}}, AllowAutoCommit: false})
 	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
-	checkpoint, err := runner.reconcileCommits(context.Background(), project, fixerCheckpoint{Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "head-1"}}, "fix: test")
+	checkpoint, err := runner.reconcileCommits(context.Background(), project, fixerCheckpoint{Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "head-1"}}, "fix: test", storage.RunRecord{})
 	if err == nil {
 		t.Fatal("reconcileCommits() error = nil, want manual intervention")
 	}

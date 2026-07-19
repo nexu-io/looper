@@ -158,3 +158,128 @@ func TestApplyFieldPatchValidUnsetMissingFieldIsNoop(t *testing.T) {
 		t.Fatalf("ApplyFieldPatch() = %#v, want empty config", patched)
 	}
 }
+
+func TestApplyFieldPatchAgentProfilesAndRoleBindings(t *testing.T) {
+	t.Parallel()
+
+	baseVendor := AgentVendorCodex
+	base := PartialConfig{
+		Agent: &PartialAgentConfig{
+			Vendor: &baseVendor,
+			Profiles: map[string]AgentBindingConfig{
+				"fast": {
+					Vendor: agentVendorPtr(AgentVendorCodex),
+					Model:  stringPtr("gpt-4o-mini"),
+				},
+				"strong": {
+					Vendor: agentVendorPtr(AgentVendorClaudeCode),
+					Model:  stringPtr("claude-sonnet"),
+				},
+			},
+		},
+		Roles: &PartialRoleConfigs{
+			Worker: &PartialWorkerRoleConfig{
+				Agent: &RoleAgentConfig{Profile: stringPtr("fast")},
+			},
+		},
+	}
+
+	t.Run("set profile leaf and role model", func(t *testing.T) {
+		t.Parallel()
+		patched, err := ApplyFieldPatch(base, map[string]json.RawMessage{
+			"agent.profiles.fast.vendor": json.RawMessage(`"claude-code"`),
+			"roles.worker.agent.model":   json.RawMessage(`"claude-haiku"`),
+		}, nil)
+		if err != nil {
+			t.Fatalf("ApplyFieldPatch() error = %v", err)
+		}
+		if patched.Agent == nil || patched.Agent.Profiles["fast"].Vendor == nil || *patched.Agent.Profiles["fast"].Vendor != AgentVendorClaudeCode {
+			t.Fatalf("profile vendor = %#v, want claude-code", patched.Agent)
+		}
+		if patched.Agent.Profiles["fast"].Model == nil || *patched.Agent.Profiles["fast"].Model != "gpt-4o-mini" {
+			t.Fatalf("profile model = %#v, want preserved gpt-4o-mini", patched.Agent.Profiles["fast"])
+		}
+		if patched.Roles == nil || patched.Roles.Worker == nil || patched.Roles.Worker.Agent == nil {
+			t.Fatalf("roles.worker.agent missing: %#v", patched.Roles)
+		}
+		if patched.Roles.Worker.Agent.Profile == nil || *patched.Roles.Worker.Agent.Profile != "fast" {
+			t.Fatalf("worker profile = %#v, want fast", patched.Roles.Worker.Agent)
+		}
+		if patched.Roles.Worker.Agent.Model == nil || *patched.Roles.Worker.Agent.Model != "claude-haiku" {
+			t.Fatalf("worker model = %#v, want claude-haiku", patched.Roles.Worker.Agent)
+		}
+	})
+
+	t.Run("unset whole profile", func(t *testing.T) {
+		t.Parallel()
+		patched, err := ApplyFieldPatch(base, nil, []string{"agent.profiles.fast"})
+		if err != nil {
+			t.Fatalf("ApplyFieldPatch() error = %v", err)
+		}
+		if _, exists := patched.Agent.Profiles["fast"]; exists {
+			t.Fatalf("profiles = %#v, want fast deleted", patched.Agent.Profiles)
+		}
+		if _, exists := patched.Agent.Profiles["strong"]; !exists {
+			t.Fatalf("profiles = %#v, want strong preserved", patched.Agent.Profiles)
+		}
+	})
+
+	t.Run("create profile via whole-object set", func(t *testing.T) {
+		t.Parallel()
+		patched, err := ApplyFieldPatch(base, map[string]json.RawMessage{
+			"agent.profiles.cheap": json.RawMessage(`{"vendor":"codex","model":"gpt-4o-mini"}`),
+		}, nil)
+		if err != nil {
+			t.Fatalf("ApplyFieldPatch() error = %v", err)
+		}
+		binding := patched.Agent.Profiles["cheap"]
+		if binding.Vendor == nil || *binding.Vendor != AgentVendorCodex {
+			t.Fatalf("cheap vendor = %#v, want codex", binding)
+		}
+		if binding.Model == nil || *binding.Model != "gpt-4o-mini" {
+			t.Fatalf("cheap model = %#v, want gpt-4o-mini", binding)
+		}
+	})
+
+	t.Run("atomic rebind role and delete old profile", func(t *testing.T) {
+		t.Parallel()
+		patched, err := ApplyFieldPatch(base, map[string]json.RawMessage{
+			"roles.worker.agent.profile": json.RawMessage(`"strong"`),
+		}, []string{"agent.profiles.fast"})
+		if err != nil {
+			t.Fatalf("ApplyFieldPatch() error = %v", err)
+		}
+		if _, exists := patched.Agent.Profiles["fast"]; exists {
+			t.Fatalf("profiles = %#v, want fast deleted", patched.Agent.Profiles)
+		}
+		if patched.Roles.Worker.Agent.Profile == nil || *patched.Roles.Worker.Agent.Profile != "strong" {
+			t.Fatalf("worker profile = %#v, want strong", patched.Roles.Worker.Agent)
+		}
+	})
+}
+
+func TestIsFieldLevelConfigPathAgentProfiles(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"agent.profiles.fast",
+		"agent.profiles.fast.vendor",
+		"agent.profiles.fast.model",
+		"roles.worker.agent.profile",
+		"roles.worker.agent.vendor",
+		"roles.worker.agent.model",
+	} {
+		if !IsFieldLevelConfigPath(path) {
+			t.Fatalf("IsFieldLevelConfigPath(%q) = false, want true", path)
+		}
+	}
+	for _, path := range []string{
+		"agent.profiles",
+		"roles.worker.agent",
+		"roles.coordinator.agent",
+	} {
+		if IsFieldLevelConfigPath(path) {
+			t.Fatalf("IsFieldLevelConfigPath(%q) = true, want false", path)
+		}
+	}
+}

@@ -27,7 +27,8 @@ func TestSchedulerWiresCommonExecutorOwnerNotWorkerOnlyRegistry(t *testing.T) {
 	}
 	src := string(schedulerSrc)
 
-	if !strings.Contains(src, "Owner: activeExecutions") {
+	// gofmt may pad struct field alignment; ignore spaces for the wire check.
+	if !strings.Contains(strings.ReplaceAll(src, " ", ""), "Owner:activeExecutions") {
 		t.Fatal("scheduler must wire agent.ExecutorOptions.Owner = activeExecutions at common boundary")
 	}
 	// Post-spawn worker-only registration is the incomplete #572 approach.
@@ -46,9 +47,10 @@ func TestSchedulerWiresCommonExecutorOwnerNotWorkerOnlyRegistry(t *testing.T) {
 			t.Fatalf("missing role adapter %s — inventory coverage incomplete", role)
 		}
 	}
-	// Coordinator triage uses the same shared agentExecutor (Owner wired once).
-	if !strings.Contains(src, "NewAgentLLM(agentExecutor") {
-		t.Fatal("coordinator triage must use the shared agentExecutor (Supervisor-owned)")
+	// Coordinator triage uses a Supervisor-owned executor (shared global or
+	// multi-role globalExecutor); both must wire Owner: activeExecutions above.
+	if !strings.Contains(src, "NewAgentLLM(agentExecutor") && !strings.Contains(src, "NewAgentLLM(globalExecutor") {
+		t.Fatal("coordinator triage must use a Supervisor-owned agent executor")
 	}
 }
 

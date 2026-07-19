@@ -101,8 +101,9 @@ func TestSafetyFloorClaimRechecksAdmissionBeforeClaimNext(t *testing.T) {
 
 	var allowCalls atomic.Int64
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
-		Repos: repos,
-		Now:   func() time.Time { return now },
+		Repos:  repos,
+		Now:    func() time.Time { return now },
+		Worker: &stubWorkerScheduler{},
 		AllowClaim: func() error {
 			allowCalls.Add(1)
 			return ErrAdmissionStopping

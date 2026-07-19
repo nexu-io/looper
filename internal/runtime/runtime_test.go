@@ -4741,6 +4741,34 @@ func seedFailedReviewerRecoveryLoop(t *testing.T, repos *storage.Repositories, p
 	}
 }
 
+func TestAsyncSnapshotQueueEnabledForRoleOnlyAgents(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Agent.Vendor = nil
+	if asyncSnapshotQueueEnabled(false, cfg) {
+		t.Fatal("asyncSnapshotQueueEnabled = true with no agents, want false")
+	}
+	if defaultSchedulerAgentsConfigured(cfg) {
+		t.Fatal("defaultSchedulerAgentsConfigured = true with no agents, want false")
+	}
+
+	roleVendor := config.AgentVendorClaudeCode
+	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &roleVendor}
+	if !defaultSchedulerAgentsConfigured(cfg) {
+		t.Fatal("defaultSchedulerAgentsConfigured = false with role-only worker vendor, want true")
+	}
+	if !asyncSnapshotQueueEnabled(false, cfg) {
+		t.Fatal("asyncSnapshotQueueEnabled = false with role-only worker vendor, want true so project import enqueues snapshots")
+	}
+	if !asyncSnapshotQueueEnabled(true, config.Config{}) {
+		t.Fatal("asyncSnapshotQueueEnabled = false with custom scheduler tick, want true")
+	}
+}
+
 func mustFormatInt64(value int64) string {
 	return strconv.FormatInt(value, 10)
 }

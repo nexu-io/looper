@@ -20,6 +20,16 @@ func TestConfigGetRedactsSecretsAndIncludesMetadata(t *testing.T) {
 	cfg.Server.LocalToken = &localToken
 	cfg.Agent.Env = map[string]string{"Z_TOKEN": "agent-env-secret", "A_TOKEN": "another-agent-secret"}
 	cfg.Agent.Params = map[string]any{"apiKey": "agent-param-secret", "nested": map[string]any{"token": "nested-param-secret"}}
+	fastVendor := config.AgentVendorCodex
+	cfg.Agent.Profiles = map[string]config.AgentBindingConfig{
+		"fast": {Vendor: &fastVendor, Model: stringPtr("gpt-5-mini")},
+	}
+	workerVendor := config.AgentVendorClaudeCode
+	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{
+		Profile: stringPtr("fast"),
+		Vendor:  &workerVendor,
+		Model:   stringPtr("claude-haiku"),
+	}
 	cfg.Daemon.Environment = map[string]string{"SECOND": "daemon-env-secret", "FIRST": "another-daemon-secret"}
 
 	lastAttempt := time.Date(2026, time.July, 16, 10, 0, 0, 0, time.UTC)
@@ -61,6 +71,27 @@ func TestConfigGetRedactsSecretsAndIncludesMetadata(t *testing.T) {
 	assertStringArray(t, agent["envKeys"], []string{"A_TOKEN", "Z_TOKEN"})
 	if len(agent["env"].(map[string]any)) != 0 || len(agent["params"].(map[string]any)) != 0 {
 		t.Fatalf("agent secret fields must be redacted to empty objects: %#v", agent)
+	}
+	profiles := agent["profiles"].(map[string]any)
+	fast := profiles["fast"].(map[string]any)
+	assertEqual(t, fast["vendor"], "codex")
+	assertEqual(t, fast["model"], "gpt-5-mini")
+	if _, hasParams := fast["params"]; hasParams {
+		t.Fatalf("agent.profiles must not expose params: %#v", fast)
+	}
+	roles := data["roles"].(map[string]any)
+	worker := roles["worker"].(map[string]any)
+	workerAgent := worker["agent"].(map[string]any)
+	assertEqual(t, workerAgent["profile"], "fast")
+	assertEqual(t, workerAgent["vendor"], "claude-code")
+	assertEqual(t, workerAgent["model"], "claude-haiku")
+	if _, hasParams := workerAgent["params"]; hasParams {
+		t.Fatalf("roles.worker.agent must not expose params: %#v", workerAgent)
+	}
+	if planner, ok := roles["planner"].(map[string]any); ok {
+		if _, hasAgent := planner["agent"]; hasAgent {
+			t.Fatalf("nil role agent must be omitted: %#v", planner)
+		}
 	}
 	daemon := data["daemon"].(map[string]any)
 	if len(daemon["environment"].(map[string]any)) != 0 {

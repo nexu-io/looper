@@ -845,4 +845,647 @@ describe("ConfigPage", () => {
       );
     });
   });
+
+  it("promotes unsetting both profile leaves to whole-profile removal", async () => {
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    // First leaf unset stays leaf-level while the other identity remains.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unset agent.profiles.fast.model" }),
+    );
+    // Last remaining leaf promotes to whole-profile removal (avoids empty {}).
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unset agent.profiles.fast.vendor" }),
+    );
+    // Profile shows as pending removal, not dual leaf unsets.
+    expect(screen.getByText("undo remove")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    // Unreferenced whole-profile remove is not high-impact; PATCH immediately.
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({});
+    expect(body.unset).toEqual(["agent.profiles.fast"]);
+  });
+
+  it("does not retain omitted profile leaves when re-adding after remove", async () => {
+    // remove+recreate with only vendor must unset the old model rather than
+    // restoring the whole profile and silently keeping the previous model leaf.
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Remove profile fast" }));
+    expect(screen.getByText("undo remove")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("New profile id"), {
+      target: { value: "fast" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    // Vendor change is high-impact (resolved-vendor companion guard).
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({ "agent.profiles.fast.vendor": "opencode" });
+    expect(body.unset).toEqual(["agent.profiles.fast.model"]);
+    expect(body.unset).not.toContain("agent.profiles.fast");
+  });
+
+  it("unsets empty model when re-adding a profile after remove with only vendor", async () => {
+    // Empty model is a meaningful suppress binding; remove+recreate with only
+    // vendor must unset it so the new profile does not keep model:"".
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Remove profile fast" }));
+    expect(screen.getByText("undo remove")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("New profile id"), {
+      target: { value: "fast" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({ "agent.profiles.fast.vendor": "opencode" });
+    expect(body.unset).toEqual(["agent.profiles.fast.model"]);
+    expect(body.unset).not.toContain("agent.profiles.fast");
+  });
+
+  it("unsets a single profile model leaf without removing the profile", async () => {
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unset agent.profiles.fast.model" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({});
+    expect(body.unset).toEqual(["agent.profiles.fast.model"]);
+  });
+
+  it("keeps staged profile leaf edits when rebasing after a conflict", async () => {
+    const baseMeta = {
+      ...configFixture().metadata.fields,
+      "agent.profiles": {
+        source: "config-file" as const,
+        editable: true,
+        applyMode: "hot" as const,
+      },
+    };
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: baseMeta,
+      },
+    });
+    const refreshed = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        revision: "sha256:external",
+        // Leaf metadata intentionally omitted — only the map entry exists.
+        fields: baseMeta,
+      },
+    });
+    const applied = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        revision: "sha256:applied",
+        fields: baseMeta,
+      },
+    });
+    let getCount = 0;
+    let patchCount = 0;
+    const fetchMock = vi.fn(
+      (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (String(input) !== "/api/v1/config") {
+          return Promise.reject(new Error(`unexpected request: ${String(input)}`));
+        }
+        if (init?.method === "PATCH") {
+          patchCount += 1;
+          if (patchCount === 1) {
+            return Promise.resolve(
+              response(
+                { code: "CONFIG_CONFLICT", message: "configuration changed on disk" },
+                409,
+              ),
+            );
+          }
+          return Promise.resolve(response(applied));
+        }
+        getCount += 1;
+        return Promise.resolve(response(getCount === 1 ? initial : refreshed));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    fireEvent.change(await screen.findByLabelText("agent.profiles.fast.model"), {
+      target: { value: "gpt-5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Reload latest and keep edits",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(
+        (screen.getByLabelText("agent.profiles.fast.model") as HTMLInputElement).value,
+      ).toBe("gpt-5");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(patchCount).toBe(2));
+    const patchCalls = fetchMock.mock.calls.filter(
+      ([, init]) => init?.method === "PATCH",
+    );
+    expect(JSON.parse(String(patchCalls[1]?.[1]?.body))).toMatchObject({
+      revision: "sha256:external",
+      set: { "agent.profiles.fast.model": "gpt-5" },
+    });
+  });
+
+  it("confirms high-impact role agent vendor changes before PATCH", async () => {
+    const initial = configFixture({
+      roles: {
+        worker: { agent: { vendor: "codex" } },
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "roles.worker.agent.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    fireEvent.change(await screen.findByLabelText("roles.worker.agent.vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(
+      await screen.findByRole("dialog", {
+        name: "Confirm high-impact configuration",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText(/worker agent vendor → opencode/i)).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+      false,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply changes" }));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+  });
+
+  it("edits agent profiles and role agent bindings without a params editor", async () => {
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      roles: {
+        worker: {
+          agent: { profile: "fast", model: "haiku" },
+        },
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.profile": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.vendor": {
+            source: "default",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    expect(screen.queryByLabelText(/params/i)).toBeNull();
+    expect(screen.queryByText(/params map/i)).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("agent.profiles.fast.model"), {
+      target: { value: "gpt-5" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile id"), {
+      target: { value: "cheap" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
+    fireEvent.change(screen.getByLabelText("roles.worker.agent.profile"), {
+      target: { value: "cheap" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    // Profile switch is high-impact (can change resolved vendor).
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set["agent.profiles.fast.model"]).toBe("gpt-5");
+    expect(body.set["agent.profiles.cheap.vendor"]).toBe("opencode");
+    expect(body.set["roles.worker.agent.profile"]).toBe("cheap");
+    expect(JSON.stringify(body)).not.toMatch(/params/i);
+  });
+
+  it("retains cleared role profile draft so Save sends unset", async () => {
+    // Clearing the text control stages only an unset (no set). onDraft must
+    // keep the empty draft; otherwise the field snaps back and Save is a no-op.
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      roles: {
+        worker: {
+          agent: { profile: "fast", vendor: "claude-code", model: "haiku" },
+        },
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "roles.worker.agent.profile": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "roles.worker.agent.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    const profileInput = (await screen.findByLabelText(
+      "roles.worker.agent.profile",
+    )) as HTMLInputElement;
+    expect(profileInput.value).toBe("fast");
+    fireEvent.change(profileInput, { target: { value: "" } });
+    // Empty draft must stick (not snap back to published "fast").
+    expect(profileInput.value).toBe("");
+    expect(screen.getByText(/1\s*pending/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    // Unsetting a role profile is high-impact.
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set).toEqual({});
+    expect(body.unset).toEqual(["roles.worker.agent.profile"]);
+  });
+
+  it("keeps profile controls editable when map container metadata is restart-bound", async () => {
+    // Mirrors real daemon metadata: agent.profiles is a non-editable map
+    // container while entry/leaf paths remain hot-editable.
+    const initial = configFixture({
+      agent: {
+        vendor: "codex",
+        model: "gpt-5",
+        profiles: { fast: { vendor: "codex", model: "gpt-5-mini" } },
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.profiles": {
+            source: "config-file",
+            editable: false,
+            applyMode: "restart",
+          },
+          "agent.profiles.fast.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+          "agent.profiles.fast.model": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${String(input)}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    expect(await screen.findByTestId("agent-profiles")).toBeTruthy();
+    expect(
+      screen.queryByText(
+        "Agent profiles are read-only under the active config authority.",
+      ),
+    ).toBeNull();
+
+    const modelInput = screen.getByLabelText(
+      "agent.profiles.fast.model",
+    ) as HTMLInputElement;
+    expect(modelInput.disabled).toBe(false);
+    fireEvent.change(modelInput, { target: { value: "gpt-5" } });
+
+    fireEvent.change(screen.getByLabelText("New profile id"), {
+      target: { value: "cheap" },
+    });
+    fireEvent.change(screen.getByLabelText("New profile vendor"), {
+      target: { value: "opencode" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Apply changes" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set["agent.profiles.fast.model"]).toBe("gpt-5");
+    expect(body.set["agent.profiles.cheap.vendor"]).toBe("opencode");
+  });
 });

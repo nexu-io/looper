@@ -34,8 +34,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0018_feishu_threads",
-              "latestAppliedId": "0018_feishu_threads",
+              "latestAvailableId": "0019_run_agent_snapshot",
+              "latestAppliedId": "0019_run_agent_snapshot",
               "pendingCount": 0
             }
           }
@@ -82,7 +82,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0018_feishu_threads",
+            "schemaVersion": "0019_run_agent_snapshot",
             "pendingMigrations": [],
             "healthy": true
           },

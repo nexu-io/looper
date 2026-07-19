@@ -94,9 +94,11 @@ Later layers override earlier ones. Objects are merged deeply, arrays are replac
 
 `looperd` watches the selected config file and publishes a candidate atomically only when every changed effective field is hot-safe. A claim made after publication uses the new snapshot; an already active run keeps the snapshot it started with. Invalid candidates and candidates containing restart-bound changes leave the last-known-good snapshot active and expose diagnostics at `/dashboard/config`. Mixed candidates are rejected as a whole rather than partially applied.
 
-The hot-safe surface is an explicit allowlist:
+The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-file-is-global-runtime-policy-authority.md) for field classification):
 
 - `agent.vendor` (including adding the first vendor after daemon startup), `agent.model`, individual `agent.env` entries, and the canonical idle/max-runtime fields under `agent.timeouts.*`
+- named `agent.profiles.<id>` entries and their `vendor` / `model` leaves (whole-map `agent.profiles` is not a dashboard path; profile ids match `[A-Za-z0-9_-]+`)
+- coding-role agent bindings: `roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}`
 - `scheduler.maxConcurrentRuns` and `scheduler.slowLaneWarnThresholdMs`
 - `notifications.inApp` and the current `notifications.osascript.*` fields; notification webhooks and Feishu notification transport are restart-bound
 - the current `disclosure.*` fields
@@ -105,9 +107,11 @@ The hot-safe surface is an explicit allowlist:
 - the current Planner discovery/trigger/instruction fields except `roles.planner.triggers.planeAssigneeId`; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
-`agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. Configuring the first vendor may use an already prepared model/params profile. A continuation created under an old vendor starts a fresh new-vendor session while retaining its checkpoint, worktree, HITL answer, and queued human instructions—it never sends an old vendor's native session ID to the new CLI.
+Profile and role agent vendor/model fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+`agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
+
+Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -212,7 +216,7 @@ Schema migration is independent from config-file format migration: precedence st
 
 In the simplest setup, you can rely on defaults and only create a config file when you need to customize behavior.
 
-`agent.vendor` does not have a built-in default. If you want planner / reviewer / fixer / worker loops to run, set it explicitly.
+`agent.vendor` does not have a built-in default. It is the inheritance base and the zero-diff default for every coding role, but it is not mandatory when a role resolves vendor from `agent.profiles` or `roles.<role>.agent` alone. Set a global vendor when you want one shared identity, or when coordinator triage LLM should run (triage uses the global agent only).
 
 Example minimal `~/.looper/config.toml`:
 
@@ -225,6 +229,120 @@ id = "looper"
 name = "Looper"
 repoPath = "/absolute/path/to/repo"
 ```
+
+Existing global-only configs remain zero-diff: a single `agent.vendor` / `agent.model` still applies to every coding role (planner, worker, reviewer, fixer) until you add profiles or per-role bindings.
+
+## Multi-role agent vendor and model
+
+Coding roles can share one global agent or override vendor/model per role. Overrides are identity-only (vendor + model). Shared executor settings such as `agent.params`, `agent.env`, timeouts, and `agent.nativeResume` stay global.
+
+### Named profiles (`agent.profiles`)
+
+Define reusable vendor/model pairs under `agent.profiles.<id>`. Each profile may set `vendor`, `model`, or both (at least one is required). Profile ids are non-empty, trimmed, and match `[A-Za-z0-9_-]+`.
+
+Profiles do not carry params, env, or timeouts.
+
+### Per-role bindings (`roles.<role>.agent`)
+
+Optional on the four coding roles only: `planner`, `worker`, `reviewer`, and `fixer`.
+
+| Field | Purpose |
+| --- | --- |
+| `profile` | Name of an entry in `agent.profiles` |
+| `vendor` | Inline vendor override |
+| `model` | Inline model override |
+
+A role may use a profile ref, inline vendor/model, or both (inline wins over the selected profile for the same field).
+
+Project-level `projects[].roles.*.agent` bindings are **not supported**. Agent identity is global-only; project role partials that set agent fields fail validation.
+
+### Resolve order
+
+For each coding role, Looper overlays identity in this order:
+
+1. **Global** `agent.vendor` / `agent.model`
+2. **Role profile** — if `roles.<role>.agent.profile` is set, overlay that profile's vendor/model
+3. **Role inline** — overlay `roles.<role>.agent.vendor` / `roles.<role>.agent.model` when present
+
+A role is runnable only when the overlay leaves a non-empty vendor. Missing global vendor is fine when a profile or role inline supplies one.
+
+### Model semantics
+
+| Config value | Meaning |
+| --- | --- |
+| field omitted / unset | inherit from the previous layer (or remain unset) |
+| non-empty string | explicit model for that layer |
+| empty string `""` | suppress inherited model → vendor default |
+
+After the full overlay, an empty-string model is kept as an explicit empty binding (not the same as unset): the vendor CLI uses its own default, and any global `agent.params` `--model`/`-m` flags are stripped so they cannot override the suppression.
+
+### Coordinator triage
+
+Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.model`, plus global params/env/timeouts). It does not read `roles.coordinator.agent` or coding-role profile bindings. If global `agent.vendor` is unset, triage LLM is skipped; coding roles that resolve via profile or role bindings can still run.
+
+### Hot reload and frozen runs
+
+- Profile and role agent vendor/model/profile paths are hot-safe for **new claims** after a successful config publication.
+- In-flight runs keep the immutable config snapshot (and durable per-run agent snapshot) they started with; resume/retry copies the predecessor run's agent snapshot rather than re-resolving live config.
+- `agent.params` remain global, file-only, and restart-bound. The dashboard does not edit params.
+
+### Example: different reviewer vs worker models
+
+TOML:
+
+```toml
+[agent]
+vendor = "codex"
+model = "gpt-5"
+
+# Shared identity presets (vendor + model only).
+[agent.profiles.fast]
+vendor = "codex"
+model = "gpt-5-mini"
+
+[agent.profiles.strong]
+vendor = "claude-code"
+model = "claude-sonnet"
+
+# Worker keeps the global codex/gpt-5 binding (no roles.worker.agent block).
+
+[roles.reviewer.agent]
+profile = "strong"
+# Optional inline pin on top of the profile:
+# model = "claude-opus"
+
+[roles.fixer.agent]
+profile = "fast"
+
+# Suppress model so the vendor CLI default is used:
+# [roles.planner.agent]
+# model = ""
+```
+
+Equivalent JSON:
+
+```json
+{
+  "agent": {
+    "vendor": "codex",
+    "model": "gpt-5",
+    "profiles": {
+      "fast": { "vendor": "codex", "model": "gpt-5-mini" },
+      "strong": { "vendor": "claude-code", "model": "claude-sonnet" }
+    }
+  },
+  "roles": {
+    "reviewer": {
+      "agent": { "profile": "strong" }
+    },
+    "fixer": {
+      "agent": { "profile": "fast" }
+    }
+  }
+}
+```
+
+With that file, worker and planner resolve to global `codex` / `gpt-5`, reviewer to `claude-code` / `claude-sonnet` via `strong`, and fixer to `codex` / `gpt-5-mini` via `fast`.
 
 ## Grok Build (xAI)
 
@@ -362,10 +480,13 @@ All role-specific config lives under `roles.<role>`.
 - shared role instructions live at `roles.<role>.instructions`
 - discovery policy lives at `roles.<role>.discovery.*`
 - runtime behavior lives at `roles.<role>.behavior.*` when that split is useful for the role
+- coding-role agent identity overlays live at `roles.{planner,worker,reviewer,fixer}.agent` (profile ref and/or inline vendor/model); see [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model)
 
 ## Coordinator config reference
 
 Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes `triaged` plus the coordinator-owned label namespace. Dispatch consumes `triaged` + `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
+
+Triage LLM calls use the **global** `agent.vendor` / `agent.model` only (not coding-role profiles or `roles.*.agent` overlays). See [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model).
 
 ### Triage settings
 
@@ -605,6 +726,12 @@ retryBaseDelayMs = 5000
 vendor = "opencode"
 model = "your-model-if-needed"
 
+# Optional named identity presets (vendor + model only). See
+# "Multi-role agent vendor and model" above.
+# [agent.profiles.fast]
+# vendor = "opencode"
+# model = "cheaper-model"
+
 [agent.params]
 reasoning = "medium"
 
@@ -842,7 +969,11 @@ Canonical replacement:
 
 ```toml
 [roles.reviewer]
-instructions = "Review carefully."
+instructions = "Review for correctness, regressions, and migration safety."
+
+# Optional per-role agent identity (profile and/or inline vendor/model).
+# [roles.reviewer.agent]
+# profile = "strong"
 
 [roles.reviewer.discovery]
 autoDiscovery = true
@@ -1021,7 +1152,7 @@ looperd \
 1. Install `git` and `gh`
 2. Create `~/.looper/config.toml`
 3. Add at least one project in `projects`
-4. Set `agent.vendor`
+4. Set coding-role agent identity: either global `agent.vendor`, or `agent.profiles` / `roles.<role>.agent` bindings (see [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model))
 5. Start the daemon with your installed `looperd` (or `go run ./cmd/looperd` while developing)
 6. Run `looper config show` to inspect the effective config
 

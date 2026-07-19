@@ -264,6 +264,72 @@ func TestTrustedReviewChildEnvCapturesAgentAndProviderCredentials(t *testing.T) 
 	}
 }
 
+func TestMaterializeTrustedReviewAgentIdentityPrefersRunSnapshot(t *testing.T) {
+	t.Parallel()
+
+	globalVendor := config.AgentVendorCodex
+	globalModel := "global-model"
+	roleVendor := config.AgentVendorClaudeCode
+	roleModel := "role-model"
+	snapshotModel := "snapshot-model"
+	cfg := config.Config{
+		Agent: config.AgentConfig{Vendor: &globalVendor, Model: &globalModel},
+		Disclosure: config.DisclosureConfig{
+			Enabled:      true,
+			IncludeAgent: true,
+			Channels:     config.DisclosureChannelsConfig{ReviewComment: true},
+		},
+	}
+
+	// Role-resolved identity overwrites the daemon global agent fields.
+	materialized := materializeTrustedReviewAgentIdentity(cfg, roleVendor, &roleModel)
+	if materialized.Agent.Vendor == nil || *materialized.Agent.Vendor != roleVendor {
+		t.Fatalf("role vendor = %#v, want %q", materialized.Agent.Vendor, roleVendor)
+	}
+	if materialized.Agent.Model == nil || *materialized.Agent.Model != roleModel {
+		t.Fatalf("role model = %#v, want %q", materialized.Agent.Model, roleModel)
+	}
+	// Source config must not be mutated (mint path takes a value copy).
+	if cfg.Agent.Vendor == nil || *cfg.Agent.Vendor != globalVendor || cfg.Agent.Model == nil || *cfg.Agent.Model != globalModel {
+		t.Fatalf("source config mutated: agent=%#v", cfg.Agent)
+	}
+	// disclosure.FromConfig must report the materialized reviewer identity.
+	stamp := disclosure.FromConfig(materialized).Markdown("body", "reviewer", disclosure.ChannelReviewComment)
+	if !strings.Contains(stamp, "agent=claude-code") {
+		t.Fatalf("disclosure stamp = %q, want agent=claude-code from role identity", stamp)
+	}
+
+	// Sticky run snapshot wins over role-resolved fallback.
+	vendor, model := reviewerTrustedReviewAgentIdentity(reviewer.AgentRunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: string(config.AgentVendorOpenCode),
+		SnapshotModel:  &snapshotModel,
+	}, roleVendor, &roleModel)
+	if vendor != config.AgentVendorOpenCode || model == nil || *model != snapshotModel {
+		t.Fatalf("snapshot identity = %q/%v, want opencode/%q", vendor, model, snapshotModel)
+	}
+	snapCfg := materializeTrustedReviewAgentIdentity(cfg, vendor, model)
+	stamp = disclosure.FromConfig(snapCfg).Markdown("body", "reviewer", disclosure.ChannelReviewComment)
+	if !strings.Contains(stamp, "agent=opencode") {
+		t.Fatalf("snapshot disclosure stamp = %q, want agent=opencode", stamp)
+	}
+
+	// Without UseSnapshot, fall back to the adapter's role-resolved identity.
+	vendor, model = reviewerTrustedReviewAgentIdentity(reviewer.AgentRunInput{}, roleVendor, &roleModel)
+	if vendor != roleVendor || model == nil || *model != roleModel {
+		t.Fatalf("fallback identity = %q/%v, want role identity", vendor, model)
+	}
+	// Empty snapshot vendor must not clear the role-resolved fallback.
+	vendor, model = reviewerTrustedReviewAgentIdentity(reviewer.AgentRunInput{
+		UseSnapshot:    true,
+		SnapshotVendor: "   ",
+		SnapshotModel:  &snapshotModel,
+	}, roleVendor, &roleModel)
+	if vendor != roleVendor || model == nil || *model != roleModel {
+		t.Fatalf("blank snapshot vendor identity = %q/%v, want role fallback", vendor, model)
+	}
+}
+
 func TestReviewerAllowsTrustedReviewProxy(t *testing.T) {
 	t.Parallel()
 	if reviewerAllowsTrustedReviewProxy(nil, "demo", nil) {
@@ -347,12 +413,14 @@ func TestReviewerAgentExecutorAdapterInjectsTrustedReviewSock(t *testing.T) {
 
 	// Shared executor config deliberately omits the sock — only the reviewer
 	// adapter may inject LOOPER_TRUSTED_REVIEW_SOCK for review-submit capability.
+	customVendor := config.AgentVendor("custom")
 	executor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
-			Vendor: config.AgentVendor("custom"),
+			Vendor: customVendor,
 			Params: map[string]any{"command": scriptPath},
 			Env:    map[string]string{"SHARED": "1"},
 		},
+		ParamsOwnerVendor: &customVendor,
 	})
 	nativeCfg := &config.Config{
 		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},

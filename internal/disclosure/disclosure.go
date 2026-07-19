@@ -36,6 +36,16 @@ type Stamper struct {
 	Model   string
 }
 
+// WithIdentity returns a copy of s with Agent/Model replaced by the provided
+// values (including empty). Callers pass run-snapshot identity so sticky resume
+// and invalid snapshots cannot keep a statically baked live agent. Empty agent
+// clears identity rather than falling back to the base stamper.
+func (s Stamper) WithIdentity(agent, model string) Stamper {
+	s.Agent = strings.TrimSpace(agent)
+	s.Model = strings.TrimSpace(model)
+	return s
+}
+
 func FromConfig(cfg config.Config) Stamper {
 	agent := ""
 	if cfg.Agent.Vendor != nil {

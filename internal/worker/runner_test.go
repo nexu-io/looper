@@ -1277,6 +1277,123 @@ func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *te
 	}
 }
 
+func TestCreateRunContextCopiesPredecessorAgentSnapshotOnResume(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"codex","model":"sticky-model","profileId":"sticky-profile"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorClaudeCode),
+		AgentModel:     stringPtr("new-model"),
+		AgentProfileID: "new-profile",
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		Execution:      &checkpointExecution{Status: "completed", Summary: "upstream server_error"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_with_snapshot",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil")
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed {
+		t.Fatal("Resumed = false, want true")
+	}
+	if resumed.Run.AgentSnapshotJSON == nil || *resumed.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %#v, want predecessor %q", resumed.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), resumed.Run.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.AgentSnapshotJSON == nil || *persisted.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("persisted AgentSnapshotJSON = %#v, want predecessor", persisted)
+	}
+}
+
+func TestCreateRunContextCopiesPredecessorAgentSnapshotOnFirstStepRetry(t *testing.T) {
+	t.Parallel()
+
+	// Failed run that restarts at prepare_work (first step) must still copy the
+	// predecessor snapshot — sticky across any failed/interrupted lineage.
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"codex","model":"sticky-first-step","profileId":"sticky-profile"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorClaudeCode),
+		AgentModel:     stringPtr("new-model"),
+		AgentProfileID: "new-profile",
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		ResumePolicy:   loops.ResumePolicyReplayStep,
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_at_prepare",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepPrepareWork)),
+		LastCompletedStep: nil,
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Resumed {
+		t.Fatal("Resumed = true, want false for first-step restart")
+	}
+	if created.StartStep != stepPrepareWork {
+		t.Fatalf("StartStep = %q, want prepare_work", created.StartStep)
+	}
+	if created.Run.AgentSnapshotJSON == nil || *created.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %#v, want predecessor %q", created.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+}
+
 func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(t *testing.T) {
 	t.Parallel()
 
@@ -4597,4 +4714,73 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	if persisted == nil || persisted.Status != "terminated" {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
 	}
+}
+
+func TestStampPullRequestDisclosureUsesRunSnapshotIdentity(t *testing.T) {
+	t.Parallel()
+
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Enabled = true
+	disclosureCfg.IncludeAgent = true
+	disclosureCfg.Channels.PullRequest = true
+
+	liveModel := "live-model"
+	runner := New(Options{
+		AgentRuntime: string(config.AgentVendorClaudeCode),
+		AgentModel:   &liveModel,
+		Disclosure:   &disclosureCfg,
+	})
+
+	snapshot := `{"vendor":"codex","model":"frozen-model","profileId":"worker"}`
+	run := storage.RunRecord{AgentSnapshotJSON: &snapshot}
+	got := runner.stampPullRequestDisclosure(run, "PR body")
+	if !strings.Contains(got, "agent=codex") {
+		t.Fatalf("stamp used live identity, got %q", got)
+	}
+	if strings.Contains(got, "agent=claude-code") {
+		t.Fatalf("stamp leaked live runner agent: %q", got)
+	}
+
+	// Empty snapshot falls back to runner identity.
+	legacy := runner.stampPullRequestDisclosure(storage.RunRecord{}, "PR body")
+	if !strings.Contains(legacy, "agent=claude-code") {
+		t.Fatalf("legacy stamp = %q, want runner agent", legacy)
+	}
+
+	// Malformed snapshot must not fall back to live runner identity.
+	bad := "not-json"
+	fallback := runner.stampPullRequestDisclosure(storage.RunRecord{AgentSnapshotJSON: &bad}, "PR body")
+	if strings.Contains(fallback, "agent=claude-code") {
+		t.Fatalf("malformed snapshot stamp leaked live runner agent: %q", fallback)
+	}
+	if strings.Contains(fallback, "agent=codex") {
+		t.Fatalf("malformed snapshot stamp should not invent agent identity: %q", fallback)
+	}
+}
+
+func TestCreatePullRequestInputCarriesDisclosureIdentity(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 9, URL: "https://example/pr/9"}}
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Enabled = true
+	disclosureCfg.IncludeAgent = true
+	disclosureCfg.Channels.PullRequest = true
+
+	// Direct adapter-style check: runners set DisclosureAgent from snapshot.
+	input := CreatePullRequestInput{
+		Repo: "acme/looper", HeadBranch: "feat", BaseBranch: "main", Title: "t",
+		Body: "body", DisclosureAgent: "codex", DisclosureModel: "frozen",
+	}
+	_, err := gh.CreatePullRequest(context.Background(), input)
+	if err != nil {
+		t.Fatalf("CreatePullRequest() error = %v", err)
+	}
+	if len(gh.createPRCalls) != 1 {
+		t.Fatalf("createPRCalls = %d, want 1", len(gh.createPRCalls))
+	}
+	if gh.createPRCalls[0].DisclosureAgent != "codex" || gh.createPRCalls[0].DisclosureModel != "frozen" {
+		t.Fatalf("Disclosure fields = %#v", gh.createPRCalls[0])
+	}
+	_ = disclosureCfg
 }

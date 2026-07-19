@@ -108,6 +108,14 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// ParamsOwnerVendor marks Config.Params as global agent.params owned by that
+	// vendor (typically agent.vendor). effectiveConfig always filters command/args
+	// via ParamsForRoleVendor against the effective identity (role or sticky
+	// snapshot): matching owner keeps wrappers, diverged or nil owner strips
+	// vendor-owned command/args so orphan global wrappers cannot ride a role-only
+	// vendor. Tests that intentionally pre-bind params.command should set the
+	// owner to Config.Vendor so the same-vendor path preserves them.
+	ParamsOwnerVendor *config.AgentVendor
 	// Owner, when set, admits every agent spawn under the Execution Supervisor
 	// before cmd.Start and binds the process containment handle before Start
 	// returns (ADR-0015 / #576). Daemon producers must wire Owner; unit tests
@@ -150,6 +158,18 @@ type RunInput struct {
 	IdempotencyKey     string
 	Env                map[string]string
 	NativeSessionID    string
+	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
+	// executor's configured vendor/model for this start only (spawn, native
+	// resume vendor checks, and persisted execution vendor). Env and
+	// NativeResumeEnabled still come from the executor config. Identity-bearing
+	// params are filtered against the frozen vendor: wrappers are kept when the
+	// snapshot matches the params owner (or pre-bound base vendor), and model
+	// flags in args are stripped so SnapshotModel wins.
+	UseSnapshot    bool
+	SnapshotVendor string
+	// SnapshotModel is used only when UseSnapshot is true. nil means no model
+	// flag; a non-nil value (including empty) sets the model override.
+	SnapshotModel *string
 }
 
 type Result struct {
@@ -189,6 +209,7 @@ type Execution interface {
 
 type ConfiguredExecutor struct {
 	config               ExecutorConfig
+	paramsOwner          *config.AgentVendor
 	repos                *storage.Repositories
 	logDir               string
 	now                  func() time.Time
@@ -204,6 +225,7 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 	}
 	return &ConfiguredExecutor{
 		config:               options.Config,
+		paramsOwner:          options.ParamsOwnerVendor,
 		repos:                options.Repos,
 		logDir:               options.LogDir,
 		now:                  now,
@@ -228,12 +250,142 @@ type nativeResumeInfo struct {
 	SourceExecutionID string
 }
 
+// effectiveConfig returns the executor config for this start, applying run
+// snapshot identity overrides when UseSnapshot is set.
+func (e *ConfiguredExecutor) effectiveConfig(input RunInput) ExecutorConfig {
+	cfg := e.config
+
+	if input.UseSnapshot {
+		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
+			cfg.Vendor = config.AgentVendor(vendor)
+			cfg.Model = input.SnapshotModel
+		}
+	}
+
+	// Always filter global agent.params against the effective identity (role
+	// vendor or sticky snapshot). Construction must not pre-strip against the
+	// live role alone: a failed Codex run that still owns params.command would
+	// otherwise lose its wrapper after the role is hot-switched and sticky
+	// retry restores the snapshot vendor. Nil paramsOwner (agent.vendor unset)
+	// still runs ParamsForRoleVendor so orphan command/args cannot launch the
+	// wrong binary for a role-only vendor.
+	cfg.Params = ParamsForRoleVendor(e.config.Params, e.paramsOwner, cfg.Vendor, cfg.Model)
+	return cfg
+}
+
+// ParamsForRoleVendor returns executor params for an effective coding-role vendor.
+// Global agent.params are owned by agent.vendor. When the effective vendor
+// (resolved role or sticky snapshot) differs from that owner — or the owner is
+// unset while a role still resolves — command and args are dropped so
+// vendor-specific wrappers/flags cannot launch the wrong binary or inject
+// foreign CLI shape. Same-vendor identity keeps command and args; model flags
+// in args are stripped whenever roleModel is non-nil so roles.*.agent.model /
+// profile / global agent.model can win via prependModelFlag, and so an
+// explicit empty model binding (suppress → vendor default) does not leave
+// params --model/-m in place. When roleModel is nil (unset), params.args
+// --model/-m are preserved so existing params-only model configs do not
+// silently fall back to vendor defaults.
+func ParamsForRoleVendor(params map[string]any, globalVendor *config.AgentVendor, roleVendor config.AgentVendor, roleModel *string) map[string]any {
+	if params == nil {
+		return nil
+	}
+	if globalVendor != nil && *globalVendor == roleVendor {
+		// Clone so role resolution cannot mutate the shared global params map.
+		// Strip model flags when a resolved model binding is present — including
+		// non-nil empty (explicit suppress to vendor default).
+		if roleModel != nil {
+			return cloneParamsForSnapshot(params, false)
+		}
+		return maps.Clone(params)
+	}
+	return cloneParamsForSnapshot(params, true)
+}
+
+// cloneParamsForSnapshot copies params and strips identity-bearing overrides.
+// When stripVendorOwned is true (diverged vendor), params.command and
+// params.args are removed entirely — global args are vendor-shaped and must
+// not follow a different binary. When false (same vendor), only model flags
+// in args are removed so SnapshotModel / role model can win.
+func cloneParamsForSnapshot(params map[string]any, stripVendorOwned bool) map[string]any {
+	if params == nil {
+		return nil
+	}
+	out := maps.Clone(params)
+	if stripVendorOwned {
+		delete(out, "command")
+		delete(out, "args")
+		return out
+	}
+	if args, ok := out["args"]; ok {
+		out["args"] = stripModelFlagsFromArgs(args)
+	}
+	return out
+}
+
+// stripModelFlagsFromArgs removes -m / --model and --model=* style flags (and
+// their values when separate) from params args. Supports []string and []any.
+func stripModelFlagsFromArgs(args any) any {
+	switch typed := args.(type) {
+	case []string:
+		return stripModelFlags(typed)
+	case []any:
+		asStrings := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				// Preserve non-string entries by converting via stringArgs path later;
+				// only strip when the whole list is string-compatible.
+				return args
+			}
+			asStrings = append(asStrings, text)
+		}
+		stripped := stripModelFlags(asStrings)
+		out := make([]any, len(stripped))
+		for i, s := range stripped {
+			out[i] = s
+		}
+		return out
+	default:
+		return args
+	}
+}
+
+func stripModelFlags(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(args))
+	skipNext := false
+	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if arg == "-m" || arg == "--model" {
+			if i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "-m=") {
+			continue
+		}
+		// Attached short form: -mMODEL (not -m=MODEL, already handled).
+		if strings.HasPrefix(arg, "-m") && !strings.HasPrefix(arg, "-m=") && arg != "-m" {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
 func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunInput) (nativeResumeInfo, error) {
-	if !e.config.NativeResumeEnabled {
+	cfg := e.effectiveConfig(input)
+	if !cfg.NativeResumeEnabled {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "disabled"}, nil
 	}
 	if sessionID := strings.TrimSpace(input.NativeSessionID); sessionID != "" {
-		if nativeResumeSupported(e.config.Vendor) {
+		if nativeResumeSupported(cfg.Vendor) {
 			return nativeResumeInfo{Enabled: true, SessionID: sessionID, Mode: "native_resume", Status: "started"}, nil
 		}
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unsupported"}, nil
@@ -248,7 +400,7 @@ func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunI
 	if latest == nil || latest.NativeSessionID == nil || strings.TrimSpace(*latest.NativeSessionID) == "" {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
-	if latest.Vendor != string(e.config.Vendor) || !nativeResumeSupported(e.config.Vendor) || !isRecoverableNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
+	if latest.Vendor != string(cfg.Vendor) || !nativeResumeSupported(cfg.Vendor) || !isRecoverableNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "unavailable"}, nil
 	}
 	return nativeResumeInfo{Enabled: true, SessionID: strings.TrimSpace(*latest.NativeSessionID), Mode: "native_resume", Status: "started", SourceExecutionID: latest.ID}, nil
@@ -304,6 +456,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
+	cfg := e.effectiveConfig(input)
 	resume, err := e.resolveNativeResume(ctx, input)
 	if err != nil {
 		return nil, err
@@ -341,12 +494,12 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if resume.Enabled && strings.TrimSpace(input.NativeResumePrompt) != "" {
 		spawnPrompt = input.NativeResumePrompt
 	}
-	command, args := ResolveSpawnWithNativeResume(e.config, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
+	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
 	processcontainment.Configure(cmd)
-	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, e.config.Env, input.Env)
+	cmd.Env = buildCommandEnv(input.WorkingDirectory, spawnPrompt, cfg.Env, input.Env)
 
 	maxOutputBytes := input.MaxOutputBytes
 	if maxOutputBytes <= 0 {
@@ -402,11 +555,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			if markErr := e.markNativeResumeFailed(ctx, resume.SourceExecutionID, err.Error()); markErr == nil && e.logDir != "" {
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
-			command, args = ResolveSpawn(e.config, input.WorkingDirectory, input.Prompt)
+			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
 			processcontainment.Configure(cmd)
-			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, e.config.Env, input.Env)
+			cmd.Env = buildCommandEnv(input.WorkingDirectory, input.Prompt, cfg.Env, input.Env)
 			cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 			cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 			x.mu.Lock()
@@ -940,11 +1093,12 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		}
 	}
 
-	command, args := ResolveSpawn(x.executor.config, x.input.WorkingDirectory, x.input.Prompt)
+	cfg := x.executor.effectiveConfig(x.input)
+	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
 	processcontainment.Configure(cmd)
-	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, x.executor.config.Env, x.input.Env)
+	cmd.Env = buildCommandEnv(x.input.WorkingDirectory, x.input.Prompt, cfg.Env, x.input.Env)
 	cmd.Stdout = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stdout", chunk) }}
 	cmd.Stderr = &streamCapture{onChunk: func(chunk []byte) { x.onOutput("stderr", chunk) }}
 
@@ -1264,7 +1418,11 @@ func (x *execution) maybeEmitProgress(now time.Time, stdout, stderr string) {
 
 // jsonMode reports whether this run is a codex `--json` run (structured events).
 func (x *execution) jsonMode() bool {
-	return x.executor != nil && x.executor.config.LiveToolEvents && x.executor.config.Vendor == config.AgentVendorCodex
+	if x.executor == nil {
+		return false
+	}
+	cfg := x.executor.effectiveConfig(x.input)
+	return cfg.LiveToolEvents && cfg.Vendor == config.AgentVendorCodex
 }
 
 // codexToolTail renders the last n command executions from a codex JSONL blob.
@@ -1348,12 +1506,13 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	metadata := mustJSON(x.executionMetadata(""))
 	commandJSON := mustJSON(map[string]any{"command": x.command, "args": x.args})
 	pid := int64(pidOrZero(x.process.Process))
+	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
 		ProjectID:          emptyToNil(x.input.ProjectID),
 		LoopID:             emptyToNil(x.input.LoopID),
 		RunID:              emptyToNil(x.input.RunID),
-		Vendor:             string(x.executor.config.Vendor),
+		Vendor:             string(cfg.Vendor),
 		Status:             status,
 		PID:                int64PtrIfPositive(pid),
 		CommandJSON:        &commandJSON,
@@ -1413,12 +1572,13 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
 		nativeResumeStatus = "captured"
 	}
+	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,
 		ProjectID:          emptyToNil(x.input.ProjectID),
 		LoopID:             emptyToNil(x.input.LoopID),
 		RunID:              emptyToNil(x.input.RunID),
-		Vendor:             string(x.executor.config.Vendor),
+		Vendor:             string(cfg.Vendor),
 		Status:             status,
 		PID:                int64PtrIfPositive(pid),
 		CommandJSON:        &commandJSON,
@@ -2439,6 +2599,7 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 	if e.repos == nil || e.repos.Events == nil {
 		return
 	}
+	vendor := string(e.effectiveConfig(input).Vendor)
 	_ = e.repos.Events.Append(context.Background(), storage.EventLogRecord{
 		ID:               eventlog.NewEventID("event"),
 		EventType:        eventType,
@@ -2448,8 +2609,8 @@ func (e *ConfiguredExecutor) appendLifecycleEvent(eventType string, input RunInp
 		EntityType:       stringPtr("agent_execution"),
 		EntityID:         &executionID,
 		ActorType:        stringPtr("agent"),
-		ActorID:          stringPtr(string(e.config.Vendor)),
-		ActorDisplayName: stringPtr(string(e.config.Vendor)),
+		ActorID:          stringPtr(vendor),
+		ActorDisplayName: stringPtr(vendor),
 		PayloadJSON:      mustJSON(payload),
 		CreatedAt:        createdAt,
 	})

@@ -106,12 +106,14 @@ type ViewIssueInput struct {
 }
 
 type CreatePullRequestInput struct {
-	Repo       string
-	HeadBranch string
-	BaseBranch string
-	Title      string
-	Body       string
-	CWD        string
+	Repo            string
+	HeadBranch      string
+	BaseBranch      string
+	Title           string
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type CreatePullRequestResult struct {
@@ -151,10 +153,12 @@ type PullRequestReviewersInput struct {
 }
 
 type UpdatePullRequestBodyInput struct {
-	Repo     string
-	PRNumber int64
-	Body     string
-	CWD      string
+	Repo            string
+	PRNumber        int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type IssueAssigneesInput struct {
@@ -217,10 +221,12 @@ type InspectHeadResult struct {
 }
 
 type CommitInput struct {
-	RepoPath     string
-	WorktreeRoot string
-	WorktreePath string
-	Message      string
+	RepoPath        string
+	WorktreeRoot    string
+	WorktreePath    string
+	Message         string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type CommitResult struct{ CommitSHA string }
@@ -243,6 +249,11 @@ type AgentRunInput struct {
 	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
+	// UseSnapshot + SnapshotVendor/Model override the executor config for this
+	// start when the run has a durable agent snapshot (execution authority).
+	UseSnapshot    bool
+	SnapshotVendor string
+	SnapshotModel  *string
 }
 
 type AgentResult struct {
@@ -293,6 +304,7 @@ type Options struct {
 	AllowAutoPush           *bool
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
+	AgentProfileID          string
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
@@ -323,9 +335,10 @@ type Runner struct {
 	allowAutoPush           bool
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
+	agentProfileID          string
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
-	agentModel              string
+	agentModel              *string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -490,7 +503,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -977,7 +990,11 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
+		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+		if err != nil {
+			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+		}
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -989,7 +1006,13 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				return checkpoint, &holdSkipError{summary: summary}
 			}
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+			Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+			Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID),
+			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1041,7 +1064,8 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if inspect.HasUncommittedChanges {
-			committed, err := r.git.Commit(ctx, CommitInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildPlannerFallbackCommitMessage(issue)})
+			disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+			committed, err := r.git.Commit(ctx, CommitInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildPlannerFallbackCommitMessage(issue), DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
@@ -1131,7 +1155,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 				} else if held {
 					return checkpoint, &holdSkipError{summary: summary}
 				}
-				if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, true); err != nil {
+				if err := r.normalizePullRequestDisclosure(ctx, input.Run, issue.Repo, adopted.Number, input.Project.RepoPath, true); err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
 				checkpoint.Publish.PullRequest = adopted
@@ -1164,7 +1188,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			} else if held {
 				return checkpoint, &holdSkipError{summary: summary}
 			}
-			if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, false); err != nil {
+			if err := r.normalizePullRequestDisclosure(ctx, input.Run, issue.Repo, adopted.Number, input.Project.RepoPath, false); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			checkpoint.Publish.PullRequest = &checkpointPullRequest{Number: adopted.Number, URL: adopted.URL, Body: ""}
@@ -1183,7 +1207,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	if checkpoint.Publish.PullRequest == nil {
 		body := buildPullRequestBody(*issue, *worktree, checkpoint.WriteSpec)
-		pr, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: issue.Repo, HeadBranch: worktree.Branch, BaseBranch: worktree.BaseBranch, Title: "Spec: " + issue.Title, Body: body, CWD: input.Project.RepoPath})
+		disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+		pr, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: issue.Repo, HeadBranch: worktree.Branch, BaseBranch: worktree.BaseBranch, Title: "Spec: " + issue.Title, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -1397,7 +1422,7 @@ func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepIn
 	return &checkpointPullRequest{Number: prNumber, URL: firstNonEmpty(detail.URL, state.PRURL), Body: ""}, nil
 }
 
-func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string, prNumber int64, cwd string, force bool) error {
+func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage.RunRecord, repo string, prNumber int64, cwd string, force bool) error {
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
@@ -1408,12 +1433,25 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string
 	if !force && !disclosure.HasMarkdownStamp(detail.Body) {
 		return nil
 	}
-	stamper := disclosure.Stamper{Config: r.disclosure, Agent: r.agentRuntime, Model: r.agentModel}
+	agent, model := r.disclosureIdentity(run)
+	stamper := disclosure.Stamper{Config: r.disclosure, Agent: agent, Model: model}
 	body := stamper.Markdown(detail.Body, "planner", disclosure.ChannelPullRequest)
 	if body == detail.Body {
 		return nil
 	}
-	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd})
+	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd, DisclosureAgent: agent, DisclosureModel: model})
+}
+
+// disclosureIdentity returns agent/model for disclosure stamps from the run
+// snapshot when present; falls back to runner identity on empty snapshot or
+// parse errors (stamp-only paths must not fail the run).
+func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		// Present but invalid snapshot must not fall back to live runner identity.
+		return "", ""
+	}
+	return vendor, derefString(modelPtr)
 }
 
 func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree, pr checkpointPullRequest) error {
@@ -1471,6 +1509,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		}
 	}
 	resumed := shouldResume && startStep != stepDiscoverIssues
+	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
+	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
 	initialCheckpoint := plannerCheckpoint{ResumePolicy: "replay_step"}
 	if resumed {
 		initialCheckpoint = check
@@ -1478,6 +1518,14 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	if err != nil {
+		return resumedRunContext{}, err
+	}
+	if snapshotJSON == nil && strings.TrimSpace(r.agentRuntime) != "" {
+		return resumedRunContext{}, fmt.Errorf("agent snapshot required for vendor %q but was not produced", r.agentRuntime)
+	}
+	run.AgentSnapshotJSON = snapshotJSON
 	if resumed && lastCompleted != "" {
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
@@ -2369,7 +2417,51 @@ func optionalString(value string) *string {
 	return &value
 }
 
+func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky bool) (*string, error) {
+	var previousSnapshot *string
+	if previous != nil {
+		previousSnapshot = previous.AgentSnapshotJSON
+	}
+	snapshotJSON, legacyResume, err := config.ResolveRunAgentSnapshotJSON(previousSnapshot, sticky, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if legacyResume && r.logger != nil && previous != nil {
+		r.logger.Warn("resuming run without agent_snapshot_json; using current runner agent identity", map[string]any{
+			"loopId": previous.LoopID,
+			"runId":  previous.ID,
+			"vendor": r.agentRuntime,
+			"model":  derefString(r.agentModel),
+		})
+	}
+	return snapshotJSON, nil
+}
+
+// identityFromRun returns the vendor/model/profile that must drive this run.
+// When the run has AgentSnapshotJSON, that identity is execution authority.
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+}
+
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+	if !useSnapshot {
+		return false, "", nil
+	}
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
+}
+
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func derefString(value *string) string {
 	if value == nil {

@@ -4815,7 +4815,10 @@ func TestInProcessSmokeWorkerWorkflowSucceedsWithManualPROpeningAndMutatesWorktr
 						Params: cfg.Agent.Params,
 						Env:    cfg.Agent.Env,
 					},
-					Repos: services.Repositories,
+					// Match production: agent.params are owned by agent.vendor so
+					// effectiveConfig keeps command/args for same-vendor custom runs.
+					ParamsOwnerVendor: cfg.Agent.Vendor,
+					Repos:             services.Repositories,
 				})},
 				AllowAutoCommit: true,
 				OpenPRStrategy:  config.OpenPRStrategyManual,

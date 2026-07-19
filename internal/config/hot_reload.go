@@ -143,7 +143,66 @@ func IsHotEditablePath(path string) bool {
 	if _, ok := hotEditablePaths[path]; ok {
 		return true
 	}
-	return strings.HasPrefix(path, "agent.env.") && len(strings.TrimPrefix(path, "agent.env.")) > 0
+	if strings.HasPrefix(path, "agent.env.") && len(strings.TrimPrefix(path, "agent.env.")) > 0 {
+		return true
+	}
+	if isHotAgentProfilePath(path) {
+		return true
+	}
+	if isHotRoleAgentPath(path) {
+		return true
+	}
+	return false
+}
+
+// isHotAgentProfilePath allows shape-aware leaves under agent.profiles:
+//   - agent.profiles.<id>           (whole profile set/unset)
+//   - agent.profiles.<id>.vendor
+//   - agent.profiles.<id>.model
+//
+// Whole-map agent.profiles and unknown nested fields are rejected.
+func isHotAgentProfilePath(path string) bool {
+	segments := strings.Split(path, ".")
+	if len(segments) < 3 || len(segments) > 4 {
+		return false
+	}
+	if segments[0] != "agent" || segments[1] != "profiles" {
+		return false
+	}
+	id := segments[2]
+	if !agentProfileIDPattern.MatchString(id) {
+		return false
+	}
+	if len(segments) == 3 {
+		return true
+	}
+	switch segments[3] {
+	case "vendor", "model":
+		return true
+	default:
+		return false
+	}
+}
+
+// isHotRoleAgentPath allows coding-role agent binding leaves:
+// roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}
+func isHotRoleAgentPath(path string) bool {
+	segments := strings.Split(path, ".")
+	if len(segments) != 4 {
+		return false
+	}
+	if segments[0] != "roles" || segments[2] != "agent" {
+		return false
+	}
+	if !isCodingRole(segments[1]) {
+		return false
+	}
+	switch segments[3] {
+	case "profile", "vendor", "model":
+		return true
+	default:
+		return false
+	}
 }
 
 func isHotReloadablePath(path string) bool {
@@ -197,23 +256,104 @@ func RestartRequiredChanges(oldConfig Config, newConfig Config) []string {
 	// are unambiguous. Reusing a command/args map under another executable is
 	// unsafe, and silently carrying the same explicit model is almost always
 	// accidental. A paired model edit (including clearing it) is explicit.
-	leavingConfiguredVendor := oldConfig.Agent.Vendor != nil && (newConfig.Agent.Vendor == nil || *oldConfig.Agent.Vendor != *newConfig.Agent.Vendor)
-	if leavingConfiguredVendor {
-		if len(newConfig.Agent.Params) > 0 {
-			if _, exists := seen["agent.params"]; !exists {
-				seen["agent.params"] = struct{}{}
-				restartRequired = append(restartRequired, "agent.params")
-			}
+	//
+	// Guard the raw global agent.vendor leave/switch (coordinator triage +
+	// agent.params ownership) and each coding role's *resolved* vendor
+	// (global + profile + role overlay). The role loop alone is not enough:
+	// when every coding role overrides vendor via profile/inline binding,
+	// resolved vendors stay stable while a hot global vendor edit would still
+	// rebind coordinator and params under a new CLI.
+	appendResolvedVendorRestartGuards(oldConfig, newConfig, seen, &restartRequired)
+	sort.Strings(restartRequired)
+	return restartRequired
+}
+
+func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen map[string]struct{}, restartRequired *[]string) {
+	mark := func(path string) {
+		if _, exists := seen[path]; exists {
+			return
 		}
-		if newConfig.Agent.Model != nil && reflect.DeepEqual(oldConfig.Agent.Model, newConfig.Agent.Model) {
-			if _, exists := seen["agent.model"]; !exists {
-				seen["agent.model"] = struct{}{}
-				restartRequired = append(restartRequired, "agent.model")
+		seen[path] = struct{}{}
+		*restartRequired = append(*restartRequired, path)
+	}
+
+	// Global agent is independent of role-resolved identity: coordinator triage
+	// still uses it, and agent.params fan out as owned by the global vendor.
+	appendGlobalVendorLeaveSwitchGuard(oldConfig, newConfig, mark)
+
+	for _, role := range []string{CodingRolePlanner, CodingRoleWorker, CodingRoleReviewer, CodingRoleFixer} {
+		oldVendor, oldModel, _, oldOK := overlayAgentIdentity(oldConfig, role)
+		if !oldOK || oldVendor == nil {
+			// First activation (no prior vendor) remains hot, including prepared models.
+			continue
+		}
+		newVendor, newModel, _, newOK := overlayAgentIdentity(newConfig, role)
+		if !newOK {
+			continue
+		}
+		if newVendor != nil && *oldVendor == *newVendor {
+			continue
+		}
+		// Prior vendor left or changed (including unset). Global params fan out.
+		if len(newConfig.Agent.Params) > 0 {
+			mark("agent.params")
+		}
+		// Retaining the same non-empty model across a vendor leave/switch is almost
+		// always accidental (and enables vendor-reset laundering: unset vendor,
+		// then set a different vendor while keeping the old model). Non-nil empty
+		// is explicit suppress-to-vendor-default, not a portable model value.
+		// Report the binding that actually owns the retained model (role inline,
+		// profile, or global) so PATCH rejection points at a field that changes
+		// the resolved value — not always agent.model.
+		if oldModel != nil && newModel != nil && *oldModel != "" && *oldModel == *newModel {
+			if path := resolvedModelBindingPath(newConfig, role); path != "" {
+				mark(path)
 			}
 		}
 	}
-	sort.Strings(restartRequired)
-	return restartRequired
+}
+
+// appendGlobalVendorLeaveSwitchGuard blocks hot leave/switch of agent.vendor when
+// companion global fields would be reused under a different CLI. First activation
+// (nil prior vendor) remains hot.
+func appendGlobalVendorLeaveSwitchGuard(oldConfig Config, newConfig Config, mark func(string)) {
+	if oldConfig.Agent.Vendor == nil {
+		return
+	}
+	if newConfig.Agent.Vendor != nil && *oldConfig.Agent.Vendor == *newConfig.Agent.Vendor {
+		return
+	}
+	if len(newConfig.Agent.Params) > 0 {
+		mark("agent.params")
+	}
+	oldModel := oldConfig.Agent.Model
+	newModel := newConfig.Agent.Model
+	if oldModel != nil && newModel != nil && *oldModel != "" && *oldModel == *newModel {
+		mark("agent.model")
+	}
+}
+
+// resolvedModelBindingPath returns the config path that owns the post-overlay
+// model for a coding role (last writer wins: role inline > profile > global).
+// Empty when no model is bound after overlay.
+func resolvedModelBindingPath(cfg Config, role string) string {
+	path := ""
+	if cfg.Agent.Model != nil {
+		path = "agent.model"
+	}
+	binding := codingRoleAgentBinding(cfg.Roles, role)
+	if binding != nil && binding.Profile != nil {
+		profileID := strings.TrimSpace(*binding.Profile)
+		if profileID != "" {
+			if profile, ok := cfg.Agent.Profiles[profileID]; ok && profile.Model != nil {
+				path = "agent.profiles." + profileID + ".model"
+			}
+		}
+	}
+	if binding != nil && binding.Model != nil {
+		path = "roles." + role + ".agent.model"
+	}
+	return path
 }
 
 // CloneConfig returns a complete detached copy. Config is a JSON configuration

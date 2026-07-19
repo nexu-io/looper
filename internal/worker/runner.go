@@ -126,10 +126,12 @@ type IssueDetail struct {
 }
 
 type IssueCommentInput struct {
-	Repo        string
-	IssueNumber int64
-	Body        string
-	CWD         string
+	Repo            string
+	IssueNumber     int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type IssueAssigneesInput struct {
@@ -145,20 +147,24 @@ type IssueCommentResult struct {
 }
 
 type UpdateIssueCommentInput struct {
-	Repo      string
-	CommentID int64
-	Body      string
-	CWD       string
+	Repo            string
+	CommentID       int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type CreatePullRequestInput struct {
-	Repo       string
-	HeadBranch string
-	BaseBranch string
-	Title      string
-	Body       string
-	Draft      bool
-	CWD        string
+	Repo            string
+	HeadBranch      string
+	BaseBranch      string
+	Title           string
+	Body            string
+	Draft           bool
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type CreatePullRequestResult struct {
@@ -188,10 +194,12 @@ type UpdatePullRequestTitleInput struct {
 }
 
 type UpdatePullRequestBodyInput struct {
-	Repo     string
-	PRNumber int64
-	Body     string
-	CWD      string
+	Repo            string
+	PRNumber        int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type PullRequestLabelsInput struct {
@@ -328,10 +336,12 @@ type InspectHeadResult struct {
 }
 
 type CommitInput struct {
-	RepoPath     string
-	WorktreeRoot string
-	WorktreePath string
-	Message      string
+	RepoPath        string
+	WorktreeRoot    string
+	WorktreePath    string
+	Message         string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type CommitResult struct{ CommitSHA string }
@@ -358,6 +368,11 @@ type AgentRunInput struct {
 	HeartbeatTimeout   time.Duration
 	Metadata           map[string]any
 	IdempotencyKey     string
+	// UseSnapshot + SnapshotVendor/Model override the executor config for this
+	// start when the run has a durable agent snapshot (execution authority).
+	UseSnapshot    bool
+	SnapshotVendor string
+	SnapshotModel  *string
 }
 
 type AgentResult struct {
@@ -452,6 +467,7 @@ type Options struct {
 	OpenPRStrategy          config.OpenPRStrategy
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
+	AgentProfileID          string
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
@@ -542,9 +558,10 @@ type Runner struct {
 	openPRStrategy          config.OpenPRStrategy
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
+	agentProfileID          string
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
-	agentModel              string
+	agentModel              *string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -814,9 +831,10 @@ func New(options Options) *Runner {
 		openPRStrategy:          strategy,
 		disclosure:              disclosureCfg,
 		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
+		agentProfileID:          strings.TrimSpace(options.AgentProfileID),
 		customInstructions:      customInstructionConfig(options.CustomInstructions),
 		projectRoleConfig:       options.CustomInstructions,
-		agentModel:              derefString(options.AgentModel),
+		agentModel:              cloneStringPtr(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
@@ -1712,7 +1730,11 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		return checkpoint, err
 	}
 	if !executionCompleted {
-		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, r.agentRuntime, r.agentModel)
+		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+		if err != nil {
+			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+		}
+		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1722,7 +1744,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		nativeSessionID := ""
 		if r.hitlEnabled {
 			prompt += hitlPromptInstruction
-			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop)
+			nativeResumePrompt, nativeSessionID = r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
 			if nativeResumePrompt != "" {
 				prompt += "\n\n" + nativeResumePrompt
 			}
@@ -1730,7 +1752,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// Handed back from an interactive human takeover: resume the exact session
 		// the human drove (independent of HITL) so the daemon sees their turns.
 		if nativeSessionID == "" {
-			if takeoverPrompt, takeoverSession := r.pendingTakeoverResume(ctx, &input.Loop); takeoverPrompt != "" {
+			if takeoverPrompt, takeoverSession := r.pendingTakeoverResume(ctx, &input.Loop, agentVendor); takeoverPrompt != "" {
 				nativeResumePrompt = takeoverPrompt
 				nativeSessionID = takeoverSession
 				prompt += "\n\n" + takeoverPrompt
@@ -1754,7 +1776,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				msgs.WriteString("\nRead them in context and respond appropriately: if a message answers a question you asked, proceed using it; if it is a follow-up question or a new instruction, address it — and if you still need a human decision, ask again (write .looper/ask.json) with your response to what they said. Do not ignore these messages.")
 				prompt += "\n\n" + msgs.String()
 				if nativeSessionID == "" {
-					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID)
+					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
 				}
 			}
 		}
@@ -1769,7 +1791,14 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		} else if held {
 			return checkpoint, &holdSkipError{summary: summary}
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID)})
+		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+			Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID,
+			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+			Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID),
+			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -1833,7 +1862,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	if err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree); err != nil {
+	if err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Execution.GitReconciled = true
@@ -1841,7 +1870,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	return checkpoint, nil
 }
 
-func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree) error {
+func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) error {
 	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 	if r.git == nil {
 		return nil
@@ -1872,7 +1901,8 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 		checkpoint.Lifecycle.LastError = message
 		return &loopError{message: message, kind: FailureManualIntervention}
 	}
-	committed, err := r.git.Commit(ctx, CommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildWorkerFallbackCommitMessage(work)})
+	agent, model := r.disclosureIdentity(run)
+	committed, err := r.git.Commit(ctx, CommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildWorkerFallbackCommitMessage(work), DisclosureAgent: agent, DisclosureModel: model})
 	if err != nil {
 		checkpoint.Lifecycle.LastError = err.Error()
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1963,7 +1993,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		return checkpoint, err
 	}
-	if err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree); err != nil {
+	if err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
 		return checkpoint, err
 	}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
@@ -2032,7 +2062,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 				return checkpoint, err
 			}
 		}
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Actions.PR == lifecycle.ActionSourceAgent); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Actions.PR == lifecycle.ActionSourceAgent); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -2062,7 +2092,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, &holdSkipError{summary: summary}
 		}
 		_ = r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, work.PRNumber, input.Project.RepoPath, false); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, work.PRNumber, input.Project.RepoPath, false); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if len(work.Reviewers) > 0 && work.PRNumber > 0 && r.github != nil {
@@ -2110,7 +2140,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, &holdSkipError{summary: summary}
 		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
@@ -2151,7 +2181,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			return checkpoint, &holdSkipError{summary: summary}
 		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
-		if err := r.normalizePullRequestDisclosure(ctx, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
+		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
@@ -2163,7 +2193,12 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
 		return checkpoint, nil
 	}
-	created, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: work.Repo, HeadBranch: worktree.Branch, BaseBranch: work.BaseBranch, Title: work.Title, Body: r.stampPullRequestDisclosure(buildPullRequestBody(work, checkpoint.Plan, checkpoint.Execution)), CWD: input.Project.RepoPath})
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	created, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{
+		Repo: work.Repo, HeadBranch: worktree.Branch, BaseBranch: work.BaseBranch, Title: work.Title,
+		Body: r.stampPullRequestDisclosure(input.Run, buildPullRequestBody(work, checkpoint.Plan, checkpoint.Execution)),
+		CWD:  input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel,
+	})
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -2420,9 +2455,19 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		}
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
+	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
+	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	if err != nil {
+		return resumedRunContext{}, err
+	}
+	if snapshotJSON == nil && strings.TrimSpace(r.agentRuntime) != "" {
+		return resumedRunContext{}, fmt.Errorf("agent snapshot required for vendor %q but was not produced", r.agentRuntime)
+	}
+	run.AgentSnapshotJSON = snapshotJSON
 	if resumed {
 		if restartFromDiscover {
 			run.LastCompletedStep = nil
@@ -2903,8 +2948,9 @@ func (r *Runner) syncIssueClaim(ctx context.Context, input stepInput, checkpoint
 	}
 	claim.Repo = repo
 	claim.IssueNumber = checkpoint.Work.IssueNumber
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if claim.CommentID == 0 {
-		created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: checkpoint.Work.IssueNumber, Body: body, CWD: input.Project.RepoPath})
+		created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: checkpoint.Work.IssueNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 		if err != nil {
 			r.logWarn("worker issue claim comment create failed", map[string]any{"loopId": input.Loop.ID, "repo": repo, "issueNumber": checkpoint.Work.IssueNumber, "error": err.Error()})
 			return
@@ -2917,7 +2963,7 @@ func (r *Runner) syncIssueClaim(ctx context.Context, input stepInput, checkpoint
 		}
 		return
 	}
-	if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: repo, CommentID: claim.CommentID, Body: body, CWD: input.Project.RepoPath}); err != nil {
+	if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: repo, CommentID: claim.CommentID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		r.logWarn("worker issue claim comment update failed", map[string]any{"loopId": input.Loop.ID, "repo": repo, "issueNumber": checkpoint.Work.IssueNumber, "commentId": claim.CommentID, "error": err.Error()})
 		return
 	}
@@ -3372,7 +3418,7 @@ func implementationPullRequestTitle(work workerInput) string {
 	return title
 }
 
-func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string, prNumber int64, cwd string, force bool) error {
+func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage.RunRecord, repo string, prNumber int64, cwd string, force bool) error {
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
@@ -3383,11 +3429,12 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string
 	if !force && !disclosure.HasMarkdownStamp(detail.Body) {
 		return nil
 	}
-	body := r.stampPullRequestDisclosure(detail.Body)
+	body := r.stampPullRequestDisclosure(run, detail.Body)
 	if body == detail.Body {
 		return nil
 	}
-	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd})
+	agent, model := r.disclosureIdentity(run)
+	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd, DisclosureAgent: agent, DisclosureModel: model})
 }
 
 func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLoopID, repo string, state *lifecycle.State, expectedBranch, expectedBaseBranch, cwd string) (checkpointPullPR, string, bool, error) {
@@ -3468,12 +3515,25 @@ func shouldPersistPullRequestReference(loop storage.LoopRecord, pr checkpointPul
 	return derefString(loop.TargetID) != fmt.Sprintf("pr:%s:%d", derefString(loop.Repo), pr.Number)
 }
 
-func (r *Runner) stampPullRequestDisclosure(body string) string {
+func (r *Runner) stampPullRequestDisclosure(run storage.RunRecord, body string) string {
 	if !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return body
 	}
-	stamper := disclosure.Stamper{Config: r.disclosure, Agent: r.agentRuntime, Model: r.agentModel}
+	agent, model := r.disclosureIdentity(run)
+	stamper := disclosure.Stamper{Config: r.disclosure, Agent: agent, Model: model}
 	return stamper.Markdown(body, "worker", disclosure.ChannelPullRequest)
+}
+
+// disclosureIdentity returns agent/model for disclosure stamps from the run
+// snapshot when present; falls back to runner identity on empty snapshot or
+// parse errors (stamp-only paths must not fail the run).
+func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		// Present but invalid snapshot must not fall back to live runner identity.
+		return "", ""
+	}
+	return vendor, derefString(modelPtr)
 }
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
@@ -4191,7 +4251,51 @@ func optionalString(value string) *string {
 	return &value
 }
 
+func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky bool) (*string, error) {
+	var previousSnapshot *string
+	if previous != nil {
+		previousSnapshot = previous.AgentSnapshotJSON
+	}
+	snapshotJSON, legacyResume, err := config.ResolveRunAgentSnapshotJSON(previousSnapshot, sticky, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if legacyResume && r.logger != nil && previous != nil {
+		r.logger.Warn("resuming run without agent_snapshot_json; using current runner agent identity", map[string]any{
+			"loopId": previous.LoopID,
+			"runId":  previous.ID,
+			"vendor": r.agentRuntime,
+			"model":  derefString(r.agentModel),
+		})
+	}
+	return snapshotJSON, nil
+}
+
+// identityFromRun returns the vendor/model/profile that must drive this run.
+// When the run has AgentSnapshotJSON, that identity is execution authority.
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+}
+
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+	if !useSnapshot {
+		return false, "", nil
+	}
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
+}
+
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func int64Ptr(value int64) *int64 { return &value }
 

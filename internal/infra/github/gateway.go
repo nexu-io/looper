@@ -411,15 +411,17 @@ type PullRequestCheckRunsInput struct {
 }
 
 type SubmitReviewInput struct {
-	Repo       string
-	PRNumber   int64
-	Event      string
-	Body       string
-	CommitID   string
-	Comments   []ReviewComment
-	Anchors    *diffanchor.Index
-	Disclosure config.DisclosureConfig
-	CWD        string
+	Repo            string
+	PRNumber        int64
+	Event           string
+	Body            string
+	CommitID        string
+	Comments        []ReviewComment
+	Anchors         *diffanchor.Index
+	Disclosure      config.DisclosureConfig
+	DisclosureAgent string
+	DisclosureModel string
+	CWD             string
 }
 
 type ReviewComment struct {

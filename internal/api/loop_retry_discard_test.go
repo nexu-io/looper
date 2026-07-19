@@ -603,6 +603,46 @@ func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeWhenAgentNotConfigured(t *
 	}
 }
 
+func TestHandlerLoopRetryAllowsStickySnapshotWhenAgentNotConfigured(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.Agent.Vendor = nil
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_sticky_snapshot",
+		LoopID:    "loop_retry_sticky_snapshot",
+		LoopSeq:   3142,
+		LoopType:  "fixer",
+		Branch:    "feature/retry-sticky-snapshot",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+
+	// Predecessor failed run carries frozen agent identity for sticky retry.
+	// agent_snapshot_json is insert-only, so seed a later failed run with the snapshot.
+	snapshot := `{"vendor":"codex","model":"frozen-model","profileId":"fixer-profile"}`
+	laterISO := "2026-04-11T12:01:00.000Z"
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_" + fixture.LoopID + "_snap", LoopID: fixture.LoopID, Status: "failed",
+		StartedAt: laterISO, CreatedAt: laterISO, UpdatedAt: laterISO, AgentSnapshotJSON: &snapshot,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(snapshot) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3142/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 sticky retry with predecessor snapshot; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop after sticky snapshot retry = %#v, %v, want queued", loop, err)
+	}
+}
+
 func TestHandlerLoopRetryDiscardPreservesDirtyWorktreeOnUniqueLoopConflict(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

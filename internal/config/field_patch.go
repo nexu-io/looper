@@ -174,10 +174,16 @@ func isFieldLevelConfigPathType(current reflect.Type, segments []string) bool {
 		}
 		return false
 	case reflect.Map:
-		if current.Key().Kind() != reflect.String || len(segments) != 1 || segments[0] == "" {
+		// One complete map entry is field-level (scalar, list, or object value).
+		// Structured map values (e.g. agent.profiles.<id>.vendor) may also be
+		// addressed at their leaves.
+		if current.Key().Kind() != reflect.String || segments[0] == "" {
 			return false
 		}
-		return isFieldLevelConfigPathType(current.Elem(), nil)
+		if len(segments) == 1 {
+			return true
+		}
+		return isFieldLevelConfigPathType(current.Elem(), segments[1:])
 	case reflect.Interface:
 		return false
 	default:

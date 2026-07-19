@@ -239,6 +239,27 @@ func TestHasMarkdownStampRequiresFooter(t *testing.T) {
 	}
 }
 
+func TestWithIdentityOverridesAgentWhenNonEmpty(t *testing.T) {
+	t.Parallel()
+
+	base := testStamper()
+	overridden := base.WithIdentity("codex", "frozen-model")
+	got := overridden.Markdown("Body", "worker", ChannelPullRequest)
+	if !strings.Contains(got, "agent=codex") {
+		t.Fatalf("WithIdentity stamp = %q, want agent=codex", got)
+	}
+	if strings.Contains(got, "agent=claude-code") {
+		t.Fatalf("WithIdentity did not override base agent: %q", got)
+	}
+
+	// Empty agent clears base identity (no live fallback).
+	cleared := base.WithIdentity("", "")
+	clearedStamp := cleared.Markdown("Body", "worker", ChannelPullRequest)
+	if strings.Contains(clearedStamp, "agent=claude-code") {
+		t.Fatalf("empty WithIdentity leaked base agent: %q", clearedStamp)
+	}
+}
+
 func testStamper() Stamper {
 	return Stamper{
 		Version: "1.2.3",

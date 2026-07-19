@@ -845,7 +845,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			return githubGateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 		},
 		AsyncSnapshotQueueEnabled: func() bool {
-			return r.customSchedulerTick || r.Config().Agent.Vendor != nil
+			return asyncSnapshotQueueEnabled(r.customSchedulerTick, r.Config())
 		},
 		PublishProjects: func(projects []config.ProjectRefConfig) {
 			r.publishProjectsSnapshot(projects)
@@ -895,7 +895,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
-		schedulerDisabled = r.config.Agent.Vendor == nil
+		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
@@ -972,7 +972,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			}
 		}
 		if schedulerDisabled && r.logger != nil {
-			r.logger.Warn("looperd scheduler waiting for agent configuration", map[string]any{"reason": "config.agent.vendor is not set"})
+			r.logger.Warn("looperd scheduler waiting for agent configuration", map[string]any{"reason": "no coding role agent is configured"})
 		}
 		// The scheduler's handlers snapshot the current config for each operation.
 		// Keep the loop alive even without an initial vendor so configuring one can
@@ -1086,6 +1086,20 @@ func runtimeProjectRepo(metadataJSON *string) string {
 	}
 	value, _ := metadata["repo"].(string)
 	return strings.TrimSpace(value)
+}
+
+// defaultSchedulerAgentsConfigured reports whether the default scheduler has at
+// least one coding-role agent vendor (global or role/profile). This is the same
+// gate as buildDefaultSchedulerHandlersWithOptions.
+func defaultSchedulerAgentsConfigured(cfg config.Config) bool {
+	return config.AnyCodingRoleAgentConfigured(cfg)
+}
+
+// asyncSnapshotQueueEnabled reports whether project import can enqueue async PR
+// snapshots for the scheduler to process. Role-only agent installs count as
+// scheduler-enabled so import does not fall back to full synchronous capture.
+func asyncSnapshotQueueEnabled(customSchedulerTick bool, cfg config.Config) bool {
+	return customSchedulerTick || defaultSchedulerAgentsConfigured(cfg)
 }
 
 func runtimeConfigHasGitHubProjects(cfg config.Config) bool {

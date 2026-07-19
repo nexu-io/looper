@@ -734,6 +734,147 @@ func TestClaimAndRunScheduledQueueItemsUsesLongTermRetryOnlyForIdleSlots(t *test
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsSkipsUnconfiguredRoles(t *testing.T) {
+	t.Parallel()
+
+	// Only worker is configured. Higher-priority reviewer work must stay queued
+	// rather than being claimed and failed with "runner is not configured".
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-configured-roles.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_roles", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker", Seq: 1, ProjectID: "project_roles", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(worker) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer", Seq: 2, ProjectID: "project_roles", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	workerLoopID := "loop_worker"
+	reviewerLoopID := "loop_reviewer"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "reviewer_high_priority", LoopID: &reviewerLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "d_reviewer", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:00.000Z", UpdatedAt: nowISO},
+		{ID: "worker_lower_priority", LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_roles", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:01:00.000Z", UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	workerRunner := &stubWorkerScheduler{}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos:  repos,
+		Now:    func() time.Time { return now },
+		Worker: workerRunner,
+		// Reviewer intentionally nil — unconfigured role must not be claimed.
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "worker_lower_priority" {
+		t.Fatalf("claimed = %#v, want only worker item", claimed)
+	}
+	reviewerItem, err := repos.Queue.GetByID(context.Background(), "reviewer_high_priority")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(reviewer) error = %v", err)
+	}
+	if reviewerItem == nil || reviewerItem.Status != "queued" {
+		t.Fatalf("reviewer item = %#v, want still queued", reviewerItem)
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *testing.T) {
+	t.Parallel()
+
+	// Operator unset the role vendor after a failed run left agent_snapshot_json.
+	// Fresh work for that role must stay queued; the sticky retry must claim.
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-sticky-snapshot.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// Live worker only; reviewer has no ResolveAgent identity.
+	cfg.Agent.Vendor = nil
+	workerVendor := config.AgentVendorCodex
+	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &workerVendor}
+
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_sticky", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_sticky", Seq: 1, ProjectID: "project_sticky", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(sticky) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_fresh", Seq: 2, ProjectID: "project_sticky", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(fresh) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_live", Seq: 3, ProjectID: "project_sticky", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(worker) error = %v", err)
+	}
+
+	snapshot := `{"vendor":"codex","model":"frozen-reviewer","profileId":"reviewer-profile"}`
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_sticky", LoopID: "loop_reviewer_sticky", Status: "failed",
+		StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, AgentSnapshotJSON: &snapshot,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(sticky) error = %v", err)
+	}
+
+	stickyLoopID := "loop_reviewer_sticky"
+	freshLoopID := "loop_reviewer_fresh"
+	workerLoopID := "loop_worker_live"
+	repo := "acme/looper"
+	prSticky := int64(10)
+	prFresh := int64(11)
+	for _, item := range []storage.QueueItemRecord{
+		// Higher priority reviewer items first: sticky should claim, fresh must not.
+		{ID: "reviewer_sticky", LoopID: &stickyLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:10", Repo: &repo, PRNumber: &prSticky, DedupeKey: "d_sticky", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:00.000Z", UpdatedAt: nowISO},
+		{ID: "reviewer_fresh", LoopID: &freshLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:11", Repo: &repo, PRNumber: &prFresh, DedupeKey: "d_fresh", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:01.000Z", UpdatedAt: nowISO},
+		{ID: "worker_live", LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:02.000Z", UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	// Simulate always-on runners with live config: worker live, reviewer sticky-only.
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 3, defaultSchedulerTickInput{
+		Repos:    repos,
+		Now:      func() time.Time { return now },
+		Config:   &cfg,
+		Worker:   &stubWorkerScheduler{},
+		Reviewer: &stubReviewerScheduler{},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed count = %d (%#v), want sticky reviewer + live worker", len(claimed), claimed)
+	}
+	gotIDs := map[string]bool{claimed[0].ID: true, claimed[1].ID: true}
+	if !gotIDs["reviewer_sticky"] || !gotIDs["worker_live"] {
+		t.Fatalf("claimed = %#v, want reviewer_sticky and worker_live", claimed)
+	}
+	freshItem, err := repos.Queue.GetByID(context.Background(), "reviewer_fresh")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(fresh) error = %v", err)
+	}
+	if freshItem == nil || freshItem.Status != "queued" {
+		t.Fatalf("fresh reviewer item = %#v, want still queued without live role agent", freshItem)
+	}
+}
+
 func TestRunScheduledQueueItemsRejectsUnsupportedType(t *testing.T) {
 	t.Parallel()
 
@@ -993,6 +1134,59 @@ func TestProcessSnapshotQueueItemFailsNonRetryableInvalidItem(t *testing.T) {
 	}
 	if updated.LastError == nil || *updated.LastError != "invalid snapshot queue item" || updated.LastErrorKind == nil || *updated.LastErrorKind != "non_retryable" {
 		t.Fatalf("queue item error = (%v, %v), want non-retryable invalid-item failure", updated.LastError, updated.LastErrorKind)
+	}
+}
+
+func TestAllowedQueueTypesFromRunners_ExcludesSnapshotWhenSnapshotterNil(t *testing.T) {
+	t.Parallel()
+
+	// Typed-nil *githubinfra.Gateway must not count as a configured Snapshotter.
+	var nilGateway *githubinfra.Gateway
+	var typedNil snapshotScheduler = nilGateway
+	if typedNil == nil {
+		t.Fatal("typed-nil interface unexpectedly compared equal to nil")
+	}
+
+	// Direct nil interface excludes snapshot.
+	got := allowedQueueTypesFromRunners(defaultSchedulerTickInput{
+		Worker:      &stubWorkerScheduler{},
+		Snapshotter: nil,
+	})
+	for _, itemType := range got {
+		if itemType == "snapshot" {
+			t.Fatalf("allowed types = %v, must not include snapshot when Snapshotter is nil", got)
+		}
+	}
+
+	// Correct construction: only assign when non-nil pointer.
+	var snapshotter snapshotScheduler
+	if nilGateway != nil {
+		snapshotter = nilGateway
+	}
+	got = allowedQueueTypesFromRunners(defaultSchedulerTickInput{
+		Worker:      &stubWorkerScheduler{},
+		Snapshotter: snapshotter,
+	})
+	for _, itemType := range got {
+		if itemType == "snapshot" {
+			t.Fatalf("allowed types = %v, must not include snapshot when github gateway is nil", got)
+		}
+	}
+
+	// Real non-nil snapshotter includes snapshot.
+	got = allowedQueueTypesFromRunners(defaultSchedulerTickInput{
+		Worker:      &stubWorkerScheduler{},
+		Snapshotter: stubSnapshotScheduler{},
+	})
+	found := false
+	for _, itemType := range got {
+		if itemType == "snapshot" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("allowed types = %v, want snapshot when Snapshotter is configured", got)
 	}
 }
 
