@@ -311,7 +311,7 @@ describe("config form contract", () => {
     ).toMatch(/referenced by worker/i);
   });
 
-  it("treats empty profile/role model drafts as unset inherit, not empty-string set", () => {
+  it("treats empty profile/role model drafts as explicit vendor-default suppress", () => {
     const data = fixture();
     const result = buildConfigPatch(
       data,
@@ -322,11 +322,11 @@ describe("config form contract", () => {
       [],
     );
     expect(result.errors).toEqual({});
-    expect(result.body.set).toEqual({});
-    expect(result.body.unset).toEqual([
-      "agent.profiles.fast.model",
-      "roles.worker.agent.model",
-    ]);
+    expect(result.body.set).toEqual({
+      "agent.profiles.fast.model": "",
+      "roles.worker.agent.model": "",
+    });
+    expect(result.body.unset).toEqual([]);
   });
 
   it("treats empty role profile drafts as unset when sibling vendor/model remain", () => {
@@ -431,6 +431,85 @@ describe("config form contract", () => {
     expect(
       profileLeafUnsetWouldEmpty(data, {}, [], "cheap", "vendor"),
     ).toBe(true);
+  });
+
+  it("auto-clears retained models when staging a vendor switch", () => {
+    const data = fixture();
+    data.agent = {
+      vendor: "codex",
+      model: "gpt-5",
+      envKeys: ["OPENAI_API_KEY"],
+      profiles: {
+        fast: { vendor: "codex", model: "gpt-5-mini" },
+      },
+      nativeResume: { enabled: true },
+      timeouts: { plannerIdleTimeoutSeconds: 300 },
+    };
+    data.roles = {
+      planner: {
+        triggers: { planeAssigneeId: "planner-member" },
+      },
+      worker: {
+        triggers: { planeAssigneeId: "worker-member" },
+        agent: {
+          profile: "fast",
+          vendor: "claude-code",
+          model: "haiku",
+        },
+      },
+      reviewer: {
+        behavior: {
+          reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
+          threadResolution: { enabled: true, mode: "report_only" },
+        },
+        autoMerge: { enabled: false },
+        agent: { vendor: "codex" },
+      },
+    };
+
+    const globalOnly = buildConfigPatch(
+      data,
+      { "agent.vendor": "opencode" },
+      [],
+    );
+    expect(globalOnly.errors).toEqual({});
+    expect(globalOnly.body.set).toEqual({ "agent.vendor": "opencode" });
+    expect(globalOnly.body.unset).toEqual(["agent.model"]);
+
+    const profileOnly = buildConfigPatch(
+      data,
+      { "agent.profiles.fast.vendor": "opencode" },
+      [],
+    );
+    expect(profileOnly.errors).toEqual({});
+    expect(profileOnly.body.set).toEqual({
+      "agent.profiles.fast.vendor": "opencode",
+    });
+    expect(profileOnly.body.unset).toEqual(["agent.profiles.fast.model"]);
+
+    const roleOwnedModel = buildConfigPatch(
+      data,
+      { "roles.worker.agent.vendor": "opencode" },
+      [],
+    );
+    expect(roleOwnedModel.errors).toEqual({});
+    expect(roleOwnedModel.body.set).toEqual({
+      "roles.worker.agent.vendor": "opencode",
+    });
+    expect(roleOwnedModel.body.unset).toEqual(["roles.worker.agent.model"]);
+
+    // Role vendor switch with only inherited global model: suppress via "".
+    const roleInherited = buildConfigPatch(
+      data,
+      { "roles.reviewer.agent.vendor": "opencode" },
+      [],
+    );
+    expect(roleInherited.errors).toEqual({});
+    expect(roleInherited.body.set).toEqual({
+      "roles.reviewer.agent.vendor": "opencode",
+      "roles.reviewer.agent.model": "",
+    });
+    expect(roleInherited.body.unset).toEqual([]);
   });
 
   it("confirms automatic commit only when the change can enable it", () => {

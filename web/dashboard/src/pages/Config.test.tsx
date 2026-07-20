@@ -99,6 +99,33 @@ function renderPage() {
   );
 }
 
+/** Header + sticky footer both expose Save while dirty. */
+function saveButtons(): HTMLButtonElement[] {
+  return screen.getAllByRole("button", {
+    name: "Save changes",
+  }) as HTMLButtonElement[];
+}
+
+function clickSaveChanges() {
+  fireEvent.click(saveButtons()[0]);
+}
+
+function expectSaveDisabled(disabled: boolean) {
+  for (const button of saveButtons()) {
+    expect(button.disabled).toBe(disabled);
+  }
+}
+
+function discardButtons(): HTMLButtonElement[] {
+  return screen.getAllByRole("button", {
+    name: "Discard",
+  }) as HTMLButtonElement[];
+}
+
+function clickDiscard() {
+  fireEvent.click(discardButtons()[0]);
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -158,7 +185,7 @@ describe("ConfigPage", () => {
       "scheduler.slowLaneWarnThresholdMs",
     ) as HTMLInputElement;
     fireEvent.change(retry, { target: { value: "8" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     await waitFor(() => {
       expect(
@@ -221,7 +248,7 @@ describe("ConfigPage", () => {
     await waitFor(() => expect(getCount).toBe(3));
 
     fireEvent.change(retry, { target: { value: "8" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     await waitFor(() => expect(retry.value).toBe("8"));
     expect(screen.queryByText("refresh failed")).toBeNull();
     expect(resolveRefresh).toBeTypeOf("function");
@@ -274,7 +301,7 @@ describe("ConfigPage", () => {
     });
     expect(retry.value).toBe("6");
 
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
         true,
@@ -327,26 +354,24 @@ describe("ConfigPage", () => {
       "scheduler.slowLaneWarnThresholdMs",
     )) as HTMLInputElement;
     fireEvent.change(retry, { target: { value: "6" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     const rebase = await screen.findByRole("button", {
       name: "Reload latest and keep edits",
     });
     expect(retry.value).toBe("6");
     expect(retry.disabled).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expectSaveDisabled(true);
     fireEvent.click(rebase);
 
     await waitFor(() => {
       const field = container.querySelector(
         '[data-config-path="scheduler.slowLaneWarnThresholdMs"]',
       );
-      expect(field?.textContent).toContain("Published value: 8");
+      expect(field?.textContent).toMatch(/Unsaved draft/i);
+      expect(field?.textContent).toContain("8");
     });
     expect(retry.value).toBe("6");
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     await waitFor(() => expect(patchCount).toBe(2));
     const patchCalls = fetchMock.mock.calls.filter(
       ([, init]) => init?.method === "PATCH",
@@ -392,7 +417,7 @@ describe("ConfigPage", () => {
       await screen.findByLabelText("scheduler.slowLaneWarnThresholdMs"),
       { target: { value: "6" } },
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Reload latest and keep edits",
@@ -409,6 +434,69 @@ describe("ConfigPage", () => {
       (screen.getByLabelText("scheduler.slowLaneWarnThresholdMs") as HTMLInputElement)
         .value,
     ).toBe("6");
+  });
+
+  it("unlocks a same-revision conflict when the daemon has no reload error", async () => {
+    // PATCH can 409 without changing the accepted content hash (identity race,
+    // cancel). Rebase must not stay locked forever when revision is unchanged
+    // but lastError is empty — OCC will re-check on the next save.
+    const initial = configFixture();
+    const sameRevision = configFixture({
+      metadata: {
+        ...initial.metadata,
+        revision: initial.metadata.revision,
+        lastError: null,
+      },
+    });
+    const applied = configFixture({
+      scheduler: { ...(initial.scheduler ?? {}), slowLaneWarnThresholdMs: 6 },
+      metadata: { ...initial.metadata, revision: "sha256:applied" },
+    });
+    let getCount = 0;
+    let patchCount = 0;
+    const fetchMock = vi.fn(
+      (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (String(input) !== "/api/v1/config") {
+          return Promise.reject(new Error(`unexpected request: ${String(input)}`));
+        }
+        if (init?.method === "PATCH") {
+          patchCount += 1;
+          if (patchCount === 1) {
+            return Promise.resolve(
+              response(
+                { code: "CONFIG_CONFLICT", message: "configuration changed on disk" },
+                409,
+              ),
+            );
+          }
+          return Promise.resolve(response(applied));
+        }
+        getCount += 1;
+        return Promise.resolve(response(getCount === 1 ? initial : sameRevision));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    fireEvent.change(
+      await screen.findByLabelText("scheduler.slowLaneWarnThresholdMs"),
+      { target: { value: "6" } },
+    );
+    clickSaveChanges();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Reload latest and keep edits",
+      }),
+    );
+
+    await waitFor(() => {
+      expectSaveDisabled(false);
+    });
+    expect(
+      screen.queryByText(/changed config file is still rejected/i),
+    ).toBeNull();
+    clickSaveChanges();
+    await waitFor(() => expect(patchCount).toBe(2));
   });
 
   it("prunes a retained draft that already matches the rebased snapshot", async () => {
@@ -448,7 +536,7 @@ describe("ConfigPage", () => {
       "scheduler.slowLaneWarnThresholdMs",
     )) as HTMLInputElement;
     fireEvent.change(retry, { target: { value: "8" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Reload latest and keep edits",
@@ -457,14 +545,11 @@ describe("ConfigPage", () => {
 
     expect(await screen.findByText(/change now matches/i)).toBeTruthy();
     expect(retry.value).toBe("8");
-    expect(
-      (screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expectSaveDisabled(true);
     const field = container.querySelector(
       '[data-config-path="scheduler.slowLaneWarnThresholdMs"]',
     );
-    expect(field?.textContent).not.toContain("Published value:");
+    expect(field?.textContent).not.toMatch(/Unsaved draft/i);
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(retry.value).toBe("9"));
@@ -504,7 +589,7 @@ describe("ConfigPage", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Stage secret" }));
     fireEvent.click(screen.getByRole("button", { name: "Remove OPENAI_API_KEY" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Reload latest and keep edits",
@@ -518,10 +603,7 @@ describe("ConfigPage", () => {
     expect(
       screen.getByRole("button", { name: "Remove OPENAI_API_KEY" }),
     ).toBeTruthy();
-    expect(
-      (screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expectSaveDisabled(true);
   });
 
   it("tracks and discards typed but unstaged environment input", async () => {
@@ -544,18 +626,14 @@ describe("ConfigPage", () => {
     fireEvent.change(key, { target: { value: "UNSTAGED" } });
     fireEvent.change(secret, { target: { value: "not-saved" } });
 
-    const discard = screen.getByRole("button", { name: "Discard" }) as HTMLButtonElement;
-    expect(discard.disabled).toBe(false);
+    expect(discardButtons()[0].disabled).toBe(false);
     expect(
       (screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expectSaveDisabled(true);
 
-    fireEvent.click(discard);
+    clickDiscard();
     expect(
       (screen.getByLabelText("Environment variable name") as HTMLInputElement)
         .value,
@@ -660,7 +738,7 @@ describe("ConfigPage", () => {
       "scheduler.slowLaneWarnThresholdMs",
     )) as HTMLInputElement;
     fireEvent.change(retry, { target: { value: "8" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     await waitFor(() => expect(resolvePatch).toBeTypeOf("function"));
 
     expect(retry.disabled).toBe(true);
@@ -712,14 +790,14 @@ describe("ConfigPage", () => {
       "scheduler.slowLaneWarnThresholdMs",
     )) as HTMLInputElement;
     fireEvent.change(retry, { target: { value: "3.5" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     expect(await screen.findByText(/enter a whole number/i)).toBeTruthy();
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
       false,
     );
 
     fireEvent.change(retry, { target: { value: "0" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     expect(
       await screen.findByText(/must be -1 or greater than zero/i),
     ).toBeTruthy();
@@ -786,7 +864,7 @@ describe("ConfigPage", () => {
     expect(container.textContent).not.toContain("super-secret-value");
     expect(screen.getByText("NEW_SECRET")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Remove OPENAI_API_KEY" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
@@ -816,7 +894,7 @@ describe("ConfigPage", () => {
       "defaults.allowAutoPush",
     )) as HTMLInputElement;
     fireEvent.click(autoPush);
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     expect(
       await screen.findByRole("dialog", {
@@ -824,17 +902,13 @@ describe("ConfigPage", () => {
       }),
     ).toBeTruthy();
     expect(
-      (screen.getByRole("button", { name: "Discard" }) as HTMLButtonElement)
-        .disabled,
+      discardButtons()[0].disabled,
     ).toBe(true);
     expect(
       (screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expectSaveDisabled(true);
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
       false,
     );
@@ -887,7 +961,7 @@ describe("ConfigPage", () => {
     );
     // Profile shows as pending removal, not dual leaf unsets.
     expect(screen.getByText("undo remove")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     // Unreferenced whole-profile remove is not high-impact; PATCH immediately.
     await waitFor(() => {
@@ -954,7 +1028,7 @@ describe("ConfigPage", () => {
       target: { value: "opencode" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     // Vendor change is high-impact (resolved-vendor companion guard).
     fireEvent.click(
@@ -1026,7 +1100,7 @@ describe("ConfigPage", () => {
       target: { value: "opencode" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Apply changes" }),
@@ -1078,7 +1152,7 @@ describe("ConfigPage", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Unset agent.profiles.fast.model" }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
@@ -1168,7 +1242,7 @@ describe("ConfigPage", () => {
     fireEvent.change(await screen.findByLabelText("agent.profiles.fast.model"), {
       target: { value: "gpt-5" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Reload latest and keep edits",
@@ -1180,7 +1254,7 @@ describe("ConfigPage", () => {
         (screen.getByLabelText("agent.profiles.fast.model") as HTMLInputElement).value,
       ).toBe("gpt-5");
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     await waitFor(() => expect(patchCount).toBe(2));
     const patchCalls = fetchMock.mock.calls.filter(
       ([, init]) => init?.method === "PATCH",
@@ -1221,7 +1295,7 @@ describe("ConfigPage", () => {
     fireEvent.change(await screen.findByLabelText("roles.worker.agent.vendor"), {
       target: { value: "opencode" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     expect(
       await screen.findByRole("dialog", {
@@ -1317,7 +1391,7 @@ describe("ConfigPage", () => {
     fireEvent.change(screen.getByLabelText("roles.worker.agent.profile"), {
       target: { value: "cheap" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     // Profile switch is high-impact (can change resolved vendor).
     fireEvent.click(
@@ -1391,9 +1465,9 @@ describe("ConfigPage", () => {
     fireEvent.change(profileInput, { target: { value: "" } });
     // Empty draft must stick (not snap back to published "fast").
     expect(profileInput.value).toBe("");
-    expect(screen.getByText(/1\s*pending/i)).toBeTruthy();
+    expect(screen.getAllByText(/1\s*unsaved/i).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
     // Unsetting a role profile is high-impact.
     fireEvent.click(
       await screen.findByRole("button", { name: "Apply changes" }),
@@ -1472,7 +1546,7 @@ describe("ConfigPage", () => {
       target: { value: "opencode" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Add profile" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    clickSaveChanges();
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Apply changes" }),

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -218,6 +220,35 @@ func TestPatchConfigCanonicalFieldRetiresShadowingLegacyAliases(t *testing.T) {
 	}
 	if got := rt.Config().Roles.Reviewer.Behavior.ReviewEvents.Clean; got != config.ReviewerReviewEventApprove {
 		t.Fatalf("clean event after canonical unset = %q, want default APPROVE", got)
+	}
+}
+
+func TestPatchConfigVendorCompanionModelMessageIsNotRestart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	original := []byte(`{"agent":{"vendor":"codex","model":"gpt-5"},"scheduler":{"maxConcurrentRuns":2}}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	rt := newConfigPatchRuntime(t, path, nil)
+	err := rt.PatchConfig(context.Background(), ConfigPatch{
+		Revision: testConfigRevision(t, path),
+		Set:      map[string]json.RawMessage{"agent.vendor": json.RawMessage(`"claude-code"`)},
+	})
+	var patchErr *ConfigPatchError
+	if !errors.As(err, &patchErr) {
+		t.Fatalf("PatchConfig() error = %v, want ConfigPatchError", err)
+	}
+	if patchErr.Kind != "validation" {
+		t.Fatalf("PatchConfig() kind = %q, want validation (companion, not restart)", patchErr.Kind)
+	}
+	if !strings.Contains(patchErr.Message, "companion fields") || strings.Contains(patchErr.Message, "daemon restart") {
+		t.Fatalf("PatchConfig() message = %q, want companion-field guidance without restart claim", patchErr.Message)
+	}
+	if got, want := patchErr.Paths, []string{"agent.model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PatchConfig() paths = %#v, want %#v", got, want)
 	}
 }
 

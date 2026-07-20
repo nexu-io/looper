@@ -500,11 +500,9 @@ export function buildConfigPatch(
       errors[path] = parsed.error;
       continue;
     }
-    // Profile/role identity text leaves: empty draft means inherit (omit leaf),
-    // not set "". Role .profile must unset rather than stage "" — backend
-    // validateRoleAgentBindings rejects empty profile when sibling vendor/model
-    // keeps the role agent object alive. Model empty-string suppress is not
-    // staged from the text control; use Unset or an explicit future control.
+    // Role/profile .profile: empty draft means inherit (omit leaf), not set "".
+    // Backend validateRoleAgentBindings rejects empty profile when sibling
+    // vendor/model keeps the role agent object alive.
     //
     // Callers that probe single-path drafts (Config onDraft / rebase) must treat
     // an unset-only result as a staged change via draftStagesConfigChange so
@@ -512,11 +510,27 @@ export function buildConfigPatch(
     if (
       parsed.value === "" &&
       (isAgentProfileLeafPath(path) || isRoleAgentLeafPath(path)) &&
-      (path.endsWith(".model") || path.endsWith(".profile"))
+      path.endsWith(".profile")
     ) {
       const current = getConfigValue(data, path);
       if (current != null && current !== "") {
         unset.add(path);
+      }
+      continue;
+    }
+    // Model empty draft: only stage explicit vendor-default suppress (non-nil
+    // "") when a non-empty model is currently published. Absent model already
+    // means inherit — empty is a no-op. Use Unset to go from suppress/value
+    // back to inherit. Vendor-switch companion logic may still set "" itself.
+    if (
+      parsed.value === "" &&
+      (path === "agent.model" ||
+        (isAgentProfileLeafPath(path) || isRoleAgentLeafPath(path)) &&
+          path.endsWith(".model"))
+    ) {
+      const current = getConfigValue(data, path);
+      if (typeof current === "string" && current !== "") {
+        set[path] = "";
       }
       continue;
     }
@@ -529,6 +543,11 @@ export function buildConfigPatch(
     if (!unset.has(path)) set[path] = value;
   }
 
+  // Vendor leave/switch while retaining the same non-empty model is rejected by
+  // the daemon as an unsafe companion reuse. Stage the paired model clear before
+  // empty-profile collapse so a vendor-only edit that clears the last model leaf
+  // promotes to whole-profile removal instead of agent.profiles.<id>={}.
+  stageVendorCompanionModelOps(data, set, unset);
   // Avoid agent.profiles.<id>={} which validateAgentProfiles rejects.
   collapseEmptyProfileLeafOps(data, set, unset);
 
@@ -536,6 +555,124 @@ export function buildConfigPatch(
     body: { revision: data.metadata.revision, set, unset: [...unset].sort() },
     errors,
   };
+}
+
+/**
+ * When a vendor leaf is set or unset to a different effective vendor, clear any
+ * retained non-empty model that would otherwise block the hot vendor edit.
+ *
+ * - Global / profile / role-owned models are unset (inherit / drop binding).
+ * - Role vendor edits that inherit a non-empty global or profile model stage an
+ *   explicit empty role model (suppress) so the resolved model is not reused
+ *   under the new CLI — matching daemon RestartRequiredChanges guards.
+ */
+function stageVendorCompanionModelOps(
+  data: ConfigData,
+  set: Record<string, ConfigValue>,
+  unset: Set<string>,
+): void {
+  const vendorChanged = (vendorPath: string): boolean => {
+    if (unset.has(vendorPath)) {
+      const current = getConfigValue(data, vendorPath);
+      return current != null && String(current).trim() !== "";
+    }
+    if (!Object.hasOwn(set, vendorPath)) return false;
+    return !valuesEqual(set[vendorPath], getConfigValue(data, vendorPath));
+  };
+
+  const modelNonEmpty = (value: unknown): boolean =>
+    value != null && String(value).trim() !== "";
+
+  // Global agent.vendor ↔ agent.model
+  if (vendorChanged("agent.vendor")) {
+    const modelPath = "agent.model";
+    if (
+      !unset.has(modelPath) &&
+      !Object.hasOwn(set, modelPath) &&
+      modelNonEmpty(getConfigValue(data, modelPath))
+    ) {
+      unset.add(modelPath);
+    }
+  }
+
+  // Profile vendor ↔ profile model
+  const profileVendorOps = new Set<string>();
+  for (const path of unset) {
+    const match = /^agent\.profiles\.([A-Za-z0-9_-]+)\.vendor$/.exec(path);
+    if (match) profileVendorOps.add(match[1]);
+  }
+  for (const path of Object.keys(set)) {
+    const match = /^agent\.profiles\.([A-Za-z0-9_-]+)\.vendor$/.exec(path);
+    if (match) profileVendorOps.add(match[1]);
+  }
+  for (const id of profileVendorOps) {
+    const vendorPath = agentProfilePath(id, "vendor");
+    if (!vendorChanged(vendorPath)) continue;
+    if (unset.has(`agent.profiles.${id}`)) continue;
+    const modelPath = agentProfilePath(id, "model");
+    if (
+      !unset.has(modelPath) &&
+      !Object.hasOwn(set, modelPath) &&
+      modelNonEmpty(getConfigValue(data, modelPath))
+    ) {
+      unset.add(modelPath);
+    }
+  }
+
+  // Role vendor ↔ role model (or suppress inherited model)
+  for (const role of CODING_ROLES) {
+    const vendorPath = roleAgentPath(role, "vendor");
+    if (!vendorChanged(vendorPath)) continue;
+    const modelPath = roleAgentPath(role, "model");
+    if (unset.has(modelPath) || Object.hasOwn(set, modelPath)) continue;
+
+    const roleModel = getConfigValue(data, modelPath);
+    if (modelNonEmpty(roleModel)) {
+      unset.add(modelPath);
+      continue;
+    }
+
+    // Role has no own model: resolve inherited model after this patch
+    // (profile overlay, then global) the same way the daemon does.
+    const inherited = resolvedInheritedRoleModel(data, set, unset, role);
+    if (modelNonEmpty(inherited)) {
+      // Explicit empty suppress: keeps the role agent object and breaks
+      // same-model retention across the vendor switch.
+      set[modelPath] = "";
+    }
+  }
+}
+
+function resolvedInheritedRoleModel(
+  data: ConfigData,
+  set: Record<string, ConfigValue>,
+  unset: Set<string>,
+  role: CodingRole,
+): unknown {
+  const profilePath = roleAgentPath(role, "profile");
+  let profileId: unknown = getConfigValue(data, profilePath);
+  if (unset.has(profilePath)) {
+    profileId = undefined;
+  } else if (Object.hasOwn(set, profilePath)) {
+    profileId = set[profilePath];
+  }
+
+  if (typeof profileId === "string" && profileId.trim() !== "") {
+    if (!unset.has(`agent.profiles.${profileId}`)) {
+      const profileModelPath = agentProfilePath(profileId, "model");
+      if (Object.hasOwn(set, profileModelPath)) {
+        return set[profileModelPath];
+      }
+      if (!unset.has(profileModelPath)) {
+        const profileModel = getConfigValue(data, profileModelPath);
+        if (profileModel != null) return profileModel;
+      }
+    }
+  }
+
+  if (Object.hasOwn(set, "agent.model")) return set["agent.model"];
+  if (unset.has("agent.model")) return undefined;
+  return getConfigValue(data, "agent.model");
 }
 
 /**

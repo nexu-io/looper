@@ -86,7 +86,7 @@ func (e *ConfigReloadError) Error() string {
 		return e.Err.Error()
 	}
 	if len(e.Paths) > 0 {
-		return fmt.Sprintf("configuration changes require a daemon restart: %s", strings.Join(e.Paths, ", "))
+		return configRestartRejectionMessage(e.Paths)
 	}
 	return "configuration reload failed"
 }
@@ -350,7 +350,8 @@ func (r *Runtime) PatchConfig(ctx context.Context, patch ConfigPatch) error {
 	}
 	if rejected := config.RestartRequiredChanges(r.loadedConfig.Config, candidate.Config); len(rejected) > 0 {
 		sort.Strings(rejected)
-		return &ConfigPatchError{Kind: "unsupported", Message: fmt.Sprintf("configuration changes require a daemon restart: %s", strings.Join(rejected, ", ")), Paths: rejected}
+		kind, message := configRestartRejection(rejected)
+		return &ConfigPatchError{Kind: kind, Message: message, Paths: rejected}
 	}
 	r.configBoundary.Lock()
 	defer r.configBoundary.Unlock()
@@ -518,6 +519,39 @@ func (r *Runtime) configReloadStatusLocked() ConfigReloadStatus {
 func timePointer(value time.Time) *time.Time {
 	copy := value
 	return &copy
+}
+
+// configRestartRejection classifies RestartRequiredChanges paths for API errors.
+// Companion guards (hot-editable model/params leaves retained across a vendor
+// switch) are fixable in the same PATCH and must not claim a daemon restart is
+// required. True restart-bound paths keep the restart message.
+func configRestartRejection(paths []string) (kind string, message string) {
+	if len(paths) == 0 {
+		return "unsupported", "configuration changes require a daemon restart"
+	}
+	allHotCompanions := true
+	for _, path := range paths {
+		// agent.params is restart-bound / file-only — not a dashboard companion.
+		if path == "agent.params" || strings.HasPrefix(path, "agent.params.") {
+			allHotCompanions = false
+			break
+		}
+		if !config.IsHotEditablePath(path) {
+			allHotCompanions = false
+			break
+		}
+	}
+	if allHotCompanions {
+		return "validation", fmt.Sprintf(
+			"vendor change also requires updating or unsetting companion fields in the same save: %s",
+			strings.Join(paths, ", "),
+		)
+	}
+	return "unsupported", configRestartRejectionMessage(paths)
+}
+
+func configRestartRejectionMessage(paths []string) string {
+	return fmt.Sprintf("configuration changes require a daemon restart: %s", strings.Join(paths, ", "))
 }
 
 func cloneValueSources(source map[string]config.ValueSource) map[string]config.ValueSource {

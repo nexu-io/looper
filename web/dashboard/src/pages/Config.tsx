@@ -199,12 +199,19 @@ function FieldFrame({
         </div>
         {unset ? (
           <p className="m-0 mt-1 text-[10px] text-[var(--warn)]">
-            Pending: remove the file value and use the next authority.
+            Unsaved: will remove the file value on Save (next authority wins).
           </p>
         ) : null}
         {dirty || unset ? (
-          <p className="m-0 mt-1 text-[10px] text-[var(--text-muted)]">
-            Published value: <code>{formatConfigValue(publishedValue)}</code>
+          <p className="m-0 mt-1 text-[10px] text-[var(--warn)]">
+            Unsaved draft
+            {unset ? null : (
+              <>
+                {" "}
+                (was <code>{formatConfigValue(publishedValue)}</code>)
+              </>
+            )}
+            . Click <strong>Save changes</strong> to apply.
           </p>
         ) : null}
         {error ? (
@@ -601,17 +608,11 @@ function AgentProfiles({
                         disabled={
                           !modelEditable || pendingRemoval || modelUnset
                         }
-                        placeholder="optional model (empty = inherit)"
+                        placeholder="optional (empty = vendor default; Unset = inherit)"
                         onChange={(event) => {
-                          const next = event.currentTarget.value;
-                          // Clearing the field unsets the leaf (inherit). Empty
-                          // string suppress is not staged from this control.
-                          // Last remaining leaf promotes to whole-profile remove.
-                          if (next === "" && published?.model != null) {
-                            if (!modelUnset) toggleProfileLeafUnset("model");
-                            return;
-                          }
-                          onDraft(modelPath, next);
+                          // Empty draft stages model:"" (vendor default suppress).
+                          // Use Unset for inheritance. Do not auto-unset on clear.
+                          onDraft(modelPath, event.currentTarget.value);
                         }}
                       />
                     </label>
@@ -1186,15 +1187,18 @@ export function ConfigPage() {
       setData(next);
       setLoadError(null);
       if (rebaseDrafts) {
+        // Stay locked only when the published generation is unchanged AND the
+        // daemon still reports a rejected reload. Same revision without
+        // lastError means the accepted file is back (or never left); OCC will
+        // re-check on the next PATCH, so unlock and let the operator retry.
         if (
           conflictRevisionRef.current !== null &&
-          next.metadata.revision === conflictRevisionRef.current
+          next.metadata.revision === conflictRevisionRef.current &&
+          Boolean(next.metadata.lastError)
         ) {
           setSaveConflict(true);
           setSaveError(
-            next.metadata.lastError
-              ? "The changed config file is still rejected. Repair it outside the dashboard, wait for a successful reload, then try again."
-              : "The daemon has not published the changed config file yet. Wait for the reload loop, then reload again.",
+            "The changed config file is still rejected. Repair it outside the dashboard, wait for a successful reload, then try again.",
           );
           setFieldErrors({});
           return;
@@ -1511,13 +1515,13 @@ export function ConfigPage() {
         <div>
           <h1 className="m-0 text-[15px] font-semibold">Configuration</h1>
           <p className="m-0 mt-0.5 text-[11px] text-[var(--text-muted)]">
-            Hot-safe global policy. Changes affect new runs; active runs keep their snapshot.
+            Hot-safe global policy. Edit fields, then click Save changes. Applies to new runs only.
           </p>
         </div>
         <div className="flex items-center gap-1.5">
           {formDirtyCount > 0 ? (
             <span className="mono text-[11px] text-[var(--warn)]">
-              {formDirtyCount} pending
+              {formDirtyCount} unsaved
             </span>
           ) : null}
           <Button
@@ -1541,11 +1545,34 @@ export function ConfigPage() {
             size="sm"
             disabled={editorLocked || environmentInputDirty || dirtyCount === 0}
             onClick={requestSave}
+            title={
+              environmentInputDirty
+                ? "Stage or clear the agent environment inputs first"
+                : dirtyCount === 0
+                  ? "No unsaved field changes"
+                  : "Write changes to the config file and apply to new runs"
+            }
           >
             {saving ? "Saving…" : "Save changes"}
           </Button>
         </div>
       </div>
+
+      {formDirtyCount > 0 && !saveConflict ? (
+        <div
+          className="rounded border border-[var(--warn)] bg-[color-mix(in_srgb,var(--warn)_8%,transparent)] px-3 py-2 text-[12px] text-[var(--warn)]"
+          role="status"
+          data-testid="config-unsaved-banner"
+        >
+          {formDirtyCount} unsaved{" "}
+          {formDirtyCount === 1 ? "change" : "changes"}. Nothing is written until
+          you click <strong>Save changes</strong>
+          {environmentInputDirty
+            ? " (stage or clear agent environment inputs first)"
+            : ""}
+          . A save bar stays pinned at the bottom while edits are pending.
+        </div>
+      ) : null}
 
       {environmentInputDirty ? (
         <div className="rounded border border-[var(--warn)] px-3 py-2 text-[12px] text-[var(--warn)]" role="status">
@@ -1640,6 +1667,37 @@ export function ConfigPage() {
           />
         ))}
       </div>
+
+      {formDirtyCount > 0 && !saveConflict ? (
+        <div
+          className="sticky bottom-0 z-20 -mx-0 flex flex-wrap items-center justify-between gap-2 border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2 shadow-[0_-8px_24px_rgba(0,0,0,0.35)]"
+          role="region"
+          aria-label="Unsaved configuration actions"
+        >
+          <p className="m-0 text-[12px] text-[var(--warn)]">
+            {formDirtyCount} unsaved{" "}
+            {formDirtyCount === 1 ? "change" : "changes"} — save to apply to new
+            runs.
+          </p>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={saving || confirmBody !== null}
+              onClick={discard}
+            >
+              Discard
+            </Button>
+            <Button
+              size="sm"
+              disabled={editorLocked || environmentInputDirty || dirtyCount === 0}
+              onClick={requestSave}
+            >
+              {saving ? "Saving…" : "Save changes"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
 
       <ConfirmDialog
         open={confirmBody !== null}
