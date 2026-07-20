@@ -510,6 +510,28 @@ describe("config form contract", () => {
       "roles.reviewer.agent.model": "",
     });
     expect(roleInherited.body.unset).toEqual([]);
+
+    // Profile vendor switch when profile model equals global model: unsetting
+    // the profile model would re-inherit that same global model under the new
+    // vendor (roles selecting the profile keep resolved model) — suppress "".
+    data.agent.profiles = {
+      fast: { vendor: "codex", model: "gpt-5" },
+    };
+    data.roles.worker = {
+      triggers: { planeAssigneeId: "worker-member" },
+      agent: { profile: "fast" },
+    };
+    const profileSameAsGlobal = buildConfigPatch(
+      data,
+      { "agent.profiles.fast.vendor": "opencode" },
+      [],
+    );
+    expect(profileSameAsGlobal.errors).toEqual({});
+    expect(profileSameAsGlobal.body.set).toEqual({
+      "agent.profiles.fast.vendor": "opencode",
+      "agent.profiles.fast.model": "",
+    });
+    expect(profileSameAsGlobal.body.unset).toEqual([]);
   });
 
   it("confirms automatic commit only when the change can enable it", () => {

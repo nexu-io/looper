@@ -561,10 +561,14 @@ export function buildConfigPatch(
  * When a vendor leaf is set or unset to a different effective vendor, clear any
  * retained non-empty model that would otherwise block the hot vendor edit.
  *
- * - Global / profile / role-owned models are unset (inherit / drop binding).
+ * - Global / profile / role-owned models are unset (inherit / drop binding)
+ *   when that does not leave the same non-empty resolved model under the new CLI.
  * - Role vendor edits that inherit a non-empty global or profile model stage an
  *   explicit empty role model (suppress) so the resolved model is not reused
  *   under the new CLI — matching daemon RestartRequiredChanges guards.
+ * - Profile vendor edits whose post-unset global inherit equals the current
+ *   profile model stage model:"" for the same reason (roles selecting the
+ *   profile would otherwise keep the global model across the vendor switch).
  */
 function stageVendorCompanionModelOps(
   data: ConfigData,
@@ -610,11 +614,19 @@ function stageVendorCompanionModelOps(
     if (!vendorChanged(vendorPath)) continue;
     if (unset.has(`agent.profiles.${id}`)) continue;
     const modelPath = agentProfilePath(id, "model");
-    if (
-      !unset.has(modelPath) &&
-      !Object.hasOwn(set, modelPath) &&
-      modelNonEmpty(getConfigValue(data, modelPath))
-    ) {
+    if (unset.has(modelPath) || Object.hasOwn(set, modelPath)) continue;
+    const profileModel = getConfigValue(data, modelPath);
+    if (!modelNonEmpty(profileModel)) continue;
+
+    // Unsetting falls through to post-patch global agent.model. When that
+    // inherits the same non-empty value, roles selecting this profile keep the
+    // resolved model across the vendor switch and RestartRequiredChanges rejects
+    // the PATCH (often reporting agent.model). Suppress with model:"" so the
+    // vendor default is used instead.
+    const inherited = resolvedPostPatchGlobalModel(data, set, unset);
+    if (modelNonEmpty(inherited) && valuesEqual(inherited, profileModel)) {
+      set[modelPath] = "";
+    } else {
       unset.add(modelPath);
     }
   }
@@ -641,6 +653,16 @@ function stageVendorCompanionModelOps(
       set[modelPath] = "";
     }
   }
+}
+
+function resolvedPostPatchGlobalModel(
+  data: ConfigData,
+  set: Record<string, ConfigValue>,
+  unset: Set<string>,
+): unknown {
+  if (Object.hasOwn(set, "agent.model")) return set["agent.model"];
+  if (unset.has("agent.model")) return undefined;
+  return getConfigValue(data, "agent.model");
 }
 
 function resolvedInheritedRoleModel(
@@ -670,9 +692,7 @@ function resolvedInheritedRoleModel(
     }
   }
 
-  if (Object.hasOwn(set, "agent.model")) return set["agent.model"];
-  if (unset.has("agent.model")) return undefined;
-  return getConfigValue(data, "agent.model");
+  return resolvedPostPatchGlobalModel(data, set, unset);
 }
 
 /**
