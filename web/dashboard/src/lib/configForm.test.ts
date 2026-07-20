@@ -329,6 +329,58 @@ describe("config form contract", () => {
     expect(result.body.unset).toEqual([]);
   });
 
+  it("stages blank profile/role model drafts as suppress when the leaf is absent", () => {
+    const data = fixture();
+    data.agent = {
+      ...data.agent!,
+      model: "gpt-5",
+      profiles: {
+        cheap: { vendor: "opencode" },
+      },
+    };
+    data.roles!.planner = {
+      ...data.roles!.planner!,
+      // no agent.model leaf — inherits global
+    };
+
+    // Absent profile model + blank draft → create suppress binding.
+    const profileBlank = buildConfigPatch(
+      data,
+      { "agent.profiles.cheap.model": "" },
+      [],
+    );
+    expect(profileBlank.errors).toEqual({});
+    expect(profileBlank.body.set).toEqual({
+      "agent.profiles.cheap.model": "",
+    });
+    expect(profileBlank.body.unset).toEqual([]);
+
+    // Absent role model + blank draft → create suppress binding.
+    const roleBlank = buildConfigPatch(
+      data,
+      { "roles.planner.agent.model": "" },
+      [],
+    );
+    expect(roleBlank.errors).toEqual({});
+    expect(roleBlank.body.set).toEqual({
+      "roles.planner.agent.model": "",
+    });
+    expect(roleBlank.body.unset).toEqual([]);
+
+    // Already-suppress model blank draft is a no-op.
+    data.roles!.planner = {
+      ...data.roles!.planner!,
+      agent: { model: "" },
+    };
+    const alreadySuppress = buildConfigPatch(
+      data,
+      { "roles.planner.agent.model": "" },
+      [],
+    );
+    expect(alreadySuppress.body.set).toEqual({});
+    expect(alreadySuppress.body.unset).toEqual([]);
+  });
+
   it("treats empty role profile drafts as unset when sibling vendor/model remain", () => {
     const data = fixture();
     // Fixture worker has profile + vendor + model; clearing only profile must
@@ -358,10 +410,11 @@ describe("config form contract", () => {
     expect(
       draftStagesConfigChange(data, "agent.profiles.fast.model", ""),
     ).toBe(true);
-    // Clearing a model that is already absent is a no-op.
+    // Blank model on an absent role/profile leaf stages suppress (""), not a
+    // no-op — empty is distinct from inherit for overlay resolution.
     expect(
       draftStagesConfigChange(data, "roles.planner.agent.model", ""),
-    ).toBe(false);
+    ).toBe(true);
     // Non-empty change still stages.
     expect(
       draftStagesConfigChange(data, "roles.worker.agent.profile", "other"),
@@ -532,6 +585,93 @@ describe("config form contract", () => {
       "agent.profiles.fast.model": "",
     });
     expect(profileSameAsGlobal.body.unset).toEqual([]);
+
+    // Model-less profile vendor switch still inherits non-empty global model
+    // for roles selecting the profile — stage profile model suppress.
+    data.agent.profiles = {
+      bare: { vendor: "codex" },
+    };
+    data.roles.worker = {
+      triggers: { planeAssigneeId: "worker-member" },
+      agent: { profile: "bare" },
+    };
+    const modelLessProfile = buildConfigPatch(
+      data,
+      { "agent.profiles.bare.vendor": "opencode" },
+      [],
+    );
+    expect(modelLessProfile.errors).toEqual({});
+    expect(modelLessProfile.body.set).toEqual({
+      "agent.profiles.bare.vendor": "opencode",
+      "agent.profiles.bare.model": "",
+    });
+    expect(modelLessProfile.body.unset).toEqual([]);
+
+    // Global vendor switch: role owns model while inheriting global vendor.
+    data.agent.profiles = {
+      fast: { vendor: "codex", model: "gpt-5-mini" },
+    };
+    data.roles.worker = {
+      triggers: { planeAssigneeId: "worker-member" },
+      agent: { model: "gpt-5" },
+    };
+    data.roles.reviewer = {
+      behavior: {
+        reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
+        threadResolution: { enabled: true, mode: "report_only" },
+      },
+      autoMerge: { enabled: false },
+    };
+    const globalWithRoleModel = buildConfigPatch(
+      data,
+      { "agent.vendor": "claude-code" },
+      [],
+    );
+    expect(globalWithRoleModel.errors).toEqual({});
+    expect(globalWithRoleModel.body.set).toEqual({
+      "agent.vendor": "claude-code",
+    });
+    expect(globalWithRoleModel.body.unset.sort()).toEqual(
+      ["agent.model", "roles.worker.agent.model"].sort(),
+    );
+
+    // Global vendor switch: role selects a profile that inherits global vendor
+    // but owns a non-empty model — clear the profile model companion.
+    data.agent.profiles = {
+      shared: { model: "gpt-5-mini" },
+    };
+    data.roles.worker = {
+      triggers: { planeAssigneeId: "worker-member" },
+      agent: { profile: "shared" },
+    };
+    const globalWithProfileModel = buildConfigPatch(
+      data,
+      { "agent.vendor": "claude-code" },
+      [],
+    );
+    expect(globalWithProfileModel.errors).toEqual({});
+    expect(globalWithProfileModel.body.set).toEqual({
+      "agent.vendor": "claude-code",
+      "agent.profiles.shared.model": "",
+    });
+    expect(globalWithProfileModel.body.unset).toEqual(["agent.model"]);
+
+    // Global vendor switch leaves role/profile models alone when the role
+    // overrides vendor (resolved vendor does not inherit global).
+    data.roles.worker = {
+      triggers: { planeAssigneeId: "worker-member" },
+      agent: { vendor: "codex", model: "gpt-5" },
+    };
+    const globalWithRoleVendor = buildConfigPatch(
+      data,
+      { "agent.vendor": "claude-code" },
+      [],
+    );
+    expect(globalWithRoleVendor.errors).toEqual({});
+    expect(globalWithRoleVendor.body.set).toEqual({
+      "agent.vendor": "claude-code",
+    });
+    expect(globalWithRoleVendor.body.unset).toEqual(["agent.model"]);
   });
 
   it("confirms automatic commit only when the change can enable it", () => {
