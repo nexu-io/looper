@@ -22,6 +22,7 @@ import {
   AGENT_VENDOR_OPTIONS,
   agentProfilePath,
   buildConfigPatch,
+  CODING_ROLES,
   CONFIG_GROUPS,
   configFieldErrors,
   configFieldKind,
@@ -30,14 +31,19 @@ import {
   configSelectOptions,
   draftFromValue,
   draftStagesConfigChange,
+  ESSENTIAL_PATHS,
   getConfigValue,
   highImpactChanges,
   isAgentProfileLeafPath,
   isAgentProfileWholePath,
   isCuratedAgentIdentityPath,
+  isEssentialConfigPath,
   isRoleAgentLeafPath,
   isValidAgentProfileId,
   profileLeafUnsetWouldEmpty,
+  ROLE_AGENT_FIELDS,
+  roleAgentPath,
+  type CodingRole,
   type ConfigDraft,
   type ConfigFieldKind,
   type ConfigGroup,
@@ -949,100 +955,100 @@ function ReloadWarning({ data }: { data: ConfigData }) {
   );
 }
 
-function ConfigGroupCard({
+function AdvancedGroupSection({
   group,
+  paths,
+  dirtyCount,
   data,
-  drafts,
+  secretSet,
   unsetPaths,
   errors,
-  secretSet,
-  onDraft,
-  onToggleUnset,
+  environmentResetToken,
   onSecretSet,
   onSecretRemove,
   onSecretUndoRemove,
-  onProfileRemove,
-  onProfileUndoRemove,
-  environmentResetToken,
   onEnvironmentInputDirtyChange,
   disabled,
+  renderField,
 }: {
   group: ConfigGroup;
+  paths: string[];
+  dirtyCount: number;
   data: ConfigData;
-  drafts: Record<string, ConfigDraft>;
+  secretSet: Record<string, string>;
   unsetPaths: Set<string>;
   errors: ErrorMap;
-  secretSet: Record<string, string>;
-  onDraft: (path: string, value: ConfigDraft) => void;
-  onToggleUnset: (path: string) => void;
+  environmentResetToken: number;
   onSecretSet: (key: string, value: string) => void;
   onSecretRemove: (key: string, existed: boolean) => void;
   onSecretUndoRemove: (key: string) => void;
-  onProfileRemove: (id: string, existed: boolean) => void;
-  onProfileUndoRemove: (id: string) => void;
-  environmentResetToken: number;
   onEnvironmentInputDirtyChange: (dirty: boolean) => void;
   disabled: boolean;
+  renderField: (path: string) => ReactNode;
 }) {
-  const paths = configFieldPaths(data, group);
-  if (paths.length === 0 && group.id !== "agent") return null;
+  // Agent group keeps its curated environment editor even when it has no plain
+  // hot-editable leaves left (all leaves either promoted to Essentials or
+  // filtered out as write-only).
+  const hasEnv = group.id === "agent";
+
+  const [open, setOpen] = useState<boolean>(dirtyCount > 0);
+  // Auto-open when this group's dirty count transitions to positive.
+  const prevDirtyRef = useRef<number>(dirtyCount);
+  useEffect(() => {
+    if (prevDirtyRef.current === 0 && dirtyCount > 0) setOpen(true);
+    prevDirtyRef.current = dirtyCount;
+  }, [dirtyCount]);
+
+  if (paths.length === 0 && !hasEnv) return null;
+
+  const total = paths.length + (hasEnv ? 1 : 0);
+  const meta = `${total} setting${total === 1 ? "" : "s"}${
+    dirtyCount > 0 ? ` · ${dirtyCount} unsaved` : ""
+  }`;
+
   return (
-    <Card
-      title={group.title}
+    <details
+      className={`rounded border border-[var(--border)] bg-[var(--bg-elevated)] [&_summary::-webkit-details-marker]:hidden${
+        group.id === "roles" ? " xl:col-span-2" : ""
+      }`}
       data-config-group={group.id}
-      className={group.id === "roles" ? "xl:col-span-2" : ""}
+      data-testid={`config-advanced-${group.id}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
     >
-      <p className="m-0 mb-1 text-[11px] text-[var(--text-muted)]">
-        {group.description}
-      </p>
-      <div>
-        {paths.map((path) => {
-          const effective = getConfigValue(data, path);
-          const kind = configFieldKind(path, effective);
-          const value = Object.hasOwn(drafts, path)
-            ? drafts[path]
-            : draftFromValue(kind, effective);
-          const meta = resolveFieldMeta(data, path);
-          const dirty = Object.hasOwn(drafts, path);
-          const unset = unsetPaths.has(path);
-          return (
-            <FieldFrame
-              key={path}
-              path={path}
-              meta={meta}
-              error={errors[path]}
-              dirty={dirty}
-              unset={unset}
-              publishedValue={effective}
-              disabled={disabled}
-              onUnset={() => onToggleUnset(path)}
+      <summary
+        aria-controls={`config-adv-body-${group.id}`}
+        className="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-1.5 hover:bg-[var(--bg-muted)]"
+      >
+        <span className="flex items-center gap-2">
+          <span
+            aria-hidden
+            className="inline-block w-2 text-[10px] text-[var(--text-muted)]"
+          >
+            {open ? "▾" : "▸"}
+          </span>
+          <span className="text-[12px] font-semibold tracking-wide uppercase text-[var(--text)]">
+            {group.title}
+          </span>
+          {dirtyCount > 0 ? (
+            <span
+              className="rounded border border-[var(--warn)] px-1 py-px mono text-[10px] text-[var(--warn)]"
+              title={`${dirtyCount} unsaved in ${group.title}`}
             >
-              <ConfigControl
-                path={path}
-                kind={kind}
-                value={value}
-                options={configSelectOptions(path)}
-                disabled={disabled || !metaIsEditable(meta)}
-                unset={unset}
-                onChange={(next) => onDraft(path, next)}
-              />
-            </FieldFrame>
-          );
-        })}
-      </div>
-      {group.id === "agent" ? (
-        <>
-          <AgentProfiles
-            data={data}
-            drafts={drafts}
-            unsetPaths={unsetPaths}
-            errors={errors}
-            onDraft={onDraft}
-            onToggleUnset={onToggleUnset}
-            onRemoveProfile={onProfileRemove}
-            onUndoRemoveProfile={onProfileUndoRemove}
-            disabled={disabled}
-          />
+              {dirtyCount}
+            </span>
+          ) : null}
+        </span>
+        <span className="mono text-[10px] text-[var(--text-muted)]">
+          {meta}
+        </span>
+      </summary>
+      <div id={`config-adv-body-${group.id}`} className="px-3 py-2">
+        <p className="m-0 mb-1 text-[11px] text-[var(--text-muted)]">
+          {group.description}
+        </p>
+        <div>{paths.map(renderField)}</div>
+        {hasEnv ? (
           <AgentEnvironment
             key={environmentResetToken}
             data={data}
@@ -1055,9 +1061,9 @@ function ConfigGroupCard({
             onInputDirtyChange={onEnvironmentInputDirtyChange}
             disabled={disabled}
           />
-        </>
-      ) : null}
-    </Card>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
@@ -1509,18 +1515,112 @@ export function ConfigPage() {
   }
   if (!data) return null;
 
+  // Renders one editable field row via FieldFrame + ConfigControl.
+  const renderField = (path: string) => {
+    const effective = getConfigValue(data, path);
+    const kind = configFieldKind(path, effective);
+    const value = Object.hasOwn(drafts, path)
+      ? drafts[path]
+      : draftFromValue(kind, effective);
+    const meta = resolveFieldMeta(data, path);
+    const dirty = Object.hasOwn(drafts, path);
+    const unset = unsetPaths.has(path);
+    return (
+      <FieldFrame
+        key={path}
+        path={path}
+        meta={meta}
+        error={fieldErrors[path]}
+        dirty={dirty}
+        unset={unset}
+        publishedValue={effective}
+        disabled={editorLocked}
+        onUnset={() => onToggleUnset(path)}
+      >
+        <ConfigControl
+          path={path}
+          kind={kind}
+          value={value}
+          options={configSelectOptions(path)}
+          disabled={editorLocked || !metaIsEditable(meta)}
+          unset={unset}
+          onChange={(next) => onDraft(path, next)}
+        />
+      </FieldFrame>
+    );
+  };
+
+  // Curated essentials: only paths this snapshot actually exposes as
+  // hot-editable, in the intended display order. Anything else falls under
+  // Advanced. Role agent leaves render in a separate curated block below.
+  const groupPathSets = CONFIG_GROUPS.map((group) => ({
+    group,
+    paths: configFieldPaths(data, group),
+  }));
+  const knownGroupPaths = new Set<string>();
+  for (const { paths } of groupPathSets) for (const p of paths) knownGroupPaths.add(p);
+  const essentialPaths = ESSENTIAL_PATHS.filter((p) => knownGroupPaths.has(p));
+
+  // Advanced paths per group: everything hot-editable that isn't essential and
+  // isn't a curated role-agent leaf (rendered under Essentials).
+  const advancedByGroup: Record<string, string[]> = {};
+  for (const { group, paths } of groupPathSets) {
+    advancedByGroup[group.id] = paths.filter(
+      (p) => !isEssentialConfigPath(p),
+    );
+  }
+
+  // Dirty counts per advanced group — for auto-open + collapsed badge.
+  const dirtyPaths = new Set<string>([
+    ...Object.keys(drafts),
+    ...Array.from(unsetPaths),
+    ...Object.keys(secretSet),
+  ]);
+  const advancedDirtyByGroup: Record<string, number> = {};
+  let essentialsDirty = 0;
+  for (const path of dirtyPaths) {
+    if (isEssentialConfigPath(path)) {
+      essentialsDirty += 1;
+      continue;
+    }
+    if (isAgentProfileLeafPath(path) || isAgentProfileWholePath(path)) {
+      // Profile edits are surfaced via the Essentials Agent Profiles block.
+      essentialsDirty += 1;
+      continue;
+    }
+    for (const { group } of groupPathSets) {
+      if (group.accepts(path)) {
+        advancedDirtyByGroup[group.id] =
+          (advancedDirtyByGroup[group.id] ?? 0) + 1;
+        break;
+      }
+    }
+  }
+  // environmentInputDirty is a typed-but-unstaged flag; count it under Agent.
+  if (environmentInputDirty) {
+    advancedDirtyByGroup.agent = (advancedDirtyByGroup.agent ?? 0) + 1;
+  }
+
+  // Keep dock while dirty (including conflict): Save stays disabled via
+  // editorLocked; Discard remains available. Conflict banner owns reload.
+  const dockVisible = formDirtyCount > 0;
+
   return (
-    <div className="flex flex-col gap-3">
+    <div className={`flex flex-col gap-3 ${dockVisible ? "pb-24" : ""}`}>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h1 className="m-0 text-[15px] font-semibold">Configuration</h1>
           <p className="m-0 mt-0.5 text-[11px] text-[var(--text-muted)]">
-            Hot-safe global policy. Edit fields, then click Save changes. Applies to new runs only.
+            Hot-safe global policy. Common settings are shown first; the rest
+            live under Advanced. Changes apply to new runs only.
           </p>
         </div>
         <div className="flex items-center gap-1.5">
           {formDirtyCount > 0 ? (
-            <span className="mono text-[11px] text-[var(--warn)]">
+            <span
+              className="mono text-[11px] text-[var(--warn)]"
+              data-testid="config-dirty-count"
+            >
               {formDirtyCount} unsaved
             </span>
           ) : null}
@@ -1529,83 +1629,54 @@ export function ConfigPage() {
             size="sm"
             disabled={editorLocked || formDirtyCount > 0}
             onClick={() => void load(false)}
-            title={formDirtyCount > 0 ? "Discard or save pending changes before refreshing" : undefined}
-          >
-            Refresh
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={saving || confirmBody !== null || formDirtyCount === 0}
-            onClick={discard}
-          >
-            Discard
-          </Button>
-          <Button
-            size="sm"
-            disabled={editorLocked || environmentInputDirty || dirtyCount === 0}
-            onClick={requestSave}
             title={
-              environmentInputDirty
-                ? "Stage or clear the agent environment inputs first"
-                : dirtyCount === 0
-                  ? "No unsaved field changes"
-                  : "Write changes to the config file and apply to new runs"
+              formDirtyCount > 0
+                ? "Discard or save pending changes before refreshing"
+                : undefined
             }
           >
-            {saving ? "Saving…" : "Save changes"}
+            Refresh
           </Button>
         </div>
       </div>
 
-      {formDirtyCount > 0 && !saveConflict ? (
-        <div
-          className="rounded border border-[var(--warn)] bg-[color-mix(in_srgb,var(--warn)_8%,transparent)] px-3 py-2 text-[12px] text-[var(--warn)]"
-          role="status"
-          data-testid="config-unsaved-banner"
-        >
-          {formDirtyCount} unsaved{" "}
-          {formDirtyCount === 1 ? "change" : "changes"}. Nothing is written until
-          you click <strong>Save changes</strong>
-          {environmentInputDirty
-            ? " (stage or clear agent environment inputs first)"
-            : ""}
-          . A save bar stays pinned at the bottom while edits are pending.
-        </div>
-      ) : null}
-
       {environmentInputDirty ? (
-        <div className="rounded border border-[var(--warn)] px-3 py-2 text-[12px] text-[var(--warn)]" role="status">
-          Stage the agent environment value or discard it before saving or refreshing.
+        <div
+          className="rounded border border-[var(--warn)] px-3 py-2 text-[12px] text-[var(--warn)]"
+          role="status"
+        >
+          Stage the agent environment value or discard it before saving or
+          refreshing.
         </div>
       ) : null}
 
       <ReloadWarning data={data} />
 
-      <Card title="Source">
-        <dl className="m-0 grid gap-x-4 gap-y-1 text-[11px] sm:grid-cols-2 lg:grid-cols-4">
-          <div>
-            <dt className="text-[var(--text-muted)]">Config file</dt>
-            <dd className="m-0 break-all mono" title={data.metadata.configPath}>
-              {data.metadata.configPath || "—"}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-[var(--text-muted)]">Format</dt>
-            <dd className="m-0 mono">
-              {data.metadata.format || "—"} · {data.metadata.filePresent ? "present" : "not created"}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-[var(--text-muted)]">Last applied</dt>
-            <dd className="m-0 mono">{formatTs(data.metadata.lastAppliedAt)}</dd>
-          </div>
-          <div>
-            <dt className="text-[var(--text-muted)]">Last attempted</dt>
-            <dd className="m-0 mono">{formatTs(data.metadata.lastAttemptAt)}</dd>
-          </div>
-        </dl>
-      </Card>
+      {/* Compact single-line source strip — was a heavy 4-col card. */}
+      <div
+        className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-1.5 text-[11px] text-[var(--text-muted)]"
+        aria-label="Configuration source"
+      >
+        <span>
+          <span className="uppercase tracking-wide">Source</span>
+        </span>
+        <span
+          className="mono max-w-full truncate text-[var(--text)]"
+          title={data.metadata.configPath}
+        >
+          {data.metadata.configPath || "—"}
+        </span>
+        <span className="mono">
+          {data.metadata.format || "—"} ·{" "}
+          {data.metadata.filePresent ? "present" : "not created"}
+        </span>
+        <span className="mono">
+          applied {formatTs(data.metadata.lastAppliedAt)}
+        </span>
+        <span className="mono">
+          attempted {formatTs(data.metadata.lastAttemptAt)}
+        </span>
+      </div>
 
       {loadError ? (
         <PanelError
@@ -1618,9 +1689,14 @@ export function ConfigPage() {
         />
       ) : null}
       {saveConflict ? (
-        <div className="rounded border border-[var(--warn)] px-3 py-2 text-[12px]" role="alert">
+        <div
+          className="rounded border border-[var(--warn)] px-3 py-2 text-[12px]"
+          role="alert"
+        >
           <p className="m-0 text-[var(--warn)]">
-            The file changed after this form loaded. Reload the published snapshot and keep your pending edits rebased on it, then review each published value before saving again.
+            The file changed after this form loaded. Reload the published
+            snapshot and keep your pending edits rebased on it, then review each
+            published value before saving again.
           </p>
           <Button
             variant="ghost"
@@ -1634,67 +1710,157 @@ export function ConfigPage() {
         </div>
       ) : null}
       {saveError ? (
-        <div className="rounded border border-[var(--danger)] px-3 py-2 text-[12px] text-[var(--danger)]" role="alert">
+        <div
+          className="rounded border border-[var(--danger)] px-3 py-2 text-[12px] text-[var(--danger)]"
+          role="alert"
+        >
           {saveError}
         </div>
       ) : null}
       {rebaseNotice ? (
-        <div className="rounded border border-[var(--warn)] px-3 py-2 text-[12px] text-[var(--warn)]" role="status">
+        <div
+          className="rounded border border-[var(--warn)] px-3 py-2 text-[12px] text-[var(--warn)]"
+          role="status"
+        >
           {rebaseNotice}
         </div>
       ) : null}
 
-      <div className="grid items-start gap-3 xl:grid-cols-2">
-        {CONFIG_GROUPS.map((group) => (
-          <ConfigGroupCard
-            key={group.id}
-            group={group}
-            data={data}
-            drafts={drafts}
-            unsetPaths={unsetPaths}
-            errors={fieldErrors}
-            secretSet={secretSet}
-            onDraft={onDraft}
-            onToggleUnset={onToggleUnset}
-            onSecretSet={onSecretSet}
-            onSecretRemove={onSecretRemove}
-            onSecretUndoRemove={onSecretUndoRemove}
-            onProfileRemove={onProfileRemove}
-            onProfileUndoRemove={onProfileUndoRemove}
-            environmentResetToken={environmentResetToken}
-            onEnvironmentInputDirtyChange={onEnvironmentInputDirtyChange}
-            disabled={editorLocked}
-          />
-        ))}
-      </div>
+      {/* Essentials — curated common knobs, always expanded. */}
+      <Card title="Common settings" data-testid="config-essentials">
+        <p className="m-0 mb-1 text-[11px] text-[var(--text-muted)]">
+          The knobs most operators tune. Everything else is under Advanced
+          below.
+        </p>
+        <div>{essentialPaths.map(renderField)}</div>
 
-      {formDirtyCount > 0 && !saveConflict ? (
+        <AgentProfiles
+          data={data}
+          drafts={drafts}
+          unsetPaths={unsetPaths}
+          errors={fieldErrors}
+          onDraft={onDraft}
+          onToggleUnset={onToggleUnset}
+          onRemoveProfile={onProfileRemove}
+          onUndoRemoveProfile={onProfileUndoRemove}
+          disabled={editorLocked}
+        />
+
         <div
-          className="sticky bottom-0 z-20 -mx-0 flex flex-wrap items-center justify-between gap-2 border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2 shadow-[0_-8px_24px_rgba(0,0,0,0.35)]"
+          className="mt-2 border-t border-[var(--border)] pt-2"
+          data-testid="role-agent-bindings"
+        >
+          <div>
+            <h3 className="m-0 text-[12px] font-medium">Role agent bindings</h3>
+            <p className="m-0 text-[10px] text-[var(--text-muted)]">
+              Optional profile / vendor / model override per coding role. Leave
+              blank to inherit the global agent.
+            </p>
+          </div>
+          <div className="mt-1.5 grid gap-2 xl:grid-cols-2">
+            {CODING_ROLES.map((role: CodingRole) => (
+              <div
+                key={role}
+                className="rounded border border-[var(--border)] px-2 py-1.5"
+                data-config-group={`roles.${role}.agent`}
+              >
+                <div className="mb-1 text-[11px] font-medium capitalize">
+                  {role}
+                </div>
+                <div>
+                  {ROLE_AGENT_FIELDS.map((field) =>
+                    renderField(roleAgentPath(role, field)),
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Card>
+
+      {/* Advanced — everything else, grouped and collapsed. */}
+      <section
+        aria-labelledby="config-advanced-heading"
+        data-testid="config-advanced"
+      >
+        <div className="mb-1.5 flex items-baseline justify-between">
+          <h2
+            id="config-advanced-heading"
+            className="m-0 text-[12px] font-semibold uppercase tracking-wide text-[var(--text-muted)]"
+          >
+            Advanced
+          </h2>
+          <span className="text-[11px] text-[var(--text-muted)]">
+            Expand a section to reveal less-tuned knobs.
+          </span>
+        </div>
+        <div className="grid items-start gap-2 xl:grid-cols-2">
+          {CONFIG_GROUPS.map((group) => (
+            <AdvancedGroupSection
+              key={group.id}
+              group={group}
+              paths={advancedByGroup[group.id] ?? []}
+              dirtyCount={advancedDirtyByGroup[group.id] ?? 0}
+              data={data}
+              secretSet={secretSet}
+              unsetPaths={unsetPaths}
+              errors={fieldErrors}
+              environmentResetToken={environmentResetToken}
+              onSecretSet={onSecretSet}
+              onSecretRemove={onSecretRemove}
+              onSecretUndoRemove={onSecretUndoRemove}
+              onEnvironmentInputDirtyChange={onEnvironmentInputDirtyChange}
+              disabled={editorLocked}
+              renderField={renderField}
+            />
+          ))}
+        </div>
+      </section>
+
+      {/* Viewport-fixed save dock — reliably visible while scrolling. */}
+      {dockVisible ? (
+        <div
+          className="fixed bottom-0 left-0 right-0 z-30 border-t border-[var(--border)] bg-[color-mix(in_srgb,var(--bg-elevated)_92%,transparent)] px-3 py-2 shadow-[0_-8px_24px_rgba(0,0,0,0.35)] backdrop-blur"
           role="region"
           aria-label="Unsaved configuration actions"
+          data-testid="config-save-dock"
         >
-          <p className="m-0 text-[12px] text-[var(--warn)]">
-            {formDirtyCount} unsaved{" "}
-            {formDirtyCount === 1 ? "change" : "changes"} — save to apply to new
-            runs.
-          </p>
-          <div className="flex items-center gap-1.5">
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={saving || confirmBody !== null}
-              onClick={discard}
-            >
-              Discard
-            </Button>
-            <Button
-              size="sm"
-              disabled={editorLocked || environmentInputDirty || dirtyCount === 0}
-              onClick={requestSave}
-            >
-              {saving ? "Saving…" : "Save changes"}
-            </Button>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="m-0 text-[12px] text-[var(--warn)]">
+              {formDirtyCount} unsaved{" "}
+              {formDirtyCount === 1 ? "change" : "changes"} — save to apply to
+              new runs
+              {environmentInputDirty
+                ? " (stage or clear agent environment inputs first)"
+                : ""}
+              .
+            </p>
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={saving || confirmBody !== null}
+                onClick={discard}
+              >
+                Discard
+              </Button>
+              <Button
+                size="sm"
+                disabled={
+                  editorLocked || environmentInputDirty || dirtyCount === 0
+                }
+                onClick={requestSave}
+                title={
+                  environmentInputDirty
+                    ? "Stage or clear the agent environment inputs first"
+                    : dirtyCount === 0
+                      ? "No unsaved field changes"
+                      : "Write changes to the config file and apply to new runs"
+                }
+              >
+                {saving ? "Saving…" : "Save changes"}
+              </Button>
+            </div>
           </div>
         </div>
       ) : null}

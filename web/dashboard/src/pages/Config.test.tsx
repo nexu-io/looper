@@ -545,7 +545,9 @@ describe("ConfigPage", () => {
 
     expect(await screen.findByText(/change now matches/i)).toBeTruthy();
     expect(retry.value).toBe("8");
-    expectSaveDisabled(true);
+    // Rebase pruned the retained draft (now matches published) — no dirty
+    // state remains and the fixed Save dock is absent entirely.
+    expect(screen.queryByTestId("config-save-dock")).toBeNull();
     const field = container.querySelector(
       '[data-config-path="scheduler.slowLaneWarnThresholdMs"]',
     );
@@ -603,7 +605,8 @@ describe("ConfigPage", () => {
     expect(
       screen.getByRole("button", { name: "Remove OPENAI_API_KEY" }),
     ).toBeTruthy();
-    expectSaveDisabled(true);
+    // Rebase cleared all write-only staging — no dirty state remains.
+    expect(screen.queryByTestId("config-save-dock")).toBeNull();
   });
 
   it("tracks and discards typed but unstaged environment input", async () => {

@@ -82,6 +82,34 @@ export function isValidAgentProfileId(id: string): boolean {
   return /^[A-Za-z0-9_-]+$/.test(id);
 }
 
+/**
+ * Curated common-operator settings shown in the Essentials section, in the
+ * intended display order. Anything else falls under Advanced. Role agent
+ * identity leaves and the Agent Profiles map are also treated as essentials
+ * but rendered by dedicated curated blocks, not by this list.
+ */
+export const ESSENTIAL_PATHS = [
+  "agent.vendor",
+  "agent.model",
+  "scheduler.maxConcurrentRuns",
+  "defaults.baseBranch",
+  "defaults.openPrStrategy",
+  "defaults.allowAutoCommit",
+  "defaults.allowAutoPush",
+  "defaults.allowAutoApprove",
+  "defaults.allowAutoMerge",
+  "defaults.allowRiskyFixes",
+] as const;
+
+const ESSENTIAL_PATH_SET = new Set<string>(ESSENTIAL_PATHS);
+
+/** True for scalar essentials plus curated role-agent identity leaves. */
+export function isEssentialConfigPath(path: string): boolean {
+  if (ESSENTIAL_PATH_SET.has(path)) return true;
+  if (isRoleAgentLeafPath(path)) return true;
+  return false;
+}
+
 export const CONFIG_GROUPS: ConfigGroup[] = [
   {
     id: "scheduler",
