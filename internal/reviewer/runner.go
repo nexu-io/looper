@@ -1641,14 +1641,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}()
-	// After successful lock reacquisition (or when no lock key is required), revoke
-	// fixer ownership before reusing a prepared path past stepWorktree.
-	// CreateWorktree/RestoreWorktree will not run on that resume path, so this is
-	// the claim-time authority handoff. Must run after the release defer so a
-	// clear failure still drops the PR lock.
-	if resumedRun.Resumed && resumedRun.StartStep != stepClaim && resumedRun.StartStep != stepWorktree && checkpoint.Worktree != nil {
-		if err := worktreesafety.ClearFixerOwnerToken(checkpoint.Worktree.Path); err != nil {
-			return ProcessResult{}, err
+	// After successful lock reacquisition (or when no lock key is required), detect
+	// intervening fixer ownership on a prepared path past stepWorktree.
+	// Unconditionally revoking the marker is unsafe: createRunContext only clears
+	// PreparedAt when StartStep == stepReview, so resume at thread_resolution would
+	// skip PrepareWorktree and let the agent inspect/cleanup fixer dirt.
+	// A present marker means the reviewer prepare is stale — re-enter worktree
+	// preparation so Create/Prepare reclaim the path and clear ownership. Must run
+	// after the release defer so claim failures still drop the PR lock.
+	startStep := resumedRun.StartStep
+	if resumedRun.Resumed && startStep != stepClaim && startStep != stepWorktree && checkpoint.Worktree != nil {
+		if worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path) != "" {
+			checkpoint.Worktree.PreparedAt = ""
+			startStep = stepWorktree
 		}
 	}
 	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -1667,10 +1672,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	// policy into every step so stale loop metadata from an earlier queued run
 	// cannot override configuration published before this claim.
 	loop = &updatedLoop
-	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
-	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
-	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
-	for _, step := range stepsFrom(resumedRun.StartStep) {
+	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(startStep)}})
+	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(startStep)}})
+	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(startStep), "resumed": resumedRun.Resumed})
+	for _, step := range stepsFrom(startStep) {
 		stepStartedAt := r.now()
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
@@ -2286,9 +2291,10 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			checkpoint.Worktree = nil
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 		} else if reviewerWorktreePrepared(checkpoint) {
-			// Reusing a prepared path skips CreateWorktree/RestoreWorktree, so
-			// explicitly revoke any fixer owner marker a concurrent fixer may
-			// have stamped between reviewer attempts.
+			// Reusing a prepared path skips CreateWorktree/RestoreWorktree.
+			// reviewerWorktreePrepared already rejects paths with a fixer marker;
+			// clear defensively so a race-stamped token cannot authorize adopt of
+			// later reviewer dirt.
 			if err := worktreesafety.ClearFixerOwnerToken(checkpoint.Worktree.Path); err != nil {
 				return checkpoint, err
 			}
@@ -6805,6 +6811,12 @@ func reviewerWorktreeRoot(project storage.ProjectRecord) (string, error) {
 
 func reviewerWorktreePrepared(checkpoint reviewerCheckpoint) bool {
 	if reviewerWorktreeNeedsPrepare(checkpoint) {
+		return false
+	}
+	// Intervening fixer ownership invalidates reviewer prepared state even when
+	// PreparedAt is still set (e.g. resume at thread_resolution, which does not
+	// clear PreparedAt in createRunContext). Forces re-prepare before agent use.
+	if worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path) != "" {
 		return false
 	}
 	return checkpoint.Worktree.PreparedAt != ""
