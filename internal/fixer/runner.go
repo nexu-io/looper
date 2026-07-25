@@ -6096,11 +6096,12 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 }
 
 // isMissingOrUnusableFixerWorktree reports whether a checkpoint worktree path
-// cannot be prepared in place and should be recreated. Path-only safety
-// validation accepts contained paths even when the directory is gone; prepare
-// then fails with a fetch/cwd error that would otherwise burn a retry.
-// When prepErr is non-nil, git "not a working tree" style failures are also
-// treated as recreate-worthy even if the directory still exists empty.
+// cannot be prepared in place and should be recreated. Authority is the
+// checkout itself (path missing / gone) or a typed local git-tree integrity
+// error ("not a working tree" / "not a git repository"). External
+// fetch/ssh/transport failures must not be treated as unusable checkouts —
+// their text often contains "no such file or directory" (e.g. missing ssh
+// binary) and force-cleaning would destroy interrupted agent dirt.
 func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -6115,14 +6116,18 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 	if prepErr == nil {
 		return false
 	}
+	// Local checkout integrity only. Do not substring-match generic existence
+	// phrases — external dependency errors share that wording.
 	msg := strings.ToLower(prepErr.Error())
 	switch {
 	case strings.Contains(msg, "not a working tree"),
-		strings.Contains(msg, "not a git repository"),
-		strings.Contains(msg, "no such file or directory"),
-		strings.Contains(msg, "does not exist"):
+		strings.Contains(msg, "not a git repository"):
 		return true
 	default:
+		// Path may have vanished during prepare; re-stat the checkout itself.
+		if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+			return true
+		}
 		return false
 	}
 }
