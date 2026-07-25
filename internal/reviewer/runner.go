@@ -2286,6 +2286,14 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 		}
 		worktreeRoot = resolvedRoot
 	}
+	// Capture fixer ownership before CreateWorktree revokes the marker. Prepare
+	// failures that occur before dirt inspection (remote-head drift, fetch errors)
+	// must restore provenance so terminal/success cleanup cannot orphan partial
+	// fixer edits that preparation never evaluated.
+	priorFixerToken := ""
+	if checkpoint.Worktree != nil {
+		priorFixerToken = worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path)
+	}
 	if checkpoint.Worktree != nil {
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 			checkpoint.Worktree = nil
@@ -2324,6 +2332,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	}
 	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
+		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
+			r.logWarn("reviewer restore fixer owner token after prepare failure failed", map[string]any{"worktreePath": created.WorktreePath, "error": restoreErr.Error()})
+		}
 		var remoteHeadChanged *gitinfra.RemoteHeadChangedError
 		if errors.As(err, &remoteHeadChanged) {
 			return markReviewerRunStale(checkpoint, remoteHeadChanged.Error()), nil
@@ -2331,6 +2342,11 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 		return checkpoint, err
 	}
 	if !prepared.Clean {
+		// Dirt observed but not claimed: restore fixer provenance so a later
+		// same-head adopt can reclaim partial edits instead of terminal cleanup.
+		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
+			r.logWarn("reviewer restore fixer owner token after dirty prepare failed", map[string]any{"worktreePath": created.WorktreePath, "error": restoreErr.Error()})
+		}
 		return checkpoint, &loopError{message: fmt.Sprintf("Reviewer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
 	checkpoint.Worktree.HeadSHA = prepared.HeadSHA
@@ -6773,6 +6789,18 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	if r.git == nil || checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
+	// Unprepared rewind paths (PreparedAt cleared, path kept) may still hold
+	// fixer dirt that prepare never evaluated (remote-head drift / fetch fail
+	// before status). Terminal success/failure cleanup must not force-remove it.
+	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) == "" {
+		return
+	}
+	// An active fixer owner stamp means the path is still fixer-owned evidence;
+	// force-remove would destroy partial edits the reviewer never successfully
+	// reclaimed.
+	if worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path) != "" {
+		return
+	}
 	protectedBranches := []string{}
 	if baseBranch := strings.TrimSpace(derefString(project.BaseBranch)); baseBranch != "" {
 		protectedBranches = append(protectedBranches, baseBranch)
@@ -6787,6 +6815,17 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 		return
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
+}
+
+// restoreFixerOwnerToken rewrites a prior fixer ownership stamp after CreateWorktree
+// revoked it and prepare could not complete a clean reclaim. Empty inputs are no-ops.
+func restoreFixerOwnerToken(worktreePath, token string) error {
+	token = strings.TrimSpace(token)
+	worktreePath = strings.TrimSpace(worktreePath)
+	if token == "" || worktreePath == "" {
+		return nil
+	}
+	return worktreesafety.WriteFixerOwnerToken(worktreePath, token)
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
