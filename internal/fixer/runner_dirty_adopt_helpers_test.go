@@ -13,6 +13,7 @@ import (
 
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 // Shared fixtures for same-head dirty adopt / prepare-error recovery.
@@ -56,20 +57,52 @@ func (f dirtyAdoptFixture) project() storage.ProjectRecord {
 	return storage.ProjectRecord{ID: "project_1", RepoPath: f.repoPath, MetadataJSON: &f.metadata}
 }
 
-func (f dirtyAdoptFixture) rewindCheckpoint() fixerCheckpoint {
-	return fixerCheckpoint{
-		Detail:   &checkpointDetail{HeadSHA: f.headSHA, HeadRefName: f.branch, BaseRefName: "main"},
-		Worktree: &checkpointWorktree{Path: f.wtPath, Branch: f.branch}, // PreparedAt cleared by rewind
+func (f dirtyAdoptFixture) seedOwnerToken(t *testing.T, token string) {
+	t.Helper()
+	if err := worktreesafety.WriteFixerOwnerToken(f.wtPath, token); err != nil {
+		t.Fatalf("WriteFixerOwnerToken: %v", err)
 	}
 }
 
+func (f dirtyAdoptFixture) rewindCheckpoint() fixerCheckpoint {
+	// Prior prepare stamped ownership; rewind clears PreparedAt but keeps Path + OwnerToken.
+	const token = "fixer:loop_1:run_prior:prepared"
+	return fixerCheckpoint{
+		Detail: &checkpointDetail{HeadSHA: f.headSHA, HeadRefName: f.branch, BaseRefName: "main"},
+		Worktree: &checkpointWorktree{
+			Path:       f.wtPath,
+			Branch:     f.branch,
+			OwnerToken: token, // PreparedAt cleared by rewind; ownership retained
+		},
+	}
+}
+
+func (f dirtyAdoptFixture) rewindCheckpointWithDiskOwnership(t *testing.T) fixerCheckpoint {
+	t.Helper()
+	cp := f.rewindCheckpoint()
+	f.seedOwnerToken(t, cp.Worktree.OwnerToken)
+	return cp
+}
+
 func (f dirtyAdoptFixture) step(loop storage.LoopRecord, git GitGateway) stepInput {
+	// Tests that only need path preservation (not adopt) may omit disk ownership.
 	return stepInput{
 		Project:    f.project(),
 		Loop:       loop,
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: f.rewindCheckpoint(),
+	}
+}
+
+func (f dirtyAdoptFixture) stepWithOwnership(t *testing.T, loop storage.LoopRecord, git GitGateway) stepInput {
+	t.Helper()
+	return stepInput{
+		Project:    f.project(),
+		Loop:       loop,
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: f.rewindCheckpointWithDiskOwnership(t),
 	}
 }
 

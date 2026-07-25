@@ -1,0 +1,114 @@
+package fixer
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
+	t.Parallel()
+
+	existing := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "gone")
+
+	// Valid linked-worktree-style checkout: .git file points at an existing gitdir.
+	usable := t.TempDir()
+	gitdir := filepath.Join(t.TempDir(), "gitdir")
+	if err := os.MkdirAll(gitdir, 0o755); err != nil {
+		t.Fatalf("MkdirAll gitdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(usable, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile usable .git: %v", err)
+	}
+
+	// Ordinary checkout with .git/HEAD present.
+	usableDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(usableDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll usableDir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(usableDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+
+	remoteIntegrityText := errors.New("fatal: not a git repository (or any of the parent directories): .git")
+
+	cases := []struct {
+		name    string
+		path    string
+		prepErr error
+		want    bool
+	}{
+		{name: "empty_path", path: "", want: true},
+		{name: "missing_path", path: missing, want: true},
+		{name: "existing_no_err", path: existing, want: false},
+		// Directory without local git metadata + integrity-looking prepare text → recreate.
+		{name: "not_a_working_tree_no_git", path: existing, prepErr: fmt.Errorf("fatal: %s is not a working tree", existing), want: true},
+		{name: "not_a_git_repository_no_git", path: existing, prepErr: remoteIntegrityText, want: true},
+		// Same remote/helper wording must NOT force cleanup when local checkout is valid.
+		{name: "not_a_git_repository_usable_gitfile", path: usable, prepErr: remoteIntegrityText, want: false},
+		{name: "not_a_git_repository_usable_gitdir", path: usableDir, prepErr: remoteIntegrityText, want: false},
+		{name: "not_a_working_tree_usable", path: usable, prepErr: fmt.Errorf("fatal: %s is not a working tree", usable), want: false},
+		// Regression: external ssh/fetch text must not classify a live checkout as unusable.
+		{name: "ssh_no_such_file", path: existing, prepErr: errors.New("error: cannot run ssh: No such file or directory\nfatal: unable to fork"), want: false},
+		{name: "fetch_transport", path: existing, prepErr: errors.New("git fetch origin feature/fix-42: fatal: unable to access remote"), want: false},
+		{name: "remote_head_changed", path: existing, prepErr: errors.New("remote head for feature/fix-42 changed: expected a, got b"), want: false},
+		// Generic existence phrases without a missing checkout must not force cleanup.
+		{name: "does_not_exist_remote_ref", path: existing, prepErr: errors.New("fatal: couldn't find remote ref does not exist"), want: false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isMissingOrUnusableFixerWorktree(tc.path, tc.prepErr); got != tc.want {
+				t.Fatalf("isMissingOrUnusableFixerWorktree(%q, %v) = %v, want %v", tc.path, tc.prepErr, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClearUnusableFixerWorktreePath(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing_ok", func(t *testing.T) {
+		t.Parallel()
+		if err := clearUnusableFixerWorktreePath(filepath.Join(t.TempDir(), "gone")); err != nil {
+			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		}
+	})
+
+	t.Run("empty_removed", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "empty")
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := clearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("path still exists after clear, err=%v", err)
+		}
+	})
+
+	t.Run("populated_preserved", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "populated")
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		marker := filepath.Join(path, "keep.txt")
+		if err := os.WriteFile(marker, []byte("x\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		err := clearUnusableFixerWorktreePath(path)
+		if !errors.Is(err, errUnusableFixerWorktreePreserved) {
+			t.Fatalf("error = %v, want errUnusableFixerWorktreePreserved", err)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("populated marker missing: %v", err)
+		}
+	})
+}

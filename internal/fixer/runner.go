@@ -764,11 +764,16 @@ type checkpointDetail struct {
 }
 
 type checkpointWorktree struct {
-	Path               string `json:"path,omitempty"`
-	Branch             string `json:"branch,omitempty"`
-	HeadSHA            string `json:"headSha,omitempty"`
-	BaseHeadSHA        string `json:"baseHeadSha,omitempty"`
-	PreparedAt         string `json:"preparedAt,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	HeadSHA     string `json:"headSha,omitempty"`
+	BaseHeadSHA string `json:"baseHeadSha,omitempty"`
+	PreparedAt  string `json:"preparedAt,omitempty"`
+	// OwnerToken is a fixer-prepare generation stamp. Same-head dirty adopt
+	// requires this token to still match the on-disk worktree marker so path
+	// equality alone cannot authorize dirt left after another runner claimed
+	// the shared project/PR detached directory (Create/Restore clears the marker).
+	OwnerToken         string `json:"ownerToken,omitempty"`
 	CleanupAttemptedAt string `json:"cleanupAttemptedAt,omitempty"`
 	CleanedAt          string `json:"cleanedAt,omitempty"`
 }
@@ -2690,9 +2695,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		return checkpoint, err
 	}
 	if !prepared.Clean {
-		// Same-head dirty adopt only with fixer provenance (checkpoint already
-		// points at this managed path). HEAD equality alone must not authorize
-		// adopting dirt left by a reviewer/worker at the shared PR path.
+		// Same-head dirty adopt only with fixer-run ownership (path + owner token
+		// still matching on disk). HEAD equality alone must not authorize adopting
+		// dirt left by a reviewer/worker at the shared PR path.
 		if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, branch, worktreeRoot, created, prepared); adoptErr != nil {
 			return checkpoint, adoptErr
 		} else if adopted {
@@ -2707,7 +2712,12 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 
 func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot, worktreePath, headSHA string) fixerCheckpoint {
 	preparedAt := r.nowISO()
-	checkpoint.Worktree = &checkpointWorktree{Path: worktreePath, Branch: branch, HeadSHA: headSHA, BaseHeadSHA: headSHA, PreparedAt: preparedAt}
+	ownerToken := newFixerWorktreeOwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
+	if err := worktreesafety.WriteFixerOwnerToken(worktreePath, ownerToken); err != nil {
+		// Without a durable stamp, later dirty adopt must not treat path equality as ownership.
+		ownerToken = ""
+	}
+	checkpoint.Worktree = &checkpointWorktree{Path: worktreePath, Branch: branch, HeadSHA: headSHA, BaseHeadSHA: headSHA, PreparedAt: preparedAt, OwnerToken: ownerToken}
 	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": worktreePath, "headSha": nilIfEmpty(headSHA), "preparedAt": preparedAt}})
@@ -2715,7 +2725,8 @@ func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, ch
 }
 
 // tryAdoptDirtyFixerWorktree adopts a dirty managed fixer worktree when:
-//   - the checkpoint already has fixer provenance for this path (prior prepare),
+//   - the checkpoint has fixer-run-specific ownership for this path (owner token),
+//   - the on-disk ownership marker still matches (not cleared by another runner),
 //   - local HEAD still matches the expected PR head, and
 //   - the loop is not under human control.
 //
@@ -2752,12 +2763,17 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 		return false, checkpoint, nil
 	}
 	preparedAt := r.nowISO()
+	ownerToken := newFixerWorktreeOwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
+	if err := worktreesafety.WriteFixerOwnerToken(created.WorktreePath, ownerToken); err != nil {
+		return false, checkpoint, err
+	}
 	checkpoint.Worktree = &checkpointWorktree{
 		Path:        created.WorktreePath,
 		Branch:      branch,
 		HeadSHA:     expectedHead,
 		BaseHeadSHA: expectedHead,
 		PreparedAt:  preparedAt,
+		OwnerToken:  ownerToken,
 	}
 	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -2778,19 +2794,40 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 	return true, checkpoint, nil
 }
 
-// hasFixerWorktreeProvenance is true when this fixer checkpoint already recorded
-// the managed path (prior prepare). Shared project/PR detached directory names
-// alone do not prove dirt belongs to this fixer (reviewer/worker may share it).
+// hasFixerWorktreeProvenance is true when this fixer checkpoint has run-specific
+// ownership of the managed path: path match plus an OwnerToken that still matches
+// the on-disk marker. Path equality alone is insufficient — Create/Restore by
+// reviewer/worker clears the marker so interleaving dirt stays MI.
 func hasFixerWorktreeProvenance(checkpoint fixerCheckpoint, worktreePath string) bool {
 	if checkpoint.Worktree == nil {
 		return false
 	}
 	prior := strings.TrimSpace(checkpoint.Worktree.Path)
 	candidate := strings.TrimSpace(worktreePath)
-	if prior == "" || candidate == "" {
+	token := strings.TrimSpace(checkpoint.Worktree.OwnerToken)
+	if prior == "" || candidate == "" || token == "" {
 		return false
 	}
-	return sameManagedWorktreePath(prior, candidate)
+	if !sameManagedWorktreePath(prior, candidate) {
+		return false
+	}
+	return worktreesafety.ReadFixerOwnerToken(candidate) == token
+}
+
+func newFixerWorktreeOwnerToken(loopID, runID, preparedAt string) string {
+	loopID = strings.TrimSpace(loopID)
+	runID = strings.TrimSpace(runID)
+	preparedAt = strings.TrimSpace(preparedAt)
+	if loopID == "" {
+		loopID = "unknown-loop"
+	}
+	if runID == "" {
+		runID = "unknown-run"
+	}
+	if preparedAt == "" {
+		preparedAt = "unknown-time"
+	}
+	return "fixer:" + loopID + ":" + runID + ":" + preparedAt
 }
 
 func sameManagedWorktreePath(a, b string) bool {

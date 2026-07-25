@@ -13,7 +13,7 @@ import (
 func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *testing.T) {
 	t.Parallel()
 
-	// Interrupted-repair lifecycle: rewind cleared PreparedAt but kept Path.
+	// Interrupted-repair lifecycle: rewind cleared PreparedAt but kept Path + OwnerToken.
 	// Same-head adopt must run before CleanupWorktree so partial agent dirt survives.
 	f := newDirtyAdoptFixture(t)
 	git := &fakeGitGateway{
@@ -22,7 +22,7 @@ func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *test
 		inspectResults: []InspectHeadResult{{HeadSHA: f.headSHA, HasUncommittedChanges: true}},
 	}
 	runner := New(Options{Git: git})
-	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), f.step(storage.LoopRecord{ID: "loop_1", Status: "running"}, git))
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), f.stepWithOwnership(t, storage.LoopRecord{ID: "loop_1", Status: "running"}, git))
 	if err != nil {
 		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
 	}
@@ -44,6 +44,9 @@ func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *test
 	if checkpoint.Worktree.PreparedAt == "" {
 		t.Fatal("checkpoint.Worktree.PreparedAt empty")
 	}
+	if checkpoint.Worktree.OwnerToken == "" {
+		t.Fatal("checkpoint.Worktree.OwnerToken empty after adopt")
+	}
 	if len(git.inspectCalls) != 1 {
 		t.Fatalf("len(git.inspectCalls) = %d, want 1", len(git.inspectCalls))
 	}
@@ -62,7 +65,7 @@ func TestRunPrepareWorktreeStepRejectsDirtyWithoutFixerProvenance(t *testing.T) 
 	t.Parallel()
 
 	// Shared project/PR detached path may hold reviewer dirt; without a prior
-	// fixer checkpoint path, same-head must stay manual_intervention.
+	// fixer ownership token, same-head must stay manual_intervention.
 	wtPath := filepath.Join(t.TempDir(), "wt-42")
 	git := &fakeGitGateway{
 		createResult:   CreateWorktreeResult{WorktreePath: wtPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
@@ -83,6 +86,63 @@ func TestRunPrepareWorktreeStepRejectsDirtyWithoutFixerProvenance(t *testing.T) 
 	}
 	if len(git.cleanupCalls) != 0 {
 		t.Fatalf("len(git.cleanupCalls) = %d, want 0", len(git.cleanupCalls))
+	}
+}
+
+func TestRunPrepareWorktreeStepRejectsDirtyWhenOwnerTokenClearedByOtherRunner(t *testing.T) {
+	t.Parallel()
+
+	// Fixer rewind still has path + OwnerToken in checkpoint, but another runner
+	// Create/Restore cleared the on-disk marker (shared detached directory).
+	f := newDirtyAdoptFixture(t)
+	cp := f.rewindCheckpoint()
+	// Intentionally do not seed disk ownership — simulates ClearFixerOwnerToken.
+	git := &fakeGitGateway{
+		createResult:   CreateWorktreeResult{WorktreePath: f.wtPath, Branch: f.branch, HeadSHA: f.headSHA},
+		prepareResult:  PrepareWorktreeResult{HeadSHA: f.headSHA, Clean: false},
+		inspectResults: []InspectHeadResult{{HeadSHA: f.headSHA, HasUncommittedChanges: true}},
+	}
+	runner := New(Options{Git: git})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:    f.project(),
+		Loop:       storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: cp,
+	})
+	assertPrepareDirtyManualIntervention(t, checkpoint, err)
+	if len(git.inspectCalls) != 0 {
+		t.Fatalf("len(git.inspectCalls) = %d, want 0 (stale ownership → no adopt)", len(git.inspectCalls))
+	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0", len(git.cleanupCalls))
+	}
+}
+
+func TestRunPrepareWorktreeStepRejectsDirtyWhenPathMatchesButOwnerTokenMissing(t *testing.T) {
+	t.Parallel()
+
+	// Path equality without OwnerToken must not authorize adopt (legacy / path-only provenance).
+	f := newDirtyAdoptFixture(t)
+	git := &fakeGitGateway{
+		createResult:   CreateWorktreeResult{WorktreePath: f.wtPath, Branch: f.branch, HeadSHA: f.headSHA},
+		prepareResult:  PrepareWorktreeResult{HeadSHA: f.headSHA, Clean: false},
+		inspectResults: []InspectHeadResult{{HeadSHA: f.headSHA, HasUncommittedChanges: true}},
+	}
+	runner := New(Options{Git: git})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  f.project(),
+		Loop:     storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: f.headSHA, HeadRefName: f.branch, BaseRefName: "main"},
+			Worktree: &checkpointWorktree{Path: f.wtPath, Branch: f.branch}, // path only
+		},
+	})
+	assertPrepareDirtyManualIntervention(t, checkpoint, err)
+	if len(git.inspectCalls) != 0 {
+		t.Fatalf("len(git.inspectCalls) = %d, want 0", len(git.inspectCalls))
 	}
 }
 
@@ -168,14 +228,20 @@ func TestRunPrepareWorktreeStepDirtyAdoptEarlyExitGatesSkipInspectHead(t *testin
 			if tc.detailHead != "" {
 				detail.HeadSHA = tc.detailHead
 			}
+			ownerToken := "fixer:loop_1:run_prior:prepared"
+			f.seedOwnerToken(t, ownerToken)
 			checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
 				Project:  f.project(),
 				Loop:     tc.loop,
 				Repo:     "acme/looper",
 				PRNumber: 42,
 				Checkpoint: fixerCheckpoint{
-					Detail:   detail,
-					Worktree: &checkpointWorktree{Path: f.wtPath, Branch: f.branch},
+					Detail: detail,
+					Worktree: &checkpointWorktree{
+						Path:       f.wtPath,
+						Branch:     f.branch,
+						OwnerToken: ownerToken,
+					},
 				},
 			})
 			assertPrepareDirtyManualIntervention(t, checkpoint, err)
