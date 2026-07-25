@@ -40,15 +40,26 @@ func TestRunPrepareWorktreeStepPrepareErrorPreservesExistingWorktree(t *testing.
 			t.Parallel()
 			f := newDirtyAdoptFixture(t)
 			if tc.withGitMeta {
-				// Linked-worktree-style local metadata with required HEAD so the
-				// probe treats the checkout as usable despite integrity-looking
-				// prepare stderr (existence of the private gitdir alone is not enough).
+				// Linked-worktree-style local metadata with required HEAD +
+				// resolvable commondir so the probe treats the checkout as
+				// usable despite integrity-looking prepare stderr (HEAD alone
+				// is not enough for a linked private gitdir).
 				gitdir := filepath.Join(t.TempDir(), "gitdir")
+				common := filepath.Join(t.TempDir(), "common")
 				if err := os.MkdirAll(gitdir, 0o755); err != nil {
 					t.Fatalf("MkdirAll gitdir: %v", err)
 				}
+				if err := os.MkdirAll(common, 0o755); err != nil {
+					t.Fatalf("MkdirAll common: %v", err)
+				}
 				if err := os.WriteFile(filepath.Join(gitdir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 					t.Fatalf("WriteFile gitdir HEAD: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(common, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile common HEAD: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(gitdir, "commondir"), []byte(common+"\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile commondir: %v", err)
 				}
 				if err := os.WriteFile(filepath.Join(f.wtPath, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
 					t.Fatalf("WriteFile .git: %v", err)

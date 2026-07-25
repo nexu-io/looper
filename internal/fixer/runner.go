@@ -6230,6 +6230,10 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 // require HEAD in the ordinary .git dir or the linked private gitdir so empty or
 // corrupt private dirs are treated as unusable (real git reports "not a git
 // repository") and prepare can enter the recreate path instead of retrying forever.
+// Linked private gitdirs must also resolve a usable common repository via
+// commondir: missing/empty/dangling commondir still leaves HEAD on disk but
+// makes real Git report "not a git repository", so prepare must recreate rather
+// than preserve the broken checkout forever.
 // A non-empty .git file that is not a gitdir: pointer is also unusable: real Git
 // reports "fatal: invalid gitfile format" and prepare must recreate rather than
 // retry forever on retained broken metadata.
@@ -6283,7 +6287,31 @@ func localFixerWorktreeCheckoutUsable(path string) bool {
 	// Linked private gitdir must look like a real git dir (HEAD), not merely exist.
 	// An empty/corrupt gitdir still makes `git` report "not a git repository"; if
 	// we only checked existence, prepare would retry forever without recreating.
-	_, err = os.Stat(filepath.Join(gitdir, "HEAD"))
+	if _, err = os.Stat(filepath.Join(gitdir, "HEAD")); err != nil {
+		return false
+	}
+	// commondir is required for linked worktrees: without it (or when it does not
+	// resolve to a common repo with HEAD), Git 2.43+ still fails with
+	// "fatal: not a git repository" even though private HEAD remains.
+	return linkedPrivateGitdirCommonUsable(gitdir)
+}
+
+// linkedPrivateGitdirCommonUsable reports whether a linked worktree private
+// gitdir has a readable commondir that resolves to a common repository with HEAD.
+func linkedPrivateGitdirCommonUsable(gitdir string) bool {
+	data, err := os.ReadFile(filepath.Join(gitdir, "commondir"))
+	if err != nil {
+		return false
+	}
+	common := strings.TrimSpace(string(data))
+	if common == "" {
+		return false
+	}
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(gitdir, common)
+	}
+	common = filepath.Clean(common)
+	_, err = os.Stat(filepath.Join(common, "HEAD"))
 	return err == nil
 }
 
