@@ -2639,6 +2639,16 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		return checkpoint, err
 	}
 	if !prepared.Clean {
+		// Same-head dirty adopt: managed fixer worktrees are daemon-owned unless
+		// human takeover/HITL. When local HEAD still matches the expected PR head,
+		// treat uncommitted dirt as authorized partial agent output (e.g. interrupt)
+		// and continue. Later reconcileCommits may auto-commit; rewind/cleanup may
+		// destroy dirt under the daemon-owned model. Cross-head dirty stays MI.
+		if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, branch, worktreeRoot, created, prepared); adoptErr != nil {
+			return checkpoint, adoptErr
+		} else if adopted {
+			return next, nil
+		}
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
 		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
@@ -2649,6 +2659,64 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": created.WorktreePath, "headSha": nilIfEmpty(prepared.HeadSHA), "preparedAt": preparedAt}})
 	return checkpoint, nil
+}
+
+// tryAdoptDirtyFixerWorktree adopts a dirty managed fixer worktree when local HEAD
+// still matches the expected PR head and the loop is not under human control.
+// PrepareWorktree returns remote HeadSHA when dirty (Clean:false); local HEAD must
+// be read via InspectHead. Returns adopted=false to keep the MI path.
+func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot string, created CreateWorktreeResult, prepared PrepareWorktreeResult) (bool, fixerCheckpoint, error) {
+	switch input.Loop.Status {
+	case string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusAwaitingHuman):
+		return false, checkpoint, nil
+	}
+	if _, ok := loops.ReadTakeoverResume(input.Loop.MetadataJSON); ok {
+		return false, checkpoint, nil
+	}
+	expectedHead := strings.TrimSpace(detailHeadSHA(checkpoint.Detail))
+	if expectedHead == "" {
+		return false, checkpoint, nil
+	}
+	// prepared.HeadSHA is remote when dirty; require it still matches expected.
+	if remoteHead := strings.TrimSpace(prepared.HeadSHA); remoteHead != "" && remoteHead != expectedHead {
+		return false, checkpoint, nil
+	}
+	local, err := r.git.InspectHead(ctx, InspectHeadInput{
+		RepoPath:     input.Project.RepoPath,
+		WorktreeRoot: worktreeRoot,
+		WorktreePath: created.WorktreePath,
+	})
+	if err != nil {
+		return false, checkpoint, err
+	}
+	if strings.TrimSpace(local.HeadSHA) != expectedHead {
+		return false, checkpoint, nil
+	}
+	preparedAt := r.nowISO()
+	checkpoint.Worktree = &checkpointWorktree{
+		Path:        created.WorktreePath,
+		Branch:      branch,
+		HeadSHA:     expectedHead,
+		BaseHeadSHA: expectedHead,
+		PreparedAt:  preparedAt,
+	}
+	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	checkpoint.Pause = nil
+	r.appendEvent(ctx, eventInput{
+		eventType:  "fixer.worktree.dirty_adopted",
+		projectID:  input.Project.ID,
+		entityType: "pull_request",
+		entityID:   buildPullRequestTargetID(input.Repo, input.PRNumber),
+		payload: map[string]any{
+			"branch":     branch,
+			"path":       created.WorktreePath,
+			"headSha":    nilIfEmpty(expectedHead),
+			"preparedAt": preparedAt,
+			"mode":       "same_head_dirty_adopt",
+		},
+	})
+	return true, checkpoint, nil
 }
 
 func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {

@@ -5745,13 +5745,165 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 func TestRunPrepareWorktreeStepPausesDirtyWorktree(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: false}}})
+	// Explicit local mismatch (not fake default "head") → cross-head MI.
+	git := &fakeGitGateway{
+		createResult:   CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult:  PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
+		inspectResults: []InspectHeadResult{{HeadSHA: "other-head", HasUncommittedChanges: true}},
+	}
+	runner := New(Options{Git: git})
 	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
 		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
 	})
+	assertPrepareDirtyManualIntervention(t, checkpoint, err)
+	if len(git.inspectCalls) != 1 {
+		t.Fatalf("len(git.inspectCalls) = %d, want 1 (local mismatch after remote match)", len(git.inspectCalls))
+	}
+}
+
+func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktree(t *testing.T) {
+	t.Parallel()
+
+	wtPath := filepath.Join(t.TempDir(), "wt-42")
+	git := &fakeGitGateway{
+		createResult:   CreateWorktreeResult{WorktreePath: wtPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult:  PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
+		inspectResults: []InspectHeadResult{{HeadSHA: "base-head", HasUncommittedChanges: true}},
+	}
+	runner := New(Options{Git: git})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	}
+	if checkpoint.Pause != nil {
+		t.Fatalf("checkpoint.Pause = %#v, want nil", checkpoint.Pause)
+	}
+	if checkpoint.Worktree == nil {
+		t.Fatal("checkpoint.Worktree = nil, want adopted worktree")
+	}
+	if checkpoint.Worktree.HeadSHA != "base-head" || checkpoint.Worktree.BaseHeadSHA != "base-head" {
+		t.Fatalf("checkpoint.Worktree = %#v, want head/base base-head", checkpoint.Worktree)
+	}
+	if checkpoint.Worktree.Branch != "feature/fix-42" {
+		t.Fatalf("checkpoint.Worktree.Branch = %q", checkpoint.Worktree.Branch)
+	}
+	if checkpoint.Worktree.PreparedAt == "" {
+		t.Fatal("checkpoint.Worktree.PreparedAt empty")
+	}
+	if len(git.inspectCalls) != 1 {
+		t.Fatalf("len(git.inspectCalls) = %d, want 1", len(git.inspectCalls))
+	}
+}
+
+func TestRunPrepareWorktreeStepDirtyAdoptEarlyExitGatesSkipInspectHead(t *testing.T) {
+	t.Parallel()
+
+	takeoverMeta, err := loops.WriteTakeoverResume(nil, loops.TakeoverResume{SessionID: "sess-1"})
+	if err != nil {
+		t.Fatalf("WriteTakeoverResume() error = %v", err)
+	}
+
+	// Early-exit gates that must not call InspectHead, plus local mismatch which does.
+	cases := []struct {
+		name        string
+		loop        storage.LoopRecord
+		detailHead  string
+		prepareHead string
+		inspectHead string // only used when inspectCalls want > 0
+		wantInspect int
+	}{
+		{
+			name:        "human_takeover",
+			loop:        storage.LoopRecord{ID: "loop_1", Status: string(domain.LoopStatusHumanTakeover)},
+			detailHead:  "base-head",
+			prepareHead: "base-head",
+			wantInspect: 0,
+		},
+		{
+			name:        "awaiting_human",
+			loop:        storage.LoopRecord{ID: "loop_1", Status: string(domain.LoopStatusAwaitingHuman)},
+			detailHead:  "base-head",
+			prepareHead: "base-head",
+			wantInspect: 0,
+		},
+		{
+			name:        "takeoverResume",
+			loop:        storage.LoopRecord{ID: "loop_1", Status: "running", MetadataJSON: &takeoverMeta},
+			detailHead:  "base-head",
+			prepareHead: "base-head",
+			wantInspect: 0,
+		},
+		{
+			name:        "empty_expected_head",
+			loop:        storage.LoopRecord{ID: "loop_1", Status: "running"},
+			detailHead:  "",
+			prepareHead: "base-head",
+			wantInspect: 0,
+		},
+		{
+			name:        "remote_mismatch",
+			loop:        storage.LoopRecord{ID: "loop_1", Status: "running"},
+			detailHead:  "base-head",
+			prepareHead: "remote-head",
+			wantInspect: 0,
+		},
+		{
+			name:        "local_mismatch",
+			loop:        storage.LoopRecord{ID: "loop_1", Status: "running"},
+			detailHead:  "base-head",
+			prepareHead: "base-head",
+			inspectHead: "other-head",
+			wantInspect: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			inspectResults := []InspectHeadResult{{HeadSHA: "base-head", HasUncommittedChanges: true}}
+			if tc.inspectHead != "" {
+				inspectResults = []InspectHeadResult{{HeadSHA: tc.inspectHead, HasUncommittedChanges: true}}
+			}
+			git := &fakeGitGateway{
+				createResult:   CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+				prepareResult:  PrepareWorktreeResult{HeadSHA: tc.prepareHead, Clean: false},
+				inspectResults: inspectResults,
+			}
+			runner := New(Options{Git: git})
+			detail := &checkpointDetail{HeadRefName: "feature/fix-42", BaseRefName: "main"}
+			if tc.detailHead != "" {
+				detail.HeadSHA = tc.detailHead
+			}
+			checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+				Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+				Loop:       tc.loop,
+				Repo:       "acme/looper",
+				PRNumber:   42,
+				Checkpoint: fixerCheckpoint{Detail: detail},
+			})
+			assertPrepareDirtyManualIntervention(t, checkpoint, err)
+			if len(git.inspectCalls) != tc.wantInspect {
+				t.Fatalf("len(git.inspectCalls) = %d, want %d", len(git.inspectCalls), tc.wantInspect)
+			}
+		})
+	}
+}
+
+func assertPrepareDirtyManualIntervention(t *testing.T, checkpoint fixerCheckpoint, err error) {
+	t.Helper()
 	if err == nil {
 		t.Fatal("runPrepareWorktreeStep() error = nil, want manual intervention")
 	}
