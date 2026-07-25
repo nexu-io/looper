@@ -5986,6 +5986,81 @@ func assertPrepareDirtyManualIntervention(t *testing.T, checkpoint fixerCheckpoi
 	}
 }
 
+// Prepare probe failures on rewind (fetch/transport/remote-head) never read
+// worktree status, so CleanupWorktree must not run — that would destroy
+// interrupted-repair dirt that the dirty-adopt path never got to evaluate.
+func TestRunPrepareWorktreeStepPrepareErrorPreservesExistingWorktree(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "fetch_transport", err: fmt.Errorf("git fetch origin feature/fix-42: fatal: unable to access remote")},
+		{name: "remote_head_changed", err: fmt.Errorf("remote head for feature/fix-42 changed: expected base-head, got advanced-head")},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			repoPath := t.TempDir()
+			worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+			wtPath := filepath.Join(worktreeRoot, "wt-42")
+			if err := os.MkdirAll(wtPath, 0o755); err != nil {
+				t.Fatalf("MkdirAll worktree: %v", err)
+			}
+			// Marker file simulates interrupted-repair dirt that must survive.
+			dirtyFile := filepath.Join(wtPath, "partial-agent-edit.txt")
+			if err := os.WriteFile(dirtyFile, []byte("keep me\n"), 0o644); err != nil {
+				t.Fatalf("WriteFile dirty marker: %v", err)
+			}
+			metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+			git := &fakeGitGateway{
+				prepareErr:     tc.err,
+				createResult:   CreateWorktreeResult{WorktreePath: wtPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
+				prepareResult:  PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
+				inspectResults: []InspectHeadResult{{HeadSHA: "base-head", HasUncommittedChanges: true}},
+			}
+			runner := New(Options{Git: git})
+			checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+				Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+				Loop:     storage.LoopRecord{ID: "loop_1", Status: "running"},
+				Repo:     "acme/looper",
+				PRNumber: 42,
+				Checkpoint: fixerCheckpoint{
+					Detail:   &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+					Worktree: &checkpointWorktree{Path: wtPath, Branch: "feature/fix-42"}, // PreparedAt cleared by rewind
+				},
+			})
+			if err == nil {
+				t.Fatal("runPrepareWorktreeStep() error = nil, want prepare error")
+			}
+			if !errors.Is(err, tc.err) && err.Error() != tc.err.Error() {
+				t.Fatalf("error = %v, want %v", err, tc.err)
+			}
+			if checkpoint.Worktree == nil || checkpoint.Worktree.Path != wtPath {
+				t.Fatalf("checkpoint.Worktree = %#v, want path preserved at %q", checkpoint.Worktree, wtPath)
+			}
+			if len(git.cleanupCalls) != 0 {
+				t.Fatalf("len(git.cleanupCalls) = %d, want 0 (prepare error must not force-remove)", len(git.cleanupCalls))
+			}
+			if len(git.createCalls) != 0 {
+				t.Fatalf("len(git.createCalls) = %d, want 0 (no recreate after prepare error)", len(git.createCalls))
+			}
+			if len(git.prepareCalls) != 1 {
+				t.Fatalf("len(git.prepareCalls) = %d, want 1", len(git.prepareCalls))
+			}
+			if len(git.inspectCalls) != 0 {
+				t.Fatalf("len(git.inspectCalls) = %d, want 0 (never reached adopt path)", len(git.inspectCalls))
+			}
+			if got, readErr := os.ReadFile(dirtyFile); readErr != nil || string(got) != "keep me\n" {
+				t.Fatalf("dirty marker after prepare error = %q err=%v, want preserved", got, readErr)
+			}
+		})
+	}
+}
+
 func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *testing.T) {
 	t.Parallel()
 
@@ -6476,6 +6551,7 @@ func (f *fakeGitHubGateway) CompareCommits(_ context.Context, input CompareCommi
 type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
 	prepareResult  PrepareWorktreeResult
+	prepareErr     error
 	inspectResults []InspectHeadResult
 	inspectIndex   int
 	ancestor       map[string]bool
@@ -6518,6 +6594,9 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
 	f.prepareCalls = append(f.prepareCalls, input)
+	if f.prepareErr != nil {
+		return PrepareWorktreeResult{}, f.prepareErr
+	}
 	result := f.prepareResult
 	if result.HeadSHA == "" {
 		result.HeadSHA = firstNonEmpty(input.ExpectedHeadSHA, "base-head")

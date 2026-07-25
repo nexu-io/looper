@@ -297,8 +297,13 @@ checkpoint already has **fixer provenance** for that path:
 - Cross-head dirty (local HEAD ≠ expected) stays `manual_intervention`.
 - Gateway `PrepareWorktree` still returns `Clean: false` when dirty; fixer must
   inspect local HEAD separately (`prepared.HeadSHA` is remote when dirty).
-- After adopt, later `reconcileCommits` may auto-commit dirt when allowed;
-  rejected adopt still falls through to cleanup/recreate under the daemon-owned model.
+- After adopt, later `reconcileCommits` may auto-commit dirt when allowed.
+- Rejected dirty adopt (missing provenance, human-control gates, empty expected
+  head, remote/local HEAD mismatch) preserves the worktree and returns
+  `manual_intervention` — it does **not** fall through to `CleanupWorktree` or
+  recreate. Prepare-probe failures on the rewind path (fetch/transport/remote
+  head advanced before status is read) likewise return the prepare error
+  without cleanup so interrupted-repair dirt is not destroyed.
 
 #### Optional narrow future automation
 

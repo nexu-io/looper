@@ -2628,7 +2628,10 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 	// Interrupted-repair rewind clears PreparedAt while keeping Path. Same-head
 	// adopt (and clean re-stamp) must run before CleanupWorktree so partial
 	// agent output is not force-deleted on repair retries. Dirty non-adopt
-	// stays MI without cleanup (preserve human/cross-head evidence).
+	// stays MI without cleanup (preserve human/cross-head evidence). Prepare
+	// probe failures (fetch/transport/remote-head) also return without cleanup:
+	// the real gateway never reaches the dirt check on those errors, so force-
+	// removing the worktree would destroy interrupted-repair edits.
 	if shouldRebuildWorktree(checkpoint) && checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.Branch != "" {
 		existingPath := checkpoint.Worktree.Path
 		existingBranch := firstNonEmpty(checkpoint.Worktree.Branch, branch)
@@ -2639,23 +2642,21 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 			Branch:          existingBranch,
 			ExpectedHeadSHA: detailHeadSHA(checkpoint.Detail),
 		})
-		if prepErr == nil {
-			if preparedExisting.Clean {
-				return r.finishPreparedWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, existingPath, preparedExisting.HeadSHA), nil
-			}
-			createdExisting := CreateWorktreeResult{WorktreePath: existingPath, Branch: existingBranch, HeadSHA: preparedExisting.HeadSHA}
-			if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, createdExisting, preparedExisting); adoptErr != nil {
-				return checkpoint, adoptErr
-			} else if adopted {
-				return next, nil
-			}
-			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
-			return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", existingBranch), kind: FailureManualIntervention}
+		if prepErr != nil {
+			return checkpoint, prepErr
 		}
-		if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: existingPath, Branch: existingBranch, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)})}); err != nil {
-			return checkpoint, err
+		if preparedExisting.Clean {
+			return r.finishPreparedWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, existingPath, preparedExisting.HeadSHA), nil
 		}
+		createdExisting := CreateWorktreeResult{WorktreePath: existingPath, Branch: existingBranch, HeadSHA: preparedExisting.HeadSHA}
+		if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, createdExisting, preparedExisting); adoptErr != nil {
+			return checkpoint, adoptErr
+		} else if adopted {
+			return next, nil
+		}
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
+		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", existingBranch), kind: FailureManualIntervention}
 	}
 	created, err := r.git.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, Branch: branch, BaseBranch: firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), PRNumber: input.PRNumber, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)}), CheckoutMode: "detached"})
 	if err != nil {
