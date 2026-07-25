@@ -2276,6 +2276,12 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			checkpoint.Worktree = nil
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 		} else if reviewerWorktreePrepared(checkpoint) {
+			// Reusing a prepared path skips CreateWorktree/RestoreWorktree, so
+			// explicitly revoke any fixer owner marker a concurrent fixer may
+			// have stamped between reviewer attempts.
+			if err := worktreesafety.ClearFixerOwnerToken(checkpoint.Worktree.Path); err != nil {
+				return checkpoint, err
+			}
 			return checkpoint, nil
 		}
 	}
@@ -4609,6 +4615,14 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 			if startStep == stepReview && initialCheckpoint.Worktree != nil {
 				initialCheckpoint.Worktree.PreparedAt = ""
+			}
+			// Resuming past the worktree step reuses the prepared path without
+			// CreateWorktree/RestoreWorktree — revoke fixer ownership now so a
+			// fixer token stamped between attempts cannot authorize reviewer dirt.
+			if startStep != stepWorktree && initialCheckpoint.Worktree != nil {
+				if err := worktreesafety.ClearFixerOwnerToken(initialCheckpoint.Worktree.Path); err != nil {
+					return resumedRunContext{}, err
+				}
 			}
 		}
 	}

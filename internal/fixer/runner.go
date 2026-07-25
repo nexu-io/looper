@@ -769,10 +769,15 @@ type checkpointWorktree struct {
 	HeadSHA     string `json:"headSha,omitempty"`
 	BaseHeadSHA string `json:"baseHeadSha,omitempty"`
 	PreparedAt  string `json:"preparedAt,omitempty"`
-	// OwnerToken is a fixer-prepare generation stamp. Same-head dirty adopt
-	// requires this token to still match the on-disk worktree marker so path
-	// equality alone cannot authorize dirt left after another runner claimed
-	// the shared project/PR detached directory (Create/Restore clears the marker).
+	// OwnerToken is persisted dual-write ownership state for same-head dirty
+	// adopt: the same value is written to the worktree-private git dir
+	// (looper-fixer-owner). Adopt requires path match and on-disk token == this
+	// field. Costs: keep checkpoint and disk copies synchronized; every non-fixer
+	// claim of the path (Create/Restore and prepared-checkpoint reuse) must clear
+	// the disk marker and fail if clear cannot revoke authority; prepare-failure
+	// rediscovery must carry Path+OwnerToken so interrupt leftovers remain adoptable.
+	// Simpler alternatives rejected: path equality alone (cross-runner dirt);
+	// event-only dirty_adopted without a stamp (no durable authority after crash).
 	OwnerToken         string `json:"ownerToken,omitempty"`
 	CleanupAttemptedAt string `json:"cleanupAttemptedAt,omitempty"`
 	CleanedAt          string `json:"cleanedAt,omitempty"`
@@ -4632,7 +4637,14 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		switch {
 		case restartFromDiscover:
 			startStep = stepDiscoverPR
-			resumedCheckpoint = fixerCheckpoint{ResumePolicy: "replay_step"}
+			// prepare-worktree failures restart discover, but an unprepared path
+			// may still hold interrupted-repair dirt and on-disk ownership. Carry
+			// Path/Branch/OwnerToken so the next prepare can same-head adopt
+			// instead of CreateWorktree-clearing the marker and falling to MI.
+			resumedCheckpoint = fixerCheckpoint{
+				ResumePolicy: "replay_step",
+				Worktree:     preservedWorktreeOwnershipForRediscovery(checkpoint, failedStep),
+			}
 		case resumeFromPrepare:
 			startStep = stepPrepareWorktree
 			resumedCheckpoint = rewindCheckpointForPrepareRetry(checkpoint)
@@ -4649,6 +4661,10 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if resumed {
 		initialCheckpoint = resumedCheckpoint
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
+	} else if restartFromDiscover && resumedCheckpoint.Worktree != nil {
+		// Discover restart is not a mid-pipeline "resume", but prepare-probe
+		// failures still need Path+OwnerToken on the next run's checkpoint.
+		initialCheckpoint.Worktree = resumedCheckpoint.Worktree
 	}
 	initialCheckpoint.Pause = nil
 	initialCheckpoint.RunStartedAt = ""
@@ -7524,6 +7540,34 @@ func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint
 	checkpoint.ResolvedComments = nil
 	checkpoint.Recheck = nil
 	return checkpoint
+}
+
+// preservedWorktreeOwnershipForRediscovery keeps fixer ownership across a
+// prepare-worktree failure that restarts from discover. Only unprepared paths
+// with a non-empty owner token are carried — prepared worktrees and markerless
+// paths do not need rediscovery ownership for same-head adopt.
+func preservedWorktreeOwnershipForRediscovery(checkpoint fixerCheckpoint, failedStep FixerStep) *checkpointWorktree {
+	if failedStep != stepPrepareWorktree {
+		return nil
+	}
+	if checkpoint.Worktree == nil {
+		return nil
+	}
+	path := strings.TrimSpace(checkpoint.Worktree.Path)
+	token := strings.TrimSpace(checkpoint.Worktree.OwnerToken)
+	if path == "" || token == "" {
+		return nil
+	}
+	// A still-prepared worktree would not re-enter the rebuild/adopt path via
+	// empty PreparedAt; only preserve the unprepared interrupt contract.
+	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) != "" {
+		return nil
+	}
+	return &checkpointWorktree{
+		Path:       path,
+		Branch:     strings.TrimSpace(checkpoint.Worktree.Branch),
+		OwnerToken: token,
+	}
 }
 
 func upsertResolvedComment(items *[]checkpointResolvedComment, next checkpointResolvedComment) {

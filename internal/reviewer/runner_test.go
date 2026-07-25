@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
@@ -6125,6 +6126,46 @@ func TestRunPrepareWorktreeStepFallsBackWhenCheckpointLacksHeadRef(t *testing.T)
 	}
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Branch != "pr-42-head" {
 		t.Fatalf("checkpoint worktree = %#v, want fallback branch", checkpoint.Worktree)
+	}
+}
+
+func TestRunPrepareWorktreeStepClearsFixerOwnerTokenWhenReusingPreparedPath(t *testing.T) {
+	t.Parallel()
+
+	// Prepared-checkpoint early return skips CreateWorktree; must still revoke
+	// fixer ownership so a concurrent fixer stamp cannot authorize reviewer dirt.
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	wtPath := filepath.Join(worktreeRoot, "wt-42")
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	const token = "fixer:loop_x:run_y:prepared-reuse"
+	if err := worktreesafety.WriteFixerOwnerToken(wtPath, token); err != nil {
+		t.Fatalf("WriteFixerOwnerToken: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "abc123", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != wtPath {
+		t.Fatalf("Worktree = %#v, want reused prepared path", checkpoint.Worktree)
+	}
+	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != "" {
+		t.Fatalf("ReadFixerOwnerToken() = %q, want empty after prepared reuse", got)
 	}
 }
 

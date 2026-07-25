@@ -1549,6 +1549,11 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 	}
 	if checkpoint.Worktree != nil {
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err == nil {
+			// Reusing an existing path skips CreateWorktree/RestoreWorktree, so
+			// revoke any fixer owner marker stamped on this checkout.
+			if err := worktreesafety.ClearFixerOwnerToken(checkpoint.Worktree.Path); err != nil {
+				return checkpoint, err
+			}
 			return checkpoint, nil
 		}
 		checkpoint.Worktree = nil

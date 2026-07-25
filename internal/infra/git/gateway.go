@@ -274,7 +274,11 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	g.applyWorktreeArtifactExcludes(ctx, worktreePath)
 	// Any CreateWorktree claim invalidates prior fixer ownership so path equality
 	// alone cannot authorize dirty adopt after another runner used this directory.
-	worktreesafety.ClearFixerOwnerToken(worktreePath)
+	// Fail the claim if the marker cannot be revoked — stale authority is worse
+	// than a retryable create error.
+	if err := worktreesafety.ClearFixerOwnerToken(worktreePath); err != nil {
+		return storage.WorktreeRecord{}, err
+	}
 
 	headSHA, err := g.getHeadSHA(ctx, worktreePath)
 	if err != nil {
@@ -389,7 +393,9 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					}
 					g.applyWorktreeArtifactExcludes(ctx, restored.WorktreePath)
 					// Restoring for a new CreateWorktree claim drops prior fixer ownership.
-					worktreesafety.ClearFixerOwnerToken(restored.WorktreePath)
+					if err := worktreesafety.ClearFixerOwnerToken(restored.WorktreePath); err != nil {
+						return nil, err
+					}
 					return &restored, nil
 				}
 				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch, input.ExpectedWorktreePath)
@@ -493,7 +499,9 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	}
 
 	g.applyWorktreeArtifactExcludes(ctx, record.WorktreePath)
-	worktreesafety.ClearFixerOwnerToken(record.WorktreePath)
+	if err := worktreesafety.ClearFixerOwnerToken(record.WorktreePath); err != nil {
+		return nil, err
+	}
 	return &record, nil
 }
 

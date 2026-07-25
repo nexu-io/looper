@@ -10,6 +10,12 @@ import (
 // FixerOwnerTokenFile is stored under the worktree's private git dir so it does
 // not appear as uncommitted dirt. It proves which fixer prepare generation last
 // stamped ownership of this managed checkout.
+//
+// This is persisted dual-write state: the same token also lives on
+// checkpoint.Worktree.OwnerToken. Both copies must stay aligned — write on
+// successful prepare/adopt, clear on every non-fixer claim of the path
+// (CreateWorktree / RestoreWorktree and prepared-checkpoint reuse), and fail
+// the claim when clear cannot revoke authority.
 const FixerOwnerTokenFile = "looper-fixer-owner"
 
 // WriteFixerOwnerToken records a fixer-run-specific ownership token for worktreePath.
@@ -48,19 +54,32 @@ func ReadFixerOwnerToken(worktreePath string) string {
 }
 
 // ClearFixerOwnerToken removes any fixer ownership stamp from worktreePath.
-// CreateWorktree / RestoreWorktree call this so a later fixer cannot treat path
-// equality alone as proof that residual dirt still belongs to its prior prepare
-// after another runner has claimed the shared project/PR detached directory.
-func ClearFixerOwnerToken(worktreePath string) {
+// Callers that claim a shared worktree for a non-fixer role must invoke this
+// and treat a non-nil error as claim failure: a stale token would otherwise
+// authorize a later fixer retry to adopt dirt produced by that other runner.
+//
+// Missing paths / markers are success (already revoked). Resolve or remove I/O
+// failures (including read-only private git dirs) are returned.
+func ClearFixerOwnerToken(worktreePath string) error {
 	worktreePath = strings.TrimSpace(worktreePath)
 	if worktreePath == "" {
-		return
+		return nil
 	}
 	gitDir, err := resolveWorktreePrivateGitDir(worktreePath, false)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("clear fixer owner token for %s: %w", worktreePath, err)
 	}
-	_ = os.Remove(filepath.Join(gitDir, FixerOwnerTokenFile))
+	markerPath := filepath.Join(gitDir, FixerOwnerTokenFile)
+	if err := os.Remove(markerPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("clear fixer owner token for %s: %w", worktreePath, err)
+	}
+	return nil
 }
 
 // resolveWorktreePrivateGitDir locates the worktree-private git directory.

@@ -280,18 +280,28 @@ checkpoint already has **fixer-run-specific ownership** for that path:
 - Managed fixer worktrees are daemon-owned unless human takeover / HITL.
 - Dirt after an agent interrupt (HEAD unchanged) is treated as authorized partial
   agent output: **default-adopt** and continue (no reset/clean, no discard).
-- Ownership (not path equality alone):
+- Ownership is a **persisted dual-write** (not event-only):
   - On successful prepare (and after dirty adopt), fixer writes
     `checkpoint.Worktree.OwnerToken` and stamps the same value into the
     worktree-private git dir (`looper-fixer-owner`).
   - Dirty adopt requires path match **and** on-disk token == checkpoint token.
-  - Gateway `CreateWorktree` / `RestoreWorktree` **clear** the on-disk stamp so
-    a later fixer cannot treat residual dirt as its own after reviewer/worker
-    claimed the shared project/PR detached directory.
+  - **Invalidation surface:** Gateway `CreateWorktree` / `RestoreWorktree` clear
+    the on-disk stamp; reviewer/worker also clear when reusing a prepared
+    checkpoint without Create/Restore (early return or resume past worktree).
+    Clear failures **fail the claim** so a stale token cannot authorize
+    cross-runner dirt.
   - Shared project/PR directory names alone do **not** authorize adopt.
+  - **Costs accepted:** keep checkpoint + disk copies synchronized; every
+    non-fixer claim path must clear and propagate clear errors; prepare-failure
+    rediscovery must carry Path+Branch+OwnerToken (PreparedAt empty) so the
+    next prepare can still same-head adopt after a transient probe failure.
+  - **Rejected simpler alternatives:** path equality alone (adopts reviewer
+    dirt); event `fixer.worktree.dirty_adopted` without a durable stamp (no
+    authority after crash/restart); silent clear failures (stale authority).
 - On prepare-retry rewind (`PreparedAt` cleared, path + `OwnerToken` kept),
   same-head adopt (or clean re-stamp) runs **before** `CleanupWorktree` so
-  interrupt leftovers are not force-deleted.
+  interrupt leftovers are not force-deleted. The same ownership slice is
+  preserved when prepare-worktree failure restarts from discover.
 - Gates (all required):
   - fixer-run ownership for the path (token match above);
   - loop status is **not** `human_takeover` or `awaiting_human`;
