@@ -1292,6 +1292,23 @@ func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 	return sanitizeBranchName(input.Branch)
 }
 
+// DetachedPRWorktreePath returns the managed shared detached worktree path that
+// CreateWorktree claims for a PR (looper-fix-<project>-pr-<N>-detached).
+// Callers that must read ownership markers before CreateWorktree revokes them
+// should probe this candidate path even when no checkpoint worktree exists.
+func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64) string {
+	worktreeRoot = strings.TrimSpace(worktreeRoot)
+	projectID = strings.TrimSpace(projectID)
+	if worktreeRoot == "" || projectID == "" || prNumber == 0 {
+		return ""
+	}
+	return filepath.Join(worktreeRoot, buildWorktreeDirectoryName(CreateWorktreeInput{
+		ProjectID:    projectID,
+		PRNumber:     prNumber,
+		CheckoutMode: CheckoutModeDetached,
+	}))
+}
+
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {
 	host, repo := parseRemoteRepoFromURL(remoteURL)
 	if !isGitHubRemoteHost(host) {

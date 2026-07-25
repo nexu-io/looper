@@ -2294,13 +2294,14 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	// must restore provenance so terminal/success cleanup cannot orphan partial
 	// fixer edits that preparation never evaluated. Unreadable markers fail the
 	// claim — proceeding would revoke or ignore ownership we cannot restore.
-	priorFixerToken := ""
-	if checkpoint.Worktree != nil {
-		token, err := worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path)
-		if err != nil {
-			return checkpoint, err
-		}
-		priorFixerToken = token
+	//
+	// Fresh reviewers may have no checkpoint worktree yet still hit an interrupted
+	// fixer's dirty checkout at the shared detached PR path. Capture that candidate
+	// path's marker too; otherwise CreateWorktree clears it and restore is a no-op,
+	// forcing the next fixer retry into MI instead of same-head adopt.
+	priorFixerToken, err := capturePriorFixerOwnerToken(checkpoint, worktreeRoot, input.Project.ID, input.PRNumber)
+	if err != nil {
+		return checkpoint, err
 	}
 	if checkpoint.Worktree != nil {
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
@@ -2341,7 +2342,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
 		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
-			r.logWarn("reviewer restore fixer owner token after prepare failure failed", map[string]any{"worktreePath": created.WorktreePath, "error": restoreErr.Error()})
+			// Do not continue with cleared-but-unrestored ownership: a later fixer
+			// retry cannot prove adopt authority and is forced into MI.
+			return checkpoint, fmt.Errorf("restore fixer owner token after prepare failure: %w (prepare error: %v)", restoreErr, err)
 		}
 		var remoteHeadChanged *gitinfra.RemoteHeadChangedError
 		if errors.As(err, &remoteHeadChanged) {
@@ -2353,7 +2356,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 		// Dirt observed but not claimed: restore fixer provenance so a later
 		// same-head adopt can reclaim partial edits instead of terminal cleanup.
 		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
-			r.logWarn("reviewer restore fixer owner token after dirty prepare failed", map[string]any{"worktreePath": created.WorktreePath, "error": restoreErr.Error()})
+			return checkpoint, fmt.Errorf("restore fixer owner token after dirty prepare: %w", restoreErr)
 		}
 		return checkpoint, &loopError{message: fmt.Sprintf("Reviewer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
@@ -6823,6 +6826,57 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 		return
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
+}
+
+// capturePriorFixerOwnerToken reads fixer ownership markers that CreateWorktree
+// is about to revoke. Probes the checkpoint path (when present) and the shared
+// detached PR candidate path so a fresh reviewer claim without checkpoint state
+// still preserves interrupted fixer authority for dirty/pre-inspect restore.
+// Unreadable markers fail the claim — proceeding would drop provenance we
+// cannot restore. Prefers a non-empty token from the shared candidate path when
+// both differ, since that is the path CreateWorktree claims and clears.
+func capturePriorFixerOwnerToken(checkpoint reviewerCheckpoint, worktreeRoot, projectID string, prNumber int64) (string, error) {
+	type probe struct {
+		path   string
+		prefer bool
+	}
+	probes := make([]probe, 0, 2)
+	if checkpoint.Worktree != nil {
+		if path := strings.TrimSpace(checkpoint.Worktree.Path); path != "" {
+			probes = append(probes, probe{path: path})
+		}
+	}
+	if candidate := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber); candidate != "" {
+		probes = append(probes, probe{path: candidate, prefer: true})
+	}
+	seen := make(map[string]struct{}, len(probes))
+	var token string
+	var preferred string
+	for _, p := range probes {
+		comparable := filepath.Clean(p.path)
+		if _, ok := seen[comparable]; ok {
+			continue
+		}
+		seen[comparable] = struct{}{}
+		got, err := worktreesafety.ReadFixerOwnerToken(p.path)
+		if err != nil {
+			return "", err
+		}
+		got = strings.TrimSpace(got)
+		if got == "" {
+			continue
+		}
+		if p.prefer {
+			preferred = got
+		}
+		if token == "" {
+			token = got
+		}
+	}
+	if preferred != "" {
+		return preferred, nil
+	}
+	return token, nil
 }
 
 // restoreFixerOwnerToken rewrites a prior fixer ownership stamp after CreateWorktree
