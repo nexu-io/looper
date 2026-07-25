@@ -58,7 +58,11 @@ func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *test
 	if checkpoint.Worktree.OwnerToken != priorToken {
 		t.Fatalf("checkpoint.Worktree.OwnerToken = %q, want stable prior token %q", checkpoint.Worktree.OwnerToken, priorToken)
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(f.wtPath); got != priorToken {
+	got, err := worktreesafety.ReadFixerOwnerToken(f.wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != priorToken {
 		t.Fatalf("disk owner token = %q, want stable prior token %q", got, priorToken)
 	}
 	if len(git.inspectCalls) != 1 {

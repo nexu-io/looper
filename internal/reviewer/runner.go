@@ -1651,7 +1651,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	// after the release defer so claim failures still drop the PR lock.
 	startStep := resumedRun.StartStep
 	if resumedRun.Resumed && startStep != stepClaim && startStep != stepWorktree && checkpoint.Worktree != nil {
-		if worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path) != "" {
+		// Present or unreadable fixer ownership both invalidate a resume past
+		// worktree: fail-closed so we re-prepare rather than inspect/cleanup
+		// dirt we cannot attribute.
+		if token, err := worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path); err != nil || token != "" {
 			checkpoint.Worktree.PreparedAt = ""
 			startStep = stepWorktree
 		}
@@ -2289,10 +2292,15 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	// Capture fixer ownership before CreateWorktree revokes the marker. Prepare
 	// failures that occur before dirt inspection (remote-head drift, fetch errors)
 	// must restore provenance so terminal/success cleanup cannot orphan partial
-	// fixer edits that preparation never evaluated.
+	// fixer edits that preparation never evaluated. Unreadable markers fail the
+	// claim — proceeding would revoke or ignore ownership we cannot restore.
 	priorFixerToken := ""
 	if checkpoint.Worktree != nil {
-		priorFixerToken = worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path)
+		token, err := worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path)
+		if err != nil {
+			return checkpoint, err
+		}
+		priorFixerToken = token
 	}
 	if checkpoint.Worktree != nil {
 		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: checkpoint.Worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
@@ -6797,8 +6805,8 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	}
 	// An active fixer owner stamp means the path is still fixer-owned evidence;
 	// force-remove would destroy partial edits the reviewer never successfully
-	// reclaimed.
-	if worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path) != "" {
+	// reclaimed. Unreadable markers are treated the same (fail closed).
+	if token, err := worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path); err != nil || token != "" {
 		return
 	}
 	protectedBranches := []string{}
@@ -6855,7 +6863,8 @@ func reviewerWorktreePrepared(checkpoint reviewerCheckpoint) bool {
 	// Intervening fixer ownership invalidates reviewer prepared state even when
 	// PreparedAt is still set (e.g. resume at thread_resolution, which does not
 	// clear PreparedAt in createRunContext). Forces re-prepare before agent use.
-	if worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path) != "" {
+	// Unreadable markers also force re-prepare (fail closed).
+	if token, err := worktreesafety.ReadFixerOwnerToken(checkpoint.Worktree.Path); err != nil || token != "" {
 		return false
 	}
 	return checkpoint.Worktree.PreparedAt != ""

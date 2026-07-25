@@ -6163,7 +6163,11 @@ func TestRunPrepareWorktreeStepClearsFixerOwnerTokenWhenReusingPreparedPath(t *t
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != wtPath {
 		t.Fatalf("Worktree = %#v, want reused prepared path", checkpoint.Worktree)
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != "" {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != "" {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want empty after prepared reuse", got)
 	}
 }
@@ -6210,7 +6214,11 @@ func TestRunPrepareWorktreeStepRePreparesWhenFixerMarkerPresent(t *testing.T) {
 	if checkpoint.Worktree == nil || checkpoint.Worktree.PreparedAt == "" {
 		t.Fatalf("Worktree = %#v, want re-prepared path", checkpoint.Worktree)
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != "" {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != "" {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want empty after reclaim", got)
 	}
 }

@@ -2832,7 +2832,12 @@ func hasFixerWorktreeProvenance(checkpoint fixerCheckpoint, worktreePath string)
 	if !sameManagedWorktreePath(prior, candidate) {
 		return false
 	}
-	return worktreesafety.ReadFixerOwnerToken(candidate) == token
+	diskToken, err := worktreesafety.ReadFixerOwnerToken(candidate)
+	if err != nil {
+		// Unreadable marker is not proven ownership — fail closed for adopt.
+		return false
+	}
+	return diskToken == token
 }
 
 func newFixerWorktreeOwnerToken(loopID, runID, preparedAt string) string {

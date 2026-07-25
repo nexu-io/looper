@@ -108,7 +108,11 @@ func TestProcessClaimedItemRemoteHeadChangedPreservesFixerDirtAndToken(t *testin
 	if len(git.cleanupCalls) != 0 {
 		t.Fatalf("cleanupCalls = %d, want 0 (must not force-remove fixer dirt after pre-inspect failure)", len(git.cleanupCalls))
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != token {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != token {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want %q restored after pre-inspect prepare failure", got, token)
 	}
 	gotDirt, err := os.ReadFile(dirtyFile)
@@ -206,7 +210,11 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesFixerDirtAndToken(t *tes
 	if len(git.cleanupCalls) != 0 {
 		t.Fatalf("cleanupCalls = %d, want 0 on terminal prepare failure with unprepared path", len(git.cleanupCalls))
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != token {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != token {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want %q restored after prepare failure", got, token)
 	}
 	gotDirt, err := os.ReadFile(dirtyFile)

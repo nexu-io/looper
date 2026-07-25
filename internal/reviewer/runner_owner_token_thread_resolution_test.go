@@ -110,7 +110,11 @@ func TestProcessClaimedItemThreadResolutionResumeRePreparesWhenFixerMarkerPresen
 	if len(git.prepareCalls) == 0 {
 		t.Fatal("expected PrepareWorktree after intervening fixer marker; prepareCalls empty")
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != "" {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != "" {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want empty after re-prepare reclaim", got)
 	}
 }

@@ -95,11 +95,15 @@ func TestRunPrepareWorktreeStepRealGatewayRemoteHeadChangedPreservesFixerDirt(t 
 	if adapter.cleanupCalls != 0 {
 		t.Fatalf("cleanupCalls = %d, want 0", adapter.cleanupCalls)
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != token {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != token {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want %q restored after pre-inspect failure", got, token)
 	}
-	got, err := os.ReadFile(dirtyFile)
-	if err != nil || string(got) != "keep me\n" {
-		t.Fatalf("dirty marker = %q err=%v, want preserved", got, err)
+	dirtyBytes, err := os.ReadFile(dirtyFile)
+	if err != nil || string(dirtyBytes) != "keep me\n" {
+		t.Fatalf("dirty marker = %q err=%v, want preserved", dirtyBytes, err)
 	}
 }

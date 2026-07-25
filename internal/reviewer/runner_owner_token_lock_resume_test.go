@@ -108,7 +108,11 @@ func TestProcessClaimedItemFailedLockResumePreservesFixerOwnerToken(t *testing.T
 	if !contains(loopErr.message, "Pull request lock is already held") {
 		t.Fatalf("error message = %q, want lock-held", loopErr.message)
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != token {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != token {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want %q (must preserve on failed lock reacquisition)", got, token)
 	}
 }
@@ -210,7 +214,11 @@ func TestProcessClaimedItemSuccessfulLockResumeRevokesFixerOwnerToken(t *testing
 	if len(git.prepareCalls) == 0 {
 		t.Fatal("expected re-prepare after intervening fixer marker; prepareCalls empty")
 	}
-	if got := worktreesafety.ReadFixerOwnerToken(wtPath); got != "" {
+	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
+	if err != nil {
+		t.Fatalf("ReadFixerOwnerToken() error = %v", err)
+	}
+	if got != "" {
 		t.Fatalf("ReadFixerOwnerToken() = %q, want empty after re-prepare reclaim", got)
 	}
 }

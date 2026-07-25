@@ -38,21 +38,32 @@ func WriteFixerOwnerToken(worktreePath, token string) error {
 	return os.WriteFile(filepath.Join(gitDir, FixerOwnerTokenFile), []byte(token+"\n"), 0o644)
 }
 
-// ReadFixerOwnerToken returns the on-disk fixer ownership token, or "" when absent.
-func ReadFixerOwnerToken(worktreePath string) string {
+// ReadFixerOwnerToken returns the on-disk fixer ownership token.
+// Empty string with a nil error means the marker is absent (or the worktree
+// path is empty). A non-nil error means the private git dir or marker could
+// not be resolved/read (I/O, permission, or non-file marker); callers must
+// not treat that as absence — resume rewind and terminal cleanup should
+// conservatively preserve the path, and provenance checks must fail closed.
+func ReadFixerOwnerToken(worktreePath string) (string, error) {
 	worktreePath = strings.TrimSpace(worktreePath)
 	if worktreePath == "" {
-		return ""
+		return "", nil
 	}
 	gitDir, err := resolveWorktreePrivateGitDir(worktreePath, false)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read fixer owner token for %s: %w", worktreePath, err)
 	}
 	data, err := os.ReadFile(filepath.Join(gitDir, FixerOwnerTokenFile))
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read fixer owner token for %s: %w", worktreePath, err)
 	}
-	return strings.TrimSpace(string(data))
+	return strings.TrimSpace(string(data)), nil
 }
 
 // ClearFixerOwnerToken removes any fixer ownership stamp from worktreePath.
