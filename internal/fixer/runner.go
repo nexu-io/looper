@@ -2667,8 +2667,17 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 			}
 		}
 		// Missing/unusable checkout: best-effort cleanup of stale registration,
-		// then CreateWorktree below recreates the managed path.
+		// then clear empty leftovers / preserve populated ones before CreateWorktree.
+		// Real CleanupWorktree swallows Git's "is not a working tree" without
+		// deleting the directory, so a leftover path would make CreateWorktree fail.
 		if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: existingPath, Branch: existingBranch, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)})}); err != nil {
+			return checkpoint, err
+		}
+		if err := clearUnusableFixerWorktreePath(existingPath); err != nil {
+			if errors.Is(err, errUnusableFixerWorktreePreserved) {
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				return checkpoint, &loopError{message: err.Error(), kind: FailureManualIntervention}
+			}
 			return checkpoint, err
 		}
 	}
@@ -6130,6 +6139,45 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 		}
 		return false
 	}
+}
+
+// errUnusableFixerWorktreePreserved signals that an unusable worktree path still
+// holds content after CleanupWorktree and must not be recreated over.
+var errUnusableFixerWorktreePreserved = errors.New("unusable fixer worktree path preserved")
+
+// clearUnusableFixerWorktreePath handles filesystem leftovers after CleanupWorktree
+// on a missing/unusable checkout. Git's `worktree remove --force` only removes
+// registered worktrees; unregistered directories are left intact, which then
+// blocks CreateWorktree when the managed path already exists.
+//
+// Policy: remove empty directories (safe stale), preserve any populated path for
+// manual intervention (may hold interrupted agent output even without .git).
+func clearUnusableFixerWorktreePath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
