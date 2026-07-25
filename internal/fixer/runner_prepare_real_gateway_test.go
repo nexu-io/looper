@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -292,5 +293,104 @@ func TestRunPrepareWorktreeStepRealGatewayPreservesPopulatedUnregisteredPath(t *
 	got, readErr := os.ReadFile(marker)
 	if readErr != nil || string(got) != "keep me\n" {
 		t.Fatalf("marker = %q err=%v, want preserved", got, readErr)
+	}
+}
+
+// Real gateway lifecycle: .git points at an existing but empty/corrupt private
+// gitdir. Real git reports "not a git repository"; prepare must classify the
+// checkout as unusable and recover (cleanup + clear/recreate) rather than
+// preserving the broken path and returning the same retryable prepare error forever.
+func TestRunPrepareWorktreeStepRealGatewayRecreatesCorruptLinkedGitdir(t *testing.T) {
+	t.Parallel()
+
+	root, _, repoPath, headSHA := setupRealRepoWithBranch(t, "feature/fix-42")
+	worktreeRoot := filepath.Join(root, "worktrees")
+	branch := "feature/fix-42"
+	projectID := "project_real_corrupt_gitdir"
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	gateway := gitinfra.New(gitinfra.Options{GitPath: "git"})
+	created, err := gateway.CreateWorktree(context.Background(), gitinfra.CreateWorktreeInput{
+		ProjectID:    projectID,
+		RepoPath:     repoPath,
+		WorktreeRoot: worktreeRoot,
+		Branch:       branch,
+		BaseBranch:   "main",
+		PRNumber:     42,
+		CheckoutMode: gitinfra.CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	wtPath := created.WorktreePath
+
+	// Resolve linked private gitdir and strip required metadata (HEAD).
+	gitMeta, err := os.ReadFile(filepath.Join(wtPath, ".git"))
+	if err != nil {
+		t.Fatalf("ReadFile .git: %v", err)
+	}
+	line := strings.TrimSpace(string(gitMeta))
+	const prefix = "gitdir:"
+	if !strings.HasPrefix(strings.ToLower(line), prefix) {
+		t.Fatalf(".git content = %q, want gitdir: pointer", line)
+	}
+	gitdir := strings.TrimSpace(line[len(prefix):])
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(wtPath, gitdir)
+	}
+	if err := os.Remove(filepath.Join(gitdir, "HEAD")); err != nil {
+		t.Fatalf("Remove private HEAD: %v", err)
+	}
+	// Drop worktree content so recovery can clear-and-recreate (only unusable
+	// .git metadata remains). Populated agent dirt would correctly go MI.
+	entries, err := os.ReadDir(wtPath)
+	if err != nil {
+		t.Fatalf("ReadDir worktree: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() == ".git" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(wtPath, e.Name())); err != nil {
+			t.Fatalf("RemoveAll %s: %v", e.Name(), err)
+		}
+	}
+	// Probe must already report unusable with integrity-looking prepare text.
+	probeErr := errors.New("fatal: not a git repository (or any of the parent directories): .git")
+	if !isMissingOrUnusableFixerWorktree(wtPath, probeErr) {
+		t.Fatal("isMissingOrUnusableFixerWorktree = false for corrupt linked gitdir, want true")
+	}
+
+	adapter := &countingRealGitGateway{inner: gateway}
+	runner := New(Options{Git: adapter})
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	checkpoint, prepErr := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:     storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: headSHA, HeadRefName: branch, BaseRefName: "main"},
+			Worktree: &checkpointWorktree{Path: wtPath, Branch: branch},
+		},
+	})
+	if prepErr != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v, want recreated prepared worktree", prepErr)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.PreparedAt == "" || checkpoint.Worktree.OwnerToken == "" {
+		t.Fatalf("checkpoint.Worktree = %#v, want prepared with owner token", checkpoint.Worktree)
+	}
+	if adapter.cleanupCalls < 1 {
+		t.Fatalf("cleanupCalls = %d, want >= 1 (unusable path recovery)", adapter.cleanupCalls)
+	}
+	if adapter.createCalls < 1 {
+		t.Fatalf("createCalls = %d, want >= 1", adapter.createCalls)
+	}
+	if _, err := os.Stat(filepath.Join(checkpoint.Worktree.Path, "README.md")); err != nil {
+		t.Fatalf("recreated worktree missing README: %v", err)
+	}
+	if !localFixerWorktreeCheckoutUsable(checkpoint.Worktree.Path) {
+		t.Fatalf("recreated path %s still unusable after prepare", checkpoint.Worktree.Path)
 	}
 }

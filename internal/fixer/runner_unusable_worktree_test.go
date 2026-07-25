@@ -14,14 +14,29 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	existing := t.TempDir()
 	missing := filepath.Join(t.TempDir(), "gone")
 
-	// Valid linked-worktree-style checkout: .git file points at an existing gitdir.
+	// Valid linked-worktree-style checkout: .git file points at a private gitdir
+	// that still has required metadata (HEAD). Existence of the dir alone is not enough.
 	usable := t.TempDir()
 	gitdir := filepath.Join(t.TempDir(), "gitdir")
 	if err := os.MkdirAll(gitdir, 0o755); err != nil {
 		t.Fatalf("MkdirAll gitdir: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(gitdir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile usable gitdir HEAD: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(usable, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile usable .git: %v", err)
+	}
+
+	// Linked gitfile to an existing but empty/corrupt private gitdir (no HEAD).
+	// Real git reports "not a git repository"; probe must treat as unusable.
+	corruptLinked := t.TempDir()
+	emptyGitdir := filepath.Join(t.TempDir(), "empty-gitdir")
+	if err := os.MkdirAll(emptyGitdir, 0o755); err != nil {
+		t.Fatalf("MkdirAll emptyGitdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptLinked, ".git"), []byte("gitdir: "+emptyGitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile corruptLinked .git: %v", err)
 	}
 
 	// Ordinary checkout with .git/HEAD present.
@@ -51,6 +66,8 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		{name: "not_a_git_repository_usable_gitfile", path: usable, prepErr: remoteIntegrityText, want: false},
 		{name: "not_a_git_repository_usable_gitdir", path: usableDir, prepErr: remoteIntegrityText, want: false},
 		{name: "not_a_working_tree_usable", path: usable, prepErr: fmt.Errorf("fatal: %s is not a working tree", usable), want: false},
+		// Existing but empty/corrupt linked gitdir must recreate (not preserve forever).
+		{name: "not_a_git_repository_corrupt_linked_gitdir", path: corruptLinked, prepErr: remoteIntegrityText, want: true},
 		// Regression: external ssh/fetch text must not classify a live checkout as unusable.
 		{name: "ssh_no_such_file", path: existing, prepErr: errors.New("error: cannot run ssh: No such file or directory\nfatal: unable to fork"), want: false},
 		{name: "fetch_transport", path: existing, prepErr: errors.New("git fetch origin feature/fix-42: fatal: unable to access remote"), want: false},
@@ -109,6 +126,27 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		}
 		if _, err := os.Stat(marker); err != nil {
 			t.Fatalf("populated marker missing: %v", err)
+		}
+	})
+
+	t.Run("only_corrupt_linked_git_removed", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "corrupt-linked")
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		emptyGitdir := filepath.Join(t.TempDir(), "empty-gitdir")
+		if err := os.MkdirAll(emptyGitdir, 0o755); err != nil {
+			t.Fatalf("MkdirAll emptyGitdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(path, ".git"), []byte("gitdir: "+emptyGitdir+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile .git: %v", err)
+		}
+		if err := clearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("corrupt-only path still exists after clear, err=%v", err)
 		}
 	})
 }

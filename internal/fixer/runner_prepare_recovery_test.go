@@ -40,11 +40,15 @@ func TestRunPrepareWorktreeStepPrepareErrorPreservesExistingWorktree(t *testing.
 			t.Parallel()
 			f := newDirtyAdoptFixture(t)
 			if tc.withGitMeta {
-				// Linked-worktree-style local metadata so the probe treats the
-				// checkout as usable despite integrity-looking prepare stderr.
+				// Linked-worktree-style local metadata with required HEAD so the
+				// probe treats the checkout as usable despite integrity-looking
+				// prepare stderr (existence of the private gitdir alone is not enough).
 				gitdir := filepath.Join(t.TempDir(), "gitdir")
 				if err := os.MkdirAll(gitdir, 0o755); err != nil {
 					t.Fatalf("MkdirAll gitdir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(gitdir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile gitdir HEAD: %v", err)
 				}
 				if err := os.WriteFile(filepath.Join(f.wtPath, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
 					t.Fatalf("WriteFile .git: %v", err)
