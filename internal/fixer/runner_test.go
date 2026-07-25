@@ -6061,6 +6061,301 @@ func TestRunPrepareWorktreeStepPrepareErrorPreservesExistingWorktree(t *testing.
 	}
 }
 
+// Missing checkpoint worktree directories must fall through to CreateWorktree instead of
+// returning a prepare/cwd error that burns a retry (and can become terminal).
+func TestRunPrepareWorktreeStepRecreatesMissingCheckpointWorktree(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	missingPath := filepath.Join(worktreeRoot, "wt-missing")
+	recreatedPath := filepath.Join(worktreeRoot, "wt-recreated")
+	// Intentionally do not create missingPath.
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: recreatedPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+	}
+	runner := New(Options{Git: git})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:     storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+			Worktree: &checkpointWorktree{Path: missingPath, Branch: "feature/fix-42"}, // PreparedAt cleared; path gone
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recreatedPath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated path %q", checkpoint.Worktree, recreatedPath)
+	}
+	if checkpoint.Worktree.PreparedAt == "" {
+		t.Fatal("checkpoint.Worktree.PreparedAt empty after recreate")
+	}
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1 (stale missing path cleanup)", len(git.cleanupCalls))
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	// Prepare is only invoked on the recreated path, not the missing checkpoint path.
+	if len(git.prepareCalls) != 1 || git.prepareCalls[0].WorktreePath != recreatedPath {
+		t.Fatalf("prepareCalls = %#v, want one call on recreated path", git.prepareCalls)
+	}
+}
+
+// Empty / unregistered directories that still pass path-safety checks must recreate
+// when prepare reports "not a working tree", rather than preserving a dead path.
+func TestRunPrepareWorktreeStepRecreatesUnusableCheckpointWorktree(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	stalePath := filepath.Join(worktreeRoot, "wt-stale")
+	if err := os.MkdirAll(stalePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll stale worktree: %v", err)
+	}
+	recreatedPath := filepath.Join(worktreeRoot, "wt-recreated")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{
+		// First prepare (stale path) fails; second prepare (recreated) succeeds.
+		prepareErrors: []error{fmt.Errorf("fatal: %s is not a working tree", stalePath), nil},
+		createResult:  CreateWorktreeResult{WorktreePath: recreatedPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+	}
+	runner := New(Options{Git: git})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:     storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+			Worktree: &checkpointWorktree{Path: stalePath, Branch: "feature/fix-42"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recreatedPath {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated path %q", checkpoint.Worktree, recreatedPath)
+	}
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
+	}
+	if len(git.createCalls) != 1 {
+		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	}
+	// First prepare on stale path fails; second prepare is on the recreated path.
+	if len(git.prepareCalls) != 2 {
+		t.Fatalf("len(git.prepareCalls) = %d, want 2 (stale then recreated)", len(git.prepareCalls))
+	}
+	if git.prepareCalls[0].WorktreePath != stalePath || git.prepareCalls[1].WorktreePath != recreatedPath {
+		t.Fatalf("prepareCalls paths = %q, %q, want stale then recreated", git.prepareCalls[0].WorktreePath, git.prepareCalls[1].WorktreePath)
+	}
+}
+
+// Full queue lifecycle: interrupted-repair rewind → prepare probe fails on final
+// attempt → terminal parking must not force-remove the dirty worktree.
+func TestProcessClaimedItemTerminalPrepareErrorPreservesDirtyWorktree(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	wtPath := filepath.Join(worktreeRoot, "wt-42")
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	dirtyFile := filepath.Join(wtPath, "partial-agent-edit.txt")
+	if err := os.WriteFile(dirtyFile, []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile dirty marker: %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	project.MetadataJSON = &metadata
+	if err := fixture.repos.Projects.Upsert(context.Background(), *project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID:         "loop_fixer_prepare_terminal_preserve",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       "fixer",
+		TargetType: "pull_request",
+		TargetID:   &loopTarget,
+		Repo:       &repo,
+		PRNumber:   &prNumber,
+		Status:     "queued",
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Prior repair failure with a prepared worktree so resume rewinds to prepare-worktree.
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+		ClaimedLockKey: "pr:acme/looper:42",
+		Detail:         &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main", State: "OPEN"},
+		FixItems:       []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
+		Worktree: &checkpointWorktree{
+			Path:        wtPath,
+			Branch:      "feature/fix-42",
+			HeadSHA:     "base-head",
+			BaseHeadSHA: "base-head",
+			PreparedAt:  nowISO,
+		},
+		Repair: &checkpointRepair{Summary: "interrupted", ParseStatus: "parsed", CompletedAt: nowISO},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_before_prepare_retry",
+		LoopID:            "loop_fixer_prepare_terminal_preserve",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepRepair)),
+		LastCompletedStep: stringPtr(string(stepPrepareWorktree)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         nowISO,
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	projectID := "project_1"
+	loopID := "loop_fixer_prepare_terminal_preserve"
+	lockKey := "pr:acme/looper:42"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:          "queue_fixer_prepare_terminal_preserve",
+		ProjectID:   &projectID,
+		LoopID:      &loopID,
+		Type:        "fixer",
+		TargetType:  "pull_request",
+		TargetID:    loopTarget,
+		Repo:        &repo,
+		PRNumber:    &prNumber,
+		DedupeKey:   "fixer:acme/looper:42:prepare-terminal-preserve",
+		Priority:    1,
+		Status:      "queued",
+		AvailableAt: nowISO,
+		MaxAttempts: 1, // final allowed attempt → terminal parking
+		LockKey:     &lockKey,
+		CreatedAt:   nowISO,
+		UpdatedAt:   nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{
+		currentUser: "looper",
+		viewResponses: []PullRequestDetail{{
+			Number: 42, State: "OPEN", HeadSHA: "base-head", HeadRefName: "feature/fix-42",
+			BaseRefName: "main", BaseSHA: "base-1", Author: "looper",
+			Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}},
+		}},
+	}
+	git := &fakeGitGateway{
+		prepareErr:    fmt.Errorf("git fetch origin feature/fix-42: fatal: unable to access remote"),
+		createResult:  CreateWorktreeResult{WorktreePath: wtPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git,
+		Logger: fixture.logger, Now: fixture.now,
+	})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" {
+		t.Fatalf("result = %#v, want failed status after terminal prepare error", result)
+	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 (terminal prepare failure must not force-remove dirty worktree)", len(git.cleanupCalls))
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("len(git.createCalls) = %d, want 0 (existing dirty path must not recreate)", len(git.createCalls))
+	}
+	if got, readErr := os.ReadFile(dirtyFile); readErr != nil || string(got) != "keep me\n" {
+		t.Fatalf("dirty marker after terminal prepare failure = %q err=%v, want preserved", got, readErr)
+	}
+
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want terminal manual_intervention", queue)
+	}
+
+	// Failed run checkpoint must still point at the preserved worktree (unprepared).
+	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+	}
+	persisted := parseCheckpoint(run.CheckpointJSON)
+	if persisted.Worktree == nil || persisted.Worktree.Path != wtPath {
+		t.Fatalf("persisted worktree = %#v, want path %q retained", persisted.Worktree, wtPath)
+	}
+	if persisted.Worktree.PreparedAt != "" {
+		t.Fatalf("persisted PreparedAt = %q, want empty (rewind / failed prepare)", persisted.Worktree.PreparedAt)
+	}
+	if persisted.Worktree.CleanedAt != "" {
+		t.Fatalf("persisted CleanedAt = %q, want empty", persisted.Worktree.CleanedAt)
+	}
+}
+
+func TestCleanupFixerWorktreeIfTerminalSkipsUnpreparedWorktree(t *testing.T) {
+	t.Parallel()
+
+	wtPath := filepath.Join(t.TempDir(), "wt-42")
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{Git: git})
+	checkpoint := &fixerCheckpoint{
+		Worktree: &checkpointWorktree{Path: wtPath, Branch: "feature/fix-42"}, // PreparedAt empty
+	}
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, checkpoint)
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 for unprepared worktree", len(git.cleanupCalls))
+	}
+	if checkpoint.Worktree.CleanedAt != "" {
+		t.Fatalf("CleanedAt = %q, want empty", checkpoint.Worktree.CleanedAt)
+	}
+
+	// Prepared worktrees still clean up on the terminal path.
+	checkpoint.Worktree.PreparedAt = "2026-04-11T12:00:00.000Z"
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, checkpoint)
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1 for prepared worktree", len(git.cleanupCalls))
+	}
+	if checkpoint.Worktree.CleanedAt == "" {
+		t.Fatal("CleanedAt empty after prepared cleanup")
+	}
+}
+
 func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *testing.T) {
 	t.Parallel()
 
@@ -6552,6 +6847,8 @@ type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
 	prepareResult  PrepareWorktreeResult
 	prepareErr     error
+	prepareErrors  []error // sequential per-call errors; nil entry falls through to prepareErr/result
+	prepareIndex   int
 	inspectResults []InspectHeadResult
 	inspectIndex   int
 	ancestor       map[string]bool
@@ -6594,7 +6891,14 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
 	f.prepareCalls = append(f.prepareCalls, input)
-	if f.prepareErr != nil {
+	if f.prepareIndex < len(f.prepareErrors) {
+		err := f.prepareErrors[f.prepareIndex]
+		f.prepareIndex++
+		if err != nil {
+			return PrepareWorktreeResult{}, err
+		}
+		// nil entry: fall through to success result for this call
+	} else if f.prepareErr != nil {
 		return PrepareWorktreeResult{}, f.prepareErr
 	}
 	result := f.prepareResult
