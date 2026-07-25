@@ -6105,12 +6105,15 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 }
 
 // isMissingOrUnusableFixerWorktree reports whether a checkpoint worktree path
-// cannot be prepared in place and should be recreated. Authority is the
-// checkout itself (path missing / gone) or a typed local git-tree integrity
-// error ("not a working tree" / "not a git repository"). External
-// fetch/ssh/transport failures must not be treated as unusable checkouts —
-// their text often contains "no such file or directory" (e.g. missing ssh
-// binary) and force-cleaning would destroy interrupted agent dirt.
+// cannot be prepared in place and should be recreated. Authority is the local
+// checkout only: path missing/gone, or prepare failed and a non-remote local
+// probe shows the path is not a usable git checkout.
+//
+// Prepare/fetch/ssh stderr must never be treated as proof of local unusability
+// by itself. Remote helpers can emit "fatal: not a git repository" while the
+// managed worktree remains valid; force CleanupWorktree would then destroy
+// interrupted agent dirt. When error text merely *looks* like a local integrity
+// failure, confirm with localFixerWorktreeCheckoutUsable before recreating.
 func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -6123,22 +6126,79 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 		// Permission/IO errors are not "missing"; let prepare surface them.
 	}
 	if prepErr == nil {
+		// Path present: try prepare in place. Local usability is decided only
+		// after prepare fails (via a non-remote probe, not error text alone).
 		return false
 	}
-	// Local checkout integrity only. Do not substring-match generic existence
-	// phrases — external dependency errors share that wording.
+	// Path may have vanished during prepare; re-stat the checkout itself.
+	if _, err := os.Stat(path); err != nil {
+		return os.IsNotExist(err)
+	}
 	msg := strings.ToLower(prepErr.Error())
-	switch {
-	case strings.Contains(msg, "not a working tree"),
-		strings.Contains(msg, "not a git repository"):
-		return true
-	default:
-		// Path may have vanished during prepare; re-stat the checkout itself.
-		if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
-			return true
-		}
+	// Integrity-looking phrases are necessary but not sufficient: remote
+	// helpers/servers can emit the same text. Do not substring-match generic
+	// existence phrases either — external dependency errors share that wording.
+	looksLikeLocalIntegrity := strings.Contains(msg, "not a working tree") ||
+		strings.Contains(msg, "not a git repository")
+	if !looksLikeLocalIntegrity {
 		return false
 	}
+	// Confirm with a non-remote local probe before force-cleaning.
+	return !localFixerWorktreeCheckoutUsable(path)
+}
+
+// localFixerWorktreeCheckoutUsable reports whether path has local git metadata
+// without contacting remotes. Linked worktrees use a .git file (gitdir pointer);
+// ordinary checkouts use a .git directory. Presence of that metadata is the
+// integrity signal used to refuse force-cleanup when prepare stderr is ambiguous.
+func localFixerWorktreeCheckoutUsable(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	gitMeta := filepath.Join(path, ".git")
+	info, err := os.Lstat(gitMeta)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		// Ordinary checkout: require HEAD so empty/.git stubs do not count.
+		_, err := os.Stat(filepath.Join(gitMeta, "HEAD"))
+		return err == nil
+	}
+	// Linked worktree or gitfile: .git is a regular file (or symlink to one).
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Stat(gitMeta)
+		if err != nil {
+			return false
+		}
+		if target.IsDir() {
+			_, err := os.Stat(filepath.Join(gitMeta, "HEAD"))
+			return err == nil
+		}
+	}
+	data, err := os.ReadFile(gitMeta)
+	if err != nil {
+		return false
+	}
+	line := strings.TrimSpace(string(data))
+	if line == "" {
+		return false
+	}
+	const prefix = "gitdir:"
+	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+		// Non-empty .git file without gitdir: still local metadata; treat usable.
+		return true
+	}
+	gitdir := strings.TrimSpace(line[len(prefix):])
+	if gitdir == "" {
+		return false
+	}
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(path, gitdir)
+	}
+	_, err = os.Stat(gitdir)
+	return err == nil
 }
 
 // errUnusableFixerWorktreePreserved signals that an unusable worktree path still

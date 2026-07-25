@@ -17,6 +17,27 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	existing := t.TempDir()
 	missing := filepath.Join(t.TempDir(), "gone")
 
+	// Valid linked-worktree-style checkout: .git file points at an existing gitdir.
+	usable := t.TempDir()
+	gitdir := filepath.Join(t.TempDir(), "gitdir")
+	if err := os.MkdirAll(gitdir, 0o755); err != nil {
+		t.Fatalf("MkdirAll gitdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(usable, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile usable .git: %v", err)
+	}
+
+	// Ordinary checkout with .git/HEAD present.
+	usableDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(usableDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll usableDir .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(usableDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+
+	remoteIntegrityText := errors.New("fatal: not a git repository (or any of the parent directories): .git")
+
 	cases := []struct {
 		name    string
 		path    string
@@ -26,8 +47,13 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		{name: "empty_path", path: "", want: true},
 		{name: "missing_path", path: missing, want: true},
 		{name: "existing_no_err", path: existing, want: false},
-		{name: "not_a_working_tree", path: existing, prepErr: fmt.Errorf("fatal: %s is not a working tree", existing), want: true},
-		{name: "not_a_git_repository", path: existing, prepErr: errors.New("fatal: not a git repository (or any of the parent directories): .git"), want: true},
+		// Directory without local git metadata + integrity-looking prepare text → recreate.
+		{name: "not_a_working_tree_no_git", path: existing, prepErr: fmt.Errorf("fatal: %s is not a working tree", existing), want: true},
+		{name: "not_a_git_repository_no_git", path: existing, prepErr: remoteIntegrityText, want: true},
+		// Same remote/helper wording must NOT force cleanup when local checkout is valid.
+		{name: "not_a_git_repository_usable_gitfile", path: usable, prepErr: remoteIntegrityText, want: false},
+		{name: "not_a_git_repository_usable_gitdir", path: usableDir, prepErr: remoteIntegrityText, want: false},
+		{name: "not_a_working_tree_usable", path: usable, prepErr: fmt.Errorf("fatal: %s is not a working tree", usable), want: false},
 		// Regression: external ssh/fetch text must not classify a live checkout as unusable.
 		{name: "ssh_no_such_file", path: existing, prepErr: errors.New("error: cannot run ssh: No such file or directory\nfatal: unable to fork"), want: false},
 		{name: "fetch_transport", path: existing, prepErr: errors.New("git fetch origin feature/fix-42: fatal: unable to access remote"), want: false},
@@ -97,13 +123,20 @@ func TestRunPrepareWorktreeStepPrepareErrorPreservesExistingWorktree(t *testing.
 	t.Parallel()
 
 	cases := []struct {
-		name string
-		err  error
+		name        string
+		err         error
+		withGitMeta bool // integrity-looking remote text needs local .git to refuse cleanup
 	}{
 		{name: "fetch_transport", err: fmt.Errorf("git fetch origin feature/fix-42: fatal: unable to access remote")},
 		{name: "remote_head_changed", err: fmt.Errorf("remote head for feature/fix-42 changed: expected base-head, got advanced-head")},
 		// External dependency wording that previously matched the broad classifier.
 		{name: "ssh_no_such_file", err: fmt.Errorf("error: cannot run ssh: No such file or directory\nfatal: unable to fork")},
+		// SSH/remote helper can emit local-integrity wording; local .git must win.
+		{
+			name:        "remote_helper_not_a_git_repository",
+			err:         fmt.Errorf("fatal: not a git repository (or any of the parent directories): .git"),
+			withGitMeta: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -111,6 +144,17 @@ func TestRunPrepareWorktreeStepPrepareErrorPreservesExistingWorktree(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newDirtyAdoptFixture(t)
+			if tc.withGitMeta {
+				// Linked-worktree-style local metadata so the probe treats the
+				// checkout as usable despite integrity-looking prepare stderr.
+				gitdir := filepath.Join(t.TempDir(), "gitdir")
+				if err := os.MkdirAll(gitdir, 0o755); err != nil {
+					t.Fatalf("MkdirAll gitdir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(f.wtPath, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile .git: %v", err)
+				}
+			}
 			git := &fakeGitGateway{
 				prepareErr:     tc.err,
 				createResult:   CreateWorktreeResult{WorktreePath: f.wtPath, Branch: f.branch, HeadSHA: f.headSHA},
