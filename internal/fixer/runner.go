@@ -771,11 +771,14 @@ type checkpointWorktree struct {
 	PreparedAt  string `json:"preparedAt,omitempty"`
 	// OwnerToken is persisted dual-write ownership state for same-head dirty
 	// adopt: the same value is written to the worktree-private git dir
-	// (looper-fixer-owner). Adopt requires path match and on-disk token == this
-	// field. Costs: keep checkpoint and disk copies synchronized; every non-fixer
-	// claim of the path (Create/Restore and prepared-checkpoint reuse) must clear
-	// the disk marker and fail if clear cannot revoke authority; prepare-failure
-	// rediscovery must carry Path+OwnerToken so interrupt leftovers remain adoptable.
+	// (looper-fixer-owner) on successful clean prepare. Same-head dirty adopt
+	// reuses the matched token (no rewrite) so marker and checkpoint stay
+	// crash-consistent until the next prepare persists. Adopt requires path
+	// match and on-disk token == this field. Costs: keep checkpoint and disk
+	// copies synchronized; every non-fixer claim of the path (Create/Restore
+	// and prepared-checkpoint reuse) must clear the disk marker and fail if
+	// clear cannot revoke authority; prepare-failure rediscovery must carry
+	// Path+OwnerToken so interrupt leftovers remain adoptable.
 	// Simpler alternatives rejected: path equality alone (cross-runner dirt);
 	// event-only dirty_adopted without a stamp (no durable authority after crash).
 	OwnerToken         string `json:"ownerToken,omitempty"`
@@ -2737,6 +2740,13 @@ func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, ch
 //
 // PrepareWorktree returns remote HeadSHA when dirty (Clean:false); local HEAD must
 // be read via InspectHead. Returns adopted=false to keep the MI path.
+//
+// Ownership token is reused as-is: hasFixerWorktreeProvenance already matched
+// checkpoint.Worktree.OwnerToken to the on-disk marker. Rewriting a new token
+// here would not be crash-consistent with checkpoint persistence — a terminate
+// after marker write but before the returned checkpoint is saved would leave
+// disk with the new token while the latest checkpoint still has the old one,
+// failing the next retry's provenance check and forcing recoverable dirt into MI.
 func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot string, created CreateWorktreeResult, prepared PrepareWorktreeResult) (bool, fixerCheckpoint, error) {
 	if !hasFixerWorktreeProvenance(checkpoint, created.WorktreePath) {
 		return false, checkpoint, nil
@@ -2768,10 +2778,8 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 		return false, checkpoint, nil
 	}
 	preparedAt := r.nowISO()
-	ownerToken := newFixerWorktreeOwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
-	if err := worktreesafety.WriteFixerOwnerToken(created.WorktreePath, ownerToken); err != nil {
-		return false, checkpoint, err
-	}
+	// Keep the already-matched token stable; only refresh PreparedAt for this adopt.
+	ownerToken := strings.TrimSpace(checkpoint.Worktree.OwnerToken)
 	checkpoint.Worktree = &checkpointWorktree{
 		Path:        created.WorktreePath,
 		Branch:      branch,

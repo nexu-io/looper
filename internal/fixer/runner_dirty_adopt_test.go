@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *testing.T) {
@@ -14,13 +15,21 @@ func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *test
 	// Interrupted-repair lifecycle: rewind cleared PreparedAt but kept Path + OwnerToken.
 	// Same-head adopt must run before CleanupWorktree so partial agent dirt survives.
 	f := newDirtyAdoptFixture(t)
+	prior := f.rewindCheckpointWithDiskOwnership(t)
+	priorToken := prior.Worktree.OwnerToken
 	git := &fakeGitGateway{
 		createResult:   CreateWorktreeResult{WorktreePath: f.wtPath, Branch: f.branch, HeadSHA: f.headSHA},
 		prepareResult:  PrepareWorktreeResult{HeadSHA: f.headSHA, Clean: false},
 		inspectResults: []InspectHeadResult{{HeadSHA: f.headSHA, HasUncommittedChanges: true}},
 	}
 	runner := New(Options{Git: git})
-	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), f.stepWithOwnership(t, storage.LoopRecord{ID: "loop_1", Status: "running"}, git))
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:    f.project(),
+		Loop:       storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: prior,
+	})
 	if err != nil {
 		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
 	}
@@ -42,8 +51,13 @@ func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *test
 	if checkpoint.Worktree.PreparedAt == "" {
 		t.Fatal("checkpoint.Worktree.PreparedAt empty")
 	}
-	if checkpoint.Worktree.OwnerToken == "" {
-		t.Fatal("checkpoint.Worktree.OwnerToken empty after adopt")
+	// Adopt must reuse the matched token (no rewrite) so a crash before
+	// checkpoint persistence cannot desync disk marker vs latest checkpoint.
+	if checkpoint.Worktree.OwnerToken != priorToken {
+		t.Fatalf("checkpoint.Worktree.OwnerToken = %q, want stable prior token %q", checkpoint.Worktree.OwnerToken, priorToken)
+	}
+	if got := worktreesafety.ReadFixerOwnerToken(f.wtPath); got != priorToken {
+		t.Fatalf("disk owner token = %q, want stable prior token %q", got, priorToken)
 	}
 	if len(git.inspectCalls) != 1 {
 		t.Fatalf("len(git.inspectCalls) = %d, want 1", len(git.inspectCalls))

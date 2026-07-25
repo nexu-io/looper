@@ -13,9 +13,11 @@ import (
 //
 // This is persisted dual-write state: the same token also lives on
 // checkpoint.Worktree.OwnerToken. Both copies must stay aligned — write on
-// successful prepare/adopt, clear on every non-fixer claim of the path
-// (CreateWorktree / RestoreWorktree and prepared-checkpoint reuse), and fail
-// the claim when clear cannot revoke authority.
+// successful clean prepare, reuse (do not rewrite) on same-head dirty adopt so
+// a crash before checkpoint persistence cannot desync marker vs checkpoint,
+// clear on every non-fixer claim of the path (CreateWorktree / RestoreWorktree
+// and prepared-checkpoint reuse), and fail the claim when clear cannot revoke
+// authority.
 const FixerOwnerTokenFile = "looper-fixer-owner"
 
 // WriteFixerOwnerToken records a fixer-run-specific ownership token for worktreePath.
