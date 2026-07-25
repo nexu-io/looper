@@ -5745,7 +5745,8 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 func TestRunPrepareWorktreeStepPausesDirtyWorktree(t *testing.T) {
 	t.Parallel()
 
-	// Explicit local mismatch (not fake default "head") → cross-head MI.
+	// Cross-head dirty without fixer provenance → MI (no InspectHead; ownership gate first).
+	// Local mismatch with provenance is covered by DirtyAdoptEarlyExitGates.
 	git := &fakeGitGateway{
 		createResult:   CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
 		prepareResult:  PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
@@ -5759,15 +5760,23 @@ func TestRunPrepareWorktreeStepPausesDirtyWorktree(t *testing.T) {
 		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
 	})
 	assertPrepareDirtyManualIntervention(t, checkpoint, err)
-	if len(git.inspectCalls) != 1 {
-		t.Fatalf("len(git.inspectCalls) = %d, want 1 (local mismatch after remote match)", len(git.inspectCalls))
+	if len(git.inspectCalls) != 0 {
+		t.Fatalf("len(git.inspectCalls) = %d, want 0 (no provenance)", len(git.inspectCalls))
 	}
 }
 
-func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktree(t *testing.T) {
+func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktreeWithProvenance(t *testing.T) {
 	t.Parallel()
 
-	wtPath := filepath.Join(t.TempDir(), "wt-42")
+	// Interrupted-repair lifecycle: rewind cleared PreparedAt but kept Path.
+	// Same-head adopt must run before CleanupWorktree so partial agent dirt survives.
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	wtPath := filepath.Join(worktreeRoot, "wt-42")
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	git := &fakeGitGateway{
 		createResult:   CreateWorktreeResult{WorktreePath: wtPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
 		prepareResult:  PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
@@ -5775,11 +5784,14 @@ func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktree(t *testing.T) {
 	}
 	runner := New(Options{Git: git})
 	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
-		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
-		Loop:       storage.LoopRecord{ID: "loop_1", Status: "running"},
-		Repo:       "acme/looper",
-		PRNumber:   42,
-		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:     storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"},
+			Worktree: &checkpointWorktree{Path: wtPath, Branch: "feature/fix-42"}, // PreparedAt cleared by rewind
+		},
 	})
 	if err != nil {
 		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
@@ -5805,6 +5817,43 @@ func TestRunPrepareWorktreeStepAdoptsSameHeadDirtyWorktree(t *testing.T) {
 	if len(git.inspectCalls) != 1 {
 		t.Fatalf("len(git.inspectCalls) = %d, want 1", len(git.inspectCalls))
 	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 (adopt before cleanup)", len(git.cleanupCalls))
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("len(git.createCalls) = %d, want 0 (reuse existing path)", len(git.createCalls))
+	}
+	if len(git.prepareCalls) != 1 {
+		t.Fatalf("len(git.prepareCalls) = %d, want 1 (existing path only)", len(git.prepareCalls))
+	}
+}
+
+func TestRunPrepareWorktreeStepRejectsDirtyWithoutFixerProvenance(t *testing.T) {
+	t.Parallel()
+
+	// Shared project/PR detached path may hold reviewer dirt; without a prior
+	// fixer checkpoint path, same-head must stay manual_intervention.
+	wtPath := filepath.Join(t.TempDir(), "wt-42")
+	git := &fakeGitGateway{
+		createResult:   CreateWorktreeResult{WorktreePath: wtPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult:  PrepareWorktreeResult{HeadSHA: "base-head", Clean: false},
+		inspectResults: []InspectHeadResult{{HeadSHA: "base-head", HasUncommittedChanges: true}},
+	}
+	runner := New(Options{Git: git})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{ID: "loop_1", Status: "running"},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
+	})
+	assertPrepareDirtyManualIntervention(t, checkpoint, err)
+	if len(git.inspectCalls) != 0 {
+		t.Fatalf("len(git.inspectCalls) = %d, want 0 (no provenance → no adopt inspect)", len(git.inspectCalls))
+	}
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0", len(git.cleanupCalls))
+	}
 }
 
 func TestRunPrepareWorktreeStepDirtyAdoptEarlyExitGatesSkipInspectHead(t *testing.T) {
@@ -5816,6 +5865,7 @@ func TestRunPrepareWorktreeStepDirtyAdoptEarlyExitGatesSkipInspectHead(t *testin
 	}
 
 	// Early-exit gates that must not call InspectHead, plus local mismatch which does.
+	// All cases carry fixer provenance so the gates under test are reached.
 	cases := []struct {
 		name        string
 		loop        storage.LoopRecord
@@ -5873,12 +5923,19 @@ func TestRunPrepareWorktreeStepDirtyAdoptEarlyExitGatesSkipInspectHead(t *testin
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			repoPath := t.TempDir()
+			worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+			wtPath := filepath.Join(worktreeRoot, "wt-42")
+			if err := os.MkdirAll(wtPath, 0o755); err != nil {
+				t.Fatalf("MkdirAll worktree: %v", err)
+			}
+			metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 			inspectResults := []InspectHeadResult{{HeadSHA: "base-head", HasUncommittedChanges: true}}
 			if tc.inspectHead != "" {
 				inspectResults = []InspectHeadResult{{HeadSHA: tc.inspectHead, HasUncommittedChanges: true}}
 			}
 			git := &fakeGitGateway{
-				createResult:   CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+				createResult:   CreateWorktreeResult{WorktreePath: wtPath, Branch: "feature/fix-42", HeadSHA: "base-head"},
 				prepareResult:  PrepareWorktreeResult{HeadSHA: tc.prepareHead, Clean: false},
 				inspectResults: inspectResults,
 			}
@@ -5888,15 +5945,25 @@ func TestRunPrepareWorktreeStepDirtyAdoptEarlyExitGatesSkipInspectHead(t *testin
 				detail.HeadSHA = tc.detailHead
 			}
 			checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
-				Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
-				Loop:       tc.loop,
-				Repo:       "acme/looper",
-				PRNumber:   42,
-				Checkpoint: fixerCheckpoint{Detail: detail},
+				Project:  storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+				Loop:     tc.loop,
+				Repo:     "acme/looper",
+				PRNumber: 42,
+				Checkpoint: fixerCheckpoint{
+					Detail:   detail,
+					Worktree: &checkpointWorktree{Path: wtPath, Branch: "feature/fix-42"},
+				},
 			})
 			assertPrepareDirtyManualIntervention(t, checkpoint, err)
 			if len(git.inspectCalls) != tc.wantInspect {
 				t.Fatalf("len(git.inspectCalls) = %d, want %d", len(git.inspectCalls), tc.wantInspect)
+			}
+			// Dirty non-adopt on rewind must not CleanupWorktree (preserve evidence).
+			if len(git.cleanupCalls) != 0 {
+				t.Fatalf("len(git.cleanupCalls) = %d, want 0 after rejected adopt", len(git.cleanupCalls))
+			}
+			if len(git.createCalls) != 0 {
+				t.Fatalf("len(git.createCalls) = %d, want 0 (no recreate after dirty MI)", len(git.createCalls))
 			}
 		})
 	}

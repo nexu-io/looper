@@ -274,12 +274,21 @@ is correct and should be preserved.
 #### Fixer same-head dirty adopt (daemon-owned managed worktrees)
 
 Fixer `runPrepareWorktreeStep` has a narrow exception when prepare finds a dirty
-managed worktree but **local HEAD still matches the expected PR head**:
+managed worktree but **local HEAD still matches the expected PR head** and the
+checkpoint already has **fixer provenance** for that path:
 
 - Managed fixer worktrees are daemon-owned unless human takeover / HITL.
 - Dirt after an agent interrupt (HEAD unchanged) is treated as authorized partial
   agent output: **default-adopt** and continue (no reset/clean, no discard).
+- Provenance: `checkpoint.Worktree.Path` already points at the managed path
+  (prior fixer prepare in this loop). Shared project/PR directory names alone
+  do **not** authorize adopt — reviewer/worker dirt at the same detached path
+  stays `manual_intervention`.
+- On prepare-retry rewind (`PreparedAt` cleared, path kept), same-head adopt
+  (or clean re-stamp) runs **before** `CleanupWorktree` so interrupt leftovers
+  are not force-deleted.
 - Gates (all required):
+  - fixer worktree provenance for the path (above);
   - loop status is **not** `human_takeover` or `awaiting_human`;
   - loop metadata has **no** pending `takeoverResume`;
   - expected PR head is known (`detail.HeadSHA` non-empty);
@@ -289,7 +298,7 @@ managed worktree but **local HEAD still matches the expected PR head**:
 - Gateway `PrepareWorktree` still returns `Clean: false` when dirty; fixer must
   inspect local HEAD separately (`prepared.HeadSHA` is remote when dirty).
 - After adopt, later `reconcileCommits` may auto-commit dirt when allowed;
-  rewind/cleanup may destroy dirt under the daemon-owned model.
+  rejected adopt still falls through to cleanup/recreate under the daemon-owned model.
 
 #### Optional narrow future automation
 

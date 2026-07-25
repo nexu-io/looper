@@ -2625,8 +2625,35 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 			return checkpoint, nil
 		}
 	}
+	// Interrupted-repair rewind clears PreparedAt while keeping Path. Same-head
+	// adopt (and clean re-stamp) must run before CleanupWorktree so partial
+	// agent output is not force-deleted on repair retries. Dirty non-adopt
+	// stays MI without cleanup (preserve human/cross-head evidence).
 	if shouldRebuildWorktree(checkpoint) && checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.Branch != "" {
-		if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)})}); err != nil {
+		existingPath := checkpoint.Worktree.Path
+		existingBranch := firstNonEmpty(checkpoint.Worktree.Branch, branch)
+		preparedExisting, prepErr := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{
+			RepoPath:        input.Project.RepoPath,
+			WorktreeRoot:    worktreeRoot,
+			WorktreePath:    existingPath,
+			Branch:          existingBranch,
+			ExpectedHeadSHA: detailHeadSHA(checkpoint.Detail),
+		})
+		if prepErr == nil {
+			if preparedExisting.Clean {
+				return r.finishPreparedWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, existingPath, preparedExisting.HeadSHA), nil
+			}
+			createdExisting := CreateWorktreeResult{WorktreePath: existingPath, Branch: existingBranch, HeadSHA: preparedExisting.HeadSHA}
+			if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, existingBranch, worktreeRoot, createdExisting, preparedExisting); adoptErr != nil {
+				return checkpoint, adoptErr
+			} else if adopted {
+				return next, nil
+			}
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
+			return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", existingBranch), kind: FailureManualIntervention}
+		}
+		if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: existingPath, Branch: existingBranch, ProtectedBranches: compactStrings([]string{detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch)})}); err != nil {
 			return checkpoint, err
 		}
 	}
@@ -2639,11 +2666,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		return checkpoint, err
 	}
 	if !prepared.Clean {
-		// Same-head dirty adopt: managed fixer worktrees are daemon-owned unless
-		// human takeover/HITL. When local HEAD still matches the expected PR head,
-		// treat uncommitted dirt as authorized partial agent output (e.g. interrupt)
-		// and continue. Later reconcileCommits may auto-commit; rewind/cleanup may
-		// destroy dirt under the daemon-owned model. Cross-head dirty stays MI.
+		// Same-head dirty adopt only with fixer provenance (checkpoint already
+		// points at this managed path). HEAD equality alone must not authorize
+		// adopting dirt left by a reviewer/worker at the shared PR path.
 		if adopted, next, adoptErr := r.tryAdoptDirtyFixerWorktree(ctx, input, checkpoint, branch, worktreeRoot, created, prepared); adoptErr != nil {
 			return checkpoint, adoptErr
 		} else if adopted {
@@ -2653,19 +2678,29 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
 		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
-	preparedAt := r.nowISO()
-	checkpoint.Worktree = &checkpointWorktree{Path: created.WorktreePath, Branch: branch, HeadSHA: prepared.HeadSHA, BaseHeadSHA: prepared.HeadSHA, PreparedAt: preparedAt}
-	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
-	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": created.WorktreePath, "headSha": nilIfEmpty(prepared.HeadSHA), "preparedAt": preparedAt}})
-	return checkpoint, nil
+	return r.finishPreparedWorktree(ctx, input, checkpoint, branch, worktreeRoot, created.WorktreePath, prepared.HeadSHA), nil
 }
 
-// tryAdoptDirtyFixerWorktree adopts a dirty managed fixer worktree when local HEAD
-// still matches the expected PR head and the loop is not under human control.
+func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot, worktreePath, headSHA string) fixerCheckpoint {
+	preparedAt := r.nowISO()
+	checkpoint.Worktree = &checkpointWorktree{Path: worktreePath, Branch: branch, HeadSHA: headSHA, BaseHeadSHA: headSHA, PreparedAt: preparedAt}
+	checkpoint.ensureLifecycle("fixer", branch, firstNonEmpty(detailBaseRefName(checkpoint.Detail), derefString(input.Project.BaseBranch), "main"), false)
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.prepared", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "path": worktreePath, "headSha": nilIfEmpty(headSHA), "preparedAt": preparedAt}})
+	return checkpoint
+}
+
+// tryAdoptDirtyFixerWorktree adopts a dirty managed fixer worktree when:
+//   - the checkpoint already has fixer provenance for this path (prior prepare),
+//   - local HEAD still matches the expected PR head, and
+//   - the loop is not under human control.
+//
 // PrepareWorktree returns remote HeadSHA when dirty (Clean:false); local HEAD must
 // be read via InspectHead. Returns adopted=false to keep the MI path.
 func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot string, created CreateWorktreeResult, prepared PrepareWorktreeResult) (bool, fixerCheckpoint, error) {
+	if !hasFixerWorktreeProvenance(checkpoint, created.WorktreePath) {
+		return false, checkpoint, nil
+	}
 	switch input.Loop.Status {
 	case string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusAwaitingHuman):
 		return false, checkpoint, nil
@@ -2717,6 +2752,36 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 		},
 	})
 	return true, checkpoint, nil
+}
+
+// hasFixerWorktreeProvenance is true when this fixer checkpoint already recorded
+// the managed path (prior prepare). Shared project/PR detached directory names
+// alone do not prove dirt belongs to this fixer (reviewer/worker may share it).
+func hasFixerWorktreeProvenance(checkpoint fixerCheckpoint, worktreePath string) bool {
+	if checkpoint.Worktree == nil {
+		return false
+	}
+	prior := strings.TrimSpace(checkpoint.Worktree.Path)
+	candidate := strings.TrimSpace(worktreePath)
+	if prior == "" || candidate == "" {
+		return false
+	}
+	return sameManagedWorktreePath(prior, candidate)
+}
+
+func sameManagedWorktreePath(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	ra, errA := filepath.EvalSymlinks(a)
+	rb, errB := filepath.EvalSymlinks(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return ra == rb
 }
 
 func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
