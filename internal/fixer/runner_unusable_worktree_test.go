@@ -39,6 +39,13 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		t.Fatalf("WriteFile corruptLinked .git: %v", err)
 	}
 
+	// Malformed .git file (not a gitdir: pointer). Real git reports
+	// "fatal: invalid gitfile format"; probe must treat as unusable.
+	malformedGitfile := t.TempDir()
+	if err := os.WriteFile(filepath.Join(malformedGitfile, ".git"), []byte("not-a-valid-gitfile\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+
 	// Ordinary checkout with .git/HEAD present.
 	usableDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(usableDir, ".git"), 0o755); err != nil {
@@ -49,6 +56,7 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	}
 
 	remoteIntegrityText := errors.New("fatal: not a git repository (or any of the parent directories): .git")
+	invalidGitfileText := errors.New("fatal: invalid gitfile format: .git")
 
 	cases := []struct {
 		name    string
@@ -68,6 +76,10 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		{name: "not_a_working_tree_usable", path: usable, prepErr: fmt.Errorf("fatal: %s is not a working tree", usable), want: false},
 		// Existing but empty/corrupt linked gitdir must recreate (not preserve forever).
 		{name: "not_a_git_repository_corrupt_linked_gitdir", path: corruptLinked, prepErr: remoteIntegrityText, want: true},
+		// Malformed gitfile + Git's distinct error must recreate (not retry forever).
+		{name: "invalid_gitfile_format_malformed", path: malformedGitfile, prepErr: invalidGitfileText, want: true},
+		// Usable checkout must not be force-cleaned even if error text mentions gitfile.
+		{name: "invalid_gitfile_format_usable", path: usable, prepErr: invalidGitfileText, want: false},
 		// Regression: external ssh/fetch text must not classify a live checkout as unusable.
 		{name: "ssh_no_such_file", path: existing, prepErr: errors.New("error: cannot run ssh: No such file or directory\nfatal: unable to fork"), want: false},
 		{name: "fetch_transport", path: existing, prepErr: errors.New("git fetch origin feature/fix-42: fatal: unable to access remote"), want: false},
@@ -147,6 +159,23 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("corrupt-only path still exists after clear, err=%v", err)
+		}
+	})
+
+	t.Run("only_malformed_gitfile_removed", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "malformed-gitfile")
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(path, ".git"), []byte("garbage-not-gitdir\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile .git: %v", err)
+		}
+		if err := clearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("malformed-only path still exists after clear, err=%v", err)
 		}
 	})
 }

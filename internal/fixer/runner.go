@@ -6207,8 +6207,11 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 	// Integrity-looking phrases are necessary but not sufficient: remote
 	// helpers/servers can emit the same text. Do not substring-match generic
 	// existence phrases either — external dependency errors share that wording.
+	// "invalid gitfile format" is Git's distinct message for a .git file that is
+	// not a gitdir: pointer (malformed retained metadata).
 	looksLikeLocalIntegrity := strings.Contains(msg, "not a working tree") ||
-		strings.Contains(msg, "not a git repository")
+		strings.Contains(msg, "not a git repository") ||
+		strings.Contains(msg, "invalid gitfile format")
 	if !looksLikeLocalIntegrity {
 		return false
 	}
@@ -6222,6 +6225,9 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 // require HEAD in the ordinary .git dir or the linked private gitdir so empty or
 // corrupt private dirs are treated as unusable (real git reports "not a git
 // repository") and prepare can enter the recreate path instead of retrying forever.
+// A non-empty .git file that is not a gitdir: pointer is also unusable: real Git
+// reports "fatal: invalid gitfile format" and prepare must recreate rather than
+// retry forever on retained broken metadata.
 func localFixerWorktreeCheckoutUsable(path string) bool {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -6258,8 +6264,9 @@ func localFixerWorktreeCheckoutUsable(path string) bool {
 	}
 	const prefix = "gitdir:"
 	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
-		// Non-empty .git file without gitdir: still local metadata; treat usable.
-		return true
+		// Malformed gitfile: real Git rejects non-gitdir: content as
+		// "invalid gitfile format". Treat as unusable so prepare can recreate.
+		return false
 	}
 	gitdir := strings.TrimSpace(line[len(prefix):])
 	if gitdir == "" {
