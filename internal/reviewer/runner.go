@@ -2336,6 +2336,13 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			step = stepWorktree
 		}
 		if err := r.persistCheckpoint(ctx, input.Run.ID, step, checkpoint); err != nil {
+			// CreateWorktree already cleared the fixer marker. If intermediate
+			// checkpoint persistence fails we never reach Prepare, so restore
+			// provenance here — otherwise the next fixer retry cannot prove
+			// ownership and is forced into MI despite preserved dirt.
+			if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
+				return checkpoint, fmt.Errorf("restore fixer owner token after checkpoint persist failure: %w (persist error: %v)", restoreErr, err)
+			}
 			return checkpoint, err
 		}
 	}
