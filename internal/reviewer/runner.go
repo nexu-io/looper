@@ -1641,6 +1641,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}()
+	// After successful lock reacquisition (or when no lock key is required), revoke
+	// fixer ownership before reusing a prepared path past stepWorktree.
+	// CreateWorktree/RestoreWorktree will not run on that resume path, so this is
+	// the claim-time authority handoff. Must run after the release defer so a
+	// clear failure still drops the PR lock.
+	if resumedRun.Resumed && resumedRun.StartStep != stepClaim && resumedRun.StartStep != stepWorktree && checkpoint.Worktree != nil {
+		if err := worktreesafety.ClearFixerOwnerToken(checkpoint.Worktree.Path); err != nil {
+			return ProcessResult{}, err
+		}
+	}
 	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
@@ -4616,14 +4626,10 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			if startStep == stepReview && initialCheckpoint.Worktree != nil {
 				initialCheckpoint.Worktree.PreparedAt = ""
 			}
-			// Resuming past the worktree step reuses the prepared path without
-			// CreateWorktree/RestoreWorktree — revoke fixer ownership now so a
-			// fixer token stamped between attempts cannot authorize reviewer dirt.
-			if startStep != stepWorktree && initialCheckpoint.Worktree != nil {
-				if err := worktreesafety.ClearFixerOwnerToken(initialCheckpoint.Worktree.Path); err != nil {
-					return resumedRunContext{}, err
-				}
-			}
+			// Fixer-owner invalidation for resume-past-worktree is deferred until
+			// ProcessClaimedItem successfully reacquires the PR lock. Clearing
+			// here would revoke an active fixer's marker even when lock
+			// reacquisition fails and this reviewer never claims the checkout.
 		}
 	}
 	nowISO := r.nowISO()

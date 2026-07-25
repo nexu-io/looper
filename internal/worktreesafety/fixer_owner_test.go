@@ -96,27 +96,22 @@ func TestClearFixerOwnerTokenPropagatesRemoveFailure(t *testing.T) {
 	if err := os.MkdirAll(gitDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll .git: %v", err)
 	}
+	// Induce a deterministic remove failure without relying on directory
+	// permissions: os.Remove refuses a non-empty directory. chmod 0555 is not
+	// reliable under root or CAP_DAC_OVERRIDE (common in CI containers).
 	marker := filepath.Join(gitDir, FixerOwnerTokenFile)
-	if err := os.WriteFile(marker, []byte("token\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile marker: %v", err)
+	if err := os.Mkdir(marker, 0o755); err != nil {
+		t.Fatalf("Mkdir marker: %v", err)
 	}
-	// Make the private git dir non-writable so remove fails on Unix.
-	if err := os.Chmod(gitDir, 0o555); err != nil {
-		t.Fatalf("Chmod gitDir: %v", err)
+	if err := os.WriteFile(filepath.Join(marker, "child"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile marker child: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(gitDir, 0o755) })
 
 	err := ClearFixerOwnerToken(wt)
 	if err == nil {
-		// Some platforms still allow remove despite dir mode; force-check by
-		// making the marker a non-empty directory instead is not possible for a
-		// file. Skip when the OS does not enforce this permission model.
-		if _, statErr := os.Stat(marker); statErr == nil {
-			t.Skip("platform allowed remove on read-only directory")
-		}
 		t.Fatal("ClearFixerOwnerToken() error = nil, want remove failure")
 	}
-	if got := ReadFixerOwnerToken(wt); got == "" {
-		t.Fatal("token was cleared despite clear error; authority must remain revoked only on success")
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("marker removed despite clear error: %v", statErr)
 	}
 }
