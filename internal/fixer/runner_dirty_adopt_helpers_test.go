@@ -226,6 +226,12 @@ func (g *countingRealGitGateway) CleanupWorktree(ctx context.Context, input Clea
 	})
 }
 
+func tryRunGit(cwd string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = cwd
+	return cmd.Run()
+}
+
 func mustRunGit(t *testing.T, cwd string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

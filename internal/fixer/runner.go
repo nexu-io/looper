@@ -6227,13 +6227,11 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 // localFixerWorktreeCheckoutUsable reports whether path has local git metadata
 // without contacting remotes. Linked worktrees use a .git file (gitdir pointer);
 // ordinary checkouts use a .git directory. Metadata presence alone is not enough:
-// require HEAD in the ordinary .git dir or the linked private gitdir so empty or
-// corrupt private dirs are treated as unusable (real git reports "not a git
-// repository") and prepare can enter the recreate path instead of retrying forever.
-// Linked private gitdirs must also resolve a usable common repository via
-// commondir: missing/empty/dangling commondir still leaves HEAD on disk but
-// makes real Git report "not a git repository", so prepare must recreate rather
-// than preserve the broken checkout forever.
+// ordinary repos and the linked common repository need full non-remote integrity
+// (HEAD + objects/ + refs/), and linked private gitdirs need HEAD plus a
+// resolvable usable common repo via commondir. Empty or corrupt metadata makes
+// real Git report "not a git repository", so prepare can recreate instead of
+// retrying forever.
 // A non-empty .git file that is not a gitdir: pointer is also unusable: real Git
 // reports "fatal: invalid gitfile format" and prepare must recreate rather than
 // retry forever on retained broken metadata.
@@ -6248,9 +6246,8 @@ func localFixerWorktreeCheckoutUsable(path string) bool {
 		return false
 	}
 	if info.IsDir() {
-		// Ordinary checkout: require HEAD so empty/.git stubs do not count.
-		_, err := os.Stat(filepath.Join(gitMeta, "HEAD"))
-		return err == nil
+		// Ordinary checkout: require full local repository metadata.
+		return localGitRepositoryMetadataUsable(gitMeta)
 	}
 	// Linked worktree or gitfile: .git is a regular file (or symlink to one).
 	if info.Mode()&os.ModeSymlink != 0 {
@@ -6259,8 +6256,7 @@ func localFixerWorktreeCheckoutUsable(path string) bool {
 			return false
 		}
 		if target.IsDir() {
-			_, err := os.Stat(filepath.Join(gitMeta, "HEAD"))
-			return err == nil
+			return localGitRepositoryMetadataUsable(gitMeta)
 		}
 	}
 	data, err := os.ReadFile(gitMeta)
@@ -6291,13 +6287,37 @@ func localFixerWorktreeCheckoutUsable(path string) bool {
 		return false
 	}
 	// commondir is required for linked worktrees: without it (or when it does not
-	// resolve to a common repo with HEAD), Git 2.43+ still fails with
-	// "fatal: not a git repository" even though private HEAD remains.
+	// resolve to a common repo with full local integrity), Git 2.43+ still fails
+	// with "fatal: not a git repository" even though private HEAD remains.
 	return linkedPrivateGitdirCommonUsable(gitdir)
 }
 
+// localGitRepositoryMetadataUsable is a non-remote integrity probe for a Git
+// repository directory (ordinary .git or a linked worktree common repo).
+// HEAD alone is insufficient: Git 2.43+ also requires objects/ and refs/ and
+// reports "fatal: not a git repository" when either directory is missing.
+func localGitRepositoryMetadataUsable(dir string) bool {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
+		return false
+	}
+	objects, err := os.Stat(filepath.Join(dir, "objects"))
+	if err != nil || !objects.IsDir() {
+		return false
+	}
+	refs, err := os.Stat(filepath.Join(dir, "refs"))
+	if err != nil || !refs.IsDir() {
+		return false
+	}
+	return true
+}
+
 // linkedPrivateGitdirCommonUsable reports whether a linked worktree private
-// gitdir has a readable commondir that resolves to a common repository with HEAD.
+// gitdir has a readable commondir that resolves to a common repository with
+// non-remote integrity (HEAD + objects/ + refs/).
 func linkedPrivateGitdirCommonUsable(gitdir string) bool {
 	data, err := os.ReadFile(filepath.Join(gitdir, "commondir"))
 	if err != nil {
@@ -6311,8 +6331,7 @@ func linkedPrivateGitdirCommonUsable(gitdir string) bool {
 		common = filepath.Join(gitdir, common)
 	}
 	common = filepath.Clean(common)
-	_, err = os.Stat(filepath.Join(common, "HEAD"))
-	return err == nil
+	return localGitRepositoryMetadataUsable(common)
 }
 
 // errUnusableFixerWorktreePreserved signals that an unusable worktree path still

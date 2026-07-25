@@ -40,24 +40,19 @@ func TestRunPrepareWorktreeStepPrepareErrorPreservesExistingWorktree(t *testing.
 			t.Parallel()
 			f := newDirtyAdoptFixture(t)
 			if tc.withGitMeta {
-				// Linked-worktree-style local metadata with required HEAD +
-				// resolvable commondir so the probe treats the checkout as
-				// usable despite integrity-looking prepare stderr (HEAD alone
-				// is not enough for a linked private gitdir).
+				// Linked-worktree-style local metadata with required private
+				// HEAD + resolvable common repo integrity (HEAD + objects/ +
+				// refs/) so the probe treats the checkout as usable despite
+				// integrity-looking prepare stderr.
 				gitdir := filepath.Join(t.TempDir(), "gitdir")
 				common := filepath.Join(t.TempDir(), "common")
 				if err := os.MkdirAll(gitdir, 0o755); err != nil {
 					t.Fatalf("MkdirAll gitdir: %v", err)
 				}
-				if err := os.MkdirAll(common, 0o755); err != nil {
-					t.Fatalf("MkdirAll common: %v", err)
-				}
 				if err := os.WriteFile(filepath.Join(gitdir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 					t.Fatalf("WriteFile gitdir HEAD: %v", err)
 				}
-				if err := os.WriteFile(filepath.Join(common, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-					t.Fatalf("WriteFile common HEAD: %v", err)
-				}
+				writeMinimalGitRepoMetadata(t, common)
 				if err := os.WriteFile(filepath.Join(gitdir, "commondir"), []byte(common+"\n"), 0o644); err != nil {
 					t.Fatalf("WriteFile commondir: %v", err)
 				}

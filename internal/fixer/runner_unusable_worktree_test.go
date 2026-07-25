@@ -8,6 +8,21 @@ import (
 	"testing"
 )
 
+// writeMinimalGitRepoMetadata creates non-remote repository integrity metadata
+// (HEAD + objects/ + refs/) that Git 2.43 accepts as a repository root.
+func writeMinimalGitRepoMetadata(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "objects"), 0o755); err != nil {
+		t.Fatalf("MkdirAll objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "refs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll refs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+}
+
 func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	t.Parallel()
 
@@ -15,23 +30,18 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "gone")
 
 	// Valid linked-worktree-style checkout: .git file points at a private gitdir
-	// that still has required metadata (HEAD + resolvable commondir). Existence
-	// of the private dir alone is not enough.
+	// that still has required metadata (HEAD + resolvable common repo integrity).
+	// Existence of the private dir alone is not enough.
 	usable := t.TempDir()
 	gitdir := filepath.Join(t.TempDir(), "gitdir")
 	common := filepath.Join(t.TempDir(), "common")
 	if err := os.MkdirAll(gitdir, 0o755); err != nil {
 		t.Fatalf("MkdirAll gitdir: %v", err)
 	}
-	if err := os.MkdirAll(common, 0o755); err != nil {
-		t.Fatalf("MkdirAll common: %v", err)
-	}
 	if err := os.WriteFile(filepath.Join(gitdir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile usable gitdir HEAD: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(common, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile usable common HEAD: %v", err)
-	}
+	writeMinimalGitRepoMetadata(t, common)
 	if err := os.WriteFile(filepath.Join(gitdir, "commondir"), []byte(common+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile usable commondir: %v", err)
 	}
@@ -81,6 +91,30 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		t.Fatalf("WriteFile danglingCommondir .git: %v", err)
 	}
 
+	// Linked private gitdir has HEAD + commondir, but common only has HEAD
+	// (missing objects/refs). Real git reports "not a git repository".
+	corruptCommon := t.TempDir()
+	corruptCommonGitdir := filepath.Join(t.TempDir(), "corrupt-common-gitdir")
+	headOnlyCommon := filepath.Join(t.TempDir(), "head-only-common")
+	if err := os.MkdirAll(corruptCommonGitdir, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptCommonGitdir: %v", err)
+	}
+	if err := os.MkdirAll(headOnlyCommon, 0o755); err != nil {
+		t.Fatalf("MkdirAll headOnlyCommon: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptCommonGitdir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile corruptCommon private HEAD: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(headOnlyCommon, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile headOnlyCommon HEAD: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptCommonGitdir, "commondir"), []byte(headOnlyCommon+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile corruptCommon commondir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptCommon, ".git"), []byte("gitdir: "+corruptCommonGitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile corruptCommon .git: %v", err)
+	}
+
 	// Malformed .git file (not a gitdir: pointer). Real git reports
 	// "fatal: invalid gitfile format"; probe must treat as unusable.
 	malformedGitfile := t.TempDir()
@@ -88,13 +122,17 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		t.Fatalf("WriteFile malformed .git: %v", err)
 	}
 
-	// Ordinary checkout with .git/HEAD present.
+	// Ordinary checkout with full local repository metadata.
 	usableDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(usableDir, ".git"), 0o755); err != nil {
-		t.Fatalf("MkdirAll usableDir .git: %v", err)
+	writeMinimalGitRepoMetadata(t, filepath.Join(usableDir, ".git"))
+
+	// Ordinary checkout with only HEAD (missing objects/refs) is unusable.
+	headOnlyDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(headOnlyDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll headOnlyDir .git: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(usableDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile HEAD: %v", err)
+	if err := os.WriteFile(filepath.Join(headOnlyDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile headOnlyDir HEAD: %v", err)
 	}
 
 	remoteIntegrityText := errors.New("fatal: not a git repository (or any of the parent directories): .git")
@@ -118,9 +156,12 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		{name: "not_a_working_tree_usable", path: usable, prepErr: fmt.Errorf("fatal: %s is not a working tree", usable), want: false},
 		// Existing but empty/corrupt linked gitdir must recreate (not preserve forever).
 		{name: "not_a_git_repository_corrupt_linked_gitdir", path: corruptLinked, prepErr: remoteIntegrityText, want: true},
-		// HEAD present but missing/dangling commondir must recreate (not preserve forever).
+		// HEAD present but missing/dangling/corrupt common must recreate (not preserve forever).
 		{name: "not_a_git_repository_missing_commondir", path: missingCommondir, prepErr: remoteIntegrityText, want: true},
 		{name: "not_a_git_repository_dangling_commondir", path: danglingCommondir, prepErr: remoteIntegrityText, want: true},
+		{name: "not_a_git_repository_corrupt_common_objects", path: corruptCommon, prepErr: remoteIntegrityText, want: true},
+		// Ordinary checkout with only HEAD (no objects/refs) must recreate.
+		{name: "not_a_git_repository_head_only_gitdir", path: headOnlyDir, prepErr: remoteIntegrityText, want: true},
 		// Malformed gitfile + Git's distinct error must recreate (not retry forever).
 		{name: "invalid_gitfile_format_malformed", path: malformedGitfile, prepErr: invalidGitfileText, want: true},
 		// Usable checkout must not be force-cleaned even if error text mentions gitfile.
