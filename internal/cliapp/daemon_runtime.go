@@ -745,7 +745,16 @@ func splitLogLines(content string) []string {
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
+	// Trusted proxy children receive a one-shot config pipe on an inherited FD.
+	// Memoize success and failure so a second loadConfig never re-reads after
+	// the descriptor is closed (which surfaces as EBADF).
+	if r.trustedReviewConfigLoaded {
+		return r.trustedReviewConfig, r.trustedReviewConfigErr
+	}
 	if loaded, configured, err := forge.LoadTrustedReviewConfigSnapshot(); configured {
+		r.trustedReviewConfigLoaded = true
+		r.trustedReviewConfig = loaded
+		r.trustedReviewConfigErr = err
 		if err != nil {
 			return config.LoadedFileConfig{}, err
 		}

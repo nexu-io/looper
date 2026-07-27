@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -335,11 +336,17 @@ func TestTrustedReviewSockConfigured(t *testing.T) {
 	if TrustedReviewSockConfigured() {
 		t.Fatal("TrustedReviewSockConfigured() = true, want false when unset")
 	}
+	if TrustedReviewProxyChildConfigured() {
+		t.Fatal("TrustedReviewProxyChildConfigured() = true, want false when unset")
+	}
 	t.Setenv(TrustedReviewSockEnv, "/tmp/sock")
 	if !TrustedReviewSockConfigured() {
 		t.Fatal("TrustedReviewSockConfigured() = false, want true when sock set")
 	}
 	t.Setenv(trustedReviewProxySkipEnv, "1")
+	if !TrustedReviewProxyChildConfigured() {
+		t.Fatal("TrustedReviewProxyChildConfigured() = false, want true for proxy child")
+	}
 	if TrustedReviewSockConfigured() {
 		t.Fatal("TrustedReviewSockConfigured() = true, want false for proxy child")
 	}
@@ -356,7 +363,7 @@ func TestTrustedReviewProxyChildEnvOmitsSocketAndFile(t *testing.T) {
 		TrustedEnvFileEnv:         "/tmp/agent-controlled-secret-file",
 		trustedReviewProxySkipEnv: "",
 		"LOOPER_CONFIG":           "/tmp/agent-controlled-config.json",
-	}, 3)
+	}, TrustedReviewConfigChildFD)
 	joined := strings.Join(env, "\n")
 	if strings.Contains(joined, TrustedReviewSockEnv+"=") {
 		t.Fatalf("child env still has %s", TrustedReviewSockEnv)
@@ -370,7 +377,7 @@ func TestTrustedReviewProxyChildEnvOmitsSocketAndFile(t *testing.T) {
 	if !strings.Contains(joined, trustedReviewProxySkipEnv+"=1") {
 		t.Fatalf("child env missing skip marker: %s", joined)
 	}
-	if !strings.Contains(joined, TrustedReviewConfigFDEnv+"=3") {
+	if !strings.Contains(joined, TrustedReviewConfigFDEnv+"="+strconv.Itoa(TrustedReviewConfigChildFD)) {
 		t.Fatalf("child env missing trusted config descriptor: %s", joined)
 	}
 	if strings.Contains(joined, "LOOPER_CONFIG=") {

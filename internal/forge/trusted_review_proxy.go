@@ -37,6 +37,11 @@ const trustedReviewProxySkipEnv = "LOOPER_TRUSTED_REVIEW_PROXY_CHILD"
 // rewrite the snapshot between proxy minting and review submission.
 const TrustedReviewConfigFDEnv = "LOOPER_TRUSTED_REVIEW_CONFIG_FD"
 
+// TrustedReviewConfigChildFD is the child file descriptor for the config
+// snapshot pipe. Go's os/exec maps ExtraFiles[i] to FD 3+i, so the first
+// ExtraFile is always FD 3 (after stdin/stdout/stderr).
+const TrustedReviewConfigChildFD = 3
+
 const (
 	maxTrustedReviewProxyConnections   = 4
 	maxTrustedReviewProxyRequestBytes  = 2 << 20
@@ -267,7 +272,7 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	// provider-qualified same-owner/repo checkouts is CWD-sensitive. The child
 	// always runs in the daemon-selected worktree bound at proxy start.
 	cmd.Dir = allowedCwd
-	cmd.Env = trustedReviewProxyChildEnv(trustedEnv, 3)
+	cmd.Env = trustedReviewProxyChildEnv(trustedEnv, TrustedReviewConfigChildFD)
 	cmd.Stdin = bytes.NewReader(req.Stdin)
 	stdout := newTrustedReviewBoundedBuffer(maxTrustedReviewProxyOutputBytes)
 	stderr := newTrustedReviewBoundedBuffer(maxTrustedReviewProxyOutputBytes)
@@ -746,13 +751,24 @@ func marshalTrustedReviewConfigSnapshot(source config.Config) ([]byte, error) {
 	return encoded, nil
 }
 
+// TrustedReviewProxyChildConfigured reports whether this process is a
+// daemon-spawned trusted review-submit child (credential-bearing, snapshot via
+// inherited FD). Callers must not run ambient CLI side effects such as
+// auto-upgrade that would consume the one-shot config descriptor.
+func TrustedReviewProxyChildConfigured() bool {
+	return strings.TrimSpace(os.Getenv(trustedReviewProxySkipEnv)) != ""
+}
+
 // LoadTrustedReviewConfigSnapshot consumes the exact materialized snapshot
 // supplied to a proxy child. It intentionally bypasses normal config file,
 // environment, and CLI precedence: those layers were already resolved by the
 // daemon when it captured the run. Provider credential variables remain in the
 // child environment for the selected transport but cannot rewrite this config.
+//
+// The descriptor is one-shot: this function closes it. Callers that may invoke
+// load more than once must memoize the result (see commandRuntime.loadConfig).
 func LoadTrustedReviewConfigSnapshot() (config.LoadedFileConfig, bool, error) {
-	if strings.TrimSpace(os.Getenv(trustedReviewProxySkipEnv)) == "" {
+	if !TrustedReviewProxyChildConfigured() {
 		return config.LoadedFileConfig{}, false, nil
 	}
 	rawFD := strings.TrimSpace(os.Getenv(TrustedReviewConfigFDEnv))
@@ -760,7 +776,7 @@ func LoadTrustedReviewConfigSnapshot() (config.LoadedFileConfig, bool, error) {
 		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config descriptor is required")
 	}
 	fd, err := strconv.ParseUint(rawFD, 10, 64)
-	if err != nil || fd < 3 {
+	if err != nil || fd < TrustedReviewConfigChildFD {
 		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config descriptor is invalid")
 	}
 	file := os.NewFile(uintptr(fd), "trusted-review-config")
@@ -768,6 +784,10 @@ func LoadTrustedReviewConfigSnapshot() (config.LoadedFileConfig, bool, error) {
 		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config descriptor is unavailable")
 	}
 	defer file.Close()
+	// Drop the selector before reading so descendants cannot inherit a stale FD
+	// number after this process closes the descriptor. Child-mode env stays set
+	// so proxy re-entry remains blocked.
+	_ = os.Unsetenv(TrustedReviewConfigFDEnv)
 	limited := &io.LimitedReader{R: file, N: maxTrustedReviewConfigSnapshotSize + 1}
 	raw, err := io.ReadAll(limited)
 	if err != nil {
@@ -820,7 +840,7 @@ func trustedReviewProxyChildEnv(trustedEnv map[string]string, configFD int) []st
 	delete(envMap, TrustedReviewConfigFDEnv)
 	delete(envMap, "LOOPER_CONFIG")
 	envMap[trustedReviewProxySkipEnv] = "1"
-	if configFD >= 3 {
+	if configFD >= TrustedReviewConfigChildFD {
 		envMap[TrustedReviewConfigFDEnv] = strconv.Itoa(configFD)
 	}
 	out := make([]string, 0, len(envMap))
@@ -878,7 +898,7 @@ func (b *trustedReviewBoundedBuffer) Truncated() bool {
 // TrustedReviewSockConfigured reports whether this process should proxy
 // `review submit` through the daemon-side trusted socket.
 func TrustedReviewSockConfigured() bool {
-	if strings.TrimSpace(os.Getenv(trustedReviewProxySkipEnv)) != "" {
+	if TrustedReviewProxyChildConfigured() {
 		return false
 	}
 	return strings.TrimSpace(os.Getenv(TrustedReviewSockEnv)) != ""

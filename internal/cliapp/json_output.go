@@ -26,6 +26,12 @@ type commandRuntime struct {
 	startupOutputPath  string
 	skipAPIStartProbe  bool
 	emittedConfigNotes map[string]struct{}
+	// trustedReviewConfig* memoize the one-shot inherited snapshot FD. Auto-
+	// upgrade skips trusted children, but any second loadConfig in the same
+	// process must not re-read a closed descriptor (EBADF).
+	trustedReviewConfigLoaded bool
+	trustedReviewConfig       config.LoadedFileConfig
+	trustedReviewConfigErr    error
 }
 
 func newCommandRuntime(app *App, argv []string) *commandRuntime {

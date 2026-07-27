@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -152,6 +153,13 @@ func (e *cliUpgradeRefusedError) Error() string {
 
 func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) error {
 	_ = args
+	// Trusted review-submit children are credential-bearing and receive a
+	// one-shot config snapshot FD. Auto-upgrade must not run here: it is
+	// unrelated to publication and historically consumed the FD before
+	// `review submit` could load the daemon-bound snapshot (EBADF).
+	if forge.TrustedReviewProxyChildConfigured() {
+		return nil
+	}
 	if shouldSkipAutoUpgrade(cmd) {
 		return nil
 	}
