@@ -765,8 +765,10 @@ func TrustedReviewProxyChildConfigured() bool {
 // daemon when it captured the run. Provider credential variables remain in the
 // child environment for the selected transport but cannot rewrite this config.
 //
-// The descriptor is one-shot: this function closes it. Callers that may invoke
-// load more than once must memoize the result (see commandRuntime.loadConfig).
+// The descriptor is one-shot: this function closes it and clears
+// TrustedReviewConfigFDEnv. A second call fails loud (missing descriptor or
+// EBADF). Trusted CLI entrypoints must not load config twice; auto-upgrade
+// skips trusted proxy children for that reason.
 func LoadTrustedReviewConfigSnapshot() (config.LoadedFileConfig, bool, error) {
 	if !TrustedReviewProxyChildConfigured() {
 		return config.LoadedFileConfig{}, false, nil

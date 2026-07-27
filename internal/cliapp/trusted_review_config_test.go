@@ -49,7 +49,9 @@ func TestCommandRuntimeTrustedReviewConfigIgnoresChildPrecedenceLayers(t *testin
 	}
 }
 
-func TestCommandRuntimeTrustedReviewConfigMemoizesOneShotFD(t *testing.T) {
+func TestCommandRuntimeTrustedReviewConfigClearsFDAndFailsLoudOnSecondLoad(t *testing.T) {
+	// Skip-only fix: no memoization. First load consumes the one-shot FD;
+	// a second load must fail loud so double consumers cannot mask as success.
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -69,42 +71,18 @@ func TestCommandRuntimeTrustedReviewConfigMemoizesOneShotFD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first loadConfig() error = %v", err)
 	}
+	if first.Config.Tools.GHPath == nil || *first.Config.Tools.GHPath != capturedGHPath {
+		t.Fatalf("first loadConfig().Tools.GHPath = %v, want %q", first.Config.Tools.GHPath, capturedGHPath)
+	}
 	if os.Getenv(forge.TrustedReviewConfigFDEnv) != "" {
 		t.Fatalf("TrustedReviewConfigFDEnv still set after first load; want cleared")
 	}
-	// Descriptor is closed; a second uncached LoadTrustedReviewConfigSnapshot
-	// would EBADF. Memoized loadConfig must return the same snapshot.
-	second, err := runtime.loadConfig()
-	if err != nil {
-		t.Fatalf("second loadConfig() error = %v (want memoized success, not EBADF)", err)
-	}
-	if first.Config.Tools.GHPath == nil || second.Config.Tools.GHPath == nil ||
-		*first.Config.Tools.GHPath != *second.Config.Tools.GHPath ||
-		*second.Config.Tools.GHPath != capturedGHPath {
-		t.Fatalf("memoized loadConfig mismatch: first=%v second=%v want %q", first.Config.Tools.GHPath, second.Config.Tools.GHPath, capturedGHPath)
-	}
-}
-
-func TestCommandRuntimeTrustedReviewConfigMemoizesOriginalError(t *testing.T) {
-	t.Setenv("LOOPER_TRUSTED_REVIEW_PROXY_CHILD", "1")
-	// Empty pipe (writer closed immediately) → decode/EOF, not EBADF.
-	installTrustedReviewConfigFD(t, nil)
-	runtime := &commandRuntime{argv: []string{"review", "submit", "acme/looper#42"}}
-
-	_, firstErr := runtime.loadConfig()
-	if firstErr == nil {
-		t.Fatal("first loadConfig() error = nil, want decode/EOF failure")
-	}
-
 	_, secondErr := runtime.loadConfig()
 	if secondErr == nil {
-		t.Fatal("second loadConfig() error = nil, want memoized original error")
+		t.Fatal("second loadConfig() error = nil, want fail-loud after one-shot FD consumed")
 	}
-	if firstErr.Error() != secondErr.Error() {
-		t.Fatalf("memoized error mismatch:\n first=%v\nsecond=%v", firstErr, secondErr)
-	}
-	if strings.Contains(strings.ToLower(secondErr.Error()), "bad file descriptor") {
-		t.Fatalf("second loadConfig() = %v, want original snapshot error not EBADF", secondErr)
+	if !strings.Contains(strings.ToLower(secondErr.Error()), "trusted review config descriptor") {
+		t.Fatalf("second loadConfig() = %v, want missing-descriptor failure", secondErr)
 	}
 }
 
@@ -118,9 +96,6 @@ func TestMaybeRunAutoUpgradeSkipsTrustedReviewProxyChild(t *testing.T) {
 	cmd.SetErr(&stderr)
 	if err := runtime.maybeRunAutoUpgrade(cmd, nil); err != nil {
 		t.Fatalf("maybeRunAutoUpgrade() error = %v", err)
-	}
-	if runtime.trustedReviewConfigLoaded {
-		t.Fatal("maybeRunAutoUpgrade loaded trusted config; want complete skip")
 	}
 	if os.Getenv(forge.TrustedReviewConfigFDEnv) != "3" {
 		t.Fatalf("TrustedReviewConfigFDEnv = %q, want untouched when auto-upgrade skips", os.Getenv(forge.TrustedReviewConfigFDEnv))
