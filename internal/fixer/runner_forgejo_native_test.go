@@ -57,6 +57,7 @@ func TestBuildFixerPromptAddsForgejoNativeCommentRepairResultsInstruction(t *tes
 		"`providerCommentId`",
 		"`observedFingerprint`",
 		"individual review comment is fixed, declined, or deferred",
+		"Create structured `repair_results` entries only for listed Forgejo native review comment fix items, never for collateral-only changes",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
