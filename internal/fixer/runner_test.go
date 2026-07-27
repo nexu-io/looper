@@ -111,11 +111,11 @@ func TestBuildFixerPromptIncludesMinimalPRSeedFetchContract(t *testing.T) {
 		"gh api repos/{owner}/{repo}/issues/{number}/comments --paginate",
 		"structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`",
 		"Fully address every listed fix item",
-		"smallest collateral changes that are directly required",
-		"same concrete root cause or invariant",
-		"Do not drive-by refactor",
-		"When uncertain, omit the collateral change",
-		"direct usages/dependents",
+		"coherent, durable repair of the underlying concrete root cause",
+		"smallest complete, coherent solution over the smallest diff",
+		"clear evidence that it has the same concrete root cause",
+		"Do not perform speculative hardening",
+		"If the relationship to a listed item is uncertain, omit the collateral change",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -141,11 +141,12 @@ func TestFixerRepairScopeInstructionAllowsCollateralWithoutDriveBy(t *testing.T)
 	got := fixerRepairScopeInstruction()
 	for _, want := range []string{
 		"Fully address every listed fix item",
-		"smallest collateral changes that are directly required",
-		"same concrete root cause or invariant",
-		"affected dependency chain",
-		"Do not drive-by refactor",
-		"When uncertain, omit the collateral change",
+		"coherent, durable repair of the underlying concrete root cause",
+		"dependency chain",
+		"smallest complete, coherent solution over the smallest diff",
+		"clear evidence that it has the same concrete root cause",
+		"Do not perform speculative hardening",
+		"If the relationship to a listed item is uncertain, omit the collateral change",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("scope instruction missing %q:\n%s", want, got)
@@ -157,6 +158,7 @@ func TestFixerRepairScopeInstructionAllowsCollateralWithoutDriveBy(t *testing.T)
 		"repair_results",
 		"change-class",
 		"likely force another review round",
+		"smallest collateral changes that are directly required",
 	} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("scope instruction contains unwanted %q:\n%s", unwanted, got)

@@ -7207,14 +7207,16 @@ func customInstructionConfig(value *config.Config) config.Config {
 }
 
 // fixerRepairScopeInstruction is the repair-scope fragment of the fixer agent
-// prompt. Listed fix items are the primary contract; directly coupled collateral
-// is allowed so one round can clear the same root cause instead of ping-ponging.
+// prompt. Listed fix items are the primary contract. When the link to a listed
+// item is clear, prefer a complete coherent repair of that root cause over a
+// minimal symptom patch; do not become a free-form refactor agent.
 func fixerRepairScopeInstruction() string {
 	return strings.Join([]string{
 		"Fully address every listed fix item. If a reviewer request should not be implemented, follow the applicable decline instructions below.",
-		"You may also make the smallest collateral changes that are directly required by a listed repair or that correct another occurrence of the same concrete root cause or invariant in its affected dependency chain. Examples: update direct consumers of a changed constant/default; update caps, backoff, cadence, or scheduling logic that relies on the same timing assumption; add focused tests for the repaired behavior.",
-		"Do not fix an independent issue merely because it is nearby, in the same file/module, or might be reported later. Do not drive-by refactor, rename, restyle, or otherwise improve unrelated code. When uncertain, omit the collateral change.",
-		"Before finishing, inspect the PR diff and direct usages/dependents of symbols, constants, defaults, and assumptions changed by the repair. Fix any remaining occurrence of the same failure mode in that dependency chain.",
+		"Prefer a coherent, durable repair of the underlying concrete root cause over a narrow symptom patch. When the relationship to a listed item is clear, make the changes needed to restore the affected invariant consistently across its dependency chain; do not minimize the diff if doing so would leave inconsistent behavior, partially updated consumers, or another clearly evidenced instance of the same failure mode.",
+		"Before finishing, inspect the PR diff and the relevant producers, direct usages, consumers, callers, defaults, limits, and assumptions affected by the repair. Follow the behavior through the dependency chain only as far as needed to verify consistency, and add or update focused tests for the repaired behavior. Examples: update consumers of a changed constant/default; align caps, backoff, cadence, or scheduling logic that relies on the same timing assumption; cover affected boundary and failure cases.",
+		"You may fix an unlisted occurrence only when the code provides clear evidence that it has the same concrete root cause or violates the same specific invariant and is in the dependency chain affected by a listed repair.",
+		"Do not fix an independent issue merely because it is nearby, in the same file/module, or might be reported later. Do not perform speculative hardening, broad redesigns, or drive-by refactors, renames, or restyling. If the relationship to a listed item is uncertain, omit the collateral change; if the relationship is clear but the repair breadth is uncertain, prefer the smallest complete, coherent solution over the smallest diff.",
 	}, "\n")
 }
 

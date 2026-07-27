@@ -332,7 +332,7 @@ Use this when you want to force a repair pass on demand before waiting for any a
 Fixer will:
 
 - read pending review comments and threads on the PR
-- create a worktree and apply each listed repair, plus the smallest directly coupled changes needed to correct the same root cause (unrelated cleanup stays out of scope)
+- create a worktree and apply each listed repair; when the link is clear, prefer a complete coherent fix of that root cause across the affected dependency chain (unrelated cleanup and speculative hardening stay out of scope)
 - run validation
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
