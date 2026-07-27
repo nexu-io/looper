@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/version"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 	"github.com/spf13/cobra"
 )
 
@@ -304,19 +307,189 @@ func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
 		if selector == "" {
 			return nil, fmt.Errorf("loop retry requires <seq|loopId>")
 		}
-		if getBoolFlag(cmd, "discard-worktree-changes") && !getBoolFlag(cmd, "confirm") {
+		discard := getBoolFlag(cmd, "discard-worktree-changes")
+		if discard && !getBoolFlag(cmd, "confirm") {
 			return nil, fmt.Errorf("--discard-worktree-changes requires --confirm")
 		}
 		mode := strings.TrimSpace(getStringFlag(cmd, "mode"))
 		if mode == "" {
 			mode = "auto"
 		}
+
+		// When discard is not already opted in, preflight dirty worktree and
+		// either prompt (human) or refuse with jump guidance (scripts/json).
+		if !discard {
+			status, statusErr := r.fetchLoopWorktreeStatus(ctx, selector)
+			if statusErr != nil {
+				// Preflight is best-effort: daemon older than worktree route
+				// should still allow plain retry.
+				if !isAPINotFoundError(statusErr) {
+					return nil, statusErr
+				}
+			} else if decision := classifyRetryWorktreePreflight(status); decision != retryWorktreeOK {
+				switch decision {
+				case retryWorktreeOfferDiscard:
+					if getBoolFlag(cmd, "json") {
+						return nil, dirtyWorktreeRetryGuidanceError(selector, status)
+					}
+					discardConfirmed, promptErr := promptDiscardDirtyWorktree(cmd, selector, status)
+					if promptErr != nil {
+						return nil, promptErr
+					}
+					if !discardConfirmed {
+						return nil, dirtyWorktreeRetryGuidanceError(selector, status)
+					}
+					discard = true
+				case retryWorktreeInspectOnly:
+					return nil, dirtyWorktreeRetryGuidanceError(selector, status)
+				}
+			}
+		}
+
 		body := map[string]any{"mode": mode, "resetAttempts": true}
-		if getBoolFlag(cmd, "discard-worktree-changes") {
+		if discard {
 			body["discardWorktreeChanges"] = true
 		}
 		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
 	}, writeHumanLoopRetried)
+}
+
+type loopWorktreeStatusOutput struct {
+	LoopID       string  `json:"loopId"`
+	Seq          int64   `json:"seq"`
+	Present      bool    `json:"present"`
+	WorktreePath *string `json:"worktreePath"`
+	Branch       *string `json:"branch"`
+	Managed      bool    `json:"managed"`
+	Clean        *bool   `json:"clean"`
+	Dirty        *bool   `json:"dirty"`
+	Reason       string  `json:"reason"`
+}
+
+func (r *commandRuntime) fetchLoopWorktreeStatus(ctx context.Context, selector string) (*loopWorktreeStatusOutput, error) {
+	payload, err := r.getJSON(ctx, "/api/v1/loops/"+url.PathEscape(strings.TrimSpace(selector))+"/worktree")
+	if err != nil {
+		return nil, err
+	}
+	var status loopWorktreeStatusOutput
+	if err := json.Unmarshal(payload, &status); err != nil {
+		return nil, fmt.Errorf("decode loop worktree status: %w", err)
+	}
+	return &status, nil
+}
+
+func promptDiscardDirtyWorktree(cmd *cobra.Command, selector string, status *loopWorktreeStatusOutput) (bool, error) {
+	path := ""
+	if status != nil && status.WorktreePath != nil {
+		path = strings.TrimSpace(*status.WorktreePath)
+	}
+	branch := ""
+	if status != nil && status.Branch != nil {
+		branch = strings.TrimSpace(*status.Branch)
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Worktree is dirty for loop %s", strings.TrimSpace(selector))
+	if branch != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), " (branch %s)", branch)
+	}
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr())
+	if path != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  path: %s\n", path)
+	}
+	return promptBootstrapBool(
+		bufio.NewReader(cmd.InOrStdin()),
+		cmd.ErrOrStderr(),
+		"Discard local worktree changes and retry",
+		false,
+	)
+}
+
+type retryWorktreeDecision int
+
+const (
+	retryWorktreeOK retryWorktreeDecision = iota
+	retryWorktreeOfferDiscard
+	retryWorktreeInspectOnly
+)
+
+// classifyRetryWorktreePreflight decides whether plain retry may proceed.
+// Discard is offered only for present + managed + dirty worktrees.
+func classifyRetryWorktreePreflight(status *loopWorktreeStatusOutput) retryWorktreeDecision {
+	if status == nil || !status.Present {
+		return retryWorktreeOK
+	}
+	if status.Dirty == nil || !*status.Dirty {
+		// status_unavailable leaves dirty nil — allow plain retry (fail later if needed).
+		return retryWorktreeOK
+	}
+	if status.Managed {
+		return retryWorktreeOfferDiscard
+	}
+	// Dirty but unmanaged: never offer discard; force inspect.
+	return retryWorktreeInspectOnly
+}
+
+func dirtyWorktreeRetryGuidanceError(selector string, status *loopWorktreeStatusOutput) error {
+	path := ""
+	if status != nil && status.WorktreePath != nil {
+		path = strings.TrimSpace(*status.WorktreePath)
+	}
+	branch := ""
+	if status != nil && status.Branch != nil {
+		branch = strings.TrimSpace(*status.Branch)
+	}
+	sel := strings.TrimSpace(selector)
+	managedDirty := status != nil && status.Managed && status.Present && status.Dirty != nil && *status.Dirty
+	var b strings.Builder
+	if status != nil && !status.Managed && status.Dirty != nil && *status.Dirty {
+		b.WriteString("retry cancelled: dirty worktree is not Looper-managed (discard unavailable)")
+	} else if managedDirty {
+		b.WriteString("retry cancelled: worktree is dirty")
+	} else {
+		b.WriteString("retry cancelled: worktree is dirty")
+	}
+	if branch != "" {
+		fmt.Fprintf(&b, " (branch %s)", branch)
+	}
+	if path != "" {
+		fmt.Fprintf(&b, "\n  path: %s", path)
+	}
+	if status != nil && status.Present {
+		fmt.Fprintf(&b, "\n  inspect: looper jump %s", quoteShellArg(sel))
+		if path != "" {
+			fmt.Fprintf(&b, "\n  or:     cd -- %s", quoteShellArg(path))
+		}
+	} else if path != "" {
+		fmt.Fprintf(&b, "\n  path missing on disk; inspect manually if needed")
+	}
+	// Document discard for managed dirty trees so operators can re-run non-interactively.
+	if managedDirty {
+		fmt.Fprintf(&b, "\n  discard: looper retry %s --discard-worktree-changes --confirm", quoteShellArg(sel))
+	}
+	return fmt.Errorf("%s", b.String())
+}
+
+func isAPINotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *DaemonAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status == http.StatusNotFound || apiErr.Code == pkgapi.ErrorCodeRouteNotFound
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown route")
+}
+
+func isActiveRunNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *DaemonAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == pkgapi.ErrorCodeActiveRunNotFound ||
+			(apiErr.Status == http.StatusNotFound && strings.Contains(strings.ToLower(apiErr.Message), "active run"))
+	}
+	return false
 }
 
 func loopSeqSelector(value string) (string, error) {
@@ -482,35 +655,89 @@ func (r *commandRuntime) jump(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Usage: looper jump <id>")
 	}
 
-	payload, err := r.getJSON(cmd.Context(), "/api/v1/runs/active/"+url.PathEscape(strings.TrimSpace(args[0])))
+	selector := strings.TrimSpace(args[0])
+	path, meta, err := r.resolveJumpWorktree(cmd.Context(), selector)
 	if err != nil {
 		return err
 	}
-
-	var data activeRunDetailOutput
-	if err := json.Unmarshal(payload, &data); err != nil {
-		return fmt.Errorf("decode active run response: %w", err)
-	}
-	if data.Worktree == nil || strings.TrimSpace(data.Worktree.Path) == "" {
-		return fmt.Errorf("Loop %s has no active worktree path", strings.TrimSpace(args[0]))
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("Loop %s has no worktree path", selector)
 	}
 
 	if getBoolFlag(cmd, "json") {
-		return writeJSON(cmd.OutOrStdout(), map[string]any{
-			"seq":       data.Seq,
-			"loopId":    data.LoopID,
-			"projectId": data.ProjectID,
-			"worktree":  data.Worktree,
-		})
+		return writeJSON(cmd.OutOrStdout(), meta)
 	}
 
 	if getBoolFlag(cmd, "print-path") {
-		_, err := fmt.Fprintln(cmd.OutOrStdout(), data.Worktree.Path)
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), path)
 		return err
 	}
 
-	_, err = fmt.Fprintln(cmd.OutOrStdout(), "cd -- "+quoteShellArg(data.Worktree.Path))
+	_, err = fmt.Fprintln(cmd.OutOrStdout(), "cd -- "+quoteShellArg(path))
 	return err
+}
+
+// resolveJumpWorktree prefers the active-run worktree, then falls back to the
+// loop worktree status endpoint so paused/failed dirty loops still jump.
+// Fallback only runs when active run is missing or has no path — not on 5xx.
+func (r *commandRuntime) resolveJumpWorktree(ctx context.Context, selector string) (string, map[string]any, error) {
+	payload, err := r.getJSON(ctx, "/api/v1/runs/active/"+url.PathEscape(selector))
+	if err == nil {
+		var data activeRunDetailOutput
+		if decodeErr := json.Unmarshal(payload, &data); decodeErr != nil {
+			return "", nil, fmt.Errorf("decode active run response: %w", decodeErr)
+		}
+		if data.Worktree != nil && strings.TrimSpace(data.Worktree.Path) != "" {
+			return data.Worktree.Path, map[string]any{
+				"seq":       data.Seq,
+				"loopId":    data.LoopID,
+				"projectId": data.ProjectID,
+				"worktree":  data.Worktree,
+				"source":    "active_run",
+			}, nil
+		}
+		// Active run exists but has no path — try loop worktree fallback.
+	} else if !isActiveRunNotFoundError(err) && !isAPINotFoundError(err) {
+		// Unexpected active-run failure (5xx, auth, etc.): do not mask with fallback.
+		return "", nil, err
+	}
+
+	status, statusErr := r.fetchLoopWorktreeStatus(ctx, selector)
+	if statusErr != nil {
+		if err != nil {
+			return "", nil, err
+		}
+		return "", nil, statusErr
+	}
+	if status == nil || status.WorktreePath == nil || strings.TrimSpace(*status.WorktreePath) == "" {
+		if err != nil {
+			return "", nil, fmt.Errorf("Loop %s has no active worktree path", selector)
+		}
+		return "", nil, fmt.Errorf("Loop %s has no worktree path", selector)
+	}
+	if !status.Present || status.Reason == "worktree_missing" {
+		path := strings.TrimSpace(*status.WorktreePath)
+		return "", nil, fmt.Errorf("Loop %s worktree path is missing on disk: %s", selector, path)
+	}
+	path := strings.TrimSpace(*status.WorktreePath)
+	branch := ""
+	if status.Branch != nil {
+		branch = strings.TrimSpace(*status.Branch)
+	}
+	return path, map[string]any{
+		"seq":    status.Seq,
+		"loopId": status.LoopID,
+		"worktree": map[string]any{
+			"path":   path,
+			"branch": branch,
+		},
+		"source":  "loop_worktree",
+		"dirty":   status.Dirty,
+		"clean":   status.Clean,
+		"reason":  status.Reason,
+		"managed": status.Managed,
+		"present": status.Present,
+	}, nil
 }
 
 func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {

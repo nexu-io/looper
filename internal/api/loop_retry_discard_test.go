@@ -20,6 +20,79 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func TestHandlerLoopWorktreeStatusDirtyAndClean(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	dirty := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_wt_status_dirty",
+		LoopID:    "loop_wt_status_dirty",
+		LoopSeq:   3201,
+		LoopType:  "fixer",
+		Branch:    "feature/wt-status-dirty",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	clean := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_wt_status_clean",
+		LoopID:    "loop_wt_status_clean",
+		LoopSeq:   3202,
+		LoopType:  "fixer",
+		Branch:    "feature/wt-status-clean",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+
+	reqDirty := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3201/worktree", nil)
+	recDirty := httptest.NewRecorder()
+	h.ServeHTTP(recDirty, reqDirty)
+	if recDirty.Code != http.StatusOK {
+		t.Fatalf("dirty status = %d, want 200; body=%s", recDirty.Code, recDirty.Body.String())
+	}
+	dirtyData := parseJSONMap(t, recDirty.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, dirtyData["present"], true)
+	assertEqual(t, dirtyData["managed"], true)
+	assertEqual(t, dirtyData["dirty"], true)
+	assertEqual(t, dirtyData["clean"], false)
+	assertEqual(t, dirtyData["reason"], "dirty")
+	assertEqual(t, dirtyData["worktreePath"], dirty.WorktreePath)
+	assertEqual(t, dirtyData["branch"], "feature/wt-status-dirty")
+
+	reqClean := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3202/worktree", nil)
+	recClean := httptest.NewRecorder()
+	h.ServeHTTP(recClean, reqClean)
+	if recClean.Code != http.StatusOK {
+		t.Fatalf("clean status = %d, want 200; body=%s", recClean.Code, recClean.Body.String())
+	}
+	cleanData := parseJSONMap(t, recClean.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, cleanData["present"], true)
+	assertEqual(t, cleanData["managed"], true)
+	assertEqual(t, cleanData["dirty"], false)
+	assertEqual(t, cleanData["clean"], true)
+	assertEqual(t, cleanData["reason"], "already_clean")
+	assertEqual(t, cleanData["worktreePath"], clean.WorktreePath)
+
+	// Missing path: present=false, path still returned for diagnostics.
+	if err := os.RemoveAll(dirty.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(dirty worktree) error = %v", err)
+	}
+	reqMissing := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3201/worktree", nil)
+	recMissing := httptest.NewRecorder()
+	h.ServeHTTP(recMissing, reqMissing)
+	if recMissing.Code != http.StatusOK {
+		t.Fatalf("missing status = %d, want 200; body=%s", recMissing.Code, recMissing.Body.String())
+	}
+	missingData := parseJSONMap(t, recMissing.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, missingData["present"], false)
+	assertEqual(t, missingData["reason"], "worktree_missing")
+	assertEqual(t, missingData["worktreePath"], dirty.WorktreePath)
+	if _, ok := missingData["dirty"]; ok {
+		t.Fatalf("missing worktree should omit dirty, got %#v", missingData["dirty"])
+	}
+}
+
 func TestHandlerLoopRetryDiscardWorktreeChangesDirtyFixer(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

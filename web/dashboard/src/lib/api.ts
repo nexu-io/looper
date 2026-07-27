@@ -482,6 +482,19 @@ export type RetryLoopResult = {
   worktreeDiscard?: unknown;
 };
 
+/** GET /loops/{sel}/worktree — retry/jump preflight. */
+export type LoopWorktreeStatus = {
+  loopId: string;
+  seq: number;
+  present: boolean;
+  worktreePath?: string | null;
+  branch?: string | null;
+  managed: boolean;
+  clean?: boolean | null;
+  dirty?: boolean | null;
+  reason?: string;
+};
+
 export type StopActiveRunResult = {
   stopped: boolean;
   loopId: string;
@@ -523,16 +536,30 @@ export function pauseLoop(
   );
 }
 
-export function retryLoop(
+export function fetchLoopWorktree(
   selector: string,
   signal?: AbortSignal,
+): Promise<LoopWorktreeStatus> {
+  return apiFetch<LoopWorktreeStatus>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/worktree`,
+    { signal },
+  );
+}
+
+export function retryLoop(
+  selector: string,
+  opts?: { discardWorktreeChanges?: boolean; signal?: AbortSignal },
 ): Promise<RetryLoopResult> {
+  const body: RetryLoopBody = {
+    ...RETRY_BODY,
+    ...(opts?.discardWorktreeChanges ? { discardWorktreeChanges: true } : {}),
+  };
   return apiFetch<RetryLoopResult>(
     `/api/v1/loops/${encodeURIComponent(selector)}/retry`,
     {
       method: "POST",
-      body: JSON.stringify(RETRY_BODY),
-      signal,
+      body: JSON.stringify(body),
+      signal: opts?.signal,
     },
   );
 }

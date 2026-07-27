@@ -3867,6 +3867,11 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
 		return h.buildLoopLogsResponse(r.Context(), loop)
+	case "worktree":
+		if r.Method != http.MethodGet {
+			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
+		}
+		return h.loopWorktreeStatus(r.Context(), loop)
 	case "start":
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}

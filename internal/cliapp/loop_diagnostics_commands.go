@@ -764,7 +764,7 @@ func recommendedActionForManualIntervention(message string) string {
 	lower := strings.ToLower(message)
 	// Match the narrower dirty-worktree classifier used by failureclass.
 	if strings.Contains(lower, "dirty worktree") || strings.Contains(lower, "worktree is dirty") || strings.Contains(lower, "uncommitted changes") {
-		return "fix or discard local worktree changes, then looper retry <seq>"
+		return "inspect with looper jump <seq>, or discard via looper retry <seq> --discard-worktree-changes --confirm"
 	}
 	if strings.Contains(lower, "worktree is locked") {
 		return "unlock or remove the locked worktree, then looper retry <seq>"

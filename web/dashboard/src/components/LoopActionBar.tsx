@@ -3,12 +3,15 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CopyButton } from "@/components/CopyButton";
 import { Button } from "@/components/ui/button";
 import {
+  ApiError,
+  fetchLoopWorktree,
   handbackLoop,
   pauseLoop,
   retryLoop,
   startLoop,
   stopActiveRun,
   takeoverLoop,
+  type LoopWorktreeStatus,
   type TakeoverResult,
 } from "@/lib/api";
 import {
@@ -38,7 +41,15 @@ type PendingConfirm =
   | { action: "stop" }
   | { action: "takeover" }
   | { action: "handback" }
+  | { action: "retry-dirty"; worktree: LoopWorktreeStatus }
   | null;
+
+type InspectGuidance = {
+  worktree: LoopWorktreeStatus;
+  jumpCommand: string;
+  /** When false, hide discard CLI hint (unmanaged paths). */
+  offerDiscard: boolean;
+} | null;
 
 const LABELS: Record<LoopAction, string> = {
   pause: "Pause",
@@ -48,6 +59,30 @@ const LABELS: Record<LoopAction, string> = {
   takeover: "Takeover",
   handback: "Handback",
 };
+
+/** True when preflight is missing on older daemons — fall back to plain retry. */
+export function isWorktreeRouteUnavailable(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false;
+  if (err.code === "ROUTE_NOT_FOUND") return true;
+  if (err.status === 404) {
+    const msg = (err.message || "").toLowerCase();
+    return msg.includes("unknown route") || msg.includes("not found");
+  }
+  return false;
+}
+
+/**
+ * Classify worktree preflight for retry UX.
+ * Discard is only offered for present + managed + dirty.
+ */
+export function classifyRetryWorktree(
+  worktree: LoopWorktreeStatus,
+): "ok" | "offer-discard" | "inspect-only" {
+  if (!worktree.present) return "ok";
+  if (worktree.dirty !== true) return "ok";
+  if (worktree.managed) return "offer-discard";
+  return "inspect-only";
+}
 
 export function LoopActionBar({
   selector,
@@ -67,12 +102,27 @@ export function LoopActionBar({
   const [takeoverResult, setTakeoverResult] = useState<TakeoverResult | null>(
     null,
   );
+  const [inspectGuidance, setInspectGuidance] =
+    useState<InspectGuidance>(null);
   const [inlineError, setInlineError] = useState<string | null>(null);
 
   const busy = pending !== null;
 
+  const finishRetry = useCallback(
+    async (discardWorktreeChanges: boolean) => {
+      await retryLoop(selector, { discardWorktreeChanges });
+      toast.success(
+        discardWorktreeChanges
+          ? "Retry queued (worktree discarded)"
+          : "Retry queued",
+      );
+      await onMutated?.();
+    },
+    [selector, toast, onMutated],
+  );
+
   const runAction = useCallback(
-    async (action: LoopAction) => {
+    async (action: Exclude<LoopAction, "retry">) => {
       setPending(action);
       setInlineError(null);
       try {
@@ -84,10 +134,6 @@ export function LoopActionBar({
           case "unpause":
             await startLoop(selector);
             toast.success("Unpaused (started)");
-            break;
-          case "retry":
-            await retryLoop(selector);
-            toast.success("Retry queued");
             break;
           case "stop":
             await stopActiveRun(selector);
@@ -108,7 +154,6 @@ export function LoopActionBar({
             toast.success("Handback queued");
             break;
         }
-        // Keep buttons pending until post-mutation refresh finishes (or fails).
         await onMutated?.();
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -122,8 +167,70 @@ export function LoopActionBar({
     [selector, toast, onMutated],
   );
 
+  const onRetryClick = useCallback(async () => {
+    if (busy || !enabled.retry) return;
+    setPending("retry");
+    setInlineError(null);
+    try {
+      let worktree: LoopWorktreeStatus;
+      try {
+        worktree = await fetchLoopWorktree(selector);
+      } catch (err) {
+        if (isWorktreeRouteUnavailable(err)) {
+          // Older daemon without /worktree — keep prior plain-retry behavior.
+          await finishRetry(false);
+          return;
+        }
+        throw err;
+      }
+
+      const decision = classifyRetryWorktree(worktree);
+      if (decision === "offer-discard") {
+        setConfirm({ action: "retry-dirty", worktree });
+        return;
+      }
+      if (decision === "inspect-only") {
+        setInspectGuidance({
+          worktree,
+          jumpCommand: `looper jump ${selector}`,
+          offerDiscard: false,
+        });
+        toast.error(
+          "Dirty worktree is not Looper-managed; inspect before retrying",
+        );
+        return;
+      }
+      await finishRetry(false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setInlineError(message);
+      toast.error(message);
+    } finally {
+      setPending(null);
+    }
+  }, [busy, enabled.retry, selector, toast, finishRetry]);
+
+  const onDiscardRetry = useCallback(async () => {
+    setPending("retry");
+    setInlineError(null);
+    try {
+      await finishRetry(true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setInlineError(message);
+      toast.error(message);
+    } finally {
+      setPending(null);
+      setConfirm(null);
+    }
+  }, [finishRetry, toast]);
+
   const onClick = (action: LoopAction) => {
     if (busy || !enabled[action]) return;
+    if (action === "retry") {
+      void onRetryClick();
+      return;
+    }
     if (action === "stop" || action === "takeover" || action === "handback") {
       setConfirm({ action });
       return;
@@ -159,6 +266,14 @@ export function LoopActionBar({
           body: "Re-queues the loop so the daemon resumes after your interactive session. Worktree edits are preserved (discard is not allowed on handback).",
           confirmLabel: "Handback",
           danger: false,
+        };
+      case "retry-dirty":
+        return {
+          title: "Dirty worktree — discard and retry?",
+          body: "Local uncommitted changes were found in the loop worktree. Discard them before retrying, or inspect the worktree first.",
+          confirmLabel: "Discard & retry",
+          danger: true,
+          cancelLabel: "Inspect first",
         };
     }
   })();
@@ -197,17 +312,120 @@ export function LoopActionBar({
           open
           title={confirmCopy.title}
           confirmLabel={confirmCopy.confirmLabel}
+          cancelLabel={
+            "cancelLabel" in confirmCopy ? confirmCopy.cancelLabel : undefined
+          }
           danger={confirmCopy.danger}
           busy={busy}
           onCancel={() => {
-            if (!busy) setConfirm(null);
+            if (busy) return;
+            if (confirm.action === "retry-dirty") {
+              const wt = confirm.worktree;
+              setConfirm(null);
+              setInspectGuidance({
+                worktree: wt,
+                jumpCommand: `looper jump ${selector}`,
+                offerDiscard: true,
+              });
+              return;
+            }
+            setConfirm(null);
           }}
-          onConfirm={() => void runAction(confirm.action)}
+          onConfirm={() => {
+            if (confirm.action === "retry-dirty") {
+              void onDiscardRetry();
+              return;
+            }
+            void runAction(confirm.action);
+          }}
         >
           <p className="m-0 text-[var(--text-muted)]">{confirmCopy.body}</p>
-          <p className="mt-2 mb-0 mono text-[11px] text-[var(--text-muted)]">
-            selector: {selector}
-          </p>
+          {confirm.action === "retry-dirty" ? (
+            <div className="mt-2 flex flex-col gap-2">
+              {confirm.worktree.branch ? (
+                <p className="m-0 mono text-[11px] text-[var(--text-muted)]">
+                  branch: {confirm.worktree.branch}
+                </p>
+              ) : null}
+              <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                    Worktree
+                  </span>
+                  <CopyButton text={confirm.worktree.worktreePath ?? ""} />
+                </div>
+                <p className="m-0 break-all mono text-[11px]">
+                  {confirm.worktree.worktreePath || "—"}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-2 mb-0 mono text-[11px] text-[var(--text-muted)]">
+              selector: {selector}
+            </p>
+          )}
+        </ConfirmDialog>
+      ) : null}
+
+      {inspectGuidance ? (
+        <ConfirmDialog
+          open
+          title={
+            inspectGuidance.offerDiscard
+              ? "Inspect dirty worktree"
+              : "Unmanaged dirty worktree"
+          }
+          confirmLabel="Close"
+          showCancel={false}
+          onCancel={() => setInspectGuidance(null)}
+          onConfirm={() => setInspectGuidance(null)}
+        >
+          <div className="flex flex-col gap-2">
+            <p className="m-0 text-[var(--text-muted)]">
+              {inspectGuidance.offerDiscard
+                ? "Review local changes in the worktree, then retry again. Use jump from a terminal on this machine."
+                : "This path is not a Looper-managed worktree, so discard is unavailable. Inspect manually, then retry only after the tree is clean or the path is fixed."}
+            </p>
+            {inspectGuidance.worktree.branch ? (
+              <p className="m-0 mono text-[11px] text-[var(--text-muted)]">
+                branch: {inspectGuidance.worktree.branch}
+              </p>
+            ) : null}
+            <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                  Worktree
+                </span>
+                <CopyButton
+                  text={inspectGuidance.worktree.worktreePath ?? ""}
+                />
+              </div>
+              <p className="m-0 break-all mono text-[11px]">
+                {inspectGuidance.worktree.worktreePath || "—"}
+              </p>
+            </div>
+            {inspectGuidance.worktree.present ? (
+              <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                    Jump command
+                  </span>
+                  <CopyButton text={inspectGuidance.jumpCommand} />
+                </div>
+                <p className="m-0 break-all mono text-[11px]">
+                  {inspectGuidance.jumpCommand}
+                </p>
+              </div>
+            ) : null}
+            {inspectGuidance.offerDiscard ? (
+              <p className="m-0 text-[11px] text-[var(--text-muted)]">
+                After fixing or deciding to drop changes: Retry again, or run{" "}
+                <span className="mono">
+                  looper retry {selector} --discard-worktree-changes --confirm
+                </span>
+              </p>
+            ) : null}
+          </div>
         </ConfirmDialog>
       ) : null}
 
