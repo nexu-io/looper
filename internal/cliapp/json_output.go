@@ -680,6 +680,8 @@ func (r *commandRuntime) jump(cmd *cobra.Command, args []string) error {
 // resolveJumpWorktree prefers the active-run worktree, then falls back to the
 // loop worktree status endpoint so paused/failed dirty loops still jump.
 // Fallback only runs when active run is missing or has no path — not on 5xx.
+// Both sources refuse paths that are missing on disk so jump never prints cd
+// for a directory the operator cannot enter.
 func (r *commandRuntime) resolveJumpWorktree(ctx context.Context, selector string) (string, map[string]any, error) {
 	payload, err := r.getJSON(ctx, "/api/v1/runs/active/"+url.PathEscape(selector))
 	if err == nil {
@@ -688,7 +690,11 @@ func (r *commandRuntime) resolveJumpWorktree(ctx context.Context, selector strin
 			return "", nil, fmt.Errorf("decode active run response: %w", decodeErr)
 		}
 		if data.Worktree != nil && strings.TrimSpace(data.Worktree.Path) != "" {
-			return data.Worktree.Path, map[string]any{
+			path := strings.TrimSpace(data.Worktree.Path)
+			if jumpPathMissingOnDisk(path) {
+				return "", nil, fmt.Errorf("Loop %s worktree path is missing on disk: %s", selector, path)
+			}
+			return path, map[string]any{
 				"seq":       data.Seq,
 				"loopId":    data.LoopID,
 				"projectId": data.ProjectID,
@@ -715,11 +721,10 @@ func (r *commandRuntime) resolveJumpWorktree(ctx context.Context, selector strin
 		}
 		return "", nil, fmt.Errorf("Loop %s has no worktree path", selector)
 	}
-	if !status.Present || status.Reason == "worktree_missing" {
-		path := strings.TrimSpace(*status.WorktreePath)
+	path := strings.TrimSpace(*status.WorktreePath)
+	if !status.Present || status.Reason == "worktree_missing" || jumpPathMissingOnDisk(path) {
 		return "", nil, fmt.Errorf("Loop %s worktree path is missing on disk: %s", selector, path)
 	}
-	path := strings.TrimSpace(*status.WorktreePath)
 	branch := ""
 	if status.Branch != nil {
 		branch = strings.TrimSpace(*status.Branch)
@@ -738,6 +743,16 @@ func (r *commandRuntime) resolveJumpWorktree(ctx context.Context, selector strin
 		"managed": status.Managed,
 		"present": status.Present,
 	}, nil
+}
+
+// jumpPathMissingOnDisk reports whether path is absent so jump must refuse cd.
+func jumpPathMissingOnDisk(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return true
+	}
+	_, err := os.Stat(path)
+	return err != nil && os.IsNotExist(err)
 }
 
 func (r *commandRuntime) activeRuns(cmd *cobra.Command, args []string) error {

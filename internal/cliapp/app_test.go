@@ -4109,11 +4109,12 @@ func TestLogsHelpIncludesFollowFlag(t *testing.T) {
 func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 	t.Parallel()
 
+	worktreePath := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": worktreePath}}))
 	}))
 	defer server.Close()
 
@@ -4125,7 +4126,7 @@ func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([jump 12]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "cd -- '/tmp/worktree'\n"; got != want {
+	if got, want := stdout, "cd -- "+quoteShellArg(worktreePath)+"\n"; got != want {
 		t.Fatalf("Run([jump 12]) stdout = %q, want %q", got, want)
 	}
 }
@@ -4133,11 +4134,12 @@ func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 func TestJumpWithPrintPathPrintsWorktreePath(t *testing.T) {
 	t.Parallel()
 
+	worktreePath := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": worktreePath}}))
 	}))
 	defer server.Close()
 
@@ -4149,7 +4151,7 @@ func TestJumpWithPrintPathPrintsWorktreePath(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([jump 12 --print-path]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "/tmp/worktree\n"; got != want {
+	if got, want := stdout, worktreePath+"\n"; got != want {
 		t.Fatalf("Run([jump 12 --print-path]) stdout = %q, want %q", got, want)
 	}
 }

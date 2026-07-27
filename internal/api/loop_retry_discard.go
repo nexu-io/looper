@@ -28,6 +28,36 @@ type worktreeDiscardResult struct {
 
 // loopWorktreeStatusResponse is the read-only preflight for retry/jump UX.
 //
+// Design trade-off (new status concept + preflight gate on retry):
+//
+// Failure prevented: operators and the dashboard used to call POST /retry while a
+// managed agent worktree was dirty. Retry re-prepares from HEAD and either fails
+// prepare-worktree or silently collides with uncommitted local edits. Without a
+// structured preflight, clients could only guess from logs after the damage.
+//
+// Cost / edge cases:
+//   - New wire fields (present/managed/clean/dirty/reason) that CLI and dashboard
+//     must interpret consistently; drift between clients is a real risk.
+//   - Extra GET before every interactive retry (latency + one more auth/path).
+//   - status_unavailable and unmanaged reasons force fail-closed discard offers
+//     while still exposing path for inspect — more branches than a pure 409.
+//   - Old daemons without /worktree must keep plain-retry fallback so upgrades
+//     are not a hard break.
+//
+// Why not simpler alternatives:
+//   - Delete the gate / trust the agent: dirty trees are operator-local state the
+//     agent did not declare; trusting retry to "just work" already caused lost
+//     edits and opaque prepare failures. Agent structured output cannot see the
+//     worktree after the run ended.
+//   - Fail loud only (hard 409 on dirty retry): blocks the legitimate "discard
+//     and retry" path and gives no jump/inspect guidance when the operator wants
+//     to keep local changes. Preflight keeps authority on the daemon's on-disk
+//     git status while letting the operator choose discard vs inspect.
+//
+// Authority: the daemon's worktree resolution + git status are the authority for
+// present/managed/dirty; the agent does not emit this after the run completes.
+// Clients may gate UX on the response but must not invent discard safety.
+//
 // Semantics:
 //   - present: path exists on disk (after successful stat)
 //   - worktreePath/branch: resolved location hints even when missing on disk
