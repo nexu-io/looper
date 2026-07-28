@@ -396,6 +396,9 @@ type GitGateway interface {
 	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
 	PrepareWorktree(context.Context, PrepareWorktreeInput) (PrepareWorktreeResult, error)
 	CleanupWorktree(context.Context, CleanupWorktreeInput) error
+	// ScrubReservedReviewerScratch removes disposable top-level reviewer submit
+	// scratch using the gateway's configured Git executable (tools.gitPath).
+	ScrubReservedReviewerScratch(ctx context.Context, worktreePath string) error
 }
 
 type AgentRunInput struct {
@@ -2348,9 +2351,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	}
 	// Discard disposable reviewer submit scratch before the ordinary cleanliness
 	// gate. Authority is the reviewer reserved-namespace contract (see
-	// gitinfra.ScrubReservedReviewerScratch); do not broaden beyond untracked
-	// root regular files matching that grammar.
-	if err := gitinfra.ScrubReservedReviewerScratch(ctx, "git", created.WorktreePath); err != nil {
+	// GitGateway.ScrubReservedReviewerScratch); use the configured Git executable
+	// via the gateway — never hard-code "git" when tools.gitPath is set.
+	if err := r.git.ScrubReservedReviewerScratch(ctx, created.WorktreePath); err != nil {
 		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
 			return checkpoint, fmt.Errorf("restore fixer owner token after reserved-scratch scrub failure: %w (scrub error: %v)", restoreErr, err)
 		}

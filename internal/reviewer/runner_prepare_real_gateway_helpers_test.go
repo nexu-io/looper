@@ -111,3 +111,7 @@ func (g *countingRealGitGateway) CleanupWorktree(ctx context.Context, input Clea
 		WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches,
 	})
 }
+
+func (g *countingRealGitGateway) ScrubReservedReviewerScratch(ctx context.Context, worktreePath string) error {
+	return g.inner.ScrubReservedReviewerScratch(ctx, worktreePath)
+}

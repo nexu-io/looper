@@ -1805,6 +1805,10 @@ func (a reviewerGitAdapter) CleanupWorktree(ctx context.Context, input reviewer.
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
+func (a reviewerGitAdapter) ScrubReservedReviewerScratch(ctx context.Context, worktreePath string) error {
+	return a.gateway.ScrubReservedReviewerScratch(ctx, worktreePath)
+}
+
 // reviewerTrustedReviewEnv injects the trusted review-submit socket only for
 // reviewer agent runs. Planner/worker/fixer share the executor but must not
 // receive review publication capability via LOOPER_TRUSTED_REVIEW_SOCK.

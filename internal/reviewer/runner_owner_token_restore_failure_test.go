@@ -101,3 +101,7 @@ func (f *restoreFailAfterClearGit) PrepareWorktree(_ context.Context, input Prep
 func (f *restoreFailAfterClearGit) CleanupWorktree(_ context.Context, _ CleanupWorktreeInput) error {
 	return nil
 }
+
+func (f *restoreFailAfterClearGit) ScrubReservedReviewerScratch(_ context.Context, _ string) error {
+	return nil
+}

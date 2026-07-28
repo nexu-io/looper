@@ -26,9 +26,14 @@ var reservedReviewerScratchBaseName = regexp.MustCompile(`^\.looper-review-[A-Za
 // managed worktree root immediately before ordinary PrepareWorktree cleanliness.
 //
 // It enumerates the worktree root directly (not via git status). Only regular
-// files matching reservedReviewerScratchBaseName that are absent from the Git
-// index are deleted. Symlinks and directories are left alone. Delete failures
+// files matching reservedReviewerScratchBaseName that are absent from both the
+// Git index and HEAD tree are deleted. Symlinks and directories are left alone.
+// Files tracked by HEAD but staged for index removal (e.g. after
+// `git rm --cached`) remain ordinary dirt and are preserved. Delete failures
 // fail closed.
+//
+// gitPath must be the configured Git executable (tools.gitPath); callers must
+// not hard-code "git" when a non-PATH binary is configured.
 func ScrubReservedReviewerScratch(ctx context.Context, gitPath, worktreePath string) error {
 	worktreePath = strings.TrimSpace(worktreePath)
 	if worktreePath == "" {
@@ -62,11 +67,11 @@ func ScrubReservedReviewerScratch(ctx context.Context, gitPath, worktreePath str
 			continue
 		}
 
-		tracked, terr := isIndexPathPresent(ctx, gitPath, worktreePath, name)
+		preserve, terr := shouldPreserveReservedScratch(ctx, gitPath, worktreePath, name)
 		if terr != nil {
 			return terr
 		}
-		if tracked {
+		if preserve {
 			continue
 		}
 		if err := os.Remove(fullPath); err != nil {
@@ -79,15 +84,39 @@ func ScrubReservedReviewerScratch(ctx context.Context, gitPath, worktreePath str
 	return nil
 }
 
-func isIndexPathPresent(ctx context.Context, gitPath, worktreePath, name string) (bool, error) {
-	// ls-files with a pathspec returns the path only when it is in the index.
+// ScrubReservedReviewerScratch removes disposable reviewer submit scratch using
+// this gateway's configured Git executable.
+func (g *Gateway) ScrubReservedReviewerScratch(ctx context.Context, worktreePath string) error {
+	return ScrubReservedReviewerScratch(ctx, g.gitPath, worktreePath)
+}
+
+// shouldPreserveReservedScratch reports whether a reserved-name file must be
+// left as ordinary dirt: present in the current index and/or the committed HEAD
+// tree. Index-only checks miss `git rm --cached` (tracked by HEAD, dropped from
+// the index while still on disk).
+func shouldPreserveReservedScratch(ctx context.Context, gitPath, worktreePath, name string) (bool, error) {
+	inIndex, err := gitListsPath(ctx, gitPath, worktreePath, name, []string{"ls-files", "--full-name", "--", name})
+	if err != nil {
+		return false, fmt.Errorf("probe index for reserved reviewer scratch %q: %w", name, err)
+	}
+	if inIndex {
+		return true, nil
+	}
+	inHead, err := gitListsPath(ctx, gitPath, worktreePath, name, []string{"ls-tree", "--name-only", "HEAD", "--", name})
+	if err != nil {
+		return false, fmt.Errorf("probe HEAD for reserved reviewer scratch %q: %w", name, err)
+	}
+	return inHead, nil
+}
+
+func gitListsPath(ctx context.Context, gitPath, worktreePath, name string, args []string) (bool, error) {
 	result, err := shell.Run(ctx, shell.Options{
 		Command: gitPath,
-		Args:    []string{"-C", worktreePath, "ls-files", "--full-name", "--", name},
+		Args:    append([]string{"-C", worktreePath}, args...),
 		CWD:     worktreePath,
 	})
 	if err != nil {
-		return false, fmt.Errorf("probe index for reserved reviewer scratch %q: %w", name, err)
+		return false, err
 	}
 	for _, line := range strings.Split(result.Stdout, "\n") {
 		if strings.TrimSpace(line) == name {

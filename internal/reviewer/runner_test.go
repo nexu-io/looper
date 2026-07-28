@@ -10338,6 +10338,10 @@ func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktre
 	return nil
 }
 
+func (f *fakeGitGateway) ScrubReservedReviewerScratch(_ context.Context, _ string) error {
+	return nil
+}
+
 type fakeAgentExecutor struct {
 	results       []AgentResult
 	starts        []AgentRunInput
