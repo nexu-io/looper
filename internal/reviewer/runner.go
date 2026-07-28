@@ -2346,6 +2346,16 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 			return checkpoint, err
 		}
 	}
+	// Discard disposable reviewer submit scratch before the ordinary cleanliness
+	// gate. Authority is the reviewer reserved-namespace contract (see
+	// gitinfra.ScrubReservedReviewerScratch); do not broaden beyond untracked
+	// root regular files matching that grammar.
+	if err := gitinfra.ScrubReservedReviewerScratch(ctx, "git", created.WorktreePath); err != nil {
+		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
+			return checkpoint, fmt.Errorf("restore fixer owner token after reserved-scratch scrub failure: %w (scrub error: %v)", restoreErr, err)
+		}
+		return checkpoint, err
+	}
 	prepared, err := r.git.PrepareWorktree(ctx, PrepareWorktreeInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: created.WorktreePath, Branch: branch, Ref: prRef, ExpectedHeadSHA: checkpoint.Snapshot.HeadSHA})
 	if err != nil {
 		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
@@ -6683,6 +6693,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewRequestInstruction,
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you have actionable findings but do not have concrete actionable prose yet, exit non-zero instead of posting logs. For a clean APPROVE review, write the required author mention, change/verification summary, and warm acknowledgement; never use an LGTM, empty, or disclosure-only clean body as a fallback.",
 		"Shell payload safety contract: never build review JSON inside a double-quoted shell string because Markdown backticks and dollar expressions can execute or expand. Serialize the payload with a JSON-aware tool or pass a literal single-quoted heredoc to the trusted review-submit wrapper.",
+		"Worktree hygiene contract: do not create review payload or scratch files inside the managed worktree (including top-level `/.looper-review-*.json`). Pipe review JSON via a literal single-quoted heredoc on stdin, or write temporary files only under an OS temp directory outside the worktree.",
 		"Content safety recovery contract: if `looper review submit` fails with an outbound content safety gate rejection, rewrite the rejected body/comments/paths in plain prose without secret-shaped env assignments, credential URLs, env dumps, or high-entropy tokens, then resubmit in the same session; do not exit non-zero solely because of that rejection, and never paste the rejected value into logs, prompts, or the next payload.",
 		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|non_blocking|blocking -->`.",
 		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),

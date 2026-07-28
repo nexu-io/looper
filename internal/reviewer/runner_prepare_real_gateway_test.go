@@ -107,3 +107,109 @@ func TestRunPrepareWorktreeStepRealGatewayRemoteHeadChangedPreservesFixerDirt(t 
 		t.Fatalf("dirty marker = %q err=%v, want preserved", dirtyBytes, err)
 	}
 }
+
+// Real-gateway contract: leftover untracked reserved reviewer scratch must not
+// force manual_intervention. Ordinary untracked dirt still does.
+func TestRunPrepareWorktreeStepRealGatewayScrubsReservedReviewerScratch(t *testing.T) {
+	t.Parallel()
+
+	const prNumber int64 = 77
+	const projectID = "project_real_reviewer_scratch"
+	branch := "feature/review-77"
+	root, _, repoPath, headSHA := setupRealRepoWithPRHead(t, branch, prNumber)
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+
+	gateway := gitinfra.New(gitinfra.Options{GitPath: "git"})
+	created, err := gateway.CreateWorktree(context.Background(), gitinfra.CreateWorktreeInput{
+		ProjectID: projectID, RepoPath: repoPath, WorktreeRoot: worktreeRoot,
+		Branch: "pr-77-head", BaseBranch: "main", PRNumber: prNumber,
+		CheckoutMode: gitinfra.CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	wtPath := created.WorktreePath
+
+	scratch := filepath.Join(wtPath, ".looper-review-3503.json")
+	if err := os.WriteFile(scratch, []byte(`{"leftover":true}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile scratch: %v", err)
+	}
+
+	adapter := &countingRealGitGateway{inner: gateway}
+	runner := New(Options{Git: adapter})
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	checkpoint, prepErr := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: stringPtr("main"), MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: headSHA, BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: headSHA},
+			Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-77-head", BaseBranch: "main"},
+		},
+	})
+	if prepErr != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v, want clean prepare after scrub", prepErr)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.PreparedAt == "" {
+		t.Fatalf("Worktree = %#v, want prepared path", checkpoint.Worktree)
+	}
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("reserved scratch still present after prepare: err=%v", err)
+	}
+}
+
+func TestRunPrepareWorktreeStepRealGatewayKeepsOrdinaryUntrackedDirt(t *testing.T) {
+	t.Parallel()
+
+	const prNumber int64 = 78
+	const projectID = "project_real_reviewer_ordinary_dirt"
+	branch := "feature/review-78"
+	root, _, repoPath, headSHA := setupRealRepoWithPRHead(t, branch, prNumber)
+	worktreeRoot := filepath.Join(root, "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+
+	gateway := gitinfra.New(gitinfra.Options{GitPath: "git"})
+	created, err := gateway.CreateWorktree(context.Background(), gitinfra.CreateWorktreeInput{
+		ProjectID: projectID, RepoPath: repoPath, WorktreeRoot: worktreeRoot,
+		Branch: "pr-78-head", BaseBranch: "main", PRNumber: prNumber,
+		CheckoutMode: gitinfra.CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	wtPath := created.WorktreePath
+
+	ordinary := filepath.Join(wtPath, "agent-notes.txt")
+	if err := os.WriteFile(ordinary, []byte("real dirt\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile ordinary: %v", err)
+	}
+
+	adapter := &countingRealGitGateway{inner: gateway}
+	runner := New(Options{Git: adapter})
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	_, prepErr := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: stringPtr("main"), MetadataJSON: &metadata},
+		Repo:     "acme/looper",
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadSHA: headSHA, BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: headSHA},
+			Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-78-head", BaseBranch: "main"},
+		},
+	})
+	if prepErr == nil {
+		t.Fatal("runPrepareWorktreeStep() error = nil, want manual_intervention for ordinary dirt")
+	}
+	if !contains(prepErr.Error(), "worktree is dirty") && !contains(prepErr.Error(), "manual intervention") {
+		t.Fatalf("error = %v, want dirty/manual intervention", prepErr)
+	}
+	if got, err := os.ReadFile(ordinary); err != nil || string(got) != "real dirt\n" {
+		t.Fatalf("ordinary dirt = %q err=%v, want preserved", got, err)
+	}
+}
