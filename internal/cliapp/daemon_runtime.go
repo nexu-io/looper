@@ -745,11 +745,15 @@ func splitLogLines(content string) []string {
 }
 
 func (r *commandRuntime) loadConfig() (config.LoadedFileConfig, error) {
-	if loaded, configured, err := forge.LoadTrustedReviewConfigSnapshot(); configured {
-		if err != nil {
-			return config.LoadedFileConfig{}, err
+	if !r.trustedReviewConfig.done {
+		loaded, configured, err := forge.LoadTrustedReviewConfigSnapshot()
+		r.trustedReviewConfig = trustedReviewConfigMemo{done: true, configured: configured, loaded: loaded, err: err}
+	}
+	if r.trustedReviewConfig.configured {
+		if r.trustedReviewConfig.err != nil {
+			return config.LoadedFileConfig{}, r.trustedReviewConfig.err
 		}
-		return loaded, nil
+		return r.trustedReviewConfig.loaded, nil
 	}
 	loaded, err := config.LoadFile(config.LoadFileOptions{Args: ExtractConfigArgs(r.argv)})
 	if err != nil {

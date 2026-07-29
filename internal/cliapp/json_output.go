@@ -21,11 +21,23 @@ import (
 const daemonVersionProbeTimeout = 250 * time.Millisecond
 
 type commandRuntime struct {
-	app                *App
-	argv               []string
-	startupOutputPath  string
-	skipAPIStartProbe  bool
-	emittedConfigNotes map[string]struct{}
+	app                 *App
+	argv                []string
+	startupOutputPath   string
+	skipAPIStartProbe   bool
+	emittedConfigNotes  map[string]struct{}
+	trustedReviewConfig trustedReviewConfigMemo
+}
+
+// trustedReviewConfigMemo holds the once-per-process result of consuming the
+// inherited trusted review config pipe. The descriptor carries a single
+// snapshot and is closed after the first read, so every later loadConfig call
+// in the same child must reuse this result instead of reading a closed pipe.
+type trustedReviewConfigMemo struct {
+	done       bool
+	configured bool
+	loaded     config.LoadedFileConfig
+	err        error
 }
 
 func newCommandRuntime(app *App, argv []string) *commandRuntime {

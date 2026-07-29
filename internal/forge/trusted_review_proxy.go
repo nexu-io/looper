@@ -884,6 +884,14 @@ func TrustedReviewSockConfigured() bool {
 	return strings.TrimSpace(os.Getenv(TrustedReviewSockEnv)) != ""
 }
 
+// TrustedReviewProxyChild reports whether this process is the daemon-spawned
+// review-submit child. Such a child runs with a daemon-materialized authority
+// (credential env, bound policy, single-use config pipe) and must not take
+// ambient side paths that a normal operator CLI invocation may take.
+func TrustedReviewProxyChild() bool {
+	return strings.TrimSpace(os.Getenv(trustedReviewProxySkipEnv)) != ""
+}
+
 // ProxyReviewSubmit forwards a review-submit invocation to the trusted proxy.
 // On success it writes the proxy stdout/stderr to the current process streams
 // and returns a process-style exit error when the proxied command failed.

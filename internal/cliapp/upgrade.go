@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -258,6 +259,13 @@ func (r *commandRuntime) maybeRunAutoUpgrade(cmd *cobra.Command, args []string) 
 
 func shouldSkipAutoUpgrade(cmd *cobra.Command) bool {
 	if cmd == nil {
+		return true
+	}
+	// A daemon-spawned review-submit child executes one bound action under a
+	// materialized authority. Replacing its own binary mid-run is never that
+	// action, and the attempt would consume run-scoped state the bound command
+	// still needs.
+	if forge.TrustedReviewProxyChild() {
 		return true
 	}
 	if cmd.Name() == "help" {
