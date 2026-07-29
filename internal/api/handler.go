@@ -1939,26 +1939,31 @@ type pullRequestLoopStatus struct {
 }
 
 type loopResponse struct {
-	ID           string  `json:"id"`
-	Seq          int64   `json:"seq"`
-	ProjectID    string  `json:"projectId"`
-	Type         string  `json:"type"`
-	TargetType   string  `json:"targetType"`
-	TargetID     *string `json:"targetId"`
-	Repo         *string `json:"repo"`
-	PRNumber     *int64  `json:"prNumber"`
-	Status       string  `json:"status"`
-	ConfigJSON   *string `json:"configJson"`
-	MetadataJSON *string `json:"metadataJson"`
-	LastRunAt    *string `json:"lastRunAt"`
-	NextRunAt    *string `json:"nextRunAt"`
-	CreatedAt    string  `json:"createdAt"`
-	UpdatedAt    string  `json:"updatedAt"`
+	ID         string  `json:"id"`
+	Seq        int64   `json:"seq"`
+	ProjectID  string  `json:"projectId"`
+	Type       string  `json:"type"`
+	TargetType string  `json:"targetType"`
+	TargetID   *string `json:"targetId"`
+	Repo       *string `json:"repo"`
+	PRNumber   *int64  `json:"prNumber"`
+	Status     string  `json:"status"`
+	// DisplayStatus is a dashboard-facing projection of durable queue/checkpoint
+	// facts (e.g. manual_intervention, backing_off). It never becomes a true loop
+	// status; clients must keep Status as the authority for mutations.
+	DisplayStatus string  `json:"displayStatus,omitempty"`
+	ConfigJSON    *string `json:"configJson"`
+	MetadataJSON  *string `json:"metadataJson"`
+	LastRunAt     *string `json:"lastRunAt"`
+	NextRunAt     *string `json:"nextRunAt"`
+	CreatedAt     string  `json:"createdAt"`
+	UpdatedAt     string  `json:"updatedAt"`
 	// Queue-derived diagnostics (latest queue item / run), matching looper describe / ps.
 	Attempts          *int64  `json:"attempts,omitempty"`
 	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
 	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
+	ResumePolicy      *string `json:"resumePolicy,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -3473,8 +3478,9 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	}
 }
 
-// decorateLoopDiagnostics attaches latest-queue attempt counts and failure reason
-// (with the same run fallback as active-run views) for dashboard list/detail.
+// decorateLoopDiagnostics attaches latest-queue attempt counts, failure reason,
+// and displayStatus (with the same run fallback and manual-intervention rules as
+// active-run views) for dashboard list/detail.
 func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
 	if view == nil {
 		return
@@ -3495,6 +3501,18 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 				view.LastFailureReason = latestRun.Summary
 			}
 		}
+	}
+	view.ResumePolicy = resumePolicyFromRun(latestRun)
+	// Same authority as decorateActiveRunView: durable queue/checkpoint facts only.
+	// Closed loops keep their true status (not re-projected as manual_intervention).
+	view.DisplayStatus = view.Status
+	if !isClosedLoopStatus(view.Status) && (isManualInterventionQueue(latestQueue) || hasManualInterventionResumePolicy(latestRun)) {
+		view.DisplayStatus = "manual_intervention"
+	} else if isBackingOffQueue(latestQueue, time.Now().UTC()) {
+		view.DisplayStatus = "backing_off"
+	}
+	if view.DisplayStatus == "" {
+		view.DisplayStatus = view.Status
 	}
 }
 

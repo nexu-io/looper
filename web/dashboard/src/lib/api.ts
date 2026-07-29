@@ -225,6 +225,11 @@ export type Loop = {
   repo?: string | null;
   prNumber?: number | null;
   status: string;
+  /**
+   * Dashboard-facing projection of durable queue/checkpoint facts
+   * (e.g. manual_intervention). Not a true loop status authority.
+   */
+  displayStatus?: string | null;
   configJson?: string | null;
   metadataJson?: string | null;
   lastRunAt?: string | null;
@@ -237,6 +242,7 @@ export type Loop = {
   maxAttempts?: number | null;
   lastFailureKind?: string | null;
   lastFailureReason?: string | null;
+  resumePolicy?: string | null;
 };
 
 export type LoopsList = {

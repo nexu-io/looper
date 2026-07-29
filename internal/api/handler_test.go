@@ -489,6 +489,245 @@ func TestHandlerLoopDetailAndListSurfaceAttemptsAndFailureReason(t *testing.T) {
 	assertEqual(t, listItem["lastFailureReason"], lastError)
 }
 
+// TestHandlerLoopDetailManualInterventionRecoverySurface covers the Dashboard
+// recovery-card inputs: displayStatus + failure reason, non-mutating detail/worktree
+// reads, and the safe discard matrix from GET /worktree facts.
+func TestHandlerLoopDetailManualInterventionRecoverySurface(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	lastErrorKind := "manual_intervention"
+	lastError := "dirty worker worktree: uncommitted local changes"
+
+	// Managed dirty worktree parked for manual intervention.
+	dirtyProjectID := "project_recovery_dirty"
+	dirtyLoopID := "loop_recovery_dirty"
+	dirty := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: dirtyProjectID,
+		LoopID:    dirtyLoopID,
+		LoopSeq:   6171,
+		LoopType:  "worker",
+		Branch:    "feature/recovery-dirty",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	// Fixture seeds a failed queue; re-park as durable manual_intervention.
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: dirty.FailedQueueID, ProjectID: &dirtyProjectID, LoopID: &dirtyLoopID, Type: "worker",
+		TargetType: "project", TargetID: dirtyProjectID, DedupeKey: "worker:recovery_dirty",
+		Priority: storage.QueuePriorityWorker, Status: "manual_intervention", AvailableAt: nowISO,
+		Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
+		FinishedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(dirty manual) error = %v", err)
+	}
+	if loop, err := services.Repositories.Loops.GetByID(context.Background(), dirtyLoopID); err != nil || loop == nil {
+		t.Fatalf("GetByID(dirty) = %#v, %v", loop, err)
+	} else {
+		loop.Status = "paused"
+		loop.UpdatedAt = nowISO
+		if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+			t.Fatalf("Loops.Upsert(dirty paused) error = %v", err)
+		}
+	}
+
+	// Clean managed worktree under manual intervention (retry without discard).
+	cleanProjectID := "project_recovery_clean"
+	cleanLoopID := "loop_recovery_clean"
+	clean := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: cleanProjectID,
+		LoopID:    cleanLoopID,
+		LoopSeq:   6172,
+		LoopType:  "worker",
+		Branch:    "feature/recovery-clean",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+	cleanReason := "prepare failed: remote rejected non-fast-forward"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: clean.FailedQueueID, ProjectID: &cleanProjectID, LoopID: &cleanLoopID, Type: "worker",
+		TargetType: "project", TargetID: cleanProjectID, DedupeKey: "worker:recovery_clean",
+		Priority: storage.QueuePriorityWorker, Status: "manual_intervention", AvailableAt: nowISO,
+		Attempts: 2, MaxAttempts: 5, LastError: &cleanReason, LastErrorKind: &lastErrorKind,
+		FinishedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(clean manual) error = %v", err)
+	}
+	if loop, err := services.Repositories.Loops.GetByID(context.Background(), cleanLoopID); err != nil || loop == nil {
+		t.Fatalf("GetByID(clean) = %#v, %v", loop, err)
+	} else {
+		loop.Status = "paused"
+		loop.UpdatedAt = nowISO
+		if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+			t.Fatalf("Loops.Upsert(clean paused) error = %v", err)
+		}
+	}
+
+	// Unmanaged dirty path: present but not under managed worktree root → no discard.
+	unmanagedProjectID := "project_recovery_unmanaged"
+	unmanagedLoopID := "loop_recovery_unmanaged"
+	unmanagedTarget := unmanagedProjectID
+	unmanagedRepo := t.TempDir()
+	runGitTest(t, unmanagedRepo, "init")
+	runGitTest(t, unmanagedRepo, "config", "user.email", "test@example.com")
+	runGitTest(t, unmanagedRepo, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(unmanagedRepo, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(unmanaged README) error = %v", err)
+	}
+	runGitTest(t, unmanagedRepo, "add", "README.md")
+	runGitTest(t, unmanagedRepo, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(unmanagedRepo, "dirty.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(unmanaged dirty) error = %v", err)
+	}
+	worktreeRoot := filepath.Join(t.TempDir(), "managed-root")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree root) error = %v", err)
+	}
+	unmanagedMeta, _ := json.Marshal(map[string]any{"worktreeRoot": worktreeRoot})
+	unmanagedMetaJSON := string(unmanagedMeta)
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: unmanagedProjectID, Name: "Unmanaged", RepoPath: unmanagedRepo, MetadataJSON: &unmanagedMetaJSON,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(unmanaged) error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: unmanagedLoopID, Seq: 6173, ProjectID: unmanagedProjectID, Type: "worker",
+		TargetType: "project", TargetID: &unmanagedTarget, Status: "paused",
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(unmanaged) error = %v", err)
+	}
+	// Checkpoint points at primary repo path (outside managed root).
+	checkpoint := fmt.Sprintf(`{"worktree":{"path":%q,"branch":"main"}}`, unmanagedRepo)
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_" + unmanagedLoopID, LoopID: unmanagedLoopID, Status: "failed",
+		CheckpointJSON: &checkpoint, ErrorMessage: &lastError, StartedAt: nowISO,
+		EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(unmanaged) error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_recovery_unmanaged", ProjectID: &unmanagedProjectID, LoopID: &unmanagedLoopID,
+		Type: "worker", TargetType: "project", TargetID: unmanagedTarget,
+		DedupeKey: "worker:recovery_unmanaged", Priority: storage.QueuePriorityWorker,
+		Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3,
+		LastError: &lastError, LastErrorKind: &lastErrorKind, FinishedAt: &nowISO,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(unmanaged) error = %v", err)
+	}
+
+	// Snapshot durable state before non-mutating reads.
+	preDirtyLoop, _ := services.Repositories.Loops.GetByID(context.Background(), dirtyLoopID)
+	preDirtyQueue, _ := services.Repositories.Queue.GetLatestByLoopID(context.Background(), dirtyLoopID)
+
+	// --- Detail reason + displayStatus ---
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6171", nil)
+	detailRec := httptest.NewRecorder()
+	h.ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
+	}
+	detail := parseJSONMap(t, detailRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, detail["status"], "paused")
+	assertEqual(t, detail["displayStatus"], "manual_intervention")
+	assertEqual(t, detail["lastFailureKind"], "manual_intervention")
+	assertEqual(t, detail["lastFailureReason"], lastError)
+
+	// GET detail must not mutate loop/queue.
+	postDirtyLoop, err := services.Repositories.Loops.GetByID(context.Background(), dirtyLoopID)
+	if err != nil || postDirtyLoop == nil || postDirtyLoop.Status != preDirtyLoop.Status || postDirtyLoop.UpdatedAt != preDirtyLoop.UpdatedAt {
+		t.Fatalf("loop mutated by GET detail: before=%#v after=%#v err=%v", preDirtyLoop, postDirtyLoop, err)
+	}
+	postDirtyQueue, err := services.Repositories.Queue.GetLatestByLoopID(context.Background(), dirtyLoopID)
+	if err != nil || postDirtyQueue == nil || postDirtyQueue.Status != preDirtyQueue.Status || postDirtyQueue.ID != preDirtyQueue.ID {
+		t.Fatalf("queue mutated by GET detail: before=%#v after=%#v err=%v", preDirtyQueue, postDirtyQueue, err)
+	}
+
+	// --- Safe action matrix via worktree preflight ---
+	// managed dirty → discard may be offered (present+managed+dirty)
+	wtDirtyReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6171/worktree", nil)
+	wtDirtyRec := httptest.NewRecorder()
+	h.ServeHTTP(wtDirtyRec, wtDirtyReq)
+	if wtDirtyRec.Code != http.StatusOK {
+		t.Fatalf("worktree dirty status = %d; body=%s", wtDirtyRec.Code, wtDirtyRec.Body.String())
+	}
+	wtDirty := parseJSONMap(t, wtDirtyRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, wtDirty["present"], true)
+	assertEqual(t, wtDirty["managed"], true)
+	assertEqual(t, wtDirty["dirty"], true)
+	assertEqual(t, wtDirty["worktreePath"], dirty.WorktreePath)
+
+	// clean → retry without discard
+	wtCleanReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6172/worktree", nil)
+	wtCleanRec := httptest.NewRecorder()
+	h.ServeHTTP(wtCleanRec, wtCleanReq)
+	if wtCleanRec.Code != http.StatusOK {
+		t.Fatalf("worktree clean status = %d; body=%s", wtCleanRec.Code, wtCleanRec.Body.String())
+	}
+	wtClean := parseJSONMap(t, wtCleanRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, wtClean["present"], true)
+	assertEqual(t, wtClean["managed"], true)
+	assertEqual(t, wtClean["dirty"], false)
+	assertEqual(t, wtClean["clean"], true)
+
+	// unmanaged → never discard through dashboard (managed=false)
+	wtUnmanagedReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6173/worktree", nil)
+	wtUnmanagedRec := httptest.NewRecorder()
+	h.ServeHTTP(wtUnmanagedRec, wtUnmanagedReq)
+	if wtUnmanagedRec.Code != http.StatusOK {
+		t.Fatalf("worktree unmanaged status = %d; body=%s", wtUnmanagedRec.Code, wtUnmanagedRec.Body.String())
+	}
+	wtUnmanaged := parseJSONMap(t, wtUnmanagedRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, wtUnmanaged["present"], true)
+	assertEqual(t, wtUnmanaged["managed"], false)
+	assertEqual(t, wtUnmanaged["reason"], "unmanaged")
+	// dirty may be reported for inspect, but clients must not offer discard when managed=false
+	if managed, _ := wtUnmanaged["managed"].(bool); managed {
+		t.Fatal("unmanaged worktree must not report managed=true")
+	}
+
+	// Clean loop detail also projects manual_intervention with its reason.
+	cleanDetailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6172", nil)
+	cleanDetailRec := httptest.NewRecorder()
+	h.ServeHTTP(cleanDetailRec, cleanDetailReq)
+	if cleanDetailRec.Code != http.StatusOK {
+		t.Fatalf("clean detail status = %d; body=%s", cleanDetailRec.Code, cleanDetailRec.Body.String())
+	}
+	cleanDetail := parseJSONMap(t, cleanDetailRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, cleanDetail["displayStatus"], "manual_intervention")
+	assertEqual(t, cleanDetail["lastFailureReason"], cleanReason)
+
+	// awaiting_human must not be re-projected as manual_intervention (decision card path).
+	hitlProjectID := "project_recovery_hitl"
+	hitlLoopID := "loop_recovery_hitl"
+	hitlTarget := hitlProjectID
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: hitlProjectID, Name: "HITL", RepoPath: "/tmp/repos/hitl", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(hitl) error = %v", err)
+	}
+	meta := `{"hitl":{"question":"Ship it?","options":["yes","no"],"status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: hitlLoopID, Seq: 6174, ProjectID: hitlProjectID, Type: "fixer",
+		TargetType: "project", TargetID: &hitlTarget, Status: "awaiting_human",
+		MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(hitl) error = %v", err)
+	}
+	hitlReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6174", nil)
+	hitlRec := httptest.NewRecorder()
+	h.ServeHTTP(hitlRec, hitlReq)
+	if hitlRec.Code != http.StatusOK {
+		t.Fatalf("hitl detail status = %d; body=%s", hitlRec.Code, hitlRec.Body.String())
+	}
+	hitlDetail := parseJSONMap(t, hitlRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, hitlDetail["status"], "awaiting_human")
+	assertEqual(t, hitlDetail["displayStatus"], "awaiting_human")
+}
+
 func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

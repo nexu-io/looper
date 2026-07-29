@@ -9,6 +9,7 @@ import {
 import { Link, useParams } from "react-router-dom";
 import { LoopActionBar } from "@/components/LoopActionBar";
 import { PanelError } from "@/components/PanelError";
+import { RecoveryCard } from "@/components/RecoveryCard";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -533,12 +534,31 @@ export function LoopDetailPage() {
             Loop{" "}
             <span className="mono">{data ? `#${data.seq}` : selector}</span>
           </h1>
-          {data ? <StatusChip status={data.status} /> : null}
+          {data ? (
+            <>
+              <StatusChip status={data.status} />
+              {data.displayStatus &&
+              data.displayStatus !== data.status ? (
+                <StatusChip status={data.displayStatus} />
+              ) : null}
+            </>
+          ) : null}
         </div>
         <Button variant="ghost" size="sm" onClick={refresh}>
           Refresh
         </Button>
       </div>
+
+      {/* Recovery card is prominent and appears above generic actions when
+          durable facts produce displayStatus=manual_intervention. */}
+      {data ? (
+        <RecoveryCard
+          loop={data}
+          selector={String(data.seq)}
+          hasActiveRun={hasActiveRun}
+          onMutated={onMutated}
+        />
+      ) : null}
 
       {data ? (
         <Card title="Actions">
@@ -573,6 +593,16 @@ export function LoopDetailPage() {
               <Kv label="ID" value={data.id} />
               <Kv label="Type" value={data.type} />
               <Kv label="Status" value={<StatusChip status={data.status} />} />
+              <Kv
+                label="Display"
+                value={
+                  data.displayStatus?.trim() ? (
+                    <StatusChip status={data.displayStatus} />
+                  ) : (
+                    "—"
+                  )
+                }
+              />
               <Kv label="Project" value={data.projectId} />
               <Kv label="Target type" value={data.targetType} />
               <Kv label="Target ID" value={data.targetId ?? "—"} />
@@ -619,7 +649,9 @@ export function LoopDetailPage() {
       </Card>
 
       {/* Remount on selector change so log buffer/stream state never leaks. */}
-      <LogsPane key={selector} selector={selector} />
+      <div id="loop-logs">
+        <LogsPane key={selector} selector={selector} />
+      </div>
     </div>
   );
 }
