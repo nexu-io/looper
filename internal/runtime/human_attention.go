@@ -368,6 +368,13 @@ func notifyDurableHumanAttention(ctx context.Context, gateway *notify.Gateway, r
 	if queue.Status != "manual_intervention" {
 		return
 	}
+	// CancelByLoop (used by Terminate/Pause) only cancels queued/running rows, so a
+	// terminal loop can retain a stale manual_intervention queue status. Alert only
+	// when the loop itself is still active — terminated/completed parks are not
+	// current operator holds.
+	if !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+		return
+	}
 	lastErrorKind := ""
 	if queue.LastErrorKind != nil {
 		lastErrorKind = *queue.LastErrorKind
