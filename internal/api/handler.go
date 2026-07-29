@@ -3420,7 +3420,19 @@ func latestQueueItemByLoopID(items []storage.QueueItemRecord) map[string]*storag
 }
 
 func isManualInterventionQueue(item *storage.QueueItemRecord) bool {
-	return item != nil && (item.Status == "manual_intervention" || (item.LastErrorKind != nil && *item.LastErrorKind == "manual_intervention"))
+	if item == nil {
+		return false
+	}
+	// Parked MI status is always a hold.
+	if item.Status == "manual_intervention" {
+		return true
+	}
+	// Active automation must not be treated as a hold solely because recovery
+	// requeues preserve last_error_kind (RequeueRunningByLoop does not clear it).
+	if queueIsActiveAutomation(item) {
+		return false
+	}
+	return item.LastErrorKind != nil && strings.TrimSpace(*item.LastErrorKind) == "manual_intervention"
 }
 
 func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
@@ -3428,11 +3440,11 @@ func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 	return policy != nil && *policy == loops.ResumePolicyManualIntervention
 }
 
-// queueSupersedesRunResumePolicy reports whether the latest queue item is active
-// work that should win over a stale run checkpoint resumePolicy (e.g. after
-// retryLoop enqueues a fresh queued item while the previous run still carries
-// resumePolicy=manual_intervention).
-func queueSupersedesRunResumePolicy(item *storage.QueueItemRecord) bool {
+// queueIsActiveAutomation reports whether the latest queue item is live work
+// (queued/running). Active status supersedes stale holds from a retained
+// last_error_kind (startup recovery requeues) and from a prior run's
+// resumePolicy=manual_intervention after retry.
+func queueIsActiveAutomation(item *storage.QueueItemRecord) bool {
 	if item == nil {
 		return false
 	}
@@ -3445,10 +3457,20 @@ func queueSupersedesRunResumePolicy(item *storage.QueueItemRecord) bool {
 }
 
 // projectManualInterventionDisplayStatus chooses displayStatus using durable
-// queue facts first, then run resumePolicy only when no active queue item has
-// superseded that hold. Closed loops keep their true status.
+// queue facts. Active queued/running items win over a retained last_error_kind
+// and over a stale run resumePolicy; only then is resumePolicy consulted.
+// Closed loops keep their true status.
 func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) string {
 	if isClosedLoopStatus(loopStatus) {
+		return ""
+	}
+	// Prefer active queue (queued/running after recovery requeue or retry) over
+	// a retained last_error_kind or a stale checkpoint hold. Delayed retryable
+	// requeues still surface as backing_off.
+	if queueIsActiveAutomation(latestQueue) {
+		if isBackingOffQueue(latestQueue, now) {
+			return "backing_off"
+		}
 		return ""
 	}
 	if isManualInterventionQueue(latestQueue) {
@@ -3457,8 +3479,7 @@ func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *stor
 	if isBackingOffQueue(latestQueue, now) {
 		return "backing_off"
 	}
-	// Prefer active queue (queued/running after retry) over a stale checkpoint hold.
-	if !queueSupersedesRunResumePolicy(latestQueue) && hasManualInterventionResumePolicy(latestRun) {
+	if hasManualInterventionResumePolicy(latestRun) {
 		return "manual_intervention"
 	}
 	return ""
