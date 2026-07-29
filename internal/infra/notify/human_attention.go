@@ -115,6 +115,13 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		entityID = firstNonEmpty(input.LoopID, entryKey)
 	}
 
+	// awaiting_human already has a Feishu HITL ask card (suspendForHuman); a
+	// second plain remote message for that park duplicates the only interactive
+	// remote signal. manual_intervention has no such duplicate: the former
+	// worker-completion remote path was removed, so suppress LocalOnly only for
+	// awaiting_human and keep remote webhook/Feishu delivery for hard holds.
+	localOnly := reason == HumanAttentionAwaitingHuman
+
 	return g.Notify(ctx, SystemNotificationPayload{
 		ProjectID:         input.ProjectID,
 		LoopID:            input.LoopID,
@@ -129,10 +136,7 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		DedupeKey:         dedupeKey,
 		OpenURL:           openURL,
 		OperatorAttention: true,
-		// Local channels only: Feishu HITL already sends an interactive ask card
-		// via suspendForHuman, and app-mode milestones cover manual holds. A second
-		// plain-text Feishu/webhook message for the same park would duplicate alerts.
-		LocalOnly: true,
+		LocalOnly:         localOnly,
 	})
 }
 

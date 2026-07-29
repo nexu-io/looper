@@ -147,9 +147,11 @@ type SystemNotificationPayload struct {
 	// (worker skipped, PR ready) leave this false so they stay lightweight
 	// display notification and do not block the scheduler for up to 30s.
 	OperatorAttention bool
-	// LocalOnly skips remote webhook / Feishu app delivery. Used for human-attention
-	// alerts so they stay on in_app + osascript and do not duplicate interactive
-	// HITL ask cards or app-mode milestones already sent on those channels.
+	// LocalOnly skips remote webhook / Feishu app delivery. Used for
+	// awaiting_human human-attention alerts so they do not duplicate the
+	// interactive Feishu HITL ask card already sent by suspendForHuman.
+	// Hard manual_intervention parks leave this false so generic webhooks
+	// (and Feishu app mode) still reach unattended operators.
 	LocalOnly bool
 }
 

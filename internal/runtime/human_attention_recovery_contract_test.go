@@ -239,6 +239,103 @@ func TestHumanAttentionContract_RecoveryNotifyOnlyAfterStartupCommitted(t *testi
 	assertHumanAttentionInAppCount(t, repositories, loopID, 0)
 }
 
+// Post-claim human-attention delivery must not use the detached WithoutCancel
+// dispatch context: BeginShutdown cancels a runtime-owned parent, and Stop
+// drains so a 35s osascript cannot outlive the shutdown timeout and persist
+// through a closed coordinator.
+func TestHumanAttentionContract_PostClaimNotifyCanceledOnShutdown(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	startedPath := filepath.Join(root, "osascript.started")
+	scriptPath := filepath.Join(root, "osascript")
+	// Block until SIGTERM/SIGINT (shell.Run kill on ctx cancel). Without cancel
+	// this would sleep ~30s like a real dialog and outlive shutdownTimeout.
+	script := "#!/bin/sh\n: > \"" + startedPath + "\"\ntrap 'exit 0' TERM INT\nwhile true; do sleep 0.05; done\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(osascript) error = %v", err)
+	}
+
+	coordinator := openMigratedCoordinator(t, filepath.Join(root, "post-claim-cancel.sqlite"), filepath.Join(root, "backups"))
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 29, 18, 0, 0, 0, time.UTC)
+	nowISO := eventlog.FormatJavaScriptISOString(now)
+	projectID := "project_post_claim_cancel"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID: projectID, Name: "Post Claim Cancel", RepoPath: filepath.Join(root, "repo"),
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_post_claim_cancel"
+	target := projectID
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{
+		ID: loopID, Seq: 901, ProjectID: projectID, Type: "worker",
+		TargetType: "project", TargetID: &target, Status: "awaiting_human",
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Notifications.InApp = true
+	cfg.Notifications.Osascript.Enabled = true
+	cfg.Notifications.Osascript.ThrottleWindowSeconds = 60
+	osascriptPath := scriptPath
+	cfg.Tools.OsascriptPath = &osascriptPath
+	cfg.Daemon.LogDir = filepath.Join(root, "logs")
+
+	admission := NewAdmission()
+	if err := admission.MarkReady("test post-claim cancel"); err != nil {
+		t.Fatalf("MarkReady() error = %v", err)
+	}
+	rt := &Runtime{
+		config:           cfg,
+		logger:           &testLogger{},
+		now:              func() time.Time { return now },
+		shutdownTimeout:  1500 * time.Millisecond,
+		services:         Services{Coordinator: coordinator, Repositories: repos},
+		admission:        admission,
+		activeExecutions: NewActiveExecutionRegistry(),
+		shutdownCh:       make(chan struct{}),
+	}
+
+	// Simulate post-finalize callback under detached dispatch ctx (WithoutCancel).
+	// Runtime must ignore that and schedule under its cancelable parent.
+	dispatchCtx := context.WithoutCancel(context.Background())
+	rt.notifyHumanAttentionPostClaim(dispatchCtx, loopID)
+
+	// Wait until the fake osascript has started so we know cancel has work to do.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("osascript did not start; post-claim notify may not have launched")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// BeginShutdown cancels HA delivery; stop drains the WaitGroup.
+	start := time.Now()
+	rt.BeginShutdown("test cancel post-claim human-attention")
+	rt.stopHumanAttentionRecoveryNotify()
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Fatalf("stopHumanAttentionRecoveryNotify() elapsed = %v, want cancel-bounded (not full osascript dialog)", elapsed)
+	}
+
+	// After cancel+drain, SQLite close must not race a still-running persist.
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("coordinator.Close() after drained HA notify error = %v", err)
+	}
+}
+
 // Post-recovery rescan is cancel/done-tracked and joined on Stop so SQLite
 // close cannot race the background query (CI TempDir state/ cleanup failures).
 func TestHumanAttentionContract_RecoveryNotifyJoinedBeforeStop(t *testing.T) {

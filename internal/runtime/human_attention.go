@@ -16,7 +16,8 @@ import (
 
 // notifyHumanAttentionBestEffort builds a short-lived gateway from the current
 // runtime config and emits human-attention notifications without affecting the
-// caller's control flow. Used from recovery rescan (async) and tests.
+// caller's control flow. Used from recovery rescan (async), post-claim delivery,
+// and tests.
 func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *storage.Repositories, loopID string) {
 	if r == nil || repos == nil || strings.TrimSpace(loopID) == "" {
 		return
@@ -34,6 +35,72 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 	notifyDurableHumanAttention(ctx, gateway, repos, loopID)
 }
 
+// ensureHumanAttentionNotifyCtx returns the shared cancelable parent for
+// human-attention delivery. Refuses to arm after Stop or while admission is
+// stopping so a post-claim race cannot outlive BeginShutdown's cancel snapshot.
+func (r *Runtime) ensureHumanAttentionNotifyCtx() (context.Context, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return nil, false
+	}
+	if r.admission != nil && r.admission.State() == AdmissionStopping {
+		return nil, false
+	}
+	if r.humanAttentionNotifyCancel == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		r.humanAttentionNotifyCtx = ctx
+		r.humanAttentionNotifyCancel = cancel
+	}
+	return r.humanAttentionNotifyCtx, true
+}
+
+// goHumanAttentionNotify runs fn under the shared cancelable HA context and
+// tracks it on humanAttentionNotifyWG so Stop can drain before SQLite close.
+func (r *Runtime) goHumanAttentionNotify(fn func(context.Context)) {
+	if r == nil || fn == nil {
+		return
+	}
+	ctx, ok := r.ensureHumanAttentionNotifyCtx()
+	if !ok {
+		return
+	}
+	r.humanAttentionNotifyWG.Add(1)
+	go func() {
+		defer r.humanAttentionNotifyWG.Done()
+		if ctx.Err() != nil {
+			return
+		}
+		fn(ctx)
+	}()
+}
+
+// notifyHumanAttentionPostClaim is the scheduler post-finalize callback.
+// It ignores the dispatch WithoutCancel context: interactive osascript must
+// cancel when BeginShutdown fires, and Stop must drain before SQLite close.
+// Delivery is async so a 35s dialog cannot pin a scheduler task slot across
+// the shutdown timeout.
+func (r *Runtime) notifyHumanAttentionPostClaim(_ context.Context, loopID string) {
+	if r == nil {
+		return
+	}
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return
+	}
+	services := r.Services()
+	if services.Repositories == nil {
+		return
+	}
+	repos := services.Repositories
+	r.goHumanAttentionNotify(func(ctx context.Context) {
+		r.notifyHumanAttentionBestEffort(ctx, repos, loopID)
+	})
+}
+
 // scheduleHumanAttentionRecoveryNotify rescans durable human-attention parks
 // after CompleteStartup has committed (MarkReady succeeded). Callers must not
 // schedule this while later startup steps can still fail and close SQLite.
@@ -45,66 +112,73 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 // on the critical path. Permanent entry-scoped dedupe decides whether an alert
 // is sent — not the crash-sensitive post-finalize callback window.
 //
-// The goroutine is cancel/done-tracked and joined in Stop before SQLite close
-// so recovery queries and best-effort delivery cannot race coordinator.Close
-// (TempDir state/ cleanup failures and retain-storage edge cases).
+// Shares the cancel/WG lifecycle with post-claim delivery; Stop joins both
+// before SQLite close so queries cannot race coordinator.Close.
 func (r *Runtime) scheduleHumanAttentionRecoveryNotify(repos *storage.Repositories) {
 	if r == nil || repos == nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	r.mu.Lock()
-	if r.stopped {
+	if r.stopped || (r.admission != nil && r.admission.State() == AdmissionStopping) {
 		r.mu.Unlock()
-		cancel()
 		return
 	}
-	// CompleteStartup is once; if a prior schedule exists (tests), cancel it first.
-	prevCancel := r.humanAttentionNotifyCancel
+	// CompleteStartup is once; if a prior schedule exists (tests), wait it out
+	// without canceling the shared delivery context (post-claim may be live).
 	prevDone := r.humanAttentionNotifyDone
-	r.humanAttentionNotifyCancel = cancel
 	r.humanAttentionNotifyDone = done
 	r.mu.Unlock()
-	if prevCancel != nil {
-		prevCancel()
-	}
 	if prevDone != nil {
 		<-prevDone
 	}
 
+	ctx, ok := r.ensureHumanAttentionNotifyCtx()
+	if !ok {
+		close(done)
+		return
+	}
+	r.humanAttentionNotifyWG.Add(1)
 	go func() {
+		defer r.humanAttentionNotifyWG.Done()
 		defer close(done)
+		if ctx.Err() != nil {
+			return
+		}
 		r.notifyDurableHumanAttentionParksBestEffort(ctx, repos)
 	}()
 }
 
-// stopHumanAttentionRecoveryNotify cancels the post-recovery rescan and waits
-// for it to exit (bounded by shutdownTimeout) before SQLite may be closed.
+// stopHumanAttentionRecoveryNotify cancels all human-attention delivery
+// (recovery rescan + post-claim) and waits for inflight work to exit
+// (bounded by shutdownTimeout) before SQLite may be closed.
 func (r *Runtime) stopHumanAttentionRecoveryNotify() {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
 	cancel := r.humanAttentionNotifyCancel
-	done := r.humanAttentionNotifyDone
 	r.humanAttentionNotifyCancel = nil
+	r.humanAttentionNotifyCtx = nil
 	r.humanAttentionNotifyDone = nil
 	r.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
-	if done == nil {
-		return
-	}
+
+	done := make(chan struct{})
+	go func() {
+		r.humanAttentionNotifyWG.Wait()
+		close(done)
+	}()
 	timer := time.NewTimer(r.shutdownTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
 	case <-timer.C:
 		if r.logger != nil {
-			r.logger.Warn("looperd stop timed out waiting for human-attention recovery notify", map[string]any{
+			r.logger.Warn("looperd stop timed out waiting for human-attention notify", map[string]any{
 				"timeoutMs": r.shutdownTimeout.Milliseconds(),
 			})
 		}

@@ -2942,7 +2942,7 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, notifyHumanAttention func(context.Context, string)) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -2986,6 +2986,12 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
 		input.AllowClaim = allowClaim
+		// Runtime-owned cancelable lifecycle for post-claim human-attention
+		// delivery (BeginShutdown cancel + Stop drain). Overrides the snapshot
+		// default which would run under the detached WithoutCancel dispatch ctx.
+		if notifyHumanAttention != nil {
+			input.NotifyHumanAttention = notifyHumanAttention
+		}
 		// Wire Supervisor operation leases for claim ownership span (#579).
 		// Prefer the live registry from Services when present (daemon path).
 		if services.ActiveExecutions != nil {
@@ -3000,6 +3006,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
 				stopped.AllowClaim = allowClaim
+				if notifyHumanAttention != nil {
+					stopped.NotifyHumanAttention = notifyHumanAttention
+				}
 				if services.ActiveExecutions != nil {
 					stopped.OperationOwner = services.ActiveExecutions
 				} else if activeExecutions != nil {
@@ -3010,6 +3019,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
 			latest.AllowClaim = allowClaim
+			if notifyHumanAttention != nil {
+				latest.NotifyHumanAttention = notifyHumanAttention
+			}
 			if services.ActiveExecutions != nil {
 				latest.OperationOwner = services.ActiveExecutions
 			} else if activeExecutions != nil {
@@ -4670,6 +4682,13 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 			}
 			// Best-effort operator notify for durable human-attention parks.
 			// Never affects claim finalization or recovery.
+			//
+			// The dispatch ctx is WithoutCancel so finalize survives shutdown;
+			// do not keep interactive osascript on that detached lifetime.
+			// Daemon wiring (notifyHumanAttentionPostClaim) ignores this ctx and
+			// uses a runtime-owned cancelable parent that BeginShutdown cancels
+			// and Stop drains before SQLite close. Tests may pass a direct
+			// callback that uses the provided ctx.
 			if input.NotifyHumanAttention != nil && item.LoopID != nil {
 				input.NotifyHumanAttention(ctx, *item.LoopID)
 			}

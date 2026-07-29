@@ -185,10 +185,15 @@ type Runtime struct {
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
-	// humanAttentionNotifyCancel/Done track the one-shot post-recovery rescan
-	// goroutine. It must be joined before SQLite close so temp test DBs and
-	// process exit do not race WAL/query handles (see scheduleHumanAttentionRecoveryNotify).
+	// humanAttentionNotifyCancel/Ctx are the shared cancelable parent for all
+	// best-effort human-attention delivery (post-claim + recovery rescan).
+	// humanAttentionNotifyWG drains those goroutines before SQLite close so
+	// interactive osascript and notification persists cannot race coordinator.Close.
+	// humanAttentionNotifyDone is the latest recovery-rescan generation only
+	// (WaitForHumanAttentionRecoveryNotify / API fixtures).
 	humanAttentionNotifyCancel context.CancelFunc
+	humanAttentionNotifyCtx    context.Context
+	humanAttentionNotifyWG     sync.WaitGroup
 	humanAttentionNotifyDone   chan struct{}
 	activeExecutions           *ActiveExecutionRegistry
 	projectCatalog             *projects.Catalog
@@ -515,8 +520,9 @@ func (c workProducerCancels) invokeForDegrade() {
 
 // invokeForShutdown cancels all work producers including webhook discovery so
 // process exit can abort in-flight CreateOrGetActiveByDedupe promptly.
-// Also cancels human-attention recovery rescan so interactive osascript cannot
-// block process exit beyond stopHumanAttentionRecoveryNotify's wait budget.
+// Also cancels human-attention delivery (recovery rescan + post-claim) so
+// interactive osascript cannot block process exit beyond
+// stopHumanAttentionRecoveryNotify's wait budget.
 func (c workProducerCancels) invokeForShutdown() {
 	c.invokeForDegrade()
 	if c.humanAttention != nil {
@@ -983,7 +989,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.notifyHumanAttentionPostClaim)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook

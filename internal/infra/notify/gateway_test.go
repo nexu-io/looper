@@ -434,7 +434,8 @@ func TestDashboardDeepLinkUsable_OriginAndAuthPolicy(t *testing.T) {
 }
 
 func TestGatewayHumanAttentionSkipsFeishuAppDelivery(t *testing.T) {
-	// Human-attention is local-only so Feishu HITL ask cards / milestones are not duplicated.
+	// awaiting_human is local-only so Feishu HITL ask cards are not duplicated.
+	// manual_intervention must still reach Feishu app (no HITL ask duplicate).
 	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
@@ -453,10 +454,26 @@ func TestGatewayHumanAttentionSkipsFeishuAppDelivery(t *testing.T) {
 		t.Fatalf("in_app status = %q, want success; records=%#v", got, records)
 	}
 	if got := notificationStatus(records, "feishu_app"); got != "" {
-		t.Fatalf("feishu_app status = %q, want absent (local-only human attention)", got)
+		t.Fatalf("feishu_app status = %q, want absent (local-only awaiting_human)", got)
 	}
 	if len(calls) != 0 {
-		t.Fatalf("feishu HTTP calls = %d, want 0 for NotifyHumanAttention", len(calls))
+		t.Fatalf("feishu HTTP calls = %d, want 0 for awaiting_human NotifyHumanAttention", len(calls))
+	}
+
+	// Hard manual_intervention parks have no HITL ask duplicate — remote delivery stays on.
+	manual := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+		LoopSeq:  8,
+		Reason:   HumanAttentionManualIntervention,
+		EntryKey: "queue:q_manual:t1",
+	})
+	if got := notificationStatus(manual, "in_app"); got != "success" {
+		t.Fatalf("manual in_app status = %q, want success; records=%#v", got, manual)
+	}
+	if got := notificationStatus(manual, "feishu_app"); got != "success" {
+		t.Fatalf("manual feishu_app status = %q, want success (remote alert for hard hold)", got)
+	}
+	if len(calls) == 0 {
+		t.Fatal("manual_intervention NotifyHumanAttention should reach Feishu app HTTP")
 	}
 
 	// Ordinary Notify still delivers to Feishu app mode.
@@ -468,9 +485,6 @@ func TestGatewayHumanAttentionSkipsFeishuAppDelivery(t *testing.T) {
 	})
 	if got := notificationStatus(ordinary, "feishu_app"); got != "success" {
 		t.Fatalf("ordinary feishu_app status = %q, want success", got)
-	}
-	if len(calls) == 0 {
-		t.Fatal("ordinary Notify should reach Feishu app HTTP")
 	}
 }
 
