@@ -90,6 +90,15 @@ describe("classifyRetryWorktree", () => {
         dirty: true,
       }),
     ).toBe("ok");
+    expect(
+      classifyRetryWorktree({
+        loopId: "l",
+        seq: 1,
+        present: true,
+        managed: true,
+        // dirty unknown → fail closed (shared with recovery card)
+      }),
+    ).toBe("inspect-only");
   });
 });
 

@@ -19,6 +19,10 @@ import {
   type LoopAction,
 } from "@/lib/actions";
 import { useToast } from "@/lib/toast";
+import { classifyRetryWorktree } from "@/lib/worktree";
+
+// Re-export so existing test imports keep working; single authority lives in lib/worktree.
+export { classifyRetryWorktree } from "@/lib/worktree";
 
 export type LoopActionBarProps = {
   /** Loop selector (seq or id) used in API paths. */
@@ -69,19 +73,6 @@ export function isWorktreeRouteUnavailable(err: unknown): boolean {
     return msg.includes("unknown route") || msg.includes("not found");
   }
   return false;
-}
-
-/**
- * Classify worktree preflight for retry UX.
- * Discard is only offered for present + managed + dirty.
- */
-export function classifyRetryWorktree(
-  worktree: LoopWorktreeStatus,
-): "ok" | "offer-discard" | "inspect-only" {
-  if (!worktree.present) return "ok";
-  if (worktree.dirty !== true) return "ok";
-  if (worktree.managed) return "offer-discard";
-  return "inspect-only";
 }
 
 export function LoopActionBar({
@@ -196,7 +187,9 @@ export function LoopActionBar({
           offerDiscard: false,
         });
         toast.error(
-          "Dirty worktree is not Looper-managed; inspect before retrying",
+          worktree.managed
+            ? "Worktree dirty state could not be verified; inspect before retrying"
+            : "Dirty worktree is not Looper-managed; inspect before retrying",
         );
         return;
       }

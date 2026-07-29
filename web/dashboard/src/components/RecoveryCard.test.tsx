@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RecoveryCard } from "@/components/RecoveryCard";
@@ -214,5 +215,90 @@ describe("RecoveryCard", () => {
     expect(screen.queryByText("Discard & Retry")).toBeNull();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(retryLoop).not.toHaveBeenCalled();
+  });
+
+  it("requires confirmation before Stop mutates the active run", async () => {
+    fetchLoopWorktree.mockResolvedValue({
+      loopId: "loop_1",
+      seq: 617,
+      present: false,
+      managed: false,
+      reason: "no_worktree",
+    });
+    stopActiveRun.mockResolvedValue({ ok: true });
+    render(
+      <ToastProvider>
+        <RecoveryCard
+          loop={baseLoop({ status: "running" })}
+          selector="617"
+          hasActiveRun
+        />
+      </ToastProvider>,
+    );
+
+    await screen.findByText(/no safe worktree repair path/i);
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(stopActiveRun).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/Stop active run/i)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Stop" }));
+    await waitFor(() => {
+      expect(stopActiveRun).toHaveBeenCalledWith("617");
+    });
+  });
+
+  it("clears stale worktree UI when the selector changes", async () => {
+    fetchLoopWorktree.mockImplementation(async (selector: string) => {
+      if (selector === "617") {
+        return {
+          loopId: "loop_a",
+          seq: 617,
+          present: true,
+          managed: true,
+          dirty: true,
+          clean: false,
+          worktreePath: "/tmp/loop-a-dirty",
+          reason: "dirty",
+        };
+      }
+      return {
+        loopId: "loop_b",
+        seq: 618,
+        present: true,
+        managed: true,
+        dirty: false,
+        clean: true,
+        worktreePath: "/tmp/loop-b-clean",
+        reason: "already_clean",
+      };
+    });
+
+    const { rerender } = render(
+      <ToastProvider>
+        <RecoveryCard loop={baseLoop({ seq: 617 })} selector="617" />
+      </ToastProvider>,
+    );
+
+    await screen.findByText("/tmp/loop-a-dirty");
+    expect(screen.getByRole("button", { name: "Discard & Retry" })).toBeTruthy();
+
+    rerender(
+      <ToastProvider>
+        <RecoveryCard
+          loop={baseLoop({
+            id: "loop_2",
+            seq: 618,
+            lastFailureReason: "remote rejected",
+          })}
+          selector="618"
+        />
+      </ToastProvider>,
+    );
+
+    // Stale path from loop A must not remain visible while targeting B.
+    expect(screen.queryByText("/tmp/loop-a-dirty")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Discard & Retry" })).toBeNull();
+    await screen.findByText("/tmp/loop-b-clean");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 });

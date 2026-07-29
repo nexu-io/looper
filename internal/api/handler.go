@@ -2273,9 +2273,10 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 		}
 
 		responseItems := make([]loopResponse, 0, len(items))
+		now := h.now().UTC()
 		for _, item := range items {
 			view := serializeLoop(item)
-			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID])
+			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID], now)
 			responseItems = append(responseItems, view)
 		}
 
@@ -3480,8 +3481,9 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 
 // decorateLoopDiagnostics attaches latest-queue attempt counts, failure reason,
 // and displayStatus (with the same run fallback and manual-intervention rules as
-// active-run views) for dashboard list/detail.
-func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
+// active-run views) for dashboard list/detail. now must be the handler clock so
+// backing_off matches /runs/active when Context.Now is injected.
+func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) {
 	if view == nil {
 		return
 	}
@@ -3508,7 +3510,7 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 	view.DisplayStatus = view.Status
 	if !isClosedLoopStatus(view.Status) && (isManualInterventionQueue(latestQueue) || hasManualInterventionResumePolicy(latestRun)) {
 		view.DisplayStatus = "manual_intervention"
-	} else if isBackingOffQueue(latestQueue, time.Now().UTC()) {
+	} else if isBackingOffQueue(latestQueue, now) {
 		view.DisplayStatus = "backing_off"
 	}
 	if view.DisplayStatus == "" {
@@ -6374,7 +6376,7 @@ func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage
 		}
 		latestRun = run
 	}
-	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	decorateLoopDiagnostics(&view, latestQueue, latestRun, h.now().UTC())
 	return view, nil
 }
 

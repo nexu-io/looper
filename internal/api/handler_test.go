@@ -894,6 +894,87 @@ func TestHandlerActiveRunsSurfacesBackingOffDisplayStatus(t *testing.T) {
 	}
 }
 
+// TestHandlerLoopListAndDetailUseHandlerClockForBackingOff ensures loop list/detail
+// project backing_off with Context.Now (same clock as /runs/active), not wall time.
+func TestHandlerLoopListAndDetailUseHandlerClockForBackingOff(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	// Fixed "now" in the past relative to AvailableAt so wall clock would already
+	// consider the queue ready, but the injected handler clock still sees backoff.
+	handlerNow := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	wallFuture := handlerNow.Add(10 * time.Minute)
+	nowISO := handlerNow.Format(time.RFC3339Nano)
+	availableAt := wallFuture.Format(time.RFC3339Nano)
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		Now:     func() time.Time { return handlerNow },
+	})
+	services := rt.Services()
+	projectID := "project_loop_backoff_clock"
+	loopID := "loop_loop_backoff_clock"
+	targetID := projectID
+	lastErrorKind := "retryable_transient"
+	lastError := "temporary network failure"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 6191, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_loop_backoff_clock", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
+		TargetType: "project", TargetID: targetID, DedupeKey: "worker:loop_backoff_clock",
+		Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: availableAt,
+		Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6191", nil)
+	detailRec := httptest.NewRecorder()
+	h.ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
+	}
+	detail := parseJSONMap(t, detailRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, detail["status"], "queued")
+	assertEqual(t, detail["displayStatus"], "backing_off")
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops?status=queued", nil)
+	listRec := httptest.NewRecorder()
+	h.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200; body=%s", listRec.Code, listRec.Body.String())
+	}
+	items := parseJSONMap(t, listRec.Body.Bytes())["data"].(map[string]any)["items"].([]any)
+	found := false
+	for _, raw := range items {
+		item := raw.(map[string]any)
+		if item["id"] == loopID {
+			found = true
+			assertEqual(t, item["displayStatus"], "backing_off")
+		}
+	}
+	if !found {
+		t.Fatalf("loop %s not found in list items: %#v", loopID, items)
+	}
+
+	// Same clock must agree on active-runs projection.
+	activeReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+	activeRec := httptest.NewRecorder()
+	h.ServeHTTP(activeRec, activeReq)
+	if activeRec.Code != http.StatusOK {
+		t.Fatalf("active status = %d, want 200; body=%s", activeRec.Code, activeRec.Body.String())
+	}
+	activeItems := parseJSONMap(t, activeRec.Body.Bytes())["data"].(map[string]any)["items"].([]any)
+	if len(activeItems) != 1 {
+		t.Fatalf("active items len = %d, want 1: %#v", len(activeItems), activeItems)
+	}
+	assertEqual(t, activeItems[0].(map[string]any)["displayStatus"], "backing_off")
+}
+
 func TestHandlerActiveRunsDefaultIncludesInterruptedManualResumeAndExcludesCompleted(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})

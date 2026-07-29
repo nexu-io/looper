@@ -1,30 +1,23 @@
 import type { LoopWorktreeStatus } from "@/lib/api";
+import {
+  classifyRetryWorktree,
+  type WorktreeActionDecision,
+  worktreeAllowsDashboardDiscard,
+} from "@/lib/worktree";
+
+export type { WorktreeActionDecision };
+export { classifyRetryWorktree, worktreeAllowsDashboardDiscard };
 
 /**
- * Recovery modes for displayStatus=manual_intervention.
- * Derived only from durable failure reason + worktree preflight facts —
- * never from parsing failure text.
+ * Whether recovery has no usable worktree path (missing / fetch failure /
+ * loop type without worktree). Presentation-only — not a second discard policy.
  */
-export type RecoveryMode =
-  | "clean"
-  | "managed_dirty"
-  | "unmanaged_or_unverifiable"
-  | "unclassifiable";
-
-/**
- * Classify worktree preflight into the recovery-card action matrix.
- *
- * - clean: present + not dirty → recommend Retry (no discard required)
- * - managed_dirty: present + managed + dirty → Inspect/Jump + confirmed Discard & Retry
- * - unmanaged_or_unverifiable: present but unmanaged or dirty unknown → inspect only, never discard
- * - unclassifiable: missing/unresolvable worktree or fetch failure → reason/logs/Takeover/Stop only
- */
-export function classifyRecoveryWorktree(
+export function isRecoveryWorktreeUnavailable(
   worktree: LoopWorktreeStatus | null | undefined,
   opts?: { fetchFailed?: boolean },
-): RecoveryMode {
-  if (opts?.fetchFailed) return "unclassifiable";
-  if (!worktree) return "unclassifiable";
+): boolean {
+  if (opts?.fetchFailed) return true;
+  if (!worktree) return true;
 
   const reason = (worktree.reason ?? "").trim().toLowerCase();
   if (
@@ -33,33 +26,39 @@ export function classifyRecoveryWorktree(
     reason === "worktree_missing" ||
     reason === "loop_type_without_worktree"
   ) {
-    return "unclassifiable";
+    return true;
   }
+  return false;
+}
 
-  // Fail closed on discard when git status is unavailable or path is unmanaged.
-  if (!worktree.managed || reason === "unmanaged" || reason === "status_unavailable") {
-    if (worktree.dirty === false || worktree.clean === true) {
-      // Unmanaged but clean: retry without discard is still safe guidance.
-      return "clean";
-    }
-    return "unmanaged_or_unverifiable";
-  }
-
-  if (worktree.dirty === true) return "managed_dirty";
-  if (worktree.dirty === false || worktree.clean === true) return "clean";
-
-  // Present + managed but dirty unknown → never offer discard.
-  return "unmanaged_or_unverifiable";
+/**
+ * Action decision for the recovery card. Uses the shared classifyRetryWorktree
+ * policy when a worktree is present; returns null when unavailable so the card
+ * can show reason/logs/Takeover/Stop without guessing a repair.
+ */
+export function recoveryWorktreeDecision(
+  worktree: LoopWorktreeStatus | null | undefined,
+  opts?: { fetchFailed?: boolean },
+): WorktreeActionDecision | null {
+  if (isRecoveryWorktreeUnavailable(worktree, opts)) return null;
+  return classifyRetryWorktree(worktree as LoopWorktreeStatus);
 }
 
 /** Whether the recovery card may offer Dashboard Discard & Retry. */
-export function recoveryOffersDiscard(mode: RecoveryMode): boolean {
-  return mode === "managed_dirty";
+export function recoveryOffersDiscard(
+  worktree: LoopWorktreeStatus | null | undefined,
+  opts?: { fetchFailed?: boolean },
+): boolean {
+  if (isRecoveryWorktreeUnavailable(worktree, opts)) return false;
+  return worktreeAllowsDashboardDiscard(worktree);
 }
 
 /** Whether the recovery card should present Retry as the recommended action. */
-export function recoveryRecommendsRetry(mode: RecoveryMode): boolean {
-  return mode === "clean";
+export function recoveryRecommendsRetry(
+  worktree: LoopWorktreeStatus | null | undefined,
+  opts?: { fetchFailed?: boolean },
+): boolean {
+  return recoveryWorktreeDecision(worktree, opts) === "ok";
 }
 
 export function recoveryJumpCommand(selector: string): string {
@@ -80,4 +79,21 @@ export function shouldShowRecoveryCard(loop: {
   // awaiting_human stays on the decision card exclusively.
   if (status === "awaiting_human") return false;
   return display === "manual_intervention";
+}
+
+/** Operator-facing guidance for the recovery card action matrix. */
+export function recoveryGuidance(
+  decision: WorktreeActionDecision | null,
+): string {
+  if (decision === null) {
+    return "Automation stopped for manual intervention, but no safe worktree repair path is available. Review the reason and logs; use Takeover or Stop when appropriate. Do not guess a repair.";
+  }
+  switch (decision) {
+    case "ok":
+      return "Worktree is clean. Retry to re-queue automation without discarding changes.";
+    case "offer-discard":
+      return "Managed worktree has local uncommitted changes. Inspect or jump first, or confirm Discard & Retry to drop them and re-queue.";
+    case "inspect-only":
+      return "Worktree is unmanaged or its dirty state cannot be verified. Inspect manually; Dashboard discard is unavailable.";
+  }
 }

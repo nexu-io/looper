@@ -553,6 +553,7 @@ export function LoopDetailPage() {
           durable facts produce displayStatus=manual_intervention. */}
       {data ? (
         <RecoveryCard
+          key={String(data.seq)}
           loop={data}
           selector={String(data.seq)}
           hasActiveRun={hasActiveRun}

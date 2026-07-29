@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { LoopWorktreeStatus } from "@/lib/api";
 import {
-  classifyRecoveryWorktree,
+  classifyRetryWorktree,
   recoveryOffersDiscard,
   recoveryRecommendsRetry,
+  recoveryWorktreeDecision,
   shouldShowRecoveryCard,
 } from "@/lib/recovery";
 
@@ -47,83 +48,79 @@ describe("shouldShowRecoveryCard", () => {
   });
 });
 
-describe("classifyRecoveryWorktree", () => {
+describe("recovery worktree decisions (shared classifyRetryWorktree)", () => {
   it("recommends retry for clean managed worktree", () => {
-    const mode = classifyRecoveryWorktree(
-      wt({
-        present: true,
-        managed: true,
-        dirty: false,
-        clean: true,
-        reason: "already_clean",
-      }),
-    );
-    expect(mode).toBe("clean");
-    expect(recoveryRecommendsRetry(mode)).toBe(true);
-    expect(recoveryOffersDiscard(mode)).toBe(false);
+    const tree = wt({
+      present: true,
+      managed: true,
+      dirty: false,
+      clean: true,
+      reason: "already_clean",
+    });
+    expect(classifyRetryWorktree(tree)).toBe("ok");
+    expect(recoveryWorktreeDecision(tree)).toBe("ok");
+    expect(recoveryRecommendsRetry(tree)).toBe(true);
+    expect(recoveryOffersDiscard(tree)).toBe(false);
   });
 
   it("offers discard only for managed dirty worktree", () => {
-    const mode = classifyRecoveryWorktree(
-      wt({
-        present: true,
-        managed: true,
-        dirty: true,
-        clean: false,
-        reason: "dirty",
-        worktreePath: "/tmp/wt",
-      }),
-    );
-    expect(mode).toBe("managed_dirty");
-    expect(recoveryOffersDiscard(mode)).toBe(true);
-    expect(recoveryRecommendsRetry(mode)).toBe(false);
+    const tree = wt({
+      present: true,
+      managed: true,
+      dirty: true,
+      clean: false,
+      reason: "dirty",
+      worktreePath: "/tmp/wt",
+    });
+    expect(classifyRetryWorktree(tree)).toBe("offer-discard");
+    expect(recoveryWorktreeDecision(tree)).toBe("offer-discard");
+    expect(recoveryOffersDiscard(tree)).toBe(true);
+    expect(recoveryRecommendsRetry(tree)).toBe(false);
   });
 
   it("never offers discard for unmanaged dirty worktree", () => {
-    const mode = classifyRecoveryWorktree(
-      wt({
-        present: true,
-        managed: false,
-        dirty: true,
-        reason: "unmanaged",
-        worktreePath: "/tmp/repo",
-      }),
-    );
-    expect(mode).toBe("unmanaged_or_unverifiable");
-    expect(recoveryOffersDiscard(mode)).toBe(false);
+    const tree = wt({
+      present: true,
+      managed: false,
+      dirty: true,
+      reason: "unmanaged",
+      worktreePath: "/tmp/repo",
+    });
+    expect(classifyRetryWorktree(tree)).toBe("inspect-only");
+    expect(recoveryWorktreeDecision(tree)).toBe("inspect-only");
+    expect(recoveryOffersDiscard(tree)).toBe(false);
   });
 
   it("never offers discard when dirty state is unverifiable", () => {
-    const mode = classifyRecoveryWorktree(
-      wt({
-        present: true,
-        managed: true,
-        reason: "status_unavailable",
-        worktreePath: "/tmp/wt",
-      }),
-    );
-    expect(mode).toBe("unmanaged_or_unverifiable");
-    expect(recoveryOffersDiscard(mode)).toBe(false);
+    const tree = wt({
+      present: true,
+      managed: true,
+      reason: "status_unavailable",
+      worktreePath: "/tmp/wt",
+    });
+    expect(classifyRetryWorktree(tree)).toBe("inspect-only");
+    expect(recoveryWorktreeDecision(tree)).toBe("inspect-only");
+    expect(recoveryOffersDiscard(tree)).toBe(false);
+    expect(recoveryRecommendsRetry(tree)).toBe(false);
   });
 
-  it("is unclassifiable when worktree is missing or fetch fails", () => {
+  it("is unavailable when worktree is missing or fetch fails", () => {
     expect(
-      classifyRecoveryWorktree(
+      recoveryWorktreeDecision(
         wt({ present: false, managed: true, reason: "worktree_missing" }),
       ),
-    ).toBe("unclassifiable");
-    expect(classifyRecoveryWorktree(null, { fetchFailed: true })).toBe(
-      "unclassifiable",
-    );
-    expect(classifyRecoveryWorktree(null)).toBe("unclassifiable");
+    ).toBeNull();
+    expect(recoveryWorktreeDecision(null, { fetchFailed: true })).toBeNull();
+    expect(recoveryWorktreeDecision(null)).toBeNull();
     expect(
-      classifyRecoveryWorktree(
+      recoveryWorktreeDecision(
         wt({
           present: false,
           managed: false,
           reason: "loop_type_without_worktree",
         }),
       ),
-    ).toBe("unclassifiable");
+    ).toBeNull();
+    expect(recoveryOffersDiscard(null, { fetchFailed: true })).toBe(false);
   });
 });

@@ -15,13 +15,13 @@ import {
 } from "@/lib/api";
 import { actionsForLoopStatus } from "@/lib/actions";
 import {
-  classifyRecoveryWorktree,
   recoveryDiscardCliHint,
+  recoveryGuidance,
   recoveryJumpCommand,
   recoveryOffersDiscard,
   recoveryRecommendsRetry,
+  recoveryWorktreeDecision,
   shouldShowRecoveryCard,
-  type RecoveryMode,
 } from "@/lib/recovery";
 import { useToast } from "@/lib/toast";
 
@@ -45,19 +45,6 @@ function dirtyLabel(worktree: LoopWorktreeStatus | null): string {
   return "unknown";
 }
 
-function modeGuidance(mode: RecoveryMode): string {
-  switch (mode) {
-    case "clean":
-      return "Worktree is clean. Retry to re-queue automation without discarding changes.";
-    case "managed_dirty":
-      return "Managed worktree has local uncommitted changes. Inspect or jump first, or confirm Discard & Retry to drop them and re-queue.";
-    case "unmanaged_or_unverifiable":
-      return "Worktree is unmanaged or its dirty state cannot be verified. Inspect manually; Dashboard discard is unavailable.";
-    case "unclassifiable":
-      return "Automation stopped for manual intervention, but no safe worktree repair path is available. Review the reason and logs; use Takeover or Stop when appropriate. Do not guess a repair.";
-  }
-}
-
 /**
  * Prominent recovery card for displayStatus=manual_intervention.
  * View/inspect/dismiss are non-mutating; only explicit action buttons change state.
@@ -77,6 +64,7 @@ export function RecoveryCard({
     "retry" | "discard-retry" | "takeover" | "stop" | null
   >(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [confirmStop, setConfirmStop] = useState(false);
   const [inspectOpen, setInspectOpen] = useState(false);
   const [takeoverResult, setTakeoverResult] = useState<TakeoverResult | null>(
     null,
@@ -84,6 +72,21 @@ export function RecoveryCard({
   const [inlineError, setInlineError] = useState<string | null>(null);
 
   const visible = shouldShowRecoveryCard(loop);
+
+  // Drop every loop-scoped UI bit immediately when the selector changes so
+  // client-side navigation cannot show loop A's worktree under loop B's actions.
+  const resetLoopScopedState = useCallback(() => {
+    setWorktree(null);
+    setWorktreeError(null);
+    setFetchFailed(false);
+    setLoadingWt(false);
+    setPending(null);
+    setConfirmDiscard(false);
+    setConfirmStop(false);
+    setInspectOpen(false);
+    setTakeoverResult(null);
+    setInlineError(null);
+  }, []);
 
   const loadWorktree = useCallback(
     async (signal?: AbortSignal) => {
@@ -117,20 +120,20 @@ export function RecoveryCard({
   );
 
   // Read-only preflight on mount / selector change — never mutates loop state.
+  // Reset is synchronous in the effect body so a mid-flight response from the
+  // previous selector cannot paint under the new one (abort still races paint).
   useEffect(() => {
+    resetLoopScopedState();
     if (!visible) {
-      setWorktree(null);
-      setWorktreeError(null);
-      setFetchFailed(false);
       return;
     }
     const controller = new AbortController();
     void loadWorktree(controller.signal);
     return () => controller.abort();
-  }, [visible, loadWorktree]);
+  }, [selector, visible, loadWorktree, resetLoopScopedState]);
 
-  const mode = useMemo(
-    () => classifyRecoveryWorktree(worktree, { fetchFailed }),
+  const decision = useMemo(
+    () => recoveryWorktreeDecision(worktree, { fetchFailed }),
     [worktree, fetchFailed],
   );
   const actions = useMemo(
@@ -145,6 +148,8 @@ export function RecoveryCard({
     "(no failure reason recorded)";
   const jumpCmd = recoveryJumpCommand(selector);
   const discardCli = recoveryDiscardCliHint(selector);
+  const offersDiscard = recoveryOffersDiscard(worktree, { fetchFailed });
+  const recommendsRetry = recoveryRecommendsRetry(worktree, { fetchFailed });
 
   const finishRetry = useCallback(
     async (discardWorktreeChanges: boolean) => {
@@ -175,7 +180,7 @@ export function RecoveryCard({
   }, [busy, actions.retry, finishRetry, toast]);
 
   const onDiscardRetry = useCallback(async () => {
-    if (busy || !recoveryOffersDiscard(mode) || !actions.retry) return;
+    if (busy || !offersDiscard || !actions.retry) return;
     setPending("discard-retry");
     setInlineError(null);
     try {
@@ -188,7 +193,7 @@ export function RecoveryCard({
     } finally {
       setPending(null);
     }
-  }, [busy, mode, actions.retry, finishRetry, toast]);
+  }, [busy, offersDiscard, actions.retry, finishRetry, toast]);
 
   const onTakeover = useCallback(async () => {
     if (busy || !actions.takeover) return;
@@ -219,6 +224,7 @@ export function RecoveryCard({
     try {
       await stopActiveRun(selector);
       toast.success("Stop requested");
+      setConfirmStop(false);
       await onMutated?.();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -337,10 +343,10 @@ export function RecoveryCard({
             </dl>
           </div>
 
-          <p className="m-0 text-[12px]">{modeGuidance(mode)}</p>
+          <p className="m-0 text-[12px]">{recoveryGuidance(decision)}</p>
 
           <div className="flex flex-wrap items-center gap-1.5">
-            {recoveryRecommendsRetry(mode) && actions.retry ? (
+            {recommendsRetry && actions.retry ? (
               <Button
                 size="sm"
                 disabled={busy}
@@ -350,7 +356,7 @@ export function RecoveryCard({
               </Button>
             ) : null}
 
-            {mode === "managed_dirty" ? (
+            {decision === "offer-discard" ? (
               <>
                 <Button
                   variant="ghost"
@@ -373,7 +379,7 @@ export function RecoveryCard({
               </>
             ) : null}
 
-            {mode === "unmanaged_or_unverifiable" ? (
+            {decision === "inspect-only" ? (
               <Button
                 variant="ghost"
                 size="sm"
@@ -384,7 +390,7 @@ export function RecoveryCard({
               </Button>
             ) : null}
 
-            {mode === "unclassifiable" ? (
+            {decision === null ? (
               <>
                 <Button
                   variant="ghost"
@@ -412,7 +418,7 @@ export function RecoveryCard({
                     variant="danger"
                     size="sm"
                     disabled={busy}
-                    onClick={() => void onStop()}
+                    onClick={() => setConfirmStop(true)}
                   >
                     {pending === "stop" ? "…" : "Stop"}
                   </Button>
@@ -421,8 +427,7 @@ export function RecoveryCard({
             ) : null}
 
             {/* Allow plain retry on dirty/inspect paths when operator has fixed the tree */}
-            {(mode === "managed_dirty" ||
-              mode === "unmanaged_or_unverifiable") &&
+            {(decision === "offer-discard" || decision === "inspect-only") &&
             actions.retry ? (
               <Button
                 variant="ghost"
@@ -474,11 +479,30 @@ export function RecoveryCard({
         </ConfirmDialog>
       ) : null}
 
+      {confirmStop ? (
+        <ConfirmDialog
+          open
+          title="Stop active run?"
+          confirmLabel="Stop"
+          danger
+          busy={busy}
+          onCancel={() => {
+            if (!busy) setConfirmStop(false);
+          }}
+          onConfirm={() => void onStop()}
+        >
+          <p className="m-0 text-[var(--text-muted)]">
+            Pauses the loop and stops the active execution. The loop stays paused
+            until you unpause or retry.
+          </p>
+        </ConfirmDialog>
+      ) : null}
+
       {inspectOpen ? (
         <ConfirmDialog
           open
           title={
-            mode === "managed_dirty"
+            decision === "offer-discard"
               ? "Inspect dirty worktree"
               : "Inspect worktree"
           }
@@ -515,7 +539,7 @@ export function RecoveryCard({
                 <p className="m-0 break-all mono text-[11px]">{jumpCmd}</p>
               </div>
             ) : null}
-            {recoveryOffersDiscard(mode) ? (
+            {offersDiscard ? (
               <p className="m-0 text-[11px] text-[var(--text-muted)]">
                 After fixing or deciding to drop changes: use Discard &amp;
                 Retry, or run{" "}
