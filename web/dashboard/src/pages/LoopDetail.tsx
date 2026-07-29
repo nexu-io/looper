@@ -70,6 +70,7 @@ type HITLAsk = {
   question?: string;
   options?: string[];
   status?: string;
+  askedAt?: string;
 };
 
 function readHITLAsk(loop: Loop): HITLAsk | null {
@@ -94,6 +95,9 @@ function HITLDecisionCard({
   const [answer, setAnswer] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setAnswer("");
+  }, [loop.id, ask?.askedAt, ask?.question]);
   if (
     loop.status !== "awaiting_human" ||
     ask?.status !== "awaiting" ||
@@ -108,6 +112,7 @@ function HITLDecisionCard({
     setError(null);
     try {
       await respondLoop(String(loop.seq), value.trim());
+      setAnswer("");
       await onMutated();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to send response");

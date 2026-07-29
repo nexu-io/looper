@@ -2,9 +2,12 @@ package fixer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/loops"
@@ -210,22 +213,54 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		Status:      "awaiting",
 		AskedAt:     nowISO,
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		if metadata, writeErr := loops.WriteHITLAsk(updated.MetadataJSON, ask); writeErr == nil {
-			updated.MetadataJSON = &metadata
+	if checkpoint.Worktree != nil {
+		dismissPath := filepath.Join(checkpoint.Worktree.Path, ".looper", "dismiss.json")
+		if err := os.Remove(dismissPath); err != nil && !os.IsNotExist(err) {
+			return ProcessResult{}, fmt.Errorf("clear pre-answer fixer dismissal intent: %w", err)
 		}
-		updated.Status = "awaiting_human"
-		updated.LastRunAt = stringPtr(nowISO)
-		updated.NextRunAt = nil
-	}); err != nil {
-		return ProcessResult{}, err
 	}
 	reason := "fixer suspended awaiting human decision"
-	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
-		return ProcessResult{}, err
-	}
 	summary := "Awaiting human decision: " + awaiting.question
-	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
+	if r.db == nil {
+		return ProcessResult{}, fmt.Errorf("fixer HITL atomic parking requires a database")
+	}
+	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, input.Loop.ID)
+		if err != nil {
+			return err
+		}
+		if loop == nil {
+			return fmt.Errorf("loop not found while parking fixer HITL: %s", input.Loop.ID)
+		}
+		if loop.Status == "terminated" {
+			return fmt.Errorf("cannot park terminated fixer loop: %s", input.Loop.ID)
+		}
+		metadata, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if err != nil {
+			return err
+		}
+		loop.MetadataJSON = &metadata
+		loop.Status = "awaiting_human"
+		loop.LastRunAt = stringPtr(nowISO)
+		loop.NextRunAt = nil
+		loop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+			return err
+		}
+		if _, err := repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
+			return err
+		}
+		updatedRun := run
+		updatedRun.Status = "interrupted"
+		updatedRun.Summary = stringPtr(summary)
+		checkpointJSON := mustMarshalJSON(checkpoint)
+		updatedRun.CheckpointJSON = &checkpointJSON
+		updatedRun.EndedAt = stringPtr(nowISO)
+		updatedRun.LastHeartbeatAt = stringPtr(nowISO)
+		updatedRun.UpdatedAt = nowISO
+		return repos.Runs.Upsert(ctx, updatedRun)
+	}); err != nil {
 		return ProcessResult{}, err
 	}
 	return ProcessResult{LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID, Status: "awaiting_human", Summary: summary}, nil

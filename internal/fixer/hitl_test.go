@@ -100,9 +100,30 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	if !strings.Contains(agent.starts[0].Prompt, "Do not push") || agent.starts[0].NativeSessionID != "" {
 		t.Fatalf("initial agent input = %#v, want local-only fresh turn", agent.starts[0])
 	}
+	badRun := run1
+	badRun.ID = "run_fixer_hitl_bad_fk"
+	badRun.LoopID = "missing_loop"
+	if _, err := runner.suspendForHuman(ctx, step, badRun, parkedCheckpoint, awaiting); err == nil {
+		t.Fatal("suspendForHuman(bad run) error = nil, want transaction rollback")
+	}
+	rolledBackLoop, _ := fixture.repos.Loops.GetByID(ctx, loopID)
+	rolledBackQueue, _ := fixture.repos.Queue.GetByID(ctx, queue.ID)
+	if rolledBackLoop.Status != "running" || rolledBackQueue.Status != "running" {
+		t.Fatalf("failed park leaked partial state: loop=%s queue=%s", rolledBackLoop.Status, rolledBackQueue.Status)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".looper"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.looper) error = %v", err)
+	}
+	dismissPath := filepath.Join(worktreePath, ".looper", "dismiss.json")
+	if err := os.WriteFile(dismissPath, []byte(`{"dismissals":[{"reviewer":"reviewer-x","reason":"stale pre-answer intent"}]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(pre-answer dismiss.json) error = %v", err)
+	}
 	result, err := runner.suspendForHuman(ctx, step, run1, parkedCheckpoint, awaiting)
 	if err != nil || result.Status != "awaiting_human" {
 		t.Fatalf("suspendForHuman() = (%#v, %v)", result, err)
+	}
+	if _, err := os.Stat(dismissPath); !os.IsNotExist(err) {
+		t.Fatalf("pre-answer dismissal intent still present after park: %v", err)
 	}
 	persistedLoop, _ := fixture.repos.Loops.GetByID(ctx, loopID)
 	ask, ok := loops.ReadHITLAsk(persistedLoop.MetadataJSON)
@@ -163,10 +184,7 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 		t.Fatalf("PrepareWorktree calls = %d, want no reset-capable prepare on HITL resume", len(git.prepareCalls))
 	}
 
-	if err := os.MkdirAll(filepath.Join(worktreePath, ".looper"), 0o755); err != nil {
-		t.Fatalf("MkdirAll(.looper) error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(worktreePath, ".looper", "dismiss.json"), []byte(`{"dismissals":[{"reviewer":"reviewer-x","reason":"conflicts with the approved direction"}]}`), 0o644); err != nil {
+	if err := os.WriteFile(dismissPath, []byte(`{"dismissals":[{"reviewer":"reviewer-x","reason":"conflicts with the approved direction"}]}`), 0o644); err != nil {
 		t.Fatalf("WriteFile(dismiss.json) error = %v", err)
 	}
 	step.Loop = *finishedLoop
