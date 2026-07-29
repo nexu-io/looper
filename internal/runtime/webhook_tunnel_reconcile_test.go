@@ -130,8 +130,8 @@ func TestReconcileTunnelHooksReactivatesOrphanedRecordWhenRepoIsReadded(t *testi
 	if len(status.TunnelHooks) != 1 || status.TunnelHooks[0].Orphaned {
 		t.Fatalf("status.TunnelHooks = %#v, want one active non-orphaned state", status.TunnelHooks)
 	}
-	if client.updateCalls != 0 {
-		t.Fatalf("UpdateHook calls = %d, want no patch for matching hook", client.updateCalls)
+	if client.updateCalls != 1 {
+		t.Fatalf("UpdateHook calls = %d, want one patch to add the Looper mount marker", client.updateCalls)
 	}
 }
 

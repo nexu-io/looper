@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,77 @@ func TestReconcileTunnelHookCreatesManagedHookWithoutAdoptingURLMatch(t *testing
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("ServeHTTP() status = %d, want %d", resp.Code, http.StatusOK)
+	}
+}
+
+func TestReconcileTunnelHookReusesMountMarkedHookWhenRecordMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	secretRef := webhookTunnelSecretRef(repo)
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, secretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	managedURL := webhookTunnelManagedURLWithSecret(cfg, repo, "top-secret")
+	hook := webhookTunnelGitHubHook{ID: 77, Active: true, Events: webhookForwardEvents}
+	hook.Config.URL = managedURL
+	hook.Config.ContentType = "json"
+	hook.Config.InsecureSSL = "0"
+	client := &fakeWebhookTunnelGitHubClient{listHooks: []webhookTunnelGitHubHook{hook}, getHook: hook, getFound: true}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+	rt.tunnelStore = repos.WebhookTunnelHooks
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Unix(10, 0).UnixNano())
+
+	if state.LastError != "" {
+		t.Fatalf("state.LastError = %q, want empty", state.LastError)
+	}
+	if client.listCalls != 1 || client.createCalls != 0 || client.getCalls != 1 || client.updateCalls != 0 {
+		t.Fatalf("client calls = list:%d create:%d get:%d update:%d, want list=1 create=0 get=1 update=0", client.listCalls, client.createCalls, client.getCalls, client.updateCalls)
+	}
+	record, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if !ok || record.HookID != 77 || record.ManagedURL != managedURL || record.SecretRef != secretRef {
+		t.Fatalf("record = %#v found=%v, want reused hook id 77 at %q", record, ok, managedURL)
+	}
+}
+
+func TestReconcileTunnelHookRejectsLegacyURLMatchWhenRecordMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	hook := webhookTunnelGitHubHook{ID: 77, Active: true, Events: webhookForwardEvents}
+	hook.Config.URL = webhookTunnelManagedURL(cfg, repo)
+	hook.Config.ContentType = "json"
+	hook.Config.InsecureSSL = "0"
+	client := &fakeWebhookTunnelGitHubClient{listHooks: []webhookTunnelGitHubHook{hook}}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+	rt.tunnelStore = repos.WebhookTunnelHooks
+
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Unix(10, 0).UnixNano())
+
+	if state.LastError == "" || !strings.Contains(state.LastError, "legacy URL") {
+		t.Fatalf("state.LastError = %q, want legacy URL conflict", state.LastError)
+	}
+	if client.listCalls != 1 || client.createCalls != 0 || client.getCalls != 0 || client.updateCalls != 0 {
+		t.Fatalf("client calls = list:%d create:%d get:%d update:%d, want only list", client.listCalls, client.createCalls, client.getCalls, client.updateCalls)
+	}
+	record, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if ok {
+		t.Fatalf("record = %#v found=%v, want no persisted record", record, ok)
 	}
 }
 
@@ -209,8 +281,8 @@ func TestReconcileTunnelHookTreatsDesiredURLAsManagedInsteadOfOrphaning(t *testi
 	if state.LastError != "" {
 		t.Fatalf("state.LastError = %q, want empty", state.LastError)
 	}
-	if client.updateCalls != 0 {
-		t.Fatalf("UpdateHook calls = %d, want 0", client.updateCalls)
+	if client.updateCalls != 1 {
+		t.Fatalf("UpdateHook calls = %d, want one patch to add the Looper mount marker", client.updateCalls)
 	}
 	updated, ok, err := repos.WebhookTunnelHooks.Get(ctx, repo)
 	if err != nil {
@@ -222,8 +294,9 @@ func TestReconcileTunnelHookTreatsDesiredURLAsManagedInsteadOfOrphaning(t *testi
 	if updated.Orphaned {
 		t.Fatalf("updated record = %#v, want non-orphaned", updated)
 	}
-	if updated.ManagedURL != desiredURL {
-		t.Fatalf("updated.ManagedURL = %q, want desired URL %q", updated.ManagedURL, desiredURL)
+	mountedURL := webhookTunnelManagedURLWithSecret(cfg, repo, "top-secret")
+	if updated.ManagedURL != mountedURL {
+		t.Fatalf("updated.ManagedURL = %q, want mounted URL %q", updated.ManagedURL, mountedURL)
 	}
 }
 

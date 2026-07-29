@@ -622,8 +622,10 @@ cloudflared tunnel --url http://127.0.0.1:8765
 Then set `webhook.publicBaseUrl` to the stable HTTPS URL for that tunnel and restart `looperd`. GitHub deliveries go to:
 
 ```text
-{publicBaseUrl}/webhook/{owner}/{repo}
+{publicBaseUrl}/webhook/{owner}/{repo}?looper_mount=<secret-derived-id>
 ```
+
+The HTTP route is still `/webhook/{owner}/{repo}`; the query marker lets Looper recognize a hook it created if the SQLite hook record is lost but the local secret file survives. Hooks at the plain route without that marker are not adopted automatically.
 
 Useful tunnel commands:
 

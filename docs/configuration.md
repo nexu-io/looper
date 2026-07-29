@@ -74,7 +74,7 @@ Rules:
 
 - `webhook.mode` is the global default. A project may override with `projects[].webhook.mode`.
 - `tunnel` requires `webhook.listenPort` between `1024` and `65535` and an HTTPS `webhook.publicBaseUrl`.
-- The tunnel URL for repo `owner/repo` is `{publicBaseUrl}/webhook/owner/repo`.
+- The tunnel URL for repo `owner/repo` is `{publicBaseUrl}/webhook/owner/repo?looper_mount=<secret-derived-id>`. The listener routes by path only; the query marker identifies Looper-created hook mounts during recovery.
 - Looper binds only `127.0.0.1:<listenPort>`; it does not run or supervise `cloudflared`, `ngrok`, Tailscale Funnel, or any reverse proxy.
 - Looper stores the remote GitHub hook id in SQLite and the HMAC secret in `secrets/webhook_<owner>_<repo>.key` with mode `0600`.
 - Removing a project or switching it away from `tunnel` marks the local hook record orphaned; it does not delete the GitHub hook automatically.

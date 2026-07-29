@@ -59,6 +59,19 @@ func TestWebhookTunnelManagedURLTrimsTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestWebhookTunnelManagedURLWithSecretAddsStableMountID(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{}
+	cfg.Webhook.PublicBaseURL = " https://example.com/base// "
+
+	got := webhookTunnelManagedURLWithSecret(cfg, "acme/looper", "top-secret")
+	want := "https://example.com/base/webhook/acme/looper?looper_mount=0169cbc690f69ab53257758793f57ab9"
+	if got != want {
+		t.Fatalf("webhookTunnelManagedURLWithSecret() = %q, want %q", got, want)
+	}
+}
+
 func TestWebhookTunnelRequestPathHonorsPublicBaseURLPath(t *testing.T) {
 	t.Parallel()
 
@@ -102,15 +115,19 @@ func setupWebhookTunnelTestRepos(t *testing.T) (context.Context, *storage.Reposi
 type fakeWebhookTunnelGitHubClient struct {
 	getHook        webhookTunnelGitHubHook
 	getFound       bool
+	listHooks      []webhookTunnelGitHubHook
+	listErr        error
 	createHook     webhookTunnelGitHubHook
 	createErr      error
 	updateHook     webhookTunnelGitHubHook
 	updateErr      error
 	deleteErr      error
 	getDeadline    bool
+	listDeadline   bool
 	createDeadline bool
 	updateDeadline bool
 	getCalls       int
+	listCalls      int
 	createCalls    int
 	updateCalls    int
 	deleteCalls    int
@@ -130,6 +147,12 @@ func (f *fakeWebhookTunnelGitHubClient) GetHook(ctx context.Context, _ string, _
 	f.getCalls++
 	_, f.getDeadline = ctx.Deadline()
 	return f.getHook, f.getFound, nil
+}
+
+func (f *fakeWebhookTunnelGitHubClient) ListHooks(ctx context.Context, _ string) ([]webhookTunnelGitHubHook, error) {
+	f.listCalls++
+	_, f.listDeadline = ctx.Deadline()
+	return f.listHooks, f.listErr
 }
 
 func (f *fakeWebhookTunnelGitHubClient) CreateHook(ctx context.Context, _ string, _ string, _ string, _ []string) (webhookTunnelGitHubHook, error) {

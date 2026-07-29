@@ -47,6 +47,7 @@ type webhookTunnelGitHubHook struct {
 
 type webhookTunnelGitHubClient interface {
 	GetHook(ctx context.Context, repo string, id int64) (webhookTunnelGitHubHook, bool, error)
+	ListHooks(ctx context.Context, repo string) ([]webhookTunnelGitHubHook, error)
 	CreateHook(ctx context.Context, repo string, url string, secret string, events []string) (webhookTunnelGitHubHook, error)
 	UpdateHook(ctx context.Context, repo string, id int64, url string, secret string, events []string, active bool) (webhookTunnelGitHubHook, error)
 	DeleteHook(ctx context.Context, repo string, id int64) error
@@ -67,6 +68,22 @@ func (c ghWebhookTunnelClient) GetHook(ctx context.Context, repo string, id int6
 		return webhookTunnelGitHubHook{}, false, fmt.Errorf("decode hook %s#%d: %w", repo, id, err)
 	}
 	return hook, true, nil
+}
+
+func (c ghWebhookTunnelClient) ListHooks(ctx context.Context, repo string) ([]webhookTunnelGitHubHook, error) {
+	result, err := c.run(ctx, repo, []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/hooks", splitRepoPath(repo))})
+	if err != nil {
+		return nil, err
+	}
+	var pages [][]webhookTunnelGitHubHook
+	if err := json.Unmarshal(result, &pages); err != nil {
+		return nil, fmt.Errorf("decode hooks for %s: %w", repo, err)
+	}
+	hooks := make([]webhookTunnelGitHubHook, 0)
+	for _, page := range pages {
+		hooks = append(hooks, page...)
+	}
+	return hooks, nil
 }
 
 func (c ghWebhookTunnelClient) CreateHook(ctx context.Context, repo string, url string, secret string, events []string) (webhookTunnelGitHubHook, error) {
@@ -216,14 +233,25 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 
 func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, repo string, record storage.WebhookTunnelHookRecord, ok bool, now int64) WebhookTunnelState {
 	client := w.tunnelGitHubClient()
-	url := webhookTunnelManagedURL(w.cfg, repo)
 	secretRef := webhookTunnelSecretRef(repo)
 	if !ok || record.HookID == 0 {
 		secret, err := ensureWebhookTunnelSecret(w.cfg.Storage.DBPath, secretRef)
 		if err != nil {
+			return WebhookTunnelState{Repo: repo, ManagedURL: webhookTunnelManagedURL(w.cfg, repo), LastError: err.Error()}
+		}
+		url := webhookTunnelManagedURLWithSecret(w.cfg, repo, secret)
+		hook, found, err := w.findReusableTunnelHook(ctx, client, repo, url)
+		if err != nil {
 			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: err.Error()}
 		}
-		hook, err := client.CreateHook(ctx, repo, url, secret, webhookForwardEvents)
+		if found {
+			record = storage.WebhookTunnelHookRecord{Repo: repo, HookID: hook.ID, ManagedURL: url, SecretRef: secretRef, ConsecutiveDisables: 0, CreatedAt: now, UpdatedAt: now}
+			if err := store.Upsert(ctx, record); err != nil {
+				return WebhookTunnelState{Repo: repo, HookID: &record.HookID, ManagedURL: url, LastError: fmt.Sprintf("persist reused tunnel hook: %v", err)}
+			}
+			return w.reconcileRecordedTunnelHook(ctx, store, repo, record, secret, secretRef, url, now)
+		}
+		hook, err = client.CreateHook(ctx, repo, url, secret, webhookForwardEvents)
 		if err != nil {
 			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: err.Error()}
 		}
@@ -240,6 +268,12 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 	if err != nil {
 		return tunnelStateFromRecord(record, fmt.Sprintf("read webhook secret: %v", err))
 	}
+	url := webhookTunnelManagedURLWithSecret(w.cfg, repo, secret)
+	return w.reconcileRecordedTunnelHook(ctx, store, repo, record, secret, secretRef, url, now)
+}
+
+func (w *webhookRuntime) reconcileRecordedTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, repo string, record storage.WebhookTunnelHookRecord, secret string, secretRef string, url string, now int64) WebhookTunnelState {
+	client := w.tunnelGitHubClient()
 	hook, found, err := client.GetHook(ctx, repo, record.HookID)
 	if err != nil {
 		return tunnelStateFromRecord(record, fmt.Sprintf("get hook by id: %v", err))
@@ -264,7 +298,9 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		}
 		return tunnelStateFromRecord(record, "")
 	}
-	if strings.TrimSpace(hook.Config.URL) != "" && strings.TrimSpace(hook.Config.URL) != strings.TrimSpace(record.ManagedURL) && strings.TrimSpace(hook.Config.URL) != url {
+	hookURL := strings.TrimSpace(hook.Config.URL)
+	legacyURL := webhookTunnelManagedURL(w.cfg, repo)
+	if hookURL != "" && hookURL != strings.TrimSpace(record.ManagedURL) && hookURL != url && hookURL != legacyURL {
 		_ = store.MarkOrphaned(ctx, repo, true, now)
 		record.Orphaned = true
 		return tunnelStateFromRecord(record, "remote hook URL drifted; record marked orphaned and not mutated")
@@ -315,6 +351,36 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		}
 	}
 	return tunnelStateFromRecord(record, "")
+}
+
+func (w *webhookRuntime) findReusableTunnelHook(ctx context.Context, client webhookTunnelGitHubClient, repo string, managedURL string) (webhookTunnelGitHubHook, bool, error) {
+	hooks, err := client.ListHooks(ctx, repo)
+	if err != nil {
+		return webhookTunnelGitHubHook{}, false, fmt.Errorf("list hooks before create: %w", err)
+	}
+	var match *webhookTunnelGitHubHook
+	legacyURL := webhookTunnelManagedURL(w.cfg, repo)
+	legacyMatches := 0
+	for _, hook := range hooks {
+		if strings.TrimSpace(hook.Config.URL) == managedURL {
+			if match != nil {
+				return webhookTunnelGitHubHook{}, false, fmt.Errorf("multiple Looper tunnel hooks already use managed URL %q; delete the duplicate GitHub hooks before restarting", managedURL)
+			}
+			copied := hook
+			match = &copied
+			continue
+		}
+		if strings.TrimSpace(hook.Config.URL) == legacyURL {
+			legacyMatches++
+		}
+	}
+	if match != nil {
+		return *match, true, nil
+	}
+	if legacyMatches > 0 {
+		return webhookTunnelGitHubHook{}, false, fmt.Errorf("found %d unmanaged tunnel hook(s) at legacy URL %q; Looper will not adopt a hook without the local mount marker", legacyMatches, legacyURL)
+	}
+	return webhookTunnelGitHubHook{}, false, nil
 }
 
 func (w *webhookRuntime) ensureTunnelServer() error {
@@ -622,6 +688,32 @@ func webhookTunnelListenerURL(cfg config.Config) string {
 
 func webhookTunnelManagedURL(cfg config.Config, repo string) string {
 	return strings.TrimRight(strings.TrimSpace(cfg.Webhook.PublicBaseURL), "/") + "/webhook/" + strings.Trim(strings.TrimSpace(repo), "/")
+}
+
+func webhookTunnelManagedURLWithSecret(cfg config.Config, repo string, secret string) string {
+	managed := webhookTunnelManagedURL(cfg, repo)
+	mountID := webhookTunnelMountID(repo, secret)
+	if mountID == "" {
+		return managed
+	}
+	parsed, err := url.Parse(managed)
+	if err != nil {
+		return managed
+	}
+	query := parsed.Query()
+	query.Set("looper_mount", mountID)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func webhookTunnelMountID(repo string, secret string) string {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte("looper:webhook-mount:" + strings.TrimSpace(repo)))
+	return hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
 func webhookTunnelRequestPath(cfg config.Config, requestPath string) (string, bool) {
