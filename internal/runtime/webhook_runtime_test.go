@@ -400,6 +400,22 @@ func TestWebhookRuntimeReconcilePassesDeadlineToTunnelHookReconcile(t *testing.T
 	}
 }
 
+func TestWebhookRuntimeEnsureTunnelServerRefusesAfterStop(t *testing.T) {
+	t.Parallel()
+
+	_, _, cfg := setupWebhookTunnelTestRepos(t)
+	cfg.Webhook.ListenPort = 0
+	rt := newWebhookRuntime(cfg, &testLogger{}, time.Now)
+	rt.Stop()
+
+	if err := rt.ensureTunnelServer(); !errors.Is(err, errWebhookRuntimeStopped) {
+		t.Fatalf("ensureTunnelServer() after Stop error = %v, want %v", err, errWebhookRuntimeStopped)
+	}
+	if rt.tunnelServer != nil {
+		t.Fatal("tunnelServer started after Stop, want nil")
+	}
+}
+
 func TestWebhookRuntimeReconcileClearsTransientListFailureAfterRecovery(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {
@@ -609,7 +625,7 @@ func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenForgejoPublishes(
 	published.Projects = append(published.Projects, config.ProjectRefConfig{ID: "project_2", Provider: "forgejo-main", Repo: "acme/forgejo"})
 	rt.updateConfig(published)
 
-	if err := rt.reconcileSnapshot(repositories, captured); err != nil {
+	if err := rt.reconcileSnapshot(context.Background(), repositories, captured); err != nil {
 		t.Fatalf("reconcileSnapshot() error = %v", err)
 	}
 	status := rt.Status()

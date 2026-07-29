@@ -298,6 +298,70 @@ func TestRuntimeProjectAddDoesNotWaitForWebhookReconciliation(t *testing.T) {
 	}
 }
 
+// Contract: project add schedules deferred webhook reconcile; Stop must cancel
+// that pass (and not hang on wg) even while the GitHub tunnel boundary blocks.
+func TestRuntimeStopCancelsBlockedScheduledWebhookReconcile(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.Mode = config.WebhookModeTunnel
+	cfg.Webhook.ListenPort = 0
+	cfg.Webhook.PublicBaseURL = "https://looper.example.test"
+	ghPath := "/usr/bin/gh"
+	cfg.Tools.GHPath = &ghPath
+
+	rt := New(Options{
+		Config:           cfg,
+		Logger:           &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	reconcileStarted := make(chan struct{})
+	// Intentionally never release: Stop must cancel via stop-aware context.
+	releaseReconcile := make(chan struct{})
+	rt.webhook.bootstrapDone = true
+	rt.webhook.tunnelClient = blockingWebhookTunnelGitHubClient{
+		started: reconcileStarted,
+		release: releaseReconcile,
+	}
+
+	projectService := rt.Services().Projects
+	projectService.ListWorktrees = nil
+	repo := "acme/live"
+	if _, err := projectService.AddProject(context.Background(), projects.AddInput{
+		ID: "live", Name: "Live", RepoPath: workingDir, Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
+	}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+
+	select {
+	case <-reconcileStarted:
+	case <-time.After(time.Second):
+		t.Fatal("webhook reconciliation did not start")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		rt.Stop("test blocked reconcile stop")
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() blocked on scheduled webhook reconciliation")
+	}
+}
+
 func TestRuntimeStartIsIdempotent(t *testing.T) {
 	t.Parallel()
 

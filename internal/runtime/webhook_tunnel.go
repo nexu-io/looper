@@ -159,7 +159,13 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 	w.tunnelStore = repos.WebhookTunnelHooks
 	w.mu.Unlock()
 	if len(repoSet) > 0 {
+		if ctx != nil && ctx.Err() != nil {
+			return errWebhookRuntimeStopped
+		}
 		if err := w.ensureTunnelServer(); err != nil {
+			if isWebhookStopError(err) {
+				return errWebhookRuntimeStopped
+			}
 			listenerErr := fmt.Errorf("webhook tunnel listener failed: %w", err)
 			w.addDegradedReason(listenerErr.Error())
 			return listenerErr
@@ -320,6 +326,11 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 func (w *webhookRuntime) ensureTunnelServer() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.stopped {
+		// Stop already captured tunnelServer (or saw nil). Do not start a
+		// listener that nobody will shut down while wg.Wait is in progress.
+		return errWebhookRuntimeStopped
+	}
 	if w.tunnelServer != nil {
 		return nil
 	}

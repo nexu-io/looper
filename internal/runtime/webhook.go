@@ -3,6 +3,7 @@ package runtime
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,14 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// errWebhookRuntimeStopped is returned when reconciliation would start side
+// effects after Stop has begun. Callers treat it as a clean no-op.
+var errWebhookRuntimeStopped = errors.New("webhook runtime stopped")
+
+func isWebhookStopError(err error) bool {
+	return errors.Is(err, errWebhookRuntimeStopped) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
 
 const webhookListenerPath = "/webhook/forward"
 
@@ -295,8 +304,14 @@ func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
 	w.reconcileMu.Lock()
 	defer w.reconcileMu.Unlock()
 
+	if w.isStopped() {
+		return nil
+	}
+	ctx, cancel := w.withStopContext(context.Background())
+	defer cancel()
+
 	cfg := w.configSnapshot()
-	return w.reconcileSnapshot(repos, cfg)
+	return w.reconcileSnapshot(ctx, repos, cfg)
 }
 
 func (w *webhookRuntime) ScheduleReconcile(repos *storage.Repositories) {
@@ -350,16 +365,51 @@ func (w *webhookRuntime) runScheduledReconcile() {
 	}
 }
 
-func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg config.Config) error {
+// withStopContext returns a child of parent that is cancelled when Stop closes
+// stopCh, so in-flight reconcile GitHub work unblocks instead of holding wg.
+func (w *webhookRuntime) withStopContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if w == nil || w.stopCh == nil {
+		return context.WithCancel(parent)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	select {
+	case <-w.stopCh:
+		cancel()
+		return ctx, cancel
+	default:
+	}
+	go func() {
+		select {
+		case <-w.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func (w *webhookRuntime) reconcileSnapshot(ctx context.Context, repos *storage.Repositories, cfg config.Config) error {
 	if w == nil || !w.status.Enabled {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || w.isStopped() {
 		return nil
 	}
 	if repos != nil {
 		w.syncForwarderStore(repos.WebhookForwarders)
 	}
 	if repos != nil && repos.WebhookForwarders != nil && !w.bootstrapCompleted() {
-		w.bootstrap(context.Background(), repos, cfg)
+		w.bootstrap(ctx, repos, cfg)
 		if !w.bootstrapCompleted() {
+			if w.isStopped() || ctx.Err() != nil {
+				return nil
+			}
 			w.scheduleReconcileRetry(repos)
 			return nil
 		}
@@ -384,8 +434,14 @@ func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg conf
 			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and tunnel", repo))
 		}
 	}
-	if err := w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet); err != nil {
+	if err := w.reconcileTunnelHooks(ctx, repos, tunnelRepoSet); err != nil {
+		if isWebhookStopError(err) {
+			return nil
+		}
 		return err
+	}
+	if w.isStopped() || ctx.Err() != nil {
+		return nil
 	}
 	launchRepos := w.reconcileForwarders(forwarderRepoSet)
 	if len(forwarderRepoSet)+len(tunnelRepoSet) == 0 {
@@ -396,6 +452,9 @@ func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg conf
 		return reason == noConfiguredWebhookReposReason
 	})
 	if len(forwarderRepoSet) == 0 || w.ghPath == "" || w.hasLaunchBlockingDegradedReason() {
+		return nil
+	}
+	if w.isStopped() {
 		return nil
 	}
 	for _, repo := range launchRepos {
