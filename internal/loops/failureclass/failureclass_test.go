@@ -2,8 +2,52 @@ package failureclass
 
 import (
 	"errors"
+	"fmt"
+	"syscall"
 	"testing"
 )
+
+func TestClassifyRecoverableInfrastructureFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		boundary Boundary
+	}{
+		{name: "typed disk full", err: fmt.Errorf("write checkpoint: %w", syscall.ENOSPC), boundary: BoundaryStorage},
+		{name: "disk full message", err: errors.New("git checkout: no space left on device"), boundary: BoundaryGitLocal},
+		{name: "missing worktree", err: errors.New("worker worktree path does not exist"), boundary: BoundaryLocalWorktree},
+		{name: "stale worktree", err: errors.New("stale worktree cannot be restored"), boundary: BoundaryGitRemote},
+		{name: "missing local path", err: errors.New("chdir /tmp/worktree: no such file or directory"), boundary: BoundaryGitRemote},
+		{name: "fork exec pressure", err: errors.New("fork/exec /usr/bin/git: resource temporarily unavailable"), boundary: BoundaryAgentProcess},
+		{name: "fork exec disappeared", err: errors.New("fork/exec /tmp/tool: no such file or directory"), boundary: BoundaryModelProvider},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Classify(tt.err, Context{Runner: RunnerWorker, Boundary: tt.boundary})
+			if got != RecoverableInfra {
+				t.Fatalf("Classify() = %s, want %s", got, RecoverableInfra)
+			}
+		})
+	}
+}
+
+func TestClassifyDoesNotTreatRemoteOrConfigMissingTargetsAsInfra(t *testing.T) {
+	tests := []struct {
+		name     string
+		boundary Boundary
+	}{
+		{name: "github target", boundary: BoundaryGitHubAPI},
+		{name: "config executable", boundary: BoundaryConfig},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Classify(errors.New("no such file or directory"), Context{Runner: RunnerWorker, Boundary: tt.boundary})
+			if got == RecoverableInfra {
+				t.Fatalf("Classify() = %s, must not promote missing target at %s", got, tt.boundary)
+			}
+		})
+	}
+}
 
 func TestClassifyExternalBoundaryTransportFailures(t *testing.T) {
 	tests := []struct {
@@ -61,8 +105,8 @@ func TestClassifyRepairableExternalFailuresRetry(t *testing.T) {
 		want     Kind
 	}{
 		{name: "github auth", boundary: BoundaryGitHubAPI, message: "GitHub API failed: HTTP 403 Forbidden", want: RetryableTransient},
-		{name: "invalid git repository", boundary: BoundaryGitRemote, message: "git worktree list --porcelain: fatal: not a git repository (or any of the parent directories): .git", want: RetryableTransient},
-		{name: "missing repo directory", boundary: BoundaryGitRemote, message: "start command: chdir /tmp/missing-repo: no such file or directory", want: RetryableTransient},
+		{name: "invalid git repository", boundary: BoundaryGitRemote, message: "git worktree list --porcelain: fatal: not a git repository (or any of the parent directories): .git", want: RecoverableInfra},
+		{name: "missing repo directory", boundary: BoundaryGitRemote, message: "start command: chdir /tmp/missing-repo: no such file or directory", want: RecoverableInfra},
 		{name: "invalid model", boundary: BoundaryModelProvider, message: "HTTP 400 Bad Request: invalid model", want: RetryableTransient},
 		{name: "unsupported model", boundary: BoundaryModelProvider, message: "HTTP 422 Unprocessable Entity: unsupported model", want: RetryableTransient},
 		{name: "repo not found", boundary: BoundaryGitHubAPI, message: "GraphQL: Could not resolve to a Repository", want: RetryableTransient},

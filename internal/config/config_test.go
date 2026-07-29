@@ -636,6 +636,40 @@ func TestValidateTreatsPlaneCodeRepoAsGitHubIdentity(t *testing.T) {
 	}
 }
 
+func TestPlaneStrictDispatchConfigNormalizesAndValidates(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "PLANE_TOKEN"
+	workspace := "open-design"
+	planeProjectID := "33333333-4444-4555-8666-777777777777"
+	providerID := "plane"
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{
+			ID: providerID, Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv,
+			Workspace: &workspace, ProjectID: &planeProjectID,
+			StrictDispatch: &PlaneStrictDispatchConfig{
+				Enabled: true, BaseURL: " https://plane.example.test/ ", NodeID: " node-cyan ",
+				BindingID: " 55555555-6666-4777-8888-999999999999 ", KeyRevision: 2,
+				PrivateKeyFile: " /secure/node-key.pem ",
+			},
+		}},
+		Projects: &[]PartialProjectRefConfig{{
+			ID: "plane-project", Name: "Plane", Provider: &providerID,
+			Repo: stringPtr("acme/app"), RepoPath: t.TempDir(),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	strict := cfg.Providers[0].StrictDispatch
+	if strict == nil || strict.BaseURL != "https://plane.example.test" || strict.NodeID != "node-cyan" || strict.PrivateKeyFile != "/secure/node-key.pem" {
+		t.Fatalf("strict dispatch normalization = %#v", strict)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v", err)
+	}
+}
+
 func TestMixedGitHubWebhookAndForgejoPollingConfigValidates(t *testing.T) {
 	t.Parallel()
 
@@ -2515,9 +2549,11 @@ func TestLoadFileAutoDetectsMissingToolPathsAfterApplyingOverrides(t *testing.T)
 
 func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 	configuredGitPath := "/configured/git"
+	configuredBrowserPath := "/Applications/Chromium"
 
 	result := DetectToolPaths(ToolPathsConfig{
-		GitPath: &configuredGitPath,
+		GitPath:     &configuredGitPath,
+		BrowserPath: &configuredBrowserPath,
 	}, fakeLookPath(map[string]string{}))
 
 	if result.Paths.GitPath == nil || *result.Paths.GitPath != configuredGitPath {
@@ -2526,6 +2562,9 @@ func TestDetectToolPathsLeavesMissingEntriesUnset(t *testing.T) {
 
 	if result.Paths.GHPath != nil {
 		t.Fatalf("DetectToolPaths().Paths.GHPath = %v, want nil", result.Paths.GHPath)
+	}
+	if result.Paths.BrowserPath == nil || *result.Paths.BrowserPath != configuredBrowserPath {
+		t.Fatalf("DetectToolPaths().Paths.BrowserPath = %v, want %q", result.Paths.BrowserPath, configuredBrowserPath)
 	}
 
 	if got := result.Detection["gitPath"]; got != ToolDetectionStatusConfigured {
@@ -3029,6 +3068,68 @@ func TestValidateRejectsInvalidReviewerReviewEvents(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsPlannerWorkerTriggerLabelOverlap(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// The P4 misconfig: worker shares the planner's trigger label while both still
+	// route by the current GitHub user, so one issue fires both roles (two PRs).
+	cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser = true
+	cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = true
+	cfg.Roles.Planner.Triggers.Labels = []string{"looper:plan"}
+	cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "overlaps roles.planner.triggers.labels") {
+		t.Fatalf("ValidateWithOptions() error = %v, want planner/worker label-overlap failure", err)
+	}
+}
+
+func TestValidateRejectsPlannerWorkerTriggerLabelOverlapInProjectOverride(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// Global roles do NOT overlap (planner=looper:plan, worker=looper:worker-ready), so
+	// the global guard passes. A PROJECT override then puts the worker back on the
+	// planner label while assignee routing stays on (inherited) — recreating the
+	// double-dispatch the guard prevents, but only in this project's effective roles.
+	cfg.Projects = append(cfg.Projects, ProjectRefConfig{
+		ID:       "overlap",
+		Name:     "Overlap",
+		Repo:     "acme/looper",
+		RepoPath: t.TempDir(),
+		Roles: &PartialRoleConfigs{Worker: &PartialWorkerRoleConfig{
+			Triggers: &PartialIssueRoleTriggersConfig{Labels: &[]string{"looper:plan"}},
+		}},
+	})
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("ValidateWithOptions() error = nil, want project-scoped overlap failure")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "projects[0].roles.worker.triggers.labels") ||
+		!strings.Contains(msg, "overlaps projects[0].roles.planner.triggers.labels") {
+		t.Fatalf("ValidateWithOptions() error = %v, want project-scoped planner/worker overlap path", err)
+	}
+}
+
+func TestValidateAllowsSharedTriggerLabelForPlaneAssigneeRouting(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	// The Plane lifecycle legitimately runs planner+worker off one label, routed by
+	// assignee UUID (RequireAssigneeCurrentUser=false on both). This must NOT be
+	// flagged as an overlap — it's the intended single-label plan→implement flow.
+	cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser = false
+	cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+	cfg.Roles.Planner.Triggers.Labels = []string{"looper:plan"}
+	cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() error = %v, want no overlap failure for the Plane single-label flow", err)
+	}
+}
+
 func TestLoadFileRejectsUnknownCLIFlagsInsteadOfPrefixMatchingThem(t *testing.T) {
 	_, err := LoadFile(LoadFileOptions{Args: []string{"--hostfoo", "127.0.0.99"}, LookupEnv: emptyEnvLookup})
 	if err == nil {
@@ -3457,20 +3558,33 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if !config.Daemon.WorktreeCleanup.Enabled {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.Enabled = false, want true")
 	}
-	if config.Daemon.WorktreeCleanup.Interval != "24h" {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "24h")
+	if config.Daemon.WorktreeCleanup.Interval != "1h" {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.Interval = %q, want %q", config.Daemon.WorktreeCleanup.Interval, "1h")
 	}
-	if config.Daemon.WorktreeCleanup.RetentionDays != 7 {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.RetentionDays = %d, want 7", config.Daemon.WorktreeCleanup.RetentionDays)
+	if config.Daemon.WorktreeCleanup.RetentionDays != 1 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.RetentionDays = %d, want 1", config.Daemon.WorktreeCleanup.RetentionDays)
 	}
-	if config.Daemon.WorktreeCleanup.MaxPerTick != 10 {
-		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 10", config.Daemon.WorktreeCleanup.MaxPerTick)
+	if config.Daemon.WorktreeCleanup.MaxPerTick != 50 {
+		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 50", config.Daemon.WorktreeCleanup.MaxPerTick)
 	}
-	if config.Daemon.WorktreeCleanup.IncludeOrphans {
-		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = true, want false")
+	if !config.Daemon.WorktreeCleanup.IncludeOrphans {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = false, want true")
 	}
 	if config.Daemon.WorktreeCleanup.DryRun {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = true, want false")
+	}
+
+	if !config.Daemon.DiskBackpressure.Enabled {
+		t.Fatal("DefaultConfig().Daemon.DiskBackpressure.Enabled = false, want true")
+	}
+	if config.Daemon.DiskBackpressure.Path != "" {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.Path = %q, want empty", config.Daemon.DiskBackpressure.Path)
+	}
+	if config.Daemon.DiskBackpressure.HighWatermarkPercent != 85 {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.HighWatermarkPercent = %v, want 85", config.Daemon.DiskBackpressure.HighWatermarkPercent)
+	}
+	if config.Daemon.DiskBackpressure.HardStopPercent != 93 {
+		t.Fatalf("DefaultConfig().Daemon.DiskBackpressure.HardStopPercent = %v, want 93", config.Daemon.DiskBackpressure.HardStopPercent)
 	}
 
 	if config.Defaults.OpenPRStrategy != OpenPRStrategyAllDone {
@@ -3510,7 +3624,7 @@ func TestNormalizeMergesPartialWorktreeCleanupConfig(t *testing.T) {
 	if cfg.Daemon.WorktreeCleanup.RetentionDays != 14 {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup.RetentionDays = %d, want 14", cfg.Daemon.WorktreeCleanup.RetentionDays)
 	}
-	if cfg.Daemon.WorktreeCleanup.Interval != "24h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 10 || cfg.Daemon.WorktreeCleanup.DryRun {
+	if cfg.Daemon.WorktreeCleanup.Interval != "1h" || cfg.Daemon.WorktreeCleanup.MaxPerTick != 50 || !cfg.Daemon.WorktreeCleanup.IncludeOrphans || cfg.Daemon.WorktreeCleanup.DryRun {
 		t.Fatalf("Normalize().Daemon.WorktreeCleanup = %#v, want unspecified defaults preserved", cfg.Daemon.WorktreeCleanup)
 	}
 }
@@ -4037,4 +4151,52 @@ func validationIssuesContainPath(issues []ValidationIssue, path string) bool {
 		}
 	}
 	return false
+}
+
+func TestProjectProductOwnerResolvesAndValidates(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if len(cfg.Projects) == 0 {
+		t.Skip("default config has no projects to attach a product owner to")
+	}
+	// Valid open_id resolves back through ProjectProductOwner.
+	cfg.Projects[0].ProductOwner = &ProductOwnerConfig{FeishuOpenID: "ou_a9fe1adce639660facbd26d7599a24e0"}
+	if got := ProjectProductOwner(cfg, cfg.Projects[0].ID).FeishuOpenID; got != "ou_a9fe1adce639660facbd26d7599a24e0" {
+		t.Fatalf("ProjectProductOwner() = %q, want the configured open_id", got)
+	}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
+		t.Fatalf("ValidateWithOptions() with valid product owner error = %v", err)
+	}
+	// A non-open_id value is rejected.
+	cfg.Projects[0].ProductOwner = &ProductOwnerConfig{FeishuOpenID: "杨瑾龙"}
+	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "open_id") {
+		t.Fatalf("ValidateWithOptions() error = %v, want open_id rejection", err)
+	}
+}
+
+func TestProjectDecisionActorsResolveAndValidatePlaneIDs(t *testing.T) {
+	const planeID = "67d4b01c-fea2-4b8f-ac14-a6fff9c9e71b"
+	cfg := Config{Projects: []ProjectRefConfig{{
+		ID:          "open-design",
+		DesignOwner: &FeishuActorConfig{FeishuOpenID: "ou_design", PlaneID: planeID},
+		Owner:       &FeishuActorConfig{FeishuOpenID: "ou_owner", PlaneID: planeID},
+	}}}
+	if got := ProjectDesignOwner(cfg, "open-design"); got.PlaneID != planeID || got.FeishuOpenID != "ou_design" {
+		t.Fatalf("ProjectDesignOwner() = %#v", got)
+	}
+	if got := ProjectOwnerActor(cfg, "open-design"); got.PlaneID != planeID || got.FeishuOpenID != "ou_owner" {
+		t.Fatalf("ProjectOwnerActor() = %#v", got)
+	}
+	issues := []ValidationIssue{}
+	validateFeishuActor(cfg.Projects[0].DesignOwner, "projects[0].designOwner", &issues)
+	if len(issues) != 0 {
+		t.Fatalf("validateFeishuActor(valid) = %#v", issues)
+	}
+	invalid := &FeishuActorConfig{FeishuOpenID: "ou_owner", PlaneID: "not-a-uuid"}
+	validateFeishuActor(invalid, "projects[0].owner", &issues)
+	if !validationIssuesContainPath(issues, "projects[0].owner.planeId") {
+		t.Fatalf("issues = %#v, want owner.planeId", issues)
+	}
 }

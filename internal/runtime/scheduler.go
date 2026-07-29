@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,12 +23,17 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/infra/disk"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/infra/planedoc"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/planestrict"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/projects"
@@ -82,6 +88,7 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos             *storage.Repositories
+	ActiveExecutions  *ActiveExecutionRegistry
 	GitHubGateway     *githubinfra.Gateway
 	Logger            bootstrap.Logger
 	Now               func() time.Time
@@ -112,6 +119,9 @@ type defaultSchedulerTickInput struct {
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	// OnPullRequestSnapshot, when set, is called after a PR snapshot is captured, so
+	// the task's anchor card can re-render with the PR's fresh review-cycle state (§A).
+	OnPullRequestSnapshot func(ctx context.Context, repo string, prNumber int64)
 	// OnHITLAsk is the exact transport callback captured by the snapshot's
 	// worker runner. Keeping it beside the answer callback makes the snapshot
 	// ownership boundary explicit and testable end to end.
@@ -208,6 +218,14 @@ type workerRunCompletedNotificationInput struct {
 	FailureKind       worker.QueueFailureKind
 	PullRequestNumber int64
 	PullRequestURL    string
+}
+
+func projectOwnerMentionOpenIDs(cfg config.Config, projectID string) []string {
+	openID := strings.TrimSpace(config.ProjectOwner(cfg, projectID))
+	if openID == "" {
+		return nil
+	}
+	return []string{openID}
 }
 
 type coordinatorNetworkGateway struct {
@@ -811,7 +829,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		}
 		result := make([]planner.IssueSummary, 0, len(issues))
 		for _, issue := range issues {
-			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID})
 		}
 		return result, nil
 	}
@@ -841,6 +859,52 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
 	}
 	return result, nil
+}
+
+func (a plannerGitHubAdapter) TransitionStrictDispatch(ctx context.Context, input planner.StrictDispatchTransitionInput) error {
+	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("strict dispatch %s is not backed by a Plane provider", input.DispatchID)
+	}
+	return client.TransitionStrictDispatch(ctx, input.DispatchID, input.State, input.WaitKind)
+}
+
+func (a plannerGitHubAdapter) CreateStrictRoleRequest(ctx context.Context, input planner.StrictRoleRequestInput) (planner.StrictRoleRequestResult, error) {
+	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return planner.StrictRoleRequestResult{}, err
+	}
+	if !ok {
+		return planner.StrictRoleRequestResult{}, fmt.Errorf("strict dispatch %s is not backed by a Plane provider", input.DispatchID)
+	}
+	questions := make([]planestrict.RoleQuestion, 0, len(input.Questions))
+	for _, question := range input.Questions {
+		options := make([]planestrict.RoleQuestionOption, 0, len(question.Options))
+		for _, option := range question.Options {
+			options = append(options, planestrict.RoleQuestionOption{ID: option.ID, Label: option.Label, Impact: option.Impact})
+		}
+		questions = append(questions, planestrict.RoleQuestion{
+			ID: question.ID, Question: question.Question, Context: question.Context, Options: options,
+			RecommendedOption: question.RecommendedOption, RecommendationReason: question.RecommendationReason,
+			DesignDocumentRequired: question.DesignDocumentRequired,
+		})
+	}
+	response, err := client.CreateStrictRoleRequest(ctx, input.DispatchID, planestrict.RoleRequestInput{
+		LoopID: input.LoopID, DecisionRevision: input.DecisionRevision, Role: string(input.Role),
+		BriefSummary: input.BriefSummary, Questions: questions,
+	})
+	if err != nil {
+		return planner.StrictRoleRequestResult{}, err
+	}
+	return planner.StrictRoleRequestResult{
+		RoleRequestID:    response.RoleRequest.ID,
+		CommentID:        response.RoleRequest.RequestCommentID,
+		CreatedAt:        response.RoleRequest.CreatedAt.Format(time.RFC3339Nano),
+		EligibleMemberID: response.RoleRequest.EligibleMemberID,
+	}, nil
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {
@@ -1039,6 +1103,16 @@ func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
+func (a plannerGitHubAdapter) ClosePullRequest(ctx context.Context, input planner.ClosePullRequestInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+		return err // forgejo delegate: nothing to close on the github side
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+}
+
 type plannerGitAdapter struct {
 	gateway *gitinfra.Gateway
 	stamper disclosure.Stamper
@@ -1057,7 +1131,7 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 	if err != nil {
 		return planner.InspectHeadResult{}, err
 	}
-	return planner.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+	return planner.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, CommittedChangedFiles: result.CommittedChangedFiles, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
 }
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
@@ -1073,28 +1147,40 @@ func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) er
 	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
 }
 
-type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type plannerAgentExecutionAdapter struct{ execution agent.Execution }
+type plannerAgentExecutorAdapter struct {
+	executor *agent.ConfiguredExecutor
+}
+
+type convertedAgentExecution[T any] struct {
+	execution agent.Execution
+	convert   func(agent.Result) T
+}
+
+func (a convertedAgentExecution[T]) Wait(ctx context.Context) (T, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return a.convert(result), nil
+}
+
+func (a convertedAgentExecution[T]) Kill(reason string) error { return a.execution.Kill(reason) }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
-		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
+		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return plannerAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a plannerAgentExecutionAdapter) Wait(ctx context.Context) (planner.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return planner.AgentResult{}, err
-	}
-	return planner.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+	return convertedAgentExecution[planner.AgentResult]{execution: execution, convert: func(result agent.Result) planner.AgentResult {
+		return planner.AgentResult{Status: result.Status, Summary: result.Summary, ProductAsk: result.ProductAsk, Stdout: result.Stdout, Stderr: result.Stderr, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, Interrupted: result.Interrupted}
+	}}, nil
 }
 
 type reviewerGitHubAdapter struct {
@@ -2429,7 +2515,6 @@ func (a fixerGitAdapter) CleanupWorktree(ctx context.Context, input fixer.Cleanu
 }
 
 type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{
@@ -2441,15 +2526,9 @@ func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentR
 	if err != nil {
 		return nil, err
 	}
-	return fixerAgentExecutionAdapter{execution: execution}, nil
-}
-
-func (a fixerAgentExecutionAdapter) Wait(ctx context.Context) (fixer.AgentResult, error) {
-	result, err := a.execution.Wait(ctx)
-	if err != nil {
-		return fixer.AgentResult{}, err
-	}
-	return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+	return convertedAgentExecution[fixer.AgentResult]{execution: execution, convert: func(result agent.Result) fixer.AgentResult {
+		return fixer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}
+	}}, nil
 }
 
 type workerGitHubAdapter struct {
@@ -2489,7 +2568,13 @@ func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input wor
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Label: input.Label})
+	pullRequests, err := a.gateway.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{
+		Repo:       input.Repo,
+		CWD:        input.CWD,
+		Limit:      input.Limit,
+		Label:      input.Label,
+		PreferREST: true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2505,13 +2590,13 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 		if err != nil {
 			return nil, err
 		}
-		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		issues, err := client.ListStrictDispatchIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, "worker")
 		if err != nil {
 			return nil, err
 		}
 		result := make([]worker.IssueSummary, 0, len(issues))
 		for _, issue := range issues {
-			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels), StrictDispatchID: issue.StrictDispatchID})
 		}
 		return result, nil
 	}
@@ -2541,6 +2626,17 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
 	}
 	return result, nil
+}
+
+func (a workerGitHubAdapter) TransitionStrictDispatch(ctx context.Context, input worker.StrictDispatchTransitionInput) error {
+	client, ok, err := a.plane(ctx, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("strict dispatch requires a Plane provider")
+	}
+	return client.TransitionStrictDispatch(ctx, input.DispatchID, input.State, input.WaitKind)
 }
 
 func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
@@ -2888,6 +2984,7 @@ func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) erro
 type workerAgentExecutorAdapter struct {
 	executor *agent.ConfiguredExecutor
 }
+
 type workerAgentExecutionAdapter struct {
 	execution agent.Execution
 }
@@ -2937,12 +3034,16 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, shepherds ...webhookforward.TargetedShepherd) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	claimMu := &sync.Mutex{}
+	var shepherd webhookforward.TargetedShepherd
+	if len(shepherds) > 0 {
+		shepherd = shepherds[0]
+	}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
 	// Trusted review proxies are minted per reviewer agent run (bound to that
@@ -2950,7 +3051,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	// transport continuity while retaining config-specific policy.
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, shepherd)
 	}
 	handlers := defaultSchedulerHandlers{
 		snapshot:             buildSnapshot,
@@ -2967,8 +3068,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			Fixer: catalogWebhookFixer{snapshot: func() fixerScheduler {
 				return handlers.snapshot().fixer
 			}},
-			Logger: logger,
-			Now:    now,
+			Shepherd: shepherd,
+			Logger:   logger,
+			Now:      now,
 			// Accept-time gate only: once Forward returns accepted/202 the
 			// delivery is committed and workers complete discovery even if
 			// admission later degrades. BeginShutdown/Stop aborts via CancelExecute.
@@ -3035,7 +3137,11 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, newSchedulerNotificationGatewayFactory(), coordinatorrole.NewRuntimeState())
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, shepherds ...webhookforward.TargetedShepherd) defaultSchedulerHandlers {
+	var shepherd webhookforward.TargetedShepherd
+	if len(shepherds) > 0 {
+		shepherd = shepherds[0]
+	}
 	if now == nil {
 		now = time.Now
 	}
@@ -3059,6 +3165,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
 		Repositories:  repos,
 		Now:           now,
+		ResolveOwnerOpenID: func(projectID string) string {
+			return config.ProjectOwner(cfg, projectID)
+		},
 	})
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.
@@ -3072,6 +3181,23 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			return
 		}
 		notificationGateway.RefreshThreadHeader(ctx, loopID, nil, 0)
+	}
+	// refreshTaskCardForPR re-renders the anchor card of the task whose worker opened
+	// this PR, so a freshly-captured snapshot advances the card through the review
+	// cycle (§A: 👀 待 review → 🔄 CI 检查中 → ✋ 待修改 / ❌ CI 失败 → ✅ 待合并). Resolves
+	// the PR → its worker loop (target pr:repo:N) → that loop's task-card. App-mode only.
+	refreshTaskCardForPR := func(ctx context.Context, repo string, prNumber int64) {
+		if repo = strings.TrimSpace(repo); repo == "" || prNumber <= 0 {
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") || repos == nil || repos.Loops == nil {
+			return
+		}
+		loop, err := repos.Loops.GetByTargetID(ctx, fmt.Sprintf("pr:%s:%d", repo, prNumber))
+		if err != nil || loop == nil {
+			return
+		}
+		notificationGateway.RefreshThreadHeader(ctx, loop.ID, nil, 0)
 	}
 	notifyAgentExecutionStarted := func(ctx context.Context, input agentExecutionNotificationInput) error {
 		notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
@@ -3121,6 +3247,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			payload.Title = "Looper Worker Opened a PR"
 			payload.Body = fmt.Sprintf("PR #%d is ready: %s", input.PullRequestNumber, runtimeFirstNonEmpty(input.PullRequestURL, input.Summary))
 			payload.DedupeKey = fmt.Sprintf("runtime.worker.pr_ready:%s", input.RunID)
+			// The requested work is delivered — @-mention the owner so it isn't missed.
+			payload.MentionOpenIds = projectOwnerMentionOpenIDs(cfg, input.ProjectID)
+			// Reflect the PR in Plane's own state column: In Progress → In Review. Plane
+			// projects only; best-effort (a failure must never disturb the notification).
+			setPlaneWorkItemState(ctx, &cfg, repos, logger, input.ProjectID, input.LoopID, "In Review")
 		default:
 			payload.Level = "success"
 			payload.Title = "Looper Worker Completed"
@@ -3253,6 +3384,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AgentModel:         agentModel,
 			AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
 			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
+			PlaneDoc:           func(projectID string) (*planedoc.Gateway, string, bool) { return planeDocForProject(&cfg, projectID) },
 			DiscoveryPolicy: planner.DiscoveryPolicy{
 				AutoDiscovery:              plannerAutoDiscovery,
 				Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
@@ -3265,6 +3397,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
+			PostThreadNote:         notificationGateway.PostThreadNote,
+			PostThreadNoteWithUUID: notificationGateway.PostThreadNoteWithUUID,
+			PostThreadCard: func(ctx context.Context, loopID, body string, mentionOpenIDs []string) error {
+				return notificationGateway.PostThreadDecisionCard(ctx, loopID, body, "", mentionOpenIDs)
+			},
+			PostThreadImage:           notificationGateway.PostThreadImage,
+			PostThreadApprovalCard:    notificationGateway.PostThreadApprovalCard,
+			PostThreadProductSpecCard: notificationGateway.PostThreadProductSpecCard,
 		})
 	}
 
@@ -3344,14 +3484,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
 			LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
 			DiscoveryPolicy: reviewer.DiscoveryPolicy{
-				AutoDiscovery:             reviewerAutoDiscovery,
-				IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
-				RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
-				EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
-				Labels:                    append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
-				LabelMode:                 cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
-				IncludeSpecReviewingLabel: cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
-				SpecReviewingLabel:        cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
+				AutoDiscovery:                  reviewerAutoDiscovery,
+				IncludeDrafts:                  cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+				RequireReviewRequest:           cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
+				EnableSelfReview:               cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+				Labels:                         append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
+				LabelMode:                      cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
+				IncludeSpecReviewingLabel:      cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
+				SpecReviewingLabel:             cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
+				SpecReviewRequireHumanApproval: cfg.Roles.Reviewer.Discovery.SpecReview.RequireHumanApproval,
 			},
 			Scope:                   cfg.Roles.Reviewer.Behavior.Scope,
 			DetectDuplicateFindings: cfg.Roles.Reviewer.Behavior.DetectDuplicateFindings,
@@ -3451,9 +3592,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			workerAutoDiscovery = false
 		}
 		workerRunner = worker.New(worker.Options{
-			DB:     coordinator.DB(),
-			Repos:  repos,
-			GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: workerStamper, config: &cfg},
+			DB:       coordinator.DB(),
+			Repos:    repos,
+			PlaneDoc: func(projectID string) (*planedoc.Gateway, string, bool) { return planeDocForProject(&cfg, projectID) },
+			GitHub:   workerGitHubAdapter{gateway: githubGateway, stamper: workerStamper, config: &cfg},
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
@@ -3463,6 +3605,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Now:             now,
 			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
 			AllowAutoPush:   cfg.Defaults.AllowAutoPush,
+			ShepherdEnabled: cfg.Defaults.WorkerShepherd || os.Getenv("LOOPER_WORKER_SHEPHERD") == "1",
 			OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
@@ -3509,6 +3652,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
+			ActiveExecutions:     activeExecutions,
 			GitHubGateway:        githubGateway,
 			Logger:               logger,
 			Now:                  now,
@@ -3532,6 +3676,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(fixerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
 			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			OnPullRequestSnapshot:    refreshTaskCardForPR,
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 		}
@@ -3549,6 +3694,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	}
 	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
+			if retried, err := notificationGateway.RetryPendingCards(ctx, 50); err != nil {
+				if logger != nil {
+					logger.Warn("notification outbox retry failed", map[string]any{"error": err.Error()})
+				}
+			} else if retried > 0 && logger != nil {
+				logger.Info("notification outbox retried", map[string]any{"count": retried})
+			}
 			return runDefaultSchedulerTick(ctx, inputForServices(services))
 		},
 		claim: func(ctx context.Context, services Services) error {
@@ -3566,6 +3718,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ConfigSource: configSource,
 			Reviewer:     webhookReviewer,
 			Fixer:        webhookFixer,
+			Shepherd:     shepherd,
 			Logger:       logger,
 			Now:          now,
 		})
@@ -3819,12 +3972,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		runGitHubHITLPoll(ctx, input, project)
 	}
 
-	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
-	// deliver any answers for this looper's awaiting loops.
-	if err := admissionRefuseWork(input); err == nil {
-		runFeishuHITLPoll(ctx, input)
-	}
-
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 
@@ -3989,6 +4136,14 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 			return 0, 0, err
 		}
 	}
+	// Disk-aware backpressure (P0-A2): even with free run slots, do not START
+	// new work when the volume backing the worktrees is near full — a fresh
+	// multi-GB worktree on a full disk fails mid-run with ENOSPC / "no such
+	// file" and strands the loop. In-flight loops (already "running") are
+	// untouched; only new claims pause until cleanup reclaims space.
+	if availableSlots > 0 {
+		availableSlots = diskBackpressureClamp(availableSlots, input.Config, input.Logger)
+	}
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {
 		claimedItems, err = claimAndRunScheduledQueueItems(ctx, availableSlots, input)
@@ -4051,11 +4206,139 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	if err != nil {
 		return 0, err
 	}
-	available := maxConcurrentRuns - int(runningCount)
+	// Queue state can briefly lag an already-running role process during recovery
+	// (for example, a claimed item is requeued while its prepare-work coroutine is
+	// still alive). Count persisted running runs too and use the larger value so a
+	// stale queue row can never make the scheduler exceed maxConcurrentRuns.
+	effectiveRunning := runningCount
+	if repos.Runs != nil {
+		runCounts, err := repos.Runs.CountByStatus(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if runningRuns := runCounts["running"]; runningRuns > effectiveRunning {
+			effectiveRunning = runningRuns
+		}
+	}
+	available := maxConcurrentRuns - int(effectiveRunning)
 	if available < 0 {
 		return 0, nil
 	}
 	return available, nil
+}
+
+// diskUsageStat is the seam through which the scheduler reads filesystem
+// capacity; tests override it to simulate a full disk deterministically.
+var diskUsageStat = disk.Stat
+
+const diskBackpressureLogInterval = 5 * time.Minute
+
+type diskBackpressureLogState struct {
+	level        string
+	lastLoggedAt time.Time
+}
+
+var (
+	diskBackpressureLogMu     sync.Mutex
+	diskBackpressureLogStates = map[string]diskBackpressureLogState{}
+	diskBackpressureNow       = time.Now
+)
+
+func shouldLogDiskBackpressure(path, level string, now time.Time) bool {
+	diskBackpressureLogMu.Lock()
+	defer diskBackpressureLogMu.Unlock()
+
+	state, ok := diskBackpressureLogStates[path]
+	if ok && state.level == level && now.Sub(state.lastLoggedAt) < diskBackpressureLogInterval {
+		return false
+	}
+	diskBackpressureLogStates[path] = diskBackpressureLogState{level: level, lastLoggedAt: now}
+	return true
+}
+
+func clearDiskBackpressureLogState(path string) bool {
+	diskBackpressureLogMu.Lock()
+	defer diskBackpressureLogMu.Unlock()
+
+	if _, ok := diskBackpressureLogStates[path]; !ok {
+		return false
+	}
+	delete(diskBackpressureLogStates, path)
+	return true
+}
+
+// diskBackpressureClamp reduces the runs the scheduler may START this phase to
+// zero when the volume backing the worktrees is at/above the configured
+// capacity. It governs NEW claims only; loops already running keep going. It
+// fails OPEN: if backpressure is disabled, the platform lacks statfs, or the
+// disk cannot be read, the original slot count is returned unchanged — a disk
+// we cannot measure must never wedge the whole scheduler.
+func diskBackpressureClamp(availableSlots int, cfg *config.Config, logger bootstrap.Logger) int {
+	if availableSlots <= 0 || cfg == nil {
+		return availableSlots
+	}
+	bp := cfg.Daemon.DiskBackpressure
+	if !bp.Enabled {
+		return availableSlots
+	}
+
+	path := strings.TrimSpace(bp.Path)
+	if path == "" {
+		root, err := config.DefaultWorktreeRoot()
+		if err != nil {
+			// No path to watch — fail open rather than block all work.
+			return availableSlots
+		}
+		path = root
+	}
+
+	usage, err := diskUsageStat(path)
+	if err != nil {
+		// Unsupported platform or a transient stat error: never block work on a
+		// disk we cannot read. Debug-log so it stays discoverable.
+		if logger != nil {
+			logger.Debug("disk backpressure: capacity check unavailable, allowing claims", map[string]any{"path": path, "error": err.Error()})
+		}
+		return availableSlots
+	}
+
+	high := bp.HighWatermarkPercent
+	if high <= 0 || usage.UsedPercent < high {
+		if logger != nil && clearDiskBackpressureLogState(usage.Path) {
+			logger.Info("disk backpressure: recovered below high watermark — resuming new run claims", map[string]any{
+				"path":          usage.Path,
+				"usedPercent":   math.Round(usage.UsedPercent*10) / 10,
+				"availGiB":      math.Round(float64(usage.AvailBytes)/(1<<30)*100) / 100,
+				"highWatermark": high,
+			})
+		}
+		return availableSlots
+	}
+
+	hard := bp.HardStopPercent
+	fields := map[string]any{
+		"path":          usage.Path,
+		"usedPercent":   math.Round(usage.UsedPercent*10) / 10,
+		"availGiB":      math.Round(float64(usage.AvailBytes)/(1<<30)*100) / 100,
+		"highWatermark": high,
+		"hardStop":      hard,
+		"blockedSlots":  availableSlots,
+	}
+	if logger != nil {
+		level := "high"
+		if hard > 0 && usage.UsedPercent >= hard {
+			level = "hard"
+		}
+		if !shouldLogDiskBackpressure(usage.Path, level, diskBackpressureNow().UTC()) {
+			return 0
+		}
+		if level == "hard" {
+			logger.Error("disk backpressure: hard stop — refusing to claim new runs (disk emergency)", fields)
+		} else {
+			logger.Warn("disk backpressure: above high watermark — pausing new run claims", fields)
+		}
+	}
+	return 0
 }
 
 // ownedQueueClaim is one durable running claim held under a Supervisor
@@ -4486,6 +4769,9 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 	if err != nil || loop == nil {
 		return false
 	}
+	if state, ok := loopengine.Read(loop.MetadataJSON); ok && state.Phase == loopengine.PhaseBlocked && (state.Condition == "manual_pause" || state.Condition == "human_takeover") {
+		return true
+	}
 	switch loop.Status {
 	case "human_takeover", "paused":
 		return true
@@ -4519,6 +4805,20 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 		item := claim.item
 		lease := claim.lease
 		permit := claim.permit
+		handled, err := gateRecoverableInfraRetry(ctx, item, input)
+		if err != nil {
+			errList = append(errList, err)
+			if input.OperationOwner != nil {
+				input.OperationOwner.ReportHardPersistFailure(err)
+			}
+			continue
+		}
+		if handled {
+			if lease != nil {
+				lease.Release()
+			}
+			continue
+		}
 
 		// A loop parked for human takeover (or paused) must never be run, even if a
 		// queue item survived a race with the parking and got claimed. Durable-
@@ -4588,7 +4888,9 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 			errList = append(errList, err)
 			continue
 		}
-		processFn := process
+		processFn := withLifecycleLease(item, input, func(ctx context.Context) error {
+			return runQueueRolePlugin(ctx, item.Type, process)
+		})
 		run := func() {
 			// Processor work is owned by the operation lease, not the detached
 			// scheduler dispatch context. dispatchOwnedQueueClaims uses
@@ -4664,6 +4966,95 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+type queueRoleCheckpoint struct{}
+
+type queueRolePlugin struct {
+	role    string
+	process func(context.Context) error
+}
+
+func (p queueRolePlugin) Steps() []string                        { return []string{p.role + ".reconcile"} }
+func (p queueRolePlugin) BoundaryFor(string) loopengine.Boundary { return loopengine.Boundary(p.role) }
+func (p queueRolePlugin) ExecuteStep(ctx context.Context, _ string, checkpoint queueRoleCheckpoint) (loopengine.StepResult[queueRoleCheckpoint], error) {
+	return loopengine.StepResult[queueRoleCheckpoint]{Checkpoint: checkpoint}, p.process(ctx)
+}
+func (p queueRolePlugin) Classify(err error, boundary loopengine.Boundary) *loopengine.Failure {
+	return &loopengine.Failure{Class: "role_failure", Boundary: boundary, Err: err}
+}
+
+type queueRoleStore struct{}
+
+func (queueRoleStore) Load(context.Context) (queueRoleCheckpoint, string, error) {
+	return queueRoleCheckpoint{}, "", nil
+}
+func (queueRoleStore) StepStarted(context.Context, string, queueRoleCheckpoint) error   { return nil }
+func (queueRoleStore) StepCompleted(context.Context, string, queueRoleCheckpoint) error { return nil }
+func (queueRoleStore) Blocked(context.Context, string, queueRoleCheckpoint, loopengine.Blocked) error {
+	return nil
+}
+func (queueRoleStore) Done(context.Context, queueRoleCheckpoint) error { return nil }
+
+func runQueueRolePlugin(ctx context.Context, role string, process func(context.Context) error) error {
+	_, err := (loopengine.Engine[queueRoleCheckpoint]{Plugin: queueRolePlugin{role: role, process: process}, Store: queueRoleStore{}}).Run(ctx)
+	return err
+}
+
+func withLifecycleLease(item storage.QueueItemRecord, input defaultSchedulerTickInput, process func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if item.LoopID == nil || strings.TrimSpace(*item.LoopID) == "" || input.Repos == nil || input.Repos.Locks == nil {
+			return process(ctx)
+		}
+		loopID := strings.TrimSpace(*item.LoopID)
+		now := input.Now
+		if now == nil {
+			now = time.Now
+		}
+		lease := loopengine.StorageLease{Locks: input.Repos.Locks, Key: "lifecycle:" + loopID, Owner: item.ID, TTL: 2 * time.Hour, Now: now}
+		acquired, err := lease.Acquire(ctx)
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			// This claimed item is a duplicate reconcile attempt. The lease owner is
+			// already advancing the loop, so retire only this queue row.
+			if input.Repos.Queue != nil {
+				_ = input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
+			}
+			return nil
+		}
+		defer func() { _ = lease.Release(context.Background()) }()
+		syncLifecycleState(ctx, input.Repos, loopID, now)
+		err = process(ctx)
+		syncLifecycleState(ctx, input.Repos, loopID, now)
+		return err
+	}
+}
+
+func syncLifecycleState(ctx context.Context, repositories *storage.Repositories, loopID string, now func() time.Time) {
+	if repositories == nil || repositories.Loops == nil {
+		return
+	}
+	loop, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	condition := ""
+	if blocked, ok := loopcondition.Read(loop.MetadataJSON); ok {
+		condition = string(blocked.Kind)
+	}
+	state := loopengine.FromLegacy(loop.Status, condition, formatJavaScriptISOString(now().UTC()))
+	if current, ok := loopengine.Read(loop.MetadataJSON); ok && current.Phase == state.Phase && current.Condition == state.Condition && current.Outcome == state.Outcome && current.Reason == state.Reason {
+		return
+	}
+	metadata, err := loopengine.Write(loop.MetadataJSON, state)
+	if err != nil {
+		return
+	}
+	loop.MetadataJSON = &metadata
+	loop.UpdatedAt = state.UpdatedAt
+	_ = repositories.Loops.Upsert(ctx, *loop)
 }
 
 // durableCompleteClaim writes queue status completed and verifies the durable
@@ -4834,6 +5225,11 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	}
 	if err := input.Repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
+	}
+	// A fresh snapshot means the PR's review state may have moved — refresh the
+	// task's anchor card so its header mirrors it (§A). Best-effort; app-mode only.
+	if input.OnPullRequestSnapshot != nil {
+		input.OnPullRequestSnapshot(ctx, *item.Repo, *item.PRNumber)
 	}
 	if err := input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC())); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {

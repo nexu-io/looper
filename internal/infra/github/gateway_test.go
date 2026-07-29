@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -363,6 +364,34 @@ func TestGatewayListOpenPullRequestsFallsBackWhenReviewRequestReviewerIsInaccess
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("gh calls = %#v, want primary and fallback list calls", runner.calls)
+	}
+}
+
+func TestGatewayListOpenPullRequestsUsesRESTForWorkerDedupe(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args == "api --method GET repos/acme/looper/pulls -f state=open -f per_page=100 --jq "+prListRESTJQ {
+			return shell.Result{Stdout: `[{"number":42,"title":"Existing PR","html_url":"https://example.test/pull/42","state":"open","updated_at":"2026-07-16T11:00:00Z","draft":false,"labels":[{"name":"ready"}],"head":{"ref":"feature","sha":"abc123"},"base":{"ref":"main","sha":"def456"},"user":{"login":"octocat"},"author_association":"MEMBER","requested_reviewers":[{"login":"reviewer","id":7}]}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	prs, err := gateway.ListOpenPullRequests(context.Background(), ListOpenPullRequestsInput{Repo: "acme/looper", Limit: 100, BaseRefName: "main", PreferREST: true})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 42 || prs[0].HeadRefName != "feature" || prs[0].BaseRefName != "main" || prs[0].URL != "https://example.test/pull/42" {
+		t.Fatalf("ListOpenPullRequests() = %#v, want REST fallback PR", prs)
+	}
+	if !slices.Equal(prs[0].ReviewRequests, []string{"reviewer"}) {
+		t.Fatalf("ReviewRequests = %#v, want reviewer", prs[0].ReviewRequests)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("gh calls = %#v, want REST only", runner.calls)
 	}
 }
 
@@ -754,6 +783,7 @@ func TestIsTransientErrorTreatsShellCommandNetworkFailuresAsRetryable(t *testing
 		{name: "gateway-wrapped tls handshake timeout", err: &TransientError{Err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "net/http: TLS handshake timeout"}}}},
 		{name: "unexpected eof", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "Post https://api.github.com/graphql: unexpected EOF"}}},
 		{name: "graphql transient", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stdout: `{"errors":[{"message":"GraphQL: Something went wrong while executing your query."}]}`}}},
+		{name: "graphql resource limit", err: &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "GraphQL: Resource limits for this query exceeded. (repository.pullRequests.nodes.1.labels)"}}},
 		{name: "bare http 504", err: fmt.Errorf("HTTP 504")},
 		{name: "generic rate limit", err: fmt.Errorf("rate limit exceeded")},
 	} {
@@ -2187,6 +2217,57 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 	}
 }
 
+// SnapshotFromDetail builds a snapshot from an ALREADY-fetched PR detail (no gh
+// call, no diff), lifting the review-cycle first-class fields and marshaling the
+// detail into the {"detail":{...}} payload the anchor card's readers expect —
+// crucially preserving Labels (the QA gate) and the merge-state fields.
+func TestGatewaySnapshotFromDetail(t *testing.T) {
+	t.Parallel()
+	gateway := New(Options{GHPath: "gh"})
+	detail := PullRequestDetail{
+		Number:         907,
+		Title:          "Add the thing",
+		State:          "OPEN",
+		ReviewDecision: "APPROVED",
+		Labels:         []string{"needs-validation", "enhancement"},
+		HeadSHA:        "abc123",
+		Author:         "octocat",
+		Checks:         []map[string]any{{"conclusion": "SUCCESS"}},
+	}
+	snapshot, err := gateway.SnapshotFromDetail(detail, "project_1", "acme/looper", 907, "2026-07-13T00:00:00.000Z")
+	if err != nil {
+		t.Fatalf("SnapshotFromDetail() error = %v", err)
+	}
+	if snapshot.PRNumber != 907 || snapshot.ProjectID != "project_1" || snapshot.Repo != "acme/looper" {
+		t.Fatalf("snapshot identity = %d/%q/%q, want 907/project_1/acme/looper", snapshot.PRNumber, snapshot.ProjectID, snapshot.Repo)
+	}
+	if snapshot.ReviewState == nil || *snapshot.ReviewState != "APPROVED" {
+		t.Fatalf("ReviewState = %v, want APPROVED", snapshot.ReviewState)
+	}
+	if snapshot.ChecksSummary == nil || *snapshot.ChecksSummary != "SUCCESS" {
+		t.Fatalf("ChecksSummary = %v, want SUCCESS", snapshot.ChecksSummary)
+	}
+	if snapshot.HeadSHA != "abc123" || snapshot.CapturedAt != "2026-07-13T00:00:00.000Z" {
+		t.Fatalf("HeadSHA/CapturedAt = %q/%q", snapshot.HeadSHA, snapshot.CapturedAt)
+	}
+	// Payload must carry the capitalized Labels + State the notify readers parse.
+	if snapshot.PayloadJSON == nil {
+		t.Fatal("PayloadJSON is nil")
+	}
+	var payload struct {
+		Detail struct {
+			State  string   `json:"State"`
+			Labels []string `json:"Labels"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal([]byte(*snapshot.PayloadJSON), &payload); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if payload.Detail.State != "OPEN" || len(payload.Detail.Labels) != 2 || payload.Detail.Labels[0] != "needs-validation" {
+		t.Fatalf("payload detail = %+v, want State OPEN + [needs-validation enhancement]", payload.Detail)
+	}
+}
+
 func TestGatewayDiffGenericFailureStillFails(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -2225,6 +2306,8 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 		switch args {
 		case "label list --repo acme/looper --limit 1000 --json name,color,description":
 			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"},{"name":"looper:spec-reviewing","color":"000000","description":"Old description"}]`}, nil
+		case "label create looper:auto --repo acme/looper --color 0052cc --description Run fully autonomously: plan → implement":
+			return shell.Result{Stdout: "{}"}, nil
 		case "label edit looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
@@ -2250,8 +2333,8 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Summary.Created != 6 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=6 updated=1 skipped=1 failed=0", result.Summary)
+	if result.Summary.Created != 7 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=7 updated=1 skipped=1 failed=0", result.Summary)
 	}
 
 	log := strings.Join(runner.calls, "\n")
@@ -2281,6 +2364,8 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 			return shell.Result{Stdout: `[]`}, nil
 		case "label create looper:plan --repo github.example.com/acme/looper --color 5319e7 --description Picked up automatically by planner":
 			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:auto --repo github.example.com/acme/looper --color 0052cc --description Run fully autonomously: plan → implement":
+			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-reviewing --repo github.example.com/acme/looper --color 1d76db --description Spec PR is under review":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo github.example.com/acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
@@ -2306,8 +2391,8 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 8 {
-		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=8", result)
+	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 9 {
+		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=9", result)
 	}
 }
 
@@ -2328,8 +2413,8 @@ func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels(dry run) error = %v", err)
 	}
-	if result.Summary.Created != 8 || len(runner.calls) != 1 {
-		t.Fatalf("dry run result = %#v, calls = %#v; want eight planned creates and only label list", result.Summary, runner.calls)
+	if result.Summary.Created != 9 || len(runner.calls) != 1 {
+		t.Fatalf("dry run result = %#v, calls = %#v; want nine planned creates and only label list", result.Summary, runner.calls)
 	}
 }
 
@@ -2341,6 +2426,8 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 		switch args {
 		case "label list --repo acme/looper --limit 1000 --json name,color,description":
 			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+		case "label create looper:auto --repo acme/looper --color 0052cc --description Run fully autonomously: plan → implement":
+			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
@@ -2367,8 +2454,8 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 	if err == nil {
 		t.Fatalf("InitializeLabels() error = nil, want failure")
 	}
-	if result.Summary.Failed != 1 || result.Summary.Created != 6 || result.Summary.Skipped != 1 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=6 skipped=1 failed=1", result.Summary)
+	if result.Summary.Failed != 1 || result.Summary.Created != 7 || result.Summary.Skipped != 1 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=7 skipped=1 failed=1", result.Summary)
 	}
 	got := ""
 	for _, label := range result.Labels {

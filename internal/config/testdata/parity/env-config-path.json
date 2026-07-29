@@ -81,7 +81,8 @@
           "allowAutoMerge": true,
           "allowRiskyFixes": true,
           "openPrStrategy": "first_commit",
-          "addSnapshotMode": "async"
+          "addSnapshotMode": "async",
+          "workerShepherd": false
         },
         "projects": [
           {
@@ -113,6 +114,7 @@
         "maxConcurrentRuns": 4,
         "retryMaxAttempts": 7,
         "retryBaseDelayMs": 1500,
+        "infraRetryBudgetSeconds": 3600,
         "slowLaneWarnThresholdMs": 5000,
         "discoveryCacheTtlSeconds": 30
       },
@@ -209,11 +211,16 @@
         },
         "worktreeCleanup": {
           "enabled": true,
-          "interval": "24h",
-          "retentionDays": 7,
-          "maxPerTick": 10,
-          "includeOrphans": false,
+          "interval": "1h",
+          "retentionDays": 1,
+          "maxPerTick": 50,
+          "includeOrphans": true,
           "dryRun": false
+        },
+        "diskBackpressure": {
+          "enabled": true,
+          "highWatermarkPercent": 85,
+          "hardStopPercent": 93
         }
       },
       "package": {
@@ -231,7 +238,8 @@
         "allowRiskyFixes": true,
         "fixAllPullRequests": false,
         "openPrStrategy": "first_commit",
-        "addSnapshotMode": "async"
+        "addSnapshotMode": "async",
+        "workerShepherd": false
       },
       "roles": {
         "coordinator": {
@@ -343,7 +351,8 @@
             },
             "specReview": {
               "includeReviewingLabel": true,
-              "reviewingLabel": "looper:spec-reviewing"
+              "reviewingLabel": "looper:spec-reviewing",
+              "requireHumanApproval": false
             }
           }
         },
@@ -395,7 +404,8 @@
         "gitPath": "configured",
         "ghPath": "configured",
         "looperPath": "detected",
-        "osascriptPath": "configured"
+        "osascriptPath": "configured",
+        "planePath": "missing"
       }
     }
   }

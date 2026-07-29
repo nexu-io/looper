@@ -30,6 +30,7 @@ const (
 	defaultGhCommandTimeout = 60 * time.Second
 	prListGhCommandTimeout  = 15 * time.Second
 	prDiffGhCommandTimeout  = 180 * time.Second
+	prListRESTJQ            = `[.[] | {number,title,html_url,state,updated_at,draft,labels:[.labels[]? | {name}],head:{ref:.head.ref,sha:.head.sha},base:{ref:.base.ref,sha:.base.sha},user:{login:.user.login},author_association,requested_reviewers:[.requested_reviewers[]? | {login,id}]}]`
 )
 
 var (
@@ -534,6 +535,7 @@ type ListOpenPullRequestsInput struct {
 	Author      string
 	BaseRefName string
 	Timeout     time.Duration
+	PreferREST  bool
 }
 
 type ListReviewRequestedPullRequestsInput struct {
@@ -717,6 +719,9 @@ func New(options Options) *Gateway {
 }
 
 func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	if input.PreferREST {
+		return g.listOpenPullRequestsREST(ctx, input)
+	}
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.listOpenPullRequests(ctx, input)
 	}
@@ -836,6 +841,60 @@ func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input List
 		})
 	}
 	return out, nil
+}
+
+func (g *Gateway) listOpenPullRequestsREST(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+	timeout := input.Timeout
+	if timeout <= 0 {
+		timeout = defaultGhCommandTimeout
+	}
+	result, err := g.runGhWithTimeout(
+		ctx,
+		input.CWD,
+		"",
+		timeout,
+		"api",
+		"--method",
+		"GET",
+		fmt.Sprintf("repos/%s/pulls", input.Repo),
+		"-f",
+		"state=open",
+		"-f",
+		fmt.Sprintf("per_page=%d", defaultLimit(input.Limit)),
+		"--jq",
+		prListRESTJQ,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	pullRequests := make([]PullRequestSummary, 0, len(rows))
+	for _, row := range rows {
+		head, _ := row["head"].(map[string]any)
+		base, _ := row["base"].(map[string]any)
+		requestedReviewers := extractActorUsers(row["requested_reviewers"])
+		pullRequests = append(pullRequests, PullRequestSummary{
+			Number:             asInt64(row["number"]),
+			Title:              asString(row["title"]),
+			URL:                asString(row["html_url"]),
+			State:              strings.ToUpper(asString(row["state"])),
+			UpdatedAt:          asString(row["updated_at"]),
+			IsDraft:            asBool(row["draft"]),
+			Labels:             extractLabelNames(row["labels"]),
+			HeadRefName:        asString(head["ref"]),
+			BaseRefName:        asString(base["ref"]),
+			HeadSHA:            asString(head["sha"]),
+			BaseSHA:            asString(base["sha"]),
+			Author:             extractAuthor(row["user"]),
+			AuthorAssociation:  asString(row["author_association"]),
+			ReviewRequests:     extractActorLogins(row["requested_reviewers"]),
+			ReviewRequestUsers: requestedReviewers,
+		})
+	}
+	return filterPullRequests(pullRequests, input), nil
 }
 
 func (g *Gateway) listOpenPullRequestRows(ctx context.Context, input ListOpenPullRequestsInput, fields []string) ([]map[string]any, error) {
@@ -3006,6 +3065,45 @@ func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CaptureP
 	}, nil
 }
 
+// SnapshotFromDetail builds a PR snapshot record from a PR detail the caller has
+// ALREADY fetched, so a caller holding the live PR in hand (e.g. the worker
+// shepherd's reconcile) can persist a snapshot WITHOUT a second view+diff fetch.
+// The diff is intentionally omitted — this snapshot feeds the anchor card's
+// review-cycle state (labels / reviewDecision / checks / merge state via the
+// captured detail), not a reviewer's diff analysis. The payload mirrors
+// CapturePullRequestSnapshot's shape ({"detail": <PullRequestDetail>}) so the same
+// readers (prMergeStateFromSnapshot, label extraction) work unchanged. capturedAt
+// defaults to now when empty.
+func (g *Gateway) SnapshotFromDetail(detail PullRequestDetail, projectID, repo string, prNumber int64, capturedAt string) (storage.PullRequestSnapshotRecord, error) {
+	capturedAt = strings.TrimSpace(capturedAt)
+	if capturedAt == "" {
+		capturedAt = g.now().UTC().Format(javaScriptISOStringLayout)
+	}
+	payload, err := json.Marshal(map[string]any{"detail": detail})
+	if err != nil {
+		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("marshal pull request snapshot payload: %w", err)
+	}
+	unresolvedCount := int64(countUnresolvedThreads(detail.Comments))
+	return storage.PullRequestSnapshotRecord{
+		ID:                    randomID(),
+		ProjectID:             projectID,
+		Repo:                  repo,
+		PRNumber:              prNumber,
+		HeadSHA:               valueOr(detail.HeadSHA, "unknown"),
+		BaseSHA:               stringPtrIfNotEmpty(detail.BaseSHA),
+		Title:                 stringPtrIfNotEmpty(detail.Title),
+		Body:                  stringPtrIfNotEmpty(detail.Body),
+		Author:                stringPtrIfNotEmpty(detail.Author),
+		DiffRef:               stringPtr(fmt.Sprintf("gh:pr-detail:%s:%d", repo, prNumber)),
+		ChecksSummary:         stringPtrIfNotEmpty(summarizeChecks(detail.Checks)),
+		UnresolvedThreadCount: &unresolvedCount,
+		ReviewState:           stringPtrIfNotEmpty(detail.ReviewDecision),
+		PayloadJSON:           stringPtr(string(payload)),
+		CapturedAt:            capturedAt,
+		CreatedAt:             capturedAt,
+	}, nil
+}
+
 type reviewThreadNode struct {
 	ID         string
 	IsResolved bool
@@ -3637,6 +3735,8 @@ func resolveLabelColor(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case "looper:plan":
 		return "5319e7"
+	case "looper:auto":
+		return "0052cc"
 	case specpr.ReviewingLabel:
 		return "1d76db"
 	case specpr.ReadyLabel:
@@ -3654,6 +3754,8 @@ func resolveLabelDescription(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case "looper:plan":
 		return "Picked up automatically by planner"
+	case "looper:auto":
+		return "Run fully autonomously: plan → implement"
 	case specpr.ReviewingLabel:
 		return "Spec PR is under review"
 	case specpr.ReadyLabel:
@@ -3676,6 +3778,7 @@ func resolveLabelDescription(label string) string {
 func StandardLooperLabels() []LabelDefinition {
 	return []LabelDefinition{
 		{Name: "looper:plan", Color: resolveLabelColor("looper:plan"), Description: resolveLabelDescription("looper:plan")},
+		{Name: "looper:auto", Color: resolveLabelColor("looper:auto"), Description: resolveLabelDescription("looper:auto")},
 		{Name: specpr.ReviewingLabel, Color: resolveLabelColor(specpr.ReviewingLabel), Description: resolveLabelDescription(specpr.ReviewingLabel)},
 		{Name: specpr.ReadyLabel, Color: resolveLabelColor(specpr.ReadyLabel), Description: resolveLabelDescription(specpr.ReadyLabel)},
 		{Name: specpr.NeedsHumanLabel, Color: resolveLabelColor(specpr.NeedsHumanLabel), Description: resolveLabelDescription(specpr.NeedsHumanLabel)},

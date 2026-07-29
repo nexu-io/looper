@@ -23,10 +23,10 @@ type HITLAsk struct {
 	Status      string   `json:"status,omitempty"` // "awaiting" | "answered" | "consumed"
 	AskedAt     string   `json:"askedAt,omitempty"`
 	AnsweredAt  string   `json:"answeredAt,omitempty"`
-	// Transport records how the ask was delivered ("github" | "feishu"). GitHub
-	// asks carry the PR + ask-comment id so the answer-poll lane can find the human
-	// reply that came after the ask and resolve/re-request on that PR.
+	// Transport records which source of truth owns the answer ("github" | "plane").
+	// ActionURL points to the exact comment where the human must respond.
 	Transport    string `json:"transport,omitempty"`
+	ActionURL    string `json:"actionUrl,omitempty"`
 	PRNumber     int64  `json:"prNumber,omitempty"`
 	AskCommentID int64  `json:"askCommentId,omitempty"`
 

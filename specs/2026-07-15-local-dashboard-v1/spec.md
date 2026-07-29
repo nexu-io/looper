@@ -152,7 +152,7 @@ On loop/run detail (where API supports):
 - takeover
 - handback
 
-Confirm dialogs **only** for high-impact: **stop**, **takeover**, **handback**.  
+Confirm dialogs **only** for high-impact: **stop**, **takeover**, **handback**.
 Pause/retry/unpause/resume: one click + toast.
 
 Action enablement: **conservative client-side** map from known status rules; never invent permissions. API 4xx still shown. No new `allowedActions` field in v1.

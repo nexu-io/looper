@@ -111,7 +111,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "dashboard", description: "Open the local operator dashboard"}, {name: "network", description: "Network membership commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "describe", description: "Show loop diagnostics detail"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "dashboard", description: "Open the local operator dashboard"}, {name: "network", description: "Network membership commands"}, {name: "plane", description: "Plane strict-dispatch binding commands"}, {name: "netadmin", description: "Network repo operator commands"}, {name: "webhook", description: "Webhook configuration and status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "login", description: "Log in to Feishu to capture the owner open_id"}, {name: "version", description: "Show Looper version"}, {name: "provider", description: "Provider commands"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "prompt", description: "Prompt inspection commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "labels", description: "GitHub label commands"}, {name: "queue", description: "Queue inspection and maintenance commands"}, {name: "worktree", description: "Worktree maintenance commands"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "fix", description: "Create a fixer task for a pull request"}, {name: "takeover", description: "Continuously review and fix a pull request until it merges"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "describe", description: "Show loop diagnostics detail"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "pause", description: "Pause a loop by sequence number"}, {name: "unpause", description: "Resume a paused loop by sequence number"}, {name: "stop", description: "Stop an active loop"}, {name: "close", description: "Terminally close a loop"}, {name: "resume", description: "Take over a loop's agent session interactively"}, {name: "handback", description: "Hand a taken-over loop back to the daemon"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
@@ -138,6 +138,27 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "leave", short: "Leave the current network", runE: runtime.networkLeave}),
 					newCommand(commandSpec{use: "status", short: "Show network membership status", runE: runtime.networkStatus, localFlags: []flagSpec{boolFlag("verbose", "Show extended membership details")}}),
 					newCommand(commandSpec{use: "members", short: "List joined network nodes", runE: runtime.networkMembers, localFlags: []flagSpec{boolFlag("verbose", "Show extended membership details")}}),
+				},
+			}),
+			newCommand(commandSpec{
+				use:             "plane",
+				short:           "Plane strict-dispatch binding commands",
+				helpSubcommands: []helpSubcommand{{name: "connect", description: "Connect this computer from a Plane one-time code"}, {name: "doctor", description: "Check whether this computer can receive Plane work"}, {name: "link", description: "Link this Node with a legacy Plane API token"}, {name: "approve", description: "Approve a binding on legacy Plane servers"}, {name: "setup", description: "Configure role owners and activate strict dispatch"}, {name: "enable", description: "Enable an existing Plane Node binding"}},
+				helpWhenNoArgs:  true,
+				subcommands: []*cobra.Command{
+					newCommand(commandSpec{use: "connect <plane-url>", short: "Connect this computer from a Plane one-time code", args: cobra.ExactArgs(1), runE: runtime.planeConnect, localFlags: []flagSpec{
+						stringFlag("code", "code", "Short-lived connection code from Plane"),
+						stringFlag("provider", "provider-id", "Plane provider to connect when more than one matches"),
+						stringFlag("project-path", "path", "Local GitHub checkout; defaults to the current directory when auto-configuring"),
+						stringFlag("code-repo", "owner/repo", "GitHub code repository; defaults to the local origin remote"),
+						stringFlag("plane-token-env", "ENV", "Environment variable holding the Plane API key (default PLANE_API_KEY)"),
+						stringFlag("trigger-label", "label", "Work-item label used by Looper (default looper:plan)"),
+					}}),
+					newCommand(commandSpec{use: "doctor [provider-id]", short: "Check whether this computer can receive Plane work", args: cobra.MaximumNArgs(1), runE: runtime.planeDoctor}),
+					newCommand(commandSpec{use: "link [provider-id]", short: "Link this Node to your Plane identity", args: cobra.MaximumNArgs(1), runE: runtime.planeLink, localFlags: []flagSpec{stringFlag("strict-base-url", "url", "Plane web origin for strict dispatch endpoints")}}),
+					newCommand(commandSpec{use: "approve <binding-id> [provider-id]", short: "Approve a binding on legacy Plane servers", args: cobra.RangeArgs(1, 2), runE: runtime.planeApprove, localFlags: []flagSpec{boolFlag("allow-offline-queue", "Allow this owner to queue work while their Node is offline")}}),
+					newCommand(commandSpec{use: "setup <product-member-id> <design-member-id> <qa-member-id> [provider-id]", short: "Configure role owners and activate strict dispatch", args: cobra.RangeArgs(3, 4), runE: runtime.planeSetup, localFlags: []flagSpec{stringFlag("checklist-revision", "revision", "Signed rollout checklist revision")}}),
+					newCommand(commandSpec{use: "enable [provider-id]", short: "Enable an existing Plane Node binding", args: cobra.MaximumNArgs(1), runE: runtime.planeEnable}),
 				},
 			}),
 			newCommand(commandSpec{
@@ -197,6 +218,23 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					"$ looper bootstrap --yes --provider forgejo --project-path /path/to/repo --forgejo-url https://code.example.com --forgejo-token-env FORGEJO_TOKEN",
 					"$ looper bootstrap --yes --provider forgejo --project-path /path/to/repo --forgejo-url https://code.example.com --auth tea --tea-login powerformer-code",
 					"$ looper bootstrap --yes --provider plane --project-path /path/to/repo --plane-workspace acme --plane-project <uuid> --feishu-webhook-env LOOPER_FEISHU_WEBHOOK_URL",
+				},
+			}),
+			newCommand(commandSpec{
+				use:   "login",
+				short: "Log in to Feishu to capture the owner open_id",
+				runE:  runtime.login,
+				localFlags: []flagSpec{
+					stringFlag("project", "projectId", "Project id to write the owner open_id into (required when config has multiple projects)"),
+					stringFlag("port", "port", "Loopback port for the OAuth callback (default 53682); must match the whitelisted redirect URI"),
+				},
+				exampleLines: []string{
+					"# Prerequisite: enable web authorization (OAuth) for the Feishu app and",
+					"# whitelist the EXACT redirect URI http://127.0.0.1:53682/callback in the",
+					"# Feishu developer console (Feishu matches host:port, not just the host).",
+					"# Credentials come from notifications.webhook appIdEnv / appSecretEnv (env vars).",
+					"$ looper login",
+					"$ looper login --project my-repo --port 53682",
 				},
 			}),
 			newCommand(commandSpec{use: "version", short: "Show Looper version", runE: runtime.version}),
@@ -379,7 +417,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "loop",
 				short:           "Loop commands",
-				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "inspect", description: "Inspect loop diagnostics"}, {name: "failures", description: "List failed loop diagnostics"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}, {name: "retry", description: "Retry a failed or paused loop"}},
+				helpSubcommands: []helpSubcommand{{name: "list", description: "List loops"}, {name: "inspect", description: "Inspect loop diagnostics"}, {name: "failures", description: "List failed loop diagnostics"}, {name: "start", description: "Start a loop"}, {name: "pause", description: "Pause a loop"}, {name: "stop", description: "Interrupt an active loop"}, {name: "retry", description: "Retry a failed or paused loop"}},
 				helpWhenNoArgs:  true,
 				exampleLines: []string{
 					"$ looper loop list",
@@ -393,6 +431,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "failures", short: "List failed loop diagnostics", runE: runtime.loopFailures, localFlags: []flagSpec{stringFlag("type", "type", "Filter by loop type"), stringFlag("project", "projectId", "Filter by project id"), stringFlag("limit", "count", "Maximum number of failed loops to list")}}),
 					newCommand(commandSpec{use: "start", short: "Start a loop", runE: runtime.loopStart, localFlags: []flagSpec{stringFlag("type", "type", "Loop type"), stringFlag("pr", "repo#number", "Pull request reference"), stringFlag("project", "projectId", "Project id")}}),
 					newCommand(commandSpec{use: "pause [id]", short: "Pause a loop", args: cobra.MaximumNArgs(1), runE: runtime.loopPause, localFlags: []flagSpec{stringFlag("id", "id", "Loop id")}}),
+					newCommand(commandSpec{use: "stop <id|seq>", short: "Interrupt an active loop", args: cobra.ExactArgs(1), runE: runtime.stopLoop}),
 					newCommand(commandSpec{use: "retry <seq|loopId>", short: "Retry a loop", args: cobra.ExactArgs(1), runE: runtime.loopRetry, localFlags: []flagSpec{stringFlag("mode", "auto|resume|rediscover", "Retry mode"), boolFlag("discard-worktree-changes", "Discard dirty worktree changes before retrying"), boolFlag("confirm", "Confirm destructive retry action")}}),
 				},
 			}),

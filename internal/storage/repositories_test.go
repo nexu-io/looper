@@ -447,12 +447,106 @@ func TestRepositoriesRoundTripForProjectsLoopsRunsAndRuntimeMetadata(t *testing.
 	}
 }
 
+func TestLoopsGetByTargetIDResolvesPRToWorkerLoop(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	targetID := "pr:owner/repo:8"
+	repo := "owner/repo"
+	prNumber := int64(8)
+	if err := repos.Loops.Upsert(ctx, LoopRecord{
+		ID: "loop_worker", Seq: 1, ProjectID: "project_1", Type: "worker",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
+		Status: "completed", CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:05:00.000Z",
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	got, err := repos.Loops.GetByTargetID(ctx, targetID)
+	if err != nil || got == nil || got.ID != "loop_worker" {
+		t.Fatalf("GetByTargetID(%q) = %v, %v; want loop_worker", targetID, got, err)
+	}
+	if got, err := repos.Loops.GetByTargetID(ctx, "pr:owner/repo:999"); err != nil || got != nil {
+		t.Fatalf("GetByTargetID(missing) = %v, %v; want nil", got, err)
+	}
+	if got, err := repos.Loops.GetByTargetID(ctx, ""); err != nil || got != nil {
+		t.Fatalf("GetByTargetID(\"\") = %v, %v; want nil", got, err)
+	}
+}
+
+func TestFeishuLiveFeedsSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	// No feed posted yet → empty, not an error.
+	if got, err := repos.FeishuLiveFeeds.MessageByLoop(ctx, "loop_1"); err != nil || got != "" {
+		t.Fatalf("MessageByLoop(unknown) = %q, %v; want \"\", nil", got, err)
+	}
+	// First feed card for the loop is remembered.
+	if err := repos.FeishuLiveFeeds.Set(ctx, "loop_1", "om_feed_1", "2026-04-11T12:00:00.000Z"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	// A "restart" (fresh repositories over the same DB) still resolves the same id.
+	fresh := NewRepositories(coordinator.DB())
+	if got, err := fresh.FeishuLiveFeeds.MessageByLoop(ctx, "loop_1"); err != nil || got != "om_feed_1" {
+		t.Fatalf("MessageByLoop() after restart = %q, %v; want om_feed_1", got, err)
+	}
+	// Re-posting (e.g. after the message was recreated) replaces the id in place.
+	if err := repos.FeishuLiveFeeds.Set(ctx, "loop_1", "om_feed_2", "2026-04-11T12:05:00.000Z"); err != nil {
+		t.Fatalf("Set(replace) error = %v", err)
+	}
+	if got, _ := repos.FeishuLiveFeeds.MessageByLoop(ctx, "loop_1"); got != "om_feed_2" {
+		t.Fatalf("MessageByLoop() after replace = %q; want om_feed_2", got)
+	}
+}
+
+func TestFeishuThreadsRootByTaskSharesOneCardAcrossLoops(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	const taskKey = "issue:owner/repo:7"
+	// Planner loop opens the task's anchor card.
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root_planner", "loop_planner", taskKey, "oc_group", "2026-04-11T12:00:00.000Z"); err != nil {
+		t.Fatalf("Upsert(planner) error = %v", err)
+	}
+	// Worker loop for the SAME issue must resolve to the planner's card, not post a new one.
+	root, err := repos.FeishuThreads.RootByTask(ctx, taskKey)
+	if err != nil || root != "om_root_planner" {
+		t.Fatalf("RootByTask() = %q, %v; want om_root_planner", root, err)
+	}
+	// Worker joins the same outbound notification thread.
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root_planner", "loop_worker", taskKey, "oc_group", "2026-04-11T12:05:00.000Z"); err != nil {
+		t.Fatalf("Upsert(worker join) error = %v", err)
+	}
+	// A task-less loop (empty taskKey) keeps per-loop keying and does not collide.
+	if err := repos.FeishuThreads.Upsert(ctx, "om_root_pr", "loop_pr", "", "oc_group", "2026-04-11T12:10:00.000Z"); err != nil {
+		t.Fatalf("Upsert(taskless) error = %v", err)
+	}
+	if root, err := repos.FeishuThreads.RootByTask(ctx, ""); err != nil || root != "" {
+		t.Fatalf("RootByTask(\"\") = %q, %v; want empty", root, err)
+	}
+	if root, err := repos.FeishuThreads.RootByLoop(ctx, "loop_pr"); err != nil || root != "om_root_pr" {
+		t.Fatalf("RootByLoop(loop_pr) = %q, %v; want om_root_pr", root, err)
+	}
+}
+
 func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openMigratedCoordinatorForRepositories(t)
 	ctx := context.Background()
 	repos := NewRepositories(coordinator.DB())
+
 	const repo = "acme/looper"
 	const prNumber int64 = 42
 
@@ -2467,4 +2561,35 @@ func openMigratedCoordinatorForRepositories(t *testing.T) *SQLiteCoordinator {
 	}
 
 	return coordinator
+}
+
+func TestCountersRepositoryGetSetMaxIsMonotonic(t *testing.T) {
+	t.Parallel()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	const cur = "feishu_inbox_cursor"
+
+	if v, err := repos.Counters.Get(ctx, cur); err != nil || v != 0 {
+		t.Fatalf("Get(unset) = %d, %v; want 0, nil", v, err)
+	}
+	if err := repos.Counters.SetMax(ctx, cur, 42); err != nil {
+		t.Fatalf("SetMax(42) error = %v", err)
+	}
+	if v, _ := repos.Counters.Get(ctx, cur); v != 42 {
+		t.Fatalf("Get() = %d, want 42", v)
+	}
+	// A restart re-reading an OLD maxID must never rewind the persisted cursor.
+	if err := repos.Counters.SetMax(ctx, cur, 30); err != nil {
+		t.Fatalf("SetMax(30) error = %v", err)
+	}
+	if v, _ := repos.Counters.Get(ctx, cur); v != 42 {
+		t.Fatalf("Get() after backward SetMax = %d, want 42 (monotonic)", v)
+	}
+	if err := repos.Counters.SetMax(ctx, cur, 100); err != nil {
+		t.Fatalf("SetMax(100) error = %v", err)
+	}
+	if v, _ := repos.Counters.Get(ctx, cur); v != 100 {
+		t.Fatalf("Get() = %d, want 100", v)
+	}
 }

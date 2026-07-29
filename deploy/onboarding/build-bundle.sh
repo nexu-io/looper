@@ -15,12 +15,18 @@ FILLED_ENV="${1:-}"
 OUT="${2:-looper-hitl-onboarding.zip}"
 case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 
+# Optionally bundle a pre-filled config instead of the generic template — e.g. one
+# with the team's shared group chatId / productOwner / qa already substituted in
+# (per-person fields like owner/repo/paths stay placeholders). Point BUNDLE_CONFIG
+# at it; defaults to the repo's placeholder template.
+BUNDLE_CONFIG="${BUNDLE_CONFIG:-$REPO_ROOT/deploy/config.hitl.example.json}"
+
 STAGE_PARENT="$(mktemp -d)"
 STAGE="$STAGE_PARENT/looper-hitl-onboarding"
 mkdir -p "$STAGE"
 
 cp "$REPO_ROOT/deploy/onboarding/SETUP-PROMPT.md" "$STAGE/"
-cp "$REPO_ROOT/deploy/config.hitl.example.json"   "$STAGE/"
+cp "$BUNDLE_CONFIG"                                "$STAGE/config.hitl.example.json"
 cp "$REPO_ROOT/docs/GUIDE-hitl-setup.md"          "$STAGE/"
 
 if [ -n "$FILLED_ENV" ] && [ -f "$FILLED_ENV" ]; then

@@ -46,6 +46,9 @@ func DefaultConfig(tb testing.TB, home TempHome, options ConfigOptions) config.C
 	cfg.Storage.BackupDir = stringPtr(home.BackupDir)
 	cfg.Daemon.LogDir = home.LogDir
 	cfg.Daemon.WorkingDirectory = workingDir
+	// E2E correctness must not depend on the host's current disk utilization.
+	// Disk backpressure itself is covered by deterministic injected-usage tests.
+	cfg.Daemon.DiskBackpressure.Enabled = false
 	cfg.Notifications.Osascript.Enabled = options.EnableOsascript
 	cfg.Defaults.OpenPRStrategy = config.OpenPRStrategyAllDone
 	if options.DisableDisclosure {

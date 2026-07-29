@@ -16,6 +16,12 @@ const (
 	DispatchPlan      = "dispatch/plan"
 	DispatchImplement = "dispatch/implement"
 
+	// AutoLabel is the per-issue opt-in to full autonomy (plan §C/§D): a human
+	// labels the issue once and looper carries it plan → implement on its own,
+	// without a /plan or /implement command, even when the coordinator is otherwise
+	// human-gated.
+	AutoLabel = "looper:auto"
+
 	ReactionSuccess = "+1"
 	ReactionFailure = "confused"
 )
@@ -34,7 +40,17 @@ type Issue struct {
 	Labels    []string
 	Comments  []Comment
 	TriagedAt time.Time
+	// HasProductSpec, when set, is whether this work item already has a product spec
+	// linked (fed in by the runner from Plane). nil = unknown/not-checked, so the
+	// product-spec gate (flowchart node D) is a no-op. Only consulted for features.
+	HasProductSpec *bool
 }
+
+// KindFeature / KindBug are the triage kind labels the flowchart's node B splits on.
+const (
+	KindFeature = "kind/feature"
+	KindBug     = "kind/bug"
+)
 
 type Config struct {
 	Mode                 string
@@ -46,6 +62,9 @@ type Config struct {
 	AssignTo             string
 	PlannerTriggerLabels []string
 	WorkerTriggerLabels  []string
+	// RequireProductSpecForPlan gates a feature from reaching the planner until it
+	// has a product spec (flowchart node D). Off → today's behaviour.
+	RequireProductSpecForPlan bool
 }
 
 type Action struct {
@@ -55,13 +74,45 @@ type Action struct {
 	ReactionCommentID  int64
 	ReactionContent    string
 	FailureCommentBody string
+	// RequestProductSpec means the feature can't be planned yet — it has no product
+	// spec, so the caller should @product and hold rather than dispatch (node D/E).
+	RequestProductSpec bool
+}
+
+// productSpecGateHolds reports whether a feature about to be planned must wait for a
+// product spec first (flowchart node D). A bug heading to a tech spec is exempt —
+// bugs don't need a product spec. A no-op unless the gate is enabled and the
+// product-spec status is known to be absent.
+func productSpecGateHolds(issue Issue, cfg Config, dispatchLabel string) bool {
+	if !cfg.RequireProductSpecForPlan || dispatchLabel != DispatchPlan {
+		return false
+	}
+	if !hasLabel(issue.Labels, KindFeature) {
+		return false
+	}
+	return issue.HasProductSpec != nil && !*issue.HasProductSpec
 }
 
 func Decide(issue Issue, cfg Config, now time.Time, graph *depgraph.DependencyGraph) Action {
+	// looper:auto opts a single issue into full autonomy regardless of the
+	// coordinator's mode: the human labelled it to run on its own, so it takes the
+	// autonomous path with no dispatch delay (they've already committed to it). It
+	// still respects triage state and dependency gates.
+	if hasLabel(issue.Labels, AutoLabel) {
+		return decideAutonomous(issue, withImmediateDispatch(cfg), now, graph)
+	}
 	if cfg.Mode == ModeAutonomous {
 		return decideAutonomous(issue, cfg, now, graph)
 	}
 	return decideHumanGated(issue, cfg, graph)
+}
+
+// withImmediateDispatch drops the autonomous cool-off for a looper:auto issue: the
+// human explicitly opted in by labelling it, so there's no need to wait out the
+// "changed my mind" delay that guards the fully-autonomous mode.
+func withImmediateDispatch(cfg Config) Config {
+	cfg.AutonomousDelay = 0
+	return cfg
 }
 
 func NeedsDependencyGate(issue Issue, cfg Config, now time.Time) bool {
@@ -164,6 +215,11 @@ func decideAutonomous(issue Issue, cfg Config, now time.Time, graph *depgraph.De
 	}
 	if len(graph.Unsatisfied(issue.Number)) > 0 {
 		return Action{NoOp: true}
+	}
+	// Node D: a feature can't be planned until it has a product spec. Everything else
+	// is satisfied, but there's no spec → ask product for one and hold instead.
+	if productSpecGateHolds(issue, cfg, dispatchLabel) {
+		return Action{RequestProductSpec: true}
 	}
 	return Action{AssignTo: strings.TrimSpace(cfg.AssignTo), TriggerLabels: missingLabels(issue.Labels, triggerLabels)}
 }

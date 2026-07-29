@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>OPEND-1645 · 在 Plane 内启动自己的 Looper</title>
+    <style>
+      /* Tokens lifted from packages/tailwind-config/variables.css (light theme). */
+      :root {
+        --neutral-white: oklch(1 0 0);
+        --neutral-100: oklch(0.9848 0.0003 230.66);
+        --neutral-200: oklch(0.9696 0.0007 230.67);
+        --neutral-300: oklch(0.9543 0.001 230.67);
+        --neutral-400: oklch(0.9389 0.0014 230.68);
+        --neutral-500: oklch(0.9235 0.001733 230.6853);
+        --neutral-600: oklch(0.8925 0.0024 230.7);
+        --neutral-800: oklch(0.6668 0.0079 230.82);
+        --neutral-900: oklch(0.6161 0.009153 230.867);
+        --neutral-1000: oklch(0.5288 0.0083 230.88);
+        --neutral-1100: oklch(0.4377 0.0066 230.87);
+        --neutral-1200: oklch(0.2378 0.0029 230.83);
+
+        --brand-100: oklch(0.9847 0.0083 236.56);
+        --brand-200: oklch(0.9715 0.0167 230.9);
+        --brand-default: oklch(0.4799 0.1158 242.91);
+        --brand-900: oklch(0.4347 0.104093 242.4823);
+
+        --green-100: oklch(0.9819 0.0181 155.83);
+        --green-700: oklch(0.632 0.185972 147.3695);
+        --green-900: oklch(0.4468 0.1187 151.4);
+        --amber-100: oklch(0.9869 0.0214 95.28);
+        --amber-900: oklch(0.4747 0.135757 44.9806);
+        --red-100: oklch(0.9705 0.0129 17.38);
+        --red-900: oklch(0.4446 0.1774 26.79);
+        --priority-high: oklch(0.6802 0.1633 50.67);
+
+        --bg-canvas: var(--neutral-300);
+        --bg-surface-1: var(--neutral-white);
+        --bg-surface-2: var(--neutral-100);
+        --bg-layer-1: var(--neutral-200);
+        --bg-layer-2: var(--neutral-white);
+        --bg-layer-3: var(--neutral-300);
+        --alpha-hover: oklch(0.1482 0.0034 196.79 / 5%);
+        --alpha-active: oklch(0.1482 0.0034 196.79 / 10%);
+
+        --border-subtle: var(--neutral-400);
+        --border-subtle-1: var(--neutral-500);
+        --border-strong: var(--neutral-600);
+
+        --text-primary: var(--neutral-1200);
+        --text-secondary: var(--neutral-1100);
+        --text-tertiary: var(--neutral-1000);
+        --text-placeholder: var(--neutral-900);
+        --text-disabled: var(--neutral-800);
+        --text-on-color: var(--neutral-100);
+
+        --shadow-raised-100: 0px 1px 6px -1px #292f3d08, 0px 1px 4px 0px #292f3d0a;
+      }
+
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: var(--bg-canvas);
+        color: var(--text-primary);
+        font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system,
+          "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        font-size: 0.8125rem;
+        line-height: 1.4;
+        letter-spacing: 0.13px;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
+      button { font: inherit; color: inherit; cursor: pointer; }
+      svg { display: block; }
+      .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+      .ic { width: 16px; height: 16px; flex-shrink: 0; }
+      .ic-14 { width: 14px; height: 14px; flex-shrink: 0; }
+      .ic-12 { width: 12px; height: 12px; flex-shrink: 0; }
+
+      /* type scale — variables.css:1023-1263 */
+      .t-h5 { font-size: 1.125rem; line-height: 1.2; letter-spacing: 0; font-weight: 500; }
+      .t-20m { font-size: 1.25rem; line-height: 1.2; letter-spacing: 0; font-weight: 500; }
+      .t-14m { font-size: 0.875rem; line-height: 1.4; font-weight: 500; }
+      .t-13 { font-size: 0.8125rem; line-height: 1.4; }
+      .t-13m { font-size: 0.8125rem; line-height: 1.4; font-weight: 500; }
+      .t-12m { font-size: 0.75rem; line-height: 1.1; letter-spacing: 0; font-weight: 500; }
+      .t-11 { font-size: 0.6875rem; line-height: 1.1; letter-spacing: 0; }
+      .t-11m { font-size: 0.6875rem; line-height: 1.1; letter-spacing: 0; font-weight: 500; }
+      .c-2 { color: var(--text-secondary); }
+      .c-3 { color: var(--text-tertiary); }
+      .c-4 { color: var(--text-placeholder); }
+
+      /* state machine: [data-when] elements only render for the active demo state */
+      [data-when]:not(.on) { display: none !important; }
+
+      /* ---------- app shell — root.tsx:241-264 ---------- */
+      .app { display: flex; height: 100%; overflow: hidden; }
+
+      /* left workspace sidebar — resizable-sidebar.tsx:183,200 */
+      .app-sidebar {
+        width: 250px; flex-shrink: 0; padding-top: 12px;
+        display: flex; flex-direction: column; overflow: hidden;
+        background: var(--bg-surface-1);
+        border-right: 1px solid var(--border-subtle);
+      }
+      .ws-switch {
+        margin: 0 12px 12px; padding: 4px 8px; border-radius: 6px;
+        display: flex; align-items: center; gap: 8px;
+      }
+      .ws-switch:hover { background: var(--alpha-hover); }
+      .ws-logo {
+        width: 24px; height: 24px; border-radius: 4px; flex-shrink: 0;
+        background: var(--brand-default); color: var(--text-on-color);
+        display: grid; place-items: center; font-size: 0.6875rem; font-weight: 600;
+      }
+      .nav-scroll { flex: 1; overflow-y: auto; padding: 0 12px; display: flex; flex-direction: column; gap: 12px; }
+      .nav-group { display: flex; flex-direction: column; gap: 2px; }
+      /* sidebar-menu-items.tsx:105-117 — 13px semibold placeholder, not uppercase */
+      .nav-heading {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 6px 8px; border-radius: 4px;
+        font-size: 0.8125rem; font-weight: 600; color: var(--text-placeholder);
+      }
+      /* sidebar-navigation.tsx:20-24 */
+      .nav-item {
+        display: flex; align-items: center; justify-content: space-between; gap: 6px;
+        padding: 4px 8px; border-radius: 6px;
+        font-size: 0.8125rem; line-height: 20px; font-weight: 500;
+        color: var(--text-secondary);
+      }
+      .nav-item > span { display: flex; align-items: center; gap: 6px; }
+      .nav-item:hover { background: var(--alpha-hover); }
+      .nav-item.active { background: var(--alpha-active); color: var(--text-primary); }
+      .nav-sub { position: relative; margin: 4px 0 6px; padding-left: 24px; display: flex; flex-direction: column; gap: 2px; }
+      .nav-sub::before { content: ""; position: absolute; left: 15px; top: 0; bottom: 4px; width: 1px; background: var(--bg-layer-3); }
+      .nav-foot {
+        height: 48px; flex-shrink: 0; padding: 12px;
+        display: flex; align-items: center; gap: 8px;
+        border-top: 1px solid var(--border-subtle);
+      }
+
+      .app-main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg-surface-1); }
+      /* app-header.tsx:25-28 — h-11, px-page-x 1.35rem */
+      .app-header {
+        height: 44px; flex-shrink: 0; padding: 0 1.35rem;
+        display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface-1);
+      }
+      /* breadcrumbs.tsx:179-186 */
+      .crumbs { display: flex; align-items: center; gap: 2px; overflow: hidden; }
+      .crumb {
+        display: flex; align-items: center; gap: 8px; height: 24px;
+        padding: 4px 6px; border-radius: 4px;
+        font-size: 0.8125rem; font-weight: 500; color: var(--text-tertiary);
+      }
+      .crumb:hover { background: var(--alpha-hover); color: var(--text-primary); }
+      .crumb.last { color: var(--text-primary); }
+      .crumb-sep { padding: 4px 6px; color: var(--text-placeholder); }
+      .header-actions { display: flex; align-items: center; gap: 4px; color: var(--text-tertiary); }
+      .icon-btn { display: grid; place-items: center; width: 24px; height: 24px; border: 0; background: none; border-radius: 4px; }
+      .icon-btn:hover { background: var(--alpha-hover); color: var(--text-primary); }
+
+      .issue-root { flex: 1; display: flex; overflow: hidden; }
+      .issue-main { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 36px 64px; }
+      .issue-main > * + * { margin-top: 24px; }
+      .issue-sidebar {
+        width: 25%; min-width: 320px; flex-shrink: 0; overflow-y: auto;
+        padding: 0 24px 40px;
+        border-left: 1px solid var(--border-subtle); background: var(--bg-surface-1);
+      }
+
+      /* ---------- issue head — main-content.tsx:108-156 ---------- */
+      .id-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+      /* identifier-text.tsx:55 — plain 12px medium tertiary text, not a chip */
+      .issue-id { font-size: 0.75rem; line-height: 1.1; font-weight: 500; color: var(--text-tertiary); }
+      .issue-title { margin: 0; }
+      .issue-desc { margin: 12px 0 0; color: var(--text-secondary); max-width: 68ch; }
+      .issue-desc + .issue-desc { margin-top: 8px; }
+
+      /* ---------- propel buttons — propel/src/button/helper.tsx ---------- */
+      .btn {
+        display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+        white-space: nowrap; border: 0; transition: background-color .15s;
+        height: 28px; border-radius: 6px; padding: 0 8px;
+        font-size: 0.8125rem; font-weight: 500;
+      }
+      .btn-primary { background: var(--brand-default); color: var(--text-on-color); }
+      .btn-primary:hover { background: var(--brand-900); }
+      .btn-secondary {
+        border: 1px solid var(--border-strong); background: var(--bg-layer-2);
+        color: var(--text-secondary); box-shadow: var(--shadow-raised-100);
+      }
+      .btn-secondary:hover { background: var(--bg-surface-2); }
+      .btn-secondary[disabled], .btn-secondary.off {
+        border-color: var(--border-subtle-1); background: transparent;
+        color: var(--text-disabled); box-shadow: none; cursor: not-allowed;
+      }
+      .btn-ghost { background: transparent; color: var(--text-secondary); }
+      .btn-ghost:hover { background: var(--alpha-hover); }
+
+      .widget-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+      /* ---------- propel badges — propel/src/badge/helper.tsx:13-22 ---------- */
+      .badge {
+        display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+        height: 20px; padding: 0 6px; border-radius: 6px;
+        font-size: 0.6875rem; font-weight: 500; line-height: 1.1;
+        white-space: nowrap;
+      }
+      .badge-neutral { background: var(--bg-layer-3); color: var(--text-tertiary); }
+      .badge-brand { background: var(--brand-200); color: var(--brand-default); }
+      .badge-warning { background: var(--amber-100); color: var(--amber-900); }
+      .badge-success { background: var(--green-100); color: var(--green-900); }
+      .badge-danger { background: var(--red-100); color: var(--red-900); }
+
+      /* ---------- collapsible section — ui/src/collapsible/collapsible-button.tsx:35 ---------- */
+      .sec { display: flex; flex-direction: column; }
+      .sec-head {
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        height: 48px; padding: 12px 10px; width: 100%;
+        border: 0; background: none; border-bottom: 1px solid var(--border-subtle);
+        text-align: left;
+      }
+      .sec-head-l { display: flex; align-items: center; gap: 14px; min-width: 0; }
+      .sec-head-r { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+      .chev { width: 8px; height: 8px; color: var(--text-tertiary); transition: transform .3s; }
+      .sec[data-open="false"] .chev { transform: rotate(-90deg); }
+      .sec[data-open="false"] > .sec-body { display: none; }
+      .sec-count { font-size: 0.875rem; line-height: 12px; color: var(--text-tertiary); }
+      .sec-body { padding: 12px 10px 4px; }
+      .sec-row {
+        display: flex; align-items: center; gap: 8px;
+        padding: 6px 4px; border-radius: 4px; color: var(--text-secondary);
+      }
+      .sec-row:hover { background: var(--alpha-hover); }
+
+      /* ---------- Looper section ---------- */
+      .looper-body > * + * { margin-top: 16px; }
+      .identity { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--text-tertiary); }
+      .avatar {
+        width: 20px; height: 20px; border-radius: 9999px; flex-shrink: 0;
+        display: grid; place-items: center;
+        background: var(--brand-default); color: var(--text-on-color);
+        font-size: 0.6875rem; font-weight: 500;
+      }
+      .avatar.sm { width: 16px; height: 16px; font-size: 0.625rem; }
+      .sep-dot { color: var(--border-strong); }
+      .online { display: inline-flex; align-items: center; gap: 4px; }
+      .online::before {
+        content: ""; width: 6px; height: 6px; border-radius: 9999px;
+        background: var(--green-700);
+      }
+      .offline::before { background: var(--text-disabled); }
+
+      /* comment-card chrome — ce/components/comments/comment-block.tsx:45 */
+      .card {
+        border: 1px solid var(--border-subtle); border-radius: 8px;
+        background: var(--bg-layer-2); padding: 12px;
+        box-shadow: var(--shadow-raised-100);
+      }
+      .card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+      .card-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+      .card p { margin: 0; }
+      .card .note { margin-top: 6px; color: var(--text-placeholder); }
+
+      /* phases */
+      .phases { display: grid; grid-template-columns: repeat(7, 1fr); gap: 0; }
+      .phase { position: relative; padding-top: 20px; text-align: center; }
+      .phase::before {
+        content: ""; position: absolute; top: 6px; left: 0; right: 0; height: 1px;
+        background: var(--bg-layer-3);
+      }
+      .phase:first-child::before { left: 50%; }
+      .phase:last-child::before { right: 50%; }
+      .phase .pdot {
+        position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+        width: 13px; height: 13px; border-radius: 9999px;
+        background: var(--bg-surface-1); border: 1px solid var(--border-strong);
+        display: grid; place-items: center; color: var(--text-on-color);
+      }
+      .phase.done .pdot { background: var(--green-700); border-color: var(--green-700); }
+      .phase.current .pdot {
+        background: var(--brand-default); border-color: var(--brand-default);
+        box-shadow: 0 0 0 3px var(--brand-100);
+      }
+      .phase .pname { color: var(--text-tertiary); }
+      .phase.done .pname { color: var(--text-secondary); }
+      .phase.current .pname { color: var(--text-primary); font-weight: 500; }
+      .phase .pmeta { display: block; margin-top: 2px; color: var(--text-placeholder); }
+
+      /* role list */
+      .subhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+      .roles { border: 1px solid var(--border-subtle); border-radius: 6px; overflow: hidden; }
+      .role {
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        padding: 8px 10px;
+      }
+      .role + .role { border-top: 1px solid var(--border-subtle); }
+      .role:hover { background: var(--alpha-hover); }
+      .role-l { display: flex; align-items: center; gap: 8px; min-width: 0; }
+      .role-name { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+      .role-tag {
+        display: inline-block; width: 3px; height: 14px; border-radius: 9999px; flex-shrink: 0;
+        background: var(--border-strong);
+      }
+      .role[data-role="product"] .role-tag { background: var(--brand-default); }
+      .role[data-role="design"] .role-tag { background: var(--priority-high); }
+      .role[data-role="eng"] .role-tag { background: var(--green-700); }
+      .role[data-role="qa"] .role-tag { background: var(--text-disabled); }
+
+      .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+
+      /* mini activity — activity-block.tsx:38-63 geometry */
+      .feed { position: relative; }
+      .feed::before {
+        content: ""; position: absolute; top: 0; bottom: 0; left: 13px; width: 1px;
+        background: var(--bg-layer-3);
+      }
+      .feed-item { position: relative; display: flex; align-items: center; gap: 12px; padding: 8px 0; }
+      .puck {
+        position: relative; z-index: 4; width: 28px; height: 28px; flex-shrink: 0;
+        display: grid; place-items: center; border-radius: 8px;
+        border: 1px solid var(--border-subtle); background: var(--bg-layer-2);
+        color: var(--text-secondary); box-shadow: var(--shadow-raised-100);
+      }
+      .feed-text { min-width: 0; flex: 1; color: var(--text-secondary); }
+      .feed-text b { color: var(--text-primary); font-weight: 500; }
+      .feed-time { flex-shrink: 0; color: var(--text-tertiary); white-space: nowrap; }
+
+      /* risk rows */
+      .risks { display: flex; flex-direction: column; }
+      .risk { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; }
+      .risk + .risk { border-top: 1px solid var(--border-subtle); }
+      .risk p { margin: 2px 0 0; color: var(--text-tertiary); }
+
+      .looper-foot {
+        display: flex; flex-wrap: wrap; gap: 4px 8px;
+        padding-top: 12px; border-top: 1px solid var(--border-subtle);
+        color: var(--text-placeholder);
+      }
+
+      /* comment composer — editor/lite-text/editor.tsx:122-128 */
+      .composer {
+        display: flex; align-items: center; gap: 8px;
+        border: 1px solid var(--border-subtle); border-radius: 4px; padding: 8px;
+        color: var(--text-placeholder);
+      }
+
+      /* ---------- right property sidebar — property-list-item.tsx:22-28 ---------- */
+      .side-title { margin: 20px 0 16px; font-size: 0.8125rem; font-weight: 500; }
+      .props > * + * { margin-top: 10px; }
+      .prop { display: flex; align-items: flex-start; gap: 8px; }
+      .prop-label {
+        display: flex; align-items: center; gap: 6px;
+        width: 120px; height: 30px; flex-shrink: 0;
+        color: var(--text-tertiary);
+      }
+      .prop-value {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+        flex-grow: 1; min-height: 30px;
+        padding: 0 6px; border-radius: 4px; color: var(--text-secondary);
+      }
+      .prop-value:hover { background: var(--alpha-hover); }
+      .prop-value.static:hover { background: none; }
+      .prop-value .ph { color: var(--text-placeholder); }
+      .state-dot { width: 12px; height: 12px; border-radius: 9999px; border: 2px solid var(--priority-high); flex-shrink: 0; }
+      .side-group { margin-top: 20px; padding-top: 20px; border-top: 2px solid var(--border-subtle-1); }
+      .label-chip {
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 1px 8px; border-radius: 9999px;
+        border: 1px solid var(--border-subtle-1); background: var(--bg-surface-2);
+        font-size: 0.6875rem; color: var(--text-secondary);
+      }
+
+      /* demo-state switcher — tab-navigation-item.tsx:14-16 */
+      .tabs { display: flex; align-items: center; gap: 4px; border-radius: 6px; }
+      .tab {
+        border: 0; background: none; border-radius: 6px; padding: 4px 8px;
+        font-size: 0.75rem; font-weight: 500; color: var(--text-secondary);
+        transition: background-color .15s;
+      }
+      .tab:hover { background: var(--alpha-hover); color: var(--text-primary); }
+      .tab[aria-selected="true"] { background: var(--alpha-active); color: var(--text-primary); }
+
+      /* ---------- responsive ---------- */
+      @media (max-width: 1279px) {
+        .issue-root { flex-direction: column; overflow-y: auto; }
+        .issue-main { overflow: visible; padding-bottom: 24px; }
+        .issue-sidebar {
+          width: 100%; min-width: 0; border-left: 0;
+          border-top: 1px solid var(--border-subtle); padding: 0 36px 48px;
+        }
+      }
+      @media (max-width: 1023px) {
+        .app-sidebar { display: none; }
+      }
+      @media (max-width: 767px) {
+        .app-header { padding: 0 12px; }
+        .issue-main { padding: 16px 12px 24px; }
+        .issue-sidebar { padding: 0 12px 40px; }
+        .sec-head { height: auto; flex-direction: column; align-items: flex-start; gap: 8px; }
+        .sec-head-r { width: 100%; justify-content: space-between; }
+        .phases { grid-template-columns: 1fr; }
+        .phase { padding: 0 0 12px 24px; text-align: left; }
+        .phase::before { top: 0; bottom: 0; left: 6px; right: auto; width: 1px; height: auto; }
+        .phase:first-child::before { top: 6px; left: 6px; }
+        .phase:last-child::before { bottom: auto; height: 6px; }
+        .phase .pdot { top: 0; left: 0; transform: none; }
+        .card-actions .btn { flex: 1 1 100%; }
+        .role { flex-wrap: wrap; }
+      }
+    </style>
+  </head>
+  <body>
+    <svg class="sprite" aria-hidden="true">
+      <symbol id="i-chev-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></symbol>
+      <symbol id="i-chev-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></symbol>
+      <symbol id="i-home" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z" /></symbol>
+      <symbol id="i-inbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2" /><path d="M5 5h14l3 7v6a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-6z" /></symbol>
+      <symbol id="i-work" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><path d="M8 12h8" /></symbol>
+      <symbol id="i-cycle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></symbol>
+      <symbol id="i-module" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5z" /><path d="M3 16l9 5 9-5" /></symbol>
+      <symbol id="i-state" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="3.5" /></symbol>
+      <symbol id="i-member" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 20v-1a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v1" /><circle cx="10" cy="7" r="3.5" /><path d="M20 20v-1a4 4 0 0 0-3-3.8" /></symbol>
+      <symbol id="i-priority" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 18v-4" /><path d="M12 18V9" /><path d="M19 18V5" /></symbol>
+      <symbol id="i-user-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9" /><circle cx="12" cy="10" r="3" /><path d="M6.5 19a6 6 0 0 1 11 0" /></symbol>
+      <symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M3 10h18M8 3v4M16 3v4" /></symbol>
+      <symbol id="i-label" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12V5a2 2 0 0 1 2-2h7l9 9-9 9z" /><circle cx="7.5" cy="7.5" r="1.2" /></symbol>
+      <symbol id="i-parent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="2" /><rect x="13" y="13" width="8" height="8" rx="2" /><path d="M7 11v4a2 2 0 0 0 2 2h4" /></symbol>
+      <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" /><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" /></symbol>
+      <symbol id="i-attach" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.5 12.5 21a5 5 0 0 1-7-7l8-8a3.5 3.5 0 1 1 5 5l-8 8a2 2 0 1 1-3-3l7.5-7.5" /></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 13 5 5L19 6" /></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.5 20h19z" /><path d="M12 10v4M12 17.5v.01" /></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.5-5.8" /><path d="M20 4v5h-5" /></symbol>
+      <symbol id="i-bot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="3" /><path d="M12 4v4M9 14v.01M15 14v.01" /></symbol>
+      <symbol id="i-arrow-ur" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 16 16 8M9 8h7v7" /></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></symbol>
+      <symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 9a6 6 0 1 0-12 0c0 5-2 6-2 6h16s-2-1-2-6" /><path d="M10.5 19a2 2 0 0 0 3 0" /></symbol>
+      <symbol id="i-dots" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="19" cy="12" r="1.6" /></symbol>
+      <symbol id="i-panel" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></symbol>
+    </svg>
+
+    <div class="app" id="app" data-state="running">
+      <!-- workspace sidebar — resizable-sidebar.tsx:183,200 -->
+      <aside class="app-sidebar">
+        <div class="ws-switch">
+          <span class="ws-logo">OD</span>
+          <span class="t-13m" style="flex:1;min-width:0">Open Design</span>
+          <svg class="ic-12 c-3"><use href="#i-chev-down" /></svg>
+        </div>
+        <div class="nav-scroll">
+          <div class="nav-group">
+            <div class="nav-item"><span><svg class="ic"><use href="#i-home" /></svg>首页</span></div>
+            <div class="nav-item"><span><svg class="ic"><use href="#i-inbox" /></svg>收件箱</span><span class="badge badge-neutral">3</span></div>
+            <div class="nav-item"><span><svg class="ic"><use href="#i-work" /></svg>我的工作</span></div>
+          </div>
+          <div class="nav-group">
+            <div class="nav-heading">项目<svg class="ic-12"><use href="#i-plus" /></svg></div>
+            <div class="nav-item active"><span><span class="ws-logo" style="width:16px;height:16px;font-size:.5625rem">OD</span>Open Design</span><svg class="ic-12 c-3"><use href="#i-chev-down" /></svg></div>
+            <div class="nav-sub">
+              <div class="nav-item active"><span><svg class="ic"><use href="#i-work" /></svg>工作项</span></div>
+              <div class="nav-item"><span><svg class="ic"><use href="#i-cycle" /></svg>周期</span></div>
+              <div class="nav-item"><span><svg class="ic"><use href="#i-module" /></svg>模块</span></div>
+            </div>
+            <div class="nav-item"><span><span class="ws-logo" style="width:16px;height:16px;font-size:.5625rem;background:var(--green-700)">LP</span>Looper</span><svg class="ic-12 c-3"><use href="#i-chev-right" /></svg></div>
+          </div>
+        </div>
+        <div class="nav-foot">
+          <span class="avatar">杨</span>
+          <span class="t-13m" style="flex:1;min-width:0">杨瑾龙</span>
+          <svg class="ic-14 c-3"><use href="#i-dots" /></svg>
+        </div>
+      </aside>
+
+      <div class="app-main">
+        <!-- app-header.tsx:25-28 + breadcrumbs.tsx:179-186 -->
+        <header class="app-header">
+          <nav class="crumbs">
+            <span class="crumb"><svg class="ic c-3"><use href="#i-panel" /></svg>Open Design</span>
+            <span class="crumb-sep"><svg class="ic-14"><use href="#i-chev-right" /></svg></span>
+            <span class="crumb"><svg class="ic c-3"><use href="#i-work" /></svg>工作项</span>
+            <span class="crumb-sep"><svg class="ic-14"><use href="#i-chev-right" /></svg></span>
+            <span class="crumb last">OPEND-1645</span>
+          </nav>
+          <div class="header-actions">
+            <button class="icon-btn" type="button" aria-label="搜索"><svg class="ic-14"><use href="#i-search" /></svg></button>
+            <button class="icon-btn" type="button" aria-label="通知"><svg class="ic-14"><use href="#i-bell" /></svg></button>
+            <button class="icon-btn" type="button" aria-label="更多"><svg class="ic-14"><use href="#i-dots" /></svg></button>
+          </div>
+        </header>
+
+        <div class="issue-root">
+          <main class="issue-main">
+            <!-- main-content.tsx:108-156 -->
+            <div>
+              <div class="id-row">
+                <span class="issue-id">OPEND-1645</span>
+                <span class="t-11 c-4">已保存</span>
+              </div>
+              <h1 class="issue-title t-20m">在 Plane 内启动自己的 Looper，并可视化多角色协作进度</h1>
+              <p class="issue-desc t-13">每位研发只把任务交给自己电脑上的 Looper；团队在同一处看到产品、设计、研发和 QA 的决策与交付进展。</p>
+              <p class="issue-desc t-13">Plane 是派发与归属的事实源，飞书只做通知。V1 不支持把任务派给同事的 Node，也不做接管或改派。</p>
+            </div>
+
+            <!-- issue-detail-widgets/action-buttons.tsx:37 -->
+            <div class="widget-actions">
+              <button class="btn btn-secondary" type="button"><svg class="ic-14"><use href="#i-work" /></svg>子工作项</button>
+              <button class="btn btn-secondary" type="button"><svg class="ic-14"><use href="#i-link" /></svg>链接</button>
+              <button class="btn btn-secondary" type="button"><svg class="ic-14"><use href="#i-attach" /></svg>附件</button>
+              <button class="btn btn-secondary" type="button"><svg class="ic-14"><use href="#i-parent" /></svg>关联</button>
+            </div>
+
+            <div>
+              <section class="sec" data-open="true">
+                <button class="sec-head" type="button" data-toggle>
+                  <span class="sec-head-l">
+                    <svg class="chev"><use href="#i-chev-down" /></svg>
+                    <span class="t-14m">子工作项</span>
+                    <span class="sec-count">2</span>
+                  </span>
+                  <span class="sec-head-r"><span class="t-11 c-3">1 / 2 已完成</span></span>
+                </button>
+                <div class="sec-body">
+                  <div class="sec-row t-13"><svg class="ic-14 c-3"><use href="#i-check" /></svg>OPEND-1661 定义 Looper 派发协议 v1<span class="badge badge-success" style="margin-left:auto">已完成</span></div>
+                  <div class="sec-row t-13"><svg class="ic-14 c-3"><use href="#i-state" /></svg>OPEND-1662 Plane 侧协作面板前端<span class="badge badge-neutral" style="margin-left:auto">进行中</span></div>
+                </div>
+              </section>
+
+              <!-- ===== Looper 协作：以 Plane 原生 collapsible 形态嵌入 ===== -->
+              <section class="sec" id="looper" data-open="true">
+                <button class="sec-head" type="button" data-toggle>
+                  <span class="sec-head-l">
+                    <svg class="chev"><use href="#i-chev-down" /></svg>
+                    <span class="t-14m">Looper 协作</span>
+                    <span class="sec-count">7 阶段</span>
+                  </span>
+                  <span class="sec-head-r">
+                    <span class="tabs" role="tablist" aria-label="原型演示态">
+                      <button class="tab" type="button" role="tab" data-go="idle" aria-selected="false">未派发</button>
+                      <button class="tab" type="button" role="tab" data-go="running" aria-selected="true">处理中</button>
+                      <button class="tab" type="button" role="tab" data-go="ready" aria-selected="false">就绪</button>
+                    </span>
+                    <!-- 状态徽章：非按钮，无边框无阴影无 hover -->
+                    <span class="badge badge-neutral" id="run-badge" data-when="idle">未派发</span>
+                    <span class="badge badge-warning" data-when="running">处理中 · 等待设计</span>
+                    <span class="badge badge-success" data-when="ready">就绪 · 实现中</span>
+                  </span>
+                </button>
+
+                <div class="sec-body looper-body">
+                  <!-- 来源身份行 -->
+                  <div class="identity t-11">
+                    <span class="avatar">杨</span>
+                    <span>来自 <b class="t-11m" style="color:var(--text-primary)">杨瑾龙的 Looper</b></span>
+                    <span class="sep-dot">·</span><span>MacBook-Pro</span>
+                    <span class="sep-dot">·</span><span class="online">在线</span>
+                    <span class="sep-dot">·</span><span data-when="idle">0 / 3 个任务</span><span data-when="running ready">1 / 3 个任务</span>
+                  </div>
+
+                  <!-- 未派发：owner 自派入口 -->
+                  <div class="card" data-when="idle">
+                    <div class="card-head">
+                      <span class="badge badge-brand">你的 Looper 已就绪</span>
+                    </div>
+                    <p class="t-13m">把这个工作项交给自己电脑上的 Looper</p>
+                    <p class="t-13 c-2" style="margin-top:4px">Looper 会先做需求调研，再把待决策的问题分别推给产品、设计和研发。</p>
+                    <div class="card-actions">
+                      <button class="btn btn-primary" type="button">交给我的 Looper</button>
+                      <button class="btn btn-secondary" type="button">查看执行方式</button>
+                    </div>
+                    <p class="note t-11">任务将在你自己的电脑上运行。V1 只能派给自己，不能选择或启动同事的 Node；未绑定 Looper 的成员在此处只读。</p>
+                  </div>
+
+                  <!-- 阶段轨迹 -->
+                  <div data-when="running ready">
+                    <div class="phases" id="phases">
+                      <div class="phase" data-i="0"><span class="pdot"><svg class="ic-12" style="width:8px;height:8px"><use href="#i-check" /></svg></span><span class="pname t-11">需求调研</span><span class="pmeta t-11">已完成</span></div>
+                      <div class="phase" data-i="1"><span class="pdot"><svg class="ic-12" style="width:8px;height:8px"><use href="#i-check" /></svg></span><span class="pname t-11">多角色决策</span><span class="pmeta t-11">未开始</span></div>
+                      <div class="phase" data-i="2"><span class="pdot"><svg class="ic-12" style="width:8px;height:8px"><use href="#i-check" /></svg></span><span class="pname t-11">技术方案</span><span class="pmeta t-11">未开始</span></div>
+                      <div class="phase" data-i="3"><span class="pdot"><svg class="ic-12" style="width:8px;height:8px"><use href="#i-check" /></svg></span><span class="pname t-11">实现</span><span class="pmeta t-11">未开始</span></div>
+                      <div class="phase" data-i="4"><span class="pdot"><svg class="ic-12" style="width:8px;height:8px"><use href="#i-check" /></svg></span><span class="pname t-11">PR</span><span class="pmeta t-11">未开始</span></div>
+                      <div class="phase" data-i="5"><span class="pdot"><svg class="ic-12" style="width:8px;height:8px"><use href="#i-check" /></svg></span><span class="pname t-11">QA 验收</span><span class="pmeta t-11">未开始</span></div>
+                      <div class="phase" data-i="6"><span class="pdot"><svg class="ic-12" style="width:8px;height:8px"><use href="#i-check" /></svg></span><span class="pname t-11">完成</span><span class="pmeta t-11">未开始</span></div>
+                    </div>
+                  </div>
+
+                  <!-- 等待回应 -->
+                  <div class="card" data-when="running">
+                    <div class="card-head">
+                      <span class="badge badge-warning">等待设计回答</span>
+                      <span class="t-11 c-4">已等待 18 分钟 · 指派给 范桢</span>
+                    </div>
+                    <p class="t-13m">按钮放在标题右侧，还是 Looper 协作面板内？</p>
+                    <p class="t-13 c-2" style="margin-top:4px">Looper 已产出 2 个可视方案与截图；你的回答会直接被 Planner 读取并推进到技术方案阶段。</p>
+                    <div class="card-actions">
+                      <button class="btn btn-primary" type="button">回答这个问题</button>
+                      <button class="btn btn-secondary" type="button">查看 2 个方案</button>
+                    </div>
+                    <p class="note t-11">回答位置在 Plane，飞书仅通知。只有被映射为设计角色的成员可回答，其余成员只读。</p>
+                  </div>
+
+                  <!-- 就绪 / 实现中 -->
+                  <div class="card" data-when="ready">
+                    <div class="card-head">
+                      <span class="badge badge-success">决策已齐备</span>
+                      <span class="t-11 c-4">已运行 41 分钟</span>
+                    </div>
+                    <p class="t-13m">技术方案已由 杨瑾龙 批准，Looper 正在实现</p>
+                    <p class="t-13 c-2" style="margin-top:4px">当前无待回答问题。产出 PR 后会自动流转到 QA 验收，验收人 尚欣雨。</p>
+                    <div class="card-actions">
+                      <button class="btn btn-secondary" type="button">查看技术 Spec</button>
+                      <button class="btn btn-secondary" type="button">请求停止</button>
+                    </div>
+                    <p class="note t-11">「请求停止」不等于远程强杀；需 owner 在本地确认，并检查旧 worktree、未提交改动与外部副作用。</p>
+                  </div>
+
+                  <!-- 多角色协作 -->
+                  <div>
+                    <div class="subhead">
+                      <span class="t-11m c-3">角色协作</span>
+                      <span class="t-11 c-4">角色映射由项目管理员维护</span>
+                    </div>
+                    <div class="roles">
+                      <div class="role" data-role="product">
+                        <span class="role-l">
+                          <span class="role-tag"></span>
+                          <span class="avatar sm">孙</span>
+                          <span class="role-name"><span class="t-13m">产品决策</span><span class="t-11 c-3">孙庆雨 · 范围与优先级</span></span>
+                        </span>
+                        <span class="badge badge-neutral" data-when="idle">未开始</span>
+                        <span class="badge badge-success" data-when="running ready">已回答 2 / 2</span>
+                      </div>
+                      <div class="role" data-role="design">
+                        <span class="role-l">
+                          <span class="role-tag"></span>
+                          <span class="avatar sm" style="background:var(--priority-high)">范</span>
+                          <span class="role-name"><span class="t-13m">设计决策</span><span class="t-11 c-3">范桢 · 界面与交互</span></span>
+                        </span>
+                        <span class="badge badge-neutral" data-when="idle">未开始</span>
+                        <span class="badge badge-warning" data-when="running">等待回答 1</span>
+                        <span class="badge badge-success" data-when="ready">已回答 1 / 1</span>
+                      </div>
+                      <div class="role" data-role="eng">
+                        <span class="role-l">
+                          <span class="role-tag"></span>
+                          <span class="avatar sm" style="background:var(--green-700)">杨</span>
+                          <span class="role-name"><span class="t-13m">研发决策</span><span class="t-11 c-3">杨瑾龙 · Looper owner · 架构与取舍</span></span>
+                        </span>
+                        <span class="badge badge-neutral" data-when="idle running">未开始</span>
+                        <span class="badge badge-success" data-when="ready">已批准技术方案</span>
+                      </div>
+                      <div class="role" data-role="qa">
+                        <span class="role-l">
+                          <span class="role-tag"></span>
+                          <span class="avatar sm" style="background:var(--text-disabled)">尚</span>
+                          <span class="role-name"><span class="t-13m">QA 验收</span><span class="t-11 c-3">尚欣雨 · 验收计划与结果</span></span>
+                        </span>
+                        <span class="badge badge-neutral" data-when="idle running">未开始</span>
+                        <span class="badge badge-brand" data-when="ready">待验收</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 产物 -->
+                  <div>
+                    <div class="subhead"><span class="t-11m c-3">产物</span></div>
+                    <div class="chips">
+                      <button class="btn btn-secondary" type="button" data-artifact="running ready">产品决策<svg class="ic-14"><use href="#i-arrow-ur" /></svg></button>
+                      <button class="btn btn-secondary" type="button" data-artifact="running ready">设计方案<svg class="ic-14"><use href="#i-arrow-ur" /></svg></button>
+                      <button class="btn btn-secondary" type="button" data-artifact="ready">技术 Spec<svg class="ic-14"><use href="#i-arrow-ur" /></svg></button>
+                      <button class="btn btn-secondary" type="button" data-artifact="ready">PR #2184<svg class="ic-14"><use href="#i-arrow-ur" /></svg></button>
+                      <button class="btn btn-secondary" type="button" data-artifact="">验收记录</button>
+                    </div>
+                  </div>
+
+                  <!-- 最近动态 -->
+                  <div>
+                    <div class="subhead"><span class="t-11m c-3">最近动态</span></div>
+                    <div class="feed">
+                      <div class="feed-item" data-when="idle">
+                        <span class="puck"><svg class="ic-14"><use href="#i-bot" /></svg></span>
+                        <span class="feed-text t-11">尚未派发。点击「交给我的 Looper」后会在此显示运行记录。</span>
+                      </div>
+                      <div class="feed-item" data-when="running ready">
+                        <span class="puck"><svg class="ic-14"><use href="#i-check" /></svg></span>
+                        <span class="feed-text t-11"><b>孙庆雨</b> 回答了 2 个产品决策问题</span>
+                        <span class="feed-time t-11">10:32</span>
+                      </div>
+                      <div class="feed-item" data-when="running">
+                        <span class="puck"><svg class="ic-14"><use href="#i-bot" /></svg></span>
+                        <span class="feed-text t-11"><b>杨瑾龙的 Looper</b> 正在等待设计选择方案</span>
+                        <span class="feed-time t-11">10:35</span>
+                      </div>
+                      <div class="feed-item" data-when="ready">
+                        <span class="puck"><svg class="ic-14"><use href="#i-check" /></svg></span>
+                        <span class="feed-text t-11"><b>范桢</b> 选择了方案 B：放在协作面板内</span>
+                        <span class="feed-time t-11">10:51</span>
+                      </div>
+                      <div class="feed-item" data-when="ready">
+                        <span class="puck"><svg class="ic-14"><use href="#i-bot" /></svg></span>
+                        <span class="feed-text t-11"><b>杨瑾龙的 Looper</b> 已批准技术方案并开始实现</span>
+                        <span class="feed-time t-11">11:04</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 决策 / 风险状态 -->
+                  <section class="sec" data-open="false" style="margin-top:4px">
+                    <button class="sec-head" type="button" data-toggle style="height:auto;padding:8px 0">
+                      <span class="sec-head-l">
+                        <svg class="chev"><use href="#i-chev-down" /></svg>
+                        <span class="t-13m">状态与风险说明</span>
+                        <span class="sec-count">4</span>
+                      </span>
+                    </button>
+                    <div class="sec-body" style="padding:8px 0 0">
+                      <div class="risks">
+                        <div class="risk">
+                          <span class="badge badge-warning"><svg class="ic-12"><use href="#i-refresh" /></svg>等待恢复</span>
+                          <div><span class="t-13">Node 已失联</span><p class="t-11">V1 不接管、不改派、不强制释放，原归属保持不变。</p></div>
+                        </div>
+                        <div class="risk">
+                          <span class="badge badge-warning"><svg class="ic-12"><use href="#i-alert" /></svg>停止待确认</span>
+                          <div><span class="t-13">请 owner 在本地停止并确认</span><p class="t-11">旧进程、未提交改动和外部副作用可能仍然存在。</p></div>
+                        </div>
+                        <div class="risk">
+                          <span class="badge badge-neutral"><svg class="ic-12"><use href="#i-state" /></svg>显示漂移</span>
+                          <div><span class="t-13">显示字段与 Authority 不一致</span><p class="t-11">Plane Authority 未改变，可显式恢复 assignee 与标识。</p></div>
+                        </div>
+                        <div class="risk">
+                          <span class="badge badge-danger"><svg class="ic-12"><use href="#i-alert" /></svg>角色冲突</span>
+                          <div><span class="t-13">产品 / 设计 / QA 映射冲突，已暂停新 run</span><p class="t-11">请项目管理员修复角色映射后重试。</p></div>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+
+                  <div class="looper-foot t-11">
+                    <span>派发人 杨瑾龙</span><span class="sep-dot">·</span>
+                    <span>Authority rev 3 · state 7</span><span class="sep-dot">·</span>
+                    <span data-when="idle">尚无运行数据</span>
+                    <span data-when="running ready">数据更新于 10:41</span><span class="sep-dot" data-when="running ready">·</span>
+                    <span>Plane 是派发事实源，飞书仅通知</span>
+                  </div>
+                </div>
+              </section>
+
+              <section class="sec" data-open="false">
+                <button class="sec-head" type="button" data-toggle>
+                  <span class="sec-head-l">
+                    <svg class="chev"><use href="#i-chev-down" /></svg>
+                    <span class="t-14m">链接</span>
+                    <span class="sec-count">1</span>
+                  </span>
+                </button>
+                <div class="sec-body">
+                  <div class="sec-row t-13"><svg class="ic-14 c-3"><use href="#i-link" /></svg>本地 Looper dashboard（仅 owner 可见）</div>
+                </div>
+              </section>
+            </div>
+
+            <!-- issue-activity/root.tsx:108-129 -->
+            <section>
+              <div class="subhead" style="margin-bottom:16px">
+                <span class="t-h5">动态</span>
+                <span class="header-actions">
+                  <button class="icon-btn" type="button" aria-label="排序"><svg class="ic-14"><use href="#i-priority" /></svg></button>
+                  <button class="icon-btn" type="button" aria-label="筛选"><svg class="ic-14"><use href="#i-dots" /></svg></button>
+                </span>
+              </div>
+              <div class="feed" style="margin-bottom:16px">
+                <div class="feed-item">
+                  <span class="puck"><svg class="ic-14"><use href="#i-plus" /></svg></span>
+                  <span class="feed-text t-11"><b>杨瑾龙</b> 创建了这个工作项</span>
+                  <span class="feed-time t-11">昨天 17:20</span>
+                </div>
+                <div class="feed-item">
+                  <span class="puck"><svg class="ic-14"><use href="#i-state" /></svg></span>
+                  <span class="feed-text t-11"><b>杨瑾龙</b> 将状态从 待办 改为 进行中</span>
+                  <span class="feed-time t-11">10:28</span>
+                </div>
+                <div class="feed-item">
+                  <span class="puck"><svg class="ic-14"><use href="#i-bot" /></svg></span>
+                  <span class="feed-text t-11"><b>杨瑾龙的 Looper</b> 接管执行并进入需求调研阶段</span>
+                  <span class="feed-time t-11">10:29</span>
+                </div>
+                <div class="feed-item" style="align-items:flex-start">
+                  <span class="puck">孙</span>
+                  <span style="flex:1;min-width:0">
+                    <span style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                      <span class="t-11m">孙庆雨</span><span class="t-11 c-3">10:32</span>
+                    </span>
+                    <span class="card" style="display:block;font-size:.875rem;line-height:1.4">
+                      产品侧两个问题都回了：优先做 owner 自派，跨人派发放到 V2。
+                    </span>
+                  </span>
+                </div>
+              </div>
+              <div class="composer t-13">
+                <svg class="ic-14"><use href="#i-plus" /></svg>
+                <span>添加评论……</span>
+              </div>
+            </section>
+          </main>
+
+          <!-- sidebar.tsx:87-90 + property-list-item.tsx:22-28 -->
+          <aside class="issue-sidebar">
+            <h5 class="side-title">属性</h5>
+            <div class="props">
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-state" /></svg>状态</span>
+                <span class="prop-value t-13"><span class="state-dot"></span>进行中</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-member" /></svg>负责人</span>
+                <span class="prop-value t-13"><span class="avatar sm">杨</span>杨瑾龙</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-priority" /></svg>优先级</span>
+                <span class="prop-value t-13"><svg class="ic-14" style="color:var(--priority-high)"><use href="#i-priority" /></svg>高</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-user-circle" /></svg>创建者</span>
+                <span class="prop-value t-13 static"><span class="avatar sm">杨</span>杨瑾龙</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-calendar" /></svg>开始日期</span>
+                <span class="prop-value t-13">2026-07-20</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-calendar" /></svg>截止日期</span>
+                <span class="prop-value t-13">2026-07-28</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-module" /></svg>模块</span>
+                <span class="prop-value t-13">协作与派发</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-cycle" /></svg>周期</span>
+                <span class="prop-value t-13">Sprint 31</span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-parent" /></svg>父级</span>
+                <span class="prop-value t-13"><span class="ph">无</span></span>
+              </div>
+              <div class="prop">
+                <span class="prop-label t-13"><svg class="ic"><use href="#i-label" /></svg>标签</span>
+                <span class="prop-value t-13"><span class="label-chip">looper</span><span class="label-chip">协作</span></span>
+              </div>
+            </div>
+
+            <div class="side-group">
+              <h5 class="side-title" style="margin-top:0">Looper</h5>
+              <div class="props">
+                <div class="prop">
+                  <span class="prop-label t-13"><svg class="ic"><use href="#i-bot" /></svg>执行者</span>
+                  <span class="prop-value t-13 static"><span class="avatar sm">杨</span>杨瑾龙的 Looper</span>
+                </div>
+                <div class="prop">
+                  <span class="prop-label t-13"><svg class="ic"><use href="#i-state" /></svg>阶段</span>
+                  <span class="prop-value t-13 static"><span data-when="idle" class="ph">未派发</span><span data-when="running">多角色决策</span><span data-when="ready">实现</span></span>
+                </div>
+                <div class="prop">
+                  <span class="prop-label t-13"><svg class="ic"><use href="#i-alert" /></svg>阻塞</span>
+                  <span class="prop-value t-13 static">
+                    <span class="badge badge-neutral" data-when="idle">无</span>
+                    <span class="badge badge-warning" data-when="running">等待设计</span>
+                    <span class="badge badge-neutral" data-when="ready">无</span>
+                  </span>
+                </div>
+                <div class="prop">
+                  <span class="prop-label t-13"><svg class="ic"><use href="#i-refresh" /></svg>Authority</span>
+                  <span class="prop-value t-13 static">rev 3 · state 7</span>
+                </div>
+                <div class="prop">
+                  <span class="prop-label t-13"><svg class="ic"><use href="#i-cycle" /></svg>运行时长</span>
+                  <span class="prop-value t-13 static"><span data-when="idle" class="ph">—</span><span data-when="running">4 分 23 秒</span><span data-when="ready">12 分 06 秒</span></span>
+                </div>
+                <div class="prop">
+                  <span class="prop-label t-13"><svg class="ic"><use href="#i-calendar" /></svg>数据更新</span>
+                  <span class="prop-value t-13 static"><span data-when="idle" class="ph">—</span><span data-when="running ready">10:41</span></span>
+                </div>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        var app = document.getElementById("app");
+
+        // collapsible sections — mirrors ui/src/collapsible behaviour
+        document.querySelectorAll("[data-toggle]").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var sec = btn.closest(".sec");
+            sec.dataset.open = sec.dataset.open === "true" ? "false" : "true";
+          });
+        });
+
+        // phase progression per demo state: [已完成数量, 当前阶段索引]
+        var PHASE_MAP = { running: [1, 1], ready: [3, 3] };
+        var PHASE_META = {
+          running: ["已完成", "等待设计", "未开始", "未开始", "未开始", "未开始", "未开始"],
+          ready: ["已完成", "已完成", "已批准", "进行中", "未开始", "未开始", "未开始"],
+        };
+
+        function render(state) {
+          app.dataset.state = state;
+
+          document.querySelectorAll("[data-when]").forEach(function (el) {
+            el.classList.toggle("on", el.dataset.when.split(" ").indexOf(state) > -1);
+          });
+
+          document.querySelectorAll("[data-artifact]").forEach(function (el) {
+            el.classList.toggle("off", el.dataset.artifact.split(" ").indexOf(state) === -1);
+          });
+
+          var cfg = PHASE_MAP[state];
+          document.querySelectorAll("#phases .phase").forEach(function (el, i) {
+            el.classList.toggle("done", !!cfg && i < cfg[0]);
+            el.classList.toggle("current", !!cfg && i === cfg[1]);
+            if (PHASE_META[state]) el.querySelector(".pmeta").textContent = PHASE_META[state][i];
+          });
+
+          document.querySelectorAll("[data-go]").forEach(function (tab) {
+            tab.setAttribute("aria-selected", String(tab.dataset.go === state));
+          });
+        }
+
+        document.querySelectorAll("[data-go]").forEach(function (tab) {
+          tab.addEventListener("click", function (e) {
+            e.stopPropagation();
+            render(tab.dataset.go);
+          });
+        });
+
+        render("running");
+      })();
+    </script>
+  </body>
+</html>
+

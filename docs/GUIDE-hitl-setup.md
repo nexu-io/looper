@@ -1,153 +1,70 @@
-# GUIDE — configuring looper's human-in-the-loop (HITL) capabilities
+# HITL setup: Plane/GitHub decisions, one-way Feishu notifications
 
-A copy-paste setup guide for the HITL features: decision cards, multi-round
-conversation, the anytime message queue, the live Feishu thread (progress +
-milestones), and one-command local takeover. For the design rationale see
-[`DESIGN-hitl-transports.md`](DESIGN-hitl-transports.md) and
-[`DESIGN-human-takeover.md`](DESIGN-human-takeover.md).
+Looper keeps collaboration in the system of record:
 
-**Everything here is off by default** — a looper with none of these flags behaves
-exactly as before. Turn them on one at a time.
+- product specs, approvals, and product answers live in Plane;
+- code, review, and implementation answers live in GitHub;
+- Feishu only delivers targeted notifications and never accepts an answer;
+- the authenticated `/respond` API is an operator/dashboard fallback.
 
----
+There is no Feishu event subscription, callback route, Cloudflare inbox worker,
+thread-reply mirror, or card-action receiver to deploy.
 
-## What each capability needs (at a glance)
+## Minimal configuration
 
-| Capability | Config to enable | Extra infra |
-| --- | --- | --- |
-| Agent pauses to ask a human (decision brief) | `hitl.enabled: true` | — |
-| Multi-round conversation + anytime message queue | `hitl.enabled: true` (same core) | — |
-| Answers via **GitHub PR comment** | `hitl.answerTransport: "github"` | none |
-| Answers via **Feishu** (cards + typed replies) | `hitl.answerTransport: "feishu"` + `notifications.webhook.mode: "app"` | Feishu app + [CF inbox worker](#4-cloudflare-inbox-worker-shared-feishu-app) |
-| Feishu thread: anchor · milestones · @-mention | `notifications.webhook.mode: "app"` | Feishu app |
-| Live tool-call feed inside the thread | env `LOOPER_CODEX_JSON_EVENTS=1` | codex vendor |
-| Takeover handback resumes the human's session | `agent.nativeResume.enabled: true` | — |
-
----
-
-## Teammate quick start (two files)
-A teammate joining the shared Feishu setup needs exactly two files:
-
-1. **The shared env file** — the team's Feishu/worker secrets (same for everyone).
-   Get the filled copy from whoever set it up, then `source` it.
-   ```sh
-   source ~/.looper/hitl.env
-   ```
-2. **Their own config** — copy the template and fill the few placeholders (agent
-   path, their group `chatId`, their `open_id`, the repo + local clone path):
-   ```sh
-   cp deploy/config.hitl.example.json ~/.looper/config.json
-   $EDITOR ~/.looper/config.json          # replace the REPLACE_/ABSOLUTE_ placeholders
-   looperd --config ~/.looper/config.json
-   ```
-The env file carries the shared **secret values**; the config carries the
-**feature switches + per-person settings**. You need both.
-
-## 0. Prerequisites
-- A coding agent configured (`agent.vendor` = `codex` / `claude-code` / …).
-- For Feishu: a Feishu **custom app** (with `im:message` send + event subscription)
-  and, for a *shared* app across teammates, the Cloudflare inbox worker (§4).
-- Takeover (`looper resume`/`handback`) runs on the **same machine as the daemon**
-  (the worktree + agent session live there). Verified for codex & claude-code.
-
-## 1. Simplest: HITL over GitHub (zero extra infra)
-Everyone already has GitHub, so this is the batteries-included default.
-
-```jsonc
+```json
 {
-  "agent": { "vendor": "codex", "nativeResume": { "enabled": true } },
   "hitl": {
     "enabled": true,
-    "answerTransport": "github"   // ask posted as a PR comment; reply on the PR
-  }
-}
-```
-The agent asks by commenting on a (draft) PR; a human replies on the PR; the poll
-lane resumes the loop. No Feishu, no worker.
-
-## 2. Full experience: HITL over Feishu
-Adds the interactive decision cards, the live thread, milestones, @-mention, and
-typed multi-round replies.
-
-```jsonc
-{
-  "agent": {
-    "vendor": "codex",
-    "nativeResume": { "enabled": true }        // handback resumes the same session
-  },
-  "hitl": {
-    "enabled": true,                            // decision cards + conversation + queue
-    "answerTransport": "feishu",
-    "feishu": {
-      "inbound": "cf-inbox",                    // read replies from the CF worker
-      "eventInboxUrlEnv": "LOOPER_FEISHU_INBOX_URL",
-      "eventInboxTokenEnv": "LOOPER_FEISHU_INBOX_TOKEN"
+    "answerTransport": "github",
+    "github": {
+      "awaitingLabel": "looper:awaiting-human",
+      "mentionLogins": ["github-owner"],
+      "answerAuthors": ["github-owner"]
     }
   },
   "notifications": {
     "webhook": {
       "enabled": true,
-      "mode": "app",                            // thread · anchor · milestones · live feed
+      "mode": "app",
       "format": "feishu",
-      "appIdEnv": "LOOPER_FEISHU_APP_ID",       // NAMES of env vars, not the values
+      "appIdEnv": "LOOPER_FEISHU_APP_ID",
       "appSecretEnv": "LOOPER_FEISHU_APP_SECRET",
-      "verificationTokenEnv": "LOOPER_FEISHU_VERIFY_TOKEN",
-      "chatId": "oc_xxxxxxxx",                  // the target group chat id
-      "mentionOpenIds": ["ou_xxxxxxxx"]         // who to @ on a decision (open_id)
+      "chatId": "oc_xxx",
+      "mentionOpenIds": ["ou_xxx"]
     }
   }
 }
 ```
 
-## 3. Environment variables
-The config stores env-var **names**; the secret values live in the environment
-(never in the config file, so the repo stays shareable). Because the Feishu app +
-inbox worker are shared, these values are the **same for the whole team**: fill
-[`deploy/hitl.env.example`](../deploy/hitl.env.example) once, distribute the filled
-copy privately, and each teammate `source`s it before running looperd. (Per-person
-settings — `chatId`, `mentionOpenIds` — go in each person's config file, not here.)
+Only the two app credentials are secrets:
 
 ```sh
-export LOOPER_FEISHU_APP_ID=cli_xxx            # Feishu app credentials
+export LOOPER_FEISHU_APP_ID=cli_xxx
 export LOOPER_FEISHU_APP_SECRET=xxx
-export LOOPER_FEISHU_VERIFY_TOKEN=xxx          # app Event Subscription verification token
-export LOOPER_FEISHU_INBOX_URL=https://<worker-domain>/events   # CF worker /events
-export LOOPER_FEISHU_INBOX_TOKEN=xxx           # shared secret to read /events (= POLL_TOKEN)
-export LOOPER_CODEX_JSON_EVENTS=1              # optional: live tool-call feed in the thread
 ```
 
-## 3b. Where every value comes from
-Nothing here has to be guessed. Grouped by who owns it.
+`chatId`, GitHub logins, and Feishu open IDs are identifiers and may remain in the
+config. Keep the credentials in the service environment, never in the JSON file.
 
-### Shared — pre-filled in `hitl.env`, same for the whole team (you don't fetch these)
-| Env var | What it is | Where it comes from |
-| --- | --- | --- |
-| `LOOPER_FEISHU_APP_ID` | Feishu app id (`cli_...`) | Feishu 开放平台 → your app → 凭证与基础信息 |
-| `LOOPER_FEISHU_APP_SECRET` | Feishu app secret | same page (凭证与基础信息) |
-| `LOOPER_FEISHU_VERIFY_TOKEN` | event verification token | Feishu app → 事件与回调 → 加密策略 → Verification Token |
-| `LOOPER_FEISHU_INBOX_URL` | CF inbox worker `/events` URL | the worker's domain + `/events` (see §4) |
-| `LOOPER_FEISHU_INBOX_TOKEN` | worker `POLL_TOKEN` | set when the worker was deployed (§4) |
+## Runtime flow
 
-Whoever set the team up fills these once and distributes the filled `hitl.env` privately.
+1. An agent surfaces a genuine blocker.
+2. Looper creates the exact question/comment in Plane or GitHub and persists a
+   named blocked condition.
+3. A one-owner Feishu card points to that exact source location.
+4. The human follows the link and answers there.
+5. The source-of-truth watcher observes the answer, clears the condition, and
+   resumes the same loop/session.
 
-### Per-person — Feishu
-- **`open_id`** (`notifications.webhook.mentionOpenIds`, who a card @-mentions):
-  - Easiest: ask the Feishu app admin — one call reads it from the group members
-    (`GET open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id`).
-  - Self-serve: Feishu 开放平台 → API 调试台 → `通讯录 / 批量获取用户 ID` (`contact/v3/users/batch_get_id`),
-    `user_id_type=open_id`, pass your own email/mobile → the returned `user_id` is your `open_id` (`ou_...`).
-  - Empty = no @-mention; or default it to the team lead so an unset teammate still pings someone.
+Posting in the Feishu thread, clicking old interactive buttons, or mentioning a
+bot does nothing by design.
 
-### Per-person — GitHub
-- **`repo`** (`owner/repo`) — the GitHub repo whose issues/PRs looper handles.
-- **`repoPath`** — the **absolute path** of your local clone of that repo.
-- **GitHub auth** — `gh auth login` as yourself; looper drives `gh`, so PRs/comments show as you.
+## Per-person Plane configuration
 
-### Per-person — coding agent
-- **`agent.params.command`** — absolute path to your `codex` / `claude` binary (`which codex`), and it must be **logged in**.
-
-### Per-person — Plane (only if your tasks live in Plane) — use the `plane` CLI
-The self-developed [`plane` CLI](https://github.com/powerformer/plane-cli) reads everything with your own API key. Configure it once — put your key + workspace in `~/.plane/plane.toml` (or export `PLANE_API_KEY` / `PLANE_WORKSPACE_SLUG`) — then:
+If your tasks live in Plane, use the self-developed [`plane` CLI](https://github.com/powerformer/plane-cli)
+with your own API key. Configure it once in `~/.plane/plane.toml` (or export
+`PLANE_API_KEY` / `PLANE_WORKSPACE_SLUG`), then:
 
 | Config value | Command to get it |
 | --- | --- |
@@ -163,34 +80,38 @@ falls back to label-only discovery (every looper watching that project grabs eve
 Each teammate should use **their own** Plane API key (correct attribution + `plane api me` gives their UUID), not a
 shared one. Full Plane setup: [`skills/looper/references/plane.md`](../skills/looper/references/plane.md).
 
+For the opt-in Plane pre-Spec decision flow, configure all three authorities on the project:
+
+```jsonc
+"productOwner": { "feishuOpenId": "ou_...", "planeId": "<product UUID>" },
+"designOwner":  { "feishuOpenId": "ou_...", "planeId": "<design UUID>" },
+"owner":        { "feishuOpenId": "ou_...", "planeId": "<your UUID from plane api me>" }
+```
+
+Requirement answers are posted as new Plane work-item comments. If Looper requires a formal product Spec, link a non-empty native Plane page from the work item with title `looper:product-spec`; an external URL, blank page or normal comment does not satisfy the formal gate. Final technical-Spec approval is posted on the Plane Spec page. Feishu is notification-only for these decisions. A user's `open_id` can still be mentioned if they are not in the notification group (it may render grey); group membership is not validated.
+
 ### looper's own data
 - **`storage` / `daemon` paths** — anywhere you like; default `~/.looper` (`looper.sqlite`, `backups/`, `logs/`).
 
-## 4. Cloudflare inbox worker (shared Feishu app)
-So one shared Feishu app can reach many NAT'd looper daemons, Feishu posts events
-to a small Cloudflare Worker; each daemon polls it. Setup in
-[`deploy/feishu-inbox-worker/README.md`](../deploy/feishu-inbox-worker/README.md):
-create the D1 db, set its id in `wrangler.toml`, then:
+## Operator fallback
+
+For local testing or a dashboard integration, an authenticated operator may use:
+
 ```sh
-wrangler secret put FEISHU_VERIFY_TOKEN   # = the app's Event verification token
-wrangler secret put POLL_TOKEN            # = LOOPER_FEISHU_INBOX_TOKEN above
-wrangler deploy
+curl -X POST http://127.0.0.1:7788/api/v1/loops/<seq>/respond \
+  -H 'Content-Type: application/json' \
+  -d '{"answer":"approved option"}'
 ```
-Point the Feishu app's Event Subscription URL at the worker; turn the Encrypt Key
-**off** (the inbox reads plain JSON).
 
-## 5. Roll it out one flag at a time
-Recommended order (observe at each step before the next):
-1. `hitl.enabled` + `answerTransport: "github"` — HITL with zero infra.
-2. Switch to Feishu: `notifications.webhook.mode: "app"` + the app env vars.
-3. `LOOPER_CODEX_JSON_EVENTS=1` — the live tool feed.
-4. `agent.nativeResume.enabled: true` — so handback continues the human's session.
+This route is governed by `server.authMode`. It is not a Feishu integration.
 
-## 6. Verify
-- Drop an issue with a genuinely ambiguous, ask-worthy decision → a decision card
-  appears in the group (@-mentioning your `mentionOpenIds`).
-- Click an option → the card marks "✅ 已选"; or type a follow-up question in the
-  thread → the agent answers and, if it still needs a decision, asks again.
-- On completion the anchor shows a timestamped milestone (`🔀 已开 PR #N`).
-- `looper resume <seq>` drops you into the loop's agent session; `looper handback
-  <seq>` returns it to the daemon.
+## Smoke test
+
+Use an isolated Looper home and test repository. Trigger a task that asks a
+question, then verify:
+
+- the question exists in Plane/GitHub;
+- the Feishu card contains the expected owner and exact deep link;
+- `POST /api/v1/hitl/feishu` returns 404;
+- a Feishu thread reply does not change loop state;
+- answering in Plane/GitHub resumes the loop.

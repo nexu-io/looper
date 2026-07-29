@@ -145,9 +145,9 @@ func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 		Logger:      fixture.logger,
 		Now:         fixture.now,
 		HITLEnabled: true,
-		// This test exercises the Feishu-notify transport; github is the default and
-		// is covered separately.
-		HITLAnswerTransport: "feishu",
+		// The operator fallback has no source-of-truth deep link, so it must not emit a
+		// misleading Feishu decision card.
+		HITLAnswerTransport: "respond",
 		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
 			sent = append(sent, n)
 			return nil
@@ -194,12 +194,8 @@ func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 		t.Fatalf("run status = %q, want interrupted", finishedRun.Status)
 	}
 
-	// Ask-card sent.
-	if len(sent) != 1 {
-		t.Fatalf("HITLNotify calls = %d, want 1", len(sent))
-	}
-	if sent[0].LoopSeq != 1 || sent[0].Question != "Which datastore?" || len(sent[0].Options) != 2 {
-		t.Fatalf("notification = %#v, want loop seq 1 + question + 2 options", sent[0])
+	if len(sent) != 0 {
+		t.Fatalf("HITLNotify calls = %d, want 0 without an exact action URL", len(sent))
 	}
 }
 
@@ -237,7 +233,8 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 		t.Fatalf("Projects.GetByID error = %v", err)
 	}
 
-	gh := &fakeGitHubGateway{issueCommentResult: IssueCommentResult{ID: 777}}
+	var sent []HITLAskNotification
+	gh := &fakeGitHubGateway{issueCommentResult: IssueCommentResult{ID: 777, URL: "https://github.com/acme/widgets/pull/42#issuecomment-777"}}
 	runner := New(Options{
 		DB:          fixture.coordinator.DB(),
 		Repos:       fixture.repos,
@@ -248,6 +245,10 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 		HITLAnswerTransport: "github",
 		HITLGitHub:          HITLGitHubSettings{AwaitingLabel: "looper:awaiting-human", MentionLogins: []string{"lefarcen"}},
 		GitHub:              gh,
+		HITLNotify: func(_ context.Context, n HITLAskNotification) error {
+			sent = append(sent, n)
+			return nil
+		},
 	})
 
 	awaiting := &awaitingHumanError{question: "Redis or Postgres?", options: []string{"redis", "postgres"}, sessionID: "sess-1", vendor: "codex"}
@@ -280,6 +281,9 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 	ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
 	if !ok || ask.Transport != "github" || ask.PRNumber != 42 || ask.AskCommentID != 777 {
 		t.Fatalf("ask = %#v, want github transport + pr 42 + comment 777", ask)
+	}
+	if len(sent) != 1 || sent[0].SourceURL != "https://github.com/acme/widgets/pull/42#issuecomment-777" {
+		t.Fatalf("decision notifications = %#v, want exact GitHub comment deep link", sent)
 	}
 }
 

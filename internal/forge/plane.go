@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/outboundguard"
+	"github.com/nexu-io/looper/internal/planestrict"
 )
 
 const (
@@ -35,13 +37,14 @@ const (
 // those belong to the project's GitHub code repo and are handled by the GitHub
 // path in the scheduler adapters (see internal/runtime/scheduler.go).
 type PlaneClient struct {
-	baseURL    *url.URL
-	webBaseURL string
-	token      string
-	userAgent  string
-	workspace  string
-	projectID  string
-	httpClient *http.Client
+	baseURL      *url.URL
+	webBaseURL   string
+	token        string
+	userAgent    string
+	workspace    string
+	projectID    string
+	httpClient   *http.Client
+	strictClient *planestrict.Client
 	// repo carries the plane provider id/kind plus the GitHub code repo where
 	// pull requests are opened (Repo == owner/name on GitHub).
 	repo RepositoryRef
@@ -151,7 +154,22 @@ func NewPlaneClientFromConfig(provider config.ProviderConfig, codeRepo string, o
 	if baseURL == "" {
 		baseURL = defaultPlaneBaseURL
 	}
-	return NewPlaneClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindPlane, BaseURL: baseURL, Repo: codeRepo}, workspace, projectID, token, options...)
+	client, err := NewPlaneClient(RepositoryRef{ProviderID: provider.ID, Kind: ProviderKindPlane, BaseURL: baseURL, Repo: codeRepo}, workspace, projectID, token, options...)
+	if err != nil {
+		return nil, err
+	}
+	if strict := provider.StrictDispatch; strict != nil && strict.Enabled {
+		credentials, err := planestrict.LoadCredentials(strict.BindingID, strict.KeyRevision, strict.NodeID, strict.PrivateKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		strictClient, err := planestrict.NewClient(strict.BaseURL, workspace, projectID, credentials)
+		if err != nil {
+			return nil, err
+		}
+		client.strictClient = strictClient
+	}
+	return client, nil
 }
 
 func (plane *PlaneClient) Kind() ProviderKind { return ProviderKindPlane }
@@ -172,6 +190,9 @@ func (plane *PlaneClient) CurrentUser(ctx context.Context) (Identity, error) {
 	if err := plane.do(ctx, http.MethodGet, "users/me", nil, nil, &user); err != nil {
 		return Identity{}, err
 	}
+	// Plane work-item assignees are member UUIDs. The shared forge interface calls
+	// this field Login, but returning a display name here makes manual plan/work
+	// commands PATCH an invalid assignee value (for example "mashu").
 	return Identity{Login: user.login()}, nil
 }
 
@@ -179,6 +200,9 @@ func (plane *PlaneClient) CurrentUser(ctx context.Context) (Identity, error) {
 // input.Labels is non-empty the results are filtered client-side to those that
 // carry ALL requested label names (label UUIDs are resolved to names first).
 func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesInput) ([]Issue, error) {
+	if plane.strictClient != nil {
+		return plane.ListStrictDispatchIssues(ctx, input, "planner")
+	}
 	labelNames, err := plane.labelNamesByID(ctx)
 	if err != nil {
 		return nil, err
@@ -211,6 +235,145 @@ func (plane *PlaneClient) ListOpenIssues(ctx context.Context, input ListIssuesIn
 		}
 	}
 	return issues, nil
+}
+
+func (plane *PlaneClient) ListStrictDispatchIssues(ctx context.Context, input ListIssuesInput, activeRole string) ([]Issue, error) {
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	issues := make([]Issue, 0, len(inbox.Dispatches))
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ActiveRole != activeRole || dispatch.Health != "ok" {
+			continue
+		}
+		if dispatch.State == "queued" {
+			claimed, err := plane.strictClient.Claim(ctx, dispatch, dispatch.ID)
+			if err != nil {
+				return nil, fmt.Errorf("claim strict dispatch %s: %w", dispatch.ID, err)
+			}
+			dispatch = claimed.Dispatch
+		}
+		if dispatch.State != "claimed" && dispatch.State != "running" && dispatch.State != "awaiting_human" {
+			continue
+		}
+		item, err := plane.workItemByID(ctx, dispatch.IssueID)
+		if err != nil {
+			return nil, err
+		}
+		labelNames, err := plane.labelNamesByID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		issue := plane.convertWorkItem(item, labelNames)
+		issue.StrictDispatchID = dispatch.ID
+		for _, label := range input.Labels {
+			if strings.TrimSpace(label) != "" {
+				issue.Labels = append(issue.Labels, Label{Name: label})
+			}
+		}
+		if strings.TrimSpace(input.Assignee) != "" {
+			issue.Assignees = append(issue.Assignees, Identity{Login: input.Assignee})
+		}
+		issues = append(issues, issue)
+		if input.Limit > 0 && len(issues) >= input.Limit {
+			break
+		}
+	}
+	return issues, nil
+}
+
+func (plane *PlaneClient) HandoffStrictDispatch(ctx context.Context, dispatchID string, input planestrict.HandoffInput) error {
+	if plane.strictClient == nil {
+		return errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID == dispatchID {
+			if dispatch.ActiveRole == "worker" && (dispatch.State == "queued" || dispatch.State == "claimed" || dispatch.State == "running") {
+				return nil
+			}
+			_, err := plane.strictClient.Handoff(ctx, dispatch, input)
+			return err
+		}
+	}
+	return fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
+}
+
+func (plane *PlaneClient) workItemByID(ctx context.Context, workItemID string) (planeWorkItem, error) {
+	var item planeWorkItem
+	if err := plane.do(ctx, http.MethodGet, plane.projectPath("work-items", workItemID), nil, nil, &item); err != nil {
+		return planeWorkItem{}, fmt.Errorf("read strict dispatch work item %s: %w", workItemID, err)
+	}
+	return item, nil
+}
+
+func (plane *PlaneClient) TransitionStrictDispatch(ctx context.Context, dispatchID, nextState string, waitKind *string) error {
+	if plane.strictClient == nil {
+		return errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID != dispatchID {
+			continue
+		}
+		if dispatch.State == nextState {
+			return nil
+		}
+		_, err := plane.strictClient.Transition(ctx, dispatch, nextState, waitKind)
+		return err
+	}
+	return fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
+}
+
+func (plane *PlaneClient) CreateStrictRoleRequest(ctx context.Context, dispatchID string, input planestrict.RoleRequestInput) (planestrict.RoleRequestResponse, error) {
+	if plane.strictClient == nil {
+		return planestrict.RoleRequestResponse{}, errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return planestrict.RoleRequestResponse{}, err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID != dispatchID {
+			continue
+		}
+		if dispatch.State != "running" && dispatch.State != "awaiting_human" {
+			return planestrict.RoleRequestResponse{}, fmt.Errorf("strict dispatch %s is not accepting role requests", dispatchID)
+		}
+		return plane.strictClient.CreateRoleRequest(ctx, dispatch, input)
+	}
+	return planestrict.RoleRequestResponse{}, fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
+}
+
+func (plane *PlaneClient) PendingStrictRoleMessages(ctx context.Context, dispatchID string) (planestrict.PendingRoleMessagesResponse, planestrict.Dispatch, error) {
+	if plane.strictClient == nil {
+		return planestrict.PendingRoleMessagesResponse{}, planestrict.Dispatch{}, errors.New("Plane strict dispatch is not configured")
+	}
+	inbox, err := plane.strictClient.Inbox(ctx, "")
+	if err != nil {
+		return planestrict.PendingRoleMessagesResponse{}, planestrict.Dispatch{}, err
+	}
+	for _, dispatch := range inbox.Dispatches {
+		if dispatch.ID == dispatchID {
+			response, err := plane.strictClient.PendingRoleMessages(ctx, dispatch)
+			return response, dispatch, err
+		}
+	}
+	return planestrict.PendingRoleMessagesResponse{}, planestrict.Dispatch{}, fmt.Errorf("strict dispatch %s is not in this Node inbox", dispatchID)
+}
+
+func (plane *PlaneClient) ReplyStrictRoleMessage(ctx context.Context, dispatch planestrict.Dispatch, roleRequestID string, input planestrict.RoleMessageReplyInput) (planestrict.RoleMessageReplyResponse, error) {
+	if plane.strictClient == nil {
+		return planestrict.RoleMessageReplyResponse{}, errors.New("Plane strict dispatch is not configured")
+	}
+	return plane.strictClient.ReplyRoleMessage(ctx, dispatch, roleRequestID, input)
 }
 
 // ViewIssue resolves a work-item by its per-project sequence_id (looper's Issue
@@ -369,14 +532,25 @@ func (plane *PlaneClient) ListIssueComments(ctx context.Context, issueNumber int
 // resolveWorkItem finds the full work-item (including its UUID, needed for
 // mutations) by its per-project sequence_id.
 func (plane *PlaneClient) resolveWorkItem(ctx context.Context, number int64) (planeWorkItem, error) {
-	items, err := plane.listWorkItems(ctx, 0)
-	if err != nil {
-		return planeWorkItem{}, err
-	}
-	for _, item := range items {
-		if item.SequenceID == number {
-			return item, nil
+	cursor := ""
+	for page := 0; page < planeMaxWorkItemPages; page++ {
+		query := url.Values{"per_page": {fmt.Sprintf("%d", planeWorkItemPageSize)}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
 		}
+		var body planeWorkItemPage
+		if err := plane.do(ctx, http.MethodGet, plane.projectPath("work-items"), query, nil, &body); err != nil {
+			return planeWorkItem{}, err
+		}
+		for _, item := range body.results() {
+			if item.SequenceID == number {
+				return item, nil
+			}
+		}
+		if !body.NextPageResults || strings.TrimSpace(body.NextCursor) == "" {
+			break
+		}
+		cursor = body.NextCursor
 	}
 	return planeWorkItem{}, fmt.Errorf("plane client: work-item with sequence_id %d not found in project %s", number, plane.projectID)
 }
@@ -578,16 +752,41 @@ var (
 	planeAPIVersionSuffix = regexp.MustCompile(`/api/v\d+/?$`)
 	planeHTMLTagPattern   = regexp.MustCompile(`</?[A-Za-z][^>]*>`)
 	planeBlockCloseTag    = regexp.MustCompile(`(?i)</(p|div|br|li|h[1-6]|tr)\s*>`)
+	planeImgTag           = regexp.MustCompile(`(?i)<img\b[^>]*>`)
+	planeAttrSrc          = regexp.MustCompile(`(?i)\bsrc\s*=\s*("[^"]*"|'[^']*')`)
+	planeAttrAlt          = regexp.MustCompile(`(?i)\balt\s*=\s*("[^"]*"|'[^']*')`)
 )
 
+// htmlAttrValue extracts the (quote-stripped) value of the first attribute the
+// regex matches inside an HTML tag, or "" if the attribute is absent.
+func htmlAttrValue(re *regexp.Regexp, tag string) string {
+	m := re.FindStringSubmatch(tag)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.Trim(m[1], `"'`)
+}
+
 // stripHTMLTags converts Plane's description_html / comment_html into plain text:
+// <img> tags are preserved as Markdown image references (![alt](src)) so the
+// image URL and alt text survive for a downstream agent to fetch/inspect,
 // block-closing tags become newlines, all other tags are dropped, and HTML
 // entities are unescaped. It is intentionally conservative (no sanitizer dep).
 func stripHTMLTags(input string) string {
 	if strings.TrimSpace(input) == "" {
 		return ""
 	}
-	text := planeBlockCloseTag.ReplaceAllString(input, "\n")
+	// Preserve inline images before the generic tag-strip below discards them.
+	// Without this, <img> is dropped whole and the agent goes blind to any
+	// screenshot or diagram embedded in a Plane description/comment.
+	text := planeImgTag.ReplaceAllStringFunc(input, func(tag string) string {
+		src := htmlAttrValue(planeAttrSrc, tag)
+		if strings.TrimSpace(src) == "" {
+			return ""
+		}
+		return "\n![" + htmlAttrValue(planeAttrAlt, tag) + "](" + src + ")\n"
+	})
+	text = planeBlockCloseTag.ReplaceAllString(text, "\n")
 	text = planeHTMLTagPattern.ReplaceAllString(text, "")
 	text = html.UnescapeString(text)
 	// Collapse runs of 3+ newlines to at most 2 and trim surrounding whitespace.
@@ -664,7 +863,12 @@ type planeUser struct {
 }
 
 func (u planeUser) login() string {
-	for _, candidate := range []string{u.DisplayName, u.Email, u.FirstName, u.ID} {
+	// Plane work-item assignees are represented by user UUIDs and PATCH expects
+	// those same UUIDs. Identity.Login is the provider-neutral string routing key
+	// used by the planner/worker adapters, so for Plane it must be the UUID rather
+	// than the human display name. Keep the readable fields only as defensive
+	// fallbacks for incomplete API fixtures/responses.
+	for _, candidate := range []string{u.ID, u.DisplayName, u.Email, u.FirstName} {
 		if strings.TrimSpace(candidate) != "" {
 			return strings.TrimSpace(candidate)
 		}

@@ -141,6 +141,12 @@ type Runtime struct {
 	logger     bootstrap.Logger
 	now        func() time.Time
 
+	// Injectable only to exercise the full Plane reconciliation state machines
+	// without a real CLI/network. Production uses planeDocForProject.
+	planeDocFactory planeDocFactory
+	// Test seam for the approval classifier; production builds the configured agent.
+	specApprovalJudge specApprovalJudgeFunc
+
 	configReloadMu       sync.Mutex
 	configBoundary       sync.RWMutex
 	loadedConfig         config.LoadedFileConfig
@@ -968,7 +974,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
@@ -1339,6 +1345,21 @@ func (r *Runtime) startSchedulerLoop() {
 		taskTracker.Go(func() {
 			r.runSchedulerClaimLoop(schedulerCtx, stopCh, claimWakeCh)
 		})
+		// Dedicated shepherd poll: drive worker loops shepherding their PR to merge
+		// on a prompt cadence (no per-PR webhook seam), so a re-review / CI change /
+		// merge is picked up in ~60s rather than the slower wake-reconcile.
+		taskTracker.Go(func() {
+			ticker := time.NewTicker(shepherdReconcileInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopCh:
+					return
+				case <-ticker.C:
+					r.reconcileWorkerShepherd(schedulerCtx)
+				}
+			}
+		})
 	}
 
 	go func() {
@@ -1625,8 +1646,141 @@ func (r *Runtime) executeSchedulerClaimPass(ctx context.Context) {
 	}
 }
 
+// releaseExpiredLocks releases every lock past its TTL and records a recovery
+// event for each. Shared by startup recovery and the sleep/wake reconcile so a
+// laptop that suspended mid-run doesn't stay wedged behind a dead owner's lock.
+func (r *Runtime) releaseExpiredLocks(ctx context.Context, repositories *storage.Repositories, nowISO string) (released int64, eventsWritten int64, err error) {
+	expiredLocks, err := repositories.Locks.ListExpired(ctx, nowISO)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, lock := range expiredLocks {
+		if err := repositories.Locks.Release(ctx, lock.Key); err != nil {
+			return released, eventsWritten, err
+		}
+		released++
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:         newRuntimeEventID(),
+			EventType:  "looperd.recovery.lock_released",
+			EntityType: stringPtr("lock"),
+			EntityID:   stringPtr(lock.Key),
+			PayloadJSON: mustMarshalJSON(map[string]any{
+				"owner":       lock.Owner,
+				"expiredAt":   lock.ExpiresAt,
+				"recoveredAt": nowISO,
+			}),
+			CreatedAt: nowISO,
+		}); err != nil {
+			return released, eventsWritten, err
+		}
+		eventsWritten++
+	}
+	return released, eventsWritten, nil
+}
+
+// wakeReconcileThreshold: a gap between 1s claim passes this much larger than the
+// tick means the host suspended (laptop closed) rather than merely idled — the cue
+// to run recovery so work resumes on wake. periodicReconcileInterval bounds how
+// often the live reconcile runs even without a wake or a full queue, so a wedged
+// run doesn't wait for availableSlots==0.
+const (
+	wakeReconcileThreshold    = 90 * time.Second
+	periodicReconcileInterval = 5 * time.Minute
+	// Plane has no inbound webhook seam for work-item/page comments in this
+	// runtime. Human decisions and spec approvals therefore need a much tighter
+	// lightweight poll than the full recovery/auto-intake sweep.
+	humanGateReconcileInterval = 30 * time.Second
+)
+
+// shouldWakeReconcile decides, from the time since the last claim pass and since
+// the last reconcile, whether to run the wake/periodic reconcile and why. A gap
+// far larger than the 1s tick means a suspend/resume; otherwise a periodic sweep.
+func shouldWakeReconcile(sinceLastPass, sinceLastReconcile time.Duration) (bool, string) {
+	switch {
+	case sinceLastPass > wakeReconcileThreshold:
+		return true, "wall_clock_jump"
+	case sinceLastReconcile >= periodicReconcileInterval:
+		return true, "periodic"
+	default:
+		return false, ""
+	}
+}
+
+// runWakeReconcile is the lightweight recovery run on sleep/wake (and periodically):
+// release expired locks + reconcile stale running runs (which also repairs the
+// queue). Unlike startup recovery it does NOT force-interrupt live runs — after a
+// suspend the agent subprocesses are usually still alive — it only touches what is
+// provably dead (expired locks, superseded / heartbeat-dead runs).
+func (r *Runtime) runWakeReconcile(ctx context.Context, reason string) {
+	r.mu.RLock()
+	repositories := r.services.Repositories
+	now := r.now
+	logger := r.logger
+	r.mu.RUnlock()
+	if repositories == nil {
+		return
+	}
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	released, _, err := r.releaseExpiredLocks(ctx, repositories, nowISO)
+	if err != nil && logger != nil {
+		logger.Warn("wake reconcile: release expired locks failed", map[string]any{"error": err.Error(), "reason": reason})
+	}
+	stale, err := r.reconcileLiveStaleRunningRuns(ctx)
+	if err != nil && logger != nil {
+		logger.Warn("wake reconcile: stale-run reconcile failed", map[string]any{"error": err.Error(), "reason": reason})
+	}
+	// Classify + route freshly-labelled looper:auto Plane items into the pipeline
+	// (flowchart top: bug/feature → product-spec gate → looper:plan / worker-ready).
+	// Env-gated (LOOPER_PLANE_AUTO_INTAKE=1); a no-op otherwise.
+	r.reconcileAutoIntake(ctx)
+	// Resume loops whose named, externally-observed blocking condition cleared.
+	r.reconcileBlockedConditions(ctx)
+	// Resume V2 planner loops only after the configured Plane role authorities have
+	// answered the current decision revision. Feishu is notification-only.
+	r.reconcileAwaitingRoleDecisions(ctx)
+	// Dispatch the worker for tech specs a human approved on the Plane page (node H→I).
+	r.reconcileSpecApproval(ctx)
+	// Drive worker loops shepherding their impl PR toward merge (looper:auto): wake
+	// a pass on an actionable PR change, terminate once a human merges. Polling
+	// cadence (no per-PR webhook seam) — best-effort.
+	r.reconcileWorkerShepherd(ctx)
+	if logger != nil && (released > 0 || stale.InterruptedRuns > 0 || stale.LoopsRequeued > 0) {
+		logger.Info("wake reconcile recovered work", map[string]any{"reason": reason, "locksReleased": released, "runsInterrupted": stale.InterruptedRuns, "loopsRequeued": stale.LoopsRequeued})
+	}
+}
+
 func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struct{}, wakeCh <-chan struct{}) {
 	const claimPumpInterval = time.Second
+	nowFn := r.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	lastPass := nowFn()
+	lastReconcile := lastPass
+	lastHumanGateReconcile := time.Time{}
+	// maybeReconcile detects a suspend/resume (or a periodic due time) before each
+	// claim pass and runs the wake reconcile so a laptop that was closed mid-run
+	// resumes its work rather than waiting for a full queue.
+	maybeReconcile := func() {
+		now := nowFn()
+		if lastHumanGateReconcile.IsZero() || now.Sub(lastHumanGateReconcile) >= humanGateReconcileInterval {
+			r.reconcileBlockedConditions(ctx)
+			r.reconcileAwaitingRoleDecisions(ctx)
+			r.reconcileSpecApproval(ctx)
+			lastHumanGateReconcile = now
+		}
+		if run, reason := shouldWakeReconcile(now.Sub(lastPass), now.Sub(lastReconcile)); run {
+			r.runWakeReconcile(ctx, reason)
+			lastReconcile = now
+		}
+		lastPass = now
+	}
+	// Reconcile named holds once at boot before claiming work. This closes the
+	// restart gap where an external answer/spec arrived while looperd was down.
+	r.reconcileBlockedConditions(ctx)
 	r.executeSchedulerClaimPass(ctx)
 	ticker := time.NewTicker(claimPumpInterval)
 	defer ticker.Stop()
@@ -1635,8 +1789,10 @@ func (r *Runtime) runSchedulerClaimLoop(ctx context.Context, stopCh <-chan struc
 		case <-stopCh:
 			return
 		case <-wakeCh:
+			maybeReconcile()
 			r.executeSchedulerClaimPass(ctx)
 		case <-ticker.C:
+			maybeReconcile()
 			r.executeSchedulerClaimPass(ctx)
 		}
 	}
@@ -1730,31 +1886,12 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 	}
 
-	expiredLocks, err := repositories.Locks.ListExpired(ctx, nowISO)
+	releasedLocks, lockEvents, err := r.releaseExpiredLocks(ctx, repositories, nowISO)
 	if err != nil {
 		return RecoverySummary{}, err
 	}
-	for _, lock := range expiredLocks {
-		if err := repositories.Locks.Release(ctx, lock.Key); err != nil {
-			return RecoverySummary{}, err
-		}
-		summary.ExpiredLocksReleased += 1
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-			ID:         newRuntimeEventID(),
-			EventType:  "looperd.recovery.lock_released",
-			EntityType: stringPtr("lock"),
-			EntityID:   stringPtr(lock.Key),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"owner":       lock.Owner,
-				"expiredAt":   lock.ExpiresAt,
-				"recoveredAt": nowISO,
-			}),
-			CreatedAt: nowISO,
-		}); err != nil {
-			return RecoverySummary{}, err
-		}
-		eventsWritten += 1
-	}
+	summary.ExpiredLocksReleased += releasedLocks
+	eventsWritten += lockEvents
 
 	staleSummary, err := r.reconcileStaleRunningRunsWithMode(ctx, repositories, now, staleRunReconcileModeStartup)
 	if err != nil {

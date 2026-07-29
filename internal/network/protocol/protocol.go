@@ -43,6 +43,7 @@ type NodeCapabilities struct {
 	DynamicLoad         int                         `json:"dynamicLoad"`
 	IdentityDrift       bool                        `json:"identityDrift"`
 	DriftReason         string                      `json:"driftReason,omitempty"`
+	StrictDispatchV1    bool                        `json:"strictDispatchV1,omitempty"`
 }
 
 type AuditEnvelope struct {
@@ -95,6 +96,17 @@ type HeartbeatRequest struct {
 type HeartbeatResponse struct {
 	RecordedAt time.Time `json:"recordedAt"`
 	Warnings   []string  `json:"warnings,omitempty"`
+}
+
+type LinkChallengeRequest struct {
+	PublicKeySHA256 string `json:"publicKeySha256"`
+	Audience        string `json:"audience"`
+}
+
+type LinkChallengeResponse struct {
+	Challenge   string `json:"challenge"`
+	ExpiresAtMS int64  `json:"expiresAtMs"`
+	KeyRevision uint64 `json:"keyRevision"`
 }
 
 type CoordinatorLease struct {

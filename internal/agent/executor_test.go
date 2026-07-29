@@ -15,6 +15,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -69,7 +70,7 @@ func TestResolveSpawnVendorParity(t *testing.T) {
 	if command != "opencode" {
 		t.Fatalf("opencode command = %q, want opencode", command)
 	}
-	if got, want := strings.Join(args, " "), "run --model gpt-5 --dir "+workDir+" hello"; got != want {
+	if got, want := strings.Join(args, " "), "run --model gpt-5 --dir "+workDir+" --format json hello"; got != want {
 		t.Fatalf("opencode args = %q, want %q", got, want)
 	}
 
@@ -111,8 +112,8 @@ func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
 	if command != "opencode" {
 		t.Fatalf("opencode command = %q, want opencode", command)
 	}
-	if strings.Join(args, " ") != "--model gpt-5 --profile test run --dir /tmp/looper-worktree hello" {
-		t.Fatalf("opencode args = %#v, want single run subcommand preserved with --dir", args)
+	if strings.Join(args, " ") != "--model gpt-5 --profile test run --dir /tmp/looper-worktree --format json hello" {
+		t.Fatalf("opencode args = %#v, want single run subcommand preserved with --dir + --format json", args)
 	}
 }
 
@@ -126,7 +127,7 @@ func TestResolveSpawnWithNativeResumeVendorArgs(t *testing.T) {
 	}{
 		{name: "claude", vendor: config.AgentVendorClaudeCode, want: "--resume session-123 --print hello --dangerously-skip-permissions"},
 		{name: "codex", vendor: config.AgentVendorCodex, want: "exec resume session-123 hello"},
-		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --dir /tmp/looper-worktree --session session-123 hello"},
+		{name: "opencode", vendor: config.AgentVendorOpenCode, want: "run --dir /tmp/looper-worktree --format json --session session-123 hello"},
 		{name: "cursor", vendor: config.AgentVendorCursorCLI, want: "--resume session-123 --print hello"},
 	}
 	for _, tc := range cases {
@@ -164,7 +165,7 @@ func TestResolveSpawnWithNativeResumeDoesNotDuplicateEqualsFlags(t *testing.T) {
 		Model:  &model,
 		Params: map[string]any{"args": []any{"run", "--model=gpt-4", "--session=existing", "--prompt=from-args"}},
 	}, "/tmp/looper-worktree", "hello", "session-123", true)
-	if got, want := strings.Join(args, " "), "run --dir /tmp/looper-worktree --model=gpt-4 --session=existing --prompt=from-args"; got != want {
+	if got, want := strings.Join(args, " "), "run --dir /tmp/looper-worktree --model=gpt-4 --session=existing --prompt=from-args --format json"; got != want {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
 }
@@ -955,6 +956,86 @@ func TestParseCompletionIgnoresTemplatePlaceholder(t *testing.T) {
 	parsed := parseCompletion(CompletionMarkerPrefix+`{"summary":"<one-sentence summary>"}`+"\nreal work\n", "")
 	if parsed.ParseStatus != "missing" || parsed.Summary != "" {
 		t.Fatalf("parseCompletion() = %#v, want template placeholder ignored", parsed)
+	}
+}
+
+func TestParseCompletionBackfillsLifecycleFromEarlierMarker(t *testing.T) {
+	t.Parallel()
+
+	// opencode/grok emits the full marker via a tool echo (earlier in the stream)
+	// but only a summary in its final assistant text (later). parseCompletion scans
+	// bottom-up and hits the summary-only marker first; it must backfill the dropped
+	// git_pr_lifecycle from the earlier echo so the worker can adopt the PR.
+	echoMarker := CompletionMarkerPrefix + `{"summary":"Implemented #1244","git_pr_lifecycle":{"branch":"looper/1244-x","baseBranch":"main","commitShas":["77ba2d3"],"pushed":true,"prNumber":5339,"prUrl":"https://github.com/nexu-io/open-design/pull/5339","prAdopted":false,"actions":{"commit":"agent","push":"agent","pr":"agent"}}}`
+	finalText := CompletionMarkerPrefix + `{"summary":"Implemented #1244: allowlist error guidance"}`
+	stdout := "some tool output\n" + echoMarker + "\nmore chatter\n" + finalText + "\n"
+
+	parsed := parseCompletion(stdout, "")
+	if parsed.ParseStatus != "parsed" {
+		t.Fatalf("ParseStatus = %q, want parsed", parsed.ParseStatus)
+	}
+	// Latest summary wins.
+	if parsed.Summary != "Implemented #1244: allowlist error guidance" {
+		t.Fatalf("Summary = %q, want the final summary", parsed.Summary)
+	}
+	// Lifecycle is backfilled from the earlier echo marker.
+	if parsed.Lifecycle == nil {
+		t.Fatal("Lifecycle = nil, want backfilled from earlier marker")
+	}
+	if parsed.Lifecycle.PRNumber != 5339 {
+		t.Fatalf("Lifecycle.PRNumber = %d, want 5339", parsed.Lifecycle.PRNumber)
+	}
+	if parsed.Lifecycle.Actions.PR != lifecycle.ActionSourceAgent {
+		t.Fatalf("Lifecycle.Actions.PR = %q, want %q", parsed.Lifecycle.Actions.PR, lifecycle.ActionSourceAgent)
+	}
+}
+
+func TestParseCompletionKeepsSingleCompleteMarkerUnchanged(t *testing.T) {
+	t.Parallel()
+
+	// codex emits one complete marker; the first (bottom-up) match already carries
+	// lifecycle, so parseCompletion returns it immediately with no scanning changes.
+	marker := CompletionMarkerPrefix + `{"summary":"done","git_pr_lifecycle":{"prNumber":42,"actions":{"pr":"agent"}}}`
+	parsed := parseCompletion("work\n"+marker+"\n", "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "done" {
+		t.Fatalf("parseCompletion() = %#v, want single complete marker parsed", parsed)
+	}
+	if parsed.Lifecycle == nil || parsed.Lifecycle.PRNumber != 42 {
+		t.Fatalf("Lifecycle = %#v, want PRNumber 42", parsed.Lifecycle)
+	}
+}
+
+func TestParseCompletionExtractsProductAsk(t *testing.T) {
+	t.Parallel()
+
+	// Planner node H: the marker carries an optional productAsk field — a product-
+	// language question for the owner — alongside the summary.
+	marker := CompletionMarkerPrefix + `{"summary":"wrote spec","productAsk":"① 背景:客户想导出品牌包。② 现状:导出格式已定。③ 问题:先支持哪种?A 图片 B PDF,建议 A。"}`
+	parsed := parseCompletion("some work\n"+marker+"\n", "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "wrote spec" {
+		t.Fatalf("parseCompletion() = %#v, want parsed with summary", parsed)
+	}
+	if !strings.Contains(parsed.ProductAsk, "① 背景") || !strings.Contains(parsed.ProductAsk, "建议 A") {
+		t.Fatalf("ProductAsk = %q, want the product-language message", parsed.ProductAsk)
+	}
+
+	// A marker WITHOUT productAsk → empty (the common case; workers never emit it).
+	plain := parseCompletion("x\n"+CompletionMarkerPrefix+`{"summary":"done"}`+"\n", "")
+	if plain.ParseStatus != "parsed" || plain.ProductAsk != "" {
+		t.Fatalf("plain = %#v, want parsed with empty ProductAsk", plain)
+	}
+}
+
+func TestParseCompletionRecoversProductAskWithUnescapedQuotes(t *testing.T) {
+	t.Parallel()
+
+	marker := CompletionMarkerPrefix + `{"summary":"wrote spec","productAsk":"① 背景：用户想导出。\n\n③ 请拍板：首版选 "HTML 优先" 还是 "React 优先"？建议 "HTML 优先"。"}`
+	parsed := parseCompletion("some work\n"+marker+"\n", "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "wrote spec" {
+		t.Fatalf("parseCompletion() = %#v, want recovered marker", parsed)
+	}
+	if !strings.Contains(parsed.ProductAsk, `"HTML 优先"`) || !strings.Contains(parsed.ProductAsk, "\n\n③ 请拍板") {
+		t.Fatalf("ProductAsk = %q, want quotes and newlines preserved", parsed.ProductAsk)
 	}
 }
 

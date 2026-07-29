@@ -18,11 +18,10 @@
   },
   "hitl": {
     "enabled": true,
-    "answerTransport": "feishu",
-    "feishu": {
-      "inbound": "cf-inbox",
-      "eventInboxUrlEnv": "LOOPER_FEISHU_INBOX_URL",
-      "eventInboxTokenEnv": "LOOPER_FEISHU_INBOX_TOKEN"
+    "answerTransport": "github",
+    "github": {
+      "awaitingLabel": "looper:awaiting-human",
+      "mentionLogins": []
     }
   },
   "notifications": {
@@ -33,7 +32,6 @@
       "format": "feishu",
       "appIdEnv": "LOOPER_FEISHU_APP_ID",
       "appSecretEnv": "LOOPER_FEISHU_APP_SECRET",
-      "verificationTokenEnv": "LOOPER_FEISHU_VERIFY_TOKEN",
       "chatId": "REPLACE_WITH_YOUR_GROUP_CHAT_ID_oc_xxx",
       "mentionOpenIds": [
         "REPLACE_WITH_YOUR_OPEN_ID_ou_xxx"
@@ -67,7 +65,26 @@
       "name": "My Repo (GitHub)",
       "repo": "OWNER/REPO",
       "repoPath": "/ABSOLUTE/PATH/TO/LOCAL/CLONE",
+      "productOwner": {
+        "feishuOpenId": "REPLACE_WITH_PRODUCT_OWNER_ou_xxx",
+        "planeId": ""
+      },
+      "designOwner": {
+        "feishuOpenId": "REPLACE_WITH_DESIGN_OWNER_ou_xxx",
+        "planeId": ""
+      },
+      "qa": {
+        "feishuOpenId": "REPLACE_WITH_QA_ou_xxx"
+      },
+      "owner": {
+        "feishuOpenId": "FILLED_BY_looper_login_ou_xxx",
+        "planeId": ""
+      },
       "roles": {
+        "planner": {
+          "autoDiscovery": false,
+          "preSpecDecisionGrill": false
+        },
         "worker": {
           "autoDiscovery": true,
           "triggers": {
@@ -75,7 +92,7 @@
               "looper:plan"
             ],
             "labelMode": "all",
-            "requireAssigneeCurrentUser": false
+            "requireAssigneeCurrentUser": true
           }
         }
       }

@@ -39,10 +39,10 @@ Webhook
 
 type      queued  running  waiting  paused  failed  terminated  stopped
 --------  ------  -------  -------  ------  ------  ----------  -------
-planner   0       0        0        1       0       0           0      
-reviewer  1       1        1        0       0       0           0      
-worker    0       2        0        0       1       1           0      
-fixer     0       0        0        0       0       0           1      
+planner   0       0        0        1       0       0           0
+reviewer  1       1        1        0       0       0           0
+worker    0       2        0        0       1       1           0
+fixer     0       0        0        0       0       0           1
 
 Tools
   git       : yes

@@ -91,6 +91,7 @@ type InspectHeadInput struct {
 type InspectHeadResult struct {
 	HeadSHA               string
 	NewCommitSHAs         []string
+	CommittedChangedFiles []string
 	HasUncommittedChanges bool
 	ChangedFiles          []string
 }
@@ -660,7 +661,18 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 		return nil
 	}
 
-	return g.runGit(ctx, input.WorktreePath, nil, "push", "-u", remote, fmt.Sprintf("HEAD:refs/heads/%s", input.Branch))
+	err := g.runGit(ctx, input.WorktreePath, nil, "push", "-u", remote, fmt.Sprintf("HEAD:refs/heads/%s", input.Branch))
+	if err != nil && pushConflictErrorPattern.MatchString(err.Error()) {
+		// The branch already exists on the remote — a prior attempt (or the agent)
+		// pushed it. Don't fail (which would wedge a retrying loop) and don't
+		// force-push (which could clobber a good spec with a stale worktree): treat it
+		// as already published and let the caller adopt the existing branch/PR. Only
+		// when the branch genuinely exists on the remote.
+		if _, lookupErr := g.getRemoteHeadSHA(ctx, input.WorktreePath, remote, input.Branch); lookupErr == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
@@ -734,8 +746,13 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	}
 
 	newCommitSHAs := []string{}
+	committedChangedFiles := []string{}
 	if input.BaseRef != "" {
 		newCommitSHAs, err = g.listCommitsSince(ctx, input.WorktreePath, input.BaseRef)
+		if err != nil {
+			return InspectHeadResult{}, err
+		}
+		committedChangedFiles, err = g.listChangedFilesSince(ctx, input.WorktreePath, input.BaseRef)
 		if err != nil {
 			return InspectHeadResult{}, err
 		}
@@ -754,6 +771,7 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	return InspectHeadResult{
 		HeadSHA:               headSHA,
 		NewCommitSHAs:         newCommitSHAs,
+		CommittedChangedFiles: committedChangedFiles,
 		HasUncommittedChanges: len(status) > 0,
 		ChangedFiles:          changedFiles,
 	}, nil
@@ -1187,6 +1205,20 @@ func (g *Gateway) listCommitsSince(ctx context.Context, repoPath, baseRef string
 		}
 	}
 	return commits, nil
+}
+
+func (g *Gateway) listChangedFilesSince(ctx context.Context, repoPath, baseRef string) ([]string, error) {
+	result, err := g.runGitResult(ctx, repoPath, nil, "diff", "--name-only", baseRef+"..HEAD")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if value := strings.TrimSpace(line); value != "" {
+			files = append(files, value)
+		}
+	}
+	return files, nil
 }
 
 type statusEntry struct {

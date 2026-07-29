@@ -31,6 +31,11 @@ type Lane string
 const (
 	LaneReviewer Lane = "reviewer"
 	LaneFixer    Lane = "fixer"
+	// LaneShepherd wakes a worker loop that is shepherding its own impl PR to
+	// merge (looper:auto) so a re-review / failing CI / conflict / merge is
+	// picked up event-driven rather than on the 60s poll. Multiple events for the
+	// same PR coalesce into one work item (CI check bursts fold to one wake).
+	LaneShepherd Lane = "shepherd"
 )
 
 type DeliveryRequest struct {
@@ -106,6 +111,12 @@ type TargetedFixer interface {
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 }
 
+// TargetedShepherd reconciles the worker loop shepherding a specific PR promptly
+// on a webhook event. A no-op when no loop is shepherding that PR.
+type TargetedShepherd interface {
+	ReconcilePullRequest(ctx context.Context, projectID, repo string, prNumber int64) error
+}
+
 type ConfigSource interface {
 	Snapshot() config.Config
 }
@@ -116,6 +127,7 @@ type Options struct {
 	ConfigSource       ConfigSource
 	Reviewer           TargetedReviewer
 	Fixer              TargetedFixer
+	Shepherd           TargetedShepherd
 	Logger             bootstrap.Logger
 	Now                func() time.Time
 	QueueCapacity      int
@@ -230,6 +242,7 @@ type forwarder struct {
 	configSource       ConfigSource
 	reviewer           TargetedReviewer
 	fixer              TargetedFixer
+	shepherd           TargetedShepherd
 	logger             bootstrap.Logger
 	now                func() time.Time
 	queueCapacity      int
@@ -289,6 +302,7 @@ func New(options Options) Forwarder {
 		configSource:       options.ConfigSource,
 		reviewer:           options.Reviewer,
 		fixer:              options.Fixer,
+		shepherd:           options.Shepherd,
 		logger:             options.Logger,
 		now:                now,
 		queueCapacity:      queueCapacity,
@@ -679,6 +693,11 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 			return err
 		}
 	}
+	if _, ok := item.lanes[LaneShepherd]; ok && f.shepherd != nil && key.Number > 0 {
+		if err := f.shepherd.ReconcilePullRequest(ctx, key.ProjectID, key.Repo, key.Number); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -735,6 +754,10 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		case "opened", "reopened", "ready_for_review", "synchronize":
 			lanes[LaneReviewer] = struct{}{}
 			lanes[LaneFixer] = struct{}{}
+			lanes[LaneShepherd] = struct{}{}
+		case "closed":
+			// a merge/close terminates a shepherding loop
+			lanes[LaneShepherd] = struct{}{}
 		default:
 			return routedDelivery{}, false, nil
 		}
@@ -759,7 +782,7 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
 			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}, LaneShepherd: {}}}, true, nil
 	case "push":
 		var envelope pushEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -794,7 +817,7 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 		if len(numbers) == 0 {
 			return routedDelivery{}, false, nil
 		}
-		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: numbers, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: numbers, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}, LaneShepherd: {}}}, true, nil
 	default:
 		return routedDelivery{}, false, nil
 	}
@@ -833,6 +856,12 @@ func enabledLanesForProject(cfg config.Config, projectID string, lanes map[Lane]
 	}
 	if _, ok := lanes[LaneFixer]; ok && roles.Fixer.AutoDiscovery {
 		result[LaneFixer] = struct{}{}
+	}
+	// Shepherd is not a discovery role (it is gated per-loop by the durable
+	// marker + LOOPER_WORKER_SHEPHERD); always let the lane through — the targeted
+	// reconcile is a cheap no-op when no loop is shepherding this PR.
+	if _, ok := lanes[LaneShepherd]; ok {
+		result[LaneShepherd] = struct{}{}
 	}
 	return result
 }

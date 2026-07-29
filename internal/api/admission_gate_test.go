@@ -85,9 +85,9 @@ func TestHandlerMutationAdmissionGate(t *testing.T) {
 	}
 }
 
-// Contract: Feishu url_verification must echo the challenge while admission is
-// closed; real card actions still require admission (#583).
-func TestHandlerFeishuURLVerificationBypassesAdmission(t *testing.T) {
+// Contract: Feishu is notification-only, so the retired inbound callback route
+// remains unavailable even while admission is closed.
+func TestHandlerFeishuInboundRouteIsUnavailable(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -102,18 +102,15 @@ func TestHandlerFeishuURLVerificationBypassesAdmission(t *testing.T) {
 	challengeBody := `{"type":"url_verification","challenge":"abc123","token":"t"}`
 	challengeRec := httptest.NewRecorder()
 	handler.ServeHTTP(challengeRec, httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(challengeBody)))
-	if challengeRec.Code != http.StatusOK {
-		t.Fatalf("url_verification while stopping status = %d body=%s, want 200", challengeRec.Code, challengeRec.Body.String())
-	}
-	if !strings.Contains(challengeRec.Body.String(), `"challenge":"abc123"`) {
-		t.Fatalf("challenge echo missing: %s", challengeRec.Body.String())
+	if challengeRec.Code != http.StatusNotFound {
+		t.Fatalf("url_verification status = %d body=%s, want 404", challengeRec.Code, challengeRec.Body.String())
 	}
 
-	// Non-handshake Feishu callbacks remain gated.
+	// Card actions are unavailable for the same reason.
 	actionBody := `{"action":{"tag":"button","value":{"loopSeq":"1","answer":"yes"}}}`
 	actionRec := httptest.NewRecorder()
 	handler.ServeHTTP(actionRec, httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(actionBody)))
-	if actionRec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("card action while stopping status = %d body=%s, want 503", actionRec.Code, actionRec.Body.String())
+	if actionRec.Code != http.StatusNotFound {
+		t.Fatalf("card action status = %d body=%s, want 404", actionRec.Code, actionRec.Body.String())
 	}
 }

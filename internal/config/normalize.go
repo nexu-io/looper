@@ -121,16 +121,17 @@ func normalizeLayerPartial(partial PartialConfig) PartialConfig {
 		partials := make([]PartialProviderConfig, len(providers))
 		for i, provider := range providers {
 			partials[i] = PartialProviderConfig{
-				ID:        provider.ID,
-				Kind:      &provider.Kind,
-				BaseURL:   &provider.BaseURL,
-				GHPath:    provider.GHPath,
-				Auth:      providerAuthModePtr(provider.Auth),
-				TokenEnv:  provider.TokenEnv,
-				TeaLogin:  provider.TeaLogin,
-				TeaPath:   provider.TeaPath,
-				Workspace: provider.Workspace,
-				ProjectID: provider.ProjectID,
+				ID:             provider.ID,
+				Kind:           &provider.Kind,
+				BaseURL:        &provider.BaseURL,
+				GHPath:         provider.GHPath,
+				Auth:           providerAuthModePtr(provider.Auth),
+				TokenEnv:       provider.TokenEnv,
+				TeaLogin:       provider.TeaLogin,
+				TeaPath:        provider.TeaPath,
+				Workspace:      provider.Workspace,
+				ProjectID:      provider.ProjectID,
+				StrictDispatch: clonePlaneStrictDispatchConfig(provider.StrictDispatch),
 			}
 		}
 		normalized.Providers = &partials
@@ -361,20 +362,6 @@ func mergeConfig(config *Config, partial PartialConfig) {
 				config.HITL.GitHub.AnswerAuthors = append([]string(nil), (*gh.AnswerAuthors)...)
 			}
 		}
-		if fs := partial.HITL.Feishu; fs != nil {
-			if config.HITL.Feishu == nil {
-				config.HITL.Feishu = &HITLFeishuConfig{}
-			}
-			if fs.Inbound != nil {
-				config.HITL.Feishu.Inbound = strings.TrimSpace(*fs.Inbound)
-			}
-			if fs.EventInboxURLEnv != nil {
-				config.HITL.Feishu.EventInboxURLEnv = strings.TrimSpace(*fs.EventInboxURLEnv)
-			}
-			if fs.EventInboxTokenEnv != nil {
-				config.HITL.Feishu.EventInboxTokenEnv = strings.TrimSpace(*fs.EventInboxTokenEnv)
-			}
-		}
 	}
 
 	if partial.Roles != nil {
@@ -501,6 +488,20 @@ func normalizeProviderConfig(provider *ProviderConfig) {
 	if provider.ProjectID != nil {
 		provider.ProjectID = stringPtr(strings.TrimSpace(*provider.ProjectID))
 	}
+	if provider.StrictDispatch != nil {
+		provider.StrictDispatch.BaseURL = normalizeBaseURL(provider.StrictDispatch.BaseURL)
+		provider.StrictDispatch.NodeID = strings.TrimSpace(provider.StrictDispatch.NodeID)
+		provider.StrictDispatch.BindingID = strings.TrimSpace(provider.StrictDispatch.BindingID)
+		provider.StrictDispatch.PrivateKeyFile = strings.TrimSpace(provider.StrictDispatch.PrivateKeyFile)
+	}
+}
+
+func clonePlaneStrictDispatchConfig(value *PlaneStrictDispatchConfig) *PlaneStrictDispatchConfig {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 // EffectiveProviderAuth resolves the authentication strategy for a provider.
@@ -596,6 +597,10 @@ func mergeSchedulerConfig(config *SchedulerConfig, partial PartialSchedulerConfi
 
 	if partial.RetryBaseDelayMS != nil {
 		config.RetryBaseDelayMS = *partial.RetryBaseDelayMS
+	}
+
+	if partial.InfraRetryBudgetSeconds != nil {
+		config.InfraRetryBudgetSeconds = *partial.InfraRetryBudgetSeconds
 	}
 
 	if partial.SlowLaneWarnThresholdMS != nil {
@@ -895,10 +900,6 @@ func mergeWebhookNotificationConfig(config *WebhookNotificationConfig, partial P
 		config.ChatID = strings.TrimSpace(*partial.ChatID)
 	}
 
-	if partial.VerificationTokenEnv != nil {
-		config.VerificationTokenEnv = strings.TrimSpace(*partial.VerificationTokenEnv)
-	}
-
 	if partial.MentionOpenIds != nil {
 		ids := make([]string, 0, len(*partial.MentionOpenIds))
 		for _, id := range *partial.MentionOpenIds {
@@ -976,6 +977,14 @@ func mergeToolPathsConfig(config *ToolPathsConfig, partial PartialToolPathsConfi
 	if partial.OsascriptPath != nil {
 		config.OsascriptPath = stringPtr(*partial.OsascriptPath)
 	}
+
+	if partial.PlanePath != nil {
+		config.PlanePath = stringPtr(*partial.PlanePath)
+	}
+
+	if partial.BrowserPath != nil {
+		config.BrowserPath = stringPtr(*partial.BrowserPath)
+	}
 }
 
 func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
@@ -1013,6 +1022,25 @@ func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
 
 	if partial.WorktreeCleanup != nil {
 		mergeWorktreeCleanupConfig(&config.WorktreeCleanup, *partial.WorktreeCleanup)
+	}
+
+	if partial.DiskBackpressure != nil {
+		mergeDiskBackpressureConfig(&config.DiskBackpressure, *partial.DiskBackpressure)
+	}
+}
+
+func mergeDiskBackpressureConfig(config *DiskBackpressureConfig, partial PartialDiskBackpressureConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Path != nil {
+		config.Path = *partial.Path
+	}
+	if partial.HighWatermarkPercent != nil {
+		config.HighWatermarkPercent = *partial.HighWatermarkPercent
+	}
+	if partial.HardStopPercent != nil {
+		config.HardStopPercent = *partial.HardStopPercent
 	}
 }
 
@@ -1066,6 +1094,10 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 
 	if partial.AllowAutoPush != nil {
 		config.AllowAutoPush = *partial.AllowAutoPush
+	}
+
+	if partial.WorkerShepherd != nil {
+		config.WorkerShepherd = *partial.WorkerShepherd
 	}
 
 	if partial.AllowAutoApprove != nil {
@@ -1355,6 +1387,9 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 	if partial.AutoDiscovery != nil {
 		config.AutoDiscovery = *partial.AutoDiscovery
 	}
+	if partial.PreSpecDecisionGrill != nil {
+		config.PreSpecDecisionGrill = *partial.PreSpecDecisionGrill
+	}
 	if partial.Triggers != nil {
 		mergeIssueRoleTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
@@ -1499,6 +1534,9 @@ func mergeReviewerSpecReviewConfig(config *ReviewerSpecReviewConfig, partial Par
 	}
 	if partial.ReviewingLabel != nil {
 		config.ReviewingLabel = *partial.ReviewingLabel
+	}
+	if partial.RequireHumanApproval != nil {
+		config.RequireHumanApproval = *partial.RequireHumanApproval
 	}
 }
 
@@ -1662,9 +1700,29 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
 			Instructions: cloneStringMap(project.Instructions),
 			Roles:        clonePartialRoleConfigs(project.Roles),
+			ProductOwner: cloneProductOwner(project.ProductOwner),
+			DesignOwner:  cloneFeishuActor(project.DesignOwner),
+			QA:           cloneFeishuActor(project.QA),
+			Owner:        cloneFeishuActor(project.Owner),
 		}
 	}
 	return cloned
+}
+
+func cloneProductOwner(owner *ProductOwnerConfig) *ProductOwnerConfig {
+	if owner == nil {
+		return nil
+	}
+	cloned := *owner
+	return &cloned
+}
+
+func cloneFeishuActor(actor *FeishuActorConfig) *FeishuActorConfig {
+	if actor == nil {
+		return nil
+	}
+	cloned := *actor
+	return &cloned
 }
 
 func clonePartialProjectNetworkConfig(config *PartialProjectNetworkConfig) *PartialProjectNetworkConfig {
@@ -1746,6 +1804,10 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		if project.Webhook != nil && project.Webhook.Mode != nil {
 			cloned[index].Webhook.Mode = *project.Webhook.Mode
 		}
+		cloned[index].ProductOwner = cloneProductOwner(project.ProductOwner)
+		cloned[index].DesignOwner = cloneFeishuActor(project.DesignOwner)
+		cloned[index].QA = cloneFeishuActor(project.QA)
+		cloned[index].Owner = cloneFeishuActor(project.Owner)
 
 		if project.BaseBranch != nil {
 			cloned[index].BaseBranch = stringPtr(*project.BaseBranch)
@@ -1778,14 +1840,15 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 			kind = *provider.Kind
 		}
 		cloned[index] = ProviderConfig{
-			ID:        strings.TrimSpace(provider.ID),
-			Kind:      kind,
-			GHPath:    cloneStringPtr(provider.GHPath),
-			TokenEnv:  cloneStringPtr(provider.TokenEnv),
-			TeaLogin:  cloneStringPtr(provider.TeaLogin),
-			TeaPath:   cloneStringPtr(provider.TeaPath),
-			Workspace: cloneStringPtr(provider.Workspace),
-			ProjectID: cloneStringPtr(provider.ProjectID),
+			ID:             strings.TrimSpace(provider.ID),
+			Kind:           kind,
+			GHPath:         cloneStringPtr(provider.GHPath),
+			TokenEnv:       cloneStringPtr(provider.TokenEnv),
+			TeaLogin:       cloneStringPtr(provider.TeaLogin),
+			TeaPath:        cloneStringPtr(provider.TeaPath),
+			Workspace:      cloneStringPtr(provider.Workspace),
+			ProjectID:      cloneStringPtr(provider.ProjectID),
+			StrictDispatch: clonePlaneStrictDispatchConfig(provider.StrictDispatch),
 		}
 		if provider.Auth != nil {
 			cloned[index].Auth = *provider.Auth

@@ -3,22 +3,15 @@ package loops
 import "encoding/json"
 
 const humanInboxMetadataKey = "humanInbox"
-
-// humanInboxCap bounds the pending human messages retained for a loop so a chatty
-// thread can't grow metadata unbounded; oldest are dropped.
 const humanInboxCap = 20
 
-// HumanMessage is one free-text message a human sent into a loop's thread at any
-// time — a follow-up question, a clarification, a new instruction — queued until
-// the loop's next turn drains it and feeds it to the agent (same session). Unlike
-// a button-click decision, a message does not by itself resolve a pending ask; the
-// agent reads it in context and decides whether to proceed, answer, or re-ask.
+// HumanMessage is retained for local/runtime handoff messages. Feishu is
+// notification-only and has no inbound route that writes this mailbox.
 type HumanMessage struct {
 	At   string `json:"at"`
 	Text string `json:"text"`
 }
 
-// ReadHumanInbox returns a loop's queued human messages in arrival order.
 func ReadHumanInbox(metadataJSON *string) []HumanMessage {
 	meta := parseMetadataObject(metadataJSON)
 	raw, ok := meta[humanInboxMetadataKey]
@@ -36,36 +29,32 @@ func ReadHumanInbox(metadataJSON *string) []HumanMessage {
 	return out
 }
 
-// AppendHumanMessage queues one human message (trimming to the most recent
-// humanInboxCap), preserving all other metadata keys.
-func AppendHumanMessage(metadataJSON *string, m HumanMessage) (string, error) {
-	msgs := append(ReadHumanInbox(metadataJSON), m)
-	if len(msgs) > humanInboxCap {
-		msgs = msgs[len(msgs)-humanInboxCap:]
+func AppendHumanMessage(metadataJSON *string, message HumanMessage) (string, error) {
+	messages := append(ReadHumanInbox(metadataJSON), message)
+	if len(messages) > humanInboxCap {
+		messages = messages[len(messages)-humanInboxCap:]
 	}
-	return marshalWithHumanInbox(metadataJSON, msgs)
+	return marshalWithHumanInbox(metadataJSON, messages)
 }
 
-// ClearHumanInbox drops all queued human messages (called after the agent drains
-// them in a turn).
 func ClearHumanInbox(metadataJSON *string) (string, error) {
 	return marshalWithHumanInbox(metadataJSON, nil)
 }
 
-func marshalWithHumanInbox(metadataJSON *string, msgs []HumanMessage) (string, error) {
+func marshalWithHumanInbox(metadataJSON *string, messages []HumanMessage) (string, error) {
 	meta := parseMetadataObject(metadataJSON)
-	if len(msgs) == 0 {
+	if len(messages) == 0 {
 		delete(meta, humanInboxMetadataKey)
 	} else {
-		encoded, err := json.Marshal(msgs)
+		encoded, err := json.Marshal(messages)
 		if err != nil {
 			return "", err
 		}
-		var asSlice []any
-		if err := json.Unmarshal(encoded, &asSlice); err != nil {
+		var values []any
+		if err := json.Unmarshal(encoded, &values); err != nil {
 			return "", err
 		}
-		meta[humanInboxMetadataKey] = asSlice
+		meta[humanInboxMetadataKey] = values
 	}
 	out, err := json.Marshal(meta)
 	if err != nil {

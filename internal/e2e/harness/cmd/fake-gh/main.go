@@ -319,6 +319,10 @@ func handleAPI(mode string, st state, stdin string) error {
 		}
 		return nil
 	}
+	if strings.HasSuffix(route, "/pulls") && strings.EqualFold(firstNonEmpty(flagValue(args, "--method"), "GET"), "GET") {
+		_, _ = fmt.Fprintln(os.Stdout, `[]`)
+		return nil
+	}
 	if slices.Contains(args, "--paginate") {
 		_, _ = fmt.Fprintln(os.Stdout, `[]`)
 		return nil

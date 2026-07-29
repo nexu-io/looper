@@ -78,6 +78,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			MaxConcurrentRuns:        3,
 			RetryMaxAttempts:         -1,
 			RetryBaseDelayMS:         5000,
+			InfraRetryBudgetSeconds:  3600,
 			SlowLaneWarnThresholdMS:  5000,
 			DiscoveryCacheTTLSeconds: 30,
 		},
@@ -141,12 +142,30 @@ func DefaultConfig(cwd string) (Config, error) {
 			WorkingDirectory:       cwd,
 			Environment:            map[string]string{},
 			WorktreeCleanup: WorktreeCleanupConfig{
-				Enabled:        true,
-				Interval:       "24h",
-				RetentionDays:  7,
-				MaxPerTick:     10,
-				IncludeOrphans: false,
+				Enabled: true,
+				// Aggressive by default: each open-design-style monorepo worktree is
+				// multiple GB, so the old 24h/7-day/no-orphans default silently leaked to
+				// 100G+ and filled the disk — which then makes worktree creation AND agent
+				// fork/exec fail intermittently ("no such file", "stale worktree"), stalling
+				// every loop. Reclaim hourly, keep only a 1-day grace on terminal worktrees,
+				// and include orphans (worktrees whose loop is gone) so nothing accumulates.
+				// The cleanup already skips any active/shepherding/paused loop's worktree.
+				Interval:       "1h",
+				RetentionDays:  1,
+				MaxPerTick:     50,
+				IncludeOrphans: true,
 				DryRun:         false,
+			},
+			DiskBackpressure: DiskBackpressureConfig{
+				// The other half of worktree disk management: cleanup reclaims,
+				// backpressure refuses to start work that would fill the disk. At
+				// 85% capacity stop claiming NEW runs (in-flight loops keep going);
+				// at 93% it's an emergency and we say so loudly. Path empty =>
+				// scheduler stats the worktree root.
+				Enabled:              true,
+				Path:                 "",
+				HighWatermarkPercent: 85,
+				HardStopPercent:      93,
 			},
 		},
 		Package: PackageConfig{

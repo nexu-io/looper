@@ -7,6 +7,7 @@ import (
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
+	loopcondition "github.com/nexu-io/looper/internal/loops/condition"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -141,22 +142,10 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 	return delivered
 }
 
-// deliverHITLAnswerToLoop is the runtime-side equivalent of the api
-// handler's deliverHumanAnswer for the poll lane: it stores the human's answer on
-// an awaiting_human loop, flips it back to running, and requeues the queue item
-// that suspendForHuman cancelled — so the worker resumes with the answer.
-// enqueueHumanMessageToLoop queues a free-text human message for a loop and makes
-// sure it gets consumed soon: a loop that isn't actively running is nudged to
-// queued so the scheduler picks it up and the worker drains the message on its
-// next turn; a running loop drains it when the current turn ends. Terminal loops
-// are left alone (a message can't reopen a finished loop yet). Unlike a button
-// answer, a message does NOT resolve a pending ask — the agent reads it and
-// decides whether to proceed, answer, or ask again.
+// enqueueHumanMessageToLoop stores a free-text message and wakes a non-terminal
+// loop. No Feishu route calls this helper; Plane/GitHub remain the only decision
+// authorities, while the helper is retained for local/runtime handoff paths.
 func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
-	// Share process-wide requeue exclusion with API discard+retry so free-text
-	// inbox delivery cannot requeue paused/waiting/manual_intervention loops
-	// between discard preflight and git reset (see LockLoopRequeue).
-	// Call order: per-loop lock first, then same-target lock (matches API).
 	unlock := LockLoopRequeue(loopID)
 	defer unlock()
 
@@ -168,23 +157,18 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	case "completed", "failed", "stopped", "terminated", "human_takeover":
 		return nil
 	}
-	// Same-target exclusion: a different waiting loop on this PR/issue can
-	// otherwise requeue while discard+retry holds only that other loop's
-	// per-loop mutex and wipes the shared worktree before the retry TX.
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
 
-	meta, werr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
-	if werr != nil {
-		return werr
+	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
+	if err != nil {
+		return err
 	}
 	updated := *loop
 	updated.MetadataJSON = &meta
 	updated.UpdatedAt = nowISO
 	notRunning := loop.Status != "running"
 	if notRunning {
-		// Wake it so the message is consumed ASAP; a running loop keeps running and
-		// drains on its next turn.
 		updated.Status = "queued"
 		updated.NextRunAt = &nowISO
 	}
@@ -197,6 +181,8 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	return err
 }
 
+// deliverHITLAnswerToLoop stores a GitHub source-of-truth answer on an
+// awaiting_human loop and requeues the suspended worker session.
 func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
 	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
 	unlock := LockLoopRequeue(loopID)
@@ -219,6 +205,10 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	ask.Status = "answered"
 	ask.AnsweredAt = nowISO
 	meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+	if werr != nil {
+		return werr
+	}
+	meta, werr = loopcondition.Clear(&meta)
 	if werr != nil {
 		return werr
 	}

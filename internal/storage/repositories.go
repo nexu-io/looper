@@ -62,6 +62,8 @@ type Repositories struct {
 	WebhookForwarders    *WebhookForwardersRepository
 	WebhookTunnelHooks   *WebhookTunnelHooksRepository
 	FeishuThreads        *FeishuThreadsRepository
+	FeishuLiveFeeds      *FeishuLiveFeedsRepository
+	Counters             *CountersRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -79,7 +81,42 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		WebhookForwarders:    &WebhookForwardersRepository{q: q},
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 		FeishuThreads:        &FeishuThreadsRepository{q: q},
+		FeishuLiveFeeds:      &FeishuLiveFeedsRepository{q: q},
+		Counters:             &CountersRepository{q: q},
 	}
+}
+
+// CountersRepository reads/advances the shared monotonic counters table (name→value).
+// Used for the Feishu inbox poll cursor so it SURVIVES a daemon restart instead of
+// resetting to 0 and re-reading old inbox events (which re-enqueued stale human
+// messages and re-fired one-shot acks).
+type CountersRepository struct{ q sqliteQuerier }
+
+// Get returns the counter's value, or 0 when it has never been set.
+func (r *CountersRepository) Get(ctx context.Context, name string) (int64, error) {
+	var v int64
+	err := r.q.QueryRowContext(ctx, `SELECT value FROM counters WHERE name = ?`, name).Scan(&v)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("get counter %s: %w", name, err)
+	}
+	return v, nil
+}
+
+// SetMax advances the counter to value, never moving it backward (monotonic) — safe for
+// a cursor that must only ever increase, even under concurrent writers.
+func (r *CountersRepository) SetMax(ctx context.Context, name string, value int64) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO counters (name, value) VALUES (?, ?)
+		ON CONFLICT(name) DO UPDATE SET value =
+			CASE WHEN excluded.value > counters.value THEN excluded.value ELSE counters.value END
+	`, name, value)
+	if err != nil {
+		return fmt.Errorf("set counter %s: %w", name, err)
+	}
+	return nil
 }
 
 type ProjectRecord struct {
@@ -323,6 +360,18 @@ func (r *NotificationsRepository) Upsert(ctx context.Context, record Notificatio
 	return nil
 }
 
+func (r *NotificationsRepository) ListPendingOutbox(ctx context.Context, limit int64) ([]NotificationRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM notifications WHERE channel = 'feishu_card' AND status = 'pending' ORDER BY created_at ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending notification outbox: %w", err)
+	}
+	defer rows.Close()
+	return scanNotifications(rows)
+}
+
 func (r *NotificationsRepository) GetByID(ctx context.Context, id string) (*NotificationRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM notifications WHERE id = ?`, id)
 	record, err := scanNotification(row)
@@ -368,18 +417,45 @@ func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel
 type FeishuThreadsRepository struct{ q sqliteQuerier }
 
 // Upsert records that rootMessageID is the thread root for loopID in chatID.
-func (r *FeishuThreadsRepository) Upsert(ctx context.Context, rootMessageID, loopID, chatID, createdAt string) error {
+// taskKey is the stable task identity (issue:repo:N) the anchor is shared under;
+// "" means the loop has no source issue and is keyed per-loop. On a repeat call
+// for an existing root (a new loop joining the same task's card) loop_id is
+// refreshed so outbound updates stay associated with the currently-active loop.
+func (r *FeishuThreadsRepository) Upsert(ctx context.Context, rootMessageID, loopID, taskKey, chatID, createdAt string) error {
+	var taskKeyArg any
+	if strings.TrimSpace(taskKey) != "" {
+		taskKeyArg = taskKey
+	}
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO feishu_threads (root_message_id, loop_id, chat_id, created_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO feishu_threads (root_message_id, loop_id, task_key, chat_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(root_message_id) DO UPDATE SET
 			loop_id=excluded.loop_id,
+			task_key=excluded.task_key,
 			chat_id=excluded.chat_id
-	`, rootMessageID, loopID, chatID, createdAt)
+	`, rootMessageID, loopID, taskKeyArg, chatID, createdAt)
 	if err != nil {
 		return fmt.Errorf("upsert feishu thread: %w", err)
 	}
 	return nil
+}
+
+// RootByTask returns the most recent thread root for a task identity (issue:repo:N),
+// or "" when none or when taskKey is empty. This is how the planner/worker/... loops
+// spawned for one work item resolve to the SAME anchor card.
+func (r *FeishuThreadsRepository) RootByTask(ctx context.Context, taskKey string) (string, error) {
+	if strings.TrimSpace(taskKey) == "" {
+		return "", nil
+	}
+	var rootMessageID string
+	err := r.q.QueryRowContext(ctx, `SELECT root_message_id FROM feishu_threads WHERE task_key = ? ORDER BY created_at DESC LIMIT 1`, taskKey).Scan(&rootMessageID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("feishu thread root by task: %w", err)
+	}
+	return rootMessageID, nil
 }
 
 // RootByLoop returns the most recent thread root for a loop, or "" when none.
@@ -395,17 +471,36 @@ func (r *FeishuThreadsRepository) RootByLoop(ctx context.Context, loopID string)
 	return rootMessageID, nil
 }
 
-// LoopByRoot returns the loop id a thread root belongs to, or "" when unknown.
-func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID string) (string, error) {
-	var loopID string
-	err := r.q.QueryRowContext(ctx, `SELECT loop_id FROM feishu_threads WHERE root_message_id = ?`, rootMessageID).Scan(&loopID)
+// FeishuLiveFeedsRepository persists each loop's live-progress feed message id so
+// the in-place patch survives a daemon restart, instead of orphaning the old card
+// and posting a fresh one on the next progress tick.
+type FeishuLiveFeedsRepository struct{ q sqliteQuerier }
+
+// Set records (or replaces) the live-feed message id for a loop.
+func (r *FeishuLiveFeedsRepository) Set(ctx context.Context, loopID, messageID, createdAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO feishu_live_feeds (loop_id, message_id, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(loop_id) DO UPDATE SET message_id=excluded.message_id
+	`, loopID, messageID, createdAt)
+	if err != nil {
+		return fmt.Errorf("upsert feishu live feed: %w", err)
+	}
+	return nil
+}
+
+// MessageByLoop returns the persisted live-feed message id for a loop, or "" when
+// none has been posted yet (or the loop is unknown).
+func (r *FeishuLiveFeedsRepository) MessageByLoop(ctx context.Context, loopID string) (string, error) {
+	var messageID string
+	err := r.q.QueryRowContext(ctx, `SELECT message_id FROM feishu_live_feeds WHERE loop_id = ?`, loopID).Scan(&messageID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil
 		}
-		return "", fmt.Errorf("feishu thread loop by root: %w", err)
+		return "", fmt.Errorf("feishu live feed by loop: %w", err)
 	}
-	return loopID, nil
+	return messageID, nil
 }
 
 type EventsRepository struct{ q sqliteQuerier }
@@ -579,6 +674,24 @@ func (r *LoopsRepository) GetBySeq(ctx context.Context, seq int64) (*LoopRecord,
 		return nil, fmt.Errorf("get loop by seq: %w", err)
 	}
 
+	return &record, nil
+}
+
+// GetByTargetID returns the most recently updated loop with the given target id
+// (e.g. pr:owner/repo:8), or nil when none. Used to resolve a PR back to the
+// worker loop that opened it, so a snapshot event can refresh that task's card.
+func (r *LoopsRepository) GetByTargetID(ctx context.Context, targetID string) (*LoopRecord, error) {
+	if strings.TrimSpace(targetID) == "" {
+		return nil, nil
+	}
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM loops WHERE target_id = ? ORDER BY updated_at DESC LIMIT 1`, targetID)
+	record, err := scanLoop(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get loop by target id: %w", err)
+	}
 	return &record, nil
 }
 
@@ -1334,6 +1447,14 @@ func (r *LocksRepository) Release(ctx context.Context, key string) error {
 	return nil
 }
 
+func (r *LocksRepository) ReleaseOwned(ctx context.Context, key, owner string) error {
+	_, err := r.q.ExecContext(ctx, `DELETE FROM locks WHERE key = ? AND owner = ?`, key, owner)
+	if err != nil {
+		return fmt.Errorf("release owned lock: %w", err)
+	}
+	return nil
+}
+
 func (r *LocksRepository) Get(ctx context.Context, key string) (*LockRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM locks WHERE key = ?`, key)
 	record, err := scanLock(row)
@@ -1674,6 +1795,20 @@ func (r *QueueRepository) CountByLoopIDAndStatus(ctx context.Context, loopID, st
 	var count int64
 	if err := row.Scan(&count); err != nil {
 		return 0, fmt.Errorf("count queue items by loop and status: %w", err)
+	}
+	return count, nil
+}
+
+func (r *QueueRepository) CountBlockedInfra(ctx context.Context) (int64, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM queue_items
+		WHERE status IN ('failed', 'manual_intervention')
+			AND last_error_kind = 'recoverable_infra'
+	`)
+	var count int64
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count infrastructure-blocked queue items: %w", err)
 	}
 	return count, nil
 }
@@ -2627,8 +2762,8 @@ const scheduledQueueOrderBy = `
 		qi.priority ASC, qi.available_at ASC, qi.created_at ASC
 `
 
-const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
-const longTermRetryPredicateParam = `qi.attempts >= ? AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
+const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'recoverable_infra', 'non_retryable')`
+const longTermRetryPredicateParam = `qi.attempts >= ? AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'recoverable_infra', 'non_retryable')`
 
 const scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
 

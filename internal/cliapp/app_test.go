@@ -456,7 +456,7 @@ func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("Run(labels init --dry-run) stderr = %q, want empty string", stderr.String())
 	}
-	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:hold", "created looper:hold:reviewer", "Summary: created=7 updated=0 skipped=1 failed=0"} {
+	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:auto", "created looper:spec-reviewing", "created looper:spec-ready", "created looper:hold", "created looper:hold:reviewer", "Summary: created=8 updated=0 skipped=1 failed=0"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout.String(), want)
 		}
@@ -524,6 +524,8 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 				return commandExecutionResult{}, nil
 			case "label list --repo acme/looper --limit 1000 --json name,color,description":
 				return commandExecutionResult{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
+			case "label create looper:auto --repo acme/looper --color 0052cc --description Run fully autonomously: plan → implement":
+				return commandExecutionResult{Stdout: "{}"}, nil
 			case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
 				return commandExecutionResult{ExitCode: 1, Stderr: "GraphQL: Resource not accessible by integration"}, nil
 			case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
@@ -552,7 +554,7 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 	if !strings.Contains(stdout.String(), "failed looper:spec-reviewing: gh exited with code 1: GraphQL: Resource not accessible by integration") {
 		t.Fatalf("stdout = %q, want failed label with gh stderr", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "Summary: created=6 updated=0 skipped=1 failed=1") {
+	if !strings.Contains(stdout.String(), "Summary: created=7 updated=0 skipped=1 failed=1") {
 		t.Fatalf("stdout = %q, want failed summary", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {
@@ -3542,6 +3544,22 @@ func TestStopAllWithoutJSONUsesStopAllRoute(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([stop all]) stdout = %q, want to contain %q", stdout, want)
 		}
+	}
+}
+
+func TestLoopStopInterruptsThroughAuthenticatedControlAPI(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/runs/active/12/stop" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"loopId": "loop_12", "runId": "run_12", "executionId": "exec_12", "vendor": "codex", "pid": 123, "stopped": true}))
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "loop", "stop", "12", "--config", configPath)
+	if exitCode != 0 || stderr != "" || !strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", exitCode, stdout, stderr)
 	}
 }
 

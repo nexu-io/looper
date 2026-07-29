@@ -294,15 +294,16 @@ type UpdateCommentInput struct {
 }
 
 type Issue struct {
-	Number    int64
-	Title     string
-	Body      string
-	State     string
-	HTMLURL   string
-	UpdatedAt string
-	User      Identity
-	Labels    []Label
-	Assignees []Identity
+	Number           int64
+	Title            string
+	Body             string
+	State            string
+	HTMLURL          string
+	UpdatedAt        string
+	User             Identity
+	Labels           []Label
+	Assignees        []Identity
+	StrictDispatchID string
 }
 
 type PullRequest struct {

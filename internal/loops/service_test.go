@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/domain"
+	loopengine "github.com/nexu-io/looper/internal/loops/engine"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -32,6 +33,9 @@ func TestServiceCreateAndPauseResumeLoop(t *testing.T) {
 	if loop.Seq != 1 {
 		t.Fatalf("Create().Seq = %d, want 1", loop.Seq)
 	}
+	if state, ok := loopengine.Read(loop.MetadataJSON); !ok || state.Phase != loopengine.PhaseRunning {
+		t.Fatalf("created lifecycle state = %#v, present=%v", state, ok)
+	}
 
 	reason := "pause for test"
 	paused, err := service.Pause(ctx, loop.ID, &reason)
@@ -40,6 +44,9 @@ func TestServiceCreateAndPauseResumeLoop(t *testing.T) {
 	}
 	if paused.Loop.Status != string(domain.LoopStatusPaused) {
 		t.Fatalf("Pause().Loop.Status = %q, want paused", paused.Loop.Status)
+	}
+	if state, ok := loopengine.Read(paused.Loop.MetadataJSON); !ok || state.Phase != loopengine.PhaseBlocked || state.Condition != "manual_pause" {
+		t.Fatalf("paused lifecycle state = %#v, present=%v", state, ok)
 	}
 
 	resumed, err := service.Resume(ctx, loop.ID)
@@ -99,6 +106,43 @@ func TestServiceCreateAllowsWaitingReviewerLoopRerun(t *testing.T) {
 	}
 	if _, err := service.Create(ctx, CreateInput{ProjectID: "project_1", Type: domain.LoopTypeReviewer, Target: target, Status: domain.LoopStatusQueued}); err != nil {
 		t.Fatalf("queued Create() with waiting existing loop error = %v, want allowed", err)
+	}
+}
+
+func TestServiceCreateIgnoresMalformedRetiredLoopTarget(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	seedProject(t, repos, now)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	repo := "acme/looper"
+	legacyTargetID := "issue:acme/looper:42:retired-rerun"
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{
+		ID:         "loop_retired",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       string(domain.LoopTypePlanner),
+		TargetType: string(domain.LoopTargetTypeIssue),
+		TargetID:   &legacyTargetID,
+		Repo:       &repo,
+		Status:     string(domain.LoopStatusTerminated),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("seed retired loop: %v", err)
+	}
+
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	if _, err := service.Create(ctx, CreateInput{
+		ProjectID: "project_1",
+		Type:      domain.LoopTypeCoordinator,
+		Target:    domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: repo, IssueNumber: 43},
+		Status:    domain.LoopStatusRunning,
+	}); err != nil {
+		t.Fatalf("Create() with malformed retired target error = %v, want allowed", err)
 	}
 }
 

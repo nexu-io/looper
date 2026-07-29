@@ -1010,6 +1010,10 @@ func printTable(w io.Writer, headers []string, rows []tableRow) {
 	writeTableLine := func(values []string) {
 		parts := make([]string, len(values))
 		for index, value := range values {
+			if index == len(values)-1 {
+				parts[index] = value
+				continue
+			}
 			parts[index] = fmt.Sprintf("%-*s", widths[index], value)
 		}
 		_, _ = fmt.Fprintln(w, strings.Join(parts, "  "))

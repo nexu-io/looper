@@ -163,11 +163,12 @@ func LimitPerTick[T any](items []T, max int) []T {
 
 func BuildPrompt(input Input) string {
 	var b strings.Builder
-	b.WriteString("You are Looper Coordinator triage. Return strict JSON only.\n")
+	b.WriteString("You are triaging a software issue for a code repository. Return strict JSON only.\n")
 	b.WriteString("Allowed dispositions: valid, out-of-scope, unclear.\n")
+	b.WriteString("Assume every issue you are given is a legitimate work item for the repository you are triaging — do NOT second-guess whether it belongs to this repo, another team, or a specific platform. Set disposition=valid for ANY genuine, actionable bug or feature request, whatever subsystem, product surface, platform, or UI area it touches. If you assign a kind/bug or kind/feature label, the disposition MUST be valid. Use out-of-scope ONLY for clearly non-software items: spam, a pure question that needs no code change, or a duplicate. Use unclear only when the request is too vague to act on. NEVER mark an issue out-of-scope because it seems to belong to a product team, a particular platform, or because no area label below fits.\n")
 	b.WriteString("Allowed kind labels: ")
 	b.WriteString(strings.Join(AllowedKinds(), ", "))
-	b.WriteString("\nAllowed area labels: ")
+	b.WriteString("\nAllowed area labels (OPTIONAL hints — pick one only if it clearly fits, otherwise omit the area field entirely): ")
 	b.WriteString(strings.Join(AllowedAreas(), ", "))
 	b.WriteString("\nAllowed complexity labels: ")
 	b.WriteString(strings.Join(AllowedComplexities(), ", "))
@@ -244,7 +245,10 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 		if err != nil {
 			return Decision{}, err
 		}
-		area, err := requireExactlyOne(output.Labels.Area, AllowedAreas())
+		// area is OPTIONAL (the prompt tells the model to omit it when nothing fits) —
+		// a product/UI bug in a non-looper repo often matches NO hardcoded looper area,
+		// and forcing it here is what silently NoOps → looper:needs-human.
+		area, err := requireAtMostOne(output.Labels.Area, AllowedAreas())
 		if err != nil {
 			return Decision{}, err
 		}
@@ -256,7 +260,12 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 		if err != nil {
 			return Decision{}, err
 		}
-		return Decision{Disposition: DispositionValid, ClearLabelPatterns: clear, ApplyLabels: []string{kind, area, complexity, dispatch, cfg.TriagedLabel}, CommentBody: comment, MarkTriaged: true}, nil
+		apply := []string{kind}
+		if area != "" {
+			apply = append(apply, area)
+		}
+		apply = append(apply, complexity, dispatch, cfg.TriagedLabel)
+		return Decision{Disposition: DispositionValid, ClearLabelPatterns: clear, ApplyLabels: apply, CommentBody: comment, MarkTriaged: true}, nil
 	case DispositionOutOfScope:
 		if hasAnyLabels(output.Labels) {
 			return Decision{}, fmt.Errorf("unexpected labels for out-of-scope disposition")
@@ -270,6 +279,33 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 	default:
 		return Decision{}, fmt.Errorf("unknown disposition")
 	}
+}
+
+// requireAtMostOne accepts 0 or 1 value (empty → ""), so an OPTIONAL label like
+// area — which the prompt tells the model to omit when nothing fits — does not force
+// the whole classification to fail. Pairs with the "area is OPTIONAL" prompt: keeping
+// requireExactlyOne on area while the prompt says omit-it turns an occasional empty
+// area into a guaranteed NoOp → silent looper:needs-human, which is exactly the
+// "classifier keeps giving up" bug.
+func requireAtMostOne(values []string, allowed []string) (string, error) {
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) != 1 {
+		return "", fmt.Errorf("expected at most one value")
+	}
+	value := strings.TrimSpace(values[0])
+	if value == "" {
+		return "", nil
+	}
+	allowedSet := map[string]struct{}{}
+	for _, item := range allowed {
+		allowedSet[item] = struct{}{}
+	}
+	if _, ok := allowedSet[value]; !ok {
+		return "", fmt.Errorf("unknown value %q", value)
+	}
+	return value, nil
 }
 
 func requireExactlyOne(values []string, allowed []string) (string, error) {

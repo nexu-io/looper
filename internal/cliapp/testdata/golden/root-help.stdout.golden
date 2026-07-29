@@ -8,9 +8,11 @@ Subcommands:
   status     Show service status
   dashboard  Open the local operator dashboard
   network    Network membership commands
+  plane      Plane strict-dispatch binding commands
   netadmin   Network repo operator commands
   webhook    Webhook configuration and status
   bootstrap  Run first-time setup
+  login      Log in to Feishu to capture the owner open_id
   version    Show Looper version
   provider   Provider commands
   project    Project commands

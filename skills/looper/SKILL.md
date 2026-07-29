@@ -181,6 +181,8 @@ export LOOPER_FEISHU_WEBHOOK_URL="<feishu-bot-webhook-url>" # matches --feishu-w
 
 Full flag reference, config shape, and follow-ups: [`references/plane.md`](references/plane.md) and [`docs/plane-provider.md`](../../docs/plane-provider.md).
 
+If enabling `roles.planner.preSpecDecisionGrill`, also collect the Plane member UUID and Feishu open_id for `productOwner`, `designOwner`, and the local `owner`. Requirement answers must be new Plane work-item comments; a formal product Spec must instead be linked from the work item with title `looper:product-spec`; final technical-Spec approval must be a Plane page comment from the local owner. Feishu is notification-only for this pipeline (a grey @ for someone outside the notification group is allowed). Do not confuse this with generic mid-coding HITL, whose explicit transport may still be bidirectional.
+
 ### Step 5 — Verify the install
 
 Run all of these and report the results. Do not restart the daemon if status is healthy.

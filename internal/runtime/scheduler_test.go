@@ -24,10 +24,10 @@ import (
 	"github.com/nexu-io/looper/internal/worker"
 )
 
-func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
+func TestConvertedAgentExecutionPropagatesResult(t *testing.T) {
 	t.Parallel()
 
-	adapter := workerAgentExecutionAdapter{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}}}}
+	adapter := convertedAgentExecution[agent.Result]{execution: stubAgentExecution{result: agent.Result{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed", ChangedFiles: []string{"worker.go"}, Commits: []string{"abc123"}}}, convert: func(result agent.Result) agent.Result { return result }}
 
 	result, err := adapter.Wait(context.Background())
 	if err != nil {
@@ -38,6 +38,21 @@ func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	}
 	if result.Status != "completed" || result.Summary != "done" || result.Stdout != "ok" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "worker.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {
 		t.Fatalf("result = %#v, want propagated agent result fields", result)
+	}
+}
+
+func TestProjectOwnerMentionOpenIDsUsesLooperOwnerNotProductOwner(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{Projects: []config.ProjectRefConfig{{
+		ID:           "project_1",
+		Owner:        &config.FeishuActorConfig{FeishuOpenID: "ou_looper_owner"},
+		ProductOwner: &config.ProductOwnerConfig{FeishuOpenID: "ou_product_owner"},
+	}}}
+
+	got := projectOwnerMentionOpenIDs(cfg, "project_1")
+	if len(got) != 1 || got[0] != "ou_looper_owner" {
+		t.Fatalf("projectOwnerMentionOpenIDs() = %v, want [ou_looper_owner]", got)
 	}
 }
 
@@ -294,6 +309,40 @@ func TestRunDefaultSchedulerTickSecondClaimPassDoesNotExceedAvailableSlots(t *te
 	}
 	if got := atomic.LoadInt32(&wakes); got != 0 {
 		t.Fatalf("scheduler wake requests = %d, want none when discovered work could not be claimed", got)
+	}
+}
+
+func TestSchedulerAvailableSlotsCountsRunningRunWhenQueueWasRequeued(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-running-run-cap.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := "2026-07-16T11:07:45.000Z"
+	projectID := "project_1"
+	loopID := "loop_prepare_work"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: workingDir, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_prepare_work", LoopID: loopID, Status: "running", CurrentStep: stringPtr("prepare-work"), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	queued := schedulerTestQueueItem("queue_requeued_while_running", "worker", nowISO)
+	queued.LoopID = &loopID
+	queued.ProjectID = &projectID
+	if err := repos.Queue.Upsert(context.Background(), queued); err != nil {
+		t.Fatal(err)
+	}
+
+	available, err := schedulerAvailableSlots(context.Background(), repos, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available != 0 {
+		t.Fatalf("schedulerAvailableSlots() = %d, want 0 while persisted run is active despite queued queue row", available)
 	}
 }
 

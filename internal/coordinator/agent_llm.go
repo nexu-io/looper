@@ -50,5 +50,11 @@ func (l agentLLM) Complete(ctx context.Context, req triage.Request) (string, err
 	if strings.TrimSpace(result.Stdout) == "" {
 		return "", fmt.Errorf("coordinator triage returned empty stdout")
 	}
+	// opencode (--format json) wraps the reply in JSONL text events; the caller
+	// json.Unmarshals this, so hand back the assistant text, not the raw blob. Other
+	// vendors print the answer plainly and fall through unchanged.
+	if text, ok := agent.OpenCodeAssistantText(result.Stdout); ok {
+		return text, nil
+	}
 	return strings.TrimSpace(result.Stdout), nil
 }

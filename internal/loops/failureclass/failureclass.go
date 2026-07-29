@@ -3,7 +3,9 @@ package failureclass
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"strings"
+	"syscall"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 )
@@ -38,8 +40,10 @@ type Kind string
 const (
 	RetryableTransient   Kind = "retryable_transient"
 	RetryableAfterResume Kind = "retryable_after_resume"
+	RecoverableInfra     Kind = "recoverable_infra"
 	NonRetryable         Kind = "non_retryable"
 	ManualIntervention   Kind = "manual_intervention"
+	HITLInterrupt        Kind = "hitl_interrupt"
 )
 
 type Context struct {
@@ -86,6 +90,9 @@ func Classify(err error, ctx Context) Kind {
 	if message == "" {
 		message = strings.ToLower(err.Error())
 	}
+	if isRecoverableInfra(err, message, ctx.Boundary) {
+		return RecoverableInfra
+	}
 	if isManualWorktreeMessage(message) || ctx.Boundary == BoundaryLocalWorktree {
 		return ManualIntervention
 	}
@@ -99,6 +106,61 @@ func Classify(err error, ctx Context) Kind {
 		return RetryableTransient
 	}
 	return NonRetryable
+}
+
+func isRecoverableInfra(err error, message string, boundary Boundary) bool {
+	// Resource exhaustion is an environmental condition regardless of which
+	// operation happened to observe it. Retrying it under its own class lets the
+	// runtime wait for the condition reconciler instead of spending agent turns.
+	for _, target := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EMFILE, syscall.ENFILE, syscall.EAGAIN, syscall.ENOMEM} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	for _, fragment := range []string{
+		"no space left on device",
+		"disk quota exceeded",
+		"too many open files",
+		"resource temporarily unavailable",
+		"cannot allocate memory",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+
+	// ENOENT is recoverable only at boundaries backed by disposable local
+	// infrastructure. At API/config boundaries it can describe a genuinely
+	// missing target or executable and must retain the boundary's normal policy.
+	if recoverableMissingPathBoundary(boundary) && (errors.Is(err, fs.ErrNotExist) || strings.Contains(message, "no such file or directory")) {
+		return true
+	}
+	if strings.Contains(message, "fork/exec") && strings.Contains(message, "no such file or directory") {
+		return true
+	}
+	if boundary == BoundaryLocalWorktree || boundary == BoundaryGitLocal || boundary == BoundaryGitRemote {
+		for _, fragment := range []string{
+			"missing worktree",
+			"worktree path does not exist",
+			"stale worktree",
+			"worktree is stale",
+			"not a git repository",
+		} {
+			if strings.Contains(message, fragment) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func recoverableMissingPathBoundary(boundary Boundary) bool {
+	switch boundary {
+	case BoundaryLocalWorktree, BoundaryGitLocal, BoundaryGitRemote, BoundaryAgentProcess:
+		return true
+	default:
+		return false
+	}
 }
 
 func isExternalBoundary(boundary Boundary) bool {

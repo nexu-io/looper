@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -251,14 +252,14 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		}
 	})
 
-	t.Run("SendHITLAsk posts a card with option buttons carrying loop seq + answer", func(t *testing.T) {
+	t.Run("SendHITLAsk posts a one-way card with exact action URL", func(t *testing.T) {
 		t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
 		t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
 
 		var calls []capturedFeishuCall
 		gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
 
-		if err := gateway.SendHITLAsk(ctx, HITLAskCard{ProjectID: "od", LoopSeq: 71, Repo: "acme/looper", Title: "Which datastore?", Question: "Redis or Postgres for the cache?", Options: []string{"redis", "postgres"}}); err != nil {
+		if err := gateway.SendHITLAsk(ctx, HITLAskCard{ProjectID: "od", LoopSeq: 71, Repo: "acme/looper", Title: "Which datastore?", Question: "Redis or Postgres for the cache?", Options: []string{"redis", "postgres"}, SourceURL: "https://github.com/acme/looper/pull/7#issuecomment-71"}); err != nil {
 			t.Fatalf("SendHITLAsk() error = %v", err)
 		}
 		if len(calls) != 2 {
@@ -277,9 +278,8 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 		if !strings.Contains(envelope.Content, "Redis or Postgres") {
 			t.Fatalf("card missing question: %s", envelope.Content)
 		}
-		// Each option becomes a button whose value carries loopSeq + answer.
-		if !strings.Contains(envelope.Content, `"loopSeq":"71"`) || !strings.Contains(envelope.Content, `"answer":"redis"`) || !strings.Contains(envelope.Content, `"answer":"postgres"`) {
-			t.Fatalf("card missing option buttons with loopSeq/answer values: %s", envelope.Content)
+		if !strings.Contains(envelope.Content, "https://github.com/acme/looper/pull/7#issuecomment-71") || strings.Contains(envelope.Content, `"answer":"redis"`) {
+			t.Fatalf("card must deep-link outward without callback values: %s", envelope.Content)
 		}
 	})
 
@@ -316,6 +316,146 @@ func TestGatewayFeishuAppChannel(t *testing.T) {
 	})
 }
 
+func TestFeishuCardOutboxRetriesAndCreatesRunlessCoordinatorAnchor(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+	ctx := context.Background()
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	projectID := "project_1"
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: eventISO(now), UpdatedAt: eventISO(now)}); err != nil {
+		t.Fatal(err)
+	}
+	repo := "acme/looper"
+	target := "issue:acme/looper:42"
+	metadata := `{"issueNumber":42,"issueUrl":"https://plane.test/issues/42","title":"Runless intake"}`
+	loop := storage.LoopRecord{ID: "loop_coordinator", Seq: 42, ProjectID: projectID, Type: "coordinator", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running", MetadataJSON: &metadata, CreatedAt: eventISO(now), UpdatedAt: eventISO(now)}
+	if err := repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	messageAttempts := 0
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{Webhook: appModeConfig()}, Repositories: repos, Now: func() time.Time { return now },
+		FeishuAppHTTP: func(_ context.Context, _ string, url string, _ map[string]string, _ []byte) (int, []byte, error) {
+			if strings.Contains(url, "/auth/v3/tenant_access_token/internal") {
+				return 200, []byte(`{"code":0,"tenant_access_token":"token","expire":7200}`), nil
+			}
+			messageAttempts++
+			if messageAttempts <= 2 {
+				return 500, []byte(`{"code":1,"msg":"temporary"}`), nil
+			}
+			return 200, []byte(`{"code":0,"data":{"message_id":"om_` + strconv.Itoa(messageAttempts) + `"}}`), nil
+		},
+	})
+	err := gateway.PostThreadDecisionCard(ctx, loop.ID, "Choose A or B", "https://plane.test/pages/p#comment-c", []string{"ou_owner", "ou_extra"})
+	if err == nil {
+		t.Fatal("first delivery error = nil, want transient failure")
+	}
+	records, _ := repos.Notifications.List(ctx, 10)
+	if len(records) != 1 || records[0].Status != "pending" {
+		t.Fatalf("outbox after failure = %#v", records)
+	}
+	now = now.Add(15 * time.Second)
+	if retried, err := gateway.RetryPendingCards(ctx, 10); err != nil || retried != 1 {
+		t.Fatalf("RetryPendingCards() = %d, %v", retried, err)
+	}
+	records, _ = repos.Notifications.List(ctx, 10)
+	if records[0].Status != "delivered" || records[0].SentAt == nil {
+		t.Fatalf("outbox after retry = %#v", records[0])
+	}
+	root, err := repos.FeishuThreads.RootByLoop(ctx, loop.ID)
+	if err != nil || root == "" {
+		t.Fatalf("run-less coordinator root = %q, %v", root, err)
+	}
+	if runs, err := repos.Runs.ListByLoop(ctx, loop.ID); err != nil || len(runs) != 0 {
+		t.Fatalf("coordinator runs = %#v, %v; anchor must not require a run", runs, err)
+	}
+}
+
+func eventISO(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
+
+func TestFeishuHeaderFallbackNeverLeaksLoopID(t *testing.T) {
+	gateway := &Gateway{}
+	text := gateway.feishuThreadHeaderText(context.Background(), "loop_secret_internal_id")
+	if strings.Contains(text, "loop_secret_internal_id") {
+		t.Fatalf("fallback leaked internal loop id: %q", text)
+	}
+}
+
+func TestPostThreadApprovalCardUsesApprovalCopyAndSeparateMessageKey(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	var calls []capturedFeishuCall
+	gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+	ctx := context.Background()
+	now := eventISO(time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC))
+	if err := gateway.repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: "loop_approval", Seq: 42, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "completed", CreatedAt: now, UpdatedAt: now}
+	if err := gateway.repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gateway.PostThreadApprovalCard(ctx, loop.ID, "方案已通过 REVIEW", "https://plane.test/pages/spec#comment-review", []string{"ou_looper_owner"}); err != nil {
+		t.Fatalf("PostThreadApprovalCard() error = %v", err)
+	}
+	var bodies strings.Builder
+	for _, call := range calls {
+		bodies.Write(call.body)
+	}
+	posted := bodies.String()
+	if !strings.Contains(posted, "技术方案已完成 GRILL + REVIEW") || !strings.Contains(posted, "前往 Plane 审核") {
+		t.Fatalf("Feishu calls missing approval-specific copy: %s", posted)
+	}
+	if strings.Contains(posted, "这个需求有个地方需要你来拍板") {
+		t.Fatalf("approval card reused product-decision copy: %s", posted)
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, approvalCardMsgIDKey); got == "" {
+		t.Fatal("approval card message id was not persisted")
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, decisionCardMsgIDKey); got != "" {
+		t.Fatalf("product decision message id = %q, want empty", got)
+	}
+}
+
+func TestPostThreadProductSpecCardPointsToPlaneSpecWork(t *testing.T) {
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	var calls []capturedFeishuCall
+	gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+	ctx := context.Background()
+	now := eventISO(time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC))
+	if err := gateway.repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	loop := storage.LoopRecord{ID: "loop_product_spec", Seq: 43, ProjectID: "project_1", Type: "planner", TargetType: "issue", Status: "awaiting_human", CreatedAt: now, UpdatedAt: now}
+	if err := gateway.repositories.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gateway.PostThreadProductSpecCard(ctx, loop.ID, "请补齐首版范围", "https://plane.test/issues/582#comment-product", []string{"ou_product_owner"}); err != nil {
+		t.Fatalf("PostThreadProductSpecCard() error = %v", err)
+	}
+	var bodies strings.Builder
+	for _, call := range calls {
+		bodies.Write(call.body)
+	}
+	posted := bodies.String()
+	if !strings.Contains(posted, "请先补充产品 spec") || !strings.Contains(posted, "前往 Plane 补 spec") {
+		t.Fatalf("Feishu calls missing product-spec copy: %s", posted)
+	}
+	if strings.Contains(posted, "技术方案已完成") || strings.Contains(posted, "这个需求有个地方需要你来拍板") {
+		t.Fatalf("product-spec card reused another gate's copy: %s", posted)
+	}
+	if got := gateway.loopMetaString(ctx, loop.ID, decisionCardMsgIDKey); got == "" {
+		t.Fatal("product-spec card message id was not persisted")
+	}
+}
+
 func TestBuildFeishuAskCardRendersMention(t *testing.T) {
 	card, err := buildFeishuAskCard(HITLAskCard{
 		LoopSeq: 7, Repo: "acme/looper", Question: "A or B?",
@@ -338,6 +478,53 @@ func TestBuildFeishuAskCardRendersMention(t *testing.T) {
 	}
 	if strings.Contains(cardText(t, plain), "<at ") {
 		t.Fatalf("unexpected @-mention when none configured: %s", cardText(t, plain))
+	}
+}
+
+func TestFeishuCardsAttributeTheLocalLooperOwner(t *testing.T) {
+	card, err := buildFeishuAskCard(HITLAskCard{
+		LoopSeq: 9, Question: "是否继续?", Options: []string{"继续"}, OwnerOpenID: "ou_local_owner",
+	})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard() error = %v", err)
+	}
+	if raw := string(card); !strings.Contains(raw, "来自 ") || !strings.Contains(raw, "ou_local_owner") || !strings.Contains(raw, " 的 Looper") {
+		t.Fatalf("ask card missing local Looper owner attribution: %s", raw)
+	}
+
+	// Membership is deliberately not checked: an open_id outside the destination
+	// group is still emitted as an @ tag (Feishu may render it grey).
+	if card, ok := feishuLiveFeedCardWithOwner([]string{"✅ git status"}, 3, "ou_not_in_chat"); !ok || !strings.Contains(card, "ou_not_in_chat") || !strings.Contains(card, "来自 ") {
+		t.Fatalf("live card must preserve out-of-chat owner attribution: %q", card)
+	}
+
+	fallback, err := buildFeishuAskCard(HITLAskCard{LoopSeq: 10, Question: "A?", Options: []string{"A"}})
+	if err != nil {
+		t.Fatalf("buildFeishuAskCard(no owner) error = %v", err)
+	}
+	if !strings.Contains(string(fallback), "未配置 owner") {
+		t.Fatalf("missing-owner card should diagnose attribution config: %s", fallback)
+	}
+
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-07-17T12:00:00.000Z"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "open-design", Name: "Open Design", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	title := `{"worker":{"issueUrl":"https://plane.example/issues/582"},"issueTitle":"导出还原度"}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop-owner", Seq: 11, ProjectID: "open-design", Type: "planner", TargetType: "issue", Status: "running", MetadataJSON: &title, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewGateway(Options{Repositories: repos, ResolveOwnerOpenID: func(projectID string) string {
+		if projectID != "open-design" {
+			t.Fatalf("owner resolver project = %q", projectID)
+		}
+		return "ou_coworker_owner"
+	}})
+	anchor, ok := gateway.feishuThreadHeaderCard(context.Background(), "loop-owner")
+	if !ok || !strings.Contains(anchor, "ou_coworker_owner") || !strings.Contains(anchor, "来自 ") {
+		t.Fatalf("task anchor missing deployment owner attribution: %q", anchor)
 	}
 }
 
@@ -368,30 +555,13 @@ func TestBuildFeishuAskCardRendersDecisionBrief(t *testing.T) {
 		"https://github.com/nexu-io/synclo-test/issues/132", // clickable link
 		"由 @lefarcen 提出",                                    // trigger attribution
 		"README 都是中文",                                       // recommendation
-		"⭐ 中文 · 推荐",                                         // recommended option marked prominently
+		"⭐ 中文（推荐）",                                          // recommended option marked prominently
 		"置信度 中",                                             // confidence
 		"写\\\"Welcome",                                      // a consequence (quote json-escaped)
 	} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("decision-brief card missing %q\ncard=%s", want, raw)
 		}
-	}
-
-	// Answered state: buttons gone, "✅ 已选" shown, brief still present for review.
-	answered, err := buildFeishuAskCard(HITLAskCard{
-		LoopSeq: 132, Title: "welcome.txt 用哪种语言?", Question: "welcome.txt 用哪种语言?",
-		Options: []string{"中文", "英文"}, Recommendation: "README 都是中文,推荐中文。",
-		AnsweredWith: "中文",
-	})
-	if err != nil {
-		t.Fatalf("buildFeishuAskCard(answered) error = %v", err)
-	}
-	ar := string(answered)
-	if !strings.Contains(ar, "已选:中文") || !strings.Contains(ar, "已定夺") || !strings.Contains(ar, "README 都是中文") {
-		t.Fatalf("answered card missing selection or brief: %s", ar)
-	}
-	if strings.Contains(ar, `"tag":"action"`) {
-		t.Fatalf("answered card should have no clickable action buttons: %s", ar)
 	}
 
 	// A bare ask (no brief) must still render — the fields are optional.
@@ -422,6 +592,11 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if got := feishuPhaseFromTail([]string{"✅ git push -u origin feat/x"}); got != "正在推送分支" {
 		t.Fatalf("feishuPhaseFromTail(push) = %q; want 正在推送分支", got)
 	}
+	// An UNRECOGNISED command must never leak onto the human-scannable anchor as a
+	// raw shell line (P2: e.g. `tmpdir=$(mktemp -d …`) — it becomes a generic phase.
+	if got := feishuPhaseFromTail([]string{"✅ tmpdir=$(mktemp -d /private/tmp/looper.XXXX)"}); got != "正在处理…" || strings.Contains(got, "mktemp") {
+		t.Fatalf("feishuPhaseFromTail(unknown) = %q; want generic phase, no raw command", got)
+	}
 	// feishuAnchorBrief falls back to the phase when no summary is in metadata, and
 	// the live feed card carries the raw feed for the in-thread surface.
 	if brief := feishuAnchorBrief(nil, []string{"✅ gh pr create --fill"}); brief != "🔧 正在开 PR" {
@@ -430,8 +605,9 @@ func TestLiveStatusHelpers(t *testing.T) {
 	if _, ok := feishuLiveFeedCard(nil, 0); ok {
 		t.Fatalf("feishuLiveFeedCard(empty) should not render")
 	}
-	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || !strings.Contains(card, "实时进度同步") {
-		t.Fatalf("feishuLiveFeedCard missing header: %q", card)
+	// Header-less now — the body leads with 🔧 实时进度, so no separate title.
+	if card, ok := feishuLiveFeedCard([]string{"✅ git push"}, 90); !ok || strings.Contains(card, "\"header\"") || !strings.Contains(card, "🔧 实时进度") {
+		t.Fatalf("feishuLiveFeedCard: want header-less card with 🔧 实时进度 body, got %q", card)
 	}
 	// Milestone narrative renders "HH:MM · text".
 	ml := feishuMilestoneList([]loops.Milestone{{At: "2026-07-05T10:30:00.000Z", Text: "已定夺:中文"}, {At: "2026-07-05T10:50:00.000Z", Text: "🔀 已开 PR #9"}})
@@ -477,20 +653,251 @@ func TestLiveStatusHelpers(t *testing.T) {
 	}
 }
 
-func TestFeishuLoopStatusStyle(t *testing.T) {
-	cases := map[string]struct{ template, contains string }{
-		"awaiting_human": {"orange", "等你定夺"},
-		"completed":      {"green", "已完成"},
-		"failed":         {"red", "需要处理"},
-		"abandoned":      {"red", "需要处理"},
-		"running":        {"blue", "处理中"},
-		"":               {"blue", "处理中"},
+func TestFeishuLoopFlowchartStyle(t *testing.T) {
+	cases := []struct {
+		name         string
+		loopType     string
+		status       string
+		hasPR        bool
+		awaitingSpec bool
+		nodeHPhase   string
+		template     string
+		contains     string
+	}{
+		// Running lanes — the header names the flowchart node by role.
+		{"coordinator triages", "coordinator", "running", false, false, "", "blue", "分诊中"},
+		{"planner writes tech spec", "planner", "running", false, false, "", "blue", "编写技术方案中"},
+		{"worker implements", "worker", "running", false, false, "", "blue", "实现中"},
+		{"reviewer reviews", "reviewer", "running", false, false, "", "blue", "评审中"},
+		{"fixer fixes", "fixer", "running", false, false, "", "blue", "修复中"},
+		{"unknown role falls back", "", "running", false, false, "", "blue", "处理中"},
+		// node H sub-phases (planner spec pipeline).
+		{"grilling", "planner", "running", false, false, "grilling", "blue", "方案拷问中"},
+		{"reviewing", "planner", "running", false, false, "reviewing", "blue", "spec 评审中"},
+		{"awaiting human review", "planner", "running", false, false, "awaiting_human_review", "orange", "需要人类审核 spec"},
+		{"phase wins over generic completed", "planner", "completed", false, false, "grilling", "blue", "方案拷问中"},
+		// node E hold: product-spec wait wins over a node H phase and a generic ask.
+		{"planner awaits product spec", "planner", "awaiting_human", false, true, "", "orange", "等待产品方案"},
+		{"generic HITL ask", "worker", "awaiting_human", false, false, "", "orange", "等你定夺"},
+		{"awaiting spec while running", "planner", "running", false, true, "", "orange", "等待产品方案"},
+		// node H: a completed planner (no phase marker) awaits a human's approve.
+		{"planner completed → needs human review", "planner", "completed", false, false, "", "orange", "需要人类审核 spec"},
+		// Worker delivery + terminals. An OPEN PR is NOT delivered — a just-opened impl
+		// PR defaults to 待 review (never the old "已交付 · 待合并"); the real state is
+		// layered on from the PR snapshot (§A). 已交付 is reserved for a MERGED PR.
+		{"worker delivered a PR", "worker", "completed", true, false, "", "blue", "待 review"},
+		{"worker completed no PR", "worker", "completed", false, false, "", "green", "已完成"},
+		{"merged terminal", "worker", "merged", false, false, "", "green", "已合并"},
+		{"failed terminal", "worker", "failed", false, false, "", "red", "需要处理"},
+		{"abandoned terminal", "planner", "abandoned", false, false, "", "red", "需要处理"},
 	}
-	for status, want := range cases {
-		gotT, gotL := feishuLoopStatusStyle(status)
+	for _, want := range cases {
+		gotT, gotL := feishuLoopFlowchartStyle(want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase, "", 0)
 		if gotT != want.template || !strings.Contains(gotL, want.contains) {
-			t.Fatalf("feishuLoopStatusStyle(%q) = (%q, %q); want template %q label~%q", status, gotT, gotL, want.template, want.contains)
+			t.Fatalf("%s: feishuLoopFlowchartStyle(%q,%q,%v,%v,%q) = (%q,%q); want template %q label~%q", want.name, want.loopType, want.status, want.hasPR, want.awaitingSpec, want.nodeHPhase, gotT, gotL, want.template, want.contains)
 		}
+	}
+	// A just-opened impl PR must never say 已交付, and carries its PR number when known.
+	if tpl, label := feishuLoopFlowchartStyle("worker", "completed", true, false, "", "", 907); tpl != "blue" || !strings.Contains(label, "待 review") || !strings.Contains(label, "PR #907") || strings.Contains(label, "已交付") {
+		t.Fatalf("delivered worker PR = (%q,%q); want blue 待 review · PR #907, never 已交付", tpl, label)
+	}
+}
+
+func TestIntakeOutcomeStyle(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		outcome  string
+		ok       bool
+		template string
+		contains string
+	}{
+		{"routed_plan", true, "blue", "写技术方案"},
+		{"routed_worker", true, "blue", "待实现"},
+		{"hold_product", true, "orange", "等待产品方案"},
+		{"needs_human", true, "orange", "转人工"},
+		{"out_of_scope", true, "grey", "超出范围"},
+		{"OUT_OF_SCOPE", true, "grey", "超出范围"}, // case-insensitive
+		{"unknown", false, "", ""},
+		{"", false, "", ""},
+	}
+	for _, tc := range cases {
+		got, ok := intakeOutcomeStyle(tc.outcome)
+		if ok != tc.ok {
+			t.Fatalf("intakeOutcomeStyle(%q) ok = %v, want %v", tc.outcome, ok, tc.ok)
+		}
+		if !tc.ok {
+			continue
+		}
+		if got.template != tc.template || !strings.Contains(got.label, tc.contains) {
+			t.Fatalf("intakeOutcomeStyle(%q) = (%q,%q); want template %q label~%q", tc.outcome, got.template, got.label, tc.template, tc.contains)
+		}
+	}
+}
+
+func TestAnchorOutcomeOverrideRoundTrip(t *testing.T) {
+	t.Parallel()
+	g := &Gateway{}
+	if _, ok := g.anchorOutcomeOverride("loop-x"); ok {
+		t.Fatal("no override should exist before FinalizeIntakeAnchor")
+	}
+	// FinalizeIntakeAnchor with app-bot unconfigured still records the override (the
+	// RefreshThreadHeader tail no-ops), so the next render picks it up.
+	g.FinalizeIntakeAnchor(context.Background(), "loop-x", "needs_human")
+	style, ok := g.anchorOutcomeOverride("loop-x")
+	if !ok || !strings.Contains(style.label, "转人工") {
+		t.Fatalf("anchorOutcomeOverride(loop-x) = (%+v,%v); want the 转人工 override", style, ok)
+	}
+	// An unknown outcome records nothing (falls through to the loop's real status).
+	g.FinalizeIntakeAnchor(context.Background(), "loop-y", "mystery")
+	if _, ok := g.anchorOutcomeOverride("loop-y"); ok {
+		t.Fatal("an unknown outcome must not record an override")
+	}
+}
+
+func TestPRCardStateFromSnapshotMapsReviewCycle(t *testing.T) {
+	cases := []struct {
+		name       string
+		review     string
+		checks     string
+		labels     []string
+		unresolved int64
+		want       prCardState
+	}{
+		{"failing CI wins", "APPROVED", "success, failure", nil, 0, prCardStateChecksFailed},
+		{"changes requested", "CHANGES_REQUESTED", "success", nil, 0, prCardStateChangesRequested},
+		{"CI still running", "REVIEW_REQUIRED", "success, pending", nil, 0, prCardStateChecksRunning},
+		{"approved + green", "APPROVED", "success, success", nil, 0, prCardStateApproved},
+		{"awaiting review", "REVIEW_REQUIRED", "success", nil, 2, prCardStateReviewPending},
+		{"no decision yet", "", "", nil, 0, prCardStateReviewPending},
+		{"in_progress running", "", "in_progress", nil, 0, prCardStateChecksRunning},
+		// QA validation gate: APPROVED splits on the needs-validation / validated labels.
+		{"approved + needs-validation → awaiting QA", "APPROVED", "success", []string{"needs-validation"}, 0, prCardStateAwaitingValidation},
+		{"approved + validated → validated", "APPROVED", "success", []string{"validated"}, 0, prCardStateValidated},
+		{"approved + validated wins over needs-validation", "APPROVED", "success", []string{"needs-validation", "validated"}, 0, prCardStateValidated},
+		{"approved + no gate label → plain approved", "APPROVED", "success", []string{"enhancement"}, 0, prCardStateApproved},
+		{"needs-validation label is case-insensitive", "APPROVED", "success", []string{"Needs-Validation"}, 0, prCardStateAwaitingValidation},
+		// Failing CI still wins even when the QA labels are present.
+		{"failing CI beats needs-validation", "APPROVED", "failure", []string{"needs-validation"}, 0, prCardStateChecksFailed},
+	}
+	for _, tc := range cases {
+		got, ok := prCardStateFromSnapshot(tc.review, tc.checks, tc.labels, tc.unresolved)
+		if !ok || got != tc.want {
+			t.Fatalf("%s: prCardStateFromSnapshot(%q,%q,%v,%d) = %q,%v; want %q", tc.name, tc.review, tc.checks, tc.labels, tc.unresolved, got, ok, tc.want)
+		}
+	}
+}
+
+func TestPRCardStateStyleTitles(t *testing.T) {
+	cases := []struct {
+		state    prCardState
+		template string
+		contains string
+	}{
+		{prCardStateChecksFailed, "red", "CI 失败"},
+		{prCardStateChangesRequested, "orange", "待修改"},
+		{prCardStateChecksRunning, "blue", "CI 检查中"},
+		{prCardStateAwaitingValidation, "orange", "待 QA 验收"},
+		{prCardStateValidated, "turquoise", "验收通过"},
+		{prCardStateApproved, "turquoise", "待合并"},
+		{prCardStateReviewPending, "blue", "待 review"},
+	}
+	for _, tc := range cases {
+		gotT, gotL := prCardStateStyle(tc.state, "8")
+		if gotT != tc.template || !strings.Contains(gotL, tc.contains) || !strings.Contains(gotL, "PR #8") {
+			t.Fatalf("prCardStateStyle(%q) = (%q,%q); want template %q label~%q with PR #8", tc.state, gotT, gotL, tc.template, tc.contains)
+		}
+	}
+}
+
+func TestPRNumberFromTargetOrURL(t *testing.T) {
+	cases := []struct {
+		target string
+		prURL  string
+		want   int64
+	}{
+		{"pr:owner/repo:8", "", 8},
+		{"issue:owner/repo:3", "https://github.com/owner/repo/pull/12", 12},
+		{"", "https://github.com/owner/repo/pull/45", 45},
+		{"project:abc", "", 0},
+	}
+	for _, tc := range cases {
+		if got := prNumberFromTargetOrURL(tc.target, tc.prURL); got != tc.want {
+			t.Fatalf("prNumberFromTargetOrURL(%q,%q) = %d, want %d", tc.target, tc.prURL, got, tc.want)
+		}
+	}
+}
+
+func TestLoopIssueNumberReadsBothMetadataShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		meta string
+		want int64
+	}{
+		{"planner top-level", `{"loopType":"planner","issueNumber":42}`, 42},
+		{"worker nested", `{"worker":{"issueNumber":7,"issueUrl":"https://x/issues/7"}}`, 7},
+		{"numeric string", `{"issueNumber":"13"}`, 13},
+		{"none", `{"repo":"owner/repo"}`, 0},
+		{"empty", ``, 0},
+	}
+	for _, tc := range cases {
+		meta := tc.meta
+		if got := loopIssueNumber(&meta); got != tc.want {
+			t.Fatalf("%s: loopIssueNumber = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestLoopTaskKeyFromRecordCollapsesSiblingLoops(t *testing.T) {
+	repo := "owner/repo"
+	plannerMeta := `{"loopType":"planner","issueNumber":9}`
+	workerMeta := `{"worker":{"issueNumber":9}}`
+	planner := &storage.LoopRecord{Repo: &repo, MetadataJSON: &plannerMeta}
+	worker := &storage.LoopRecord{Repo: &repo, MetadataJSON: &workerMeta}
+	// Planner and worker for the same issue must derive the SAME task key → one card.
+	if pk, wk := loopTaskKeyFromRecord(planner), loopTaskKeyFromRecord(worker); pk != "issue:owner/repo:9" || pk != wk {
+		t.Fatalf("task keys planner=%q worker=%q; want both issue:owner/repo:9", pk, wk)
+	}
+	// No issue number → no task key (falls back to per-loop keying).
+	noIssueMeta := `{"repo":"owner/repo"}`
+	if k := loopTaskKeyFromRecord(&storage.LoopRecord{Repo: &repo, MetadataJSON: &noIssueMeta}); k != "" {
+		t.Fatalf("task key for issue-less loop = %q, want empty", k)
+	}
+	// No repo → no task key.
+	onlyIssueMeta := `{"issueNumber":5}`
+	if k := loopTaskKeyFromRecord(&storage.LoopRecord{MetadataJSON: &onlyIssueMeta}); k != "" {
+		t.Fatalf("task key without repo = %q, want empty", k)
+	}
+}
+
+func TestFeishuThreadHeaderCardLinksCheckpointIssueURL(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openNotifyCoordinator(t, t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-07-16T02:00:00.000Z"
+	projectID := "project_checkpoint_link"
+	loopID := "loop_checkpoint_link"
+	target := "issue:nexu-io/open-design:582"
+	repo := "nexu-io/open-design"
+	metadata := `{"issueNumber":582,"title":"High-fidelity export"}`
+	checkpoint := `{"issue":{"url":"https://plane.example/open-design/browse/OPEND-582"}}`
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Project", RepoPath: t.TempDir(), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "running", MetadataJSON: &metadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_checkpoint_link", LoopID: loopID, Status: "running", CheckpointJSON: &checkpoint, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	gateway := NewGateway(Options{Repositories: repos})
+	card, ok := gateway.feishuThreadHeaderCard(ctx, loopID)
+	if !ok {
+		t.Fatal("feishuThreadHeaderCard() did not render")
+	}
+	want := `[Issue #582](https://plane.example/open-design/browse/OPEND-582)`
+	if !strings.Contains(card, want) {
+		t.Fatalf("checkpoint issue reference is not clickable; want %q in %s", want, card)
 	}
 }
 
@@ -503,7 +910,7 @@ func TestGatewayStateSurvivesConfigSpecificGatewaySnapshots(t *testing.T) {
 	first := newFeishuAppGateway(t, appModeConfig(), &firstCalls, state)
 	second := newFeishuAppGateway(t, appModeConfig(), &secondCalls, state)
 	if err := first.SendHITLAsk(context.Background(), HITLAskCard{
-		LoopID: "loop_shared", LoopSeq: 42, Question: "Redis or Postgres?", Options: []string{"redis", "postgres"},
+		LoopID: "loop_shared", LoopSeq: 42, Question: "Redis or Postgres?", Options: []string{"redis", "postgres"}, SourceURL: "https://plane.example/issues/42",
 	}); err != nil {
 		t.Fatalf("first snapshot SendHITLAsk() error = %v", err)
 	}
@@ -559,4 +966,97 @@ func cardText(t *testing.T, card []byte) string {
 		parts = append(parts, e.Text.Content)
 	}
 	return strings.Join(parts, "\n")
+}
+
+func TestPRMergeStateFromSnapshot(t *testing.T) {
+	merged := `{"detail":{"State":"MERGED"},"diff":"..."}`
+	if s := prMergeStateFromSnapshot(&merged); s != "MERGED" {
+		t.Fatalf("merged = %q, want MERGED", s)
+	}
+	mergedAt := `{"detail":{"State":"OPEN","MergedAt":"2026-07-07T00:00:00Z"}}`
+	if s := prMergeStateFromSnapshot(&mergedAt); s != "MERGED" {
+		t.Fatalf("mergedAt = %q, want MERGED", s)
+	}
+	closed := `{"detail":{"State":"CLOSED"}}`
+	if s := prMergeStateFromSnapshot(&closed); s != "CLOSED" {
+		t.Fatalf("closed = %q, want CLOSED", s)
+	}
+	open := `{"detail":{"State":"OPEN"}}`
+	if s := prMergeStateFromSnapshot(&open); s != "OPEN" {
+		t.Fatalf("open = %q, want OPEN", s)
+	}
+	if s := prMergeStateFromSnapshot(nil); s != "" {
+		t.Fatalf("nil = %q, want empty", s)
+	}
+}
+
+// prLabelsFromSnapshot reads the PR labels the QA gate keys on out of a snapshot's
+// captured detail payload — the same {"detail":{"Labels":[...]}} shape both
+// github.CapturePullRequestSnapshot and github.SnapshotFromDetail marshal (the
+// PullRequestDetail struct has no json tags, so the field stays capitalized).
+func TestPRLabelsFromSnapshot(t *testing.T) {
+	withLabels := `{"detail":{"State":"OPEN","ReviewDecision":"APPROVED","Labels":["needs-validation","enhancement"]},"diff":"..."}`
+	got := prLabelsFromSnapshot(&withLabels)
+	if len(got) != 2 || got[0] != "needs-validation" || got[1] != "enhancement" {
+		t.Fatalf("prLabelsFromSnapshot = %v, want [needs-validation enhancement]", got)
+	}
+	// End-to-end through the state mapper: APPROVED + needs-validation → 🧪 待 QA 验收.
+	if state, ok := prCardStateFromSnapshot("APPROVED", "success", prLabelsFromSnapshot(&withLabels), 0); !ok || state != prCardStateAwaitingValidation {
+		t.Fatalf("APPROVED + needs-validation snapshot → %q,%v; want awaiting_validation", state, ok)
+	}
+	noLabels := `{"detail":{"State":"OPEN"}}`
+	if got := prLabelsFromSnapshot(&noLabels); got != nil {
+		t.Fatalf("no Labels field → %v, want nil", got)
+	}
+	if got := prLabelsFromSnapshot(nil); got != nil {
+		t.Fatalf("nil payload → %v, want nil", got)
+	}
+	garbage := `not json`
+	if got := prLabelsFromSnapshot(&garbage); got != nil {
+		t.Fatalf("garbage payload → %v, want nil", got)
+	}
+}
+
+// A worker loop shepherding its impl PR animates the card through the PR-driving
+// lane; the "ready" state reads 待合并 (a human merges — the bot never does), and
+// 🎉已合并 comes only from the terminal "merged" outcome, never from shepherding.
+func TestFeishuLoopFlowchartStyleShepherding(t *testing.T) {
+	cases := []struct {
+		phase    string
+		template string
+		contains string
+	}{
+		{"reviewing", "blue", "评审中"},
+		{"fixing", "blue", "修复中"},
+		{"awaiting_merge", "turquoise", "待合并"},
+		{"", "blue", "评审中"},
+	}
+	for _, c := range cases {
+		gotT, gotL := feishuLoopFlowchartStyle("worker", "shepherding", true, false, "", c.phase, 0)
+		if gotT != c.template || !strings.Contains(gotL, c.contains) {
+			t.Fatalf("shepherd phase %q = (%q,%q); want template %q label~%q", c.phase, gotT, gotL, c.template, c.contains)
+		}
+		if strings.Contains(gotL, "已合并") {
+			t.Fatalf("shepherding must never show 已合并 (only terminal merged does): phase %q → %q", c.phase, gotL)
+		}
+	}
+	// merged terminal wins regardless of shepherd phase
+	if _, label := feishuLoopFlowchartStyle("worker", "merged", true, false, "", "fixing", 0); !strings.Contains(label, "已合并") {
+		t.Fatalf("merged terminal must show 已合并, got %q", label)
+	}
+	// During a shepherd FIX pass the loop status is "running", not "shepherding" — the
+	// card must still show the shepherd phase, not drop back to the generic 实现中.
+	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "fixing", 0); !strings.Contains(label, "修复中") {
+		t.Fatalf("running shepherd fix pass must show 修复中, got %q", label)
+	}
+	if _, label := feishuLoopFlowchartStyle("worker", "running", true, false, "", "awaiting_validation", 0); !strings.Contains(label, "待验收") {
+		t.Fatalf("running shepherd (awaiting_validation) must show 待验收, got %q", label)
+	}
+	// A plain worker run with no shepherd marker still reads 实现中.
+	if _, label := feishuLoopFlowchartStyle("worker", "running", false, false, "", "", 0); !strings.Contains(label, "实现中") {
+		t.Fatalf("plain worker run must show 实现中, got %q", label)
+	}
+	if !feishuLoopAwaitingMerge("shepherding") {
+		t.Fatal("feishuLoopAwaitingMerge(shepherding) = false, want true (card should mirror PR state)")
+	}
 }

@@ -883,6 +883,37 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 			providers = append(providers, partialForgejoProvider(plan.ForgejoProviderID, plan.ForgejoURL, plan.ForgejoAuth, plan.ForgejoTokenEnv, plan.ForgejoTeaLogin))
 			partial.Providers = &providers
 		}
+	} else if plan.Provider == bootstrapProviderPlane {
+		providerID := planeBootstrapProviderID(plan.PlaneWorkspace)
+		candidate := planeBootstrapProviderConfig(plan)
+		providerExists := false
+		for _, provider := range normalized.Providers {
+			if provider.ID != providerID {
+				continue
+			}
+			providerExists = true
+			if !planeBootstrapProvidersEquivalent(provider, candidate) {
+				return false, false, fmt.Errorf("provider id %q already exists with different settings; pass --provider or use a separate config", providerID)
+			}
+			break
+		}
+		for _, project := range normalized.Projects {
+			if !samePath(project.RepoPath, plan.ProjectPath) {
+				continue
+			}
+			if project.Provider != providerID || project.Repo != plan.CodeRepo {
+				return false, false, fmt.Errorf("project %q already exists for %s but is not bound to Plane provider %q repository %q; remove or rebind the project first", project.ID, plan.ProjectPath, providerID, plan.CodeRepo)
+			}
+			return false, false, nil
+		}
+		if !providerExists {
+			providers := []config.PartialProviderConfig{}
+			if partial.Providers != nil {
+				providers = append(providers, (*partial.Providers)...)
+			}
+			providers = append(providers, partialPlaneBootstrapProvider(plan))
+			partial.Providers = &providers
+		}
 	} else if hasBootstrapProject(normalized.Projects, plan.ProjectPath) {
 		return false, false, nil
 	}
@@ -894,6 +925,10 @@ func (r *commandRuntime) ensureBootstrapConfig(configPath string, cwd string, pl
 	if plan.Provider == bootstrapProviderForgejo {
 		project.Provider = plan.ForgejoProviderID
 		project.Repo = plan.Repo
+	} else if plan.Provider == bootstrapProviderPlane {
+		project.Provider = planeBootstrapProviderID(plan.PlaneWorkspace)
+		project.Repo = plan.CodeRepo
+		project.Roles = planeBootstrapProjectRoles(plan.TriggerLabel)
 	}
 	projects = append(projects, partialProjectFromConfig(project))
 	partial.Projects = &projects
@@ -962,14 +997,7 @@ func applyForgejoBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
 // discovery keys on the label only (requireAssigneeCurrentUser=false).
 func applyPlaneBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
 	providerID := planeBootstrapProviderID(plan.PlaneWorkspace)
-	cfg.Providers = append(cfg.Providers, config.ProviderConfig{
-		ID:        providerID,
-		Kind:      config.ProviderKindPlane,
-		BaseURL:   plan.PlaneBaseURL,
-		TokenEnv:  stringPtr(plan.PlaneTokenEnv),
-		Workspace: stringPtr(plan.PlaneWorkspace),
-		ProjectID: stringPtr(plan.PlaneProject),
-	})
+	cfg.Providers = append(cfg.Providers, planeBootstrapProviderConfig(plan))
 
 	projectName := filepath.Base(plan.ProjectPath)
 	if strings.TrimSpace(projectName) == "" || projectName == "." || projectName == string(filepath.Separator) {
@@ -982,18 +1010,63 @@ func applyPlaneBootstrapPlan(cfg *config.Config, plan bootstrapConfigPlan) {
 		Repo:       plan.CodeRepo,
 		RepoPath:   plan.ProjectPath,
 		BaseBranch: stringPtr(cfg.Defaults.BaseBranch),
+		Roles:      planeBootstrapProjectRoles(plan.TriggerLabel),
 	})
+}
 
-	label := plan.TriggerLabel
-	if strings.TrimSpace(label) == "" {
+func planeBootstrapProviderConfig(plan bootstrapConfigPlan) config.ProviderConfig {
+	return config.ProviderConfig{
+		ID:        planeBootstrapProviderID(plan.PlaneWorkspace),
+		Kind:      config.ProviderKindPlane,
+		BaseURL:   plan.PlaneBaseURL,
+		TokenEnv:  stringPtr(plan.PlaneTokenEnv),
+		Workspace: stringPtr(plan.PlaneWorkspace),
+		ProjectID: stringPtr(plan.PlaneProject),
+	}
+}
+
+func partialPlaneBootstrapProvider(plan bootstrapConfigPlan) config.PartialProviderConfig {
+	kind := config.ProviderKindPlane
+	provider := planeBootstrapProviderConfig(plan)
+	return config.PartialProviderConfig{
+		ID: provider.ID, Kind: &kind, BaseURL: stringPtr(provider.BaseURL), TokenEnv: provider.TokenEnv,
+		Workspace: provider.Workspace, ProjectID: provider.ProjectID,
+	}
+}
+
+func planeBootstrapProvidersEquivalent(existing, candidate config.ProviderConfig) bool {
+	return existing.Kind == candidate.Kind &&
+		strings.TrimRight(existing.BaseURL, "/") == strings.TrimRight(candidate.BaseURL, "/") &&
+		stringPointerValue(existing.TokenEnv) == stringPointerValue(candidate.TokenEnv) &&
+		stringPointerValue(existing.Workspace) == stringPointerValue(candidate.Workspace) &&
+		stringPointerValue(existing.ProjectID) == stringPointerValue(candidate.ProjectID)
+}
+
+func stringPointerValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
+func planeBootstrapProjectRoles(triggerLabel string) *config.PartialRoleConfigs {
+	label := strings.TrimSpace(triggerLabel)
+	if label == "" {
 		label = defaultBootstrapTriggerText
 	}
-	cfg.Roles.Planner.Triggers.Labels = []string{label}
-	cfg.Roles.Planner.Triggers.LabelMode = config.LabelModeAll
-	cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser = false
-	cfg.Roles.Worker.Triggers.Labels = []string{label}
-	cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
-	cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+	labels := []string{label}
+	labelMode := config.LabelModeAll
+	requireAssignee := false
+	preSpecDecisionGrill := true
+	triggers := func() *config.PartialIssueRoleTriggersConfig {
+		return &config.PartialIssueRoleTriggersConfig{
+			Labels: &labels, LabelMode: &labelMode, RequireAssigneeCurrentUser: &requireAssignee,
+		}
+	}
+	return &config.PartialRoleConfigs{
+		Planner: &config.PartialPlannerRoleConfig{PreSpecDecisionGrill: &preSpecDecisionGrill, Triggers: triggers()},
+		Worker:  &config.PartialWorkerRoleConfig{Triggers: triggers()},
+	}
 }
 
 func planeBootstrapProviderID(workspace string) string {

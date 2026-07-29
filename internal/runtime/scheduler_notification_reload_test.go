@@ -81,7 +81,7 @@ func TestCatalogSchedulerPreservesNotificationTransportAcrossConfigSnapshots(t *
 		t.Fatal("first catalog snapshot did not expose its worker HITL notification path")
 	}
 	if err := firstInput.OnHITLAsk(context.Background(), worker.HITLAskNotification{
-		LoopID: "loop_shared", LoopSeq: 42, Question: "Redis or Postgres?", Options: []string{"redis", "postgres"},
+		LoopID: "loop_shared", LoopSeq: 42, Question: "Redis or Postgres?", Options: []string{"redis", "postgres"}, SourceURL: "https://plane.example/issues/42",
 	}); err != nil {
 		t.Fatalf("first snapshot worker HITL notification error = %v", err)
 	}
