@@ -97,6 +97,91 @@ func TestHandlerLoopDetailManualInterventionRecoverySurface(t *testing.T) {
 	assertEqual(t, hitlDetail["displayStatus"], "awaiting_human")
 }
 
+// After MI recovery, suspendForHuman sets loop=awaiting_human and CancelByLoop
+// marks the queue cancelled without clearing last_error_kind. HITL must win so
+// Loop Detail keeps displayStatus=awaiting_human (decision card), not MI recovery.
+func TestHandlerLoopDetailAwaitingHumanSupersedesStaleManualErrorKind(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	lastErrorKind := "manual_intervention"
+	lastError := "dirty worker worktree: uncommitted local changes"
+	projectID := "project_recovery_hitl_stale_kind"
+	loopID := "loop_recovery_hitl_stale_kind"
+	targetID := projectID
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	runError := "checkpoint hold: operator must inspect worktree"
+	meta := `{"hitl":{"question":"Ship it?","options":["yes","no"],"status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "HITL supersedes stale MI", RepoPath: "/tmp/repos/hitl-stale-mi",
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 6177, ProjectID: projectID, Type: "fixer",
+		TargetType: "project", TargetID: &targetID, Status: "awaiting_human",
+		MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert error = %v", err)
+	}
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_recovery_hitl_stale_kind", LoopID: loopID, Status: "failed",
+		CheckpointJSON: &checkpoint, ErrorMessage: &runError, StartedAt: nowISO,
+		EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert error = %v", err)
+	}
+	// Mirrors CancelByLoop after suspendForHuman: cancelled queue retains
+	// last_error_kind=manual_intervention from the prior recovery hold.
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_recovery_hitl_stale_kind", ProjectID: &projectID, LoopID: &loopID, Type: "fixer",
+		TargetType: "project", TargetID: targetID, DedupeKey: "fixer:recovery_hitl_stale_kind",
+		Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO,
+		Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
+		FinishedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert error = %v", err)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6177", nil)
+	detailRec := httptest.NewRecorder()
+	h.ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
+	}
+	detail := parseJSONMap(t, detailRec.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, detail["status"], "awaiting_human")
+	assertEqual(t, detail["displayStatus"], "awaiting_human")
+	// Historical MI diagnostics may still be present for operators, but must not
+	// override HITL displayStatus / recovery-card gating.
+	assertEqual(t, detail["lastFailureKind"], "manual_intervention")
+	assertEqual(t, detail["resumePolicy"], "manual_intervention")
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops?limit=100", nil)
+	listRec := httptest.NewRecorder()
+	h.ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200; body=%s", listRec.Code, listRec.Body.String())
+	}
+	items := parseJSONMap(t, listRec.Body.Bytes())["data"].(map[string]any)["items"].([]any)
+	found := false
+	for _, raw := range items {
+		item := raw.(map[string]any)
+		if item["id"] != loopID {
+			continue
+		}
+		found = true
+		assertEqual(t, item["status"], "awaiting_human")
+		assertEqual(t, item["displayStatus"], "awaiting_human")
+	}
+	if !found {
+		t.Fatalf("list items missing loop %s: %#v", loopID, items)
+	}
+}
+
 // Startup recovery requeues running→queued while intentionally retaining
 // last_error_kind=manual_intervention. Active queue status must supersede that
 // stale kind so Loop Detail does not show an action-required recovery card.

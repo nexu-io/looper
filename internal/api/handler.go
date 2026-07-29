@@ -1948,9 +1948,25 @@ type loopResponse struct {
 	Repo       *string `json:"repo"`
 	PRNumber   *int64  `json:"prNumber"`
 	Status     string  `json:"status"`
-	// DisplayStatus is a dashboard-facing projection of durable queue/checkpoint
-	// facts (e.g. manual_intervention, backing_off). It never becomes a true loop
-	// status; clients must keep Status as the authority for mutations.
+	// DisplayStatus is a read-only, non-persisted dashboard projection of durable
+	// queue/checkpoint facts (e.g. manual_intervention, backing_off). It never
+	// becomes a true loop status; clients must keep Status as the authority for
+	// mutations and lifecycle transitions.
+	//
+	// Trade-off (AGENTS.md new-concept checklist):
+	//   Failure prevented: operators could not see why automation stopped when
+	//   loop.Status stayed paused/failed/queued while queue last_error_kind or
+	//   checkpoint resumePolicy already encoded a hard hold — without a
+	//   projection, the recovery card would re-parse diagnostics ad hoc or the
+	//   daemon would need a new true loop status (rejected).
+	//   Costs: DisplayStatus must stay in sync with decorateActiveRunView and
+	//   decorateLoopDiagnostics; active queue, closed loops, and awaiting_human
+	//   must win over stale retained kinds; empty projection falls back to
+	//   Status so list/detail never invent a third authority.
+	//   Why not Status + diagnostics alone: Status is lifecycle authority and
+	//   does not carry hold semantics; exposing lastFailureKind/resumePolicy raw
+	//   forces every client to reimplement supersede rules (active queue, HITL,
+	//   closed loops). Centralizing projection keeps one contract for the card.
 	DisplayStatus string  `json:"displayStatus,omitempty"`
 	ConfigJSON    *string `json:"configJson"`
 	MetadataJSON  *string `json:"metadataJson"`
@@ -3459,9 +3475,17 @@ func queueIsActiveAutomation(item *storage.QueueItemRecord) bool {
 // projectManualInterventionDisplayStatus chooses displayStatus using durable
 // queue facts. Active queued/running items win over a retained last_error_kind
 // and over a stale run resumePolicy; only then is resumePolicy consulted.
-// Closed loops keep their true status.
+// Closed loops and awaiting_human keep their true status (HITL is authoritative
+// even when CancelByLoop left last_error_kind=manual_intervention on a
+// cancelled queue item).
 func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) string {
 	if isClosedLoopStatus(loopStatus) {
+		return ""
+	}
+	// HITL suspension owns the operator UX (decision card). Do not re-project
+	// stale manual_intervention diagnostics from a cancelled prior queue item
+	// or an old checkpoint hold while the loop is awaiting_human.
+	if domain.LoopStatus(strings.TrimSpace(loopStatus)) == domain.LoopStatusAwaitingHuman {
 		return ""
 	}
 	// Prefer active queue (queued/running after recovery requeue or retry) over
