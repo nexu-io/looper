@@ -269,4 +269,18 @@ describe("LoopActionBar retry dirty UX", () => {
     });
     expect(retryLoop).not.toHaveBeenCalled();
   });
+
+  it("disables Unpause when displayStatus is manual_intervention", () => {
+    renderBar({ displayStatus: "manual_intervention", status: "paused" });
+    const unpause = screen.getByRole("button", { name: "Unpause" });
+    expect(unpause).toHaveProperty("disabled", true);
+    fireEvent.click(unpause);
+    expect(startLoop).not.toHaveBeenCalled();
+  });
+
+  it("enables Unpause when paused without manual_intervention projection", () => {
+    renderBar({ status: "paused" });
+    const unpause = screen.getByRole("button", { name: "Unpause" });
+    expect(unpause).toHaveProperty("disabled", false);
+  });
 });

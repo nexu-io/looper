@@ -388,6 +388,62 @@ describe("RecoveryCard", () => {
     });
   });
 
+  it("keeps takeover result dialog after refresh flips to human_takeover", async () => {
+    fetchLoopWorktree.mockRejectedValue(new Error("worktree endpoint down"));
+    takeoverLoop.mockResolvedValue({
+      loopId: "loop_1",
+      supported: true,
+      worktreePath: "/tmp/takeover-wt",
+      resumeCommand: "codex resume abc",
+      message: "Loop parked for interactive work",
+    });
+    const onMutated = vi.fn().mockResolvedValue(undefined);
+
+    const { rerender } = render(
+      <ToastProvider>
+        <RecoveryCard
+          loop={baseLoop({ status: "running" })}
+          selector="617"
+          hasActiveRun
+          onMutated={onMutated}
+        />
+      </ToastProvider>,
+    );
+
+    await screen.findByText(/no safe worktree repair path/i);
+    fireEvent.click(screen.getByRole("button", { name: "Takeover" }));
+    const confirm = await screen.findByRole("dialog");
+    fireEvent.click(within(confirm).getByRole("button", { name: "Takeover" }));
+
+    await waitFor(() => {
+      expect(takeoverLoop).toHaveBeenCalledWith("617");
+      expect(onMutated).toHaveBeenCalled();
+    });
+
+    // Simulate detail refresh: loop is now human_takeover so recovery card
+    // projection ends — result dialog must remain usable.
+    rerender(
+      <ToastProvider>
+        <RecoveryCard
+          loop={baseLoop({
+            status: "human_takeover",
+            displayStatus: "human_takeover",
+            lastFailureKind: null,
+            lastFailureReason: null,
+          })}
+          selector="617"
+          onMutated={onMutated}
+        />
+      </ToastProvider>,
+    );
+
+    expect(screen.queryByText(/Manual intervention required/i)).toBeNull();
+    const result = await screen.findByRole("dialog");
+    expect(within(result).getByText(/Takeover result/i)).toBeTruthy();
+    expect(within(result).getByText("/tmp/takeover-wt")).toBeTruthy();
+    expect(within(result).getByText("codex resume abc")).toBeTruthy();
+  });
+
   it("clears stale worktree UI when the selector changes", async () => {
     fetchLoopWorktree.mockImplementation(async (selector: string) => {
       if (selector === "617") {

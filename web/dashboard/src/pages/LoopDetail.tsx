@@ -566,6 +566,7 @@ export function LoopDetailPage() {
           <LoopActionBar
             selector={String(data.seq)}
             status={data.status}
+            displayStatus={data.displayStatus}
             hasActiveRun={hasActiveRun}
             onMutated={onMutated}
             mode="full"

@@ -92,6 +92,22 @@ export function RecoveryCard({
     setInlineError(null);
   }, []);
 
+  // Hide recovery-only UI when the card is no longer projected, but keep
+  // takeoverResult so the post-takeover dialog survives onMutated refresh
+  // (status → human_takeover clears displayStatus=manual_intervention).
+  const clearRecoveryUiKeepTakeover = useCallback(() => {
+    setWorktree(null);
+    setWorktreeError(null);
+    setFetchFailed(false);
+    setLoadingWt(false);
+    setPending(null);
+    setConfirmDiscard(false);
+    setConfirmStop(false);
+    setConfirmTakeover(false);
+    setInspectOpen(false);
+    setInlineError(null);
+  }, []);
+
   const loadWorktree = useCallback(
     async (signal?: AbortSignal) => {
       if (!visible) return;
@@ -123,18 +139,21 @@ export function RecoveryCard({
     [selector, visible],
   );
 
-  // Read-only preflight on mount / selector change — never mutates loop state.
-  // Reset is synchronous in the effect body so a mid-flight response from the
-  // previous selector cannot paint under the new one (abort still races paint).
+  // Full reset only on selector change (not when visibility flips after takeover).
   useEffect(() => {
     resetLoopScopedState();
+  }, [selector, resetLoopScopedState]);
+
+  // Read-only preflight when the recovery card is projected — never mutates loop state.
+  useEffect(() => {
     if (!visible) {
+      clearRecoveryUiKeepTakeover();
       return;
     }
     const controller = new AbortController();
     void loadWorktree(controller.signal);
     return () => controller.abort();
-  }, [selector, visible, loadWorktree, resetLoopScopedState]);
+  }, [selector, visible, loadWorktree, clearRecoveryUiKeepTakeover]);
 
   const decision = useMemo(
     () => recoveryWorktreeDecision(worktree, { fetchFailed }),
@@ -281,345 +300,352 @@ export function RecoveryCard({
     }
   }, [busy, actions.stop, selector, toast, onMutated]);
 
-  if (!visible) return null;
+  // Takeover result must render even when visible becomes false after refresh
+  // (human_takeover clears the recovery projection). Without this, the dialog
+  // with worktree path + resume command only flashes or never appears.
+  if (!visible && !takeoverResult) return null;
 
   return (
     <>
-      <Card
-        title="Manual intervention required"
-        className="border-[var(--warn)]"
-        actions={
-          <span className="mono text-[10px] uppercase tracking-wide text-[var(--warn)]">
-            recovery
-          </span>
-        }
-      >
-        <div className="flex flex-col gap-3">
-          <p className="m-0 text-[12px] text-[var(--text-muted)]">
-            Automation stopped. Review the durable failure reason and worktree
-            facts, then take an explicit recovery action. Viewing this card does
-            not acknowledge or advance the loop.
-          </p>
-
-          <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
-            <div className="mb-1 text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-              Failure reason
-            </div>
-            <p className="m-0 whitespace-pre-wrap break-words text-[13px]">
-              {reason}
-            </p>
-            {loop.lastFailureKind?.trim() ? (
-              <p className="mt-1 mb-0 mono text-[11px] text-[var(--text-muted)]">
-                kind: {loop.lastFailureKind.trim()}
-              </p>
-            ) : null}
-          </div>
-
-          <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
-            <div className="mb-1 flex items-center justify-between gap-2">
-              <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                Worktree
+      {visible ? (
+        <>
+          <Card
+            title="Manual intervention required"
+            className="border-[var(--warn)]"
+            actions={
+              <span className="mono text-[10px] uppercase tracking-wide text-[var(--warn)]">
+                recovery
               </span>
-              {loadingWt ? (
-                <span className="text-[10px] text-[var(--text-muted)]">
-                  loading…
-                </span>
-              ) : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => void loadWorktree()}
-                >
-                  Refresh
-                </Button>
-              )}
-            </div>
-            {worktreeError ? (
-              <p className="m-0 text-[11px] text-[var(--danger)]">
-                {worktreeError}
+            }
+          >
+            <div className="flex flex-col gap-3">
+              <p className="m-0 text-[12px] text-[var(--text-muted)]">
+                Automation stopped. Review the durable failure reason and worktree
+                facts, then take an explicit recovery action. Viewing this card does
+                not acknowledge or advance the loop.
               </p>
-            ) : null}
-            <dl className="m-0 grid gap-1 text-[12px]">
-              <div className="grid grid-cols-[90px_1fr] gap-2">
-                <dt className="text-[var(--text-muted)]">Path</dt>
-                <dd className="m-0 flex items-start gap-1 break-all mono">
-                  <span className="min-w-0 flex-1">
-                    {worktree?.worktreePath?.trim() || "—"}
-                  </span>
-                  {worktree?.worktreePath?.trim() ? (
-                    <CopyButton text={worktree.worktreePath} />
-                  ) : null}
-                </dd>
-              </div>
-              <div className="grid grid-cols-[90px_1fr] gap-2">
-                <dt className="text-[var(--text-muted)]">Present</dt>
-                <dd className="m-0 mono">
-                  {worktree
-                    ? worktree.present
-                      ? "yes"
-                      : "no"
-                    : fetchFailed
-                      ? "—"
-                      : loadingWt
-                        ? "…"
-                        : "—"}
-                </dd>
-              </div>
-              <div className="grid grid-cols-[90px_1fr] gap-2">
-                <dt className="text-[var(--text-muted)]">Ownership</dt>
-                <dd className="m-0 mono">{ownershipLabel(worktree)}</dd>
-              </div>
-              <div className="grid grid-cols-[90px_1fr] gap-2">
-                <dt className="text-[var(--text-muted)]">Dirty</dt>
-                <dd className="m-0 mono">{dirtyLabel(worktree)}</dd>
-              </div>
-              {worktree?.branch ? (
-                <div className="grid grid-cols-[90px_1fr] gap-2">
-                  <dt className="text-[var(--text-muted)]">Branch</dt>
-                  <dd className="m-0 mono">{worktree.branch}</dd>
+
+              <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                  Failure reason
                 </div>
-              ) : null}
-              {worktree?.reason ? (
-                <div className="grid grid-cols-[90px_1fr] gap-2">
-                  <dt className="text-[var(--text-muted)]">Preflight</dt>
-                  <dd className="m-0 mono">{worktree.reason}</dd>
-                </div>
-              ) : null}
-            </dl>
-          </div>
-
-          <p className="m-0 text-[12px]">{recoveryGuidance(decision)}</p>
-
-          <div className="flex flex-wrap items-center gap-1.5">
-            {recommendsRetry && actions.retry ? (
-              <Button
-                size="sm"
-                disabled={busy}
-                onClick={() => void onRetry()}
-              >
-                {pending === "retry" ? "…" : "Retry"}
-              </Button>
-            ) : null}
-
-            {decision === "offer-discard" ? (
-              <>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => setInspectOpen(true)}
-                >
-                  Inspect / Jump
-                </Button>
-                {actions.retry ? (
-                  <Button
-                    variant="danger"
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => setConfirmDiscard(true)}
-                  >
-                    Discard &amp; Retry
-                  </Button>
+                <p className="m-0 whitespace-pre-wrap break-words text-[13px]">
+                  {reason}
+                </p>
+                {loop.lastFailureKind?.trim() ? (
+                  <p className="mt-1 mb-0 mono text-[11px] text-[var(--text-muted)]">
+                    kind: {loop.lastFailureKind.trim()}
+                  </p>
                 ) : null}
-              </>
-            ) : null}
-
-            {decision === "inspect-only" ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={busy}
-                onClick={() => setInspectOpen(true)}
-              >
-                Inspect
-              </Button>
-            ) : null}
-
-            {decision === null ? (
-              <>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    document
-                      .getElementById("loop-logs")
-                      ?.scrollIntoView({ behavior: "smooth", block: "start" });
-                  }}
-                >
-                  View logs
-                </Button>
-                {actions.takeover ? (
-                  <Button
-                    variant="danger"
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => setConfirmTakeover(true)}
-                  >
-                    {pending === "takeover" ? "…" : "Takeover"}
-                  </Button>
-                ) : null}
-                {actions.stop ? (
-                  <Button
-                    variant="danger"
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => setConfirmStop(true)}
-                  >
-                    {pending === "stop" ? "…" : "Stop"}
-                  </Button>
-                ) : null}
-              </>
-            ) : null}
-
-            {/* Allow plain retry on dirty/inspect paths when operator has fixed the tree */}
-            {(decision === "offer-discard" || decision === "inspect-only") &&
-            actions.retry ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={busy}
-                title="Retry without discarding (use after cleaning the tree yourself)"
-                onClick={() => void onRetry()}
-              >
-                {pending === "retry" ? "…" : "Retry without discard"}
-              </Button>
-            ) : null}
-          </div>
-
-          {inlineError ? (
-            <p className="m-0 text-[11px] text-[var(--danger)]">{inlineError}</p>
-          ) : null}
-        </div>
-      </Card>
-
-      {confirmDiscard ? (
-        <ConfirmDialog
-          open
-          title="Discard worktree changes and retry?"
-          confirmLabel="Discard & retry"
-          danger
-          busy={busy}
-          onCancel={() => {
-            if (!busy) setConfirmDiscard(false);
-          }}
-          onConfirm={() => void onDiscardRetry()}
-        >
-          <p className="m-0 text-[var(--text-muted)]">
-            Local uncommitted changes in the managed worktree will be discarded,
-            then the loop will be re-queued. This requires an explicit confirm.
-          </p>
-          {worktree?.worktreePath ? (
-            <div className="mt-2 rounded border border-[var(--border)] bg-[var(--bg)] p-2">
-              <div className="mb-1 flex items-center justify-between gap-2">
-                <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                  Worktree
-                </span>
-                <CopyButton text={worktree.worktreePath} />
               </div>
-              <p className="m-0 break-all mono text-[11px]">
-                {worktree.worktreePath}
-              </p>
-            </div>
-          ) : null}
-        </ConfirmDialog>
-      ) : null}
 
-      {confirmStop ? (
-        <ConfirmDialog
-          open
-          title="Stop active run?"
-          confirmLabel="Stop"
-          danger
-          busy={busy}
-          onCancel={() => {
-            if (!busy) setConfirmStop(false);
-          }}
-          onConfirm={() => void onStop()}
-        >
-          <p className="m-0 text-[var(--text-muted)]">
-            Pauses the loop and stops the active execution. The loop stays paused
-            until you unpause or retry.
-          </p>
-        </ConfirmDialog>
-      ) : null}
-
-      {confirmTakeover ? (
-        <ConfirmDialog
-          open
-          title="Take over loop?"
-          confirmLabel="Takeover"
-          danger
-          busy={busy}
-          onCancel={() => {
-            if (!busy) setConfirmTakeover(false);
-          }}
-          onConfirm={() => void onTakeover()}
-        >
-          <p className="m-0 text-[var(--text-muted)]">
-            Parks the loop in human_takeover and stops the daemon run. You will
-            get a worktree path and resume command (if supported) to continue
-            interactively. Hand back when done.
-          </p>
-        </ConfirmDialog>
-      ) : null}
-
-      {inspectOpen ? (
-        <ConfirmDialog
-          open
-          title={
-            decision === "offer-discard"
-              ? "Inspect dirty worktree"
-              : "Inspect worktree"
-          }
-          confirmLabel="Close"
-          showCancel={false}
-          onCancel={() => setInspectOpen(false)}
-          onConfirm={() => setInspectOpen(false)}
-        >
-          <div className="flex flex-col gap-2">
-            <p className="m-0 text-[var(--text-muted)]">
-              Copy the path or jump command into a terminal on this machine.
-              Dashboard never executes shell commands or launches Terminal/editor
-              apps.
-            </p>
-            <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
-              <div className="mb-1 flex items-center justify-between gap-2">
-                <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                  Worktree path
-                </span>
-                <CopyButton text={worktree?.worktreePath ?? ""} />
-              </div>
-              <p className="m-0 break-all mono text-[11px]">
-                {worktree?.worktreePath || "—"}
-              </p>
-            </div>
-            {worktree?.present ? (
               <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                    Jump command
+                    Worktree
                   </span>
-                  <CopyButton text={jumpCmd} />
+                  {loadingWt ? (
+                    <span className="text-[10px] text-[var(--text-muted)]">
+                      loading…
+                    </span>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => void loadWorktree()}
+                    >
+                      Refresh
+                    </Button>
+                  )}
                 </div>
-                <p className="m-0 break-all mono text-[11px]">{jumpCmd}</p>
+                {worktreeError ? (
+                  <p className="m-0 text-[11px] text-[var(--danger)]">
+                    {worktreeError}
+                  </p>
+                ) : null}
+                <dl className="m-0 grid gap-1 text-[12px]">
+                  <div className="grid grid-cols-[90px_1fr] gap-2">
+                    <dt className="text-[var(--text-muted)]">Path</dt>
+                    <dd className="m-0 flex items-start gap-1 break-all mono">
+                      <span className="min-w-0 flex-1">
+                        {worktree?.worktreePath?.trim() || "—"}
+                      </span>
+                      {worktree?.worktreePath?.trim() ? (
+                        <CopyButton text={worktree.worktreePath} />
+                      ) : null}
+                    </dd>
+                  </div>
+                  <div className="grid grid-cols-[90px_1fr] gap-2">
+                    <dt className="text-[var(--text-muted)]">Present</dt>
+                    <dd className="m-0 mono">
+                      {worktree
+                        ? worktree.present
+                          ? "yes"
+                          : "no"
+                        : fetchFailed
+                          ? "—"
+                          : loadingWt
+                            ? "…"
+                            : "—"}
+                    </dd>
+                  </div>
+                  <div className="grid grid-cols-[90px_1fr] gap-2">
+                    <dt className="text-[var(--text-muted)]">Ownership</dt>
+                    <dd className="m-0 mono">{ownershipLabel(worktree)}</dd>
+                  </div>
+                  <div className="grid grid-cols-[90px_1fr] gap-2">
+                    <dt className="text-[var(--text-muted)]">Dirty</dt>
+                    <dd className="m-0 mono">{dirtyLabel(worktree)}</dd>
+                  </div>
+                  {worktree?.branch ? (
+                    <div className="grid grid-cols-[90px_1fr] gap-2">
+                      <dt className="text-[var(--text-muted)]">Branch</dt>
+                      <dd className="m-0 mono">{worktree.branch}</dd>
+                    </div>
+                  ) : null}
+                  {worktree?.reason ? (
+                    <div className="grid grid-cols-[90px_1fr] gap-2">
+                      <dt className="text-[var(--text-muted)]">Preflight</dt>
+                      <dd className="m-0 mono">{worktree.reason}</dd>
+                    </div>
+                  ) : null}
+                </dl>
               </div>
-            ) : null}
-            {offersDiscard ? (
-              <p className="m-0 text-[11px] text-[var(--text-muted)]">
-                After fixing or deciding to drop changes: use Discard &amp;
-                Retry, or run{" "}
-                <span className="mono">{discardCli}</span>
+
+              <p className="m-0 text-[12px]">{recoveryGuidance(decision)}</p>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {recommendsRetry && actions.retry ? (
+                  <Button
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => void onRetry()}
+                  >
+                    {pending === "retry" ? "…" : "Retry"}
+                  </Button>
+                ) : null}
+
+                {decision === "offer-discard" ? (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => setInspectOpen(true)}
+                    >
+                      Inspect / Jump
+                    </Button>
+                    {actions.retry ? (
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => setConfirmDiscard(true)}
+                      >
+                        Discard &amp; Retry
+                      </Button>
+                    ) : null}
+                  </>
+                ) : null}
+
+                {decision === "inspect-only" ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => setInspectOpen(true)}
+                  >
+                    Inspect
+                  </Button>
+                ) : null}
+
+                {decision === null ? (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        document
+                          .getElementById("loop-logs")
+                          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+                      }}
+                    >
+                      View logs
+                    </Button>
+                    {actions.takeover ? (
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => setConfirmTakeover(true)}
+                      >
+                        {pending === "takeover" ? "…" : "Takeover"}
+                      </Button>
+                    ) : null}
+                    {actions.stop ? (
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => setConfirmStop(true)}
+                      >
+                        {pending === "stop" ? "…" : "Stop"}
+                      </Button>
+                    ) : null}
+                  </>
+                ) : null}
+
+                {/* Allow plain retry on dirty/inspect paths when operator has fixed the tree */}
+                {(decision === "offer-discard" || decision === "inspect-only") &&
+                actions.retry ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={busy}
+                    title="Retry without discarding (use after cleaning the tree yourself)"
+                    onClick={() => void onRetry()}
+                  >
+                    {pending === "retry" ? "…" : "Retry without discard"}
+                  </Button>
+                ) : null}
+              </div>
+
+              {inlineError ? (
+                <p className="m-0 text-[11px] text-[var(--danger)]">{inlineError}</p>
+              ) : null}
+            </div>
+          </Card>
+
+          {confirmDiscard ? (
+            <ConfirmDialog
+              open
+              title="Discard worktree changes and retry?"
+              confirmLabel="Discard & retry"
+              danger
+              busy={busy}
+              onCancel={() => {
+                if (!busy) setConfirmDiscard(false);
+              }}
+              onConfirm={() => void onDiscardRetry()}
+            >
+              <p className="m-0 text-[var(--text-muted)]">
+                Local uncommitted changes in the managed worktree will be discarded,
+                then the loop will be re-queued. This requires an explicit confirm.
               </p>
-            ) : (
-              <p className="m-0 text-[11px] text-[var(--text-muted)]">
-                Discard is unavailable for this worktree from Dashboard. Clean or
-                repair the path yourself, then Retry without discard if
-                appropriate.
+              {worktree?.worktreePath ? (
+                <div className="mt-2 rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                      Worktree
+                    </span>
+                    <CopyButton text={worktree.worktreePath} />
+                  </div>
+                  <p className="m-0 break-all mono text-[11px]">
+                    {worktree.worktreePath}
+                  </p>
+                </div>
+              ) : null}
+            </ConfirmDialog>
+          ) : null}
+
+          {confirmStop ? (
+            <ConfirmDialog
+              open
+              title="Stop active run?"
+              confirmLabel="Stop"
+              danger
+              busy={busy}
+              onCancel={() => {
+                if (!busy) setConfirmStop(false);
+              }}
+              onConfirm={() => void onStop()}
+            >
+              <p className="m-0 text-[var(--text-muted)]">
+                Pauses the loop and stops the active execution. The loop stays paused
+                until you unpause or retry.
               </p>
-            )}
-          </div>
-        </ConfirmDialog>
+            </ConfirmDialog>
+          ) : null}
+
+          {confirmTakeover ? (
+            <ConfirmDialog
+              open
+              title="Take over loop?"
+              confirmLabel="Takeover"
+              danger
+              busy={busy}
+              onCancel={() => {
+                if (!busy) setConfirmTakeover(false);
+              }}
+              onConfirm={() => void onTakeover()}
+            >
+              <p className="m-0 text-[var(--text-muted)]">
+                Parks the loop in human_takeover and stops the daemon run. You will
+                get a worktree path and resume command (if supported) to continue
+                interactively. Hand back when done.
+              </p>
+            </ConfirmDialog>
+          ) : null}
+
+          {inspectOpen ? (
+            <ConfirmDialog
+              open
+              title={
+                decision === "offer-discard"
+                  ? "Inspect dirty worktree"
+                  : "Inspect worktree"
+              }
+              confirmLabel="Close"
+              showCancel={false}
+              onCancel={() => setInspectOpen(false)}
+              onConfirm={() => setInspectOpen(false)}
+            >
+              <div className="flex flex-col gap-2">
+                <p className="m-0 text-[var(--text-muted)]">
+                  Copy the path or jump command into a terminal on this machine.
+                  Dashboard never executes shell commands or launches Terminal/editor
+                  apps.
+                </p>
+                <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                      Worktree path
+                    </span>
+                    <CopyButton text={worktree?.worktreePath ?? ""} />
+                  </div>
+                  <p className="m-0 break-all mono text-[11px]">
+                    {worktree?.worktreePath || "—"}
+                  </p>
+                </div>
+                {worktree?.present ? (
+                  <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                        Jump command
+                      </span>
+                      <CopyButton text={jumpCmd} />
+                    </div>
+                    <p className="m-0 break-all mono text-[11px]">{jumpCmd}</p>
+                  </div>
+                ) : null}
+                {offersDiscard ? (
+                  <p className="m-0 text-[11px] text-[var(--text-muted)]">
+                    After fixing or deciding to drop changes: use Discard &amp;
+                    Retry, or run{" "}
+                    <span className="mono">{discardCli}</span>
+                  </p>
+                ) : (
+                  <p className="m-0 text-[11px] text-[var(--text-muted)]">
+                    Discard is unavailable for this worktree from Dashboard. Clean or
+                    repair the path yourself, then Retry without discard if
+                    appropriate.
+                  </p>
+                )}
+              </div>
+            </ConfirmDialog>
+          ) : null}
+        </>
       ) : null}
 
       {takeoverResult ? (
