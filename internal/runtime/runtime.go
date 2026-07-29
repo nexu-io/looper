@@ -185,16 +185,21 @@ type Runtime struct {
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
-	activeExecutions            *ActiveExecutionRegistry
-	projectCatalog              *projects.Catalog
-	githubGateway               *githubinfra.Gateway
-	webhook                     *webhookRuntime
-	webhookDaemonLock           *daemonLock
-	webhookForwarder            WebhookForwarder
-	networkManager              runtimeNetworkManager
-	schedulerDisabled           bool
-	startupReadyOnce            sync.Once
-	startupReadyErr             error
+	// humanAttentionNotifyCancel/Done track the one-shot post-recovery rescan
+	// goroutine. It must be joined before SQLite close so temp test DBs and
+	// process exit do not race WAL/query handles (see scheduleHumanAttentionRecoveryNotify).
+	humanAttentionNotifyCancel context.CancelFunc
+	humanAttentionNotifyDone   chan struct{}
+	activeExecutions           *ActiveExecutionRegistry
+	projectCatalog             *projects.Catalog
+	githubGateway              *githubinfra.Gateway
+	webhook                    *webhookRuntime
+	webhookDaemonLock          *daemonLock
+	webhookForwarder           WebhookForwarder
+	networkManager             runtimeNetworkManager
+	schedulerDisabled          bool
+	startupReadyOnce           sync.Once
+	startupReadyErr            error
 	// ownershipAcquired remains true after CompleteStartup succeeds so stop
 	// still writes looperd.stopped. Admission is the sole ready Authority;
 	// this flag is not a mutation/claim gate.
@@ -361,6 +366,7 @@ func (r *Runtime) Stop(reason string) {
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
+		r.stopHumanAttentionRecoveryNotify()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
@@ -483,15 +489,18 @@ func (r *Runtime) BeginShutdown(reason string) {
 // MarkDegraded/BeginShutdown can invoke them while holding admission.mu
 // without re-entering r.mu (lock-order safety).
 type workProducerCancels struct {
-	scheduler context.CancelFunc
-	recovery  context.CancelFunc
-	cleanup   context.CancelFunc
-	forwarder interface{ CancelExecute() }
+	scheduler      context.CancelFunc
+	recovery       context.CancelFunc
+	cleanup        context.CancelFunc
+	humanAttention context.CancelFunc
+	forwarder      interface{ CancelExecute() }
 }
 
 // invokeForDegrade cancels sticky-degrade producers but leaves webhook execute
 // live: Forward may already have returned accepted/202 for queued discovery,
 // and GitHub will not retry that delivery while the daemon stays up.
+// Human-attention recovery rescan is left running on sticky degrade so an
+// already-scheduled post-recovery alert can still deliver while the daemon stays up.
 func (c workProducerCancels) invokeForDegrade() {
 	if c.scheduler != nil {
 		c.scheduler()
@@ -506,8 +515,13 @@ func (c workProducerCancels) invokeForDegrade() {
 
 // invokeForShutdown cancels all work producers including webhook discovery so
 // process exit can abort in-flight CreateOrGetActiveByDedupe promptly.
+// Also cancels human-attention recovery rescan so interactive osascript cannot
+// block process exit beyond stopHumanAttentionRecoveryNotify's wait budget.
 func (c workProducerCancels) invokeForShutdown() {
 	c.invokeForDegrade()
+	if c.humanAttention != nil {
+		c.humanAttention()
+	}
 	if c.forwarder != nil {
 		c.forwarder.CancelExecute()
 	}
@@ -520,10 +534,11 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return workProducerCancels{
-		scheduler: r.schedulerCancel,
-		recovery:  r.recoveryCancel,
-		cleanup:   r.worktreeCleanupCancel,
-		forwarder: r.webhookForwarder,
+		scheduler:      r.schedulerCancel,
+		recovery:       r.recoveryCancel,
+		cleanup:        r.worktreeCleanupCancel,
+		humanAttention: r.humanAttentionNotifyCancel,
+		forwarder:      r.webhookForwarder,
 	}
 }
 

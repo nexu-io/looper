@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/notify"
@@ -41,21 +42,104 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 // scheduler finalize callback; (2) recovery quarantine parks that used to notify
 // on the critical path. Permanent entry-scoped dedupe decides whether an alert
 // is sent — not the crash-sensitive post-finalize callback window.
+//
+// The goroutine is cancel/done-tracked and joined in Stop before SQLite close
+// so recovery queries and best-effort delivery cannot race coordinator.Close
+// (TempDir state/ cleanup failures and retain-storage edge cases).
 func (r *Runtime) scheduleHumanAttentionRecoveryNotify(repos *storage.Repositories) {
 	if r == nil || repos == nil {
 		return
 	}
-	go r.notifyDurableHumanAttentionParksBestEffort(context.Background(), repos)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	r.mu.Lock()
+	if r.stopped {
+		r.mu.Unlock()
+		cancel()
+		return
+	}
+	// CompleteStartup is once; if a prior schedule exists (tests), cancel it first.
+	prevCancel := r.humanAttentionNotifyCancel
+	prevDone := r.humanAttentionNotifyDone
+	r.humanAttentionNotifyCancel = cancel
+	r.humanAttentionNotifyDone = done
+	r.mu.Unlock()
+	if prevCancel != nil {
+		prevCancel()
+	}
+	if prevDone != nil {
+		<-prevDone
+	}
+
+	go func() {
+		defer close(done)
+		r.notifyDurableHumanAttentionParksBestEffort(ctx, repos)
+	}()
+}
+
+// stopHumanAttentionRecoveryNotify cancels the post-recovery rescan and waits
+// for it to exit (bounded by shutdownTimeout) before SQLite may be closed.
+func (r *Runtime) stopHumanAttentionRecoveryNotify() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	cancel := r.humanAttentionNotifyCancel
+	done := r.humanAttentionNotifyDone
+	r.humanAttentionNotifyCancel = nil
+	r.humanAttentionNotifyDone = nil
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done == nil {
+		return
+	}
+	timer := time.NewTimer(r.shutdownTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		if r.logger != nil {
+			r.logger.Warn("looperd stop timed out waiting for human-attention recovery notify", map[string]any{
+				"timeoutMs": r.shutdownTimeout.Milliseconds(),
+			})
+		}
+	}
+}
+
+// WaitForHumanAttentionRecoveryNotify blocks until the post-recovery human-
+// attention rescan exits, or until ctx is canceled. Returns immediately when
+// the rescan was never scheduled. Test fixtures use this after CompleteStartup
+// so later Stop/TempDir cleanup does not race a still-running query.
+func (r *Runtime) WaitForHumanAttentionRecoveryNotify(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	done := r.humanAttentionNotifyDone
+	r.mu.RUnlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // notifyDurableHumanAttentionParksBestEffort lists durable awaiting_human loops
 // and latest hard manual_intervention queue holds, then observes each once.
-// Safe to call from a background goroutine; skips when the runtime is stopping.
+// Safe to call from a background goroutine; skips when the runtime is stopping
+// or the provided context is canceled.
 func (r *Runtime) notifyDurableHumanAttentionParksBestEffort(ctx context.Context, repos *storage.Repositories) {
 	if r == nil || repos == nil {
 		return
 	}
-	if r.isStopped() {
+	if ctx.Err() != nil || r.isStopped() {
 		return
 	}
 	for _, loopID := range collectHumanAttentionLoopIDs(ctx, repos) {

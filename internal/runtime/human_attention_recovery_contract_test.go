@@ -142,6 +142,57 @@ func TestHumanAttentionContract_RecoveryRescanAwaitingAndManual(t *testing.T) {
 	assertHumanAttentionInAppCount(t, repos, manualLoopID, 1)
 }
 
+// Post-recovery rescan is cancel/done-tracked and joined on Stop so SQLite
+// close cannot race the background query (CI TempDir state/ cleanup failures).
+func TestHumanAttentionContract_RecoveryNotifyJoinedBeforeStop(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "state", "join-stop.sqlite")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(state) error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	backupDir := filepath.Join(root, "backups")
+	cfg.Storage.DBPath = dbPath
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Daemon.LogDir = filepath.Join(root, "logs")
+	cfg.Daemon.WorkingDirectory = root
+	cfg.Notifications.InApp = true
+	cfg.Notifications.Osascript.Enabled = false
+	// No coding agent → scheduler may wait, but recovery rescan still schedules.
+	now := time.Date(2026, time.July, 29, 16, 0, 0, 0, time.UTC)
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now:    func() time.Time { return now },
+		RunSchedulerTick: func(context.Context, Services) error {
+			return nil
+		},
+		ShutdownTimeout: 2 * time.Second,
+	})
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := rt.CompleteStartup(ctx); err != nil {
+		t.Fatalf("CompleteStartup() error = %v", err)
+	}
+	// Wait path used by API fixtures after CompleteStartup.
+	if err := rt.WaitForHumanAttentionRecoveryNotify(ctx); err != nil {
+		t.Fatalf("WaitForHumanAttentionRecoveryNotify() error = %v", err)
+	}
+	// Stop must join (or cancel+join) before closing SQLite; no hang / panic.
+	rt.Stop("test join human-attention recovery notify")
+	// Second wait is a no-op once the done channel was cleared.
+	if err := rt.WaitForHumanAttentionRecoveryNotify(ctx); err != nil {
+		t.Fatalf("WaitForHumanAttentionRecoveryNotify() after Stop = %v", err)
+	}
+}
+
 // Recovery quarantine must not deliver human-attention notifications on the
 // critical path (interactive dialogs can take tens of seconds per loop).
 func TestHumanAttentionContract_QuarantineDoesNotNotifySynchronously(t *testing.T) {
