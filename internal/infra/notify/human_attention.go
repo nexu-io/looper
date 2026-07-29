@@ -129,6 +129,10 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		DedupeKey:         dedupeKey,
 		OpenURL:           openURL,
 		OperatorAttention: true,
+		// Local channels only: Feishu HITL already sends an interactive ask card
+		// via suspendForHuman, and app-mode milestones cover manual holds. A second
+		// plain-text Feishu/webhook message for the same park would duplicate alerts.
+		LocalOnly: true,
 	})
 }
 
@@ -166,15 +170,11 @@ func (g *Gateway) dashboardDeepLinkUsable() bool {
 
 // ResolveDashboardBaseURL derives a browser-openable local origin for Dashboard
 // deep links from server config. Matches CLI dashboard host mapping for wildcards.
-// Never includes path prefixes, tokens, or query parameters.
+// Never includes path prefixes, userinfo, tokens, query parameters, or fragments.
 func ResolveDashboardBaseURL(server config.ServerConfig) string {
 	if server.BaseURL != nil {
-		base := strings.TrimRight(strings.TrimSpace(*server.BaseURL), "/")
-		if base != "" {
-			parsed, err := url.Parse(base)
-			if err == nil && parsed.Scheme != "" && parsed.Host != "" && strings.Trim(parsed.Path, "/") == "" {
-				return base
-			}
+		if origin, ok := parseDashboardOrigin(*server.BaseURL); ok {
+			return origin
 		}
 	}
 	host := strings.TrimSpace(server.Host)
@@ -187,6 +187,31 @@ func ResolveDashboardBaseURL(server config.ServerConfig) string {
 		port = 17310
 	}
 	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// parseDashboardOrigin accepts only a bare HTTP(S) origin: scheme + host[:port],
+// with no userinfo, path, query, or fragment. Rejected values fall back to
+// host/port construction so credentials never reach OpenURL or osascript.
+func parseDashboardOrigin(raw string) (string, bool) {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if base == "" {
+		return "", false
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	if parsed.Host == "" || parsed.User != nil {
+		return "", false
+	}
+	if strings.Trim(parsed.Path, "/") != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	return scheme + "://" + parsed.Host, true
 }
 
 // IsHumanAttentionLoopStatus reports whether the loop status itself is a

@@ -100,6 +100,13 @@ func TestResolveDashboardBaseURL_NoTokensOrSensitivePath(t *testing.T) {
 	if base != "http://127.0.0.1:17310" {
 		t.Fatalf("ResolveDashboardBaseURL(wildcard) = %q", base)
 	}
+	// Userinfo / query must not leak into deep links — fall back to host/port origin.
+	leaky := "https://user:secret@evil.example/?token=abc#frag"
+	if got := notify.ResolveDashboardBaseURL(config.ServerConfig{
+		Host: "0.0.0.0", Port: 17310, BaseURL: &leaky,
+	}); got != "http://127.0.0.1:17310" {
+		t.Fatalf("ResolveDashboardBaseURL(leaky) = %q, want host/port fallback", got)
+	}
 	gateway := notify.NewGateway(notify.Options{DashboardBaseURL: base})
 	u, err := gateway.DashboardLoopDetailURL(42)
 	if err != nil {
@@ -108,7 +115,7 @@ func TestResolveDashboardBaseURL_NoTokensOrSensitivePath(t *testing.T) {
 	if u != "http://127.0.0.1:17310/dashboard/loops/42" {
 		t.Fatalf("DashboardLoopDetailURL() = %q", u)
 	}
-	if strings.Contains(u, "token") || strings.Contains(u, "code=") || strings.Contains(u, "answer") {
+	if strings.Contains(u, "token") || strings.Contains(u, "code=") || strings.Contains(u, "answer") || strings.Contains(u, "secret") {
 		t.Fatalf("deep link must not contain secrets: %q", u)
 	}
 }

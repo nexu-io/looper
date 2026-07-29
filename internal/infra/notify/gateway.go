@@ -145,6 +145,10 @@ type SystemNotificationPayload struct {
 	// (worker skipped, PR ready) leave this false so they stay lightweight
 	// display notification and do not block the scheduler for up to 30s.
 	OperatorAttention bool
+	// LocalOnly skips remote webhook / Feishu app delivery. Used for human-attention
+	// alerts so they stay on in_app + osascript and do not duplicate interactive
+	// HITL ask cards or app-mode milestones already sent on those channels.
+	LocalOnly bool
 }
 
 type Gateway struct {
@@ -217,12 +221,14 @@ func (g *Gateway) Notify(ctx context.Context, payload SystemNotificationPayload)
 		records = append(records, record)
 	}
 
-	if strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
-		if record, ok := g.recordFeishuApp(ctx, payload); ok {
+	if !payload.LocalOnly {
+		if strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+			if record, ok := g.recordFeishuApp(ctx, payload); ok {
+				records = append(records, record)
+			}
+		} else if record, ok := g.recordWebhook(ctx, payload); ok {
 			records = append(records, record)
 		}
-	} else if record, ok := g.recordWebhook(ctx, payload); ok {
-		records = append(records, record)
 	}
 
 	return records

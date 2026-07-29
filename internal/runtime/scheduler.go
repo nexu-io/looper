@@ -3102,13 +3102,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
 		workerNotificationKeyID := runtimeFirstNonEmpty(input.RunID, input.LoopID)
-		// Hard holds are owned by the central human-attention path (durable
-		// transition observer) so all loop types share one action_required shape
-		// and dedupe key. Still record the Feishu milestone / refresh below.
+		// Hard holds are owned by the central human-attention path after claim
+		// finalization and lease release (runOwnedQueueClaims post-observer).
+		// Do not notify here: OnRunCompleted still holds the operation lease and
+		// the loop is still running, so an interactive osascript dialog would
+		// block a concurrency slot for up to ~35s before durable pause.
+		// Still record the Feishu milestone / refresh below.
 		if input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention {
-			if strings.TrimSpace(input.LoopID) != "" {
-				notifyHumanAttention(ctx, input.LoopID)
-			}
 			if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
 				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
 			} else {

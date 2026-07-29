@@ -348,6 +348,79 @@ func TestGatewayHumanAttentionLocalTokenFallsBackToDaemonLog(t *testing.T) {
 	}
 }
 
+func TestGatewayHumanAttentionSkipsFeishuAppDelivery(t *testing.T) {
+	// Human-attention is local-only so Feishu HITL ask cards / milestones are not duplicated.
+	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
+	t.Setenv("LOOPER_TEST_FEISHU_APP_SECRET", "app_secret_value")
+
+	ctx := context.Background()
+	var calls []capturedFeishuCall
+	gateway := newFeishuAppGateway(t, appModeConfig(), &calls)
+	// Enable in_app so permanent entry dedupe still has a durable record.
+	gateway.config.InApp = true
+
+	records := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+		LoopSeq:  7,
+		Reason:   HumanAttentionAwaitingHuman,
+		EntryKey: "run:hitl_feishu_dedupe",
+	})
+	if got := notificationStatus(records, "in_app"); got != "success" {
+		t.Fatalf("in_app status = %q, want success; records=%#v", got, records)
+	}
+	if got := notificationStatus(records, "feishu_app"); got != "" {
+		t.Fatalf("feishu_app status = %q, want absent (local-only human attention)", got)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("feishu HTTP calls = %d, want 0 for NotifyHumanAttention", len(calls))
+	}
+
+	// Ordinary Notify still delivers to Feishu app mode.
+	ordinary := gateway.Notify(ctx, SystemNotificationPayload{
+		Level:     "action_required",
+		Title:     "Ordinary",
+		Body:      "not human-attention",
+		DedupeKey: "ordinary:1",
+	})
+	if got := notificationStatus(ordinary, "feishu_app"); got != "success" {
+		t.Fatalf("ordinary feishu_app status = %q, want success", got)
+	}
+	if len(calls) == 0 {
+		t.Fatal("ordinary Notify should reach Feishu app HTTP")
+	}
+}
+
+func TestResolveDashboardBaseURL_RejectsNonOriginBaseURL(t *testing.T) {
+	t.Parallel()
+
+	fallback := "http://127.0.0.1:17310"
+	cases := []struct {
+		name    string
+		baseURL string
+		host    string
+		port    int
+		want    string
+	}{
+		{name: "clean http origin", baseURL: "http://dash.example:8080", want: "http://dash.example:8080"},
+		{name: "clean https origin trailing slash", baseURL: "https://dash.example/", want: "https://dash.example"},
+		{name: "userinfo rejected", baseURL: "https://user:token@dash.example", host: "127.0.0.1", port: 17310, want: fallback},
+		{name: "query rejected", baseURL: "https://dash.example/?x=y", host: "127.0.0.1", port: 17310, want: fallback},
+		{name: "fragment rejected", baseURL: "https://dash.example/#frag", host: "127.0.0.1", port: 17310, want: fallback},
+		{name: "path rejected", baseURL: "https://dash.example/prefix", host: "127.0.0.1", port: 17310, want: fallback},
+		{name: "non-http scheme rejected", baseURL: "ftp://dash.example", host: "127.0.0.1", port: 17310, want: fallback},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := tc.baseURL
+			cfg := config.ServerConfig{Host: tc.host, Port: tc.port, BaseURL: &base}
+			if got := ResolveDashboardBaseURL(cfg); got != tc.want {
+				t.Fatalf("ResolveDashboardBaseURL(%q) = %q, want %q", tc.baseURL, got, tc.want)
+			}
+		})
+	}
+}
+
 func openNotifyCoordinator(t *testing.T, rootDir string) *storage.SQLiteCoordinator {
 	t.Helper()
 
