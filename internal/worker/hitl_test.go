@@ -201,6 +201,16 @@ func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 	if sent[0].LoopSeq != 1 || sent[0].Question != "Which datastore?" || len(sent[0].Options) != 2 {
 		t.Fatalf("notification = %#v, want loop seq 1 + question + 2 options", sent[0])
 	}
+	// Successful Feishu delivery is recorded on durable ask metadata so human-
+	// attention LocalOnly can suppress only real Feishu-card duplicates.
+	got, err = fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || got == nil {
+		t.Fatalf("Loops.GetByID after notify error = %v", err)
+	}
+	ask, ok = loops.ReadHITLAsk(got.MetadataJSON)
+	if !ok || ask.Transport != "feishu" {
+		t.Fatalf("persisted ask.Transport = %q (ok=%v), want feishu after successful notify", ask.Transport, ok)
+	}
 }
 
 func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {

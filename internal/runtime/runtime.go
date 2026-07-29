@@ -185,16 +185,26 @@ type Runtime struct {
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
-	activeExecutions            *ActiveExecutionRegistry
-	projectCatalog              *projects.Catalog
-	githubGateway               *githubinfra.Gateway
-	webhook                     *webhookRuntime
-	webhookDaemonLock           *daemonLock
-	webhookForwarder            WebhookForwarder
-	networkManager              runtimeNetworkManager
-	schedulerDisabled           bool
-	startupReadyOnce            sync.Once
-	startupReadyErr             error
+	// humanAttentionNotifyCancel/Ctx are the shared cancelable parent for all
+	// best-effort human-attention delivery (post-claim + recovery rescan).
+	// humanAttentionNotifyWG drains those goroutines before SQLite close so
+	// interactive osascript and notification persists cannot race coordinator.Close.
+	// humanAttentionNotifyDone is the latest recovery-rescan generation only
+	// (WaitForHumanAttentionRecoveryNotify / API fixtures).
+	humanAttentionNotifyCancel context.CancelFunc
+	humanAttentionNotifyCtx    context.Context
+	humanAttentionNotifyWG     sync.WaitGroup
+	humanAttentionNotifyDone   chan struct{}
+	activeExecutions           *ActiveExecutionRegistry
+	projectCatalog             *projects.Catalog
+	githubGateway              *githubinfra.Gateway
+	webhook                    *webhookRuntime
+	webhookDaemonLock          *daemonLock
+	webhookForwarder           WebhookForwarder
+	networkManager             runtimeNetworkManager
+	schedulerDisabled          bool
+	startupReadyOnce           sync.Once
+	startupReadyErr            error
 	// ownershipAcquired remains true after CompleteStartup succeeds so stop
 	// still writes looperd.stopped. Admission is the sole ready Authority;
 	// this flag is not a mutation/claim gate.
@@ -361,6 +371,7 @@ func (r *Runtime) Stop(reason string) {
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
+		r.stopHumanAttentionRecoveryNotify()
 		r.stopWorktreeCleanupLoop()
 		r.stopSchedulerLoop()
 		r.stopWebhookRuntime()
@@ -483,15 +494,18 @@ func (r *Runtime) BeginShutdown(reason string) {
 // MarkDegraded/BeginShutdown can invoke them while holding admission.mu
 // without re-entering r.mu (lock-order safety).
 type workProducerCancels struct {
-	scheduler context.CancelFunc
-	recovery  context.CancelFunc
-	cleanup   context.CancelFunc
-	forwarder interface{ CancelExecute() }
+	scheduler      context.CancelFunc
+	recovery       context.CancelFunc
+	cleanup        context.CancelFunc
+	humanAttention context.CancelFunc
+	forwarder      interface{ CancelExecute() }
 }
 
 // invokeForDegrade cancels sticky-degrade producers but leaves webhook execute
 // live: Forward may already have returned accepted/202 for queued discovery,
 // and GitHub will not retry that delivery while the daemon stays up.
+// Human-attention recovery rescan is left running on sticky degrade so an
+// already-scheduled post-recovery alert can still deliver while the daemon stays up.
 func (c workProducerCancels) invokeForDegrade() {
 	if c.scheduler != nil {
 		c.scheduler()
@@ -506,8 +520,14 @@ func (c workProducerCancels) invokeForDegrade() {
 
 // invokeForShutdown cancels all work producers including webhook discovery so
 // process exit can abort in-flight CreateOrGetActiveByDedupe promptly.
+// Also cancels human-attention delivery (recovery rescan + post-claim) so
+// interactive osascript cannot block process exit beyond
+// stopHumanAttentionRecoveryNotify's wait budget.
 func (c workProducerCancels) invokeForShutdown() {
 	c.invokeForDegrade()
+	if c.humanAttention != nil {
+		c.humanAttention()
+	}
 	if c.forwarder != nil {
 		c.forwarder.CancelExecute()
 	}
@@ -520,10 +540,11 @@ func (r *Runtime) snapshotWorkProducerCancels() workProducerCancels {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return workProducerCancels{
-		scheduler: r.schedulerCancel,
-		recovery:  r.recoveryCancel,
-		cleanup:   r.worktreeCleanupCancel,
-		forwarder: r.webhookForwarder,
+		scheduler:      r.schedulerCancel,
+		recovery:       r.recoveryCancel,
+		cleanup:        r.worktreeCleanupCancel,
+		humanAttention: r.humanAttentionNotifyCancel,
+		forwarder:      r.webhookForwarder,
 	}
 }
 
@@ -968,7 +989,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.notifyHumanAttentionPostClaim)
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
@@ -1072,6 +1093,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// the shutdown race where BeginShutdown may have already missed a nil
 		// recoveryCancel between MarkReady and registration).
 		r.startDeferredReviewerRecovery(githubGateway)
+		// Rescan durable human-attention parks only after startup is committed
+		// (admission ready). Launching earlier races Start's failure cleanup,
+		// which closes SQLite while this goroutine still queries/persists or
+		// blocks in osascript. Delivery stays async so interactive dialogs
+		// cannot delay MarkReady / admission.
+		r.scheduleHumanAttentionRecoveryNotify(repositories)
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
 		// admission is ready so discovery/HITL do not wait a full poll interval.
@@ -2894,6 +2921,11 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 				return false, false, err
 			}
 			did = true
+			// Operator notify is deliberately not invoked here. Synchronous
+			// osascript dialogs (up to ~30s each) would block the recovery
+			// critical path before MarkReady. CompleteStartup rescans durable
+			// human-attention parks asynchronously after recovery finishes;
+			// permanent entry dedupe decides whether an alert is sent.
 		}
 	}
 

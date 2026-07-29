@@ -50,6 +50,7 @@ func TestCatalogSchedulerPreservesNotificationTransportAcrossConfigSnapshots(t *
 		nil,
 		nil,
 		nil,
+		nil,
 	)
 	if handlers.webhook != nil {
 		t.Cleanup(handlers.webhook.Close)

@@ -7213,6 +7213,11 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 	if err := rt.WaitForDeferredReviewerRecovery(context.Background()); err != nil {
 		t.Fatalf("Runtime.WaitForDeferredReviewerRecovery() error = %v", err)
 	}
+	// CompleteStartup also schedules async human-attention recovery rescan.
+	// Wait so Stop/TempDir cleanup does not race SQLite queries from that path.
+	if err := rt.WaitForHumanAttentionRecoveryNotify(context.Background()); err != nil {
+		t.Fatalf("Runtime.WaitForHumanAttentionRecoveryNotify() error = %v", err)
+	}
 
 	t.Cleanup(func() {
 		rt.Stop("test cleanup")

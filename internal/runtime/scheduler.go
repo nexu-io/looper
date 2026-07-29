@@ -119,6 +119,10 @@ type defaultSchedulerTickInput struct {
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
+	// NotifyHumanAttention, when set, observes durable loop/queue state after a
+	// claim finishes and emits a best-effort action_required notification when
+	// the loop newly entered awaiting_human or manual_intervention.
+	NotifyHumanAttention func(context.Context, string)
 }
 
 type defaultSchedulerHandlers struct {
@@ -2938,7 +2942,7 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, notifyHumanAttention func(context.Context, string)) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -2982,6 +2986,12 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
 		input.AllowClaim = allowClaim
+		// Runtime-owned cancelable lifecycle for post-claim human-attention
+		// delivery (BeginShutdown cancel + Stop drain). Overrides the snapshot
+		// default which would run under the detached WithoutCancel dispatch ctx.
+		if notifyHumanAttention != nil {
+			input.NotifyHumanAttention = notifyHumanAttention
+		}
 		// Wire Supervisor operation leases for claim ownership span (#579).
 		// Prefer the live registry from Services when present (daemon path).
 		if services.ActiveExecutions != nil {
@@ -2996,6 +3006,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
 				stopped.AllowClaim = allowClaim
+				if notifyHumanAttention != nil {
+					stopped.NotifyHumanAttention = notifyHumanAttention
+				}
 				if services.ActiveExecutions != nil {
 					stopped.OperationOwner = services.ActiveExecutions
 				} else if activeExecutions != nil {
@@ -3006,6 +3019,9 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
 			latest.AllowClaim = allowClaim
+			if notifyHumanAttention != nil {
+				latest.NotifyHumanAttention = notifyHumanAttention
+			}
 			if services.ActiveExecutions != nil {
 				latest.OperationOwner = services.ActiveExecutions
 			} else if activeExecutions != nil {
@@ -3055,12 +3071,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and
 	// webhook nil-runner checks.
 	notificationGateway := notificationGateways.New(notify.Options{
-		Config:        cfg.Notifications,
-		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		Repositories:  repos,
-		Now:           now,
+		Config:            cfg.Notifications,
+		OsascriptPath:     derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:       filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		DashboardBaseURL:  notify.ResolveDashboardBaseURL(cfg.Server),
+		DashboardAuthMode: cfg.Server.AuthMode,
+		Repositories:      repos,
+		Now:               now,
 	})
+	notifyHumanAttention := func(ctx context.Context, loopID string) {
+		notifyDurableHumanAttention(ctx, notificationGateway, repos, loopID)
+	}
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.
 	// The anchor is otherwise only patched opportunistically by the progress ticker
@@ -3093,6 +3114,20 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
 		workerNotificationKeyID := runtimeFirstNonEmpty(input.RunID, input.LoopID)
+		// Hard holds are owned by the central human-attention path after claim
+		// finalization and lease release (runOwnedQueueClaims post-observer).
+		// Do not notify here: OnRunCompleted still holds the operation lease and
+		// the loop is still running, so an interactive osascript dialog would
+		// block a concurrency slot for up to ~35s before durable pause.
+		// Still record the Feishu milestone / refresh below.
+		if input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention {
+			if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
+			} else {
+				refreshFeishuAnchor(ctx, input.LoopID)
+			}
+			return nil
+		}
 		payload := notify.SystemNotificationPayload{
 			ProjectID:  input.ProjectID,
 			LoopID:     input.LoopID,
@@ -3102,11 +3137,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			EntityID:   input.RunID,
 		}
 		switch {
-		case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
-			payload.Level = "action_required"
-			payload.Title = "Looper Worker Needs Attention"
-			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
 		case input.Status == "failed":
 			payload.Level = "failure"
 			payload.Title = "Looper Worker Failed"
@@ -3139,8 +3169,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				} else {
 					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 PR #%d", input.PullRequestNumber))
 				}
-			case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
-				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
 			case input.Status == "failed":
 				notificationGateway.RecordMilestone(ctx, input.LoopID, "⚠️ 本轮失败,重试中")
 			case input.Status != "skipped":
@@ -3536,6 +3564,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			NotifyHumanAttention:     notifyHumanAttention,
 		}
 	}
 
@@ -4650,6 +4679,18 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 					return
 				}
 				lease.Release()
+			}
+			// Best-effort operator notify for durable human-attention parks.
+			// Never affects claim finalization or recovery.
+			//
+			// The dispatch ctx is WithoutCancel so finalize survives shutdown;
+			// do not keep interactive osascript on that detached lifetime.
+			// Daemon wiring (notifyHumanAttentionPostClaim) ignores this ctx and
+			// uses a runtime-owned cancelable parent that BeginShutdown cancels
+			// and Stop drains before SQLite close. Tests may pass a direct
+			// callback that uses the provided ctx.
+			if input.NotifyHumanAttention != nil && item.LoopID != nil {
+				input.NotifyHumanAttention(ctx, *item.LoopID)
 			}
 			if runErr != nil && input.Logger != nil {
 				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": runErr.Error()})
