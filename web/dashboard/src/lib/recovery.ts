@@ -9,8 +9,10 @@ export type { WorktreeActionDecision };
 export { classifyRetryWorktree, worktreeAllowsDashboardDiscard };
 
 /**
- * Whether recovery has no usable worktree path (missing / fetch failure /
- * loop type without worktree). Presentation-only — not a second discard policy.
+ * Whether recovery has no classifiable worktree preflight response.
+ * Reserved for fetch/unverifiable failures (null payload or request error).
+ * Legitimate present=false responses (no_worktree / worktree_missing / etc.)
+ * are NOT unavailable — they follow classifyRetryWorktree (retryable "ok").
  */
 export function isRecoveryWorktreeUnavailable(
   worktree: LoopWorktreeStatus | null | undefined,
@@ -18,23 +20,13 @@ export function isRecoveryWorktreeUnavailable(
 ): boolean {
   if (opts?.fetchFailed) return true;
   if (!worktree) return true;
-
-  const reason = (worktree.reason ?? "").trim().toLowerCase();
-  if (
-    !worktree.present ||
-    reason === "no_worktree" ||
-    reason === "worktree_missing" ||
-    reason === "loop_type_without_worktree"
-  ) {
-    return true;
-  }
   return false;
 }
 
 /**
  * Action decision for the recovery card. Uses the shared classifyRetryWorktree
- * policy when a worktree is present; returns null when unavailable so the card
- * can show reason/logs/Takeover/Stop without guessing a repair.
+ * policy for any successful GET /worktree payload (including present=false).
+ * Returns null only when preflight could not be loaded/classified.
  */
 export function recoveryWorktreeDecision(
   worktree: LoopWorktreeStatus | null | undefined,
@@ -90,7 +82,7 @@ export function recoveryGuidance(
   }
   switch (decision) {
     case "ok":
-      return "Worktree is clean. Retry to re-queue automation without discarding changes.";
+      return "Plain retry is safe (worktree clean or not required yet). Re-queue automation without discarding changes.";
     case "offer-discard":
       return "Managed worktree has local uncommitted changes. Inspect or jump first, or confirm Discard & Retry to drop them and re-queue.";
     case "inspect-only":

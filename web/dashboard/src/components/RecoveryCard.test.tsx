@@ -193,7 +193,7 @@ describe("RecoveryCard", () => {
     expect(retryLoop).not.toHaveBeenCalled();
   });
 
-  it("unclassifiable mode shows reason/logs without guessing repair", async () => {
+  it("recommends plain retry when worktree was never created", async () => {
     fetchLoopWorktree.mockResolvedValue({
       loopId: "loop_1",
       seq: 617,
@@ -201,6 +201,29 @@ describe("RecoveryCard", () => {
       managed: false,
       reason: "no_worktree",
     });
+    renderCard(
+      baseLoop({
+        lastFailureReason: "prepare failed before worktree creation",
+      }),
+    );
+
+    await screen.findByText(/Plain retry is safe/i);
+    expect(
+      screen.getByText(/prepare failed before worktree creation/i),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.queryByText("Discard & Retry")).toBeNull();
+    expect(screen.queryByRole("button", { name: "View logs" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => {
+      expect(retryLoop).toHaveBeenCalledWith("617", {
+        discardWorktreeChanges: false,
+      });
+    });
+  });
+
+  it("unclassifiable mode shows reason/logs when preflight fetch fails", async () => {
+    fetchLoopWorktree.mockRejectedValue(new Error("worktree endpoint down"));
     renderCard(
       baseLoop({
         lastFailureReason: "checkpoint hold: operator must inspect",
@@ -218,13 +241,7 @@ describe("RecoveryCard", () => {
   });
 
   it("requires confirmation before Stop mutates the active run", async () => {
-    fetchLoopWorktree.mockResolvedValue({
-      loopId: "loop_1",
-      seq: 617,
-      present: false,
-      managed: false,
-      reason: "no_worktree",
-    });
+    fetchLoopWorktree.mockRejectedValue(new Error("worktree endpoint down"));
     stopActiveRun.mockResolvedValue({ ok: true });
     render(
       <ToastProvider>

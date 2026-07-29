@@ -3428,6 +3428,42 @@ func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 	return policy != nil && *policy == loops.ResumePolicyManualIntervention
 }
 
+// queueSupersedesRunResumePolicy reports whether the latest queue item is active
+// work that should win over a stale run checkpoint resumePolicy (e.g. after
+// retryLoop enqueues a fresh queued item while the previous run still carries
+// resumePolicy=manual_intervention).
+func queueSupersedesRunResumePolicy(item *storage.QueueItemRecord) bool {
+	if item == nil {
+		return false
+	}
+	switch strings.TrimSpace(item.Status) {
+	case "queued", "running":
+		return true
+	default:
+		return false
+	}
+}
+
+// projectManualInterventionDisplayStatus chooses displayStatus using durable
+// queue facts first, then run resumePolicy only when no active queue item has
+// superseded that hold. Closed loops keep their true status.
+func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) string {
+	if isClosedLoopStatus(loopStatus) {
+		return ""
+	}
+	if isManualInterventionQueue(latestQueue) {
+		return "manual_intervention"
+	}
+	if isBackingOffQueue(latestQueue, now) {
+		return "backing_off"
+	}
+	// Prefer active queue (queued/running after retry) over a stale checkpoint hold.
+	if !queueSupersedesRunResumePolicy(latestQueue) && hasManualInterventionResumePolicy(latestRun) {
+		return "manual_intervention"
+	}
+	return ""
+}
+
 // isClosedLoopStatus reports loop statuses that are fully finished and must not
 // appear in the default active-run listing (looper ps). Failed/interrupted loops
 // remain eligible when parked for manual intervention so operators can retry.
@@ -3469,10 +3505,8 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
 	// Do not override a closed loop's status with manual_intervention: the loop
 	// is no longer actionable even if the latest queue item still has that status.
-	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
-		view.DisplayStatus = "manual_intervention"
-	} else if isBackingOffQueue(latestQueue, now) {
-		view.DisplayStatus = "backing_off"
+	if projected := projectManualInterventionDisplayStatus(loop.Status, latestQueue, latestRun, now); projected != "" {
+		view.DisplayStatus = projected
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status
@@ -3508,10 +3542,8 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 	// Same authority as decorateActiveRunView: durable queue/checkpoint facts only.
 	// Closed loops keep their true status (not re-projected as manual_intervention).
 	view.DisplayStatus = view.Status
-	if !isClosedLoopStatus(view.Status) && (isManualInterventionQueue(latestQueue) || hasManualInterventionResumePolicy(latestRun)) {
-		view.DisplayStatus = "manual_intervention"
-	} else if isBackingOffQueue(latestQueue, now) {
-		view.DisplayStatus = "backing_off"
+	if projected := projectManualInterventionDisplayStatus(view.Status, latestQueue, latestRun, now); projected != "" {
+		view.DisplayStatus = projected
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status

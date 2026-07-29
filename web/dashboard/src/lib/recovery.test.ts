@@ -104,23 +104,35 @@ describe("recovery worktree decisions (shared classifyRetryWorktree)", () => {
     expect(recoveryRecommendsRetry(tree)).toBe(false);
   });
 
-  it("is unavailable when worktree is missing or fetch fails", () => {
-    expect(
-      recoveryWorktreeDecision(
-        wt({ present: false, managed: true, reason: "worktree_missing" }),
-      ),
-    ).toBeNull();
+  it("recommends retry for legitimate missing-worktree preflight", () => {
+    const missing = wt({
+      present: false,
+      managed: true,
+      reason: "worktree_missing",
+    });
+    const noTree = wt({
+      present: false,
+      managed: false,
+      reason: "no_worktree",
+    });
+    const noWorktreeType = wt({
+      present: false,
+      managed: false,
+      reason: "loop_type_without_worktree",
+    });
+    expect(classifyRetryWorktree(missing)).toBe("ok");
+    expect(recoveryWorktreeDecision(missing)).toBe("ok");
+    expect(recoveryRecommendsRetry(missing)).toBe(true);
+    expect(recoveryOffersDiscard(missing)).toBe(false);
+    expect(recoveryWorktreeDecision(noTree)).toBe("ok");
+    expect(recoveryRecommendsRetry(noTree)).toBe(true);
+    expect(recoveryWorktreeDecision(noWorktreeType)).toBe("ok");
+  });
+
+  it("is unavailable only when preflight fetch fails or payload is missing", () => {
     expect(recoveryWorktreeDecision(null, { fetchFailed: true })).toBeNull();
     expect(recoveryWorktreeDecision(null)).toBeNull();
-    expect(
-      recoveryWorktreeDecision(
-        wt({
-          present: false,
-          managed: false,
-          reason: "loop_type_without_worktree",
-        }),
-      ),
-    ).toBeNull();
     expect(recoveryOffersDiscard(null, { fetchFailed: true })).toBe(false);
+    expect(recoveryRecommendsRetry(null, { fetchFailed: true })).toBe(false);
   });
 });
