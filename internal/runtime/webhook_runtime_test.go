@@ -447,6 +447,127 @@ func TestWebhookRuntimeLaunchForwarderRefusesAfterStop(t *testing.T) {
 	}
 }
 
+// Contract: Stop that wins the pre-start boundary must refuse cmd.Start under
+// the same lock that observes stopped; no process side effect after shutdown.
+func TestWebhookRuntimeAdmitForwarderStartRefusesAfterStop(t *testing.T) {
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+
+	startGate := make(chan struct{})
+	atBoundary := make(chan struct{})
+	originalPreStart := webhookForwarderPreStartHook
+	webhookForwarderPreStartHook = func() {
+		close(atBoundary)
+		<-startGate
+	}
+	t.Cleanup(func() {
+		webhookForwarderPreStartHook = originalPreStart
+		select {
+		case <-startGate:
+		default:
+			close(startGate)
+		}
+	})
+
+	rt := &webhookRuntime{
+		stopCh: make(chan struct{}),
+		now:    time.Now,
+	}
+	cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.admitForwarderStart(cmd)
+	}()
+
+	select {
+	case <-atBoundary:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitForwarderStart did not reach pre-start boundary")
+	}
+
+	rt.Stop()
+	close(startGate)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errWebhookRuntimeStopped) {
+			t.Fatalf("admitForwarderStart() error = %v, want errWebhookRuntimeStopped", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitForwarderStart did not return after Stop")
+	}
+	if cmd.Process != nil {
+		t.Fatal("cmd.Process started after Stop won start admission")
+	}
+}
+
+// Contract: Stop that wins the pre-persist boundary must refuse store.Upsert
+// under the same lock that observes stopped.
+func TestWebhookRuntimeAdmitForwarderPersistRefusesAfterStop(t *testing.T) {
+	repositories := openWebhookRuntimeTestRepositories(t)
+	persistGate := make(chan struct{})
+	atBoundary := make(chan struct{})
+	originalPrePersist := webhookForwarderPrePersistHook
+	webhookForwarderPrePersistHook = func() {
+		close(atBoundary)
+		<-persistGate
+	}
+	t.Cleanup(func() {
+		webhookForwarderPrePersistHook = originalPrePersist
+		select {
+		case <-persistGate:
+		default:
+			close(persistGate)
+		}
+	})
+
+	rt := &webhookRuntime{
+		stopCh:         make(chan struct{}),
+		now:            time.Now,
+		forwarderStore: repositories.WebhookForwarders,
+	}
+	record := storage.WebhookForwarderRecord{
+		Repo: "nexu-io/looper", PID: 1, ProcessStart: 1, Fingerprint: "fp",
+		Endpoint: "http://127.0.0.1/webhook/forward", Events: "push", GHPath: "/usr/bin/gh",
+		DaemonID: "daemon", SpawnedAt: 1, UpdatedAt: 1,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.admitForwarderPersist(repositories.WebhookForwarders, record)
+	}()
+
+	select {
+	case <-atBoundary:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitForwarderPersist did not reach pre-persist boundary")
+	}
+
+	rt.Stop()
+	close(persistGate)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errWebhookRuntimeStopped) {
+			t.Fatalf("admitForwarderPersist() error = %v, want errWebhookRuntimeStopped", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitForwarderPersist did not return after Stop")
+	}
+
+	rows, err := repositories.WebhookForwarders.List(context.Background())
+	if err != nil {
+		t.Fatalf("WebhookForwarders.List() error = %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("persisted %d forwarder rows after Stop, want 0", len(rows))
+	}
+}
+
 func TestWebhookRuntimeReconcileDoesNotLaunchForwarderAfterStop(t *testing.T) {
 	// Mutates package-level execCommand; must not run in parallel.
 	repositories := openWebhookRuntimeTestRepositories(t)

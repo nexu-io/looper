@@ -363,11 +363,11 @@ func TestRuntimeStopCancelsBlockedScheduledWebhookReconcile(t *testing.T) {
 	}
 }
 
-// Contract: project mutation schedules deferred gh-forward reconcile; Stop must
-// not admit a new gh webhook forward process after shutdown begins, and must
-// not hang waiting on a launch admitted after stopped was set.
+// Contract: project mutation → admitted gh-forward launch (past execCommand /
+// pipe setup) → Stop must still refuse cmd.Start when shutdown wins the
+// start-admission boundary, and must not hang on the in-flight launch.
 func TestRuntimeStopRejectsScheduledGHForwardLaunch(t *testing.T) {
-	// Mutates package-level execCommand / webhookForwarderStartedHook.
+	// Mutates package-level execCommand / pre-start / started hooks.
 	workingDir := t.TempDir()
 	cfg, err := config.DefaultConfig(workingDir)
 	if err != nil {
@@ -385,29 +385,28 @@ func TestRuntimeStopRejectsScheduledGHForwardLaunch(t *testing.T) {
 	}
 
 	var (
-		commandMu    sync.Mutex
-		commandCalls int
-		startGate    = make(chan struct{})
-		launchSeen   = make(chan struct{})
-		startedHook  = make(chan struct{}, 1)
+		startGate   = make(chan struct{})
+		launchSeen  = make(chan struct{})
+		startedHook = make(chan struct{}, 1)
 	)
 	originalCommand := execCommand
 	originalStartedHook := webhookForwarderStartedHook
+	originalPreStartHook := webhookForwarderPreStartHook
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		commandMu.Lock()
-		commandCalls++
-		first := commandCalls == 1
-		commandMu.Unlock()
-		if first {
-			close(launchSeen)
-		}
-		// Hold admitted launches before process start so Stop can win the race
-		// and prove runForwarder rechecks the global stop gate.
-		<-startGate
+		// Command construction alone must not be the stop boundary; admission
+		// is exercised after pipes are attached, inside admitForwarderStart.
 		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
 		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
 		cmd.Args[0] = name
 		return cmd
+	}
+	webhookForwarderPreStartHook = func() {
+		select {
+		case <-launchSeen:
+		default:
+			close(launchSeen)
+		}
+		<-startGate
 	}
 	webhookForwarderStartedHook = func() {
 		select {
@@ -418,6 +417,7 @@ func TestRuntimeStopRejectsScheduledGHForwardLaunch(t *testing.T) {
 	t.Cleanup(func() {
 		execCommand = originalCommand
 		webhookForwarderStartedHook = originalStartedHook
+		webhookForwarderPreStartHook = originalPreStartHook
 		select {
 		case <-startGate:
 		default:
@@ -463,7 +463,8 @@ func TestRuntimeStopRejectsScheduledGHForwardLaunch(t *testing.T) {
 		close(stopDone)
 	}()
 
-	// Let Stop set stopped before releasing any in-flight execCommand.
+	// Let Stop set stopped after launch was admitted past execCommand/pipes but
+	// before the linearized start admission runs.
 	time.Sleep(50 * time.Millisecond)
 	close(startGate)
 

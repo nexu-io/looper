@@ -923,6 +923,38 @@ func (w *webhookRuntime) isStopped() bool {
 	return w.stopped
 }
 
+// admitForwarderStart linearizes cmd.Start with Stop: stopped is observed under
+// the same lock that serializes process spawn so shutdown cannot interleave
+// between the check and the start side effect.
+func (w *webhookRuntime) admitForwarderStart(cmd *exec.Cmd) error {
+	if webhookForwarderPreStartHook != nil {
+		webhookForwarderPreStartHook()
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return errWebhookRuntimeStopped
+	}
+	return cmd.Start()
+}
+
+// admitForwarderPersist linearizes store.Upsert with Stop the same way so a
+// forwarder row is never written after shutdown has begun.
+func (w *webhookRuntime) admitForwarderPersist(store *storage.WebhookForwardersRepository, record storage.WebhookForwarderRecord) error {
+	if store == nil {
+		return nil
+	}
+	if webhookForwarderPrePersistHook != nil {
+		webhookForwarderPrePersistHook()
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return errWebhookRuntimeStopped
+	}
+	return store.Upsert(context.Background(), record)
+}
+
 func (w *webhookRuntime) runForwarder(repo string) {
 	backoff := time.Second
 	for {
@@ -946,12 +978,13 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			w.recordForwarderError(repo, stopCh, fmt.Sprintf("attach stderr: %v", err), true)
 			return
 		}
-		// Re-check after preparing the command: Stop may have closed stopCh
-		// after forwarderSnapshot admitted this iteration.
-		if w.isStopped() {
-			return
-		}
-		if err := cmd.Start(); err != nil {
+		// Start admission is linearized with Stop under w.mu: a stopped check
+		// that released the lock before cmd.Start would still let gh forward
+		// spawn after shutdown began.
+		if err := w.admitForwarderStart(cmd); err != nil {
+			if errors.Is(err, errWebhookRuntimeStopped) {
+				return
+			}
 			w.recordForwarderError(repo, stopCh, err.Error(), true)
 			if !w.sleep(backoff, stopCh) {
 				return
@@ -975,14 +1008,14 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			continue
 		}
 		if store := w.currentForwarderStore(); store != nil {
-			if w.isStopped() {
-				// Avoid persisting forwarder rows after shutdown began.
-				w.killAndWait(cmd)
-				return
-			}
 			record := webhookForwarderRecordFromState(repo, pid, processStart, state.Command, w.daemonID, w.currentTime())
-			if err := store.Upsert(context.Background(), record); err != nil {
+			// Persist admission is also linearized with Stop so shutdown cannot
+			// interleave between the stopped check and the store write.
+			if err := w.admitForwarderPersist(store, record); err != nil {
 				w.killAndWait(cmd)
+				if errors.Is(err, errWebhookRuntimeStopped) {
+					return
+				}
 				w.recordForwarderError(repo, stopCh, fmt.Sprintf("persist forwarder record: %v", err), true)
 				if !w.sleep(backoff, stopCh) {
 					return
@@ -1356,6 +1389,11 @@ func appendTail(lines []string, line string, limit int) []string {
 var execCommand = exec.Command
 
 var webhookForwarderStartedHook func()
+
+// Test hooks invoked just before stop-linearized start/persist admission so
+// lifecycle tests can pause at the exact interleaving boundary.
+var webhookForwarderPreStartHook func()
+var webhookForwarderPrePersistHook func()
 
 var osFindProcess = func(pid int) (*os.Process, error) {
 	return os.FindProcess(pid)
