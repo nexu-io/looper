@@ -899,7 +899,18 @@ func (w *webhookRuntime) processProbe() processProbe {
 }
 
 func (w *webhookRuntime) launchForwarder(repo string) {
+	if w == nil {
+		return
+	}
+	// Admit under the same lock Stop uses to set stopped so wg.Add cannot
+	// race with Stop's wg.Wait after shutdown began.
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
 	w.wg.Add(1)
+	w.mu.Unlock()
 	go func() {
 		defer w.wg.Done()
 		w.runForwarder(repo)
@@ -935,6 +946,11 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			w.recordForwarderError(repo, stopCh, fmt.Sprintf("attach stderr: %v", err), true)
 			return
 		}
+		// Re-check after preparing the command: Stop may have closed stopCh
+		// after forwarderSnapshot admitted this iteration.
+		if w.isStopped() {
+			return
+		}
 		if err := cmd.Start(); err != nil {
 			w.recordForwarderError(repo, stopCh, err.Error(), true)
 			if !w.sleep(backoff, stopCh) {
@@ -959,6 +975,11 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			continue
 		}
 		if store := w.currentForwarderStore(); store != nil {
+			if w.isStopped() {
+				// Avoid persisting forwarder rows after shutdown began.
+				w.killAndWait(cmd)
+				return
+			}
 			record := webhookForwarderRecordFromState(repo, pid, processStart, state.Command, w.daemonID, w.currentTime())
 			if err := store.Upsert(context.Background(), record); err != nil {
 				w.killAndWait(cmd)

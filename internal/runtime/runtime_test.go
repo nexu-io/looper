@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -359,6 +360,130 @@ func TestRuntimeStopCancelsBlockedScheduledWebhookReconcile(t *testing.T) {
 	case <-stopDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop() blocked on scheduled webhook reconciliation")
+	}
+}
+
+// Contract: project mutation schedules deferred gh-forward reconcile; Stop must
+// not admit a new gh webhook forward process after shutdown begins, and must
+// not hang waiting on a launch admitted after stopped was set.
+func TestRuntimeStopRejectsScheduledGHForwardLaunch(t *testing.T) {
+	// Mutates package-level execCommand / webhookForwarderStartedHook.
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.Mode = config.WebhookModeGHForward
+	ghPath := "/usr/bin/gh"
+	cfg.Tools.GHPath = &ghPath
+
+	testBin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+
+	var (
+		commandMu    sync.Mutex
+		commandCalls int
+		startGate    = make(chan struct{})
+		launchSeen   = make(chan struct{})
+		startedHook  = make(chan struct{}, 1)
+	)
+	originalCommand := execCommand
+	originalStartedHook := webhookForwarderStartedHook
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		commandMu.Lock()
+		commandCalls++
+		first := commandCalls == 1
+		commandMu.Unlock()
+		if first {
+			close(launchSeen)
+		}
+		// Hold admitted launches before process start so Stop can win the race
+		// and prove runForwarder rechecks the global stop gate.
+		<-startGate
+		cmd := exec.Command(testBin, "-test.run=TestWebhookRuntimeForwarderHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		cmd.Args[0] = name
+		return cmd
+	}
+	webhookForwarderStartedHook = func() {
+		select {
+		case startedHook <- struct{}{}:
+		default:
+		}
+	}
+	t.Cleanup(func() {
+		execCommand = originalCommand
+		webhookForwarderStartedHook = originalStartedHook
+		select {
+		case <-startGate:
+		default:
+			close(startGate)
+		}
+	})
+
+	rt := New(Options{
+		Config:           cfg,
+		Logger:           &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	rt.webhook.bootstrapDone = true
+
+	projectService := rt.Services().Projects
+	projectService.ListWorktrees = nil
+	repo := "acme/gh-forward-live"
+	if _, err := projectService.AddProject(context.Background(), projects.AddInput{
+		ID: "ghfwd", Name: "GH Forward Live", RepoPath: workingDir, Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
+	}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+
+	select {
+	case <-launchSeen:
+	case <-time.After(2 * time.Second):
+		// If reconcile never reached launch (catalog/config path), still exercise
+		// Stop after an explicit ScheduleReconcile with the published catalog.
+		rt.scheduleWebhookForwarderReconcile()
+		select {
+		case <-launchSeen:
+		case <-time.After(2 * time.Second):
+			t.Fatal("scheduled gh-forward reconcile did not attempt forwarder launch")
+		}
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		rt.Stop("test gh-forward launch stop")
+		close(stopDone)
+	}()
+
+	// Let Stop set stopped before releasing any in-flight execCommand.
+	time.Sleep(50 * time.Millisecond)
+	close(startGate)
+
+	select {
+	case <-stopDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop() blocked on scheduled gh-forward forwarder launch")
+	}
+
+	select {
+	case <-startedHook:
+		t.Fatal("forwarder process reached started hook after Stop began")
+	default:
+	}
+
+	status := rt.WebhookStatus()
+	for _, fwd := range status.Forwarders {
+		if fwd.Running || fwd.PID != nil {
+			t.Fatalf("forwarder still running after Stop: %#v", fwd)
+		}
 	}
 }
 

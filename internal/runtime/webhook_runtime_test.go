@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -413,6 +414,85 @@ func TestWebhookRuntimeEnsureTunnelServerRefusesAfterStop(t *testing.T) {
 	}
 	if rt.tunnelServer != nil {
 		t.Fatal("tunnelServer started after Stop, want nil")
+	}
+}
+
+func TestWebhookRuntimeLaunchForwarderRefusesAfterStop(t *testing.T) {
+	// Mutates package-level execCommand; must not run in parallel.
+	var starts atomic.Int32
+	originalCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		starts.Add(1)
+		return exec.Command("false")
+	}
+	t.Cleanup(func() { execCommand = originalCommand })
+
+	rt := &webhookRuntime{
+		status: WebhookStatus{
+			Enabled:    true,
+			Forwarders: []WebhookForwarderState{{Repo: "nexu-io/looper", Command: []string{"gh", "webhook", "forward"}}},
+		},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{"nexu-io/looper": make(chan struct{})},
+		now:             time.Now,
+	}
+	rt.Stop()
+	rt.launchForwarder("nexu-io/looper")
+
+	// launchForwarder must not admit after Stop: no command construction and no
+	// extra work that would race with Stop's completed Wait.
+	time.Sleep(50 * time.Millisecond)
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("execCommand starts after Stop = %d, want 0", got)
+	}
+}
+
+func TestWebhookRuntimeReconcileDoesNotLaunchForwarderAfterStop(t *testing.T) {
+	// Mutates package-level execCommand; must not run in parallel.
+	repositories := openWebhookRuntimeTestRepositories(t)
+	nowISO := formatJavaScriptISOString(time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC))
+	metadata := `{"repo":"nexu-io/looper"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	var starts atomic.Int32
+	originalCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		starts.Add(1)
+		return exec.Command("false")
+	}
+	t.Cleanup(func() { execCommand = originalCommand })
+
+	rt := &webhookRuntime{
+		cfg:    webhookRuntimeTestConfig("nexu-io/looper"),
+		ghPath: "/usr/bin/gh",
+		status: WebhookStatus{
+			Enabled:     true,
+			EndpointURL: "http://127.0.0.1:7777/webhook/forward",
+		},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{},
+		now:             time.Now,
+		bootstrapDone:   true,
+	}
+	rt.Stop()
+
+	if err := rt.Reconcile(repositories); err != nil {
+		t.Fatalf("Reconcile() after Stop error = %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("execCommand starts after stopped Reconcile = %d, want 0", got)
+	}
+	if status := rt.Status(); len(status.Forwarders) != 0 {
+		// Reconcile may still materialize desired state before launch admission;
+		// either empty or non-running is fine as long as no process started.
+		for _, fwd := range status.Forwarders {
+			if fwd.Running || fwd.PID != nil {
+				t.Fatalf("forwarder started after Stop: %#v", fwd)
+			}
+		}
 	}
 }
 
