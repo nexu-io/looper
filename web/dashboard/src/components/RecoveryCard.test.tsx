@@ -126,6 +126,7 @@ describe("RecoveryCard", () => {
     expect(retryLoop).not.toHaveBeenCalled();
     expect(stopActiveRun).not.toHaveBeenCalled();
     expect(takeoverLoop).not.toHaveBeenCalled();
+    expect(fetchLoopWorktree).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => {
@@ -133,7 +134,101 @@ describe("RecoveryCard", () => {
         discardWorktreeChanges: false,
       });
     });
+    // Click-time revalidation before plain retry (LoopActionBar parity).
+    expect(fetchLoopWorktree).toHaveBeenCalledTimes(2);
     expect(screen.queryByText("Discard & Retry")).toBeNull();
+  });
+
+  it("blocks plain retry when revalidation finds managed dirty worktree", async () => {
+    fetchLoopWorktree
+      .mockResolvedValueOnce({
+        loopId: "loop_1",
+        seq: 617,
+        present: true,
+        managed: true,
+        dirty: false,
+        clean: true,
+        worktreePath: "/tmp/was-clean",
+        reason: "already_clean",
+      })
+      .mockResolvedValueOnce({
+        loopId: "loop_1",
+        seq: 617,
+        present: true,
+        managed: true,
+        dirty: true,
+        clean: false,
+        worktreePath: "/tmp/now-dirty",
+        reason: "dirty",
+      });
+    renderCard();
+
+    await screen.findByRole("button", { name: "Retry" });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => {
+      expect(fetchLoopWorktree).toHaveBeenCalledTimes(2);
+    });
+    expect(retryLoop).not.toHaveBeenCalled();
+    await screen.findByText(/Managed worktree has local uncommitted changes/i);
+    expect(screen.getByRole("button", { name: "Discard & Retry" })).toBeTruthy();
+  });
+
+  it("blocks Retry without discard when revalidation stays inspect-only", async () => {
+    fetchLoopWorktree.mockResolvedValue({
+      loopId: "loop_1",
+      seq: 617,
+      present: true,
+      managed: false,
+      dirty: true,
+      worktreePath: "/tmp/primary-repo",
+      reason: "unmanaged",
+    });
+    renderCard();
+
+    await screen.findByRole("button", { name: "Retry without discard" });
+    fireEvent.click(screen.getByRole("button", { name: "Retry without discard" }));
+
+    await waitFor(() => {
+      expect(fetchLoopWorktree).toHaveBeenCalledTimes(2);
+    });
+    expect(retryLoop).not.toHaveBeenCalled();
+    await screen.findByText(/Dashboard discard is unavailable/i);
+  });
+
+  it("allows Retry without discard only after revalidation returns ok", async () => {
+    fetchLoopWorktree
+      .mockResolvedValueOnce({
+        loopId: "loop_1",
+        seq: 617,
+        present: true,
+        managed: true,
+        dirty: true,
+        clean: false,
+        worktreePath: "/tmp/dirty-wt",
+        reason: "dirty",
+      })
+      .mockResolvedValueOnce({
+        loopId: "loop_1",
+        seq: 617,
+        present: true,
+        managed: true,
+        dirty: false,
+        clean: true,
+        worktreePath: "/tmp/dirty-wt",
+        reason: "already_clean",
+      });
+    renderCard();
+
+    await screen.findByRole("button", { name: "Retry without discard" });
+    fireEvent.click(screen.getByRole("button", { name: "Retry without discard" }));
+
+    await waitFor(() => {
+      expect(retryLoop).toHaveBeenCalledWith("617", {
+        discardWorktreeChanges: false,
+      });
+    });
+    expect(fetchLoopWorktree).toHaveBeenCalledTimes(2);
   });
 
   it("offers Inspect/Jump and confirmed Discard & Retry for managed dirty", async () => {

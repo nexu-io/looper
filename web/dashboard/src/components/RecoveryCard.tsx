@@ -14,7 +14,9 @@ import {
   type TakeoverResult,
 } from "@/lib/api";
 import { actionsForLoopStatus } from "@/lib/actions";
+import { isWorktreeRouteUnavailable } from "@/components/LoopActionBar";
 import {
+  classifyRetryWorktree,
   recoveryDiscardCliHint,
   recoveryGuidance,
   recoveryJumpCommand,
@@ -164,11 +166,52 @@ export function RecoveryCard({
     [selector, toast, onMutated],
   );
 
+  // Plain retry must re-fetch /worktree at click time (same authority as
+  // LoopActionBar): a stale "ok" preflight or "Retry without discard" on a
+  // dirty/unmanaged tree must not requeue until classification is freshly ok.
   const onRetry = useCallback(async () => {
     if (busy || !actions.retry) return;
     setPending("retry");
     setInlineError(null);
     try {
+      let fresh: LoopWorktreeStatus;
+      try {
+        fresh = await fetchLoopWorktree(selector);
+      } catch (err) {
+        if (isWorktreeRouteUnavailable(err)) {
+          // Older daemon without /worktree — match LoopActionBar plain retry.
+          await finishRetry(false);
+          return;
+        }
+        setWorktree(null);
+        setFetchFailed(true);
+        const message = err instanceof Error ? err.message : String(err);
+        setWorktreeError(message);
+        setInlineError(message);
+        toast.error(message);
+        return;
+      }
+
+      setWorktree(fresh);
+      setFetchFailed(false);
+      setWorktreeError(null);
+
+      const decision = classifyRetryWorktree(fresh);
+      if (decision === "offer-discard") {
+        toast.error(
+          "Worktree has local uncommitted changes; discard or inspect before plain retry",
+        );
+        return;
+      }
+      if (decision === "inspect-only") {
+        toast.error(
+          fresh.managed
+            ? "Worktree dirty state could not be verified; inspect before retrying"
+            : "Dirty worktree is not Looper-managed; inspect before retrying",
+        );
+        return;
+      }
+
       await finishRetry(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -177,7 +220,7 @@ export function RecoveryCard({
     } finally {
       setPending(null);
     }
-  }, [busy, actions.retry, finishRetry, toast]);
+  }, [busy, actions.retry, selector, finishRetry, toast]);
 
   const onDiscardRetry = useCallback(async () => {
     if (busy || !offersDiscard || !actions.retry) return;
