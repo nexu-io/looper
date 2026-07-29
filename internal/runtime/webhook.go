@@ -110,9 +110,13 @@ type webhookRuntime struct {
 	forwarderStopCh    map[string]chan struct{}
 	mu                 sync.RWMutex
 	bootstrapMu        sync.Mutex
+	reconcileMu        sync.Mutex
 	wg                 sync.WaitGroup
 	stopped            bool
 	reconcileRetry     bool
+	reconcileRunning   bool
+	reconcilePending   bool
+	reconcileRepos     *storage.Repositories
 	daemonID           string
 	probe              processProbe
 	forwarderStore     *storage.WebhookForwardersRepository
@@ -288,8 +292,62 @@ func (w *webhookRuntime) canLaunchForwarders() bool {
 }
 
 func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
+	w.reconcileMu.Lock()
+	defer w.reconcileMu.Unlock()
+
 	cfg := w.configSnapshot()
 	return w.reconcileSnapshot(repos, cfg)
+}
+
+func (w *webhookRuntime) ScheduleReconcile(repos *storage.Repositories) {
+	if w == nil || repos == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
+	w.reconcileRepos = repos
+	w.reconcilePending = true
+	if w.reconcileRunning {
+		w.mu.Unlock()
+		return
+	}
+	w.reconcileRunning = true
+	w.wg.Add(1)
+	w.mu.Unlock()
+
+	go w.runScheduledReconcile()
+}
+
+func (w *webhookRuntime) runScheduledReconcile() {
+	defer w.wg.Done()
+	for {
+		w.mu.Lock()
+		if w.stopped {
+			w.reconcileRunning = false
+			w.reconcilePending = false
+			w.mu.Unlock()
+			return
+		}
+		repos := w.reconcileRepos
+		w.reconcilePending = false
+		w.mu.Unlock()
+
+		if err := w.Reconcile(repos); err != nil && w.logger != nil {
+			w.logger.Warn("webhook.reconcile_failed", map[string]any{"error": err.Error()})
+		}
+
+		w.mu.Lock()
+		if w.stopped || !w.reconcilePending {
+			w.reconcileRunning = false
+			w.reconcilePending = false
+			w.mu.Unlock()
+			return
+		}
+		w.mu.Unlock()
+	}
 }
 
 func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg config.Config) error {

@@ -237,6 +237,67 @@ func TestRuntimeProjectMutationsAtomicallyPublishCatalog(t *testing.T) {
 	}
 }
 
+func TestRuntimeProjectAddDoesNotWaitForWebhookReconciliation(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.Mode = config.WebhookModeTunnel
+	cfg.Webhook.ListenPort = 0
+	cfg.Webhook.PublicBaseURL = "https://looper.example.test"
+	ghPath := "/usr/bin/gh"
+	cfg.Tools.GHPath = &ghPath
+
+	rt := New(Options{
+		Config:           cfg,
+		Logger:           &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	reconcileStarted := make(chan struct{})
+	releaseReconcile := make(chan struct{})
+	defer close(releaseReconcile)
+	rt.webhook.bootstrapDone = true
+	rt.webhook.tunnelClient = blockingWebhookTunnelGitHubClient{
+		started: reconcileStarted,
+		release: releaseReconcile,
+	}
+
+	projectService := rt.Services().Projects
+	projectService.ListWorktrees = nil
+	repo := "acme/live"
+	addDone := make(chan error, 1)
+	go func() {
+		_, err := projectService.AddProject(context.Background(), projects.AddInput{
+			ID: "live", Name: "Live", RepoPath: workingDir, Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
+		})
+		addDone <- err
+	}()
+
+	select {
+	case <-reconcileStarted:
+	case <-time.After(time.Second):
+		t.Fatal("webhook reconciliation did not start")
+	}
+	select {
+	case err := <-addDone:
+		if err != nil {
+			t.Fatalf("AddProject() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AddProject() waited for webhook reconciliation")
+	}
+}
+
 func TestRuntimeStartIsIdempotent(t *testing.T) {
 	t.Parallel()
 
@@ -4812,4 +4873,31 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatal("condition not satisfied before timeout")
+}
+
+type blockingWebhookTunnelGitHubClient struct {
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (c blockingWebhookTunnelGitHubClient) GetHook(context.Context, string, int64) (webhookTunnelGitHubHook, bool, error) {
+	return webhookTunnelGitHubHook{}, false, nil
+}
+
+func (c blockingWebhookTunnelGitHubClient) CreateHook(ctx context.Context, _ string, _ string, _ string, _ []string) (webhookTunnelGitHubHook, error) {
+	close(c.started)
+	select {
+	case <-c.release:
+		return webhookTunnelGitHubHook{ID: 1}, nil
+	case <-ctx.Done():
+		return webhookTunnelGitHubHook{}, ctx.Err()
+	}
+}
+
+func (c blockingWebhookTunnelGitHubClient) UpdateHook(context.Context, string, int64, string, string, []string, bool) (webhookTunnelGitHubHook, error) {
+	return webhookTunnelGitHubHook{}, nil
+}
+
+func (c blockingWebhookTunnelGitHubClient) DeleteHook(context.Context, string, int64) error {
+	return nil
 }
