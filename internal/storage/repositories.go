@@ -363,6 +363,28 @@ func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel
 	return &record, nil
 }
 
+// InsertIfAbsent inserts a notification only when its primary key is free.
+// Returns true when this call created the row (atomic claim), false when the
+// id already existed. Used for permanent human-attention entry reservation so
+// concurrent recovery + post-claim observers cannot both emit.
+func (r *NotificationsRepository) InsertIfAbsent(ctx context.Context, record NotificationRecord) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		INSERT OR IGNORE INTO notifications (
+			id, project_id, loop_id, run_id, entity_type, entity_id, channel, level,
+			title, subtitle, body, status, dedupe_key, error_message, payload_json,
+			sent_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.ID, record.ProjectID, record.LoopID, record.RunID, record.EntityType, record.EntityID, record.Channel, record.Level, record.Title, record.Subtitle, record.Body, record.Status, record.DedupeKey, record.ErrorMessage, record.PayloadJSON, record.SentAt, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("insert notification if absent: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("insert notification if absent rows affected: %w", err)
+	}
+	return rowsAffected > 0, nil
+}
+
 // FeishuThreadsRepository maps a Feishu message thread root to the loop whose
 // notifications thread under it, in both directions.
 type FeishuThreadsRepository struct{ q sqliteQuerier }

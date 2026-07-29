@@ -2,6 +2,8 @@ package notify
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -84,9 +88,6 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		return nil
 	}
 	dedupeKey := HumanAttentionDedupeKey(reason, entryKey)
-	if g.alreadyNotifiedHumanAttention(ctx, dedupeKey) {
-		return nil
-	}
 
 	loopLabel := humanAttentionLoopLabel(input.LoopSeq, input.LoopID)
 	body := fmt.Sprintf("%s requires operator attention (%s).", loopLabel, humanAttentionReasonLabel(reason))
@@ -115,14 +116,15 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		entityID = firstNonEmpty(input.LoopID, entryKey)
 	}
 
-	// awaiting_human already has a Feishu HITL ask card (suspendForHuman); a
-	// second plain remote message for that park duplicates the only interactive
-	// remote signal. manual_intervention has no such duplicate: the former
-	// worker-completion remote path was removed, so suppress LocalOnly only for
-	// awaiting_human and keep remote webhook/Feishu delivery for hard holds.
-	localOnly := reason == HumanAttentionAwaitingHuman
+	// Suppress remote channels only when a Feishu HITL ask card was actually
+	// delivered for this park (live card in gateway state, or durable
+	// hitl.transport=feishu). Unconditional awaiting_human LocalOnly would drop
+	// the only remote alert for fixer parks and github/respond transports that
+	// never send a Feishu card. manual_intervention never has that duplicate.
+	localOnly := reason == HumanAttentionAwaitingHuman && g.feishuAskDeliveredForLoop(ctx, input.LoopID)
 
-	return g.Notify(ctx, SystemNotificationPayload{
+	payload := SystemNotificationPayload{
+		ID:                humanAttentionReservationID(dedupeKey),
 		ProjectID:         input.ProjectID,
 		LoopID:            input.LoopID,
 		RunID:             input.RunID,
@@ -137,7 +139,138 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		OpenURL:           openURL,
 		OperatorAttention: true,
 		LocalOnly:         localOnly,
-	})
+	}
+
+	// Atomic permanent entry claim before any channel delivery so concurrent
+	// recovery rescan + post-claim observers cannot both emit.
+	inApp, claimed := g.claimHumanAttentionEntry(ctx, payload)
+	if !claimed {
+		return nil
+	}
+
+	records := make([]storage.NotificationRecord, 0, 3)
+	if inApp.ID != "" {
+		records = append(records, inApp)
+	}
+	if record, ok := g.recordOsascript(ctx, payload); ok {
+		records = append(records, record)
+	}
+	if !payload.LocalOnly {
+		if strings.EqualFold(strings.TrimSpace(g.config.Webhook.Mode), "app") {
+			if record, ok := g.recordFeishuApp(ctx, payload); ok {
+				records = append(records, record)
+			}
+		} else if record, ok := g.recordWebhook(ctx, payload); ok {
+			records = append(records, record)
+		}
+	}
+	return records
+}
+
+// humanAttentionReservationID is a stable primary key for the permanent in_app
+// claim row for one human-attention entry. Concurrent InsertIfAbsent callers
+// race on this id; only the winner proceeds to osascript/webhook delivery.
+func humanAttentionReservationID(dedupeKey string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(dedupeKey)))
+	return "notification_ha_" + hex.EncodeToString(sum[:16])
+}
+
+// claimHumanAttentionEntry reserves the permanent in_app audit row for one
+// entry. Returns claimed=false when another caller already reserved it.
+// Without a notifications repository the claim cannot be durable; delivery is
+// still allowed (same as the previous best-effort path without storage).
+func (g *Gateway) claimHumanAttentionEntry(ctx context.Context, payload SystemNotificationPayload) (storage.NotificationRecord, bool) {
+	nowISO := eventlog.FormatJavaScriptISOString(g.now())
+	record := storage.NotificationRecord{
+		ID:           firstNonEmpty(payload.ID, humanAttentionReservationID(payload.DedupeKey)),
+		ProjectID:    nilIfEmpty(payload.ProjectID),
+		LoopID:       nilIfEmpty(payload.LoopID),
+		RunID:        nilIfEmpty(payload.RunID),
+		EntityType:   nilIfEmpty(payload.EntityType),
+		EntityID:     nilIfEmpty(payload.EntityID),
+		Channel:      "in_app",
+		Level:        payload.Level,
+		Title:        payload.Title,
+		Subtitle:     nilIfEmpty(payload.Subtitle),
+		Body:         payload.Body,
+		Status:       ternaryString(g.config.InApp, "success", "skipped"),
+		DedupeKey:    nilIfEmpty(payload.DedupeKey),
+		ErrorMessage: ternaryPointer(!g.config.InApp, "disabled"),
+		PayloadJSON:  stringPointer(mustMarshalPayload(payload)),
+		SentAt:       ternaryTimePointer(g.config.InApp, nowISO),
+		CreatedAt:    nowISO,
+		UpdatedAt:    nowISO,
+	}
+	if g.repositories == nil || g.repositories.Notifications == nil {
+		return record, true
+	}
+	inserted, err := g.repositories.Notifications.InsertIfAbsent(ctx, record)
+	if err != nil {
+		// Fail open on storage errors so a transient DB fault cannot permanently
+		// silence a park; concurrent double-emit is preferred over total silence.
+		return record, true
+	}
+	if !inserted {
+		return storage.NotificationRecord{}, false
+	}
+	if g.repositories.Events != nil {
+		_ = eventlog.Append(ctx, g.repositories, eventlog.AppendInput{
+			ID:         eventlog.NewEventID("event"),
+			EventType:  "notification.sent",
+			ProjectID:  record.ProjectID,
+			LoopID:     record.LoopID,
+			RunID:      record.RunID,
+			EntityType: firstPointer(record.EntityType, stringPointer("notification")),
+			EntityID:   firstPointer(record.EntityID, &record.ID),
+			Payload: map[string]any{
+				"channel":   record.Channel,
+				"level":     record.Level,
+				"status":    record.Status,
+				"dedupeKey": record.DedupeKey,
+				"title":     record.Title,
+			},
+			CreatedAt: mustParseJSISOString(record.CreatedAt),
+		})
+	}
+	return record, true
+}
+
+// feishuAskDeliveredForLoop reports whether a Feishu HITL ask card is the active
+// remote signal for this loop: either this process still holds the live card, or
+// durable loop metadata records hitl.transport=feishu after a successful send.
+func (g *Gateway) feishuAskDeliveredForLoop(ctx context.Context, loopID string) bool {
+	loopID = strings.TrimSpace(loopID)
+	if loopID != "" && g.hasOpenFeishuAskCard(loopID) {
+		return true
+	}
+	if loopID == "" || g.repositories == nil || g.repositories.Loops == nil {
+		return false
+	}
+	loop, err := g.repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return false
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(ask.Transport), "feishu")
+}
+
+// hasOpenFeishuAskCard reports whether this gateway's shared state still holds a
+// live Feishu ask card for loopID (set by SendHITLAsk, cleared by MarkAskAnswered).
+func (g *Gateway) hasOpenFeishuAskCard(loopID string) bool {
+	if g == nil || g.state == nil {
+		return false
+	}
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return false
+	}
+	g.state.liveMu.Lock()
+	defer g.state.liveMu.Unlock()
+	st, ok := g.state.askCards[loopID]
+	return ok && strings.TrimSpace(st.msgID) != ""
 }
 
 // HumanAttentionDedupeKey builds the durable dedupe key for one human-attention entry.
@@ -262,19 +395,6 @@ func IsManualInterventionCondition(lastErrorKind string, resumePolicy string) bo
 		return true
 	}
 	return strings.TrimSpace(resumePolicy) == string(HumanAttentionManualIntervention)
-}
-
-func (g *Gateway) alreadyNotifiedHumanAttention(ctx context.Context, dedupeKey string) bool {
-	if g.repositories == nil || g.repositories.Notifications == nil || strings.TrimSpace(dedupeKey) == "" {
-		return false
-	}
-	// Permanent entry dedupe across restarts: any prior in_app record with this
-	// key means we already emitted for this durable entry.
-	existing, err := g.repositories.Notifications.GetLatestByDedupe(ctx, "in_app", dedupeKey)
-	if err != nil || existing == nil {
-		return false
-	}
-	return true
 }
 
 func humanAttentionLoopLabel(seq int64, loopID string) string {

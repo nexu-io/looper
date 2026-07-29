@@ -395,12 +395,27 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 				notif.SourceURL = w.IssueURL
 			}
 		}
-		if err := r.hitlNotify(ctx, notif); err != nil && r.logger != nil {
-			// The loop is already parked in awaiting_human; if the human is never
-			// notified they must find it via the dashboard / API. Surface loudly so an
-			// unconfigured or failing notifier can't silently strand a run.
-			r.logger.Warn("worker HITL ask notification failed; loop parked awaiting human with no notification sent", map[string]any{
-				"loopId": input.Loop.ID, "loopSeq": input.Loop.Seq, "runId": run.ID, "error": err.Error(),
+		if err := r.hitlNotify(ctx, notif); err != nil {
+			if r.logger != nil {
+				// The loop is already parked in awaiting_human; if the human is never
+				// notified they must find it via the dashboard / API. Surface loudly so an
+				// unconfigured or failing notifier can't silently strand a run.
+				r.logger.Warn("worker HITL ask notification failed; loop parked awaiting human with no notification sent", map[string]any{
+					"loopId": input.Loop.ID, "loopSeq": input.Loop.Seq, "runId": run.ID, "error": err.Error(),
+				})
+			}
+		} else if r.hitlTransportFeishu() {
+			// Durable delivery evidence for human-attention LocalOnly: suppress
+			// remote HA alerts only when a Feishu ask card was actually sent.
+			_, _ = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+				ask, ok := loops.ReadHITLAsk(updated.MetadataJSON)
+				if !ok {
+					return
+				}
+				ask.Transport = "feishu"
+				if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
+					updated.MetadataJSON = &meta
+				}
 			})
 		}
 	}
@@ -412,6 +427,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 func (r *Runner) hitlTransportGitHub() bool {
 	t := strings.TrimSpace(strings.ToLower(r.hitlAnswerTransport))
 	return t == "" || t == "github"
+}
+
+// hitlTransportFeishu reports whether the Feishu app-bot ask transport is active.
+func (r *Runner) hitlTransportFeishu() bool {
+	return strings.EqualFold(strings.TrimSpace(r.hitlAnswerTransport), "feishu")
 }
 
 func (r *Runner) hitlAwaitingLabel() string {
