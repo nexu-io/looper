@@ -1041,9 +1041,6 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
-		// Rescan durable human-attention parks after recovery durability is done.
-		// Delivery is async so interactive osascript cannot delay MarkReady.
-		r.scheduleHumanAttentionRecoveryNotify(repositories)
 		if err := r.appendStartedEvent(context.Background(), *startedAt, recoverySummary); err != nil {
 			r.startupReadyErr = err
 			return
@@ -1090,6 +1087,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// the shutdown race where BeginShutdown may have already missed a nil
 		// recoveryCancel between MarkReady and registration).
 		r.startDeferredReviewerRecovery(githubGateway)
+		// Rescan durable human-attention parks only after startup is committed
+		// (admission ready). Launching earlier races Start's failure cleanup,
+		// which closes SQLite while this goroutine still queries/persists or
+		// blocks in osascript. Delivery stays async so interactive dialogs
+		// cannot delay MarkReady / admission.
+		r.scheduleHumanAttentionRecoveryNotify(repositories)
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
 		// admission is ready so discovery/HITL do not wait a full poll interval.

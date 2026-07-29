@@ -35,8 +35,10 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 }
 
 // scheduleHumanAttentionRecoveryNotify rescans durable human-attention parks
-// after startup recovery durability is complete. Delivery runs asynchronously
-// so interactive osascript dialogs cannot delay MarkReady / admission.
+// after CompleteStartup has committed (MarkReady succeeded). Callers must not
+// schedule this while later startup steps can still fail and close SQLite.
+// Delivery runs asynchronously so interactive osascript dialogs cannot delay
+// admission readiness.
 //
 // Covers: (1) parks that crashed after durable await/manual hold but before the
 // scheduler finalize callback; (2) recovery quarantine parks that used to notify

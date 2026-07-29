@@ -159,13 +159,44 @@ func (g *Gateway) DashboardLoopDetailURL(loopSeq int64) (string, error) {
 }
 
 // dashboardDeepLinkUsable reports whether a bare origin + loop path can load loop
-// detail APIs in a newly opened browser tab. local-token requires session bootstrap
-// that osascript does not mint, so deep links are not offered in that mode.
+// detail APIs in a newly opened browser tab without bypassing dashboard open policy.
+//
+// local-token requires session bootstrap that osascript does not mint, so deep
+// links are never offered in that mode. Non-loopback origins are also rejected:
+// the supported dashboard open path (allowDashboardOpen) only permits non-loopback
+// when using HTTPS with local-token, and this notification path suppresses every
+// local-token link — so non-loopback would otherwise open a remote/plain-HTTP
+// dashboard the CLI refuses. Fall back to Open Log instead.
 func (g *Gateway) dashboardDeepLinkUsable() bool {
 	if g == nil {
 		return false
 	}
-	return g.dashboardAuthMode != config.AuthModeLocalToken
+	if g.dashboardAuthMode == config.AuthModeLocalToken {
+		return false
+	}
+	return isDashboardDeepLinkOriginSafe(g.dashboardBaseURL)
+}
+
+// isDashboardDeepLinkOriginSafe mirrors CLI dashboard open host policy for bare
+// deep links: only loopback origins are safe without local-token bootstrap.
+func isDashboardDeepLinkOriginSafe(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return isLoopbackHostname(parsed.Hostname())
+}
+
+func isLoopbackHostname(host string) bool {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ResolveDashboardBaseURL derives a browser-openable local origin for Dashboard

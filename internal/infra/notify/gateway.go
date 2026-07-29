@@ -47,8 +47,10 @@ type Options struct {
 	DashboardBaseURL string
 	// DashboardAuthMode controls whether bare Dashboard deep links are usable
 	// from a freshly opened browser tab. When local-token, Open Loop is omitted
-	// (no one-shot bootstrap from osascript) and human-attention falls back to
-	// the daemon log dialog instead of an unauthenticated SPA shell.
+	// (no one-shot bootstrap from osascript). Non-loopback DashboardBaseURL is
+	// also rejected so notifications do not open remote/plain-HTTP dashboards
+	// the CLI open policy refuses. Human-attention falls back to the daemon
+	// log dialog instead of an unusable or policy-bypassing SPA shell.
 	DashboardAuthMode config.AuthMode
 	Repositories      *storage.Repositories
 	State             *GatewayState

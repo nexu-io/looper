@@ -348,6 +348,91 @@ func TestGatewayHumanAttentionLocalTokenFallsBackToDaemonLog(t *testing.T) {
 	}
 }
 
+func TestGatewayHumanAttentionNonLoopbackFallsBackToDaemonLog(t *testing.T) {
+	// Non-loopback baseUrl + authMode=none must not open a remote dashboard that
+	// the CLI open policy rejects (non-loopback requires HTTPS + local-token).
+	t.Parallel()
+
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	capturePath := filepath.Join(rootDir, "osascript.log")
+	scriptPath := filepath.Join(rootDir, "osascript")
+	writeExecutableScript(t, scriptPath, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \""+capturePath+"\"\n")
+	logPath := filepath.Join(rootDir, "logs", "looperd.log")
+
+	coordinator := openNotifyCoordinator(t, rootDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{
+			InApp: true,
+			Osascript: config.OsascriptNotificationConfig{
+				Enabled:               true,
+				ThrottleWindowSeconds: 60,
+			},
+		},
+		OsascriptPath:     scriptPath,
+		LogFilePath:       logPath,
+		DashboardBaseURL:  "http://dash.example:8080",
+		DashboardAuthMode: config.AuthModeNone,
+		Repositories:      repos,
+	})
+
+	records := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+		LoopSeq:  42,
+		Reason:   HumanAttentionAwaitingHuman,
+		EntryKey: "run:run_non_loopback",
+	})
+	if got := notificationStatus(records, "osascript"); got != "success" {
+		t.Fatalf("osascript status = %q, want success; records=%#v", got, records)
+	}
+
+	osascriptCallsBytes, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
+	}
+	osascriptCalls := string(osascriptCallsBytes)
+	assertContains(t, osascriptCalls, "Open Log")
+	assertContains(t, osascriptCalls, logPath)
+	if strings.Contains(osascriptCalls, "Open Loop") {
+		t.Fatalf("non-loopback authMode=none must not offer Open Loop: %q", osascriptCalls)
+	}
+	if strings.Contains(osascriptCalls, "dash.example") || strings.Contains(osascriptCalls, "/dashboard/loops/") {
+		t.Fatalf("non-loopback must not open remote dashboard deep link: %q", osascriptCalls)
+	}
+}
+
+func TestDashboardDeepLinkUsable_OriginAndAuthPolicy(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		baseURL  string
+		authMode config.AuthMode
+		want     bool
+	}{
+		{name: "loopback none", baseURL: "http://127.0.0.1:17310", authMode: config.AuthModeNone, want: true},
+		{name: "localhost none", baseURL: "http://localhost:17310", authMode: config.AuthModeNone, want: true},
+		{name: "loopback local-token", baseURL: "http://127.0.0.1:17310", authMode: config.AuthModeLocalToken, want: false},
+		{name: "non-loopback http none", baseURL: "http://dash.example:8080", authMode: config.AuthModeNone, want: false},
+		{name: "non-loopback https none", baseURL: "https://dash.example", authMode: config.AuthModeNone, want: false},
+		{name: "non-loopback https local-token", baseURL: "https://dash.example", authMode: config.AuthModeLocalToken, want: false},
+		{name: "empty base", baseURL: "", authMode: config.AuthModeNone, want: false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewGateway(Options{
+				DashboardBaseURL:  tc.baseURL,
+				DashboardAuthMode: tc.authMode,
+			})
+			if got := g.dashboardDeepLinkUsable(); got != tc.want {
+				t.Fatalf("dashboardDeepLinkUsable() = %v, want %v (base=%q auth=%q)", got, tc.want, tc.baseURL, tc.authMode)
+			}
+		})
+	}
+}
+
 func TestGatewayHumanAttentionSkipsFeishuAppDelivery(t *testing.T) {
 	// Human-attention is local-only so Feishu HITL ask cards / milestones are not duplicated.
 	t.Setenv("LOOPER_TEST_FEISHU_APP_ID", "cli_app_id")
