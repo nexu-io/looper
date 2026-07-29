@@ -83,11 +83,11 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 		DB: fixture.coordinator.DB(), Repos: fixture.repos,
 		GitHub: github, Git: git,
 		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
-		AgentRuntime: "codex", AllowAutoPush: true, HITLEnabled: true,
+		AgentRuntime: "codex", AllowAutoPush: true, AllowRiskyFixes: true, HITLEnabled: true,
 	})
 	checkpoint := fixerCheckpoint{
 		Detail:       &checkpointDetail{HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main"},
-		FixItems:     []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "conflicting request"}},
+		FixItems:     []FixItem{{Type: "conflict", ID: "conflict-1", Summary: "base merge conflict"}, {Type: "comment", ID: "c1", ThreadID: "t1", Summary: "conflicting request"}},
 		FixItemsHash: "fix-items-1",
 		Worktree:     &checkpointWorktree{Path: worktreePath, Branch: "feature/fix-42", PreparedAt: fixture.nowISO()},
 	}
@@ -100,6 +100,9 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	}
 	if !strings.Contains(agent.starts[0].Prompt, "Do not push") || agent.starts[0].NativeSessionID != "" {
 		t.Fatalf("initial agent input = %#v, want local-only fresh turn", agent.starts[0])
+	}
+	if len(git.mergeBaseCalls) != 1 {
+		t.Fatalf("initial base merge calls = %d, want 1", len(git.mergeBaseCalls))
 	}
 	badRun := run1
 	badRun.ID = "run_fixer_hitl_bad_fk"
@@ -183,6 +186,9 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	}
 	if len(git.prepareCalls) != 0 {
 		t.Fatalf("PrepareWorktree calls = %d, want no reset-capable prepare on HITL resume", len(git.prepareCalls))
+	}
+	if len(git.mergeBaseCalls) != 1 {
+		t.Fatalf("base merge calls after HITL resume = %d, want initial merge only", len(git.mergeBaseCalls))
 	}
 
 	// Simulate a daemon exit after the durable repair consumed the answer but

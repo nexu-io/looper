@@ -2922,6 +2922,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
+	worktreeReprepared := false
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		checkpoint.Worktree = nil
 		checkpoint.Repair = nil
@@ -2931,6 +2932,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		if err != nil {
 			return checkpoint, err
 		}
+		worktreeReprepared = true
 		worktree, err = requireWorktree(checkpoint)
 		if err != nil {
 			return checkpoint, err
@@ -2944,11 +2946,18 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	nativeResumePrompt, nativeSessionID := r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
+	continuingHITL := nativeResumePrompt != ""
 	// Autonomous conflict resolution (risky fixes on): merge the base into the
 	// worktree so the agent has the conflict markers to resolve, instead of punting
-	// the conflict to a human. A merge that fails for a non-conflict reason falls
-	// back to manual intervention.
-	if hasConflict {
+	// the conflict to a human. An answered HITL continuation reuses the merge
+	// already started before parking unless worktree recovery replaced it. A merge
+	// that fails for a non-conflict reason falls back to manual intervention.
+	if hasConflict && (!continuingHITL || worktreeReprepared) {
 		base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
 		if base == "" {
 			base = "main"
@@ -2960,12 +2969,6 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		}
 	}
 	executionID := eventlog.NewEventID("agent")
-	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
-	if err != nil {
-		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
-	}
-	nativeResumePrompt, nativeSessionID := r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
-	continuingHITL := nativeResumePrompt != ""
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush && !r.hitlEnabled && !continuingHITL, r.disclosure, agentVendor, derefString(agentModel))
 	if r.hitlEnabled {
 		if instruction := fixerHITLPromptFor(checkpoint.FixItems); instruction != "" {
