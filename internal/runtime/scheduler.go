@@ -3059,12 +3059,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and
 	// webhook nil-runner checks.
 	notificationGateway := notificationGateways.New(notify.Options{
-		Config:           cfg.Notifications,
-		OsascriptPath:    derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:      filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		DashboardBaseURL: notify.ResolveDashboardBaseURL(cfg.Server),
-		Repositories:     repos,
-		Now:              now,
+		Config:            cfg.Notifications,
+		OsascriptPath:     derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:       filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		DashboardBaseURL:  notify.ResolveDashboardBaseURL(cfg.Server),
+		DashboardAuthMode: cfg.Server.AuthMode,
+		Repositories:      repos,
+		Now:               now,
 	})
 	notifyHumanAttention := func(ctx context.Context, loopID string) {
 		notifyDurableHumanAttention(ctx, notificationGateway, repos, loopID)

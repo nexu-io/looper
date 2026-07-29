@@ -24,8 +24,37 @@ const (
 )
 
 // HumanAttentionInput describes one durable entry into a state that requires an operator.
-// EntryKey must uniquely identify this entry so daemon restart / unchanged park do not
-// resend, while leaving and re-entering can notify again with a new key.
+//
+// EntryKey permanently dedupes human-attention notifications for one durable entry.
+//
+// Failure it prevents: daemon restart, recovery re-observation, and unchanged
+// parked re-polls would otherwise resend the same operator alert for a hold the
+// operator already saw.
+//
+// Costs of this concept:
+//   - Failed delivery is permanent for that entry: if the first attempt records an
+//     in_app row (audit) but osascript/webhook fails, re-observe will not retry
+//     that entry; the operator must notice via dashboard/other channels until a
+//     leave+re-enter produces a new EntryKey.
+//   - Key collision edge cases: two distinct parks that produce the same EntryKey
+//     (e.g. same run id reused incorrectly, or FinishedAt missing so only queue id
+//     is used) suppress a legitimate second alert.
+//   - Storage coupling: dedupe authority is the notifications table (GetLatestByDedupe
+//     on in_app), so notification persistence is required for cross-restart silence;
+//     wiping notifications re-enables alerts for still-parked entries.
+//   - Extra paths: callers must mint stable EntryKeys (run:/queue:/asked:/loop:) and
+//     NotifyHumanAttention short-circuits on lookup before Notify.
+//
+// Why simpler alternatives are insufficient:
+//   - Transition-only delivery without a durable key cannot survive restart: the
+//     runtime re-observes parked state after recovery and would re-notify.
+//   - Existing osascript throttle is time-windowed per channel and does not span
+//     daemon restarts or distinguish leave+re-enter from unchanged park.
+//   - Trusting "notify once in process memory" loses silence across restarts, which
+//     is the dominant unattended-operator case for local macOS alerts.
+//
+// Authority for "already notified" is the durable notifications row for this
+// dedupe key, not agent structured output.
 type HumanAttentionInput struct {
 	ProjectID  string
 	LoopID     string
@@ -65,8 +94,13 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		body = fmt.Sprintf("%s (%s) requires operator attention (%s).", loopLabel, loopType, humanAttentionReasonLabel(reason))
 	}
 
+	// Bare Dashboard deep links are only usable when the SPA does not require a
+	// session token. Under local-token auth a fresh osascript tab has neither
+	// sessionStorage nor a one-shot ?code=, so loop-detail API calls 401 — offer
+	// Open Log instead of an unusable Open Loop action. Deep links never carry
+	// tokens or bootstrap codes (CLI mint remains the supported auth bootstrap).
 	openURL := ""
-	if input.LoopSeq > 0 {
+	if input.LoopSeq > 0 && g.dashboardDeepLinkUsable() {
 		if u, err := g.DashboardLoopDetailURL(input.LoopSeq); err == nil {
 			openURL = u
 		}
@@ -82,18 +116,19 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 	}
 
 	return g.Notify(ctx, SystemNotificationPayload{
-		ProjectID:  input.ProjectID,
-		LoopID:     input.LoopID,
-		RunID:      input.RunID,
-		Level:      "action_required",
-		Title:      "Looper Needs Attention",
-		Subtitle:   strings.TrimSpace(input.Subtitle),
-		Body:       body,
-		Sound:      "Funk",
-		EntityType: entityType,
-		EntityID:   entityID,
-		DedupeKey:  dedupeKey,
-		OpenURL:    openURL,
+		ProjectID:         input.ProjectID,
+		LoopID:            input.LoopID,
+		RunID:             input.RunID,
+		Level:             "action_required",
+		Title:             "Looper Needs Attention",
+		Subtitle:          strings.TrimSpace(input.Subtitle),
+		Body:              body,
+		Sound:             "Funk",
+		EntityType:        entityType,
+		EntityID:          entityID,
+		DedupeKey:         dedupeKey,
+		OpenURL:           openURL,
+		OperatorAttention: true,
 	})
 }
 
@@ -104,7 +139,7 @@ func HumanAttentionDedupeKey(reason HumanAttentionReason, entryKey string) strin
 
 // DashboardLoopDetailURL builds a local Dashboard Loop Detail URL from the gateway's
 // configured base. The URL contains only the loop seq path segment — no auth token,
-// answer text, or failure detail.
+// bootstrap code, answer text, or failure detail.
 func (g *Gateway) DashboardLoopDetailURL(loopSeq int64) (string, error) {
 	if g == nil {
 		return "", fmt.Errorf("notification gateway is not configured")
@@ -117,6 +152,16 @@ func (g *Gateway) DashboardLoopDetailURL(loopSeq int64) (string, error) {
 		return "", fmt.Errorf("dashboard base URL is not configured")
 	}
 	return base + "/dashboard/loops/" + strconv.FormatInt(loopSeq, 10), nil
+}
+
+// dashboardDeepLinkUsable reports whether a bare origin + loop path can load loop
+// detail APIs in a newly opened browser tab. local-token requires session bootstrap
+// that osascript does not mint, so deep links are not offered in that mode.
+func (g *Gateway) dashboardDeepLinkUsable() bool {
+	if g == nil {
+		return false
+	}
+	return g.dashboardAuthMode != config.AuthModeLocalToken
 }
 
 // ResolveDashboardBaseURL derives a browser-openable local origin for Dashboard

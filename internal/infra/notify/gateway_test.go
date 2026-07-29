@@ -159,10 +159,11 @@ func TestGatewayActionRequiredOpensDashboardLoopDetailDeepLink(t *testing.T) {
 				ThrottleWindowSeconds: 60,
 			},
 		},
-		OsascriptPath:    scriptPath,
-		LogFilePath:      filepath.Join(rootDir, "logs", "looperd.log"),
-		DashboardBaseURL: "http://127.0.0.1:17310",
-		Repositories:     repos,
+		OsascriptPath:     scriptPath,
+		LogFilePath:       filepath.Join(rootDir, "logs", "looperd.log"),
+		DashboardBaseURL:  "http://127.0.0.1:17310",
+		DashboardAuthMode: config.AuthModeNone,
+		Repositories:      repos,
 	})
 
 	// Avoid FK targets that do not exist in this isolated DB; deep-link uses LoopSeq only.
@@ -201,7 +202,7 @@ func TestGatewayActionRequiredOpensDashboardLoopDetailDeepLink(t *testing.T) {
 	}
 }
 
-func TestGatewayActionRequiredFallsBackToDaemonLogWithoutDeepLink(t *testing.T) {
+func TestGatewayHumanAttentionFallsBackToDaemonLogWithoutDeepLink(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -226,11 +227,10 @@ func TestGatewayActionRequiredFallsBackToDaemonLogWithoutDeepLink(t *testing.T) 
 		Repositories:  repos,
 	})
 
-	gateway.Notify(ctx, SystemNotificationPayload{
-		Level:     "action_required",
-		Title:     "Looper Needs Attention",
-		Body:      "Loop needs operator attention",
-		DedupeKey: "human_attention:manual_intervention:queue:q1:t1",
+	// Human-attention without loop seq / base URL → Open Log dialog.
+	gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+		Reason:   HumanAttentionManualIntervention,
+		EntryKey: "queue:q1:t1",
 	})
 
 	osascriptCallsBytes, err := os.ReadFile(capturePath)
@@ -240,6 +240,112 @@ func TestGatewayActionRequiredFallsBackToDaemonLogWithoutDeepLink(t *testing.T) 
 	osascriptCalls := string(osascriptCallsBytes)
 	assertContains(t, osascriptCalls, "Open Log")
 	assertContains(t, osascriptCalls, logPath)
+	if strings.Contains(osascriptCalls, "Open Loop") {
+		t.Fatalf("osascript calls = %q, want Open Log without Open Loop", osascriptCalls)
+	}
+}
+
+func TestGatewayOrdinaryActionRequiredStaysLightweightOsascript(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	capturePath := filepath.Join(rootDir, "osascript.log")
+	scriptPath := filepath.Join(rootDir, "osascript")
+	writeExecutableScript(t, scriptPath, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \""+capturePath+"\"\n")
+	logPath := filepath.Join(rootDir, "logs", "looperd.log")
+
+	coordinator := openNotifyCoordinator(t, rootDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{
+			InApp: true,
+			Osascript: config.OsascriptNotificationConfig{
+				Enabled:               true,
+				SoundForLevels:        []config.NotificationSoundLevel{config.NotificationSoundLevelActionRequired},
+				ThrottleWindowSeconds: 60,
+			},
+		},
+		OsascriptPath: scriptPath,
+		LogFilePath:   logPath,
+		Repositories:  repos,
+	})
+
+	// Worker skipped / PR-ready shape: action_required without OperatorAttention.
+	gateway.Notify(ctx, SystemNotificationPayload{
+		Level:     "action_required",
+		Title:     "Looper Worker Needs Attention",
+		Body:      "skipped: dirty worktree",
+		Sound:     "Funk",
+		DedupeKey: "runtime.worker.action_required:run_1",
+	})
+
+	osascriptCallsBytes, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
+	}
+	osascriptCalls := string(osascriptCallsBytes)
+	assertContains(t, osascriptCalls, "display notification")
+	if strings.Contains(osascriptCalls, "display dialog") {
+		t.Fatalf("ordinary action_required must stay lightweight, got dialog: %q", osascriptCalls)
+	}
+	if strings.Contains(osascriptCalls, "Open Log") || strings.Contains(osascriptCalls, "Open Loop") {
+		t.Fatalf("ordinary action_required must not offer Open Log/Loop: %q", osascriptCalls)
+	}
+}
+
+func TestGatewayHumanAttentionLocalTokenFallsBackToDaemonLog(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	capturePath := filepath.Join(rootDir, "osascript.log")
+	scriptPath := filepath.Join(rootDir, "osascript")
+	writeExecutableScript(t, scriptPath, "#!/bin/sh\nprintf '%s\n' \"$*\" >> \""+capturePath+"\"\n")
+	logPath := filepath.Join(rootDir, "logs", "looperd.log")
+
+	coordinator := openNotifyCoordinator(t, rootDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	gateway := NewGateway(Options{
+		Config: config.NotificationConfig{
+			InApp: true,
+			Osascript: config.OsascriptNotificationConfig{
+				Enabled:               true,
+				ThrottleWindowSeconds: 60,
+			},
+		},
+		OsascriptPath:     scriptPath,
+		LogFilePath:       logPath,
+		DashboardBaseURL:  "http://127.0.0.1:17310",
+		DashboardAuthMode: config.AuthModeLocalToken,
+		Repositories:      repos,
+	})
+
+	records := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
+		LoopSeq:  42,
+		Reason:   HumanAttentionAwaitingHuman,
+		EntryKey: "run:run_local_token",
+	})
+	if got := notificationStatus(records, "osascript"); got != "success" {
+		t.Fatalf("osascript status = %q, want success; records=%#v", got, records)
+	}
+
+	osascriptCallsBytes, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
+	}
+	osascriptCalls := string(osascriptCallsBytes)
+	assertContains(t, osascriptCalls, "Open Log")
+	assertContains(t, osascriptCalls, logPath)
+	if strings.Contains(osascriptCalls, "Open Loop") {
+		t.Fatalf("local-token must not offer unusable Open Loop: %q", osascriptCalls)
+	}
+	if strings.Contains(osascriptCalls, "/dashboard/loops/") {
+		t.Fatalf("local-token must not open bare dashboard deep link: %q", osascriptCalls)
+	}
+	if strings.Contains(osascriptCalls, "code=") || strings.Contains(osascriptCalls, "token") {
+		t.Fatalf("notification must not embed auth material: %q", osascriptCalls)
+	}
 }
 
 func openNotifyCoordinator(t *testing.T, rootDir string) *storage.SQLiteCoordinator {

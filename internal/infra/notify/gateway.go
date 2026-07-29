@@ -45,12 +45,17 @@ type Options struct {
 	OsascriptPath    string
 	LogFilePath      string
 	DashboardBaseURL string
-	Repositories     *storage.Repositories
-	State            *GatewayState
-	Now              func() time.Time
-	RunCommand       RunCommandFunc
-	HTTPPost         HTTPPostFunc
-	FeishuAppHTTP    FeishuAppHTTPFunc
+	// DashboardAuthMode controls whether bare Dashboard deep links are usable
+	// from a freshly opened browser tab. When local-token, Open Loop is omitted
+	// (no one-shot bootstrap from osascript) and human-attention falls back to
+	// the daemon log dialog instead of an unauthenticated SPA shell.
+	DashboardAuthMode config.AuthMode
+	Repositories      *storage.Repositories
+	State             *GatewayState
+	Now               func() time.Time
+	RunCommand        RunCommandFunc
+	HTTPPost          HTTPPostFunc
+	FeishuAppHTTP     FeishuAppHTTPFunc
 }
 
 // GatewayState retains transport continuity across immutable, config-specific
@@ -135,19 +140,25 @@ type SystemNotificationPayload struct {
 	// OpenURL is an optional local deep link (e.g. Dashboard Loop Detail).
 	// Must not carry auth tokens, answers, or sensitive failure detail.
 	OpenURL string
+	// OperatorAttention marks human-attention alerts that may use an interactive
+	// osascript dialog (Open Loop / Open Log). Ordinary action_required payloads
+	// (worker skipped, PR ready) leave this false so they stay lightweight
+	// display notification and do not block the scheduler for up to 30s.
+	OperatorAttention bool
 }
 
 type Gateway struct {
-	config           config.NotificationConfig
-	osascriptPath    string
-	logFilePath      string
-	dashboardBaseURL string
-	repositories     *storage.Repositories
-	now              func() time.Time
-	runCommand       RunCommandFunc
-	httpPost         HTTPPostFunc
-	feishuAppHTTP    FeishuAppHTTPFunc
-	state            *GatewayState
+	config            config.NotificationConfig
+	osascriptPath     string
+	logFilePath       string
+	dashboardBaseURL  string
+	dashboardAuthMode config.AuthMode
+	repositories      *storage.Repositories
+	now               func() time.Time
+	runCommand        RunCommandFunc
+	httpPost          HTTPPostFunc
+	feishuAppHTTP     FeishuAppHTTPFunc
+	state             *GatewayState
 }
 
 type askCardState struct {
@@ -181,16 +192,17 @@ func NewGateway(options Options) *Gateway {
 	}
 
 	return &Gateway{
-		config:           options.Config,
-		osascriptPath:    options.OsascriptPath,
-		logFilePath:      options.LogFilePath,
-		dashboardBaseURL: strings.TrimRight(strings.TrimSpace(options.DashboardBaseURL), "/"),
-		repositories:     options.Repositories,
-		now:              now,
-		runCommand:       runCommand,
-		httpPost:         httpPost,
-		feishuAppHTTP:    feishuAppHTTP,
-		state:            state,
+		config:            options.Config,
+		osascriptPath:     options.OsascriptPath,
+		logFilePath:       options.LogFilePath,
+		dashboardBaseURL:  strings.TrimRight(strings.TrimSpace(options.DashboardBaseURL), "/"),
+		dashboardAuthMode: options.DashboardAuthMode,
+		repositories:      options.Repositories,
+		now:               now,
+		runCommand:        runCommand,
+		httpPost:          httpPost,
+		feishuAppHTTP:     feishuAppHTTP,
+		state:             state,
 	}
 }
 
@@ -1699,9 +1711,10 @@ func buildAppleScript(payload SystemNotificationPayload, cfg config.Notification
 	body := escapeAppleScriptString(payload.Body)
 	title := escapeAppleScriptString(payload.Title)
 
-	// action_required with a local Dashboard deep link: offer Open Loop.
+	// Human-attention action_required with a usable Dashboard deep link: Open Loop.
 	// Never put tokens/answers/sensitive detail in the URL — caller is responsible.
-	if payload.Level == "action_required" && strings.TrimSpace(payload.OpenURL) != "" {
+	// Ordinary action_required (worker skipped / PR ready) must not take this path.
+	if payload.OperatorAttention && payload.Level == "action_required" && strings.TrimSpace(payload.OpenURL) != "" {
 		openURL := escapeAppleScriptString(payload.OpenURL)
 		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Loop", "Dismiss"} default button "Open Loop" cancel button "Dismiss" giving up after 30
 if gave up of dialogResult is false and button returned of dialogResult is "Open Loop" then
@@ -1709,8 +1722,10 @@ if gave up of dialogResult is false and button returned of dialogResult is "Open
 end if`, body, title, openURL)
 	}
 
-	// failure, or action_required without a deep link: fall back to the daemon log.
-	if (payload.Level == "failure" || payload.Level == "action_required") && strings.TrimSpace(logFilePath) != "" {
+	// Failures always offer Open Log. Human-attention without a usable deep link
+	// (no seq, or local-token auth where bare URLs 401) also falls back to the log.
+	// Other action_required stays lightweight so Notify does not block for 30s.
+	if (payload.Level == "failure" || (payload.OperatorAttention && payload.Level == "action_required")) && strings.TrimSpace(logFilePath) != "" {
 		openLogPath := escapeAppleScriptString(logFilePath)
 		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Log", "Dismiss"} default button "Dismiss" cancel button "Dismiss" giving up after 30
 if gave up of dialogResult is false and button returned of dialogResult is "Open Log" then

@@ -22,12 +22,13 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 	}
 	cfg := r.Config()
 	gateway := notify.NewGateway(notify.Options{
-		Config:           cfg.Notifications,
-		OsascriptPath:    strings.TrimSpace(derefString(cfg.Tools.OsascriptPath)),
-		LogFilePath:      filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		DashboardBaseURL: notify.ResolveDashboardBaseURL(cfg.Server),
-		Repositories:     repos,
-		Now:              r.now,
+		Config:            cfg.Notifications,
+		OsascriptPath:     strings.TrimSpace(derefString(cfg.Tools.OsascriptPath)),
+		LogFilePath:       filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		DashboardBaseURL:  notify.ResolveDashboardBaseURL(cfg.Server),
+		DashboardAuthMode: cfg.Server.AuthMode,
+		Repositories:      repos,
+		Now:               r.now,
 	})
 	notifyDurableHumanAttention(ctx, gateway, repos, loopID)
 }
