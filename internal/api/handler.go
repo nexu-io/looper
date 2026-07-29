@@ -1939,26 +1939,47 @@ type pullRequestLoopStatus struct {
 }
 
 type loopResponse struct {
-	ID           string  `json:"id"`
-	Seq          int64   `json:"seq"`
-	ProjectID    string  `json:"projectId"`
-	Type         string  `json:"type"`
-	TargetType   string  `json:"targetType"`
-	TargetID     *string `json:"targetId"`
-	Repo         *string `json:"repo"`
-	PRNumber     *int64  `json:"prNumber"`
-	Status       string  `json:"status"`
-	ConfigJSON   *string `json:"configJson"`
-	MetadataJSON *string `json:"metadataJson"`
-	LastRunAt    *string `json:"lastRunAt"`
-	NextRunAt    *string `json:"nextRunAt"`
-	CreatedAt    string  `json:"createdAt"`
-	UpdatedAt    string  `json:"updatedAt"`
+	ID         string  `json:"id"`
+	Seq        int64   `json:"seq"`
+	ProjectID  string  `json:"projectId"`
+	Type       string  `json:"type"`
+	TargetType string  `json:"targetType"`
+	TargetID   *string `json:"targetId"`
+	Repo       *string `json:"repo"`
+	PRNumber   *int64  `json:"prNumber"`
+	Status     string  `json:"status"`
+	// DisplayStatus is a read-only, non-persisted dashboard projection of durable
+	// queue/checkpoint facts (e.g. manual_intervention, backing_off). It never
+	// becomes a true loop status; clients must keep Status as the authority for
+	// mutations and lifecycle transitions.
+	//
+	// Trade-off (AGENTS.md new-concept checklist):
+	//   Failure prevented: operators could not see why automation stopped when
+	//   loop.Status stayed paused/failed/queued while queue last_error_kind or
+	//   checkpoint resumePolicy already encoded a hard hold — without a
+	//   projection, the recovery card would re-parse diagnostics ad hoc or the
+	//   daemon would need a new true loop status (rejected).
+	//   Costs: DisplayStatus must stay in sync with decorateActiveRunView and
+	//   decorateLoopDiagnostics; active queue, closed loops, and awaiting_human
+	//   must win over stale retained kinds; empty projection falls back to
+	//   Status so list/detail never invent a third authority.
+	//   Why not Status + diagnostics alone: Status is lifecycle authority and
+	//   does not carry hold semantics; exposing lastFailureKind/resumePolicy raw
+	//   forces every client to reimplement supersede rules (active queue, HITL,
+	//   closed loops). Centralizing projection keeps one contract for the card.
+	DisplayStatus string  `json:"displayStatus,omitempty"`
+	ConfigJSON    *string `json:"configJson"`
+	MetadataJSON  *string `json:"metadataJson"`
+	LastRunAt     *string `json:"lastRunAt"`
+	NextRunAt     *string `json:"nextRunAt"`
+	CreatedAt     string  `json:"createdAt"`
+	UpdatedAt     string  `json:"updatedAt"`
 	// Queue-derived diagnostics (latest queue item / run), matching looper describe / ps.
 	Attempts          *int64  `json:"attempts,omitempty"`
 	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
 	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
+	ResumePolicy      *string `json:"resumePolicy,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -2268,9 +2289,10 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 		}
 
 		responseItems := make([]loopResponse, 0, len(items))
+		now := h.now().UTC()
 		for _, item := range items {
 			view := serializeLoop(item)
-			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID])
+			decorateLoopDiagnostics(&view, latestQueueByLoopID[item.ID], latestRunByLoopID[item.ID], now)
 			responseItems = append(responseItems, view)
 		}
 
@@ -3414,12 +3436,85 @@ func latestQueueItemByLoopID(items []storage.QueueItemRecord) map[string]*storag
 }
 
 func isManualInterventionQueue(item *storage.QueueItemRecord) bool {
-	return item != nil && (item.Status == "manual_intervention" || (item.LastErrorKind != nil && *item.LastErrorKind == "manual_intervention"))
+	if item == nil {
+		return false
+	}
+	// Parked MI status is always a hold.
+	if item.Status == "manual_intervention" {
+		return true
+	}
+	// Active automation must not be treated as a hold solely because recovery
+	// requeues preserve last_error_kind (RequeueRunningByLoop does not clear it).
+	if queueIsActiveAutomation(item) {
+		return false
+	}
+	return item.LastErrorKind != nil && strings.TrimSpace(*item.LastErrorKind) == "manual_intervention"
 }
 
 func hasManualInterventionResumePolicy(run *storage.RunRecord) bool {
 	policy := resumePolicyFromRun(run)
 	return policy != nil && *policy == loops.ResumePolicyManualIntervention
+}
+
+// queueIsActiveAutomation reports whether the latest queue item is live work
+// (queued/running). Active status supersedes stale holds from a retained
+// last_error_kind (startup recovery requeues) and from a prior run's
+// resumePolicy=manual_intervention after retry.
+func queueIsActiveAutomation(item *storage.QueueItemRecord) bool {
+	if item == nil {
+		return false
+	}
+	switch strings.TrimSpace(item.Status) {
+	case "queued", "running":
+		return true
+	default:
+		return false
+	}
+}
+
+// projectManualInterventionDisplayStatus chooses displayStatus using durable
+// queue facts. Active queued/running items win over a retained last_error_kind
+// and over a stale run resumePolicy; a newer non-MI queue event (including a
+// clean cancelled item after Pause of a post-retry queue) also supersedes
+// resumePolicy. resumePolicy is consulted only when there is no latest queue.
+// Closed loops, awaiting_human, and human_takeover keep their true status
+// (operator UX is authoritative even when CancelByLoop or safety-floor
+// quarantine left last_error_kind=manual_intervention on a retained queue item).
+func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) string {
+	if isClosedLoopStatus(loopStatus) {
+		return ""
+	}
+	// HITL decision card and human takeover/handback own the operator UX. Do not
+	// re-project stale manual_intervention diagnostics from a retained queue
+	// item or an old checkpoint hold while those statuses are active.
+	switch domain.LoopStatus(strings.TrimSpace(loopStatus)) {
+	case domain.LoopStatusAwaitingHuman, domain.LoopStatusHumanTakeover:
+		return ""
+	}
+	// Prefer active queue (queued/running after recovery requeue or retry) over
+	// a retained last_error_kind or a stale checkpoint hold. Delayed retryable
+	// requeues still surface as backing_off.
+	if queueIsActiveAutomation(latestQueue) {
+		if isBackingOffQueue(latestQueue, now) {
+			return "backing_off"
+		}
+		return ""
+	}
+	if isManualInterventionQueue(latestQueue) {
+		return "manual_intervention"
+	}
+	if isBackingOffQueue(latestQueue, now) {
+		return "backing_off"
+	}
+	// Any other latest queue fact (e.g. clean cancelled after Pause of a
+	// post-retry item) supersedes a prior run's resumePolicy hold.
+	if latestQueue != nil {
+		return ""
+	}
+	if hasManualInterventionResumePolicy(latestRun) {
+		return "manual_intervention"
+	}
+	return ""
 }
 
 // isClosedLoopStatus reports loop statuses that are fully finished and must not
@@ -3463,19 +3558,19 @@ func decorateActiveRunView(view *activeRunView, loop storage.LoopRecord, latestQ
 	view.ResumePolicy = resumePolicyFromRun(latestRun)
 	// Do not override a closed loop's status with manual_intervention: the loop
 	// is no longer actionable even if the latest queue item still has that status.
-	if !isClosedLoopStatus(loop.Status) && (isManualInterventionQueue(latestQueue) || (view.ResumePolicy != nil && *view.ResumePolicy == loops.ResumePolicyManualIntervention)) {
-		view.DisplayStatus = "manual_intervention"
-	} else if isBackingOffQueue(latestQueue, now) {
-		view.DisplayStatus = "backing_off"
+	if projected := projectManualInterventionDisplayStatus(loop.Status, latestQueue, latestRun, now); projected != "" {
+		view.DisplayStatus = projected
 	}
 	if view.DisplayStatus == "" {
 		view.DisplayStatus = view.Status
 	}
 }
 
-// decorateLoopDiagnostics attaches latest-queue attempt counts and failure reason
-// (with the same run fallback as active-run views) for dashboard list/detail.
-func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord) {
+// decorateLoopDiagnostics attaches latest-queue attempt counts, failure reason,
+// and displayStatus (with the same run fallback and manual-intervention rules as
+// active-run views) for dashboard list/detail. now must be the handler clock so
+// backing_off matches /runs/active when Context.Now is injected.
+func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) {
 	if view == nil {
 		return
 	}
@@ -3495,6 +3590,16 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 				view.LastFailureReason = latestRun.Summary
 			}
 		}
+	}
+	view.ResumePolicy = resumePolicyFromRun(latestRun)
+	// Same authority as decorateActiveRunView: durable queue/checkpoint facts only.
+	// Closed loops keep their true status (not re-projected as manual_intervention).
+	view.DisplayStatus = view.Status
+	if projected := projectManualInterventionDisplayStatus(view.Status, latestQueue, latestRun, now); projected != "" {
+		view.DisplayStatus = projected
+	}
+	if view.DisplayStatus == "" {
+		view.DisplayStatus = view.Status
 	}
 }
 
@@ -6356,7 +6461,7 @@ func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage
 		}
 		latestRun = run
 	}
-	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	decorateLoopDiagnostics(&view, latestQueue, latestRun, h.now().UTC())
 	return view, nil
 }
 

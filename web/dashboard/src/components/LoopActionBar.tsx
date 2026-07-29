@@ -19,12 +19,22 @@ import {
   type LoopAction,
 } from "@/lib/actions";
 import { useToast } from "@/lib/toast";
+import { classifyRetryWorktree } from "@/lib/worktree";
+
+// Re-export so existing test imports keep working; single authority lives in lib/worktree.
+export { classifyRetryWorktree } from "@/lib/worktree";
 
 export type LoopActionBarProps = {
   /** Loop selector (seq or id) used in API paths. */
   selector: string;
   status: string;
   hasActiveRun?: boolean;
+  /**
+   * Projected display status from the API. When manual_intervention, Unpause is
+   * disabled so operators use recovery retry (worktree preflight) instead of
+   * generic POST …/start.
+   */
+  displayStatus?: string | null;
   /**
    * Called after a successful mutation so the page can refetch.
    * Awaited while action buttons stay pending (use forceRefresh).
@@ -71,30 +81,18 @@ export function isWorktreeRouteUnavailable(err: unknown): boolean {
   return false;
 }
 
-/**
- * Classify worktree preflight for retry UX.
- * Discard is only offered for present + managed + dirty.
- */
-export function classifyRetryWorktree(
-  worktree: LoopWorktreeStatus,
-): "ok" | "offer-discard" | "inspect-only" {
-  if (!worktree.present) return "ok";
-  if (worktree.dirty !== true) return "ok";
-  if (worktree.managed) return "offer-discard";
-  return "inspect-only";
-}
-
 export function LoopActionBar({
   selector,
   status,
   hasActiveRun,
+  displayStatus,
   onMutated,
   mode = "full",
 }: LoopActionBarProps) {
   const toast = useToast();
   const enabled = useMemo(
-    () => actionsForLoopStatus(status, { hasActiveRun }),
-    [status, hasActiveRun],
+    () => actionsForLoopStatus(status, { hasActiveRun, displayStatus }),
+    [status, hasActiveRun, displayStatus],
   );
 
   const [pending, setPending] = useState<LoopAction | null>(null);
@@ -196,7 +194,9 @@ export function LoopActionBar({
           offerDiscard: false,
         });
         toast.error(
-          "Dirty worktree is not Looper-managed; inspect before retrying",
+          worktree.managed
+            ? "Worktree dirty state could not be verified; inspect before retrying"
+            : "Dirty worktree is not Looper-managed; inspect before retrying",
         );
         return;
       }

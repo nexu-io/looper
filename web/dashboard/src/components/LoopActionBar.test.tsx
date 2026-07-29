@@ -90,6 +90,15 @@ describe("classifyRetryWorktree", () => {
         dirty: true,
       }),
     ).toBe("ok");
+    expect(
+      classifyRetryWorktree({
+        loopId: "l",
+        seq: 1,
+        present: true,
+        managed: true,
+        // dirty unknown → fail closed (shared with recovery card)
+      }),
+    ).toBe("inspect-only");
   });
 });
 
@@ -259,5 +268,19 @@ describe("LoopActionBar retry dirty UX", () => {
       expect(screen.getAllByText("git status failed").length).toBeGreaterThan(0);
     });
     expect(retryLoop).not.toHaveBeenCalled();
+  });
+
+  it("disables Unpause when displayStatus is manual_intervention", () => {
+    renderBar({ displayStatus: "manual_intervention", status: "paused" });
+    const unpause = screen.getByRole("button", { name: "Unpause" });
+    expect(unpause).toHaveProperty("disabled", true);
+    fireEvent.click(unpause);
+    expect(startLoop).not.toHaveBeenCalled();
+  });
+
+  it("enables Unpause when paused without manual_intervention projection", () => {
+    renderBar({ status: "paused" });
+    const unpause = screen.getByRole("button", { name: "Unpause" });
+    expect(unpause).toHaveProperty("disabled", false);
   });
 });
