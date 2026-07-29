@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -184,11 +185,34 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 		t.Fatalf("PrepareWorktree calls = %d, want no reset-capable prepare on HITL resume", len(git.prepareCalls))
 	}
 
+	// Simulate a daemon exit after the durable repair consumed the answer but
+	// before the outer lifecycle marked stepRepair complete.
+	crashedRun := resume.Run
+	crashedRun.Status = "interrupted"
+	crashedRun.CurrentStep = stringPtr(string(stepRepair))
+	crashedRun.LastCompletedStep = stringPtr(string(stepPrepareWorktree))
+	crashedRun.StartedAt = fixture.now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+	crashedCheckpointJSON := mustMarshalJSON(resumed)
+	crashedRun.CheckpointJSON = &crashedCheckpointJSON
+	crashedRun.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Runs.Upsert(ctx, crashedRun); err != nil {
+		t.Fatalf("Runs.Upsert(crashed repair) error = %v", err)
+	}
+	recovered, err := runner.createRunContext(ctx, *finishedLoop)
+	if err != nil {
+		t.Fatalf("createRunContext(consumed repair) error = %v", err)
+	}
+	if !recovered.Resumed || recovered.StartStep != stepRepair || recovered.Checkpoint.Repair == nil ||
+		recovered.Checkpoint.Worktree == nil || recovered.Checkpoint.Worktree.PreparedAt == "" {
+		t.Fatalf("consumed repair recovery = %#v, want durable repair replay without prepare", recovered)
+	}
+
 	if err := os.WriteFile(dismissPath, []byte(`{"dismissals":[{"reviewer":"reviewer-x","reason":"conflicts with the approved direction"}]}`), 0o644); err != nil {
 		t.Fatalf("WriteFile(dismiss.json) error = %v", err)
 	}
 	step.Loop = *finishedLoop
-	step.Checkpoint = resumed
+	step.Run = recovered.Run
+	step.Checkpoint = recovered.Checkpoint
 	if _, err := runner.runRepairStep(ctx, step); err != nil {
 		t.Fatalf("runRepairStep(durable repair retry) error = %v", err)
 	}

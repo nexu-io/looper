@@ -4697,7 +4697,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		pause, _ := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
 		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, pause, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint) &&
-			!shouldResumeAnsweredHITLRepair(loop.MetadataJSON, latestRun.Status, failedStep)
+			!shouldResumeHITLRepair(loop.MetadataJSON, latestRun.Status, failedStep, checkpoint)
 	}
 	startStep := stepDiscoverPR
 	resumedCheckpoint := checkpoint

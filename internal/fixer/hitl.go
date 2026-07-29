@@ -131,12 +131,19 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 	return prompt, strings.TrimSpace(ask.SessionID)
 }
 
-func shouldResumeAnsweredHITLRepair(metadataJSON *string, runStatus string, failedStep FixerStep) bool {
+func shouldResumeHITLRepair(metadataJSON *string, runStatus string, failedStep FixerStep, checkpoint fixerCheckpoint) bool {
 	if runStatus != "interrupted" || failedStep != stepRepair {
 		return false
 	}
 	ask, ok := loops.ReadHITLAsk(metadataJSON)
-	return ok && ask.Status == "answered" && strings.TrimSpace(ask.Answer) != ""
+	if !ok || strings.TrimSpace(ask.Answer) == "" {
+		return false
+	}
+	if ask.Status == "answered" {
+		return true
+	}
+	return ask.Status == "consumed" && checkpoint.Repair != nil &&
+		validateCompletedRepairCheckpoint(checkpoint.Repair) == nil
 }
 
 func hasDeliveredHITLAnswer(metadataJSON *string) bool {
