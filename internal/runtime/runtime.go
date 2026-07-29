@@ -2894,6 +2894,11 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 				return false, false, err
 			}
 			did = true
+			// Best-effort operator notify after durable manual_intervention park.
+			// Recovery must not fail if notification delivery fails.
+			if item.LoopID != nil {
+				r.notifyHumanAttentionBestEffort(ctx, repositories, *item.LoopID)
+			}
 		}
 	}
 

@@ -41,15 +41,16 @@ type HTTPPostFunc func(url string, body []byte) (int, error)
 type FeishuAppHTTPFunc func(ctx context.Context, method, url string, headers map[string]string, body []byte) (int, []byte, error)
 
 type Options struct {
-	Config        config.NotificationConfig
-	OsascriptPath string
-	LogFilePath   string
-	Repositories  *storage.Repositories
-	State         *GatewayState
-	Now           func() time.Time
-	RunCommand    RunCommandFunc
-	HTTPPost      HTTPPostFunc
-	FeishuAppHTTP FeishuAppHTTPFunc
+	Config           config.NotificationConfig
+	OsascriptPath    string
+	LogFilePath      string
+	DashboardBaseURL string
+	Repositories     *storage.Repositories
+	State            *GatewayState
+	Now              func() time.Time
+	RunCommand       RunCommandFunc
+	HTTPPost         HTTPPostFunc
+	FeishuAppHTTP    FeishuAppHTTPFunc
 }
 
 // GatewayState retains transport continuity across immutable, config-specific
@@ -131,18 +132,22 @@ type SystemNotificationPayload struct {
 	EntityType string
 	EntityID   string
 	DedupeKey  string
+	// OpenURL is an optional local deep link (e.g. Dashboard Loop Detail).
+	// Must not carry auth tokens, answers, or sensitive failure detail.
+	OpenURL string
 }
 
 type Gateway struct {
-	config        config.NotificationConfig
-	osascriptPath string
-	logFilePath   string
-	repositories  *storage.Repositories
-	now           func() time.Time
-	runCommand    RunCommandFunc
-	httpPost      HTTPPostFunc
-	feishuAppHTTP FeishuAppHTTPFunc
-	state         *GatewayState
+	config           config.NotificationConfig
+	osascriptPath    string
+	logFilePath      string
+	dashboardBaseURL string
+	repositories     *storage.Repositories
+	now              func() time.Time
+	runCommand       RunCommandFunc
+	httpPost         HTTPPostFunc
+	feishuAppHTTP    FeishuAppHTTPFunc
+	state            *GatewayState
 }
 
 type askCardState struct {
@@ -176,15 +181,16 @@ func NewGateway(options Options) *Gateway {
 	}
 
 	return &Gateway{
-		config:        options.Config,
-		osascriptPath: options.OsascriptPath,
-		logFilePath:   options.LogFilePath,
-		repositories:  options.Repositories,
-		now:           now,
-		runCommand:    runCommand,
-		httpPost:      httpPost,
-		feishuAppHTTP: feishuAppHTTP,
-		state:         state,
+		config:           options.Config,
+		osascriptPath:    options.OsascriptPath,
+		logFilePath:      options.LogFilePath,
+		dashboardBaseURL: strings.TrimRight(strings.TrimSpace(options.DashboardBaseURL), "/"),
+		repositories:     options.Repositories,
+		now:              now,
+		runCommand:       runCommand,
+		httpPost:         httpPost,
+		feishuAppHTTP:    feishuAppHTTP,
+		state:            state,
 	}
 }
 
@@ -1693,7 +1699,18 @@ func buildAppleScript(payload SystemNotificationPayload, cfg config.Notification
 	body := escapeAppleScriptString(payload.Body)
 	title := escapeAppleScriptString(payload.Title)
 
-	if payload.Level == "failure" && strings.TrimSpace(logFilePath) != "" {
+	// action_required with a local Dashboard deep link: offer Open Loop.
+	// Never put tokens/answers/sensitive detail in the URL — caller is responsible.
+	if payload.Level == "action_required" && strings.TrimSpace(payload.OpenURL) != "" {
+		openURL := escapeAppleScriptString(payload.OpenURL)
+		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Loop", "Dismiss"} default button "Open Loop" cancel button "Dismiss" giving up after 30
+if gave up of dialogResult is false and button returned of dialogResult is "Open Loop" then
+  do shell script "open " & quoted form of %q
+end if`, body, title, openURL)
+	}
+
+	// failure, or action_required without a deep link: fall back to the daemon log.
+	if (payload.Level == "failure" || payload.Level == "action_required") && strings.TrimSpace(logFilePath) != "" {
 		openLogPath := escapeAppleScriptString(logFilePath)
 		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Log", "Dismiss"} default button "Dismiss" cancel button "Dismiss" giving up after 30
 if gave up of dialogResult is false and button returned of dialogResult is "Open Log" then

@@ -119,6 +119,10 @@ type defaultSchedulerTickInput struct {
 	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
 	// delivered to a loop, so the transport can mark the ask card resolved.
 	OnHITLAnswerDelivered func(context.Context, string, string)
+	// NotifyHumanAttention, when set, observes durable loop/queue state after a
+	// claim finishes and emits a best-effort action_required notification when
+	// the loop newly entered awaiting_human or manual_intervention.
+	NotifyHumanAttention func(context.Context, string)
 }
 
 type defaultSchedulerHandlers struct {
@@ -3055,12 +3059,16 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and
 	// webhook nil-runner checks.
 	notificationGateway := notificationGateways.New(notify.Options{
-		Config:        cfg.Notifications,
-		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		Repositories:  repos,
-		Now:           now,
+		Config:           cfg.Notifications,
+		OsascriptPath:    derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:      filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		DashboardBaseURL: notify.ResolveDashboardBaseURL(cfg.Server),
+		Repositories:     repos,
+		Now:              now,
 	})
+	notifyHumanAttention := func(ctx context.Context, loopID string) {
+		notifyDurableHumanAttention(ctx, notificationGateway, repos, loopID)
+	}
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
 	// CURRENT status (colour + label), without disturbing the retained live tail.
 	// The anchor is otherwise only patched opportunistically by the progress ticker
@@ -3093,6 +3101,20 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
 		workerNotificationKeyID := runtimeFirstNonEmpty(input.RunID, input.LoopID)
+		// Hard holds are owned by the central human-attention path (durable
+		// transition observer) so all loop types share one action_required shape
+		// and dedupe key. Still record the Feishu milestone / refresh below.
+		if input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention {
+			if strings.TrimSpace(input.LoopID) != "" {
+				notifyHumanAttention(ctx, input.LoopID)
+			}
+			if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
+			} else {
+				refreshFeishuAnchor(ctx, input.LoopID)
+			}
+			return nil
+		}
 		payload := notify.SystemNotificationPayload{
 			ProjectID:  input.ProjectID,
 			LoopID:     input.LoopID,
@@ -3102,11 +3124,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			EntityID:   input.RunID,
 		}
 		switch {
-		case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
-			payload.Level = "action_required"
-			payload.Title = "Looper Worker Needs Attention"
-			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
 		case input.Status == "failed":
 			payload.Level = "failure"
 			payload.Title = "Looper Worker Failed"
@@ -3139,8 +3156,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				} else {
 					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 PR #%d", input.PullRequestNumber))
 				}
-			case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
-				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
 			case input.Status == "failed":
 				notificationGateway.RecordMilestone(ctx, input.LoopID, "⚠️ 本轮失败,重试中")
 			case input.Status != "skipped":
@@ -3536,6 +3551,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			NotifyHumanAttention:     notifyHumanAttention,
 		}
 	}
 
@@ -4650,6 +4666,11 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 					return
 				}
 				lease.Release()
+			}
+			// Best-effort operator notify for durable human-attention parks.
+			// Never affects claim finalization or recovery.
+			if input.NotifyHumanAttention != nil && item.LoopID != nil {
+				input.NotifyHumanAttention(ctx, *item.LoopID)
 			}
 			if runErr != nil && input.Logger != nil {
 				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": runErr.Error()})
