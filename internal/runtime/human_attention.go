@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -114,13 +116,21 @@ func (r *Runtime) notifyHumanAttentionPostClaim(_ context.Context, loopID string
 //
 // Shares the cancel/WG lifecycle with post-claim delivery; Stop joins both
 // before SQLite close so queries cannot race coordinator.Close.
+//
+// Mirrors startDeferredReviewerRecovery: require ready admission, publish the
+// generation under lock, then recheck so a BeginShutdown that missed a nil
+// cancel cannot leave a live notify goroutine after stop has already drained.
 func (r *Runtime) scheduleHumanAttentionRecoveryNotify(repos *storage.Repositories) {
 	if r == nil || repos == nil {
 		return
 	}
 	done := make(chan struct{})
 	r.mu.Lock()
-	if r.stopped || (r.admission != nil && r.admission.State() == AdmissionStopping) {
+	// Refuse once shutdown has begun or admission is no longer ready.
+	// Checking only Stopping/stopped is insufficient: BeginShutdown may race
+	// after MarkReady and before cancel is published; stop may already have
+	// waited on a nil cancel/empty WaitGroup.
+	if r.stopped || r.admission == nil || r.admission.State() != AdmissionReady {
 		r.mu.Unlock()
 		return
 	}
@@ -135,9 +145,20 @@ func (r *Runtime) scheduleHumanAttentionRecoveryNotify(repos *storage.Repositori
 
 	ctx, ok := r.ensureHumanAttentionNotifyCtx()
 	if !ok {
+		r.clearHumanAttentionNotifyDone(done)
 		close(done)
 		return
 	}
+
+	// Publish-then-recheck: if BeginShutdown raced between the ready check and
+	// arming humanAttentionNotifyCancel, it missed cancel. If admission is no
+	// longer ready, do not launch work (stop may already have drained).
+	if r.admission == nil || r.admission.State() != AdmissionReady {
+		r.clearHumanAttentionNotifyDone(done)
+		close(done)
+		return
+	}
+
 	r.humanAttentionNotifyWG.Add(1)
 	go func() {
 		defer r.humanAttentionNotifyWG.Done()
@@ -145,13 +166,32 @@ func (r *Runtime) scheduleHumanAttentionRecoveryNotify(repos *storage.Repositori
 		if ctx.Err() != nil {
 			return
 		}
+		// Born-canceled / late-shutdown recheck before any SQLite or osascript.
+		if r.isStopped() || r.admission == nil || r.admission.State() != AdmissionReady {
+			return
+		}
 		r.notifyDurableHumanAttentionParksBestEffort(ctx, repos)
 	}()
+}
+
+func (r *Runtime) clearHumanAttentionNotifyDone(done chan struct{}) {
+	if r == nil || done == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.humanAttentionNotifyDone == done {
+		r.humanAttentionNotifyDone = nil
+	}
+	r.mu.Unlock()
 }
 
 // stopHumanAttentionRecoveryNotify cancels all human-attention delivery
 // (recovery rescan + post-claim) and waits for inflight work to exit
 // (bounded by shutdownTimeout) before SQLite may be closed.
+//
+// A wait timeout is a drain failure: shell.Run may still be in TERM grace /
+// SIGKILL (up to ~5s + slack) while Stop would otherwise close SQLite. Record
+// shutdownDrainErr so Stop retains storage ownership (#577).
 func (r *Runtime) stopHumanAttentionRecoveryNotify() {
 	if r == nil {
 		return
@@ -182,6 +222,11 @@ func (r *Runtime) stopHumanAttentionRecoveryNotify() {
 				"timeoutMs": r.shutdownTimeout.Milliseconds(),
 			})
 		}
+		// Confirmed-drain failed: retain SQLite so a still-live osascript/notify
+		// cannot persist through a closed coordinator.
+		r.mu.Lock()
+		r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, fmt.Errorf("%w: human-attention notify", errShutdownDrainTimeout))
+		r.mu.Unlock()
 	}
 }
 
