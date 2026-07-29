@@ -463,16 +463,18 @@ type MergeBaseResult struct {
 }
 
 type AgentRunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	Metadata         map[string]any
-	IdempotencyKey   string
+	ExecutionID        string
+	ProjectID          string
+	LoopID             string
+	RunID              string
+	Prompt             string
+	NativeResumePrompt string
+	NativeSessionID    string
+	WorkingDirectory   string
+	Timeout            time.Duration
+	HeartbeatTimeout   time.Duration
+	Metadata           map[string]any
+	IdempotencyKey     string
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -548,6 +550,7 @@ type Options struct {
 	AllowAutoCommit         bool
 	AllowAutoPush           bool
 	AllowRiskyFixes         bool
+	HITLEnabled             bool
 	FixAllPullRequests      bool
 	DiscoveryPolicy         DiscoveryPolicy
 	Disclosure              *config.DisclosureConfig
@@ -587,6 +590,7 @@ type Runner struct {
 	allowAutoCommit         bool
 	allowAutoPush           bool
 	allowRiskyFixes         bool
+	hitlEnabled             bool
 	fixAllPullRequests      bool
 	discoveryPolicy         DiscoveryPolicy
 	disclosure              config.DisclosureConfig
@@ -641,8 +645,9 @@ type ProcessResult struct {
 type replyAction string
 
 const (
-	replyActionFixed    replyAction = "fixed"
-	replyActionDeclined replyAction = "declined"
+	replyActionFixed      replyAction = "fixed"
+	replyActionDeclined   replyAction = "declined"
+	replyActionNeedsHuman replyAction = "needs_human"
 )
 
 type fixerFollowupReason string
@@ -1078,6 +1083,8 @@ func normalizeReplyAction(raw string) string {
 		return string(replyActionFixed)
 	case replyActionDeclined:
 		return string(replyActionDeclined)
+	case replyActionNeedsHuman:
+		return string(replyActionNeedsHuman)
 	default:
 		return ""
 	}
@@ -1312,6 +1319,7 @@ func New(options Options) *Runner {
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
 		allowRiskyFixes:         options.AllowRiskyFixes,
+		hitlEnabled:             options.HITLEnabled,
 		fixAllPullRequests:      options.FixAllPullRequests,
 		discoveryPolicy:         policy,
 		disclosure:              disclosureCfg,
@@ -2121,6 +2129,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.logInfo("fixer step started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(step)})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
+			if awaiting, ok := asAwaitingHumanError(err); ok {
+				return r.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint}, run, checkpoint, awaiting)
+			}
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
 				return r.finishHeldFixerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
@@ -2880,6 +2891,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		if err := validateCompletedRepairCheckpoint(checkpoint.Repair); err != nil {
 			return checkpoint, err
 		}
+		if err := r.markHumanAnswerConsumed(ctx, &input.Loop); err != nil {
+			return checkpoint, err
+		}
+		if hasDeliveredHITLAnswer(input.Loop.MetadataJSON) && checkpoint.Worktree != nil {
+			r.applyReviewDismissals(ctx, input, checkpoint.Worktree.Path)
+		}
 		return checkpoint, nil
 	}
 	if len(checkpoint.FixItems) == 0 {
@@ -2905,6 +2922,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
+	worktreeReprepared := false
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		checkpoint.Worktree = nil
 		checkpoint.Repair = nil
@@ -2914,6 +2932,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		if err != nil {
 			return checkpoint, err
 		}
+		worktreeReprepared = true
 		worktree, err = requireWorktree(checkpoint)
 		if err != nil {
 			return checkpoint, err
@@ -2927,11 +2946,18 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	nativeResumePrompt, nativeSessionID := r.pendingHumanAnswer(ctx, &input.Loop, agentVendor)
+	continuingHITL := nativeResumePrompt != ""
 	// Autonomous conflict resolution (risky fixes on): merge the base into the
 	// worktree so the agent has the conflict markers to resolve, instead of punting
-	// the conflict to a human. A merge that fails for a non-conflict reason falls
-	// back to manual intervention.
-	if hasConflict {
+	// the conflict to a human. An answered HITL continuation reuses the merge
+	// already started before parking unless worktree recovery replaced it. A merge
+	// that fails for a non-conflict reason falls back to manual intervention.
+	if hasConflict && (!continuingHITL || worktreeReprepared) {
 		base := strings.TrimSpace(checkpoint.Detail.BaseRefName)
 		if base == "" {
 			base = "main"
@@ -2943,11 +2969,15 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		}
 	}
 	executionID := eventlog.NewEventID("agent")
-	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
-	if err != nil {
-		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush && !r.hitlEnabled && !continuingHITL, r.disclosure, agentVendor, derefString(agentModel))
+	if r.hitlEnabled {
+		if instruction := fixerHITLPromptFor(checkpoint.FixItems); instruction != "" {
+			prompt += "\n\n" + instruction
+		}
 	}
-	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+	if continuingHITL {
+		prompt += "\n\n" + nativeResumePrompt
+	}
 	metadata := map[string]any{"loopType": "fixer", "repo": input.Repo, "prNumber": input.PRNumber, "step": "repair"}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
@@ -2960,7 +2990,8 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
-		Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID,
+		WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 		Metadata: metadata, IdempotencyKey: fmt.Sprintf("fixer:%s:%s:%s", input.Loop.ID, firstNonEmpty(checkpoint.FixItemsHash, "unknown"), firstNonEmpty(detailHeadSHA(checkpoint.Detail), "unknown")),
 		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 	})
@@ -2998,17 +3029,35 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	// If the agent judged one or more CHANGES_REQUESTED reviews unreasonable it
-	// wrote a dismiss sentinel — dismiss those reviews (best-effort).
-	r.applyReviewDismissals(ctx, input, worktree.Path)
+	replies := normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
+	if err := validateNeedsHumanReplies(result.Stdout, result.Stderr, checkpoint.FixItems, replies); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureManualIntervention}
+	}
+	if awaiting := humanDecisionFromReplies(replies, executionID, agentVendor); awaiting != nil {
+		if !r.hitlEnabled {
+			return checkpoint, &loopError{message: "Fixer requested human input while HITL is disabled", kind: FailureManualIntervention}
+		}
+		return checkpoint, awaiting
+	}
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
-	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
+	checkpoint.Repair.ReplyExplanations = replies
 	checkpoint.Repair.ReplyExplanations = append(checkpoint.Repair.ReplyExplanations, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if continuingHITL {
+		if err := r.markHumanAnswerConsumed(ctx, &input.Loop); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+	}
+	// Remote review mutations happen only after the repair checkpoint is durable
+	// and any delivered human answer has been consumed.
+	r.applyReviewDismissals(ctx, input, worktree.Path)
 	return checkpoint, nil
 }
 
@@ -4650,7 +4699,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
 		pause, _ := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
 		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, pause, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
-		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
+		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint) &&
+			!shouldResumeHITLRepair(loop.MetadataJSON, latestRun.Status, failedStep, checkpoint)
 	}
 	startStep := stepDiscoverPR
 	resumedCheckpoint := checkpoint
@@ -7248,7 +7298,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 			"Each entry must be an object with these fields:",
 			`  - "fixItemId": the exact "id" of the fix item`,
 			`  - "threadId": the exact "threadId" of the same fix item`,
-			`  - "action": "fixed" or "declined"`,
+			`  - "action": "fixed" or "declined" (or "needs_human" only when a later HUMAN-IN-THE-LOOP instruction explicitly enables it)`,
 			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
 			`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. The "id" MUST be the GraphQL PullRequestReviewComment node ID. If you fetched comments with REST pulls/{number}/comments, map REST "node_id" to "id" and REST "updated_at" to "updatedAt"; do not use the REST numeric "id". Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
 			"Before including an entry, re-read the relevant review thread/comment context.",

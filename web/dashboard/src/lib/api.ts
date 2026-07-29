@@ -536,6 +536,17 @@ export function pauseLoop(
   );
 }
 
+export function respondLoop(
+  selector: string,
+  answer: string,
+  signal?: AbortSignal,
+): Promise<Loop> {
+  return apiFetch<Loop>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/respond`,
+    { method: "POST", body: JSON.stringify({ answer }), signal },
+  );
+}
+
 export function fetchLoopWorktree(
   selector: string,
   signal?: AbortSignal,

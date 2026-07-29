@@ -2434,7 +2434,8 @@ type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
 	execution, err := a.executor.Start(ctx, agent.RunInput{
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
-		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
+		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
@@ -3399,6 +3400,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
 			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
 			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
+			HITLEnabled:        cfg.HITL.Enabled,
 			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,

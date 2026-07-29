@@ -15,6 +15,7 @@ import { Card } from "@/components/ui/card";
 import {
   fetchLoop,
   openLoopLogsStream,
+  respondLoop,
   type Loop,
   type LoopLogsChunk,
   type LoopLogsSnapshot,
@@ -62,6 +63,101 @@ function Kv({ label, value }: { label: string; value: ReactNode }) {
       <dt className="text-[var(--text-muted)]">{label}</dt>
       <dd className="m-0 break-all mono">{value}</dd>
     </div>
+  );
+}
+
+type HITLAsk = {
+  question?: string;
+  options?: string[];
+  status?: string;
+  askedAt?: string;
+};
+
+function readHITLAsk(loop: Loop): HITLAsk | null {
+  try {
+    const metadata = JSON.parse(loop.metadataJson ?? "{}") as {
+      hitl?: HITLAsk;
+    };
+    return metadata.hitl ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function HITLDecisionCard({
+  loop,
+  onMutated,
+}: {
+  loop: Loop;
+  onMutated: () => Promise<void>;
+}) {
+  const ask = readHITLAsk(loop);
+  const [answer, setAnswer] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setAnswer("");
+  }, [loop.id, ask?.askedAt, ask?.question]);
+  if (
+    loop.status !== "awaiting_human" ||
+    ask?.status !== "awaiting" ||
+    !ask.question?.trim()
+  ) {
+    return null;
+  }
+
+  const submit = async (value: string) => {
+    if (!value.trim() || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await respondLoop(String(loop.seq), value.trim());
+      setAnswer("");
+      await onMutated();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to send response");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Card title="Human decision required">
+      <p className="mt-0 whitespace-pre-wrap text-[13px]">{ask.question}</p>
+      <div className="mb-3 flex flex-wrap gap-2">
+        {ask.options
+          ?.filter((option) => option !== "Provide different guidance")
+          .map((option) => (
+            <Button
+              key={option}
+              size="sm"
+              disabled={submitting}
+              onClick={() => void submit(option)}
+            >
+              {option}
+            </Button>
+          ))}
+      </div>
+      <form
+        className="flex gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit(answer);
+        }}
+      >
+        <input
+          className="min-w-0 flex-1 rounded border border-[var(--border)] bg-transparent px-2 text-[12px]"
+          value={answer}
+          onChange={(event) => setAnswer(event.target.value)}
+          placeholder="Or provide different guidance"
+          disabled={submitting}
+        />
+        <Button size="sm" type="submit" disabled={submitting || !answer.trim()}>
+          Respond
+        </Button>
+      </form>
+      {error ? <p className="mb-0 text-[12px] text-red-500">{error}</p> : null}
+    </Card>
   );
 }
 
@@ -455,6 +551,8 @@ export function LoopDetailPage() {
           />
         </Card>
       ) : null}
+
+      {data ? <HITLDecisionCard loop={data} onMutated={onMutated} /> : null}
 
       <Card title="Metadata">
         {error && !data ? (
