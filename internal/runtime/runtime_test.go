@@ -463,9 +463,15 @@ func TestRuntimeStopRejectsScheduledGHForwardLaunch(t *testing.T) {
 		close(stopDone)
 	}()
 
-	// Let Stop set stopped after launch was admitted past execCommand/pipes but
-	// before the linearized start admission runs.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until the webhook runtime has observed shutdown before releasing the
+	// start gate. Runtime.Stop drains config/scheduler/etc. before
+	// stopWebhookRuntime; a fixed sleep races on slow CI and can let
+	// admitForwarderStart win the mutex and start the process.
+	select {
+	case <-rt.webhook.stopCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("webhook runtime did not observe Stop before start gate release")
+	}
 	close(startGate)
 
 	select {
