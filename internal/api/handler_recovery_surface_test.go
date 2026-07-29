@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,364 +10,266 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-// Compact recovery-surface contracts for the Dashboard manual-intervention card.
-// Worktree dirty/clean/missing preflight matrix lives in loop_retry_discard_test.go;
-// this file covers displayStatus projection and isolation only.
+const recoverySurfaceNow = "2026-04-11T12:00:00.000Z"
+
+// seedRecoverySurfaceLoop inserts a project+loop and optional run/queue rows.
+// seq is the public loop number used by GET /api/v1/loops/{seq}.
+func seedRecoverySurfaceLoop(t *testing.T, repos *storage.Repositories, seq int64, loop storage.LoopRecord, run *storage.RunRecord, queue *storage.QueueItemRecord) {
+	t.Helper()
+	now := recoverySurfaceNow
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: loop.ProjectID, Name: loop.ProjectID, RepoPath: "/tmp/repos/" + loop.ProjectID,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert error = %v", err)
+	}
+	loop.Seq = seq
+	if loop.CreatedAt == "" {
+		loop.CreatedAt = now
+	}
+	if loop.UpdatedAt == "" {
+		loop.UpdatedAt = now
+	}
+	if err := repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert error = %v", err)
+	}
+	if run != nil {
+		if run.StartedAt == "" {
+			run.StartedAt = now
+		}
+		if run.CreatedAt == "" {
+			run.CreatedAt = now
+		}
+		if run.UpdatedAt == "" {
+			run.UpdatedAt = now
+		}
+		if run.EndedAt == nil {
+			run.EndedAt = &now
+		}
+		if err := repos.Runs.Upsert(context.Background(), *run); err != nil {
+			t.Fatalf("Runs.Upsert error = %v", err)
+		}
+	}
+	if queue != nil {
+		if queue.AvailableAt == "" {
+			queue.AvailableAt = now
+		}
+		if queue.CreatedAt == "" {
+			queue.CreatedAt = now
+		}
+		if queue.UpdatedAt == "" {
+			queue.UpdatedAt = now
+		}
+		if err := repos.Queue.Upsert(context.Background(), *queue); err != nil {
+			t.Fatalf("Queue.Upsert error = %v", err)
+		}
+	}
+}
+
+func getLoopDetail(t *testing.T, h http.Handler, seq int64) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/loops/%d", seq), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	return parseJSONMap(t, rec.Body.Bytes())["data"].(map[string]any)
+}
+
+// Compact recovery-surface contracts for Dashboard manual-intervention gating.
+// Worktree dirty/clean/missing preflight matrix lives in loop_retry_discard_test.go.
 func TestHandlerLoopDetailManualInterventionRecoverySurface(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	services := rt.Services()
-	nowISO := "2026-04-11T12:00:00.000Z"
-	lastErrorKind := "manual_intervention"
-	lastError := "dirty worker worktree: uncommitted local changes"
-	projectID := "project_recovery_surface"
-	loopID := "loop_recovery_surface"
-	targetID := projectID
+	now := recoverySurfaceNow
+	kind, reason := "manual_intervention", "dirty worker worktree: uncommitted local changes"
+	projectID, loopID, target := "project_recovery_surface", "loop_recovery_surface", "project_recovery_surface"
 
-	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: projectID, Name: "Recovery", RepoPath: "/tmp/repos/recovery", CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: loopID, Seq: 6171, ProjectID: projectID, Type: "worker",
-		TargetType: "project", TargetID: &targetID, Status: "paused",
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Loops.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+	repos := services.Repositories
+	seedRecoverySurfaceLoop(t, repos, 6171, storage.LoopRecord{
+		ID: loopID, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &target, Status: "paused",
+	}, nil, &storage.QueueItemRecord{
 		ID: "queue_recovery_surface", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
-		TargetType: "project", TargetID: targetID, DedupeKey: "worker:recovery_surface",
-		Priority: storage.QueuePriorityWorker, Status: "manual_intervention", AvailableAt: nowISO,
-		Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
-		FinishedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Queue.Upsert error = %v", err)
-	}
+		TargetType: "project", TargetID: target, DedupeKey: "worker:recovery_surface",
+		Priority: storage.QueuePriorityWorker, Status: "manual_intervention",
+		Attempts: 1, MaxAttempts: 3, LastError: &reason, LastErrorKind: &kind, FinishedAt: &now,
+	})
 
-	preLoop, _ := services.Repositories.Loops.GetByID(context.Background(), loopID)
-	preQueue, _ := services.Repositories.Queue.GetLatestByLoopID(context.Background(), loopID)
-
-	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6171", nil)
-	detailRec := httptest.NewRecorder()
-	h.ServeHTTP(detailRec, detailReq)
-	if detailRec.Code != http.StatusOK {
-		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
-	}
-	detail := parseJSONMap(t, detailRec.Body.Bytes())["data"].(map[string]any)
+	preLoop, _ := repos.Loops.GetByID(context.Background(), loopID)
+	preQueue, _ := repos.Queue.GetLatestByLoopID(context.Background(), loopID)
+	detail := getLoopDetail(t, h, 6171)
 	assertEqual(t, detail["status"], "paused")
 	assertEqual(t, detail["displayStatus"], "manual_intervention")
 	assertEqual(t, detail["lastFailureKind"], "manual_intervention")
-	assertEqual(t, detail["lastFailureReason"], lastError)
+	assertEqual(t, detail["lastFailureReason"], reason)
 
-	postLoop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	postLoop, err := repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil || postLoop == nil || postLoop.Status != preLoop.Status || postLoop.UpdatedAt != preLoop.UpdatedAt {
 		t.Fatalf("loop mutated by GET detail: before=%#v after=%#v err=%v", preLoop, postLoop, err)
 	}
-	postQueue, err := services.Repositories.Queue.GetLatestByLoopID(context.Background(), loopID)
+	postQueue, err := repos.Queue.GetLatestByLoopID(context.Background(), loopID)
 	if err != nil || postQueue == nil || postQueue.Status != preQueue.Status || postQueue.ID != preQueue.ID {
 		t.Fatalf("queue mutated by GET detail: before=%#v after=%#v err=%v", preQueue, postQueue, err)
 	}
 
 	// awaiting_human must not be re-projected as manual_intervention (decision card path).
-	hitlProjectID := "project_recovery_hitl"
-	hitlLoopID := "loop_recovery_hitl"
-	hitlTarget := hitlProjectID
-	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: hitlProjectID, Name: "HITL", RepoPath: "/tmp/repos/hitl", CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert(hitl) error = %v", err)
-	}
-	meta := `{"hitl":{"question":"Ship it?","options":["yes","no"],"status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
-	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: hitlLoopID, Seq: 6174, ProjectID: hitlProjectID, Type: "fixer",
-		TargetType: "project", TargetID: &hitlTarget, Status: "awaiting_human",
-		MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Loops.Upsert(hitl) error = %v", err)
-	}
-	hitlReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6174", nil)
-	hitlRec := httptest.NewRecorder()
-	h.ServeHTTP(hitlRec, hitlReq)
-	if hitlRec.Code != http.StatusOK {
-		t.Fatalf("hitl detail status = %d; body=%s", hitlRec.Code, hitlRec.Body.String())
-	}
-	hitlDetail := parseJSONMap(t, hitlRec.Body.Bytes())["data"].(map[string]any)
-	assertEqual(t, hitlDetail["status"], "awaiting_human")
-	assertEqual(t, hitlDetail["displayStatus"], "awaiting_human")
+	hitlMeta := `{"hitl":{"question":"Ship it?","options":["yes","no"],"status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	hitlProject, hitlLoop, hitlTarget := "project_recovery_hitl", "loop_recovery_hitl", "project_recovery_hitl"
+	seedRecoverySurfaceLoop(t, repos, 6174, storage.LoopRecord{
+		ID: hitlLoop, ProjectID: hitlProject, Type: "fixer", TargetType: "project", TargetID: &hitlTarget,
+		Status: "awaiting_human", MetadataJSON: &hitlMeta,
+	}, nil, nil)
+	hitl := getLoopDetail(t, h, 6174)
+	assertEqual(t, hitl["status"], "awaiting_human")
+	assertEqual(t, hitl["displayStatus"], "awaiting_human")
 }
 
-// After MI recovery, suspendForHuman sets loop=awaiting_human and CancelByLoop
-// marks the queue cancelled without clearing last_error_kind. HITL must win so
-// Loop Detail keeps displayStatus=awaiting_human (decision card), not MI recovery.
-func TestHandlerLoopDetailAwaitingHumanSupersedesStaleManualErrorKind(t *testing.T) {
+// Table-driven supersession contracts for displayStatus projection.
+func TestHandlerLoopDetailRecoveryDisplayStatusSupersession(t *testing.T) {
+	kind, reason := "manual_intervention", "dirty worker worktree: uncommitted local changes"
+	checkpoint := `{"resumePolicy":"manual_intervention"}`
+	runError := "checkpoint hold: operator must inspect worktree"
+	hitlMeta := `{"hitl":{"question":"Ship it?","options":["yes","no"],"status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	now := recoverySurfaceNow
+
+	cases := []struct {
+		name            string
+		seq             int64
+		loopStatus      string
+		meta            *string
+		queueStatus     string // empty = no queue
+		queueKind       *string
+		wantStatus      string
+		wantDisplay     string
+		wantFailureKind any
+	}{
+		// CancelByLoop after suspendForHuman retains MI kind; HITL wins.
+		{
+			name: "awaiting_human supersedes stale MI kind",
+			seq:  6177, loopStatus: "awaiting_human", meta: &hitlMeta,
+			queueStatus: "cancelled", queueKind: &kind,
+			wantStatus: "awaiting_human", wantDisplay: "awaiting_human", wantFailureKind: "manual_intervention",
+		},
+		// Safety-floor quarantine may retain MI queue while loop is human_takeover.
+		{
+			name: "human_takeover supersedes retained MI queue",
+			seq:  6178, loopStatus: "human_takeover",
+			queueStatus: "manual_intervention", queueKind: &kind,
+			wantStatus: "human_takeover", wantDisplay: "human_takeover", wantFailureKind: "manual_intervention",
+		},
+		// Startup recovery requeues running→queued while retaining last_error_kind.
+		{
+			name: "active queued supersedes stale MI kind",
+			seq:  6176, loopStatus: "queued",
+			queueStatus: "queued", queueKind: &kind,
+			wantStatus: "queued", wantDisplay: "queued", wantFailureKind: "manual_intervention",
+		},
+		// retryLoop leaves resumePolicy; Pause cancels the clean replacement queue.
+		{
+			name: "clean cancelled supersedes stale resumePolicy",
+			seq:  6179, loopStatus: "paused",
+			queueStatus: "cancelled", queueKind: nil,
+			wantStatus: "paused", wantDisplay: "paused", wantFailureKind: nil,
+		},
+		// Fresh post-retry queued item supersedes stale resumePolicy.
+		{
+			name: "queued retry supersedes stale resumePolicy",
+			seq:  6175, loopStatus: "queued",
+			queueStatus: "queued", queueKind: nil,
+			wantStatus: "queued", wantDisplay: "queued", wantFailureKind: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, cfg := startTestRuntime(t)
+			h := NewHandler(Context{Config: cfg, Runtime: rt})
+			services := rt.Services()
+			projectID := "project_" + tc.name
+			loopID := "loop_" + tc.name
+			target := projectID
+
+			var queue *storage.QueueItemRecord
+			if tc.queueStatus != "" {
+				q := storage.QueueItemRecord{
+					ID: "queue_" + tc.name, ProjectID: &projectID, LoopID: &loopID, Type: "worker",
+					TargetType: "project", TargetID: target, DedupeKey: "worker:" + tc.name,
+					Priority: storage.QueuePriorityWorker, Status: tc.queueStatus,
+					Attempts: 1, MaxAttempts: 3, LastErrorKind: tc.queueKind,
+				}
+				if tc.queueKind != nil {
+					q.LastError = &reason
+					if tc.queueStatus != "queued" && tc.queueStatus != "running" {
+						q.FinishedAt = &now
+					}
+				} else {
+					q.Attempts = 0
+				}
+				queue = &q
+			}
+			seedRecoverySurfaceLoop(t, services.Repositories, tc.seq, storage.LoopRecord{
+				ID: loopID, ProjectID: projectID, Type: "worker", TargetType: "project",
+				TargetID: &target, Status: tc.loopStatus, MetadataJSON: tc.meta,
+			}, &storage.RunRecord{
+				ID: "run_" + tc.name, LoopID: loopID, Status: "failed",
+				CheckpointJSON: &checkpoint, ErrorMessage: &runError,
+			}, queue)
+
+			detail := getLoopDetail(t, h, tc.seq)
+			assertEqual(t, detail["status"], tc.wantStatus)
+			assertEqual(t, detail["displayStatus"], tc.wantDisplay)
+			assertEqual(t, detail["resumePolicy"], "manual_intervention")
+			if tc.wantFailureKind == nil {
+				if detail["lastFailureKind"] != nil {
+					t.Fatalf("lastFailureKind = %#v, want nil", detail["lastFailureKind"])
+				}
+			} else {
+				assertEqual(t, detail["lastFailureKind"], tc.wantFailureKind)
+			}
+		})
+	}
+}
+
+// Claimed/running with retained MI kind stays active (not recovery card).
+func TestHandlerLoopDetailActiveRunningSupersedesStaleManualErrorKind(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	services := rt.Services()
-	nowISO := "2026-04-11T12:00:00.000Z"
-	lastErrorKind := "manual_intervention"
-	lastError := "dirty worker worktree: uncommitted local changes"
-	projectID := "project_recovery_hitl_stale_kind"
-	loopID := "loop_recovery_hitl_stale_kind"
-	targetID := projectID
+	now := recoverySurfaceNow
+	kind, reason := "manual_intervention", "dirty worker worktree: uncommitted local changes"
 	checkpoint := `{"resumePolicy":"manual_intervention"}`
-	runError := "checkpoint hold: operator must inspect worktree"
-	meta := `{"hitl":{"question":"Ship it?","options":["yes","no"],"status":"awaiting","askedAt":"2026-04-11T12:00:00.000Z"}}`
+	projectID, loopID, target := "project_recovery_running", "loop_recovery_running", "project_recovery_running"
 
-	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: projectID, Name: "HITL supersedes stale MI", RepoPath: "/tmp/repos/hitl-stale-mi",
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: loopID, Seq: 6177, ProjectID: projectID, Type: "fixer",
-		TargetType: "project", TargetID: &targetID, Status: "awaiting_human",
-		MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Loops.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
-		ID: "run_recovery_hitl_stale_kind", LoopID: loopID, Status: "failed",
-		CheckpointJSON: &checkpoint, ErrorMessage: &runError, StartedAt: nowISO,
-		EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Runs.Upsert error = %v", err)
-	}
-	// Mirrors CancelByLoop after suspendForHuman: cancelled queue retains
-	// last_error_kind=manual_intervention from the prior recovery hold.
-	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
-		ID: "queue_recovery_hitl_stale_kind", ProjectID: &projectID, LoopID: &loopID, Type: "fixer",
-		TargetType: "project", TargetID: targetID, DedupeKey: "fixer:recovery_hitl_stale_kind",
-		Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO,
-		Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
-		FinishedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Queue.Upsert error = %v", err)
-	}
+	seedRecoverySurfaceLoop(t, services.Repositories, 6180, storage.LoopRecord{
+		ID: loopID, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &target, Status: "running",
+	}, &storage.RunRecord{
+		ID: "run_recovery_running", LoopID: loopID, Status: "failed", CheckpointJSON: &checkpoint, ErrorMessage: &reason,
+	}, &storage.QueueItemRecord{
+		ID: "queue_recovery_running", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
+		TargetType: "project", TargetID: target, DedupeKey: "worker:recovery_running",
+		Priority: storage.QueuePriorityWorker, Status: "running",
+		Attempts: 1, MaxAttempts: 3, LastError: &reason, LastErrorKind: &kind,
+		ClaimedBy: stringPtr("scheduler"), ClaimedAt: &now, StartedAt: &now,
+	})
 
-	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6177", nil)
-	detailRec := httptest.NewRecorder()
-	h.ServeHTTP(detailRec, detailReq)
-	if detailRec.Code != http.StatusOK {
-		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
-	}
-	detail := parseJSONMap(t, detailRec.Body.Bytes())["data"].(map[string]any)
-	assertEqual(t, detail["status"], "awaiting_human")
-	assertEqual(t, detail["displayStatus"], "awaiting_human")
-	// Historical MI diagnostics may still be present for operators, but must not
-	// override HITL displayStatus / recovery-card gating.
-	assertEqual(t, detail["lastFailureKind"], "manual_intervention")
-	assertEqual(t, detail["resumePolicy"], "manual_intervention")
-
-	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops?limit=100", nil)
-	listRec := httptest.NewRecorder()
-	h.ServeHTTP(listRec, listReq)
-	if listRec.Code != http.StatusOK {
-		t.Fatalf("list status = %d, want 200; body=%s", listRec.Code, listRec.Body.String())
-	}
-	items := parseJSONMap(t, listRec.Body.Bytes())["data"].(map[string]any)["items"].([]any)
-	found := false
-	for _, raw := range items {
-		item := raw.(map[string]any)
-		if item["id"] != loopID {
-			continue
-		}
-		found = true
-		assertEqual(t, item["status"], "awaiting_human")
-		assertEqual(t, item["displayStatus"], "awaiting_human")
-	}
-	if !found {
-		t.Fatalf("list items missing loop %s: %#v", loopID, items)
-	}
-}
-
-// Startup recovery requeues running→queued while intentionally retaining
-// last_error_kind=manual_intervention. Active queue status must supersede that
-// stale kind so Loop Detail does not show an action-required recovery card.
-func TestHandlerLoopDetailActiveQueueSupersedesStaleManualErrorKind(t *testing.T) {
-	rt, cfg := startTestRuntime(t)
-	h := NewHandler(Context{Config: cfg, Runtime: rt})
-	services := rt.Services()
-	nowISO := "2026-04-11T12:00:00.000Z"
-	lastErrorKind := "manual_intervention"
-	lastError := "dirty worker worktree: uncommitted local changes"
-	projectID := "project_recovery_stale_kind"
-	loopID := "loop_recovery_stale_kind"
-	targetID := projectID
-	checkpoint := `{"resumePolicy":"manual_intervention"}`
-	runError := "checkpoint hold: operator must inspect worktree"
-
-	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: projectID, Name: "Stale kind supersede", RepoPath: "/tmp/repos/stale-kind",
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: loopID, Seq: 6176, ProjectID: projectID, Type: "worker",
-		TargetType: "project", TargetID: &targetID, Status: "queued",
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Loops.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
-		ID: "run_recovery_stale_kind", LoopID: loopID, Status: "failed",
-		CheckpointJSON: &checkpoint, ErrorMessage: &runError, StartedAt: nowISO,
-		EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Runs.Upsert error = %v", err)
-	}
-	// Mirrors RequeueRunningByLoop after startup recovery: status=queued but
-	// last_error_kind still manual_intervention.
-	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
-		ID: "queue_recovery_stale_kind", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
-		TargetType: "project", TargetID: targetID, DedupeKey: "worker:recovery_stale_kind",
-		Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO,
-		Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Queue.Upsert error = %v", err)
-	}
-
-	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6176", nil)
-	detailRec := httptest.NewRecorder()
-	h.ServeHTTP(detailRec, detailReq)
-	if detailRec.Code != http.StatusOK {
-		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
-	}
-	detail := parseJSONMap(t, detailRec.Body.Bytes())["data"].(map[string]any)
-	assertEqual(t, detail["status"], "queued")
-	assertEqual(t, detail["displayStatus"], "queued")
-	// Historical failure fields may still be present for diagnostics, but must
-	// not force the recovery card via displayStatus.
-	assertEqual(t, detail["lastFailureKind"], "manual_intervention")
-	assertEqual(t, detail["resumePolicy"], "manual_intervention")
-
-	// Claimed/running with the same retained kind must also stay active.
-	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
-		ID: "queue_recovery_stale_kind", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
-		TargetType: "project", TargetID: targetID, DedupeKey: "worker:recovery_stale_kind",
-		Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO,
-		Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind,
-		ClaimedBy: stringPtr("scheduler"), ClaimedAt: &nowISO, StartedAt: &nowISO,
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Queue.Upsert(running) error = %v", err)
-	}
-	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: loopID, Seq: 6176, ProjectID: projectID, Type: "worker",
-		TargetType: "project", TargetID: &targetID, Status: "running",
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Loops.Upsert(running) error = %v", err)
-	}
-	runDetailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6176", nil)
-	runDetailRec := httptest.NewRecorder()
-	h.ServeHTTP(runDetailRec, runDetailReq)
-	if runDetailRec.Code != http.StatusOK {
-		t.Fatalf("running detail status = %d, want 200; body=%s", runDetailRec.Code, runDetailRec.Body.String())
-	}
-	runDetail := parseJSONMap(t, runDetailRec.Body.Bytes())["data"].(map[string]any)
-	assertEqual(t, runDetail["status"], "running")
-	assertEqual(t, runDetail["displayStatus"], "running")
+	detail := getLoopDetail(t, h, 6180)
+	assertEqual(t, detail["status"], "running")
+	assertEqual(t, detail["displayStatus"], "running")
 
 	activeReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
 	activeRec := httptest.NewRecorder()
 	h.ServeHTTP(activeRec, activeReq)
 	if activeRec.Code != http.StatusOK {
-		t.Fatalf("active status = %d, want 200; body=%s", activeRec.Code, activeRec.Body.String())
+		t.Fatalf("active status = %d; body=%s", activeRec.Code, activeRec.Body.String())
 	}
-	items := parseJSONMap(t, activeRec.Body.Bytes())["data"].(map[string]any)["items"].([]any)
-	found := false
-	for _, raw := range items {
+	for _, raw := range parseJSONMap(t, activeRec.Body.Bytes())["data"].(map[string]any)["items"].([]any) {
 		item := raw.(map[string]any)
-		if item["loopId"] != loopID {
-			continue
+		if item["loopId"] == loopID {
+			assertEqual(t, item["displayStatus"], "running")
+			return
 		}
-		found = true
-		assertEqual(t, item["displayStatus"], "running")
 	}
-	if !found {
-		t.Fatalf("active items missing loop %s: %#v", loopID, items)
-	}
-}
-
-// After retryLoop, a fresh queued item must supersede a stale run resumePolicy so
-// the dashboard does not keep showing the recovery card for an already-queued loop.
-func TestHandlerLoopDetailQueuedRetrySupersedesStaleResumePolicy(t *testing.T) {
-	rt, cfg := startTestRuntime(t)
-	h := NewHandler(Context{Config: cfg, Runtime: rt})
-	services := rt.Services()
-	nowISO := "2026-04-11T12:00:00.000Z"
-	projectID := "project_recovery_retry_supersede"
-	loopID := "loop_recovery_retry_supersede"
-	targetID := projectID
-	checkpoint := `{"resumePolicy":"manual_intervention"}`
-	runError := "checkpoint hold: operator must inspect worktree"
-
-	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: projectID, Name: "Retry supersede", RepoPath: "/tmp/repos/retry-supersede",
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: loopID, Seq: 6175, ProjectID: projectID, Type: "worker",
-		TargetType: "project", TargetID: &targetID, Status: "queued",
-		CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Loops.Upsert error = %v", err)
-	}
-	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{
-		ID: "run_recovery_retry_supersede", LoopID: loopID, Status: "failed",
-		CheckpointJSON: &checkpoint, ErrorMessage: &runError, StartedAt: nowISO,
-		EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Runs.Upsert error = %v", err)
-	}
-	// Fresh post-retry queue item: no error fields (supersedes the hold).
-	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
-		ID: "queue_recovery_retry_supersede", ProjectID: &projectID, LoopID: &loopID, Type: "worker",
-		TargetType: "project", TargetID: targetID, DedupeKey: "worker:recovery_retry_supersede",
-		Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO,
-		Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Queue.Upsert error = %v", err)
-	}
-
-	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/6175", nil)
-	detailRec := httptest.NewRecorder()
-	h.ServeHTTP(detailRec, detailReq)
-	if detailRec.Code != http.StatusOK {
-		t.Fatalf("detail status = %d, want 200; body=%s", detailRec.Code, detailRec.Body.String())
-	}
-	detail := parseJSONMap(t, detailRec.Body.Bytes())["data"].(map[string]any)
-	assertEqual(t, detail["status"], "queued")
-	assertEqual(t, detail["displayStatus"], "queued")
-	// resumePolicy may still be reported from the latest completed run, but must
-	// not force displayStatus back to manual_intervention after re-queue.
-	assertEqual(t, detail["resumePolicy"], "manual_intervention")
-
-	activeReq := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
-	activeRec := httptest.NewRecorder()
-	h.ServeHTTP(activeRec, activeReq)
-	if activeRec.Code != http.StatusOK {
-		t.Fatalf("active status = %d, want 200; body=%s", activeRec.Code, activeRec.Body.String())
-	}
-	items := parseJSONMap(t, activeRec.Body.Bytes())["data"].(map[string]any)["items"].([]any)
-	found := false
-	for _, raw := range items {
-		item := raw.(map[string]any)
-		if item["loopId"] != loopID {
-			continue
-		}
-		found = true
-		assertEqual(t, item["displayStatus"], "queued")
-		assertEqual(t, item["resumePolicy"], "manual_intervention")
-	}
-	if !found {
-		t.Fatalf("active items missing loop %s: %#v", loopID, items)
-	}
+	t.Fatalf("active items missing loop %s", loopID)
 }

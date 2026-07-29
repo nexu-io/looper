@@ -3474,18 +3474,21 @@ func queueIsActiveAutomation(item *storage.QueueItemRecord) bool {
 
 // projectManualInterventionDisplayStatus chooses displayStatus using durable
 // queue facts. Active queued/running items win over a retained last_error_kind
-// and over a stale run resumePolicy; only then is resumePolicy consulted.
-// Closed loops and awaiting_human keep their true status (HITL is authoritative
-// even when CancelByLoop left last_error_kind=manual_intervention on a
-// cancelled queue item).
+// and over a stale run resumePolicy; a newer non-MI queue event (including a
+// clean cancelled item after Pause of a post-retry queue) also supersedes
+// resumePolicy. resumePolicy is consulted only when there is no latest queue.
+// Closed loops, awaiting_human, and human_takeover keep their true status
+// (operator UX is authoritative even when CancelByLoop or safety-floor
+// quarantine left last_error_kind=manual_intervention on a retained queue item).
 func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *storage.QueueItemRecord, latestRun *storage.RunRecord, now time.Time) string {
 	if isClosedLoopStatus(loopStatus) {
 		return ""
 	}
-	// HITL suspension owns the operator UX (decision card). Do not re-project
-	// stale manual_intervention diagnostics from a cancelled prior queue item
-	// or an old checkpoint hold while the loop is awaiting_human.
-	if domain.LoopStatus(strings.TrimSpace(loopStatus)) == domain.LoopStatusAwaitingHuman {
+	// HITL decision card and human takeover/handback own the operator UX. Do not
+	// re-project stale manual_intervention diagnostics from a retained queue
+	// item or an old checkpoint hold while those statuses are active.
+	switch domain.LoopStatus(strings.TrimSpace(loopStatus)) {
+	case domain.LoopStatusAwaitingHuman, domain.LoopStatusHumanTakeover:
 		return ""
 	}
 	// Prefer active queue (queued/running after recovery requeue or retry) over
@@ -3502,6 +3505,11 @@ func projectManualInterventionDisplayStatus(loopStatus string, latestQueue *stor
 	}
 	if isBackingOffQueue(latestQueue, now) {
 		return "backing_off"
+	}
+	// Any other latest queue fact (e.g. clean cancelled after Pause of a
+	// post-retry item) supersedes a prior run's resumePolicy hold.
+	if latestQueue != nil {
+		return ""
 	}
 	if hasManualInterventionResumePolicy(latestRun) {
 		return "manual_intervention"
