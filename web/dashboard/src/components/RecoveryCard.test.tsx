@@ -359,6 +359,35 @@ describe("RecoveryCard", () => {
     });
   });
 
+  it("requires confirmation before Takeover parks a running loop", async () => {
+    fetchLoopWorktree.mockRejectedValue(new Error("worktree endpoint down"));
+    takeoverLoop.mockResolvedValue({
+      loopId: "loop_1",
+      supported: true,
+      worktreePath: "/tmp/wt",
+      resumeCommand: "looper handback 617",
+    });
+    render(
+      <ToastProvider>
+        <RecoveryCard
+          loop={baseLoop({ status: "running" })}
+          selector="617"
+          hasActiveRun
+        />
+      </ToastProvider>,
+    );
+
+    await screen.findByText(/no safe worktree repair path/i);
+    fireEvent.click(screen.getByRole("button", { name: "Takeover" }));
+    expect(takeoverLoop).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/Take over loop/i)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Takeover" }));
+    await waitFor(() => {
+      expect(takeoverLoop).toHaveBeenCalledWith("617");
+    });
+  });
+
   it("clears stale worktree UI when the selector changes", async () => {
     fetchLoopWorktree.mockImplementation(async (selector: string) => {
       if (selector === "617") {

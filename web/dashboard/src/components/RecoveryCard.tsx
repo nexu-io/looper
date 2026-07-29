@@ -67,6 +67,7 @@ export function RecoveryCard({
   >(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
+  const [confirmTakeover, setConfirmTakeover] = useState(false);
   const [inspectOpen, setInspectOpen] = useState(false);
   const [takeoverResult, setTakeoverResult] = useState<TakeoverResult | null>(
     null,
@@ -85,6 +86,7 @@ export function RecoveryCard({
     setPending(null);
     setConfirmDiscard(false);
     setConfirmStop(false);
+    setConfirmTakeover(false);
     setInspectOpen(false);
     setTakeoverResult(null);
     setInlineError(null);
@@ -245,6 +247,7 @@ export function RecoveryCard({
     try {
       const result = await takeoverLoop(selector);
       setTakeoverResult(result);
+      setConfirmTakeover(false);
       toast.success(
         result.supported
           ? "Takeover: loop parked"
@@ -451,7 +454,7 @@ export function RecoveryCard({
                     variant="danger"
                     size="sm"
                     disabled={busy}
-                    onClick={() => void onTakeover()}
+                    onClick={() => setConfirmTakeover(true)}
                   >
                     {pending === "takeover" ? "…" : "Takeover"}
                   </Button>
@@ -537,6 +540,26 @@ export function RecoveryCard({
           <p className="m-0 text-[var(--text-muted)]">
             Pauses the loop and stops the active execution. The loop stays paused
             until you unpause or retry.
+          </p>
+        </ConfirmDialog>
+      ) : null}
+
+      {confirmTakeover ? (
+        <ConfirmDialog
+          open
+          title="Take over loop?"
+          confirmLabel="Takeover"
+          danger
+          busy={busy}
+          onCancel={() => {
+            if (!busy) setConfirmTakeover(false);
+          }}
+          onConfirm={() => void onTakeover()}
+        >
+          <p className="m-0 text-[var(--text-muted)]">
+            Parks the loop in human_takeover and stops the daemon run. You will
+            get a worktree path and resume command (if supported) to continue
+            interactively. Hand back when done.
           </p>
         </ConfirmDialog>
       ) : null}
