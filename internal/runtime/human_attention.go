@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -14,8 +15,7 @@ import (
 
 // notifyHumanAttentionBestEffort builds a short-lived gateway from the current
 // runtime config and emits human-attention notifications without affecting the
-// caller's control flow. Used from recovery paths that park work outside the
-// scheduler claim lifecycle.
+// caller's control flow. Used from recovery rescan (async) and tests.
 func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *storage.Repositories, loopID string) {
 	if r == nil || repos == nil || strings.TrimSpace(loopID) == "" {
 		return
@@ -31,6 +31,91 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 		Now:               r.now,
 	})
 	notifyDurableHumanAttention(ctx, gateway, repos, loopID)
+}
+
+// scheduleHumanAttentionRecoveryNotify rescans durable human-attention parks
+// after startup recovery durability is complete. Delivery runs asynchronously
+// so interactive osascript dialogs cannot delay MarkReady / admission.
+//
+// Covers: (1) parks that crashed after durable await/manual hold but before the
+// scheduler finalize callback; (2) recovery quarantine parks that used to notify
+// on the critical path. Permanent entry-scoped dedupe decides whether an alert
+// is sent — not the crash-sensitive post-finalize callback window.
+func (r *Runtime) scheduleHumanAttentionRecoveryNotify(repos *storage.Repositories) {
+	if r == nil || repos == nil {
+		return
+	}
+	go r.notifyDurableHumanAttentionParksBestEffort(context.Background(), repos)
+}
+
+// notifyDurableHumanAttentionParksBestEffort lists durable awaiting_human loops
+// and latest hard manual_intervention queue holds, then observes each once.
+// Safe to call from a background goroutine; skips when the runtime is stopping.
+func (r *Runtime) notifyDurableHumanAttentionParksBestEffort(ctx context.Context, repos *storage.Repositories) {
+	if r == nil || repos == nil {
+		return
+	}
+	if r.isStopped() {
+		return
+	}
+	for _, loopID := range collectHumanAttentionLoopIDs(ctx, repos) {
+		if ctx.Err() != nil || r.isStopped() {
+			return
+		}
+		r.notifyHumanAttentionBestEffort(ctx, repos, loopID)
+	}
+}
+
+func (r *Runtime) isStopped() bool {
+	if r == nil {
+		return true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.stopped
+}
+
+// collectHumanAttentionLoopIDs returns loop IDs that may need human-attention
+// observation after recovery: durable awaiting_human loop status, and latest
+// queue rows parked as manual_intervention. notifyDurableHumanAttention applies
+// the hard-condition filter and permanent entry dedupe.
+func collectHumanAttentionLoopIDs(ctx context.Context, repos *storage.Repositories) []string {
+	if repos == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	ids := make([]string, 0)
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if repos.Loops != nil {
+		loops, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusAwaitingHuman)})
+		if err == nil {
+			for _, loop := range loops {
+				add(loop.ID)
+			}
+		}
+	}
+	if repos.Queue != nil {
+		// Latest row per loop only: older manual_intervention history is not a current park.
+		items, err := repos.Queue.ListLatestByLoopStatuses(ctx, []string{"manual_intervention"})
+		if err == nil {
+			for _, item := range items {
+				if item.LoopID != nil {
+					add(*item.LoopID)
+				}
+			}
+		}
+	}
+	return ids
 }
 
 // notifyDurableHumanAttention observes durable loop/queue state after a claim

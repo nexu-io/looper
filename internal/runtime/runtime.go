@@ -1026,6 +1026,9 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
+		// Rescan durable human-attention parks after recovery durability is done.
+		// Delivery is async so interactive osascript cannot delay MarkReady.
+		r.scheduleHumanAttentionRecoveryNotify(repositories)
 		if err := r.appendStartedEvent(context.Background(), *startedAt, recoverySummary); err != nil {
 			r.startupReadyErr = err
 			return
@@ -2894,11 +2897,11 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 				return false, false, err
 			}
 			did = true
-			// Best-effort operator notify after durable manual_intervention park.
-			// Recovery must not fail if notification delivery fails.
-			if item.LoopID != nil {
-				r.notifyHumanAttentionBestEffort(ctx, repositories, *item.LoopID)
-			}
+			// Operator notify is deliberately not invoked here. Synchronous
+			// osascript dialogs (up to ~30s each) would block the recovery
+			// critical path before MarkReady. CompleteStartup rescans durable
+			// human-attention parks asynchronously after recovery finishes;
+			// permanent entry dedupe decides whether an alert is sent.
 		}
 	}
 
