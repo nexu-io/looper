@@ -220,6 +220,22 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 	return nil
 }
 
+// deleteTunnelHookForRollback deletes a just-created remote hook after local
+// persistence fails. It uses a stop-independent bounded context so shutdown
+// cancellation of the reconcile parent cannot strand an unrecorded hook ID.
+func (w *webhookRuntime) deleteTunnelHookForRollback(client webhookTunnelGitHubClient, repo string, hookID int64) error {
+	if client == nil {
+		return errors.New("tunnel github client is unavailable")
+	}
+	timeout := 5 * time.Second
+	if w != nil {
+		timeout = w.shutdownTimeout()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return client.DeleteHook(ctx, repo, hookID)
+}
+
 func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, repo string, record storage.WebhookTunnelHookRecord, ok bool, now int64) WebhookTunnelState {
 	client := w.tunnelGitHubClient()
 	url := webhookTunnelManagedURL(w.cfg, repo)
@@ -235,7 +251,9 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		}
 		record = storage.WebhookTunnelHookRecord{Repo: repo, HookID: hook.ID, ManagedURL: url, SecretRef: secretRef, ConsecutiveDisables: 0, CreatedAt: now, UpdatedAt: now}
 		if err := store.Upsert(ctx, record); err != nil {
-			if deleteErr := client.DeleteHook(ctx, repo, hook.ID); deleteErr != nil {
+			// Rollback must not inherit a stop-cancelled reconcile ctx: CreateHook
+			// already succeeded, so a dead parent would leave an unrecorded remote hook.
+			if deleteErr := w.deleteTunnelHookForRollback(client, repo, hook.ID); deleteErr != nil {
 				return WebhookTunnelState{Repo: repo, HookID: &record.HookID, ManagedURL: url, LastError: fmt.Sprintf("persist tunnel hook: %v; rollback delete of remote hook %d failed: %v", err, hook.ID, deleteErr)}
 			}
 			return WebhookTunnelState{Repo: repo, HookID: &record.HookID, ManagedURL: url, LastError: fmt.Sprintf("persist tunnel hook: %v", err)}
@@ -263,7 +281,8 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		record.Orphaned = false
 		record.UpdatedAt = now
 		if err := store.Upsert(ctx, record); err != nil {
-			if deleteErr := client.DeleteHook(ctx, repo, hook.ID); deleteErr != nil {
+			// Same create→persist race as initial create: use stop-independent cleanup.
+			if deleteErr := w.deleteTunnelHookForRollback(client, repo, hook.ID); deleteErr != nil {
 				return tunnelStateFromRecord(record, fmt.Sprintf("persist recreated hook: %v; rollback delete of remote hook %d failed: %v", err, hook.ID, deleteErr))
 			}
 			return tunnelStateFromRecord(record, fmt.Sprintf("persist recreated hook: %v", err))

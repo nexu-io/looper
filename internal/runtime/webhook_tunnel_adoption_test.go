@@ -1,11 +1,13 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,6 +127,117 @@ func TestReconcileTunnelHookCreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("record = %#v found=%v, want no persisted record", record, ok)
+	}
+}
+
+func TestReconcileTunnelHookCreateRollbackUsesLiveCleanupContextAfterCancel(t *testing.T) {
+	t.Parallel()
+
+	// CreateHook already succeeded under a live reconcile ctx; shutdown then
+	// cancels that parent before SQLite Upsert. Rollback DeleteHook must still
+	// reach GitHub on a stop-independent bounded cleanup context.
+	liveCtx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	client := &fakeWebhookTunnelGitHubClient{createHook: webhookTunnelGitHubHook{ID: 77, Active: true, Events: webhookForwardEvents}}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+
+	canceled, cancel := context.WithCancel(liveCtx)
+	cancel()
+
+	state := rt.reconcileTunnelHook(canceled, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
+
+	if client.createCalls != 1 {
+		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
+	}
+	if client.deleteCalls != 1 {
+		t.Fatalf("DeleteHook calls = %d, want 1 rollback after canceled persist", client.deleteCalls)
+	}
+	if len(client.deletedHooks) != 1 || client.deletedHooks[0] != 77 {
+		t.Fatalf("deletedHooks = %v, want [77]", client.deletedHooks)
+	}
+	if client.deleteCtxErr != nil {
+		t.Fatalf("DeleteHook ctx.Err() = %v, want live cleanup context", client.deleteCtxErr)
+	}
+	if !client.deleteDeadline {
+		t.Fatal("DeleteHook context missing deadline, want bounded cleanup context")
+	}
+	if state.LastError == "" || !strings.Contains(state.LastError, "persist tunnel hook") {
+		t.Fatalf("state.LastError = %q, want persist failure after canceled upsert", state.LastError)
+	}
+	if strings.Contains(state.LastError, "rollback delete") {
+		t.Fatalf("state.LastError = %q, rollback delete should have succeeded", state.LastError)
+	}
+	record, ok, err := repos.WebhookTunnelHooks.Get(liveCtx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if ok {
+		t.Fatalf("record = %#v found=%v, want no persisted record after rollback", record, ok)
+	}
+}
+
+func TestReconcileTunnelHookRecreateRollbackUsesLiveCleanupContextAfterCancel(t *testing.T) {
+	t.Parallel()
+
+	liveCtx, repos, cfg := setupWebhookTunnelTestRepos(t)
+	const repo = "acme/looper"
+	url := webhookTunnelManagedURL(cfg, repo)
+	record := storage.WebhookTunnelHookRecord{Repo: repo, HookID: 42, ManagedURL: url, SecretRef: webhookTunnelSecretRef(repo), CreatedAt: 1, UpdatedAt: 1}
+	if err := repos.WebhookTunnelHooks.Upsert(liveCtx, record); err != nil {
+		t.Fatalf("WebhookTunnelHooks.Upsert() error = %v", err)
+	}
+	secretPath := webhookTunnelSecretPath(cfg.Storage.DBPath, record.SecretRef)
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o700); err != nil {
+		t.Fatalf("os.MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(secretPath, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	client := &fakeWebhookTunnelGitHubClient{
+		getFound:   false,
+		createHook: webhookTunnelGitHubHook{ID: 88, Active: true, Events: webhookForwardEvents},
+	}
+	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
+	rt.tunnelClient = client
+
+	// GetHook succeeds under live ctx first so recreate path is reached; then
+	// cancel before Upsert so rollback DeleteHook is the only stop-critical call.
+	// Calling with an already-canceled parent models shutdown mid-recreate after
+	// CreateHook (fake ignores parent cancel) and forces Upsert to fail.
+	canceled, cancel := context.WithCancel(liveCtx)
+	cancel()
+
+	state := rt.reconcileTunnelHook(canceled, repos.WebhookTunnelHooks, repo, record, true, time.Now().UnixNano())
+
+	if client.createCalls != 1 {
+		t.Fatalf("CreateHook calls = %d, want 1 recreate", client.createCalls)
+	}
+	if client.deleteCalls != 1 {
+		t.Fatalf("DeleteHook calls = %d, want 1 rollback after canceled persist", client.deleteCalls)
+	}
+	if len(client.deletedHooks) != 1 || client.deletedHooks[0] != 88 {
+		t.Fatalf("deletedHooks = %v, want [88]", client.deletedHooks)
+	}
+	if client.deleteCtxErr != nil {
+		t.Fatalf("DeleteHook ctx.Err() = %v, want live cleanup context", client.deleteCtxErr)
+	}
+	if !client.deleteDeadline {
+		t.Fatal("DeleteHook context missing deadline, want bounded cleanup context")
+	}
+	if state.LastError == "" || !strings.Contains(state.LastError, "persist recreated hook") {
+		t.Fatalf("state.LastError = %q, want persist failure after canceled upsert", state.LastError)
+	}
+	if strings.Contains(state.LastError, "rollback delete") {
+		t.Fatalf("state.LastError = %q, rollback delete should have succeeded", state.LastError)
+	}
+	// Original record remains; recreated ID must not be persisted.
+	updated, ok, err := repos.WebhookTunnelHooks.Get(liveCtx, repo)
+	if err != nil {
+		t.Fatalf("WebhookTunnelHooks.Get() error = %v", err)
+	}
+	if !ok || updated.HookID != 42 {
+		t.Fatalf("record = %#v found=%v, want original hook id 42", updated, ok)
 	}
 }
 
