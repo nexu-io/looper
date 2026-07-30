@@ -1615,6 +1615,12 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 		return worktree, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
 	}
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
+		// A checkpoint that points at the project repo is corrupt authority, not a
+		// hollow managed worktree. Recreate-after-restore-nil would invent a fresh
+		// path and let post-execute steps succeed without the claimed work.
+		if worktreesafety.IsProjectRepoPath(worktree.Path, input.Project.RepoPath) {
+			return worktree, staleWorkerWorktreeError(worktree, work, err.Error())
+		}
 		return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, err.Error())
 	}
 	info, err := os.Stat(worktree.Path)

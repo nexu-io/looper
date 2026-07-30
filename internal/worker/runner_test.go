@@ -1356,6 +1356,62 @@ func TestRunExecuteStepRecoversMalformedGitCheckoutAfterPrepare(t *testing.T) {
 	}
 }
 
+// Resumed post-prepare steps must not recreate when the checkpoint worktree is
+// the project repo itself. Create-after-restore-nil is for hollow managed
+// paths under the worktree root; inventing a fresh path would let validate /
+// open_pr succeed after a corrupt "ran in user repo" checkpoint.
+func TestRunValidateStepRejectsCheckpointWorktreePathAtUserRepo(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/bad-checkpoint"
+	git := &fakeGitGateway{
+		restoreNil:   true,
+		createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "recreated"), Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_created"},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runValidateStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     storage.RunRecord{ID: "run_bad_repo_checkpoint", LoopID: loop.ID},
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Reject unsafe worktree checkpoint", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_bad", Path: repoPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Reject unsafe worktree checkpoint", Items: []string{"Never use the user repo as worker cwd"}},
+			Execution: &checkpointExecution{Status: "completed", Summary: "prior execution completed", ParseStatus: "parsed"},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("runValidateStep() error = %v, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if !strings.Contains(loopErr.message, "Worker worktree path") {
+		t.Fatalf("error = %q, want Worker worktree path rejection", loopErr.message)
+	}
+	if !strings.Contains(loopErr.message, "must not equal project repo path") {
+		t.Fatalf("error = %q, want project-repo-path detail", loopErr.message)
+	}
+	if len(git.restoreCalls) != 0 {
+		t.Fatalf("restoreCalls = %#v, want no restore for project-repo checkpoint", git.restoreCalls)
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("createCalls = %#v, want no recreate for project-repo checkpoint", git.createCalls)
+	}
+}
+
 // Production RestoreWorktree clears empty/metadata-only hollow leftovers and
 // returns (nil, nil) when no healthy registered worktree remains. Recovery must
 // fall through to CreateWorktree instead of parking as stale-worktree MI.
