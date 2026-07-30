@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -26,13 +25,10 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 	}
 	cfg := r.Config()
 	gateway := notify.NewGateway(notify.Options{
-		Config:            cfg.Notifications,
-		OsascriptPath:     strings.TrimSpace(derefString(cfg.Tools.OsascriptPath)),
-		LogFilePath:       filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		DashboardBaseURL:  notify.ResolveDashboardBaseURL(cfg.Server),
-		DashboardAuthMode: cfg.Server.AuthMode,
-		Repositories:      repos,
-		Now:               r.now,
+		Config:        cfg.Notifications,
+		OsascriptPath: strings.TrimSpace(derefString(cfg.Tools.OsascriptPath)),
+		Repositories:  repos,
+		Now:           r.now,
 	})
 	notifyDurableHumanAttention(ctx, gateway, repos, loopID)
 }
@@ -81,10 +77,10 @@ func (r *Runtime) goHumanAttentionNotify(fn func(context.Context)) {
 }
 
 // notifyHumanAttentionPostClaim is the scheduler post-finalize callback.
-// It ignores the dispatch WithoutCancel context: interactive osascript must
+// It ignores the dispatch WithoutCancel context: notification delivery must
 // cancel when BeginShutdown fires, and Stop must drain before SQLite close.
-// Delivery is async so a 35s dialog cannot pin a scheduler task slot across
-// the shutdown timeout.
+// Delivery is async so a slow local or remote notifier cannot pin a scheduler
+// task slot across the shutdown timeout.
 func (r *Runtime) notifyHumanAttentionPostClaim(_ context.Context, loopID string) {
 	if r == nil {
 		return
@@ -106,7 +102,7 @@ func (r *Runtime) notifyHumanAttentionPostClaim(_ context.Context, loopID string
 // scheduleHumanAttentionRecoveryNotify rescans durable human-attention parks
 // after CompleteStartup has committed (MarkReady succeeded). Callers must not
 // schedule this while later startup steps can still fail and close SQLite.
-// Delivery runs asynchronously so interactive osascript dialogs cannot delay
+// Delivery runs asynchronously so notification transports cannot delay
 // admission readiness.
 //
 // Covers: (1) parks that crashed after durable await/manual hold but before the

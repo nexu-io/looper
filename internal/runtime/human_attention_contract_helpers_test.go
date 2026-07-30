@@ -55,6 +55,17 @@ func assertOsascriptContains(t *testing.T, path, want string) {
 	}
 }
 
+func assertOsascriptNotContains(t *testing.T, path, unwanted string) {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	if strings.Contains(string(body), unwanted) {
+		t.Fatalf("osascript log %q unexpectedly contains %q\nlog:\n%s", path, unwanted, body)
+	}
+}
+
 func assertOsascriptLacksSensitive(t *testing.T, path string) {
 	t.Helper()
 	body, err := os.ReadFile(path)

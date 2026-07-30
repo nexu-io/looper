@@ -188,7 +188,7 @@ type Runtime struct {
 	// humanAttentionNotifyCancel/Ctx are the shared cancelable parent for all
 	// best-effort human-attention delivery (post-claim + recovery rescan).
 	// humanAttentionNotifyWG drains those goroutines before SQLite close so
-	// interactive osascript and notification persists cannot race coordinator.Close.
+	// notification transports and persistence cannot race coordinator.Close.
 	// humanAttentionNotifyDone is the latest recovery-rescan generation only
 	// (WaitForHumanAttentionRecoveryNotify / API fixtures).
 	humanAttentionNotifyCancel context.CancelFunc
@@ -521,7 +521,7 @@ func (c workProducerCancels) invokeForDegrade() {
 // invokeForShutdown cancels all work producers including webhook discovery so
 // process exit can abort in-flight CreateOrGetActiveByDedupe promptly.
 // Also cancels human-attention delivery (recovery rescan + post-claim) so
-// interactive osascript cannot block process exit beyond
+// a slow notification transport cannot block process exit beyond
 // stopHumanAttentionRecoveryNotify's wait budget.
 func (c workProducerCancels) invokeForShutdown() {
 	c.invokeForDegrade()
@@ -1106,8 +1106,8 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// Rescan durable human-attention parks only after startup is committed
 		// (admission ready). Launching earlier races Start's failure cleanup,
 		// which closes SQLite while this goroutine still queries/persists or
-		// blocks in osascript. Delivery stays async so interactive dialogs
-		// cannot delay MarkReady / admission.
+		// waits on a notification transport. Delivery stays async so notification
+		// dispatch cannot delay MarkReady / admission.
 		r.scheduleHumanAttentionRecoveryNotify(repositories)
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
@@ -2932,8 +2932,8 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 			}
 			did = true
 			// Operator notify is deliberately not invoked here. Synchronous
-			// osascript dialogs (up to ~30s each) would block the recovery
-			// critical path before MarkReady. CompleteStartup rescans durable
+			// notification delivery could block the recovery critical path
+			// before MarkReady. CompleteStartup rescans durable
 			// human-attention parks asynchronously after recovery finishes;
 			// permanent entry dedupe decides whether an alert is sent.
 		}

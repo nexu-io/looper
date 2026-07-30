@@ -62,12 +62,9 @@ func TestHumanAttentionContract_AwaitingHumanTransitionAndDedupe(t *testing.T) {
 				ThrottleWindowSeconds: 1,
 			},
 		},
-		OsascriptPath:     scriptPath,
-		LogFilePath:       filepath.Join(root, "logs", "looperd.log"),
-		DashboardBaseURL:  "http://127.0.0.1:17310",
-		DashboardAuthMode: config.AuthModeNone,
-		Repositories:      repos,
-		Now:               func() time.Time { return now },
+		OsascriptPath: scriptPath,
+		Repositories:  repos,
+		Now:           func() time.Time { return now },
 	})
 
 	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{
@@ -86,8 +83,8 @@ func TestHumanAttentionContract_AwaitingHumanTransitionAndDedupe(t *testing.T) {
 
 	notifyDurableHumanAttention(ctx, gateway, repos, loopID)
 	assertHumanAttentionInAppCount(t, repos, loopID, 1)
-	assertOsascriptContains(t, capturePath, "Open Loop")
-	assertOsascriptContains(t, capturePath, "http://127.0.0.1:17310/dashboard/loops/616")
+	assertOsascriptContains(t, capturePath, "display notification")
+	assertOsascriptNotContains(t, capturePath, "display dialog")
 	assertOsascriptLacksSensitive(t, capturePath)
 
 	// Unchanged parked state / re-observe (daemon restart simulation) must not resend.
@@ -128,12 +125,9 @@ func TestHumanAttentionContract_AwaitingHumanTransitionAndDedupe(t *testing.T) {
 				ThrottleWindowSeconds: 1,
 			},
 		},
-		OsascriptPath:     scriptPath,
-		LogFilePath:       filepath.Join(root, "logs", "looperd.log"),
-		DashboardBaseURL:  "http://127.0.0.1:17310",
-		DashboardAuthMode: config.AuthModeNone,
-		Repositories:      repos,
-		Now:               func() time.Time { return now.Add(3 * time.Minute) },
+		OsascriptPath: scriptPath,
+		Repositories:  repos,
+		Now:           func() time.Time { return now.Add(3 * time.Minute) },
 	})
 	notifyDurableHumanAttention(ctx, gateway, repos, loopID)
 	assertHumanAttentionInAppCount(t, repos, loopID, 2)
