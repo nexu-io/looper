@@ -2026,6 +2026,7 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 	assertEqual(t, project["archived"], false)
 	assertEqual(t, project["provider"], "github")
 	assertEqual(t, project["repo"], "acme/looper")
+	assertEqual(t, project["repoUrl"], "https://github.com/acme/looper")
 	if project["worktreeRoot"] != nil {
 		t.Fatalf("worktreeRoot = %#v, want nil", project["worktreeRoot"])
 	}
@@ -2054,6 +2055,35 @@ func TestResolveProjectProviderKind(t *testing.T) {
 	}
 	if got := resolveProjectProviderKind(cfg, "legacy-github", map[string]any{"repo": "acme/looper"}); got != "github" {
 		t.Fatalf("legacy github = %q, want github", got)
+	}
+}
+
+func TestResolveProjectRepoURL(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "FORGEJO_TOKEN"
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com/", TokenEnv: &tokenEnv},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+		},
+	}
+
+	repo := "acme/fj"
+	if got := resolveProjectRepoURL(cfg, "configured-forgejo", map[string]any{}, &repo); got == nil || *got != "https://code.example.com/acme/fj" {
+		t.Fatalf("configured forgejo repoUrl = %v, want https://code.example.com/acme/fj", got)
+	}
+
+	metaRepo := "core/odcrew"
+	if got := resolveProjectRepoURL(cfg, "api-forgejo", map[string]any{"provider": "forgejo-main"}, &metaRepo); got == nil || *got != "https://code.example.com/core/odcrew" {
+		t.Fatalf("metadata forgejo repoUrl = %v, want https://code.example.com/core/odcrew", got)
+	}
+
+	ghRepo := "acme/looper"
+	if got := resolveProjectRepoURL(cfg, "legacy-github", map[string]any{}, &ghRepo); got == nil || *got != "https://github.com/acme/looper" {
+		t.Fatalf("legacy github repoUrl = %v, want https://github.com/acme/looper", got)
 	}
 }
 

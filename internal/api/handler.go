@@ -2024,8 +2024,11 @@ type projectResponse struct {
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
 	// Provider is the resolved provider kind for display (github, forgejo, plane).
-	Provider     string  `json:"provider"`
-	Repo         *string `json:"repo"`
+	Provider string  `json:"provider"`
+	Repo     *string `json:"repo"`
+	// RepoURL is the forge HTML URL for the repo (provider base + owner/name).
+	// Nil when repo slug or forge base cannot be resolved.
+	RepoURL      *string `json:"repoUrl"`
 	WorktreeRoot *string `json:"worktreeRoot"`
 	CreatedAt    string  `json:"createdAt"`
 	UpdatedAt    string  `json:"updatedAt"`
@@ -7494,14 +7497,30 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		baseBranch = *project.BaseBranch
 	}
 
+	repo := stringMetadataPtr(metadata, "repo")
+	// Prefer config project.Repo when metadata lacks it (configured projects).
+	if repo == nil {
+		for _, configured := range cfg.Projects {
+			if configured.ID != project.ID {
+				continue
+			}
+			if trimmed := strings.TrimSpace(configured.Repo); trimmed != "" {
+				repo = &trimmed
+			}
+			break
+		}
+	}
+
+	providerKind := resolveProjectProviderKind(cfg, project.ID, metadata)
 	return projectResponse{
 		ID:           project.ID,
 		Name:         project.Name,
 		RepoPath:     project.RepoPath,
 		BaseBranch:   baseBranch,
 		Archived:     project.Archived,
-		Provider:     resolveProjectProviderKind(cfg, project.ID, metadata),
-		Repo:         stringMetadataPtr(metadata, "repo"),
+		Provider:     providerKind,
+		Repo:         repo,
+		RepoURL:      resolveProjectRepoURL(cfg, project.ID, metadata, repo),
 		WorktreeRoot: stringMetadataPtr(metadata, "worktreeRoot"),
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
@@ -7511,24 +7530,70 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 // resolveProjectProviderKind returns the display provider kind for a project:
 // config binding first, then API metadata provider id, else github.
 func resolveProjectProviderKind(cfg config.Config, projectID string, metadata map[string]any) string {
+	if kind, _, ok := resolveProjectProvider(cfg, projectID, metadata); ok && kind != "" {
+		return string(kind)
+	}
+	return string(config.ProviderKindGitHub)
+}
+
+// resolveProjectProvider returns kind + base URL from config project binding or
+// metadata provider id. Base URL is empty for unknown providers; GitHub defaults
+// to https://github.com when kind is github and base is unset.
+func resolveProjectProvider(cfg config.Config, projectID string, metadata map[string]any) (kind config.ProviderKind, baseURL string, ok bool) {
+	providerID := ""
 	for _, configured := range cfg.Projects {
 		if configured.ID != projectID {
 			continue
 		}
-		kind := config.ResolvedProjectProviderKind(cfg, configured)
-		if kind != "" {
-			return string(kind)
+		providerID = strings.TrimSpace(configured.Provider)
+		if providerID == "" {
+			return config.ProviderKindGitHub, "https://github.com", true
 		}
 		break
 	}
-	if providerID := strings.TrimSpace(stringMetadataValue(metadata, "provider")); providerID != "" {
-		for _, provider := range cfg.Providers {
-			if provider.ID == providerID && provider.Kind != "" {
-				return string(provider.Kind)
-			}
-		}
+	if providerID == "" {
+		providerID = strings.TrimSpace(stringMetadataValue(metadata, "provider"))
 	}
-	return string(config.ProviderKindGitHub)
+	if providerID == "" {
+		return config.ProviderKindGitHub, "https://github.com", true
+	}
+	for _, provider := range cfg.Providers {
+		if provider.ID != providerID {
+			continue
+		}
+		if provider.Kind == config.ProviderKindPlane {
+			// Plane projects still host code on GitHub in current model.
+			return config.ProviderKindGitHub, "https://github.com", true
+		}
+		base := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+		if provider.Kind == config.ProviderKindGitHub && base == "" {
+			base = "https://github.com"
+		}
+		if provider.Kind == "" {
+			return config.ProviderKindGitHub, base, true
+		}
+		return provider.Kind, base, true
+	}
+	return "", "", false
+}
+
+// resolveProjectRepoURL builds the forge HTML URL for owner/repo using the
+// configured provider base (Forgejo host, github.com, …). Returns nil when the
+// slug or base cannot be resolved — callers should not invent github.com.
+func resolveProjectRepoURL(cfg config.Config, projectID string, metadata map[string]any, repo *string) *string {
+	if repo == nil {
+		return nil
+	}
+	slug := strings.TrimSpace(*repo)
+	if slug == "" || strings.Contains(slug, "://") || strings.Count(slug, "/") != 1 {
+		return nil
+	}
+	_, baseURL, ok := resolveProjectProvider(cfg, projectID, metadata)
+	if !ok || strings.TrimSpace(baseURL) == "" {
+		return nil
+	}
+	url := strings.TrimRight(baseURL, "/") + "/" + slug
+	return &url
 }
 
 func stringMetadataValue(metadata map[string]any, key string) string {

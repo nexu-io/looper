@@ -2,12 +2,26 @@ import { useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { DataTable, type Column } from "@/components/DataTable";
 import { PanelError } from "@/components/PanelError";
+import { PullRequestLink } from "@/components/PullRequestLink";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import type { Project } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
-import { formatTs } from "@/lib/format";
+import { formatTs, repositoryUrl } from "@/lib/format";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
+
+function RepoCell({ project }: { project: Project }) {
+  const label = project.repo?.trim() || "—";
+  const href = repositoryUrl(project.repo, project.repoUrl);
+  if (!href) {
+    return (
+      <span className="mono" title={project.repo ?? undefined}>
+        {label}
+      </span>
+    );
+  }
+  return <PullRequestLink href={href}>{label}</PullRequestLink>;
+}
 
 export function ProjectsPage() {
   const navigate = useNavigate();
@@ -22,8 +36,9 @@ export function ProjectsPage() {
       {
         key: "name",
         header: "Name",
+        width: "10rem",
         cell: (p) => (
-          <span className="font-medium">
+          <span className="block min-w-0 truncate font-medium" title={p.name}>
             {p.name}
             {p.archived ? (
               <span className="ml-1 text-[var(--text-muted)]">(archived)</span>
@@ -34,29 +49,37 @@ export function ProjectsPage() {
       {
         key: "id",
         header: "ID",
+        width: "9rem",
         cell: (p) => (
-          <span className="mono text-[var(--text-muted)]">{p.id}</span>
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={p.id}
+          >
+            {p.id}
+          </span>
         ),
       },
       {
         key: "provider",
         header: "Provider",
+        width: "6rem",
         cell: (p) => <span className="mono">{p.provider || "—"}</span>,
       },
       {
         key: "repo",
         header: "Repo",
-        cell: (p) => (
-          <span className="mono" title={p.repo ?? undefined}>
-            {p.repo ?? "—"}
-          </span>
-        ),
+        width: "14rem",
+        cell: (p) => <RepoCell project={p} />,
       },
       {
         key: "repoPath",
         header: "Path",
+        width: "18rem",
         cell: (p) => (
-          <span className="mono text-[var(--text-muted)]" title={p.repoPath}>
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={p.repoPath}
+          >
             {p.repoPath}
           </span>
         ),
@@ -64,13 +87,19 @@ export function ProjectsPage() {
       {
         key: "baseBranch",
         header: "Base",
-        cell: (p) => <span className="mono">{p.baseBranch}</span>,
+        width: "6rem",
+        cell: (p) => (
+          <span className="mono block min-w-0 truncate" title={p.baseBranch}>
+            {p.baseBranch}
+          </span>
+        ),
       },
       {
         key: "updatedAt",
         header: "Updated",
+        width: "8rem",
         cell: (p) => (
-          <span className="mono text-[var(--text-muted)]">
+          <span className="mono block min-w-0 truncate text-[var(--text-muted)]">
             {formatTs(p.updatedAt)}
           </span>
         ),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Shell } from "@/components/layout/Shell";
 import { exchangeBootstrapCodeIfPresent } from "@/lib/api";
@@ -11,27 +11,11 @@ import { OverviewPage } from "@/pages/Overview";
 import { ProjectsPage } from "@/pages/Projects";
 import { ConfigPage } from "@/pages/Config";
 
-function resolveHostPort(): string {
-  // Prefer the browser's authority as displayed in the address bar.
-  if (typeof window !== "undefined" && window.location.host) {
-    return window.location.host;
-  }
-  const { hostname, port } = window.location;
-  if (port) {
-    return `${hostname}:${port}`;
-  }
-  if (hostname === "localhost" || hostname === "127.0.0.1") {
-    return `${hostname}:17310`;
-  }
-  return hostname;
-}
-
 export default function App() {
   const [bootstrapped, setBootstrapped] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [healthy, setHealthy] = useState<boolean | null>(null);
   const [version, setVersion] = useState<string | undefined>();
-  const hostPort = useMemo(() => resolveHostPort(), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,7 +90,6 @@ export default function App() {
               <Route
                 element={
                   <Shell
-                    hostPort={hostPort}
                     healthy={healthy}
                     version={version}
                     onHealthChange={onHealthChange}

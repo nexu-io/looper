@@ -9,7 +9,9 @@ import {
 import { useNavigate } from "react-router-dom";
 import { DataTable, type Column } from "@/components/DataTable";
 import { LoopActionBar } from "@/components/LoopActionBar";
+import { LoopTypeBadge } from "@/components/LoopTypeBadge";
 import { PanelError } from "@/components/PanelError";
+import { PullRequestLink } from "@/components/PullRequestLink";
 import { StatusChip } from "@/components/StatusChip";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -17,12 +19,14 @@ import {
   fetchStatus,
   type ActiveRun,
   type LoopRoleCounts,
+  type Project,
   type StatusData,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
   formatAge,
   formatAttempts,
+  pullRequestUrl,
   truncateReason,
 } from "@/lib/format";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
@@ -94,6 +98,28 @@ function activeTargetLabel(run: ActiveRun): string {
   return t?.type || "—";
 }
 
+function ActiveTargetCell({
+  run,
+  project,
+}: {
+  run: ActiveRun;
+  project?: Project;
+}) {
+  const label = activeTargetLabel(run);
+  const href = pullRequestUrl(run.target?.repo, run.target?.prNumber, {
+    repoUrl: project?.repoUrl,
+    provider: project?.provider,
+  });
+  if (!href) {
+    return (
+      <span className="mono" title={label}>
+        {label}
+      </span>
+    );
+  }
+  return <PullRequestLink href={href}>{label}</PullRequestLink>;
+}
+
 function activeAgentLabel(run: ActiveRun): string {
   const agent = run.agent;
   if (!agent) return "—";
@@ -109,7 +135,19 @@ export function OverviewPage({
 }) {
   const navigate = useNavigate();
   const { projectId } = useProjectFilter();
-  const { health, healthy: sharedHealthy, activeRuns } = useDashboardData();
+  const {
+    health,
+    healthy: sharedHealthy,
+    activeRuns,
+    projects,
+  } = useDashboardData();
+  const projectsById = useMemo(() => {
+    const map = new Map<string, Project>();
+    for (const p of projects.data?.items ?? []) {
+      map.set(p.id, p);
+    }
+    return map;
+  }, [projects.data]);
 
   const [status, setStatus] = useState<StatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -215,6 +253,7 @@ export function OverviewPage({
       {
         key: "seq",
         header: "Seq",
+        width: "4.5rem",
         cell: (r) => (
           <span className="mono text-[var(--accent)]">{r.seq}</span>
         ),
@@ -222,13 +261,18 @@ export function OverviewPage({
       {
         key: "type",
         header: "Type",
-        cell: (r) => <span className="mono">{r.type}</span>,
+        width: "6.5rem",
+        cell: (r) => <LoopTypeBadge type={r.type} size="sm" />,
       },
       {
         key: "projectId",
         header: "Project",
+        width: "8rem",
         cell: (r) => (
-          <span className="mono text-[var(--text-muted)]" title={r.projectId}>
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={r.projectId}
+          >
             {r.projectId}
           </span>
         ),
@@ -236,6 +280,7 @@ export function OverviewPage({
       {
         key: "status",
         header: "Status",
+        width: "7.5rem",
         cell: (r) => (
           <StatusChip status={r.displayStatus || r.loopStatus || r.status} />
         ),
@@ -243,8 +288,12 @@ export function OverviewPage({
       {
         key: "step",
         header: "Step",
+        width: "8rem",
         cell: (r) => (
-          <span className="mono text-[var(--text-muted)]">
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={r.currentStep ?? undefined}
+          >
             {r.currentStep ?? "—"}
           </span>
         ),
@@ -252,17 +301,20 @@ export function OverviewPage({
       {
         key: "target",
         header: "Target",
+        width: "14rem",
         cell: (r) => (
-          <span className="mono" title={activeTargetLabel(r)}>
-            {activeTargetLabel(r)}
-          </span>
+          <ActiveTargetCell run={r} project={projectsById.get(r.projectId)} />
         ),
       },
       {
         key: "agent",
         header: "Agent / PID",
+        width: "9rem",
         cell: (r) => (
-          <span className="mono text-[var(--text-muted)]">
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={activeAgentLabel(r)}
+          >
             {activeAgentLabel(r)}
           </span>
         ),
@@ -270,6 +322,7 @@ export function OverviewPage({
       {
         key: "attempts",
         header: "Attempts",
+        width: "5rem",
         cell: (r) => (
           <span className="mono text-[var(--text-muted)]">
             {formatAttempts(r.attempts, r.maxAttempts) ?? "—"}
@@ -279,12 +332,13 @@ export function OverviewPage({
       {
         key: "reason",
         header: "Reason",
+        width: "12rem",
         cell: (r) => {
           const full = r.lastFailureReason?.trim() || null;
           const display = full ? truncateReason(full, 48) ?? "—" : "—";
           return (
             <span
-              className="mono text-[var(--text-muted)] max-w-[14rem] truncate inline-block align-bottom"
+              className="mono block min-w-0 truncate text-[var(--text-muted)]"
               title={full ?? undefined}
             >
               {display}
@@ -295,8 +349,9 @@ export function OverviewPage({
       {
         key: "age",
         header: "Age",
+        width: "5.5rem",
         cell: (r) => (
-          <span className="mono text-[var(--text-muted)]">
+          <span className="mono block min-w-0 truncate text-[var(--text-muted)]">
             {r.startedAt ? formatAge(r.startedAt) : "—"}
           </span>
         ),
@@ -304,6 +359,7 @@ export function OverviewPage({
       {
         key: "actions",
         header: "Actions",
+        width: "11rem",
         stopRowClick: true,
         cell: (r) => (
           <LoopActionBar
@@ -316,7 +372,7 @@ export function OverviewPage({
         ),
       },
     ],
-    [onRunningMutated],
+    [onRunningMutated, projectsById],
   );
 
   if (health.loading && !health.data && !health.error) {

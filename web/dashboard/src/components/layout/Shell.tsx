@@ -14,7 +14,6 @@ export const navItems: { to: string; label: string; end?: boolean }[] = [
 const logoSrc = `${import.meta.env.BASE_URL}apple-touch-icon.png`;
 
 export type ShellProps = {
-  hostPort: string;
   healthy: boolean | null;
   version?: string;
   onHealthChange?: (healthy: boolean | null, version?: string) => void;
@@ -47,7 +46,6 @@ function HealthDot({ healthy }: { healthy: boolean | null }) {
 }
 
 export function Shell({
-  hostPort,
   healthy,
   version,
   onHealthChange,
@@ -96,9 +94,6 @@ export function Shell({
               />
               <span>Looper</span>
             </Link>
-            <span className="mono text-[12px] text-[var(--text-muted)]">
-              {hostPort}
-            </span>
             <HealthDot healthy={chromeHealthy} />
             <span
               className="inline-flex items-center gap-1 rounded border border-[var(--border)] px-1.5 py-0.5 text-[11px] text-[var(--text-muted)]"

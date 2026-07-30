@@ -260,6 +260,8 @@ export type Project = {
   archived: boolean;
   provider: string;
   repo?: string | null;
+  /** Forge HTML URL for the repo (provider base + owner/name). */
+  repoUrl?: string | null;
   worktreeRoot?: string | null;
   createdAt: string;
   updatedAt: string;

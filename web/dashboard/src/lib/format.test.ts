@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { formatAttempts, truncateReason } from "./format";
+import {
+  formatAttempts,
+  issueUrl,
+  parseIssueTargetId,
+  pullRequestUrl,
+  repositoryUrl,
+  truncateReason,
+} from "./format";
 
 describe("formatAttempts", () => {
   it("formats current/max including unlimited -1", () => {
@@ -17,6 +24,102 @@ describe("formatAttempts", () => {
     expect(formatAttempts(null, 3)).toBeNull();
     expect(formatAttempts(undefined, -1)).toBeNull();
     expect(formatAttempts(Number.NaN, 3)).toBeNull();
+  });
+});
+
+describe("repositoryUrl", () => {
+  it("prefers server-resolved repoUrl", () => {
+    expect(
+      repositoryUrl("acme/fj", "https://code.example.com/acme/fj"),
+    ).toBe("https://code.example.com/acme/fj");
+  });
+
+  it("builds github repo urls from owner/repo as fallback", () => {
+    expect(repositoryUrl("powerformer/vela")).toBe(
+      "https://github.com/powerformer/vela",
+    );
+  });
+
+  it("returns null for incomplete or invalid inputs", () => {
+    expect(repositoryUrl(null)).toBeNull();
+    expect(repositoryUrl("")).toBeNull();
+    expect(repositoryUrl("bare")).toBeNull();
+    expect(repositoryUrl("https://github.com/o/r")).toBeNull();
+  });
+});
+
+describe("pullRequestUrl", () => {
+  it("builds github PR urls from owner/repo + number", () => {
+    expect(pullRequestUrl("powerformer/vela", 1217)).toBe(
+      "https://github.com/powerformer/vela/pull/1217",
+    );
+  });
+
+  it("uses forgejo /pulls path when provider is forgejo", () => {
+    expect(
+      pullRequestUrl("acme/fj", 42, {
+        repoUrl: "https://code.example.com/acme/fj",
+        provider: "forgejo",
+      }),
+    ).toBe("https://code.example.com/acme/fj/pulls/42");
+  });
+
+  it("uses /pull path for github repoUrl", () => {
+    expect(
+      pullRequestUrl("o/r", 7, {
+        repoUrl: "https://github.com/o/r/",
+        provider: "github",
+      }),
+    ).toBe("https://github.com/o/r/pull/7");
+  });
+
+  it("returns null for incomplete or invalid inputs", () => {
+    expect(pullRequestUrl(null, 1)).toBeNull();
+    expect(pullRequestUrl("owner/repo", null)).toBeNull();
+    expect(pullRequestUrl("owner/repo", 0)).toBeNull();
+    expect(pullRequestUrl("bare", 1)).toBeNull();
+    expect(pullRequestUrl("https://github.com/o/r", 1)).toBeNull();
+  });
+});
+
+describe("issueUrl", () => {
+  it("builds github issue urls from owner/repo + number", () => {
+    expect(issueUrl("powerformer/vela", 77)).toBe(
+      "https://github.com/powerformer/vela/issues/77",
+    );
+  });
+
+  it("uses server repoUrl when provided (forgejo self-host)", () => {
+    expect(
+      issueUrl("acme/fj", 42, {
+        repoUrl: "https://code.example.com/acme/fj/",
+      }),
+    ).toBe("https://code.example.com/acme/fj/issues/42");
+  });
+
+  it("returns null for incomplete or invalid inputs", () => {
+    expect(issueUrl(null, 1)).toBeNull();
+    expect(issueUrl("owner/repo", null)).toBeNull();
+    expect(issueUrl("owner/repo", 0)).toBeNull();
+    expect(issueUrl("bare", 1)).toBeNull();
+  });
+});
+
+describe("parseIssueTargetId", () => {
+  it("parses canonical issue target key", () => {
+    expect(parseIssueTargetId("issue:acme/looper:77")).toEqual({
+      repo: "acme/looper",
+      issueNumber: 77,
+    });
+  });
+
+  it("rejects non-issue or malformed keys", () => {
+    expect(parseIssueTargetId(null)).toBeNull();
+    expect(parseIssueTargetId("")).toBeNull();
+    expect(parseIssueTargetId("project:acme")).toBeNull();
+    expect(parseIssueTargetId("issue:acme/looper")).toBeNull();
+    expect(parseIssueTargetId("issue:barerepo:1")).toBeNull();
+    expect(parseIssueTargetId("issue:acme/looper:abc")).toBeNull();
   });
 });
 
