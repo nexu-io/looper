@@ -1385,9 +1385,9 @@ func TestRunValidateStepRejectsCheckpointWorktreePathAtUserRepo(t *testing.T) {
 		Loop:    *loop,
 		Run:     storage.RunRecord{ID: "run_bad_repo_checkpoint", LoopID: loop.ID},
 		Checkpoint: workerCheckpoint{
-			Work:     &workerInput{Title: "Reject unsafe worktree checkpoint", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
-			Worktree: &checkpointWorktree{ID: "worktree_bad", Path: repoPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
-			Plan:     &checkpointPlan{Summary: "Reject unsafe worktree checkpoint", Items: []string{"Never use the user repo as worker cwd"}},
+			Work:      &workerInput{Title: "Reject unsafe worktree checkpoint", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree:  &checkpointWorktree{ID: "worktree_bad", Path: repoPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:      &checkpointPlan{Summary: "Reject unsafe worktree checkpoint", Items: []string{"Never use the user repo as worker cwd"}},
 			Execution: &checkpointExecution{Status: "completed", Summary: "prior execution completed", ParseStatus: "parsed"},
 		},
 	})
