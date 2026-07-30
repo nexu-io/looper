@@ -673,6 +673,13 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 	if msg == "" && kind == "" {
 		return loopDiagnosis{}
 	}
+	// Preserved unusable managed paths are stored as LastErrorKind=manual_intervention.
+	// Classify them before the generic MI branch so operators get integrity-specific
+	// cleanup guidance instead of generic manual_intervention actions.
+	if strings.Contains(lower, "unusable and not empty") || strings.Contains(lower, "unusable worktree path preserved") {
+		retryable := false
+		return loopDiagnosis{FailureClass: "managed_worktree_integrity", Retryable: &retryable, Message: msg, RecommendedAction: "inspect the managed worktree path, preserve any agent output, clear or move the leftover directory, then retry the loop"}
+	}
 	if kind == "manual_intervention" {
 		retryable := false
 		return loopDiagnosis{
@@ -705,10 +712,6 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 	if strings.Contains(lower, "could not resolve to a repository") || strings.Contains(lower, "repository not found") {
 		retryable := true
 		return loopDiagnosis{FailureClass: "github_repository_access", Retryable: &retryable, Message: msg, RecommendedAction: "check the configured repo slug and GitHub access, then allow the queued retry to continue"}
-	}
-	if strings.Contains(lower, "unusable and not empty") || strings.Contains(lower, "unusable worktree path preserved") {
-		retryable := false
-		return loopDiagnosis{FailureClass: "managed_worktree_integrity", Retryable: &retryable, Message: msg, RecommendedAction: "inspect the managed worktree path, preserve any agent output, clear or move the leftover directory, then retry the loop"}
 	}
 	if strings.Contains(lower, "start command: chdir") || strings.Contains(lower, "not a git repository") || strings.Contains(lower, "not in a git directory") {
 		retryable := true

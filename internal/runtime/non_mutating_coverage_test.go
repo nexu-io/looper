@@ -147,14 +147,18 @@ func TestNonMutatingCoverageDegradedPausesClaimPump(t *testing.T) {
 	rt.mu.Unlock()
 
 	rt.executeSchedulerClaimPass(context.Background())
-	if claimCalls.Load() != 1 {
-		t.Fatalf("claim calls while ready = %d, want 1", claimCalls.Load())
+	claimsWhenReady := claimCalls.Load()
+	if claimsWhenReady < 1 {
+		t.Fatalf("claim calls while ready = %d, want >= 1", claimsWhenReady)
 	}
 	if err := rt.MarkDegraded("persist failure"); err != nil {
 		t.Fatalf("MarkDegraded() error = %v", err)
 	}
+	// Snapshot after degrade so a background claim-pump tick that raced while
+	// still ready cannot fail the assertion (same pattern as safety_floor).
+	claimsAtDegrade := claimCalls.Load()
 	rt.executeSchedulerClaimPass(context.Background())
-	if claimCalls.Load() != 1 {
-		t.Fatalf("claim calls after degraded = %d, want still 1", claimCalls.Load())
+	if claimCalls.Load() != claimsAtDegrade {
+		t.Fatalf("claim calls after degraded = %d, want still %d (ready had %d)", claimCalls.Load(), claimsAtDegrade, claimsWhenReady)
 	}
 }
