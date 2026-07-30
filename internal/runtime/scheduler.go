@@ -2154,9 +2154,9 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 // unlimited fixer queues request intervention instead of retrying forever:
 //   - launch failures: missing/moved gh, inaccessible CWD, bad permissions
 //   - completed CLI contract failures: incompatible gh schema/invocation
-//     (e.g. unknown --json field) and zero-exit invalidJSONError payloads
-//     ("Invalid gh JSON payload"), which are not IsStartFailure but still
-//     local and non-retryable
+//     (e.g. unknown --json field), zero-exit invalidJSONError payloads
+//     ("Invalid gh JSON payload"), and local shell capture truncation
+//     ("GitHub command output truncated" / Result truncation flags)
 //
 // Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY, EMFILE,
 // ENFILE after the short shell retry) stay BoundaryGitHubAPI so Classify
@@ -2182,9 +2182,12 @@ func withHostingAPIBoundary(err error) error {
 //   - gh exits 0 with malformed/empty JSON and gateway emits
 //     `Invalid gh JSON payload` via invalidJSONError — still local decode
 //     contract, not a remote transport outage
+//   - shell capture exceeds the 256 KiB bound: runGhWithTimeout returns
+//     CommandExecutionError with StdoutTruncated/StderrTruncated and message
+//     "GitHub command output truncated" — local buffer limit, not API outage
 //
-// Retrying forever under BoundaryGitHubAPI cannot fix either class of
-// deterministic CLI-output contract failure.
+// Retrying forever under BoundaryGitHubAPI cannot fix these deterministic
+// CLI-output contract failures.
 func isLocalCLIContractFailure(err error) bool {
 	if err == nil || shell.IsStartFailure(err) {
 		return false
@@ -2192,6 +2195,11 @@ func isLocalCLIContractFailure(err error) bool {
 	var commandErr *shell.CommandExecutionError
 	if !errors.As(err, &commandErr) {
 		return false
+	}
+	// Prefer structural truncation flags from the shell Result; gateway
+	// runGhWithTimeout sets these when the local capture limit is hit.
+	if commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return true
 	}
 	message := strings.ToLower(strings.Join([]string{
 		commandErr.Message,
@@ -2204,7 +2212,8 @@ func isLocalCLIContractFailure(err error) bool {
 func isLocalCLIContractMessage(message string) bool {
 	for _, fragment := range []string{
 		"unknown json field",
-		"invalid gh json payload", // zero-exit decode/shape failures from invalidJSONError
+		"invalid gh json payload",         // zero-exit decode/shape failures from invalidJSONError
+		"github command output truncated", // local shell capture limit (flags may be lost after wrap)
 		"unknown flag",
 		"flag provided but not defined",
 		"unknown command",

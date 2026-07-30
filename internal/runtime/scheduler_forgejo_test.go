@@ -880,6 +880,11 @@ func TestWithHostingAPIBoundaryClassification(t *testing.T) {
 		{"unknown flag", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: "unknown flag: --not-a-real-flag"}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
 		// Zero-exit decode failures from invalidJSONError must not become endless API retries.
 		{"invalid gh json payload", &shell.CommandExecutionError{Message: "Invalid gh JSON payload: unexpected end of JSON input; stdoutBytes=0", Result: shell.Result{ExitCode: 0, Stdout: "", Stderr: "unexpected end of JSON input"}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		// Local shell capture truncation (256 KiB) must park as BoundaryConfig, not
+		// BoundaryGitHubAPI — oversized PR status/review payloads cannot be fixed by retry.
+		{"truncated stdout flags", &shell.CommandExecutionError{Message: "GitHub command output truncated: stdout after 262144 bytes", Result: shell.Result{ExitCode: 0, Stdout: strings.Repeat("x", 64), StdoutTruncated: true}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"truncated stderr flags", &shell.CommandExecutionError{Message: "GitHub command output truncated: stderr after 262144 bytes", Result: shell.Result{ExitCode: 1, Stderr: strings.Repeat("e", 64), StderrTruncated: true}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"truncated message only", &shell.CommandExecutionError{Message: "GitHub command output truncated: stdout after 262144 bytes", Result: shell.Result{ExitCode: 0}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
 		{"remote EOF", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: `Post "https://api.github.com/graphql": unexpected EOF`}}, failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
 	}
 	for _, tc := range cases {
@@ -1016,6 +1021,45 @@ func TestFixerGitHubAdapterBoundaryContracts(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "Invalid gh JSON payload") {
 				t.Fatalf("%s error = %v, want Invalid gh JSON payload", name, err)
+			}
+			assertHostingBoundary(t, name, err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		}
+	})
+
+	t.Run("truncated shell capture", func(t *testing.T) {
+		// Real gateway + shell path: gh writes past shell's 256 KiB capture limit.
+		// runGhWithTimeout must surface truncation; withHostingAPIBoundary must park
+		// it as BoundaryConfig so unlimited fixer queues request intervention.
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{
+			GHPath: writeFakeGH(t, "#!/bin/sh\n# Exceed shell defaultMaxOutputBytes (256 KiB).\ndd if=/dev/zero bs=1024 count=260 2>/dev/null | tr '\\0' 'x'\nexit 0\n"),
+		})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		for _, name := range []string{"GetCurrentUserLogin", "GetPullRequestAuthor", "ViewPullRequest"} {
+			var err error
+			switch name {
+			case "GetCurrentUserLogin":
+				_, err = adapter.GetCurrentUserLogin(context.Background(), cwd)
+			case "GetPullRequestAuthor":
+				_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+			case "ViewPullRequest":
+				_, err = adapter.ViewPullRequest(context.Background(), in)
+			}
+			if err == nil {
+				t.Fatalf("%s error = nil, want truncated capture failure", name)
+			}
+			if shell.IsStartFailure(err) {
+				t.Fatalf("%s IsStartFailure = true, want completed truncation contract failure", name)
+			}
+			if !strings.Contains(err.Error(), "GitHub command output truncated") {
+				t.Fatalf("%s error = %v, want GitHub command output truncated", name, err)
+			}
+			var commandErr *shell.CommandExecutionError
+			if !errors.As(err, &commandErr) {
+				t.Fatalf("%s error type = %T, want *shell.CommandExecutionError", name, err)
+			}
+			if !commandErr.Result.StdoutTruncated && !commandErr.Result.StderrTruncated {
+				t.Fatalf("%s truncation flags unset on Result: %#v", name, commandErr.Result)
 			}
 			assertHostingBoundary(t, name, err, failureclass.BoundaryConfig, failureclass.NonRetryable)
 		}
