@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
+import { ThemeToggle } from "./ThemeToggle";
 
 export const navItems: {
   to: string;
@@ -161,6 +162,7 @@ export function Shell({
             })}
           </nav>
           <div className="ml-auto flex items-center gap-2">
+            <ThemeToggle />
             <label className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
               <span className="uppercase tracking-wide">Project</span>
               <select
