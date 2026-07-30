@@ -2511,6 +2511,8 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 	})
 
 	t.Run("limit and offset page with total", func(t *testing.T) {
+		// Default list order is status tier then updated_at DESC, seq DESC:
+		// running (loop_4, loop_3, loop_1) → paused (loop_2) → failed (loop_5).
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?limit=2&offset=1", nil)
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, req)
@@ -2523,8 +2525,8 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 		if len(items) != 2 {
 			t.Fatalf("items len = %d, want 2", len(items))
 		}
-		assertEqual(t, items[0].(map[string]any)["id"], "loop_4")
-		assertEqual(t, items[1].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[1].(map[string]any)["id"], "loop_1")
 		assertEqual(t, data["total"], float64(5))
 		assertEqual(t, data["limit"], float64(2))
 		assertEqual(t, data["offset"], float64(1))
@@ -2543,9 +2545,9 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 		if len(items) != 3 {
 			t.Fatalf("items len = %d, want 3", len(items))
 		}
-		assertEqual(t, items[0].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_1")
 		assertEqual(t, items[1].(map[string]any)["id"], "loop_2")
-		assertEqual(t, items[2].(map[string]any)["id"], "loop_1")
+		assertEqual(t, items[2].(map[string]any)["id"], "loop_5")
 		assertEqual(t, data["total"], float64(5))
 		assertEqual(t, data["offset"], float64(2))
 		if _, ok := data["limit"]; ok {
