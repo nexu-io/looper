@@ -37,7 +37,7 @@ func TestReconcileTunnelHookPatchPreservesWebhookSecret(t *testing.T) {
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, record.Repo, record, true, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, record.Repo, record, true, time.Now().UnixNano())
 
 	if state.LastError != "" {
 		t.Fatalf("state.LastError = %q, want empty", state.LastError)
@@ -62,7 +62,7 @@ func TestReconcileTunnelHookCreatesManagedHookWithoutAdoptingURLMatch(t *testing
 	rt.setAllowedTunnelRepos(map[string]struct{}{repo: {}})
 	server := &webhookTunnelServer{runtime: rt}
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
 
 	if state.LastError != "" {
 		t.Fatalf("state.LastError = %q, want empty", state.LastError)
@@ -110,7 +110,7 @@ func TestReconcileTunnelHookCreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 	rt.tunnelClient = client
 	rt.tunnelStore = repos.WebhookTunnelHooks
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
 
 	if state.LastError != "create timed out" {
 		t.Fatalf("state.LastError = %q, want create failure", state.LastError)
@@ -145,7 +145,7 @@ func TestReconcileTunnelHookCreateRollbackUsesLiveCleanupContextAfterCancel(t *t
 	canceled, cancel := context.WithCancel(liveCtx)
 	cancel()
 
-	state := rt.reconcileTunnelHook(canceled, repos.WebhookTunnelHooks, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(canceled, repos.WebhookTunnelHooks, cfg, repo, storage.WebhookTunnelHookRecord{}, false, time.Now().UnixNano())
 
 	if client.createCalls != 1 {
 		t.Fatalf("CreateHook calls = %d, want 1", client.createCalls)
@@ -208,7 +208,7 @@ func TestReconcileTunnelHookRecreateRollbackUsesLiveCleanupContextAfterCancel(t 
 	canceled, cancel := context.WithCancel(liveCtx)
 	cancel()
 
-	state := rt.reconcileTunnelHook(canceled, repos.WebhookTunnelHooks, repo, record, true, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(canceled, repos.WebhookTunnelHooks, cfg, repo, record, true, time.Now().UnixNano())
 
 	if client.createCalls != 1 {
 		t.Fatalf("CreateHook calls = %d, want 1 recreate", client.createCalls)
@@ -262,7 +262,7 @@ func TestReconcileTunnelHookRecreateErrorDoesNotAdoptURLMatch(t *testing.T) {
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, record, true, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, repo, record, true, time.Now().UnixNano())
 
 	if state.LastError != "recreate missing hook: hook already exists" {
 		t.Fatalf("state.LastError = %q, want recreate failure", state.LastError)
@@ -317,7 +317,7 @@ func TestReconcileTunnelHookTreatsDesiredURLAsManagedInsteadOfOrphaning(t *testi
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client
 
-	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, repo, record, true, time.Now().UnixNano())
+	state := rt.reconcileTunnelHook(ctx, repos.WebhookTunnelHooks, cfg, repo, record, true, time.Now().UnixNano())
 
 	if state.LastError != "" {
 		t.Fatalf("state.LastError = %q, want empty", state.LastError)
@@ -349,7 +349,7 @@ func TestReconcileTunnelHooksHostQualifiedRepoReturnsLastErrorWithoutGitHubCall(
 	rt.ghPath = "/usr/bin/gh"
 	rt.tunnelClient = client
 
-	rt.reconcileTunnelHooks(ctx, repos, map[string]struct{}{"github.example.com/acme/looper": {}})
+	rt.reconcileTunnelHooks(ctx, repos, cfg, map[string]struct{}{"github.example.com/acme/looper": {}})
 	defer rt.stopTunnelServer()
 
 	status := rt.Status()

@@ -434,7 +434,7 @@ func (w *webhookRuntime) reconcileSnapshot(ctx context.Context, repos *storage.R
 			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and tunnel", repo))
 		}
 	}
-	if err := w.reconcileTunnelHooks(ctx, repos, tunnelRepoSet); err != nil {
+	if err := w.reconcileTunnelHooks(ctx, repos, cfg, tunnelRepoSet); err != nil {
 		if isWebhookStopError(err) {
 			return nil
 		}

@@ -299,6 +299,115 @@ func TestRuntimeProjectAddDoesNotWaitForWebhookReconciliation(t *testing.T) {
 	}
 }
 
+// Contract: while tunnel reconcile from mutation A is blocked on GitHub, mutation B
+// may publish the catalog (updateConfig) without racing the in-flight pass.
+// Each Reconcile uses the config snapshot captured at pass start; the coalesced
+// follow-up pass reconciles the second project after the first unblocks.
+func TestRuntimeSecondProjectPublishDuringBlockedTunnelReconcile(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	secondDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.Mode = config.WebhookModeTunnel
+	cfg.Webhook.ListenPort = 0
+	cfg.Webhook.PublicBaseURL = "https://looper.example.test"
+	ghPath := "/usr/bin/gh"
+	cfg.Tools.GHPath = &ghPath
+
+	rt := New(Options{
+		Config:           cfg,
+		Logger:           &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondCreateSeen := make(chan struct{})
+	client := &recordingBlockingTunnelClient{
+		firstStarted:     firstStarted,
+		firstRelease:     releaseFirst,
+		secondCreateSeen: secondCreateSeen,
+	}
+	rt.webhook.bootstrapDone = true
+	rt.webhook.tunnelClient = client
+
+	projectService := rt.Services().Projects
+	projectService.ListWorktrees = nil
+	repoA := "acme/first"
+	if _, err := projectService.AddProject(context.Background(), projects.AddInput{
+		ID: "first", Name: "First", RepoPath: workingDir, Repo: &repoA, SnapshotMode: projects.SnapshotModeOff,
+	}); err != nil {
+		t.Fatalf("AddProject(first) error = %v", err)
+	}
+
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first tunnel reconcile CreateHook did not start")
+	}
+
+	// First pass must still be blocked on GitHub when the second mutation publishes.
+	if got := client.createRepos(); len(got) != 1 || got[0] != repoA {
+		t.Fatalf("creates while first blocked = %v, want only %q", got, repoA)
+	}
+
+	repoB := "acme/second"
+	addSecondDone := make(chan error, 1)
+	go func() {
+		_, err := projectService.AddProject(context.Background(), projects.AddInput{
+			ID: "second", Name: "Second", RepoPath: secondDir, Repo: &repoB, SnapshotMode: projects.SnapshotModeOff,
+		})
+		addSecondDone <- err
+	}()
+
+	select {
+	case err := <-addSecondDone:
+		if err != nil {
+			t.Fatalf("AddProject(second) error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AddProject(second) waited for blocked first tunnel reconciliation")
+	}
+
+	// Concurrent publish must not advance CreateHook for B until first pass ends.
+	if got := client.createRepos(); len(got) != 1 || got[0] != repoA {
+		t.Fatalf("creates after second publish while first blocked = %v, want only %q", got, repoA)
+	}
+
+	close(releaseFirst)
+
+	select {
+	case <-secondCreateSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("coalesced reconcile did not CreateHook for second project")
+	}
+
+	got := client.createRepos()
+	if len(got) < 2 || got[0] != repoA {
+		t.Fatalf("create order = %v, want first %q then later %q", got, repoA, repoB)
+	}
+	foundB := false
+	for _, repo := range got[1:] {
+		if repo == repoB {
+			foundB = true
+			break
+		}
+	}
+	if !foundB {
+		t.Fatalf("create order = %v, want %q after first pass unblocked", got, repoB)
+	}
+}
+
 // Contract: project add schedules deferred webhook reconcile; Stop must cancel
 // that pass (and not hang on wg) even while the GitHub tunnel boundary blocks.
 func TestRuntimeStopCancelsBlockedScheduledWebhookReconcile(t *testing.T) {
@@ -5095,5 +5204,91 @@ func (c blockingWebhookTunnelGitHubClient) UpdateHook(context.Context, string, i
 }
 
 func (c blockingWebhookTunnelGitHubClient) DeleteHook(context.Context, string, int64) error {
+	return nil
+}
+
+// recordingBlockingTunnelClient blocks only the first CreateHook, remembers
+// created hooks for later GetHook, and signals when a second create arrives.
+type recordingBlockingTunnelClient struct {
+	mu               sync.Mutex
+	hooks            map[string]webhookTunnelGitHubHook
+	createOrder      []string
+	nextID           int64
+	firstStarted     chan struct{}
+	firstRelease     <-chan struct{}
+	secondCreateSeen chan struct{}
+	firstSignaled    bool
+}
+
+func (c *recordingBlockingTunnelClient) createRepos() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.createOrder))
+	copy(out, c.createOrder)
+	return out
+}
+
+func (c *recordingBlockingTunnelClient) GetHook(_ context.Context, repo string, id int64) (webhookTunnelGitHubHook, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	hook, ok := c.hooks[repo]
+	if !ok || hook.ID != id {
+		return webhookTunnelGitHubHook{}, false, nil
+	}
+	return hook, true, nil
+}
+
+func (c *recordingBlockingTunnelClient) CreateHook(ctx context.Context, repo string, url string, _ string, events []string) (webhookTunnelGitHubHook, error) {
+	c.mu.Lock()
+	c.nextID++
+	id := c.nextID
+	hook := webhookTunnelGitHubHook{ID: id, Active: true, Events: append([]string(nil), events...)}
+	hook.Config.URL = url
+	hook.Config.ContentType = "json"
+	hook.Config.InsecureSSL = "0"
+	if c.hooks == nil {
+		c.hooks = map[string]webhookTunnelGitHubHook{}
+	}
+	c.hooks[repo] = hook
+	c.createOrder = append(c.createOrder, repo)
+	createIndex := len(c.createOrder)
+	first := !c.firstSignaled
+	if first {
+		c.firstSignaled = true
+	}
+	c.mu.Unlock()
+
+	if first {
+		close(c.firstStarted)
+		select {
+		case <-c.firstRelease:
+		case <-ctx.Done():
+			return webhookTunnelGitHubHook{}, ctx.Err()
+		}
+	} else if createIndex == 2 {
+		select {
+		case <-c.secondCreateSeen:
+		default:
+			close(c.secondCreateSeen)
+		}
+	}
+	return hook, nil
+}
+
+func (c *recordingBlockingTunnelClient) UpdateHook(_ context.Context, repo string, id int64, url string, _ string, events []string, active bool) (webhookTunnelGitHubHook, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	hook := webhookTunnelGitHubHook{ID: id, Active: active, Events: append([]string(nil), events...)}
+	hook.Config.URL = url
+	hook.Config.ContentType = "json"
+	hook.Config.InsecureSSL = "0"
+	if c.hooks == nil {
+		c.hooks = map[string]webhookTunnelGitHubHook{}
+	}
+	c.hooks[repo] = hook
+	return hook, nil
+}
+
+func (c *recordingBlockingTunnelClient) DeleteHook(context.Context, string, int64) error {
 	return nil
 }

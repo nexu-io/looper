@@ -149,7 +149,7 @@ func (c ghWebhookTunnelClient) run(ctx context.Context, repo string, args []stri
 	return stdout.Bytes(), nil
 }
 
-func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storage.Repositories, repoSet map[string]struct{}) error {
+func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storage.Repositories, cfg config.Config, repoSet map[string]struct{}) error {
 	w.setAllowedTunnelRepos(repoSet)
 	if repos == nil || repos.WebhookTunnelHooks == nil {
 		w.addDegradedReason("webhook tunnel hook store is unavailable")
@@ -210,7 +210,9 @@ func (w *webhookRuntime) reconcileTunnelHooks(ctx context.Context, repos *storag
 			continue
 		}
 		repoCtx, cancel := context.WithTimeout(ctx, w.shutdownTimeout())
-		state := w.reconcileTunnelHook(repoCtx, store, repo, record, ok, now)
+		// Use the Reconcile-captured cfg snapshot; do not reread w.cfg while
+		// concurrent project mutations may publish via updateConfig.
+		state := w.reconcileTunnelHook(repoCtx, store, cfg, repo, record, ok, now)
 		cancel()
 		states = append(states, state)
 	}
@@ -236,12 +238,12 @@ func (w *webhookRuntime) deleteTunnelHookForRollback(client webhookTunnelGitHubC
 	return client.DeleteHook(ctx, repo, hookID)
 }
 
-func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, repo string, record storage.WebhookTunnelHookRecord, ok bool, now int64) WebhookTunnelState {
+func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage.WebhookTunnelHooksRepository, cfg config.Config, repo string, record storage.WebhookTunnelHookRecord, ok bool, now int64) WebhookTunnelState {
 	client := w.tunnelGitHubClient()
-	url := webhookTunnelManagedURL(w.cfg, repo)
+	url := webhookTunnelManagedURL(cfg, repo)
 	secretRef := webhookTunnelSecretRef(repo)
 	if !ok || record.HookID == 0 {
-		secret, err := ensureWebhookTunnelSecret(w.cfg.Storage.DBPath, secretRef)
+		secret, err := ensureWebhookTunnelSecret(cfg.Storage.DBPath, secretRef)
 		if err != nil {
 			return WebhookTunnelState{Repo: repo, ManagedURL: url, LastError: err.Error()}
 		}
@@ -260,7 +262,7 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 		}
 		return tunnelStateFromRecord(record, "")
 	}
-	secret, err := readWebhookTunnelSecret(w.cfg.Storage.DBPath, record.SecretRef)
+	secret, err := readWebhookTunnelSecret(cfg.Storage.DBPath, record.SecretRef)
 	if err != nil {
 		return tunnelStateFromRecord(record, fmt.Sprintf("read webhook secret: %v", err))
 	}
