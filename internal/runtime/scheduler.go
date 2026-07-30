@@ -2154,7 +2154,8 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 // unlimited fixer queues request intervention instead of retrying forever:
 //   - launch failures: missing/moved gh, inaccessible CWD, bad permissions
 //   - completed CLI contract failures: incompatible gh schema/invocation
-//     (e.g. unknown --json field), which are not IsStartFailure but still
+//     (e.g. unknown --json field) and zero-exit invalidJSONError payloads
+//     ("Invalid gh JSON payload"), which are not IsStartFailure but still
 //     local and non-retryable
 //
 // Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY, EMFILE,
@@ -2174,11 +2175,16 @@ func withHostingAPIBoundary(err error) error {
 }
 
 // isLocalCLIContractFailure reports whether err is a successfully-launched
-// CLI failure from local invocation/schema incompatibility rather than a
-// remote hosting API response. Example: gh pr view --json rejects a field
-// with `unknown JSON field: "statusCheckRollup"` — the process started and
-// exited nonzero, so it is not IsStartFailure, but retrying forever under
-// BoundaryGitHubAPI cannot fix a deterministic local CLI contract mismatch.
+// CLI failure from local invocation/schema/output-contract incompatibility
+// rather than a remote hosting API response. Examples:
+//   - gh pr view --json rejects a field (`unknown JSON field: "..."`) and
+//     exits nonzero — not IsStartFailure, but deterministic local mismatch
+//   - gh exits 0 with malformed/empty JSON and gateway emits
+//     `Invalid gh JSON payload` via invalidJSONError — still local decode
+//     contract, not a remote transport outage
+//
+// Retrying forever under BoundaryGitHubAPI cannot fix either class of
+// deterministic CLI-output contract failure.
 func isLocalCLIContractFailure(err error) bool {
 	if err == nil || shell.IsStartFailure(err) {
 		return false
@@ -2198,6 +2204,7 @@ func isLocalCLIContractFailure(err error) bool {
 func isLocalCLIContractMessage(message string) bool {
 	for _, fragment := range []string{
 		"unknown json field",
+		"invalid gh json payload", // zero-exit decode/shape failures from invalidJSONError
 		"unknown flag",
 		"flag provided but not defined",
 		"unknown command",

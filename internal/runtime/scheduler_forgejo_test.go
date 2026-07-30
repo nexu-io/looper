@@ -827,310 +827,199 @@ func TestForgejoSupportsFixerDiscoveryWithoutOpeningCoordinatorLane(t *testing.T
 	}
 }
 
-func TestFixerGitHubAdapterTagsLocalConstructionAsConfigBoundary(t *testing.T) {
-	// Missing token env fails before any remote API call.
-	t.Setenv("FORGEJO_TOKEN", "")
-	repoPath := filepath.Join(t.TempDir(), "repo")
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forge.example", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
-		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
-	}
-	adapter := fixerGitHubAdapter{config: &cfg}
-
-	_, err := adapter.GetCurrentUserLogin(context.Background(), repoPath)
+// assertHostingBoundary checks adapter/withHostingAPIBoundary classification and
+// that a later BoundaryGitHubAPI re-wrap preserves an existing local boundary.
+func assertHostingBoundary(t *testing.T, name string, err error, wantBoundary failureclass.Boundary, wantKind failureclass.Kind) {
+	t.Helper()
 	if err == nil {
-		t.Fatal("GetCurrentUserLogin() error = nil, want missing token construction failure")
+		t.Fatalf("%s error = nil, want %s", name, wantBoundary)
 	}
 	var boundaryErr *failureclass.BoundaryError
-	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("GetCurrentUserLogin() boundary = %#v, want BoundaryConfig", err)
+	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != wantBoundary {
+		t.Fatalf("%s boundary = %#v, want %s", name, err, wantBoundary)
 	}
-	// Re-applying the hosting API boundary must not promote local construction failures.
-	preserved := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
-	if !errors.As(preserved, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("preserved boundary = %#v, want BoundaryConfig", preserved)
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != wantKind {
+		t.Fatalf("%s Classify() = %s, want %s", name, kind, wantKind)
 	}
-	if kind := failureclass.Classify(preserved, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("Classify() = %s, want non_retryable for local construction failure", kind)
-	}
-
-	_, err = adapter.GetPullRequestAuthor(context.Background(), fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath})
-	if err == nil || !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("GetPullRequestAuthor() = %v, want BoundaryConfig construction failure", err)
-	}
-	_, err = adapter.ViewPullRequest(context.Background(), fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath})
-	if err == nil || !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("ViewPullRequest() = %v, want BoundaryConfig construction failure", err)
-	}
-}
-
-func TestFixerGitHubAdapterTagsRemoteAPIFailuresAsGitHubBoundary(t *testing.T) {
-	t.Setenv("FORGEJO_TOKEN", "secret")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte("bad gateway"))
-	}))
-	defer server.Close()
-
-	repoPath := filepath.Join(t.TempDir(), "repo")
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
-		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
-	}
-	adapter := fixerGitHubAdapter{config: &cfg}
-
-	_, err := adapter.GetCurrentUserLogin(context.Background(), repoPath)
-	if err == nil {
-		t.Fatal("GetCurrentUserLogin() error = nil, want remote API failure")
-	}
-	var boundaryErr *failureclass.BoundaryError
-	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
-		t.Fatalf("GetCurrentUserLogin() boundary = %#v, want BoundaryGitHubAPI after client construction", err)
-	}
-	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.RetryableTransient {
-		t.Fatalf("Classify() = %s, want retryable_transient for remote hosting API failure", kind)
-	}
-}
-
-func TestFixerGitHubAdapterTagsLocalCLILaunchFailuresAsConfigBoundary(t *testing.T) {
-	// Exercise the real gateway + shell.Run contract: a missing gh binary produces
-	// "start command: ..." before any API call. That must stay BoundaryConfig so
-	// unlimited fixer queues park instead of retrying forever under BoundaryGitHubAPI.
-	missingGH := filepath.Join(t.TempDir(), "no-such-gh")
-	gateway := githubinfra.New(githubinfra.Options{GHPath: missingGH})
-	adapter := fixerGitHubAdapter{gateway: gateway}
-	cwd := t.TempDir()
-	input := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
-
-	assertLocalCLILaunchBoundary := func(t *testing.T, name string, err error) {
-		t.Helper()
-		if err == nil {
-			t.Fatalf("%s error = nil, want local CLI launch failure", name)
-		}
-		var boundaryErr *failureclass.BoundaryError
-		if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-			t.Fatalf("%s boundary = %#v, want BoundaryConfig for start command failure", name, err)
-		}
-		// Runner re-wraps with BoundaryGitHubAPI; local boundary must be preserved.
+	if wantBoundary == failureclass.BoundaryConfig {
 		preserved := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		if !errors.As(preserved, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-			t.Fatalf("%s preserved boundary = %#v, want BoundaryConfig", name, preserved)
+			t.Fatalf("%s re-wrap promoted local boundary: %#v", name, preserved)
 		}
 		if kind := failureclass.Classify(preserved, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-			t.Fatalf("%s Classify() = %s, want non_retryable for local CLI launch failure", name, kind)
+			t.Fatalf("%s re-wrapped Classify() = %s, want non_retryable", name, kind)
 		}
 	}
-
-	_, err := adapter.GetCurrentUserLogin(context.Background(), cwd)
-	assertLocalCLILaunchBoundary(t, "GetCurrentUserLogin", err)
-	_, err = adapter.GetPullRequestAuthor(context.Background(), input)
-	assertLocalCLILaunchBoundary(t, "GetPullRequestAuthor", err)
-	_, err = adapter.ViewPullRequest(context.Background(), input)
-	assertLocalCLILaunchBoundary(t, "ViewPullRequest", err)
 }
 
-func TestWithHostingAPIBoundaryLeavesTransientStartFailuresRetryable(t *testing.T) {
-	// Host-pressure launch failures share the "start command:" marker with
-	// missing-binary/bad-CWD errors but must stay BoundaryGitHubAPI so
-	// unlimited fixer queues requeue instead of parking as non_retryable.
-	for _, tc := range []struct {
-		name string
-		err  error
-	}{
-		{name: "EAGAIN", err: fmt.Errorf("start command: %w", syscall.EAGAIN)},
-		{name: "ENOMEM", err: fmt.Errorf("start command: %w", syscall.ENOMEM)},
-		{name: "ETXTBSY", err: fmt.Errorf("start command: %w", syscall.ETXTBSY)},
-		{name: "EMFILE", err: fmt.Errorf("start command: %w", syscall.EMFILE)},
-		{name: "ENFILE", err: fmt.Errorf("start command: %w", syscall.ENFILE)},
-	} {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			got := withHostingAPIBoundary(tc.err)
-			var boundaryErr *failureclass.BoundaryError
-			if !errors.As(got, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
-				t.Fatalf("withHostingAPIBoundary() = %#v, want BoundaryGitHubAPI for transient start failure", got)
-			}
-			if kind := failureclass.Classify(got, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.RetryableTransient {
-				t.Fatalf("Classify() = %s, want retryable_transient for transient start failure", kind)
-			}
-		})
-	}
-
-	// Deterministic config launch failures still park.
-	configErr := withHostingAPIBoundary(fmt.Errorf("start command: %w", exec.ErrNotFound))
-	var boundaryErr *failureclass.BoundaryError
-	if !errors.As(configErr, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("withHostingAPIBoundary(exec.ErrNotFound) = %#v, want BoundaryConfig", configErr)
-	}
-	if kind := failureclass.Classify(configErr, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("Classify() = %s, want non_retryable for deterministic config start failure", kind)
-	}
-}
-
-func TestWithHostingAPIBoundaryParksLocalCLIContractFailuresAsConfig(t *testing.T) {
-	// Successfully-launched gh that rejects --json schema is local/config, not
-	// a remote API outage. Without BoundaryConfig, Classify treats
-	// BoundaryGitHubAPI as retryable_transient and unlimited fixer queues loop.
-	schemaErr := &shell.CommandExecutionError{
-		Message: "Command exited with code 1",
-		Result: shell.Result{
-			ExitCode: 1,
-			Stderr:   `unknown JSON field: "statusCheckRollup"` + "\nAvailable fields:\n  number\n  title\n",
-		},
-	}
-	got := withHostingAPIBoundary(schemaErr)
-	var boundaryErr *failureclass.BoundaryError
-	if !errors.As(got, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("withHostingAPIBoundary(unknown JSON field) = %#v, want BoundaryConfig", got)
-	}
-	if kind := failureclass.Classify(got, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("Classify() = %s, want non_retryable for local CLI schema failure", kind)
-	}
-	// Runner re-wrap must preserve the local boundary.
-	preserved := failureclass.WithBoundary(got, failureclass.BoundaryGitHubAPI)
-	if !errors.As(preserved, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("preserved boundary = %#v, want BoundaryConfig", preserved)
-	}
-	if kind := failureclass.Classify(preserved, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("re-wrapped Classify() = %s, want non_retryable", kind)
-	}
-
-	// Unknown flag / invocation contract is likewise local config.
-	flagErr := &shell.CommandExecutionError{
-		Message: "Command exited with code 1",
-		Result:  shell.Result{ExitCode: 1, Stderr: "unknown flag: --not-a-real-flag"},
-	}
-	got = withHostingAPIBoundary(flagErr)
-	if !errors.As(got, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("withHostingAPIBoundary(unknown flag) = %#v, want BoundaryConfig", got)
-	}
-
-	// Real remote/hosting failures still use BoundaryGitHubAPI so transient
-	// network paths remain retryable and typed denials stay on API rules.
-	remoteErr := &shell.CommandExecutionError{
-		Message: "Command exited with code 1",
-		Result:  shell.Result{ExitCode: 1, Stderr: `Post "https://api.github.com/graphql": unexpected EOF`},
-	}
-	got = withHostingAPIBoundary(remoteErr)
-	if !errors.As(got, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
-		t.Fatalf("withHostingAPIBoundary(remote EOF) = %#v, want BoundaryGitHubAPI", got)
-	}
-	if kind := failureclass.Classify(got, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.RetryableTransient {
-		t.Fatalf("Classify(remote EOF) = %s, want retryable_transient", kind)
-	}
-}
-
-func TestFixerGitHubAdapterTagsInaccessibleCWDLaunchAsConfigBoundary(t *testing.T) {
-	// Real gateway launch with an inaccessible working directory is also local.
-	// Prefer a resolvable gh path so the failure is CWD rather than missing binary.
-	ghPath := "gh"
-	if resolved, err := exec.LookPath("gh"); err == nil {
-		ghPath = resolved
-	}
-	gateway := githubinfra.New(githubinfra.Options{GHPath: ghPath})
-	adapter := fixerGitHubAdapter{gateway: gateway}
-	missingCWD := filepath.Join(t.TempDir(), "missing-worktree")
-
-	_, err := adapter.GetCurrentUserLogin(context.Background(), missingCWD)
-	if err == nil {
-		t.Fatal("GetCurrentUserLogin() error = nil, want inaccessible CWD launch failure")
-	}
-	var boundaryErr *failureclass.BoundaryError
-	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-		t.Fatalf("GetCurrentUserLogin() boundary = %#v, want BoundaryConfig for inaccessible CWD", err)
-	}
-	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("Classify() = %s, want non_retryable for inaccessible CWD launch failure", kind)
-	}
-}
-
-func TestFixerGitHubAdapterTagsCLISchemaFailureAsConfigBoundary(t *testing.T) {
-	// Exercise the real gateway + shell.Run contract: gh launches and exits
-	// nonzero for an incompatible --json field. That must stay BoundaryConfig
-	// (not BoundaryGitHubAPI) so unlimited fixer queues park instead of retrying.
-	binDir := t.TempDir()
-	ghPath := filepath.Join(binDir, "gh")
-	script := "#!/bin/sh\nprintf '%s\\n' 'unknown JSON field: \"statusCheckRollup\"' >&2\nexit 1\n"
-	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+func writeFakeGH(t *testing.T, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "gh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
 	}
-	gateway := githubinfra.New(githubinfra.Options{GHPath: ghPath})
-	adapter := fixerGitHubAdapter{gateway: gateway}
-	cwd := t.TempDir()
-	input := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
-
-	assertLocalCLIContractBoundary := func(t *testing.T, name string, err error) {
-		t.Helper()
-		if err == nil {
-			t.Fatalf("%s error = nil, want local CLI schema failure", name)
-		}
-		if shell.IsStartFailure(err) {
-			t.Fatalf("%s IsStartFailure = true, want completed CLI contract failure", name)
-		}
-		var boundaryErr *failureclass.BoundaryError
-		if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
-			t.Fatalf("%s boundary = %#v, want BoundaryConfig for CLI schema failure", name, err)
-		}
-		if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-			t.Fatalf("%s Classify() = %s, want non_retryable for CLI schema failure", name, kind)
-		}
-	}
-
-	_, err := adapter.GetCurrentUserLogin(context.Background(), cwd)
-	assertLocalCLIContractBoundary(t, "GetCurrentUserLogin", err)
-	_, err = adapter.GetPullRequestAuthor(context.Background(), input)
-	assertLocalCLIContractBoundary(t, "GetPullRequestAuthor", err)
-	_, err = adapter.ViewPullRequest(context.Background(), input)
-	assertLocalCLIContractBoundary(t, "ViewPullRequest", err)
+	return path
 }
 
-func TestFixerGitHubAdapterTreatsForgejoPR404AsTerminal(t *testing.T) {
-	// Deleted Forgejo PRs return typed HTTP 404 from ViewPullRequest. After the
-	// adapter tags them BoundaryGitHubAPI, Classify must keep them non_retryable
-	// so unlimited fixer queues park instead of requeueing forever.
-	t.Setenv("FORGEJO_TOKEN", "secret")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
-	}))
-	defer server.Close()
-
-	repoPath := filepath.Join(t.TempDir(), "repo")
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
-		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+func TestWithHostingAPIBoundaryClassification(t *testing.T) {
+	// Unit table for the adapter boundary helper: local contract/config parks,
+	// host-pressure launch and remote transport stay retryable GitHubAPI.
+	cases := []struct {
+		name     string
+		err      error
+		boundary failureclass.Boundary
+		kind     failureclass.Kind
+	}{
+		{"missing binary", fmt.Errorf("start command: %w", exec.ErrNotFound), failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"EAGAIN", fmt.Errorf("start command: %w", syscall.EAGAIN), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"ENOMEM", fmt.Errorf("start command: %w", syscall.ENOMEM), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"ETXTBSY", fmt.Errorf("start command: %w", syscall.ETXTBSY), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"EMFILE", fmt.Errorf("start command: %w", syscall.EMFILE), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"ENFILE", fmt.Errorf("start command: %w", syscall.ENFILE), failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
+		{"unknown json field", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: `unknown JSON field: "statusCheckRollup"`}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"unknown flag", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: "unknown flag: --not-a-real-flag"}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		// Zero-exit decode failures from invalidJSONError must not become endless API retries.
+		{"invalid gh json payload", &shell.CommandExecutionError{Message: "Invalid gh JSON payload: unexpected end of JSON input; stdoutBytes=0", Result: shell.Result{ExitCode: 0, Stdout: "", Stderr: "unexpected end of JSON input"}}, failureclass.BoundaryConfig, failureclass.NonRetryable},
+		{"remote EOF", &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1, Stderr: `Post "https://api.github.com/graphql": unexpected EOF`}}, failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient},
 	}
-	adapter := fixerGitHubAdapter{config: &cfg}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertHostingBoundary(t, tc.name, withHostingAPIBoundary(tc.err), tc.boundary, tc.kind)
+		})
+	}
+}
+
+func TestFixerGitHubAdapterBoundaryContracts(t *testing.T) {
+	// Cross-component contracts for fixerGitHubAdapter: construction, remote
+	// HTTP, real gateway/shell launch, CLI schema, and zero-exit invalid JSON.
+	repoPath := filepath.Join(t.TempDir(), "repo")
 	input := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath}
 
-	_, err := adapter.GetPullRequestAuthor(context.Background(), input)
-	if err == nil {
-		t.Fatal("GetPullRequestAuthor() error = nil, want Forgejo PR 404")
-	}
-	var boundaryErr *failureclass.BoundaryError
-	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
-		t.Fatalf("GetPullRequestAuthor() boundary = %#v, want BoundaryGitHubAPI", err)
-	}
-	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("GetPullRequestAuthor Classify() = %s, want non_retryable for typed HTTP 404", kind)
-	}
-	// Runner re-wraps adapter errors with BoundaryGitHubAPI; existing boundary and
-	// typed status must still classify as terminal.
-	rewrapped := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
-	if kind := failureclass.Classify(rewrapped, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("re-wrapped Classify() = %s, want non_retryable", kind)
-	}
+	t.Run("local construction", func(t *testing.T) {
+		t.Setenv("FORGEJO_TOKEN", "")
+		cfg := config.Config{
+			Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forge.example", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+			Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+		}
+		adapter := fixerGitHubAdapter{config: &cfg}
+		_, err := adapter.GetCurrentUserLogin(context.Background(), repoPath)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.GetPullRequestAuthor(context.Background(), input)
+		assertHostingBoundary(t, "GetPullRequestAuthor", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.ViewPullRequest(context.Background(), input)
+		assertHostingBoundary(t, "ViewPullRequest", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+	})
 
-	_, err = adapter.ViewPullRequest(context.Background(), input)
-	if err == nil {
-		t.Fatal("ViewPullRequest() error = nil, want Forgejo PR 404")
-	}
-	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
-		t.Fatalf("ViewPullRequest() boundary = %#v, want BoundaryGitHubAPI", err)
-	}
-	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
-		t.Fatalf("ViewPullRequest Classify() = %s, want non_retryable for typed HTTP 404", kind)
-	}
+	t.Run("remote 502 retryable", func(t *testing.T) {
+		t.Setenv("FORGEJO_TOKEN", "secret")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("bad gateway"))
+		}))
+		t.Cleanup(server.Close)
+		cfg := config.Config{
+			Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+			Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+		}
+		_, err := fixerGitHubAdapter{config: &cfg}.GetCurrentUserLogin(context.Background(), repoPath)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryGitHubAPI, failureclass.RetryableTransient)
+	})
+
+	t.Run("forgejo PR 404 terminal", func(t *testing.T) {
+		t.Setenv("FORGEJO_TOKEN", "secret")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+		}))
+		t.Cleanup(server.Close)
+		cfg := config.Config{
+			Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+			Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+		}
+		adapter := fixerGitHubAdapter{config: &cfg}
+		_, err := adapter.GetPullRequestAuthor(context.Background(), input)
+		assertHostingBoundary(t, "GetPullRequestAuthor", err, failureclass.BoundaryGitHubAPI, failureclass.NonRetryable)
+		_, err = adapter.ViewPullRequest(context.Background(), input)
+		assertHostingBoundary(t, "ViewPullRequest", err, failureclass.BoundaryGitHubAPI, failureclass.NonRetryable)
+	})
+
+	t.Run("missing gh launch", func(t *testing.T) {
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{GHPath: filepath.Join(t.TempDir(), "no-such-gh")})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		_, err := adapter.GetCurrentUserLogin(context.Background(), cwd)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+		assertHostingBoundary(t, "GetPullRequestAuthor", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		_, err = adapter.ViewPullRequest(context.Background(), in)
+		assertHostingBoundary(t, "ViewPullRequest", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+	})
+
+	t.Run("inaccessible CWD launch", func(t *testing.T) {
+		ghPath := "gh"
+		if resolved, err := exec.LookPath("gh"); err == nil {
+			ghPath = resolved
+		}
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{GHPath: ghPath})}
+		missingCWD := filepath.Join(t.TempDir(), "missing-worktree")
+		_, err := adapter.GetCurrentUserLogin(context.Background(), missingCWD)
+		assertHostingBoundary(t, "GetCurrentUserLogin", err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+	})
+
+	t.Run("CLI schema failure", func(t *testing.T) {
+		// Real gateway + shell: gh launches and exits nonzero for bad --json field.
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{
+			GHPath: writeFakeGH(t, "#!/bin/sh\nprintf '%s\\n' 'unknown JSON field: \"statusCheckRollup\"' >&2\nexit 1\n"),
+		})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		for _, name := range []string{"GetCurrentUserLogin", "GetPullRequestAuthor", "ViewPullRequest"} {
+			var err error
+			switch name {
+			case "GetCurrentUserLogin":
+				_, err = adapter.GetCurrentUserLogin(context.Background(), cwd)
+			case "GetPullRequestAuthor":
+				_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+			case "ViewPullRequest":
+				_, err = adapter.ViewPullRequest(context.Background(), in)
+			}
+			if shell.IsStartFailure(err) {
+				t.Fatalf("%s IsStartFailure = true, want completed CLI contract failure", name)
+			}
+			assertHostingBoundary(t, name, err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		}
+	})
+
+	t.Run("invalid JSON zero-exit", func(t *testing.T) {
+		// Real gateway contract: gh exits 0 with malformed stdout; invalidJSONError
+		// emits "Invalid gh JSON payload" and must park as BoundaryConfig.
+		// GetCurrentUserLogin uses `gh api user --jq .login` (raw text), so cover
+		// the JSON-decoding entrypoints that surface invalidJSONError.
+		adapter := fixerGitHubAdapter{gateway: githubinfra.New(githubinfra.Options{
+			GHPath: writeFakeGH(t, "#!/bin/sh\nprintf '%s\\n' 'not-json-at-all'\nexit 0\n"),
+		})}
+		cwd := t.TempDir()
+		in := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+		for _, name := range []string{"GetPullRequestAuthor", "ViewPullRequest"} {
+			var err error
+			switch name {
+			case "GetPullRequestAuthor":
+				_, err = adapter.GetPullRequestAuthor(context.Background(), in)
+			case "ViewPullRequest":
+				_, err = adapter.ViewPullRequest(context.Background(), in)
+			}
+			if err == nil {
+				t.Fatalf("%s error = nil, want invalid JSON payload failure", name)
+			}
+			if shell.IsStartFailure(err) {
+				t.Fatalf("%s IsStartFailure = true, want completed zero-exit decode failure", name)
+			}
+			if !strings.Contains(err.Error(), "Invalid gh JSON payload") {
+				t.Fatalf("%s error = %v, want Invalid gh JSON payload", name, err)
+			}
+			assertHostingBoundary(t, name, err, failureclass.BoundaryConfig, failureclass.NonRetryable)
+		}
+	})
 }
 
 func TestFixerGitHubAdapterForgejoResolveNativeReviewComment(t *testing.T) {
