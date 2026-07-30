@@ -4525,6 +4525,82 @@ func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *
 	}
 }
 
+func TestProcessClaimedQueueItemRequeuesNetworkFailureDuringOwnershipCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentUserErr: errors.New("Command exited with code 1: error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_ownership_network_error", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_ownership_network_error", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:ownership-network-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable transient ownership-check failure", result)
+	}
+	requeued, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if requeued == nil || requeued.Status != "queued" || requeued.Attempts != 2 || requeued.LastErrorKind == nil || *requeued.LastErrorKind != string(FailureRetryableTransient) || requeued.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want queued retryable transient item", requeued)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if updatedLoop == nil || updatedLoop.Status != "queued" || updatedLoop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop with next run", updatedLoop)
+	}
+}
+
+func TestProcessClaimedQueueItemRequeuesNetworkFailureDuringLabelAuthorityCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{viewErr: errors.New("Command exited with code 1: error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com")}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy: DiscoveryPolicy{AuthorFilter: config.FixerAuthorFilterAny, Labels: []string{"bug"}, LabelMode: config.LabelModeAll},
+	})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_label_authority_network_error", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_label_authority_network_error", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:label-authority-network-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable transient label-authority failure", result)
+	}
+	requeued, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if requeued == nil || requeued.Status != "queued" || requeued.Attempts != 2 || requeued.LastErrorKind == nil || *requeued.LastErrorKind != string(FailureRetryableTransient) || requeued.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want queued retryable transient item", requeued)
+	}
+}
+
 func TestCreateRunContextTreatsLegacyMarkerlessRunAsRetryable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -6112,6 +6188,7 @@ type fakeGitHubGateway struct {
 	listOpenByLabel       map[string][]PullRequestSummary
 	listCalls             []ListOpenPullRequestsInput
 	viewResponses         []PullRequestDetail
+	viewErr               error
 	threads               []ReviewThread
 	viewThreadCalls       []ViewReviewThreadInput
 	viewIndex             int
@@ -6180,6 +6257,9 @@ func (f *fakeGitHubGateway) GetPullRequestAuthor(_ context.Context, input ViewPu
 }
 
 func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	if f.viewErr != nil {
+		return PullRequestDetail{}, f.viewErr
+	}
 	if len(f.viewResponses) == 0 {
 		return PullRequestDetail{Number: input.PRNumber, State: "OPEN", HeadSHA: "head-default", HeadRefName: "feature/default", BaseRefName: "main", BaseSHA: "base-default"}, nil
 	}
