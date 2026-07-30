@@ -70,6 +70,16 @@ describe("getTheme / setTheme / applyTheme", () => {
     expect(detail).toBe("light");
     window.removeEventListener("looper:theme-change", spy as EventListener);
   });
+
+  it("getTheme + applyTheme restores an explicit stored preference onto the DOM", () => {
+    // Mirrors main.tsx startup and CSP-safe theme-init.js: without this,
+    // reloading with a saved light/dark mode leaves data-theme unset and the
+    // palette follows the OS while the toggle reports the stored value.
+    window.localStorage.setItem(THEME_STORAGE_KEY, "light");
+    expect(document.documentElement.dataset.theme).toBeUndefined();
+    applyTheme(getTheme());
+    expect(document.documentElement.dataset.theme).toBe("light");
+  });
 });
 
 describe("resolvedTheme", () => {

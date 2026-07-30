@@ -84,7 +84,10 @@ export function useTheme(): {
     resolvedTheme(mode),
   );
 
+  // Keep data-theme aligned with React state on mount and mode changes.
+  // Required because production CSP blocks inline HTML init scripts.
   useEffect(() => {
+    applyTheme(mode);
     setResolved(resolvedTheme(mode));
   }, [mode]);
 

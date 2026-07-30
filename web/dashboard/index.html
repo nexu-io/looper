@@ -21,20 +21,8 @@
     <link rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon.png" />
     <link rel="manifest" href="%BASE_URL%site.webmanifest" />
     <meta name="theme-color" content="#0a0a0a" />
-    <script>
-      // Inline theme init: run before paint so first render matches the
-      // persisted preference. CSS falls back to the media query when no
-      // attribute is set, so failures here still produce a sensible palette.
-      (function () {
-        try {
-          var m = localStorage.getItem("looper.dashboard.theme");
-          if (m !== "light" && m !== "dark" && m !== "system") m = "system";
-          document.documentElement.setAttribute("data-theme", m);
-        } catch (_) {
-          /* localStorage unavailable — leave attribute unset, CSS media query decides. */
-        }
-      })();
-    </script>
+    <!-- External script: production CSP is script-src 'self' (no unsafe-inline). -->
+    <script src="%BASE_URL%theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>
