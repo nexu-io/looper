@@ -83,6 +83,7 @@ func (f *restoreFailAfterClearGit) CreateWorktree(_ context.Context, input Creat
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return CreateWorktreeResult{}, err
 	}
+	ensureFakeUsableGitCheckout(path)
 	if err := worktreesafety.ClearFixerOwnerToken(path); err != nil {
 		return CreateWorktreeResult{}, err
 	}

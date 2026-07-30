@@ -231,6 +231,24 @@ func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
 		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
 	}
+	// Populated hollow worktree parks as MI and must not infinite-retry under max=-1.
+	if shouldRetryQueueFailure(FailureManualIntervention, 242, -1) {
+		t.Fatal("shouldRetryQueueFailure(MI) = true, want false so hollow storms park")
+	}
+}
+
+func TestClassifyPreservedUnusableWorktreeAsManualIntervention(t *testing.T) {
+	t.Parallel()
+
+	runner := &Runner{}
+	err := fmt.Errorf("worktree path /tmp/wt is unusable and not empty; manual intervention required: %w", worktreesafety.ErrUnusableWorktreePreserved)
+	got := runner.classifyFailureForProjectAndBoundary("project_1", err, failureclass.BoundaryGitRemote)
+	if got == nil || got.kind != FailureManualIntervention {
+		t.Fatalf("classify = %#v, want FailureManualIntervention (not transient via worktree step boundary)", got)
+	}
+	if shouldRetryQueueFailure(got.kind, 1, -1) {
+		t.Fatal("preserved unusable worktree must not requeue under unlimited maxAttempts")
+	}
 }
 
 func TestBackoffDelayCapsBeforeDurationOverflow(t *testing.T) {
@@ -6144,6 +6162,7 @@ func TestRunPrepareWorktreeStepClearsFixerOwnerTokenWhenReusingPreparedPath(t *t
 	if err := os.MkdirAll(wtPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll worktree: %v", err)
 	}
+	ensureFakeUsableGitCheckout(wtPath)
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now})
 
@@ -6184,6 +6203,7 @@ func TestRunPrepareWorktreeStepRePreparesWhenFixerMarkerPresent(t *testing.T) {
 	if err := os.MkdirAll(wtPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll worktree: %v", err)
 	}
+	ensureFakeUsableGitCheckout(wtPath)
 	const token = "fixer:loop_x:run_y:must-reprepare"
 	if err := worktreesafety.WriteFixerOwnerToken(wtPath, token); err != nil {
 		t.Fatalf("WriteFixerOwnerToken: %v", err)
@@ -10314,11 +10334,25 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return CreateWorktreeResult{}, err
 	}
+	// Seed usable local git metadata so reviewerWorktreePrepared (which probes
+	// LocalCheckoutUsable) can reuse the path after Prepare sets PreparedAt.
+	// Without this, stepReview re-enters prepare and double-counts Create.
+	ensureFakeUsableGitCheckout(path)
 	// Match real gateway: any CreateWorktree claim revokes prior fixer ownership.
 	if err := worktreesafety.ClearFixerOwnerToken(path); err != nil {
 		return CreateWorktreeResult{}, err
 	}
 	return CreateWorktreeResult{WorktreePath: path, Branch: input.Branch, HeadSHA: "abc123"}, nil
+}
+
+func ensureFakeUsableGitCheckout(path string) {
+	gitDir := filepath.Join(path, ".git")
+	if worktreesafety.LocalCheckoutUsable(path) {
+		return
+	}
+	_ = os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755)
+	_ = os.MkdirAll(filepath.Join(gitDir, "refs"), 0o755)
+	_ = os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
 }
 
 func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {

@@ -6237,7 +6237,7 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 // by itself. Remote helpers can emit "fatal: not a git repository" while the
 // managed worktree remains valid; force CleanupWorktree would then destroy
 // interrupted agent dirt. When error text merely *looks* like a local integrity
-// failure, confirm with localFixerWorktreeCheckoutUsable before recreating.
+// failure, confirm with LocalCheckoutUsable before recreating.
 func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -6258,188 +6258,37 @@ func isMissingOrUnusableFixerWorktree(path string, prepErr error) bool {
 	if _, err := os.Stat(path); err != nil {
 		return os.IsNotExist(err)
 	}
-	msg := strings.ToLower(prepErr.Error())
-	// Integrity-looking phrases are necessary but not sufficient: remote
-	// helpers/servers can emit the same text. Do not substring-match generic
-	// existence phrases either — external dependency errors share that wording.
-	// "invalid gitfile format" is Git's distinct message for a .git file that is
-	// not a gitdir: pointer (malformed retained metadata).
-	looksLikeLocalIntegrity := strings.Contains(msg, "not a working tree") ||
-		strings.Contains(msg, "not a git repository") ||
-		strings.Contains(msg, "invalid gitfile format")
-	if !looksLikeLocalIntegrity {
+	if !worktreesafety.LooksLikeLocalIntegrityError(prepErr) {
 		return false
 	}
 	// Confirm with a non-remote local probe before force-cleaning.
-	return !localFixerWorktreeCheckoutUsable(path)
+	return !worktreesafety.LocalCheckoutUsable(path)
 }
 
-// localFixerWorktreeCheckoutUsable reports whether path has local git metadata
-// without contacting remotes. Linked worktrees use a .git file (gitdir pointer);
-// ordinary checkouts use a .git directory. Metadata presence alone is not enough:
-// ordinary repos and the linked common repository need full non-remote integrity
-// (HEAD + objects/ + refs/), and linked private gitdirs need HEAD plus a
-// resolvable usable common repo via commondir. Empty or corrupt metadata makes
-// real Git report "not a git repository", so prepare can recreate instead of
-// retrying forever.
-// A non-empty .git file that is not a gitdir: pointer is also unusable: real Git
-// reports "fatal: invalid gitfile format" and prepare must recreate rather than
-// retry forever on retained broken metadata.
+// localFixerWorktreeCheckoutUsable delegates to the shared local metadata probe.
 func localFixerWorktreeCheckoutUsable(path string) bool {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return false
-	}
-	gitMeta := filepath.Join(path, ".git")
-	info, err := os.Lstat(gitMeta)
-	if err != nil {
-		return false
-	}
-	if info.IsDir() {
-		// Ordinary checkout: require full local repository metadata.
-		return localGitRepositoryMetadataUsable(gitMeta)
-	}
-	// Linked worktree or gitfile: .git is a regular file (or symlink to one).
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Stat(gitMeta)
-		if err != nil {
-			return false
-		}
-		if target.IsDir() {
-			return localGitRepositoryMetadataUsable(gitMeta)
-		}
-	}
-	data, err := os.ReadFile(gitMeta)
-	if err != nil {
-		return false
-	}
-	line := strings.TrimSpace(string(data))
-	if line == "" {
-		return false
-	}
-	const prefix = "gitdir:"
-	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
-		// Malformed gitfile: real Git rejects non-gitdir: content as
-		// "invalid gitfile format". Treat as unusable so prepare can recreate.
-		return false
-	}
-	gitdir := strings.TrimSpace(line[len(prefix):])
-	if gitdir == "" {
-		return false
-	}
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(path, gitdir)
-	}
-	// Linked private gitdir must look like a real git dir (HEAD), not merely exist.
-	// An empty/corrupt gitdir still makes `git` report "not a git repository"; if
-	// we only checked existence, prepare would retry forever without recreating.
-	if _, err = os.Stat(filepath.Join(gitdir, "HEAD")); err != nil {
-		return false
-	}
-	// commondir is required for linked worktrees: without it (or when it does not
-	// resolve to a common repo with full local integrity), Git 2.43+ still fails
-	// with "fatal: not a git repository" even though private HEAD remains.
-	return linkedPrivateGitdirCommonUsable(gitdir)
+	return worktreesafety.LocalCheckoutUsable(path)
 }
 
-// localGitRepositoryMetadataUsable is a non-remote integrity probe for a Git
-// repository directory (ordinary .git or a linked worktree common repo).
-// HEAD alone is insufficient: Git 2.43+ also requires objects/ and refs/ and
-// reports "fatal: not a git repository" when either directory is missing.
-func localGitRepositoryMetadataUsable(dir string) bool {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return false
-	}
-	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
-		return false
-	}
-	objects, err := os.Stat(filepath.Join(dir, "objects"))
-	if err != nil || !objects.IsDir() {
-		return false
-	}
-	refs, err := os.Stat(filepath.Join(dir, "refs"))
-	if err != nil || !refs.IsDir() {
-		return false
-	}
-	return true
-}
+// errUnusableFixerWorktreePreserved aliases the shared preserved-path sentinel
+// so existing fixer call sites and tests keep working.
+var errUnusableFixerWorktreePreserved = worktreesafety.ErrUnusableWorktreePreserved
 
-// linkedPrivateGitdirCommonUsable reports whether a linked worktree private
-// gitdir has a readable commondir that resolves to a common repository with
-// non-remote integrity (HEAD + objects/ + refs/).
-func linkedPrivateGitdirCommonUsable(gitdir string) bool {
-	data, err := os.ReadFile(filepath.Join(gitdir, "commondir"))
-	if err != nil {
-		return false
-	}
-	common := strings.TrimSpace(string(data))
-	if common == "" {
-		return false
-	}
-	if !filepath.IsAbs(common) {
-		common = filepath.Join(gitdir, common)
-	}
-	common = filepath.Clean(common)
-	return localGitRepositoryMetadataUsable(common)
-}
-
-// errUnusableFixerWorktreePreserved signals that an unusable worktree path still
-// holds content after CleanupWorktree and must not be recreated over.
-var errUnusableFixerWorktreePreserved = errors.New("unusable fixer worktree path preserved")
-
-// clearUnusableFixerWorktreePath handles filesystem leftovers after CleanupWorktree
-// on a missing/unusable checkout. Git's `worktree remove --force` only removes
-// registered worktrees; unregistered directories are left intact, which then
-// blocks CreateWorktree when the managed path already exists.
-//
-// Policy: remove empty directories (safe stale), and remove directories whose only
-// content is unusable local git metadata (corrupt/empty linked .git) so Create
-// can reuse the managed path. Preserve any other populated path for manual
-// intervention (may hold interrupted agent output even without a usable .git).
+// clearUnusableFixerWorktreePath clears empty/metadata-only leftovers after
+// CleanupWorktree. Safety bounds use the path itself as WorktreePath; callers
+// only invoke this for managed fixer checkouts under the project worktree root.
 func clearUnusableFixerWorktreePath(path string) error {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	if len(entries) == 0 {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	// Only corrupt/empty git metadata: safe to remove so prepare can recreate.
-	if onlyUnusableLocalGitMetadata(path, entries) {
-		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, errUnusableFixerWorktreePreserved)
-}
-
-// onlyUnusableLocalGitMetadata is true when path holds nothing but a non-usable
-// .git file/dir (and optional nested empties under an ordinary .git dir). Any
-// other entry is treated as possible agent dirt and must be preserved.
-func onlyUnusableLocalGitMetadata(path string, entries []os.DirEntry) bool {
-	if len(entries) != 1 || entries[0].Name() != ".git" {
-		return false
-	}
-	return !localFixerWorktreeCheckoutUsable(path)
+	// Parent of the worktree directory is the managed root for this path.
+	// Validate requires path under WorktreeRoot and not equal to it.
+	root := filepath.Dir(path)
+	return worktreesafety.ClearUnusableManagedPath(worktreesafety.CheckInput{
+		WorktreePath: path,
+		WorktreeRoot: root,
+	}, path)
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {

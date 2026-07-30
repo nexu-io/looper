@@ -228,6 +228,19 @@ func TestClassifyDiagnosticMessageManualIntervention(t *testing.T) {
 	if !strings.Contains(locked.RecommendedAction, "unlock") {
 		t.Fatalf("RecommendedAction = %q, want unlock guidance for locked worktree", locked.RecommendedAction)
 	}
+
+	// Production stores ErrUnusableWorktreePreserved as LastErrorKind=manual_intervention;
+	// message-specific integrity class must win over the generic MI branch.
+	preserved := classifyDiagnosticMessage(
+		"worktree path /tmp/wt is unusable and not empty; manual intervention required: unusable worktree path preserved",
+		"manual_intervention",
+	)
+	if preserved.FailureClass != "managed_worktree_integrity" || preserved.Retryable == nil || *preserved.Retryable {
+		t.Fatalf("preserved diagnosis = %#v, want non-retryable managed_worktree_integrity", preserved)
+	}
+	if !strings.Contains(preserved.RecommendedAction, "preserve any agent output") {
+		t.Fatalf("RecommendedAction = %q, want managed-worktree cleanup guidance", preserved.RecommendedAction)
+	}
 }
 
 func TestDiagnoseLoopExpandsRetrySeqPlaceholder(t *testing.T) {

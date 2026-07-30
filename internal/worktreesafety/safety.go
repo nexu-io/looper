@@ -40,6 +40,14 @@ func IsSafe(input CheckInput) bool {
 	return Validate(input) == nil
 }
 
+// IsProjectRepoPath reports whether worktreePath is the project's main
+// checkout. Managed worktrees must never equal the project repo; callers that
+// resume past prepare should hard-fail this case instead of inventing a fresh
+// worktree and continuing on a checkpoint that claimed work lived at the repo.
+func IsProjectRepoPath(worktreePath, repoPath string) bool {
+	return samePath(worktreePath, repoPath)
+}
+
 func samePath(a, b string) bool {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
