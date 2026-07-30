@@ -3,6 +3,7 @@ package runtime
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,14 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// errWebhookRuntimeStopped is returned when reconciliation would start side
+// effects after Stop has begun. Callers treat it as a clean no-op.
+var errWebhookRuntimeStopped = errors.New("webhook runtime stopped")
+
+func isWebhookStopError(err error) bool {
+	return errors.Is(err, errWebhookRuntimeStopped) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
 
 const webhookListenerPath = "/webhook/forward"
 
@@ -101,18 +110,30 @@ type WebhookForwarderState struct {
 }
 
 type webhookRuntime struct {
-	cfg                config.Config
-	logger             bootstrap.Logger
-	now                func() time.Time
-	ghPath             string
-	status             WebhookStatus
-	stopCh             chan struct{}
-	forwarderStopCh    map[string]chan struct{}
-	mu                 sync.RWMutex
-	bootstrapMu        sync.Mutex
-	wg                 sync.WaitGroup
-	stopped            bool
-	reconcileRetry     bool
+	cfg    config.Config
+	logger bootstrap.Logger
+	now    func() time.Time
+	ghPath string
+	status WebhookStatus
+	stopCh chan struct{}
+	// life is cancelled exactly once when Stop begins. Deferred reconcile and
+	// GitHub tunnel work inherit it so shutdown unblocks blocked remote calls
+	// without a per-pass stop-context factory.
+	life            context.Context
+	lifeCancel      context.CancelFunc
+	forwarderStopCh map[string]chan struct{}
+	mu              sync.RWMutex
+	bootstrapMu     sync.Mutex
+	// reconcileMu serializes Reconcile bodies so concurrent schedule wakes and
+	// synchronous Reconcile calls never overlap GitHub/hook side effects.
+	reconcileMu    sync.Mutex
+	wg             sync.WaitGroup
+	stopped        bool
+	reconcileRetry bool
+	// Deferred coalescer: at most one scheduled worker; later wakes set pending.
+	reconcileRunning   bool
+	reconcilePending   bool
+	reconcileRepos     *storage.Repositories
 	daemonID           string
 	probe              processProbe
 	forwarderStore     *storage.WebhookForwardersRepository
@@ -148,7 +169,21 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		Forwarders:                  []WebhookForwarderState{},
 		TunnelHooks:                 []WebhookTunnelState{},
 	}
-	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, allowedTunnelRepos: map[string]struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
+	life, lifeCancel := context.WithCancel(context.Background())
+	rt := &webhookRuntime{
+		cfg:                cfg,
+		logger:             logger,
+		now:                now,
+		ghPath:             strings.TrimSpace(derefString(cfg.Tools.GHPath)),
+		status:             status,
+		stopCh:             make(chan struct{}),
+		life:               life,
+		lifeCancel:         lifeCancel,
+		forwarderStopCh:    map[string]chan struct{}{},
+		allowedTunnelRepos: map[string]struct{}{},
+		daemonID:           newDaemonID(),
+		probe:              defaultProcessProbe{},
+	}
 	if !cfg.Webhook.Enabled {
 		return rt
 	}
@@ -288,20 +323,108 @@ func (w *webhookRuntime) canLaunchForwarders() bool {
 }
 
 func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
+	w.reconcileMu.Lock()
+	defer w.reconcileMu.Unlock()
+
+	if w.isStopped() {
+		return nil
+	}
 	cfg := w.configSnapshot()
-	return w.reconcileSnapshot(repos, cfg)
+	return w.reconcileSnapshot(w.lifeContext(), repos, cfg)
 }
 
-func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg config.Config) error {
+// ScheduleReconcile defers a coalesced reconcile onto a single worker. Project
+// mutations call this so SQLite catalog publication is not blocked by remote
+// webhook work. Later wakes while a pass is running mark pending; the worker
+// runs until the queue is empty or Stop cancels life.
+func (w *webhookRuntime) ScheduleReconcile(repos *storage.Repositories) {
+	if w == nil || repos == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
+	w.reconcileRepos = repos
+	w.reconcilePending = true
+	if w.reconcileRunning {
+		w.mu.Unlock()
+		return
+	}
+	w.reconcileRunning = true
+	w.wg.Add(1)
+	w.mu.Unlock()
+
+	go w.runScheduledReconcile()
+}
+
+func (w *webhookRuntime) runScheduledReconcile() {
+	defer w.wg.Done()
+	for {
+		w.mu.Lock()
+		if w.stopped {
+			w.reconcileRunning = false
+			w.reconcilePending = false
+			w.mu.Unlock()
+			return
+		}
+		repos := w.reconcileRepos
+		w.reconcilePending = false
+		w.mu.Unlock()
+
+		if err := w.Reconcile(repos); err != nil && w.logger != nil {
+			w.logger.Warn("webhook.reconcile_failed", map[string]any{"error": err.Error()})
+		}
+
+		w.mu.Lock()
+		if w.stopped || !w.reconcilePending {
+			w.reconcileRunning = false
+			w.reconcilePending = false
+			w.mu.Unlock()
+			return
+		}
+		w.mu.Unlock()
+	}
+}
+
+// lifeContext is the single shutdown-cancelled context for reconcile work.
+// newWebhookRuntime owns life; bare test constructions fall back to Background
+// and rely on isStopped gates for side effects.
+func (w *webhookRuntime) lifeContext() context.Context {
+	if w == nil {
+		return context.Background()
+	}
+	if w.life != nil {
+		return w.life
+	}
+	if w.isStopped() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	return context.Background()
+}
+
+func (w *webhookRuntime) reconcileSnapshot(ctx context.Context, repos *storage.Repositories, cfg config.Config) error {
 	if w == nil || !w.status.Enabled {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || w.isStopped() {
 		return nil
 	}
 	if repos != nil {
 		w.syncForwarderStore(repos.WebhookForwarders)
 	}
 	if repos != nil && repos.WebhookForwarders != nil && !w.bootstrapCompleted() {
-		w.bootstrap(context.Background(), repos, cfg)
+		w.bootstrap(ctx, repos, cfg)
 		if !w.bootstrapCompleted() {
+			if w.isStopped() || ctx.Err() != nil {
+				return nil
+			}
 			w.scheduleReconcileRetry(repos)
 			return nil
 		}
@@ -326,8 +449,14 @@ func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg conf
 			w.addDegradedReason(fmt.Sprintf("webhook mode conflict for %s: repo is configured for both gh-forward and tunnel", repo))
 		}
 	}
-	if err := w.reconcileTunnelHooks(context.Background(), repos, tunnelRepoSet); err != nil {
+	if err := w.reconcileTunnelHooks(ctx, repos, cfg, tunnelRepoSet); err != nil {
+		if isWebhookStopError(err) {
+			return nil
+		}
 		return err
+	}
+	if w.isStopped() || ctx.Err() != nil {
+		return nil
 	}
 	launchRepos := w.reconcileForwarders(forwarderRepoSet)
 	if len(forwarderRepoSet)+len(tunnelRepoSet) == 0 {
@@ -338,6 +467,9 @@ func (w *webhookRuntime) reconcileSnapshot(repos *storage.Repositories, cfg conf
 		return reason == noConfiguredWebhookReposReason
 	})
 	if len(forwarderRepoSet) == 0 || w.ghPath == "" || w.hasLaunchBlockingDegradedReason() {
+		return nil
+	}
+	if w.isStopped() {
 		return nil
 	}
 	for _, repo := range launchRepos {
@@ -378,9 +510,16 @@ func (w *webhookRuntime) Stop() {
 	}
 	w.stopped = true
 	close(w.stopCh)
+	lifeCancel := w.lifeCancel
+	w.lifeCancel = nil
 	server := w.tunnelServer
 	w.tunnelServer = nil
 	w.mu.Unlock()
+	// Cancel life outside the mutex so blocked GitHub calls wake without
+	// contending on w.mu held by side-effect paths.
+	if lifeCancel != nil {
+		lifeCancel()
+	}
 	if server != nil && server.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), w.shutdownTimeout())
 		_ = server.server.Shutdown(ctx)
@@ -782,7 +921,18 @@ func (w *webhookRuntime) processProbe() processProbe {
 }
 
 func (w *webhookRuntime) launchForwarder(repo string) {
+	if w == nil {
+		return
+	}
+	// wg.Add is linearized with Stop's stopped flag so Wait cannot race a
+	// post-shutdown goroutine.
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
 	w.wg.Add(1)
+	w.mu.Unlock()
 	go func() {
 		defer w.wg.Done()
 		w.runForwarder(repo)
@@ -793,6 +943,49 @@ func (w *webhookRuntime) isStopped() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.stopped
+}
+
+// startForwarderCmd is the only process-spawn boundary: stopped is observed
+// under the same lock as cmd.Start so shutdown cannot interleave a new
+// gh-forward process after Stop began.
+func (w *webhookRuntime) startForwarderCmd(cmd *exec.Cmd) error {
+	if webhookForwarderStartGate != nil {
+		webhookForwarderStartGate()
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return errWebhookRuntimeStopped
+	}
+	return cmd.Start()
+}
+
+// persistForwarderRecord writes a forwarder row without holding w.mu across
+// SQLite I/O (Stop must not block on DB). Uses a stop-independent timeout;
+// rows written after Stop began are deleted so durable state does not outlive
+// shutdown.
+func (w *webhookRuntime) persistForwarderRecord(store *storage.WebhookForwardersRepository, record storage.WebhookForwarderRecord) error {
+	if store == nil {
+		return nil
+	}
+	if w.isStopped() {
+		return errWebhookRuntimeStopped
+	}
+	if webhookForwarderPersistGate != nil {
+		webhookForwarderPersistGate()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), w.shutdownTimeout())
+	defer cancel()
+	if err := store.Upsert(ctx, record); err != nil {
+		return err
+	}
+	if w.isStopped() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), w.shutdownTimeout())
+		_ = store.Delete(cleanupCtx, record.Repo)
+		cleanupCancel()
+		return errWebhookRuntimeStopped
+	}
+	return nil
 }
 
 func (w *webhookRuntime) runForwarder(repo string) {
@@ -818,7 +1011,10 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			w.recordForwarderError(repo, stopCh, fmt.Sprintf("attach stderr: %v", err), true)
 			return
 		}
-		if err := cmd.Start(); err != nil {
+		if err := w.startForwarderCmd(cmd); err != nil {
+			if errors.Is(err, errWebhookRuntimeStopped) {
+				return
+			}
 			w.recordForwarderError(repo, stopCh, err.Error(), true)
 			if !w.sleep(backoff, stopCh) {
 				return
@@ -843,8 +1039,11 @@ func (w *webhookRuntime) runForwarder(repo string) {
 		}
 		if store := w.currentForwarderStore(); store != nil {
 			record := webhookForwarderRecordFromState(repo, pid, processStart, state.Command, w.daemonID, w.currentTime())
-			if err := store.Upsert(context.Background(), record); err != nil {
+			if err := w.persistForwarderRecord(store, record); err != nil {
 				w.killAndWait(cmd)
+				if errors.Is(err, errWebhookRuntimeStopped) {
+					return
+				}
 				w.recordForwarderError(repo, stopCh, fmt.Sprintf("persist forwarder record: %v", err), true)
 				if !w.sleep(backoff, stopCh) {
 					return
@@ -1162,8 +1361,8 @@ func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) {
 		return
 	}
 	w.reconcileRetry = true
-	w.mu.Unlock()
 	w.wg.Add(1)
+	w.mu.Unlock()
 	go func() {
 		defer w.wg.Done()
 		timer := time.NewTimer(webhookReconcileRetryDelay)
@@ -1218,6 +1417,11 @@ func appendTail(lines []string, line string, limit int) []string {
 var execCommand = exec.Command
 
 var webhookForwarderStartedHook func()
+
+// Optional test gates at the stop-linearized process-start and post-check
+// persist boundaries. Production keeps both nil.
+var webhookForwarderStartGate func()
+var webhookForwarderPersistGate func()
 
 var osFindProcess = func(pid int) (*os.Process, error) {
 	return os.FindProcess(pid)

@@ -609,7 +609,7 @@ func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenForgejoPublishes(
 	published.Projects = append(published.Projects, config.ProjectRefConfig{ID: "project_2", Provider: "forgejo-main", Repo: "acme/forgejo"})
 	rt.updateConfig(published)
 
-	if err := rt.reconcileSnapshot(repositories, captured); err != nil {
+	if err := rt.reconcileSnapshot(context.Background(), repositories, captured); err != nil {
 		t.Fatalf("reconcileSnapshot() error = %v", err)
 	}
 	status := rt.Status()
@@ -618,6 +618,8 @@ func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenForgejoPublishes(
 	}
 }
 
+// Contract: tunnel helpers must keep using the Reconcile-captured config while a
+// concurrent project publication rewrites w.cfg.Projects under updateConfig.
 func TestWebhookRuntimeTerminalForwarderExitLatchesWithoutRespawn(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {

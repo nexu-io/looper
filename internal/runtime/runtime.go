@@ -792,6 +792,16 @@ func (r *Runtime) ReconcileWebhookForwarders() {
 	}
 }
 
+func (r *Runtime) scheduleWebhookForwarderReconcile() {
+	r.mu.RLock()
+	webhook := r.webhook
+	repositories := r.services.Repositories
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.ScheduleReconcile(repositories)
+	}
+}
+
 func (r *Runtime) RefreshWebhookForwarders() error {
 	r.ReconcileWebhookForwarders()
 	return nil
@@ -1318,7 +1328,7 @@ func (r *Runtime) afterProjectsPublished() {
 	if started {
 		r.TriggerSchedulerTick()
 		r.TriggerSchedulerClaim()
-		r.ReconcileWebhookForwarders()
+		r.scheduleWebhookForwarderReconcile()
 	}
 }
 
