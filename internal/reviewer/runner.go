@@ -6953,8 +6953,12 @@ func reviewerWorktreeNeedsPrepare(checkpoint reviewerCheckpoint) bool {
 	if strings.TrimSpace(worktree.Path) == "" || strings.TrimSpace(worktree.Branch) == "" || worktree.CleanedAt != "" {
 		return true
 	}
-	_, err := os.Stat(worktree.Path)
-	return err != nil
+	if _, err := os.Stat(worktree.Path); err != nil {
+		return true
+	}
+	// Hollow/corrupt checkouts must not skip CreateWorktree via PreparedAt.
+	// Local metadata is authority for usability; path existence alone is not.
+	return !worktreesafety.LocalCheckoutUsable(worktree.Path)
 }
 
 func reviewerWorktreeBranch(prNumber int64, checkpoint reviewerCheckpoint) string {

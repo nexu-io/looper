@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
 
   --bg: #f4f4f5;
   --bg-elevated: #ffffff;
@@ -20,8 +20,31 @@
     sans-serif;
 }
 
+/* Shared dark palette. Applied on explicit `data-theme="dark"` and,
+   via the media query below, whenever the theme is unset or "system"
+   and the OS reports a dark preference. Keeping the tokens in one
+   place avoids drift between explicit-dark and system-dark. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #09090b;
+  --bg-elevated: #18181b;
+  --bg-muted: #27272a;
+  --border: #3f3f46;
+  --text: #fafafa;
+  --text-muted: #a1a1aa;
+  --accent: #3b82f6;
+  --accent-fg: #f8fafc;
+  --danger: #f87171;
+  --ok: #4ade80;
+  --warn: #facc15;
+}
+
 @media (prefers-color-scheme: dark) {
-  :root {
+  /* No data-theme set (first paint before JS) OR explicit "system" */
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+
     --bg: #09090b;
     --bg-elevated: #18181b;
     --bg-muted: #27272a;

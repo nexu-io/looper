@@ -67,7 +67,13 @@ func TestRunPrepareWorktreeStepRealGatewayRecreatesCorruptCommonRepo(t *testing.
 	t.Parallel()
 
 	f := setupRealLinkedWorktree(t, "project_real_corrupt_common", "feature/fix-42")
-	if !localGitRepositoryMetadataUsable(resolveLinkedCommonDir(t, f.gitdir)) {
+	// Common dir alone is not a checkout path; probe via a synthetic ordinary
+	// checkout whose .git is that common repository.
+	commonCheckout := t.TempDir()
+	if err := os.Symlink(resolveLinkedCommonDir(t, f.gitdir), filepath.Join(commonCheckout, ".git")); err != nil {
+		t.Fatalf("Symlink common .git: %v", err)
+	}
+	if !localFixerWorktreeCheckoutUsable(commonCheckout) {
 		t.Fatal("common repo not usable before corruption")
 	}
 	// HEAD-only common: missing objects/ (and refs/) — Git rejects as not a repo.

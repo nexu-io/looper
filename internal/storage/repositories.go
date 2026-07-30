@@ -632,11 +632,14 @@ func (r *LoopsRepository) AllocateSeq(ctx context.Context) (int64, error) {
 // ListLoopsOptions filters and paginates loop listings.
 // Empty Status/ProjectID match all. Limit 0 means no limit (full list).
 // Offset is always applied when > 0, including when Limit == 0 (SQLite LIMIT -1 OFFSET n).
+// Default order is newest-first (updated_at DESC, seq DESC). OrderByStatusTier is for
+// dashboard list UX only; generic List() and first-match scans must stay newest-first.
 type ListLoopsOptions struct {
-	Status    string
-	ProjectID string
-	Limit     int64
-	Offset    int64
+	Status            string
+	ProjectID         string
+	Limit             int64
+	Offset            int64
+	OrderByStatusTier bool
 }
 
 func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
@@ -680,7 +683,28 @@ func buildLoopsListQuery(base string, opts ListLoopsOptions, withOrderAndLimit b
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 	if withOrderAndLimit {
-		query += " ORDER BY updated_at DESC, seq DESC"
+		if opts.OrderByStatusTier {
+			// Dashboard list only: active / attention-needed statuses first so
+			// recently completed loops (which bump updated_at) do not dominate.
+			// Generic List() stays newest-first for first-match mutation scans.
+			query += ` ORDER BY CASE status
+			WHEN 'running' THEN 0
+			WHEN 'awaiting_human' THEN 0
+			WHEN 'human_takeover' THEN 0
+			WHEN 'queued' THEN 1
+			WHEN 'paused' THEN 2
+			WHEN 'waiting' THEN 2
+			WHEN 'idle' THEN 2
+			WHEN 'failed' THEN 3
+			WHEN 'interrupted' THEN 3
+			WHEN 'stopped' THEN 4
+			WHEN 'completed' THEN 4
+			WHEN 'terminated' THEN 4
+			ELSE 5
+		END ASC, updated_at DESC, seq DESC`
+		} else {
+			query += " ORDER BY updated_at DESC, seq DESC"
+		}
 		if opts.Limit > 0 {
 			query += " LIMIT ?"
 			args = append(args, opts.Limit)

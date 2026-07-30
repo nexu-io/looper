@@ -83,11 +83,12 @@ func Classify(err error, ctx Context) Kind {
 	if githubinfra.IsTransientError(err) {
 		return RetryableTransient
 	}
-	if ctx.Boundary == BoundaryUnknown {
-		var boundaryErr *BoundaryError
-		if errors.As(err, &boundaryErr) && boundaryErr.Boundary != "" {
-			ctx.Boundary = boundaryErr.Boundary
-		}
+	// Prefer an explicit boundary attached to the error over the caller's step
+	// default. Worktree steps often default to git_remote (fetch), but local
+	// integrity failures wrap BoundaryLocalWorktree after a confirmed probe.
+	var boundaryErr *BoundaryError
+	if errors.As(err, &boundaryErr) && boundaryErr.Boundary != "" {
+		ctx.Boundary = boundaryErr.Boundary
 	}
 
 	message := strings.ToLower(githubinfra.ErrorMessage(err))

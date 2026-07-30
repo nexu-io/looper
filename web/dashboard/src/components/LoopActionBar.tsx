@@ -1,4 +1,13 @@
 import { useCallback, useMemo, useState } from "react";
+import {
+  Hand,
+  Pause,
+  Play,
+  RotateCcw,
+  Square,
+  Undo2,
+  type LucideIcon,
+} from "lucide-react";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CopyButton } from "@/components/CopyButton";
 import { Button } from "@/components/ui/button";
@@ -68,6 +77,15 @@ const LABELS: Record<LoopAction, string> = {
   stop: "Stop",
   takeover: "Takeover",
   handback: "Handback",
+};
+
+const ICONS: Record<LoopAction, LucideIcon> = {
+  pause: Pause,
+  unpause: Play,
+  retry: RotateCcw,
+  stop: Square,
+  takeover: Hand,
+  handback: Undo2,
 };
 
 /** True when preflight is missing on older daemons — fall back to plain retry. */
@@ -283,6 +301,12 @@ export function LoopActionBar({
       <div className="flex flex-wrap items-center gap-1">
         {visibleActions.map((action) => {
           if (!enabled[action] && mode === "compact") return null;
+              const Icon = ICONS[action];
+          // Fill Stop/Pause so small media glyphs read solid, not empty outlines.
+          const iconProps =
+            action === "stop" || action === "pause"
+              ? { size: 10, className: "shrink-0", fill: "currentColor" }
+              : { size: 11, className: "shrink-0" };
           return (
             <Button
               key={action}
@@ -290,6 +314,7 @@ export function LoopActionBar({
                 action === "stop" || action === "takeover" ? "danger" : "ghost"
               }
               size="sm"
+              className="gap-1"
               disabled={busy || !enabled[action]}
               onClick={() => onClick(action)}
               title={
@@ -298,6 +323,7 @@ export function LoopActionBar({
                   : LABELS[action]
               }
             >
+              <Icon {...iconProps} aria-hidden />
               {pending === action ? "…" : LABELS[action]}
             </Button>
           );

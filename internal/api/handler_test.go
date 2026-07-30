@@ -2026,6 +2026,7 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 	assertEqual(t, project["archived"], false)
 	assertEqual(t, project["provider"], "github")
 	assertEqual(t, project["repo"], "acme/looper")
+	assertEqual(t, project["repoUrl"], "https://github.com/acme/looper")
 	if project["worktreeRoot"] != nil {
 		t.Fatalf("worktreeRoot = %#v, want nil", project["worktreeRoot"])
 	}
@@ -2037,12 +2038,15 @@ func TestResolveProjectProviderKind(t *testing.T) {
 	t.Parallel()
 
 	tokenEnv := "FORGEJO_TOKEN"
+	planeTokenEnv := "PLANE_TOKEN"
 	cfg := config.Config{
 		Providers: []config.ProviderConfig{
 			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
+			{ID: "plane-main", Kind: config.ProviderKindPlane, BaseURL: "https://plane.example.com/api/v1", TokenEnv: &planeTokenEnv},
 		},
 		Projects: []config.ProjectRefConfig{
 			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+			{ID: "configured-plane", Name: "Plane", Provider: "plane-main", Repo: "acme/looper", RepoPath: "/tmp/looper"},
 		},
 	}
 
@@ -2054,6 +2058,50 @@ func TestResolveProjectProviderKind(t *testing.T) {
 	}
 	if got := resolveProjectProviderKind(cfg, "legacy-github", map[string]any{"repo": "acme/looper"}); got != "github" {
 		t.Fatalf("legacy github = %q, want github", got)
+	}
+	if got := resolveProjectProviderKind(cfg, "configured-plane", map[string]any{}); got != "plane" {
+		t.Fatalf("configured plane = %q, want plane", got)
+	}
+	if got := resolveProjectProviderKind(cfg, "api-plane", map[string]any{"provider": "plane-main", "repo": "acme/looper"}); got != "plane" {
+		t.Fatalf("metadata plane = %q, want plane", got)
+	}
+}
+
+func TestResolveProjectRepoURL(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "FORGEJO_TOKEN"
+	planeTokenEnv := "PLANE_TOKEN"
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com/", TokenEnv: &tokenEnv},
+			{ID: "plane-main", Kind: config.ProviderKindPlane, BaseURL: "https://plane.example.com/api/v1", TokenEnv: &planeTokenEnv},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+			{ID: "configured-plane", Name: "Plane", Provider: "plane-main", Repo: "acme/looper", RepoPath: "/tmp/looper"},
+		},
+	}
+
+	repo := "acme/fj"
+	if got := resolveProjectRepoURL(cfg, "configured-forgejo", map[string]any{}, &repo); got == nil || *got != "https://code.example.com/acme/fj" {
+		t.Fatalf("configured forgejo repoUrl = %v, want https://code.example.com/acme/fj", got)
+	}
+
+	metaRepo := "core/odcrew"
+	if got := resolveProjectRepoURL(cfg, "api-forgejo", map[string]any{"provider": "forgejo-main"}, &metaRepo); got == nil || *got != "https://code.example.com/core/odcrew" {
+		t.Fatalf("metadata forgejo repoUrl = %v, want https://code.example.com/core/odcrew", got)
+	}
+
+	ghRepo := "acme/looper"
+	if got := resolveProjectRepoURL(cfg, "legacy-github", map[string]any{}, &ghRepo); got == nil || *got != "https://github.com/acme/looper" {
+		t.Fatalf("legacy github repoUrl = %v, want https://github.com/acme/looper", got)
+	}
+
+	// Plane reports provider "plane" but code links use GitHub.
+	planeRepo := "acme/looper"
+	if got := resolveProjectRepoURL(cfg, "configured-plane", map[string]any{}, &planeRepo); got == nil || *got != "https://github.com/acme/looper" {
+		t.Fatalf("configured plane repoUrl = %v, want https://github.com/acme/looper", got)
 	}
 }
 
@@ -2481,6 +2529,8 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 	})
 
 	t.Run("limit and offset page with total", func(t *testing.T) {
+		// Default list order is status tier then updated_at DESC, seq DESC:
+		// running (loop_4, loop_3, loop_1) → paused (loop_2) → failed (loop_5).
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?limit=2&offset=1", nil)
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, req)
@@ -2493,8 +2543,8 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 		if len(items) != 2 {
 			t.Fatalf("items len = %d, want 2", len(items))
 		}
-		assertEqual(t, items[0].(map[string]any)["id"], "loop_4")
-		assertEqual(t, items[1].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[1].(map[string]any)["id"], "loop_1")
 		assertEqual(t, data["total"], float64(5))
 		assertEqual(t, data["limit"], float64(2))
 		assertEqual(t, data["offset"], float64(1))
@@ -2513,9 +2563,9 @@ func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
 		if len(items) != 3 {
 			t.Fatalf("items len = %d, want 3", len(items))
 		}
-		assertEqual(t, items[0].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_1")
 		assertEqual(t, items[1].(map[string]any)["id"], "loop_2")
-		assertEqual(t, items[2].(map[string]any)["id"], "loop_1")
+		assertEqual(t, items[2].(map[string]any)["id"], "loop_5")
 		assertEqual(t, data["total"], float64(5))
 		assertEqual(t, data["offset"], float64(2))
 		if _, ok := data["limit"]; ok {

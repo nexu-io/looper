@@ -60,6 +60,19 @@ func TestWithBoundaryAppliesWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestClassifyWrappedLocalWorktreeOverridesStepRemoteBoundary(t *testing.T) {
+	// Reviewer worktree steps default to git_remote (fetch), but a confirmed
+	// local integrity failure must park as MI rather than infinite transient retry.
+	err := WithBoundary(
+		errors.New("worktree path /tmp/wt is unusable and not empty; manual intervention required"),
+		BoundaryLocalWorktree,
+	)
+	got := Classify(err, Context{Runner: RunnerReviewer, Boundary: BoundaryGitRemote})
+	if got != ManualIntervention {
+		t.Fatalf("Classify() = %s, want %s", got, ManualIntervention)
+	}
+}
+
 func TestClassifyRetriesGitHubGraphQLUnauthorizedAtGitHubBoundary(t *testing.T) {
 	got := Classify(errors.New(`Post "https://api.github.com/graphql": HTTP 401 Unauthorized`), Context{Runner: RunnerReviewer, Boundary: BoundaryGitHubAPI})
 	if got != RetryableTransient {

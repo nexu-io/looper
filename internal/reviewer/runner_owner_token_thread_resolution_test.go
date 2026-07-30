@@ -126,6 +126,8 @@ func TestReviewerWorktreePreparedRejectsFixerOwnedPath(t *testing.T) {
 	if err := os.MkdirAll(wtPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
+	// Prepared reuse requires a usable local checkout, not just path existence.
+	writeMinimalUsableGitCheckout(t, wtPath)
 	checkpoint := reviewerCheckpoint{
 		Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", PreparedAt: "2026-04-11T12:00:00.000Z"},
 	}
@@ -137,5 +139,36 @@ func TestReviewerWorktreePreparedRejectsFixerOwnedPath(t *testing.T) {
 	}
 	if reviewerWorktreePrepared(checkpoint) {
 		t.Fatal("reviewerWorktreePrepared() = true, want false when fixer marker present")
+	}
+}
+
+func TestReviewerWorktreePreparedRejectsHollowCheckout(t *testing.T) {
+	t.Parallel()
+
+	wtPath := filepath.Join(t.TempDir(), "hollow-wt")
+	if err := os.MkdirAll(filepath.Join(wtPath, ".tmp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	checkpoint := reviewerCheckpoint{
+		Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", PreparedAt: "2026-04-11T12:00:00.000Z"},
+	}
+	if reviewerWorktreePrepared(checkpoint) {
+		t.Fatal("reviewerWorktreePrepared() = true for hollow path, want false so CreateWorktree runs")
+	}
+	if !reviewerWorktreeNeedsPrepare(checkpoint) {
+		t.Fatal("reviewerWorktreeNeedsPrepare() = false for hollow path, want true")
+	}
+}
+
+func writeMinimalUsableGitCheckout(t *testing.T, path string) {
+	t.Helper()
+	gitDir := filepath.Join(path, ".git")
+	for _, sub := range []string{"objects", "refs"} {
+		if err := os.MkdirAll(filepath.Join(gitDir, sub), 0o755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", sub, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
 	}
 }

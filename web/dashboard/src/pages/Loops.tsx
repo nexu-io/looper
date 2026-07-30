@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { Inbox, RefreshCw, Repeat } from "lucide-react";
+import { AttemptsCell } from "@/components/AttemptsCell";
 import { DataTable, type Column } from "@/components/DataTable";
 import { LoopActionBar } from "@/components/LoopActionBar";
+import { LoopTypeBadge } from "@/components/LoopTypeBadge";
 import { PanelError } from "@/components/PanelError";
+import { PullRequestLink } from "@/components/PullRequestLink";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { fetchLoops, type ActiveRun, type Loop } from "@/lib/api";
+import { fetchLoops, type ActiveRun, type Loop, type Project } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
   formatAge,
   formatAttempts,
-  formatTs,
+  pullRequestUrl,
   truncateReason,
 } from "@/lib/format";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
@@ -53,6 +57,28 @@ function targetLabel(loop: Loop): string {
   return loop.targetType || "—";
 }
 
+function TargetCell({
+  loop,
+  project,
+}: {
+  loop: Loop;
+  project?: Project;
+}) {
+  const label = targetLabel(loop);
+  const href = pullRequestUrl(loop.repo, loop.prNumber, {
+    repoUrl: project?.repoUrl,
+    provider: project?.provider,
+  });
+  if (!href) {
+    return (
+      <span className="mono" title={label}>
+        {label}
+      </span>
+    );
+  }
+  return <PullRequestLink href={href}>{label}</PullRequestLink>;
+}
+
 function agentLabel(run: ActiveRun | undefined): string {
   if (!run?.agent) return "—";
   const agent = run.agent;
@@ -70,6 +96,20 @@ function rowAttempts(l: LoopRow): string {
   );
 }
 
+/** Same precedence as `rowAttempts`, but returns the raw pair for AttemptsCell. */
+function rowAttemptsPair(
+  l: LoopRow,
+): { attempts: number; maxAttempts: number | null | undefined } | null {
+  if (l.attempts != null && !Number.isNaN(Number(l.attempts))) {
+    return { attempts: Number(l.attempts), maxAttempts: l.maxAttempts };
+  }
+  const r = l.activeRun;
+  if (r?.attempts != null && !Number.isNaN(Number(r.attempts))) {
+    return { attempts: Number(r.attempts), maxAttempts: r.maxAttempts };
+  }
+  return null;
+}
+
 function rowReason(l: LoopRow): { display: string; full: string | null } {
   const full =
     (l.lastFailureReason && l.lastFailureReason.trim()) ||
@@ -83,7 +123,14 @@ function rowReason(l: LoopRow): { display: string; full: string | null } {
 export function LoopsPage() {
   const navigate = useNavigate();
   const { projectId } = useProjectFilter();
-  const { activeRuns } = useDashboardData();
+  const { activeRuns, projects } = useDashboardData();
+  const projectsById = useMemo(() => {
+    const map = new Map<string, Project>();
+    for (const p of projects.data?.items ?? []) {
+      map.set(p.id, p);
+    }
+    return map;
+  }, [projects.data]);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>(
     DEFAULT_STATUS_FILTER,
   );
@@ -162,18 +209,24 @@ export function LoopsPage() {
       {
         key: "seq",
         header: "Seq",
+        width: "4.5rem",
         cell: (l) => <span className="mono text-[var(--accent)]">{l.seq}</span>,
       },
       {
         key: "type",
         header: "Type",
-        cell: (l) => <span className="mono">{l.type}</span>,
+        width: "6.5rem",
+        cell: (l) => <LoopTypeBadge type={l.type} size="sm" />,
       },
       {
         key: "projectId",
         header: "Project",
+        width: "8rem",
         cell: (l) => (
-          <span className="mono text-[var(--text-muted)]" title={l.projectId}>
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={l.projectId}
+          >
             {l.projectId}
           </span>
         ),
@@ -181,13 +234,18 @@ export function LoopsPage() {
       {
         key: "status",
         header: "Status",
+        width: "7.5rem",
         cell: (l) => <StatusChip status={l.status} />,
       },
       {
         key: "step",
         header: "Step",
+        width: "8rem",
         cell: (l) => (
-          <span className="mono text-[var(--text-muted)]">
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={l.activeRun?.currentStep ?? undefined}
+          >
             {l.activeRun?.currentStep ?? "—"}
           </span>
         ),
@@ -195,17 +253,20 @@ export function LoopsPage() {
       {
         key: "target",
         header: "Target",
+        width: "14rem",
         cell: (l) => (
-          <span className="mono" title={targetLabel(l)}>
-            {targetLabel(l)}
-          </span>
+          <TargetCell loop={l} project={projectsById.get(l.projectId)} />
         ),
       },
       {
         key: "agent",
         header: "Agent / PID",
+        width: "9rem",
         cell: (l) => (
-          <span className="mono text-[var(--text-muted)]">
+          <span
+            className="mono block min-w-0 truncate text-[var(--text-muted)]"
+            title={agentLabel(l.activeRun)}
+          >
             {agentLabel(l.activeRun)}
           </span>
         ),
@@ -213,18 +274,31 @@ export function LoopsPage() {
       {
         key: "attempts",
         header: "Attempts",
-        cell: (l) => (
-          <span className="mono text-[var(--text-muted)]">{rowAttempts(l)}</span>
-        ),
+        width: "5rem",
+        cell: (l) => {
+          const pair = rowAttemptsPair(l);
+          if (!pair) {
+            return <span className="mono text-[var(--text-muted)]">—</span>;
+          }
+          return (
+            <span title={rowAttempts(l)}>
+              <AttemptsCell
+                attempts={pair.attempts}
+                maxAttempts={pair.maxAttempts}
+              />
+            </span>
+          );
+        },
       },
       {
         key: "reason",
         header: "Reason",
+        width: "12rem",
         cell: (l) => {
           const { display, full } = rowReason(l);
           return (
             <span
-              className="mono text-[var(--text-muted)] max-w-[14rem] truncate inline-block align-bottom"
+              className="mono block min-w-0 truncate text-[var(--text-muted)]"
               title={full ?? undefined}
             >
               {display}
@@ -235,17 +309,26 @@ export function LoopsPage() {
       {
         key: "age",
         header: "Age",
-        cell: (l) => (
-          <span className="mono text-[var(--text-muted)]">
-            {l.activeRun?.startedAt
-              ? formatAge(l.activeRun.startedAt)
-              : formatTs(l.updatedAt)}
-          </span>
-        ),
+        width: "5.5rem",
+        cell: (l) => {
+          // Elapsed duration, never absolute timestamps. Prefer live run start,
+          // then last run, then loop creation.
+          const since =
+            l.activeRun?.startedAt ?? l.lastRunAt ?? l.createdAt ?? null;
+          return (
+            <span
+              className="mono block min-w-0 truncate text-[var(--text-muted)]"
+              title={since ?? undefined}
+            >
+              {formatAge(since)}
+            </span>
+          );
+        },
       },
       {
         key: "actions",
         header: "Actions",
+        width: "11rem",
         stopRowClick: true,
         cell: (l) => (
           <LoopActionBar
@@ -258,7 +341,7 @@ export function LoopsPage() {
         ),
       },
     ],
-    [onMutated],
+    [onMutated, projectsById],
   );
 
   const emptyLabel =
@@ -266,10 +349,24 @@ export function LoopsPage() {
       ? "No loops"
       : `No loops with status=${statusFilter}`;
 
+  const emptyNode = (
+    <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+      <Inbox size={14} className="shrink-0" aria-hidden />
+      {emptyLabel}
+    </span>
+  );
+
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="m-0 text-[15px] font-semibold">Loops</h1>
+        <h1 className="m-0 inline-flex items-center gap-1.5 text-[15px] font-semibold">
+          <Repeat
+            size={15}
+            className="shrink-0 text-[var(--text-muted)]"
+            aria-hidden
+          />
+          Loops
+        </h1>
         <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
           <label className="flex items-center gap-1.5">
             <span className="uppercase tracking-wide">Status</span>
@@ -291,7 +388,8 @@ export function LoopsPage() {
           {projectId ? (
             <span className="mono">project: {projectId}</span>
           ) : null}
-          <Button variant="ghost" size="sm" onClick={refresh}>
+          <Button variant="ghost" size="sm" className="gap-1.5" onClick={refresh}>
+            <RefreshCw size={13} className="shrink-0" aria-hidden />
             Refresh
           </Button>
         </div>
@@ -315,7 +413,7 @@ export function LoopsPage() {
               columns={columns}
               rows={rows}
               rowKey={(l) => l.id}
-              empty={emptyLabel}
+              empty={emptyNode}
               onRowClick={onRowClick}
             />
             {total != null && total > 0 && totalPages != null ? (

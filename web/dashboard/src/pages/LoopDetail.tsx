@@ -8,7 +8,9 @@ import {
 } from "react";
 import { Link, useParams } from "react-router-dom";
 import { LoopActionBar } from "@/components/LoopActionBar";
+import { LoopTypeBadge } from "@/components/LoopTypeBadge";
 import { PanelError } from "@/components/PanelError";
+import { PullRequestLink } from "@/components/PullRequestLink";
 import { RecoveryCard } from "@/components/RecoveryCard";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
@@ -17,12 +19,21 @@ import {
   fetchLoop,
   openLoopLogsStream,
   respondLoop,
+  type ActiveRun,
   type Loop,
   type LoopLogsChunk,
   type LoopLogsSnapshot,
+  type Project,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
-import { formatAttempts, formatTs } from "@/lib/format";
+import {
+  formatAttempts,
+  formatTs,
+  issueUrl,
+  parseIssueTargetId,
+  pullRequestUrl,
+  repositoryUrl,
+} from "@/lib/format";
 import { capLogChunk, capLogSeed, trimLogBuffer } from "@/lib/logBuffer";
 import {
   type LogsStreamPhase,
@@ -63,6 +74,97 @@ function Kv({ label, value }: { label: string; value: ReactNode }) {
     <div className="grid grid-cols-[110px_1fr] gap-2 py-0.5 text-[12px]">
       <dt className="text-[var(--text-muted)]">{label}</dt>
       <dd className="m-0 break-all mono">{value}</dd>
+    </div>
+  );
+}
+
+type ForgeLinkPalette = "accent" | "warn";
+
+const FORGE_LINK_CLASSES: Record<ForgeLinkPalette, string> = {
+  accent:
+    "text-[var(--accent)] focus-visible:outline-[var(--accent)] [--forge-border:color-mix(in_srgb,var(--accent)_40%,transparent)] [--forge-border-hover:var(--accent)]",
+  warn: "text-[var(--warn)] focus-visible:outline-[var(--warn)] [--forge-border:color-mix(in_srgb,var(--warn)_45%,transparent)] [--forge-border-hover:var(--warn)]",
+};
+
+function ForgeLink({
+  href,
+  label,
+  children,
+  palette = "accent",
+}: {
+  href: string;
+  label: string;
+  children: ReactNode;
+  palette?: ForgeLinkPalette;
+}) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      title={href}
+      className={`group inline-flex max-w-full items-baseline gap-1 rounded-[2px] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 ${FORGE_LINK_CLASSES[palette]}`}
+    >
+      <span className="text-[10px] font-semibold uppercase tracking-wider opacity-70 group-hover:opacity-100">
+        {label}
+      </span>
+      <span className="mono truncate border-b border-[var(--forge-border)] text-[12px] transition-[border-color] group-hover:border-[var(--forge-border-hover)] group-focus-visible:border-[var(--forge-border-hover)]">
+        {children}
+      </span>
+      <span
+        aria-hidden="true"
+        className="shrink-0 text-[0.85em] opacity-60 transition-[opacity,transform] group-hover:-translate-y-px group-hover:opacity-100"
+      >
+        ↗
+      </span>
+    </a>
+  );
+}
+
+function TargetLinks({
+  loop,
+  repoUrl,
+  provider,
+}: {
+  loop: Loop;
+  repoUrl?: string | null;
+  provider?: string | null;
+}) {
+  const prHref = pullRequestUrl(loop.repo, loop.prNumber, { repoUrl, provider });
+  const prLabel =
+    loop.repo && loop.prNumber != null
+      ? `${loop.repo}#${loop.prNumber}`
+      : prHref
+      ? `#${loop.prNumber}`
+      : null;
+
+  // Worker loops targeting an issue store targetId as `issue:{repo}:{n}`.
+  const isWorker = (loop.type ?? "").toLowerCase() === "worker";
+  const parsedIssue =
+    isWorker && loop.targetType === "issue"
+      ? parseIssueTargetId(loop.targetId)
+      : null;
+  const issueHref = parsedIssue
+    ? issueUrl(parsedIssue.repo, parsedIssue.issueNumber, { repoUrl })
+    : null;
+  const issueLabel = parsedIssue
+    ? `${parsedIssue.repo}#${parsedIssue.issueNumber}`
+    : null;
+
+  if (!prHref && !issueHref) return null;
+
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+      {prHref && prLabel ? (
+        <ForgeLink href={prHref} label="PR" palette="accent">
+          {prLabel}
+        </ForgeLink>
+      ) : null}
+      {issueHref && issueLabel ? (
+        <ForgeLink href={issueHref} label="Issue" palette="warn">
+          {issueLabel}
+        </ForgeLink>
+      ) : null}
     </div>
   );
 }
@@ -486,9 +588,144 @@ function LogsPane({ selector }: { selector: string }) {
   );
 }
 
+function agentLabel(run: ActiveRun): string {
+  const agent = run.agent;
+  if (!agent) return "";
+  const pid = agent.pid != null ? ` · pid ${agent.pid}` : "";
+  return `${agent.vendor || "agent"}${pid}`;
+}
+
+function targetSummaryText(loop: Loop): string {
+  if (loop.repo && loop.prNumber != null) {
+    return `${loop.repo}#${loop.prNumber}`;
+  }
+  if (loop.targetType === "issue" && loop.targetId) {
+    const parsed = parseIssueTargetId(loop.targetId);
+    if (parsed) return `${parsed.repo}#${parsed.issueNumber}`;
+  }
+  if (loop.repo) return loop.repo;
+  if (loop.targetId) return loop.targetId;
+  return loop.targetType || "—";
+}
+
+function targetSummaryHref(
+  loop: Loop,
+  project?: Project,
+): string | null {
+  const repoUrl = project?.repoUrl;
+  const provider = project?.provider;
+  const prHref = pullRequestUrl(loop.repo, loop.prNumber, { repoUrl, provider });
+  if (prHref) return prHref;
+  if (loop.targetType === "issue" && loop.targetId) {
+    const parsed = parseIssueTargetId(loop.targetId);
+    if (parsed) {
+      const href = issueUrl(parsed.repo, parsed.issueNumber, { repoUrl });
+      if (href) return href;
+    }
+  }
+  return repositoryUrl(loop.repo, repoUrl);
+}
+
+function TargetSummaryValue({
+  loop,
+  project,
+}: {
+  loop: Loop;
+  project?: Project;
+}) {
+  const label = targetSummaryText(loop);
+  const href = targetSummaryHref(loop, project);
+  if (!href) return label;
+  return <PullRequestLink href={href}>{label}</PullRequestLink>;
+}
+
+function SummaryCard({
+  loop,
+  project,
+  activeRun,
+  error,
+  onRetry,
+}: {
+  loop: Loop;
+  project?: Project;
+  activeRun?: ActiveRun;
+  error?: string | null;
+  onRetry: () => void;
+}) {
+  const attempts = formatAttempts(loop.attempts, loop.maxAttempts);
+  const failureKind = loop.lastFailureKind?.trim();
+  const failureReason = loop.lastFailureReason?.trim();
+  const resumePolicy = loop.resumePolicy?.trim();
+  const currentStep = activeRun?.currentStep?.trim();
+  const agent = activeRun ? agentLabel(activeRun) : "";
+
+  return (
+    <Card title="Summary">
+      {error ? (
+        <div className="mb-2">
+          <PanelError message={error} onRetry={onRetry} />
+        </div>
+      ) : null}
+      <dl className="m-0 columns-1 gap-x-6 md:columns-2">
+        <Kv
+          label="Project"
+          value={
+            project ? (
+              <span>
+                <span>{project.name}</span>
+                <span className="ml-1 text-[var(--text-muted)]">
+                  {loop.projectId}
+                </span>
+              </span>
+            ) : (
+              loop.projectId
+            )
+          }
+        />
+        <Kv
+          label="Target"
+          value={<TargetSummaryValue loop={loop} project={project} />}
+        />
+        <Kv label="Target type" value={loop.targetType} />
+        <Kv label="Target ID" value={loop.targetId ?? "—"} />
+        <Kv label="ID" value={loop.id} />
+        <Kv label="Attempts" value={attempts ?? "—"} />
+        {currentStep ? <Kv label="Current step" value={currentStep} /> : null}
+        {agent ? <Kv label="Agent" value={agent} /> : null}
+        <Kv label="Last run" value={formatTs(loop.lastRunAt)} />
+        <Kv label="Next run" value={formatTs(loop.nextRunAt)} />
+        <Kv label="Created" value={formatTs(loop.createdAt)} />
+        <Kv label="Updated" value={formatTs(loop.updatedAt)} />
+        {resumePolicy ? (
+          <Kv label="Resume policy" value={resumePolicy} />
+        ) : null}
+        {failureKind ? <Kv label="Failure kind" value={failureKind} /> : null}
+      </dl>
+      {failureReason ? (
+        <div className="mt-2">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+            Failure reason
+          </div>
+          <pre
+            title={failureReason}
+            className="mono m-0 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded border p-2 text-[11px] leading-snug"
+            style={{
+              borderColor:
+                "color-mix(in srgb, var(--danger) 40%, var(--border))",
+              background: "var(--bg)",
+            }}
+          >
+            {failureReason}
+          </pre>
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
 export function LoopDetailPage() {
   const { selector = "" } = useParams<{ selector: string }>();
-  const { activeRuns } = useDashboardData();
+  const { activeRuns, projects } = useDashboardData();
 
   const fetcher = useCallback(
     (signal: AbortSignal) => fetchLoop(selector, signal),
@@ -504,17 +741,22 @@ export function LoopDetailPage() {
   const activeRunItems = activeRuns.data?.items;
   const forceRefreshActiveRuns = activeRuns.forceRefresh;
 
-  const hasActiveRun = useMemo(() => {
-    if (!data) return false;
+  const activeRun = useMemo(() => {
+    if (!data) return undefined;
     const items = activeRunItems ?? [];
-    return items.some(
-      (r) => r.loopId === data.id || r.seq === data.seq,
-    );
+    return items.find((r) => r.loopId === data.id || r.seq === data.seq);
   }, [activeRunItems, data]);
+
+  const hasActiveRun = Boolean(activeRun);
 
   const onMutated = useCallback(async () => {
     await Promise.all([forceRefresh(), forceRefreshActiveRuns()]);
   }, [forceRefresh, forceRefreshActiveRuns]);
+
+  const project = useMemo(() => {
+    if (!data) return undefined;
+    return projects.data?.items.find((p) => p.id === data.projectId);
+  }, [data, projects.data]);
 
   if (!selector) {
     return <PanelError message="Missing loop selector" />;
@@ -522,17 +764,26 @@ export function LoopDetailPage() {
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <Link
             to="/loops"
             className="text-[12px] text-[var(--text-muted)] hover:text-[var(--text)]"
           >
             ← Loops
           </Link>
-          <h1 className="m-0 text-[15px] font-semibold">
-            Loop{" "}
-            <span className="mono">{data ? `#${data.seq}` : selector}</span>
+          <h1 className="m-0 flex items-center gap-2 text-[15px] font-semibold">
+            {data ? (
+              <>
+                <LoopTypeBadge type={data.type} />
+                <span className="mono">#{data.seq}</span>
+              </>
+            ) : (
+              <>
+                <span>Loop</span>
+                <span className="mono">{selector}</span>
+              </>
+            )}
           </h1>
           {data ? (
             <>
@@ -544,9 +795,15 @@ export function LoopDetailPage() {
             </>
           ) : null}
         </div>
-        <Button variant="ghost" size="sm" onClick={refresh}>
-          Refresh
-        </Button>
+        {data ? (
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-x-3 gap-y-1">
+            <TargetLinks
+              loop={data}
+              repoUrl={project?.repoUrl}
+              provider={project?.provider}
+            />
+          </div>
+        ) : null}
       </div>
 
       {/* Recovery card is prominent and appears above generic actions when
@@ -561,6 +818,8 @@ export function LoopDetailPage() {
         />
       ) : null}
 
+      {data ? <HITLDecisionCard loop={data} onMutated={onMutated} /> : null}
+
       {data ? (
         <Card title="Actions">
           <LoopActionBar
@@ -574,81 +833,25 @@ export function LoopDetailPage() {
         </Card>
       ) : null}
 
-      {data ? <HITLDecisionCard loop={data} onMutated={onMutated} /> : null}
-
-      <Card title="Metadata">
-        {error && !data ? (
+      {data ? (
+        <SummaryCard
+          loop={data}
+          project={project}
+          activeRun={activeRun}
+          error={error}
+          onRetry={refresh}
+        />
+      ) : error ? (
+        <Card title="Summary">
           <PanelError message={error} onRetry={refresh} />
-        ) : loading && !data ? (
+        </Card>
+      ) : loading ? (
+        <Card title="Summary">
           <p className="m-0 text-[12px] text-[var(--text-muted)]">
             Loading loop…
           </p>
-        ) : data ? (
-          <>
-            {error ? (
-              <div className="mb-2">
-                <PanelError message={error} onRetry={refresh} />
-              </div>
-            ) : null}
-            <dl className="m-0 columns-1 gap-x-6 md:columns-2">
-              <Kv label="Seq" value={data.seq} />
-              <Kv label="ID" value={data.id} />
-              <Kv label="Type" value={data.type} />
-              <Kv label="Status" value={<StatusChip status={data.status} />} />
-              <Kv
-                label="Display"
-                value={
-                  data.displayStatus?.trim() ? (
-                    <StatusChip status={data.displayStatus} />
-                  ) : (
-                    "—"
-                  )
-                }
-              />
-              <Kv label="Project" value={data.projectId} />
-              <Kv label="Target type" value={data.targetType} />
-              <Kv label="Target ID" value={data.targetId ?? "—"} />
-              <Kv label="Repo" value={data.repo ?? "—"} />
-              <Kv
-                label="PR"
-                value={data.prNumber != null ? String(data.prNumber) : "—"}
-              />
-              <Kv
-                label="Attempts"
-                value={
-                  formatAttempts(data.attempts, data.maxAttempts) ?? "—"
-                }
-              />
-              <Kv
-                label="Error kind"
-                value={
-                  data.lastFailureKind?.trim()
-                    ? data.lastFailureKind.trim()
-                    : "—"
-                }
-              />
-              <Kv
-                label="Error / reason"
-                value={
-                  data.lastFailureReason?.trim() ? (
-                    <span className="whitespace-pre-wrap break-words">
-                      {data.lastFailureReason.trim()}
-                    </span>
-                  ) : (
-                    "—"
-                  )
-                }
-              />
-              <Kv label="Last run" value={formatTs(data.lastRunAt)} />
-              <Kv label="Next run" value={formatTs(data.nextRunAt)} />
-              <Kv label="Created" value={formatTs(data.createdAt)} />
-              <Kv label="Updated" value={formatTs(data.updatedAt)} />
-            </dl>
-          </>
-        ) : (
-          <p className="m-0 text-[12px] text-[var(--text-muted)]">No data</p>
-        )}
-      </Card>
+        </Card>
+      ) : null}
 
       {/* Remount on selector change so log buffer/stream state never leaks. */}
       <div id="loop-logs">
