@@ -2038,12 +2038,15 @@ func TestResolveProjectProviderKind(t *testing.T) {
 	t.Parallel()
 
 	tokenEnv := "FORGEJO_TOKEN"
+	planeTokenEnv := "PLANE_TOKEN"
 	cfg := config.Config{
 		Providers: []config.ProviderConfig{
 			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
+			{ID: "plane-main", Kind: config.ProviderKindPlane, BaseURL: "https://plane.example.com/api/v1", TokenEnv: &planeTokenEnv},
 		},
 		Projects: []config.ProjectRefConfig{
 			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+			{ID: "configured-plane", Name: "Plane", Provider: "plane-main", Repo: "acme/looper", RepoPath: "/tmp/looper"},
 		},
 	}
 
@@ -2056,18 +2059,27 @@ func TestResolveProjectProviderKind(t *testing.T) {
 	if got := resolveProjectProviderKind(cfg, "legacy-github", map[string]any{"repo": "acme/looper"}); got != "github" {
 		t.Fatalf("legacy github = %q, want github", got)
 	}
+	if got := resolveProjectProviderKind(cfg, "configured-plane", map[string]any{}); got != "plane" {
+		t.Fatalf("configured plane = %q, want plane", got)
+	}
+	if got := resolveProjectProviderKind(cfg, "api-plane", map[string]any{"provider": "plane-main", "repo": "acme/looper"}); got != "plane" {
+		t.Fatalf("metadata plane = %q, want plane", got)
+	}
 }
 
 func TestResolveProjectRepoURL(t *testing.T) {
 	t.Parallel()
 
 	tokenEnv := "FORGEJO_TOKEN"
+	planeTokenEnv := "PLANE_TOKEN"
 	cfg := config.Config{
 		Providers: []config.ProviderConfig{
 			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com/", TokenEnv: &tokenEnv},
+			{ID: "plane-main", Kind: config.ProviderKindPlane, BaseURL: "https://plane.example.com/api/v1", TokenEnv: &planeTokenEnv},
 		},
 		Projects: []config.ProjectRefConfig{
 			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+			{ID: "configured-plane", Name: "Plane", Provider: "plane-main", Repo: "acme/looper", RepoPath: "/tmp/looper"},
 		},
 	}
 
@@ -2084,6 +2096,12 @@ func TestResolveProjectRepoURL(t *testing.T) {
 	ghRepo := "acme/looper"
 	if got := resolveProjectRepoURL(cfg, "legacy-github", map[string]any{}, &ghRepo); got == nil || *got != "https://github.com/acme/looper" {
 		t.Fatalf("legacy github repoUrl = %v, want https://github.com/acme/looper", got)
+	}
+
+	// Plane reports provider "plane" but code links use GitHub.
+	planeRepo := "acme/looper"
+	if got := resolveProjectRepoURL(cfg, "configured-plane", map[string]any{}, &planeRepo); got == nil || *got != "https://github.com/acme/looper" {
+		t.Fatalf("configured plane repoUrl = %v, want https://github.com/acme/looper", got)
 	}
 }
 

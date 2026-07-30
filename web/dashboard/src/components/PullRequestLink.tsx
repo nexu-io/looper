@@ -25,6 +25,13 @@ export function PullRequestLink({
       rel="noreferrer"
       title={title ?? href}
       onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        // DataTable rows handle Enter/Space for navigation; keep those keys on
+        // the forge link so keyboard users can activate the external href.
+        if (e.key === "Enter" || e.key === " ") {
+          e.stopPropagation();
+        }
+      }}
       className={[
         "mono group inline-flex max-w-full items-baseline gap-1",
         "text-[var(--accent)]",

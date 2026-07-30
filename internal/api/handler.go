@@ -2318,8 +2318,9 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 
 func parseLoopsListOptions(r *http.Request) (storage.ListLoopsOptions, error) {
 	opts := storage.ListLoopsOptions{
-		Status:    strings.TrimSpace(r.URL.Query().Get("status")),
-		ProjectID: strings.TrimSpace(r.URL.Query().Get("projectId")),
+		Status:            strings.TrimSpace(r.URL.Query().Get("status")),
+		ProjectID:         strings.TrimSpace(r.URL.Query().Get("projectId")),
+		OrderByStatusTier: true, // dashboard list only; repository List() stays newest-first
 	}
 
 	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
@@ -7562,8 +7563,8 @@ func resolveProjectProvider(cfg config.Config, projectID string, metadata map[st
 			continue
 		}
 		if provider.Kind == config.ProviderKindPlane {
-			// Plane projects still host code on GitHub in current model.
-			return config.ProviderKindGitHub, "https://github.com", true
+			// Plane remains the reported task-source provider; code hosting is GitHub.
+			return config.ProviderKindPlane, "https://github.com", true
 		}
 		base := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
 		if provider.Kind == config.ProviderKindGitHub && base == "" {

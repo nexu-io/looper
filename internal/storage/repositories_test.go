@@ -2289,7 +2289,7 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 		}
 	}
 
-	// Distinct updated_at; default order is status tier then updated_at DESC, seq DESC.
+	// Distinct updated_at; default generic order is newest-first (updated_at DESC, seq DESC).
 	loops := []LoopRecord{
 		{ID: "loop_1", Seq: 1, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:01.000Z", UpdatedAt: "2026-04-11T12:00:01.000Z"},
 		{ID: "loop_2", Seq: 2, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: "2026-04-11T12:00:02.000Z", UpdatedAt: "2026-04-11T12:00:02.000Z"},
@@ -2310,9 +2310,27 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if len(all) != 5 {
 		t.Fatalf("ListFiltered(unlimited) len = %d, want 5", len(all))
 	}
-	// running (newest first) → paused → failed; completed-like terminal does not lead.
-	if got := loopIDs(all); !reflect.DeepEqual(got, []string{"loop_4", "loop_3", "loop_1", "loop_2", "loop_5"}) {
-		t.Fatalf("ListFiltered(unlimited) order = %v, want status-tier then newest", got)
+	if got := loopIDs(all); !reflect.DeepEqual(got, []string{"loop_5", "loop_4", "loop_3", "loop_2", "loop_1"}) {
+		t.Fatalf("ListFiltered(unlimited) order = %v, want newest-first", got)
+	}
+
+	// List() must stay newest-first so first-match scans (ensureLoop / PR grouping)
+	// pick the latest loop rather than an older higher-status-tier row.
+	listed, err := repos.Loops.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got := loopIDs(listed); !reflect.DeepEqual(got, []string{"loop_5", "loop_4", "loop_3", "loop_2", "loop_1"}) {
+		t.Fatalf("List() order = %v, want newest-first", got)
+	}
+
+	tiered, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{OrderByStatusTier: true})
+	if err != nil {
+		t.Fatalf("ListFiltered(status-tier) error = %v", err)
+	}
+	// running (newest first) → paused → failed
+	if got := loopIDs(tiered); !reflect.DeepEqual(got, []string{"loop_4", "loop_3", "loop_1", "loop_2", "loop_5"}) {
+		t.Fatalf("ListFiltered(status-tier) order = %v, want status-tier then newest", got)
 	}
 
 	total, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{})
@@ -2327,8 +2345,16 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFiltered(limit/offset) error = %v", err)
 	}
-	if got := loopIDs(page); !reflect.DeepEqual(got, []string{"loop_3", "loop_1"}) {
-		t.Fatalf("ListFiltered(limit=2,offset=1) = %v, want [loop_3 loop_1]", got)
+	if got := loopIDs(page); !reflect.DeepEqual(got, []string{"loop_4", "loop_3"}) {
+		t.Fatalf("ListFiltered(limit=2,offset=1) = %v, want [loop_4 loop_3]", got)
+	}
+
+	tieredPage, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{OrderByStatusTier: true, Limit: 2, Offset: 1})
+	if err != nil {
+		t.Fatalf("ListFiltered(status-tier limit/offset) error = %v", err)
+	}
+	if got := loopIDs(tieredPage); !reflect.DeepEqual(got, []string{"loop_3", "loop_1"}) {
+		t.Fatalf("ListFiltered(status-tier limit=2,offset=1) = %v, want [loop_3 loop_1]", got)
 	}
 
 	// Offset without limit must still skip rows (SQLite LIMIT -1 OFFSET n).
@@ -2336,8 +2362,8 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFiltered(offset-only) error = %v", err)
 	}
-	if got := loopIDs(offsetOnly); !reflect.DeepEqual(got, []string{"loop_1", "loop_2", "loop_5"}) {
-		t.Fatalf("ListFiltered(offset=2) = %v, want [loop_1 loop_2 loop_5]", got)
+	if got := loopIDs(offsetOnly); !reflect.DeepEqual(got, []string{"loop_3", "loop_2", "loop_1"}) {
+		t.Fatalf("ListFiltered(offset=2) = %v, want [loop_3 loop_2 loop_1]", got)
 	}
 
 	running, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running"})
@@ -2359,8 +2385,8 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFiltered(projectId) error = %v", err)
 	}
-	if got := loopIDs(projectB); !reflect.DeepEqual(got, []string{"loop_4", "loop_5"}) {
-		t.Fatalf("ListFiltered(projectId=project_b) = %v, want [loop_4 loop_5]", got)
+	if got := loopIDs(projectB); !reflect.DeepEqual(got, []string{"loop_5", "loop_4"}) {
+		t.Fatalf("ListFiltered(projectId=project_b) = %v, want [loop_5 loop_4]", got)
 	}
 
 	combined, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running", ProjectID: "project_a", Limit: 1, Offset: 0})
@@ -2376,6 +2402,41 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	}
 	if combinedTotal != 2 {
 		t.Fatalf("CountFiltered(status+project) = %d, want 2", combinedTotal)
+	}
+}
+
+func TestLoopsListNewestFirstDespiteLowerStatusTier(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{
+		ID: "project_pr", Name: "PR", RepoPath: "/tmp/pr",
+		CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z",
+	}); err != nil {
+		t.Fatalf("Projects.Upsert error = %v", err)
+	}
+	// Older waiting loop vs newer completed loop for the same PR: generic List
+	// must surface the newer completed row first (status tier would invert this).
+	repo := "acme/looper"
+	pr := int64(42)
+	for _, loop := range []LoopRecord{
+		{ID: "loop_old_waiting", Seq: 1, ProjectID: "project_pr", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "waiting", CreatedAt: "2026-04-11T12:00:01.000Z", UpdatedAt: "2026-04-11T12:00:01.000Z"},
+		{ID: "loop_new_completed", Seq: 2, ProjectID: "project_pr", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "completed", CreatedAt: "2026-04-11T12:00:02.000Z", UpdatedAt: "2026-04-11T12:00:02.000Z"},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	listed, err := repos.Loops.List(ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got := loopIDs(listed); !reflect.DeepEqual(got, []string{"loop_new_completed", "loop_old_waiting"}) {
+		t.Fatalf("List() order = %v, want newest completed before older waiting", got)
 	}
 }
 
