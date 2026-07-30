@@ -1648,27 +1648,77 @@ func (r *Runner) recoverWorkerWorktree(ctx context.Context, input stepInput, che
 	if rootErr != nil {
 		return worktree, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
 	}
+	baseBranch := firstNonEmpty(worktree.BaseBranch, work.BaseBranch)
 	restored, restoreErr := r.git.RestoreWorktree(ctx, RestoreWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, Branch: branch, WorktreeRoot: worktreeRoot, ExpectedWorktreePath: worktree.Path})
 	if restoreErr != nil {
+		// Production restore preserves populated unusable paths. Park as MI so
+		// unlimited retry queues cannot storm on the same preserved directory.
+		if errors.Is(restoreErr, worktreesafety.ErrUnusableWorktreePreserved) {
+			return worktree, &loopError{message: restoreErr.Error(), kind: FailureManualIntervention}
+		}
 		return worktree, &loopError{message: fmt.Sprintf("Worker worktree path %s for branch %s is stale (%s) and re-resolving registered git worktrees failed: %v", worktree.Path, branch, reason, restoreErr), kind: FailureRetryableAfterResume}
 	}
-	if restored == nil || strings.TrimSpace(restored.WorktreePath) == "" {
-		return worktree, staleWorkerWorktreeError(worktree, work, reason+" and no active git worktree is registered for that branch")
+	if restored != nil && strings.TrimSpace(restored.WorktreePath) != "" {
+		return r.applyRecoveredWorkerWorktree(ctx, input, checkpoint, worktree, work, recoveredWorkerWorktree{
+			path:       restored.WorktreePath,
+			branch:     firstNonEmpty(restored.Branch, branch),
+			baseBranch: firstNonEmpty(baseBranch, restored.BaseBranch),
+			headSHA:    firstNonEmpty(worktree.HeadSHA, restored.HeadSHA),
+			id:         firstNonEmpty(restored.WorktreeID, worktree.ID),
+		})
 	}
-	recovered := worktree
-	recovered.Path = restored.WorktreePath
-	recovered.Branch = firstNonEmpty(restored.Branch, branch)
-	recovered.BaseBranch = firstNonEmpty(worktree.BaseBranch, restored.BaseBranch, work.BaseBranch)
-	recovered.HeadSHA = firstNonEmpty(worktree.HeadSHA, restored.HeadSHA)
-	recovered.ID = firstNonEmpty(restored.WorktreeID, worktree.ID)
-	checkpoint.Worktree = &recovered
+	// Restore cleared empty/metadata-only leftovers (or found no registered
+	// healthy worktree). Recreate instead of parking as stale-worktree MI.
+	created, createErr := r.git.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:         input.Project.ID,
+		RepoPath:          input.Project.RepoPath,
+		WorktreeRoot:      worktreeRoot,
+		Branch:            branch,
+		BaseBranch:        baseBranch,
+		PRNumber:          work.PRNumber,
+		ProtectedBranches: compactStrings([]string{baseBranch}),
+	})
+	if createErr != nil {
+		if errors.Is(createErr, worktreesafety.ErrUnusableWorktreePreserved) {
+			return worktree, &loopError{message: createErr.Error(), kind: FailureManualIntervention}
+		}
+		return worktree, &loopError{message: fmt.Sprintf("Worker worktree path %s for branch %s is stale (%s) and recreating the worktree failed: %v", worktree.Path, branch, reason, createErr), kind: FailureRetryableAfterResume}
+	}
+	if strings.TrimSpace(created.WorktreePath) == "" {
+		return worktree, staleWorkerWorktreeError(worktree, work, reason+" and create-worktree returned an empty path")
+	}
+	return r.applyRecoveredWorkerWorktree(ctx, input, checkpoint, worktree, work, recoveredWorkerWorktree{
+		path:       created.WorktreePath,
+		branch:     firstNonEmpty(created.Branch, branch),
+		baseBranch: firstNonEmpty(baseBranch, created.BaseBranch),
+		headSHA:    firstNonEmpty(worktree.HeadSHA, created.HeadSHA),
+		id:         firstNonEmpty(created.WorktreeID, worktree.ID),
+	})
+}
+
+type recoveredWorkerWorktree struct {
+	path       string
+	branch     string
+	baseBranch string
+	headSHA    string
+	id         string
+}
+
+func (r *Runner) applyRecoveredWorkerWorktree(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, worktree checkpointWorktree, work workerInput, recovered recoveredWorkerWorktree) (checkpointWorktree, error) {
+	next := worktree
+	next.Path = recovered.path
+	next.Branch = recovered.branch
+	next.BaseBranch = firstNonEmpty(recovered.baseBranch, work.BaseBranch)
+	next.HeadSHA = recovered.headSHA
+	next.ID = recovered.id
+	checkpoint.Worktree = &next
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	if input.Run.ID != "" {
 		if persistErr := r.persistCheckpoint(ctx, input.Run.ID, *checkpoint); persistErr != nil {
 			return worktree, &loopError{message: persistErr.Error(), kind: FailureRetryableAfterResume}
 		}
 	}
-	return recovered, nil
+	return next, nil
 }
 
 func workerWorktreeRoot(project storage.ProjectRecord) (string, error) {

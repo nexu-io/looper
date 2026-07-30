@@ -1356,6 +1356,145 @@ func TestRunExecuteStepRecoversMalformedGitCheckoutAfterPrepare(t *testing.T) {
 	}
 }
 
+// Production RestoreWorktree clears empty/metadata-only hollow leftovers and
+// returns (nil, nil) when no healthy registered worktree remains. Recovery must
+// fall through to CreateWorktree instead of parking as stale-worktree MI.
+func TestRunExecuteStepRecreatesAfterRestoreReturnsNil(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	corruptPath := filepath.Join(worktreeRoot, "hollow-wt")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("gitdir: /missing/gitdir\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	recreatedPath := filepath.Join(worktreeRoot, "recreated")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		restoreNil:    true,
+		createResult:  CreateWorktreeResult{WorktreePath: recreatedPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_created"},
+		inspectResult: InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_restore_nil_recreate", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recreatedPath || checkpoint.Worktree.ID != "worktree_created" {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree after restore nil", checkpoint.Worktree)
+	}
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want 1", git.restoreCalls)
+	}
+	if len(git.createCalls) != 1 || git.createCalls[0].Branch != branch || git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("createCalls = %#v, want CreateWorktree fallback after restore nil", git.createCalls)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recreatedPath {
+		t.Fatalf("agent starts = %#v, want recreated working directory", agent.starts)
+	}
+}
+
+// Production RestoreWorktree preserves populated unusable paths and returns
+// ErrUnusableWorktreePreserved. Recovery must park as FailureManualIntervention
+// so unlimited queues cannot infinite-retry.
+func TestRunExecuteStepParksPreservedUnusableWorktreeAsManualIntervention(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	corruptPath := filepath.Join(worktreeRoot, "populated-hollow")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("gitdir: /missing/gitdir\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, "agent-output.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile agent-output: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	preservedErr := fmt.Errorf("worktree path %s is unusable and not empty; manual intervention required: %w", corruptPath, worktreesafety.ErrUnusableWorktreePreserved)
+	git := &fakeGitGateway{restoreErr: preservedErr}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_preserve_mi", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("runExecuteStep() error = %v, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if !errors.Is(err, worktreesafety.ErrUnusableWorktreePreserved) && !strings.Contains(loopErr.message, "manual intervention required") {
+		t.Fatalf("error = %q, want preserved unusable worktree message", loopErr.message)
+	}
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want 1", git.restoreCalls)
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("createCalls = %#v, want 0 (must not recreate preserved path)", git.createCalls)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts = %#v, want none", agent.starts)
+	}
+	// Queue classification must park under unlimited maxAttempts.
+	if shouldRetryQueueFailure(loopErr.kind, 242, -1) {
+		t.Fatal("preserved unusable worktree must not requeue under unlimited maxAttempts")
+	}
+	got, readErr := os.ReadFile(filepath.Join(corruptPath, "agent-output.txt"))
+	if readErr != nil || string(got) != "keep me\n" {
+		t.Fatalf("agent-output = %q err=%v, want preserved", got, readErr)
+	}
+}
+
 func TestCreateRunContextCopiesPredecessorAgentSnapshotOnResume(t *testing.T) {
 	t.Parallel()
 
@@ -4633,7 +4772,10 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 
 type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
+	createErr      error
 	restoreResult  *RestoreWorktreeResult
+	restoreErr     error
+	restoreNil     bool
 	prepareResult  PrepareWorktreeResult
 	inspectResult  InspectHeadResult
 	inspectResults []InspectHeadResult
@@ -4652,6 +4794,9 @@ type fakeGitGateway struct {
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
 	f.createCalls = append(f.createCalls, input)
+	if f.createErr != nil {
+		return CreateWorktreeResult{}, f.createErr
+	}
 	result := f.createResult
 	if result.WorktreePath == "" {
 		result.WorktreePath = filepath.Join(input.WorktreeRoot, "wt")
@@ -4670,6 +4815,12 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) RestoreWorktree(_ context.Context, input RestoreWorktreeInput) (*RestoreWorktreeResult, error) {
 	f.restoreCalls = append(f.restoreCalls, input)
+	if f.restoreErr != nil {
+		return nil, f.restoreErr
+	}
+	if f.restoreNil {
+		return nil, nil
+	}
 	if f.restoreResult != nil {
 		return f.restoreResult, nil
 	}
