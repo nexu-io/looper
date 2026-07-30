@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatAge,
   formatAttempts,
   issueUrl,
   parseIssueTargetId,
@@ -8,10 +9,29 @@ import {
   truncateReason,
 } from "./format";
 
+describe("formatAge", () => {
+  const now = Date.parse("2026-04-11T12:00:00.000Z");
+
+  it("formats compact elapsed durations", () => {
+    expect(formatAge("2026-04-11T11:59:48.000Z", now)).toBe("12s");
+    expect(formatAge("2026-04-11T11:57:00.000Z", now)).toBe("3m");
+    expect(formatAge("2026-04-11T10:00:00.000Z", now)).toBe("2h");
+    expect(formatAge("2026-04-11T09:40:00.000Z", now)).toBe("2h 20m");
+    expect(formatAge("2026-04-09T12:00:00.000Z", now)).toBe("2d");
+    expect(formatAge("2026-04-09T08:00:00.000Z", now)).toBe("2d 4h");
+  });
+
+  it("returns em dash for missing or invalid input", () => {
+    expect(formatAge(null, now)).toBe("—");
+    expect(formatAge(undefined, now)).toBe("—");
+    expect(formatAge("not-a-date", now)).toBe("—");
+  });
+});
+
 describe("formatAttempts", () => {
-  it("formats current/max including unlimited -1", () => {
+  it("formats current/max including unlimited as infinity", () => {
     expect(formatAttempts(2, 5)).toBe("2/5");
-    expect(formatAttempts(1, -1)).toBe("1/-1");
+    expect(formatAttempts(1, -1)).toBe("1/∞");
     expect(formatAttempts(0, 3)).toBe("0/3");
   });
 

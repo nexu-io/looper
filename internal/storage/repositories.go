@@ -680,7 +680,23 @@ func buildLoopsListQuery(base string, opts ListLoopsOptions, withOrderAndLimit b
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 	if withOrderAndLimit {
-		query += " ORDER BY updated_at DESC, seq DESC"
+		// Active / attention-needed statuses first so recently completed loops
+		// (which bump updated_at) do not dominate the default list page.
+		query += ` ORDER BY CASE status
+			WHEN 'running' THEN 0
+			WHEN 'awaiting_human' THEN 0
+			WHEN 'human_takeover' THEN 0
+			WHEN 'queued' THEN 1
+			WHEN 'paused' THEN 2
+			WHEN 'waiting' THEN 2
+			WHEN 'idle' THEN 2
+			WHEN 'failed' THEN 3
+			WHEN 'interrupted' THEN 3
+			WHEN 'stopped' THEN 4
+			WHEN 'completed' THEN 4
+			WHEN 'terminated' THEN 4
+			ELSE 5
+		END ASC, updated_at DESC, seq DESC`
 		if opts.Limit > 0 {
 			query += " LIMIT ?"
 			args = append(args, opts.Limit)

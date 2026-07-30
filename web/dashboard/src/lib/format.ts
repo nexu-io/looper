@@ -1,4 +1,4 @@
-/** Compact relative age from ISO timestamp (e.g. 12s, 3m, 2h, 1d). */
+/** Compact relative age from ISO timestamp (e.g. 12s, 3m, 2h 3m, 1d 4h). */
 export function formatAge(iso: string | null | undefined, nowMs = Date.now()): string {
   if (!iso) return "—";
   const t = Date.parse(iso);
@@ -8,9 +8,13 @@ export function formatAge(iso: string | null | undefined, nowMs = Date.now()): s
   const min = Math.floor(sec / 60);
   if (min < 60) return `${min}m`;
   const hr = Math.floor(min / 60);
-  if (hr < 48) return `${hr}h`;
+  if (hr < 48) {
+    const remMin = min % 60;
+    return remMin > 0 ? `${hr}h ${remMin}m` : `${hr}h`;
+  }
   const day = Math.floor(hr / 24);
-  return `${day}d`;
+  const remHr = hr % 24;
+  return remHr > 0 ? `${day}d ${remHr}h` : `${day}d`;
 }
 
 export function formatTs(iso: string | null | undefined): string {
@@ -32,7 +36,7 @@ export function formatTs(iso: string | null | undefined): string {
 }
 
 /**
- * Format attempt count as current/max (e.g. "2/5", "1/-1" for unlimited).
+ * Format attempt count as current/max (e.g. "2/5", "1/∞" for unlimited).
  * Returns null when attempt metadata is absent so callers can hide clutter.
  */
 export function formatAttempts(
@@ -46,7 +50,9 @@ export function formatAttempts(
   if (maxAttempts == null || Number.isNaN(Number(maxAttempts))) {
     return String(current);
   }
-  return `${current}/${Math.trunc(Number(maxAttempts))}`;
+  const max = Math.trunc(Number(maxAttempts));
+  // -1 means unlimited in queue/loop policy.
+  return `${current}/${max < 0 ? "∞" : max}`;
 }
 
 /**

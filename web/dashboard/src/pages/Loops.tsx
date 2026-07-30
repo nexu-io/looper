@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { Inbox, RefreshCw, Repeat } from "lucide-react";
+import { AttemptsCell } from "@/components/AttemptsCell";
 import { DataTable, type Column } from "@/components/DataTable";
 import { LoopActionBar } from "@/components/LoopActionBar";
 import { LoopTypeBadge } from "@/components/LoopTypeBadge";
@@ -13,7 +15,6 @@ import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
   formatAge,
   formatAttempts,
-  formatTs,
   pullRequestUrl,
   truncateReason,
 } from "@/lib/format";
@@ -93,6 +94,20 @@ function rowAttempts(l: LoopRow): string {
     formatAttempts(l.activeRun?.attempts, l.activeRun?.maxAttempts) ??
     "—"
   );
+}
+
+/** Same precedence as `rowAttempts`, but returns the raw pair for AttemptsCell. */
+function rowAttemptsPair(
+  l: LoopRow,
+): { attempts: number; maxAttempts: number | null | undefined } | null {
+  if (l.attempts != null && !Number.isNaN(Number(l.attempts))) {
+    return { attempts: Number(l.attempts), maxAttempts: l.maxAttempts };
+  }
+  const r = l.activeRun;
+  if (r?.attempts != null && !Number.isNaN(Number(r.attempts))) {
+    return { attempts: Number(r.attempts), maxAttempts: r.maxAttempts };
+  }
+  return null;
 }
 
 function rowReason(l: LoopRow): { display: string; full: string | null } {
@@ -260,9 +275,20 @@ export function LoopsPage() {
         key: "attempts",
         header: "Attempts",
         width: "5rem",
-        cell: (l) => (
-          <span className="mono text-[var(--text-muted)]">{rowAttempts(l)}</span>
-        ),
+        cell: (l) => {
+          const pair = rowAttemptsPair(l);
+          if (!pair) {
+            return <span className="mono text-[var(--text-muted)]">—</span>;
+          }
+          return (
+            <span title={rowAttempts(l)}>
+              <AttemptsCell
+                attempts={pair.attempts}
+                maxAttempts={pair.maxAttempts}
+              />
+            </span>
+          );
+        },
       },
       {
         key: "reason",
@@ -284,13 +310,20 @@ export function LoopsPage() {
         key: "age",
         header: "Age",
         width: "5.5rem",
-        cell: (l) => (
-          <span className="mono block min-w-0 truncate text-[var(--text-muted)]">
-            {l.activeRun?.startedAt
-              ? formatAge(l.activeRun.startedAt)
-              : formatTs(l.updatedAt)}
-          </span>
-        ),
+        cell: (l) => {
+          // Elapsed duration, never absolute timestamps. Prefer live run start,
+          // then last run, then loop creation.
+          const since =
+            l.activeRun?.startedAt ?? l.lastRunAt ?? l.createdAt ?? null;
+          return (
+            <span
+              className="mono block min-w-0 truncate text-[var(--text-muted)]"
+              title={since ?? undefined}
+            >
+              {formatAge(since)}
+            </span>
+          );
+        },
       },
       {
         key: "actions",
@@ -316,10 +349,24 @@ export function LoopsPage() {
       ? "No loops"
       : `No loops with status=${statusFilter}`;
 
+  const emptyNode = (
+    <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+      <Inbox size={14} className="shrink-0" aria-hidden />
+      {emptyLabel}
+    </span>
+  );
+
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="m-0 text-[15px] font-semibold">Loops</h1>
+        <h1 className="m-0 inline-flex items-center gap-1.5 text-[15px] font-semibold">
+          <Repeat
+            size={15}
+            className="shrink-0 text-[var(--text-muted)]"
+            aria-hidden
+          />
+          Loops
+        </h1>
         <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
           <label className="flex items-center gap-1.5">
             <span className="uppercase tracking-wide">Status</span>
@@ -341,7 +388,8 @@ export function LoopsPage() {
           {projectId ? (
             <span className="mono">project: {projectId}</span>
           ) : null}
-          <Button variant="ghost" size="sm" onClick={refresh}>
+          <Button variant="ghost" size="sm" className="gap-1.5" onClick={refresh}>
+            <RefreshCw size={13} className="shrink-0" aria-hidden />
             Refresh
           </Button>
         </div>
@@ -365,7 +413,7 @@ export function LoopsPage() {
               columns={columns}
               rows={rows}
               rowKey={(l) => l.id}
-              empty={emptyLabel}
+              empty={emptyNode}
               onRowClick={onRowClick}
             />
             {total != null && total > 0 && totalPages != null ? (

@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useNavigate } from "react-router-dom";
+import { FolderGit2, Inbox, RefreshCw } from "lucide-react";
 import { DataTable, type Column } from "@/components/DataTable";
 import { PanelError } from "@/components/PanelError";
 import { PullRequestLink } from "@/components/PullRequestLink";
@@ -117,12 +118,20 @@ export function ProjectsPage() {
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-2">
         <div>
-          <h1 className="m-0 text-[15px] font-semibold">Projects</h1>
+          <h1 className="m-0 inline-flex items-center gap-1.5 text-[15px] font-semibold">
+            <FolderGit2
+              size={15}
+              className="shrink-0 text-[var(--text-muted)]"
+              aria-hidden
+            />
+            Projects
+          </h1>
           <p className="m-0 mt-0.5 text-[11px] text-[var(--text-muted)]">
             Click a row to set the project filter and open Loops.
           </p>
         </div>
-        <Button variant="ghost" size="sm" onClick={refresh}>
+        <Button variant="ghost" size="sm" className="gap-1.5" onClick={refresh}>
+          <RefreshCw size={13} className="shrink-0" aria-hidden />
           Refresh
         </Button>
       </div>
@@ -145,7 +154,12 @@ export function ProjectsPage() {
               columns={columns}
               rows={rows}
               rowKey={(p) => p.id}
-              empty="No projects"
+              empty={
+                <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+                  <Inbox size={14} className="shrink-0" aria-hidden />
+                  No projects
+                </span>
+              }
               onRowClick={onRowClick}
             />
           </>

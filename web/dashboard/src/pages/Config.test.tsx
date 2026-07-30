@@ -152,7 +152,11 @@ describe("ConfigPage", () => {
     expect(await screen.findByRole("heading", { name: "Configuration" })).toBeTruthy();
     const configLink = screen.getByRole("link", { name: "Config" });
     expect(configLink.getAttribute("href")).toBe("/dashboard/config");
-    expect(navItems).toContainEqual({ to: "/config", label: "Config" });
+    expect(
+      navItems.some(
+        (item) => item.to === "/config" && item.label === "Config",
+      ),
+    ).toBe(true);
   });
 
   it("locks env/CLI winners and uses the authoritative PATCH snapshot", async () => {

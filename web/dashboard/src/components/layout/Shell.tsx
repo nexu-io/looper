@@ -1,13 +1,25 @@
 import { useEffect, useMemo } from "react";
 import { Link, NavLink, Outlet } from "react-router-dom";
+import {
+  FolderGit2,
+  LayoutDashboard,
+  Repeat,
+  Settings,
+  type LucideIcon,
+} from "lucide-react";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
 
-export const navItems: { to: string; label: string; end?: boolean }[] = [
-  { to: "/", label: "Overview", end: true },
-  { to: "/loops", label: "Loops" },
-  { to: "/projects", label: "Projects" },
-  { to: "/config", label: "Config" },
+export const navItems: {
+  to: string;
+  label: string;
+  end?: boolean;
+  icon: LucideIcon;
+}[] = [
+  { to: "/", label: "Overview", end: true, icon: LayoutDashboard },
+  { to: "/loops", label: "Loops", icon: Repeat },
+  { to: "/projects", label: "Projects", icon: FolderGit2 },
+  { to: "/config", label: "Config", icon: Settings },
 ];
 
 /** Public asset under Vite base (/dashboard/). */
@@ -118,31 +130,35 @@ export function Shell({
             </span>
           </div>
           <nav className="flex flex-wrap items-center gap-1">
-            {navItems.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                end={item.end}
-                className={({ isActive }) =>
-                  [
-                    "rounded px-2 py-0.5 text-[12px] font-medium",
-                    isActive
-                      ? "bg-[var(--bg-muted)] text-[var(--text)]"
-                      : "text-[var(--text-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--text)]",
-                  ].join(" ")
-                }
-              >
-                {item.label}
-                {item.to === "/loops" &&
-                !activeRuns.error &&
-                activeRuns.data != null &&
-                activeCount > 0 ? (
-                  <span className="ml-1 mono text-[10px] text-[var(--ok)]">
-                    {activeCount}
-                  </span>
-                ) : null}
-              </NavLink>
-            ))}
+            {navItems.map((item) => {
+              const Icon = item.icon;
+              return (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  end={item.end}
+                  className={({ isActive }) =>
+                    [
+                      "inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[12px] font-medium",
+                      isActive
+                        ? "bg-[var(--bg-muted)] text-[var(--text)]"
+                        : "text-[var(--text-muted)] hover:bg-[var(--bg-muted)] hover:text-[var(--text)]",
+                    ].join(" ")
+                  }
+                >
+                  <Icon size={14} className="shrink-0" aria-hidden />
+                  {item.label}
+                  {item.to === "/loops" &&
+                  !activeRuns.error &&
+                  activeRuns.data != null &&
+                  activeCount > 0 ? (
+                    <span className="ml-1 mono text-[10px] text-[var(--ok)]">
+                      {activeCount}
+                    </span>
+                  ) : null}
+                </NavLink>
+              );
+            })}
           </nav>
           <div className="ml-auto flex items-center gap-2">
             <label className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">

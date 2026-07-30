@@ -7,6 +7,8 @@ import {
   type ReactNode,
 } from "react";
 import { useNavigate } from "react-router-dom";
+import { Inbox, LayoutDashboard, RefreshCw } from "lucide-react";
+import { AttemptsCell } from "@/components/AttemptsCell";
 import { DataTable, type Column } from "@/components/DataTable";
 import { LoopActionBar } from "@/components/LoopActionBar";
 import { LoopTypeBadge } from "@/components/LoopTypeBadge";
@@ -324,8 +326,8 @@ export function OverviewPage({
         header: "Attempts",
         width: "5rem",
         cell: (r) => (
-          <span className="mono text-[var(--text-muted)]">
-            {formatAttempts(r.attempts, r.maxAttempts) ?? "—"}
+          <span title={formatAttempts(r.attempts, r.maxAttempts) ?? "—"}>
+            <AttemptsCell attempts={r.attempts} maxAttempts={r.maxAttempts} />
           </span>
         ),
       },
@@ -428,14 +430,23 @@ export function OverviewPage({
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-2">
-        <h1 className="m-0 text-[15px] font-semibold">Overview</h1>
+        <h1 className="m-0 inline-flex items-center gap-1.5 text-[15px] font-semibold">
+          <LayoutDashboard
+            size={15}
+            className="shrink-0 text-[var(--text-muted)]"
+            aria-hidden
+          />
+          Overview
+        </h1>
         <Button
           variant="ghost"
+          className="gap-1.5"
           onClick={() => {
             health.refresh();
             void loadStatus();
           }}
         >
+          <RefreshCw size={13} className="shrink-0" aria-hidden />
           Refresh
         </Button>
       </div>
@@ -603,9 +614,12 @@ export function OverviewPage({
               rows={runningRows}
               rowKey={(r) => r.loopId || String(r.seq)}
               empty={
-                projectId
-                  ? "No running loops for this project"
-                  : "No running loops"
+                <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+                  <Inbox size={14} className="shrink-0" aria-hidden />
+                  {projectId
+                    ? "No running loops for this project"
+                    : "No running loops"}
+                </span>
               }
               onRowClick={onRunningRowClick}
             />

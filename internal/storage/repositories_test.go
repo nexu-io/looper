@@ -2289,7 +2289,7 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 		}
 	}
 
-	// Distinct updated_at so ORDER BY updated_at DESC, seq DESC is deterministic.
+	// Distinct updated_at; default order is status tier then updated_at DESC, seq DESC.
 	loops := []LoopRecord{
 		{ID: "loop_1", Seq: 1, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:01.000Z", UpdatedAt: "2026-04-11T12:00:01.000Z"},
 		{ID: "loop_2", Seq: 2, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: "2026-04-11T12:00:02.000Z", UpdatedAt: "2026-04-11T12:00:02.000Z"},
@@ -2310,8 +2310,9 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if len(all) != 5 {
 		t.Fatalf("ListFiltered(unlimited) len = %d, want 5", len(all))
 	}
-	if all[0].ID != "loop_5" || all[4].ID != "loop_1" {
-		t.Fatalf("ListFiltered(unlimited) order = %v, want newest-first", loopIDs(all))
+	// running (newest first) → paused → failed; completed-like terminal does not lead.
+	if got := loopIDs(all); !reflect.DeepEqual(got, []string{"loop_4", "loop_3", "loop_1", "loop_2", "loop_5"}) {
+		t.Fatalf("ListFiltered(unlimited) order = %v, want status-tier then newest", got)
 	}
 
 	total, err := repos.Loops.CountFiltered(ctx, ListLoopsOptions{})
@@ -2326,8 +2327,8 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFiltered(limit/offset) error = %v", err)
 	}
-	if got := loopIDs(page); !reflect.DeepEqual(got, []string{"loop_4", "loop_3"}) {
-		t.Fatalf("ListFiltered(limit=2,offset=1) = %v, want [loop_4 loop_3]", got)
+	if got := loopIDs(page); !reflect.DeepEqual(got, []string{"loop_3", "loop_1"}) {
+		t.Fatalf("ListFiltered(limit=2,offset=1) = %v, want [loop_3 loop_1]", got)
 	}
 
 	// Offset without limit must still skip rows (SQLite LIMIT -1 OFFSET n).
@@ -2335,8 +2336,8 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFiltered(offset-only) error = %v", err)
 	}
-	if got := loopIDs(offsetOnly); !reflect.DeepEqual(got, []string{"loop_3", "loop_2", "loop_1"}) {
-		t.Fatalf("ListFiltered(offset=2) = %v, want [loop_3 loop_2 loop_1]", got)
+	if got := loopIDs(offsetOnly); !reflect.DeepEqual(got, []string{"loop_1", "loop_2", "loop_5"}) {
+		t.Fatalf("ListFiltered(offset=2) = %v, want [loop_1 loop_2 loop_5]", got)
 	}
 
 	running, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running"})
@@ -2358,8 +2359,8 @@ func TestLoopsListFilteredAndCountFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListFiltered(projectId) error = %v", err)
 	}
-	if got := loopIDs(projectB); !reflect.DeepEqual(got, []string{"loop_5", "loop_4"}) {
-		t.Fatalf("ListFiltered(projectId=project_b) = %v, want [loop_5 loop_4]", got)
+	if got := loopIDs(projectB); !reflect.DeepEqual(got, []string{"loop_4", "loop_5"}) {
+		t.Fatalf("ListFiltered(projectId=project_b) = %v, want [loop_4 loop_5]", got)
 	}
 
 	combined, err := repos.Loops.ListFiltered(ctx, ListLoopsOptions{Status: "running", ProjectID: "project_a", Limit: 1, Offset: 0})
