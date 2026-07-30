@@ -45,6 +45,9 @@ func TestIsStartFailureDetectsMissingExecutableAndBadCWD(t *testing.T) {
 	if !IsStartFailure(err) {
 		t.Fatalf("IsStartFailure(%v) = false, want true", err)
 	}
+	if IsTransientStartFailure(err) {
+		t.Fatalf("IsTransientStartFailure(%v) = true, want false for missing executable", err)
+	}
 
 	badCWD := filepath.Join(t.TempDir(), "missing-dir")
 	_, err = Run(context.Background(), Options{Command: "/bin/sh", Args: []string{"-c", "true"}, CWD: badCWD})
@@ -53,6 +56,9 @@ func TestIsStartFailureDetectsMissingExecutableAndBadCWD(t *testing.T) {
 	}
 	if !IsStartFailure(err) {
 		t.Fatalf("IsStartFailure(%v) = false, want true for bad CWD", err)
+	}
+	if IsTransientStartFailure(err) {
+		t.Fatalf("IsTransientStartFailure(%v) = true, want false for bad CWD", err)
 	}
 
 	// Completed non-zero exit is not a launch failure.
@@ -65,6 +71,41 @@ func TestIsStartFailureDetectsMissingExecutableAndBadCWD(t *testing.T) {
 	}
 	if IsStartFailure(nil) {
 		t.Fatal("IsStartFailure(nil) = true, want false")
+	}
+	if IsTransientStartFailure(nil) {
+		t.Fatal("IsTransientStartFailure(nil) = true, want false")
+	}
+}
+
+func TestIsTransientStartFailureDetectsHostPressureErrnos(t *testing.T) {
+	t.Parallel()
+
+	// Synthetic Run-shaped wrappers: cmd.Start errno values wrap under the
+	// stable "start command:" marker after local ETXTBSY retries are exhausted.
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "EAGAIN", err: fmt.Errorf("start command: %w", syscall.EAGAIN), want: true},
+		{name: "ENOMEM", err: fmt.Errorf("start command: %w", syscall.ENOMEM), want: true},
+		{name: "ETXTBSY", err: fmt.Errorf("start command: %w", syscall.ETXTBSY), want: true},
+		{name: "path EAGAIN", err: fmt.Errorf("start command: %w", &os.PathError{Op: "fork/exec", Path: "/tmp/x", Err: syscall.EAGAIN}), want: true},
+		{name: "ENOENT config", err: fmt.Errorf("start command: %w", &os.PathError{Op: "fork/exec", Path: "/missing", Err: syscall.ENOENT}), want: false},
+		{name: "permission", err: fmt.Errorf("start command: %w", syscall.EACCES), want: false},
+		{name: "non-start", err: syscall.EAGAIN, want: false},
+		{name: "completed command", err: &CommandExecutionError{Message: "Command exited with code 1"}, want: false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsTransientStartFailure(tc.err); got != tc.want {
+				t.Fatalf("IsTransientStartFailure(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+			if tc.want && !IsStartFailure(tc.err) {
+				t.Fatalf("IsStartFailure(%v) = false, want true when transient", tc.err)
+			}
+		})
 	}
 }
 

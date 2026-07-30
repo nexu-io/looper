@@ -87,6 +87,10 @@ func (e *CommandExecutionError) Error() string { return e.Message }
 //     any command output"; this helper only exposes it.
 //   - Why not trust gateway/API error shape alone: gh CLI launch failures
 //     surface as plain exec errors before any hosting response exists.
+//
+// Callers that park failures as non-retryable config must also check
+// IsTransientStartFailure: host-pressure launch errors share the same
+// "start command:" marker but should remain retryable.
 func IsStartFailure(err error) bool {
 	if err == nil {
 		return false
@@ -100,6 +104,34 @@ func IsStartFailure(err error) bool {
 		}
 	}
 	return strings.Contains(err.Error(), "start command:")
+}
+
+// IsTransientStartFailure reports whether err is a process-launch failure
+// caused by temporary host pressure rather than deterministic local config.
+//
+// Covered errno values (after Run's short local ETXTBSY retry is exhausted):
+//   - EAGAIN / EWOULDBLOCK: process table or resource temporarily unavailable
+//   - ENOMEM: cannot allocate memory for the new process
+//   - ETXTBSY: text file busy (binary/script still open for write)
+//
+// These still match IsStartFailure (same "start command:" marker) but a later
+// launch may succeed, so classifiers must not park them as BoundaryConfig.
+func IsTransientStartFailure(err error) bool {
+	if !IsStartFailure(err) {
+		return false
+	}
+	return isTransientStartErrno(err)
+}
+
+func isTransientStartErrno(err error) bool {
+	if err == nil {
+		return false
+	}
+	// EWOULDBLOCK is often identical to EAGAIN; check both for portability.
+	return errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EWOULDBLOCK) ||
+		errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.ETXTBSY)
 }
 
 // Run starts a command under process containment (ADR-0015 / #577).

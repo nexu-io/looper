@@ -2150,14 +2150,16 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 }
 
 // withHostingAPIBoundary tags remote GitHub/hosting transport failures as
-// BoundaryGitHubAPI. Local CLI launch failures (missing/moved gh, inaccessible
-// working directory) keep BoundaryConfig so unlimited fixer queues request
-// intervention instead of retrying forever.
+// BoundaryGitHubAPI. Deterministic local CLI launch failures (missing/moved
+// gh, inaccessible working directory, bad permissions) keep BoundaryConfig so
+// unlimited fixer queues request intervention instead of retrying forever.
+// Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY after the
+// short shell retry) stay BoundaryGitHubAPI so Classify leaves them retryable.
 func withHostingAPIBoundary(err error) error {
 	if err == nil {
 		return nil
 	}
-	if shell.IsStartFailure(err) {
+	if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
 		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 	}
 	return failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)

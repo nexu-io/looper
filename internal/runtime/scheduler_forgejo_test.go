@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -924,6 +925,42 @@ func TestFixerGitHubAdapterTagsLocalCLILaunchFailuresAsConfigBoundary(t *testing
 	assertLocalCLILaunchBoundary(t, "GetPullRequestAuthor", err)
 	_, err = adapter.ViewPullRequest(context.Background(), input)
 	assertLocalCLILaunchBoundary(t, "ViewPullRequest", err)
+}
+
+func TestWithHostingAPIBoundaryLeavesTransientStartFailuresRetryable(t *testing.T) {
+	// Host-pressure launch failures share the "start command:" marker with
+	// missing-binary/bad-CWD errors but must stay BoundaryGitHubAPI so
+	// unlimited fixer queues requeue instead of parking as non_retryable.
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "EAGAIN", err: fmt.Errorf("start command: %w", syscall.EAGAIN)},
+		{name: "ENOMEM", err: fmt.Errorf("start command: %w", syscall.ENOMEM)},
+		{name: "ETXTBSY", err: fmt.Errorf("start command: %w", syscall.ETXTBSY)},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := withHostingAPIBoundary(tc.err)
+			var boundaryErr *failureclass.BoundaryError
+			if !errors.As(got, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
+				t.Fatalf("withHostingAPIBoundary() = %#v, want BoundaryGitHubAPI for transient start failure", got)
+			}
+			if kind := failureclass.Classify(got, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.RetryableTransient {
+				t.Fatalf("Classify() = %s, want retryable_transient for transient start failure", kind)
+			}
+		})
+	}
+
+	// Deterministic config launch failures still park.
+	configErr := withHostingAPIBoundary(fmt.Errorf("start command: %w", exec.ErrNotFound))
+	var boundaryErr *failureclass.BoundaryError
+	if !errors.As(configErr, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+		t.Fatalf("withHostingAPIBoundary(exec.ErrNotFound) = %#v, want BoundaryConfig", configErr)
+	}
+	if kind := failureclass.Classify(configErr, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+		t.Fatalf("Classify() = %s, want non_retryable for deterministic config start failure", kind)
+	}
 }
 
 func TestFixerGitHubAdapterTagsInaccessibleCWDLaunchAsConfigBoundary(t *testing.T) {
