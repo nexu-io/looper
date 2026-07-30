@@ -35,7 +35,6 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 			},
 		},
 		OsascriptPath: scriptPath,
-		LogFilePath:   filepath.Join(rootDir, "logs", "looperd.log"),
 		Repositories:  repos,
 		Now:           func() time.Time { return now },
 	})
@@ -89,10 +88,10 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
 	}
 	osascriptCalls := string(osascriptCallsBytes)
-	assertContains(t, osascriptCalls, "display dialog")
-	assertContains(t, osascriptCalls, "Open Log")
-	assertContains(t, osascriptCalls, "open ")
-	assertContains(t, osascriptCalls, filepath.Join(rootDir, "logs", "looperd.log"))
+	assertContains(t, osascriptCalls, "display notification")
+	if strings.Contains(osascriptCalls, "display dialog") {
+		t.Fatalf("failure notification must not open a dialog: %q", osascriptCalls)
+	}
 }
 
 func TestGatewayUsesLightweightOsascriptNotificationForNonFailureLevels(t *testing.T) {

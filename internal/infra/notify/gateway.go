@@ -41,23 +41,14 @@ type HTTPPostFunc func(url string, body []byte) (int, error)
 type FeishuAppHTTPFunc func(ctx context.Context, method, url string, headers map[string]string, body []byte) (int, []byte, error)
 
 type Options struct {
-	Config           config.NotificationConfig
-	OsascriptPath    string
-	LogFilePath      string
-	DashboardBaseURL string
-	// DashboardAuthMode controls whether bare Dashboard deep links are usable
-	// from a freshly opened browser tab. When local-token, Open Loop is omitted
-	// (no one-shot bootstrap from osascript). Non-loopback DashboardBaseURL is
-	// also rejected so notifications do not open remote/plain-HTTP dashboards
-	// the CLI open policy refuses. Human-attention falls back to the daemon
-	// log dialog instead of an unusable or policy-bypassing SPA shell.
-	DashboardAuthMode config.AuthMode
-	Repositories      *storage.Repositories
-	State             *GatewayState
-	Now               func() time.Time
-	RunCommand        RunCommandFunc
-	HTTPPost          HTTPPostFunc
-	FeishuAppHTTP     FeishuAppHTTPFunc
+	Config        config.NotificationConfig
+	OsascriptPath string
+	Repositories  *storage.Repositories
+	State         *GatewayState
+	Now           func() time.Time
+	RunCommand    RunCommandFunc
+	HTTPPost      HTTPPostFunc
+	FeishuAppHTTP FeishuAppHTTPFunc
 }
 
 // GatewayState retains transport continuity across immutable, config-specific
@@ -139,14 +130,6 @@ type SystemNotificationPayload struct {
 	EntityType string
 	EntityID   string
 	DedupeKey  string
-	// OpenURL is an optional local deep link (e.g. Dashboard Loop Detail).
-	// Must not carry auth tokens, answers, or sensitive failure detail.
-	OpenURL string
-	// OperatorAttention marks human-attention alerts that may use an interactive
-	// osascript dialog (Open Loop / Open Log). Ordinary action_required payloads
-	// (worker skipped, PR ready) leave this false so they stay lightweight
-	// display notification and do not block the scheduler for up to 30s.
-	OperatorAttention bool
 	// LocalOnly skips remote webhook / Feishu app delivery. Human-attention
 	// sets this only when a Feishu HITL ask card was actually delivered for
 	// an awaiting_human park (so a plain remote alert would duplicate it).
@@ -156,17 +139,14 @@ type SystemNotificationPayload struct {
 }
 
 type Gateway struct {
-	config            config.NotificationConfig
-	osascriptPath     string
-	logFilePath       string
-	dashboardBaseURL  string
-	dashboardAuthMode config.AuthMode
-	repositories      *storage.Repositories
-	now               func() time.Time
-	runCommand        RunCommandFunc
-	httpPost          HTTPPostFunc
-	feishuAppHTTP     FeishuAppHTTPFunc
-	state             *GatewayState
+	config        config.NotificationConfig
+	osascriptPath string
+	repositories  *storage.Repositories
+	now           func() time.Time
+	runCommand    RunCommandFunc
+	httpPost      HTTPPostFunc
+	feishuAppHTTP FeishuAppHTTPFunc
+	state         *GatewayState
 }
 
 type askCardState struct {
@@ -200,17 +180,14 @@ func NewGateway(options Options) *Gateway {
 	}
 
 	return &Gateway{
-		config:            options.Config,
-		osascriptPath:     options.OsascriptPath,
-		logFilePath:       options.LogFilePath,
-		dashboardBaseURL:  strings.TrimRight(strings.TrimSpace(options.DashboardBaseURL), "/"),
-		dashboardAuthMode: options.DashboardAuthMode,
-		repositories:      options.Repositories,
-		now:               now,
-		runCommand:        runCommand,
-		httpPost:          httpPost,
-		feishuAppHTTP:     feishuAppHTTP,
-		state:             state,
+		config:        options.Config,
+		osascriptPath: options.OsascriptPath,
+		repositories:  options.Repositories,
+		now:           now,
+		runCommand:    runCommand,
+		httpPost:      httpPost,
+		feishuAppHTTP: feishuAppHTTP,
+		state:         state,
 	}
 }
 
@@ -335,7 +312,7 @@ func (g *Gateway) recordOsascript(ctx context.Context, payload SystemNotificatio
 
 	_, err := g.runCommand(ctx, shell.Options{
 		Command: g.osascriptPath,
-		Args:    []string{"-e", buildAppleScript(payload, g.config, g.logFilePath)},
+		Args:    []string{"-e", buildAppleScript(payload, g.config)},
 		Timeout: osascriptTimeout,
 	})
 	if err != nil {
@@ -1717,31 +1694,9 @@ func (g *Gateway) persistNotification(ctx context.Context, record storage.Notifi
 	})
 }
 
-func buildAppleScript(payload SystemNotificationPayload, cfg config.NotificationConfig, logFilePath string) string {
+func buildAppleScript(payload SystemNotificationPayload, cfg config.NotificationConfig) string {
 	body := escapeAppleScriptString(payload.Body)
 	title := escapeAppleScriptString(payload.Title)
-
-	// Human-attention action_required with a usable Dashboard deep link: Open Loop.
-	// Never put tokens/answers/sensitive detail in the URL — caller is responsible.
-	// Ordinary action_required (worker skipped / PR ready) must not take this path.
-	if payload.OperatorAttention && payload.Level == "action_required" && strings.TrimSpace(payload.OpenURL) != "" {
-		openURL := escapeAppleScriptString(payload.OpenURL)
-		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Loop", "Dismiss"} default button "Open Loop" cancel button "Dismiss" giving up after 30
-if gave up of dialogResult is false and button returned of dialogResult is "Open Loop" then
-  do shell script "open " & quoted form of %q
-end if`, body, title, openURL)
-	}
-
-	// Failures always offer Open Log. Human-attention without a usable deep link
-	// (no seq, or local-token auth where bare URLs 401) also falls back to the log.
-	// Other action_required stays lightweight so Notify does not block for 30s.
-	if (payload.Level == "failure" || (payload.OperatorAttention && payload.Level == "action_required")) && strings.TrimSpace(logFilePath) != "" {
-		openLogPath := escapeAppleScriptString(logFilePath)
-		return fmt.Sprintf(`set dialogResult to display dialog %q with title %q buttons {"Open Log", "Dismiss"} default button "Dismiss" cancel button "Dismiss" giving up after 30
-if gave up of dialogResult is false and button returned of dialogResult is "Open Log" then
-  do shell script "open " & quoted form of %q
-end if`, body, title, openLogPath)
-	}
 
 	subtitle := ""
 	if payload.Subtitle != "" {

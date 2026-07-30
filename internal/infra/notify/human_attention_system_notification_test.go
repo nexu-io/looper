@@ -11,7 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestGatewayActionRequiredOpensDashboardLoopDetailDeepLink(t *testing.T) {
+func TestGatewayHumanAttentionUsesSystemNotification(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -31,22 +31,16 @@ func TestGatewayActionRequiredOpensDashboardLoopDetailDeepLink(t *testing.T) {
 				ThrottleWindowSeconds: 60,
 			},
 		},
-		OsascriptPath:     scriptPath,
-		LogFilePath:       filepath.Join(rootDir, "logs", "looperd.log"),
-		DashboardBaseURL:  "http://127.0.0.1:17310",
-		DashboardAuthMode: config.AuthModeNone,
-		Repositories:      repos,
+		OsascriptPath: scriptPath,
+		Repositories:  repos,
 	})
 
-	// Avoid FK targets that do not exist in this isolated DB; deep-link uses LoopSeq only.
 	records := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
-		LoopSeq:    42,
-		LoopType:   "worker",
-		Reason:     HumanAttentionAwaitingHuman,
-		EntryKey:   "run:run_1",
-		Subtitle:   "acme/looper",
-		EntityType: "loop",
-		EntityID:   "loop_1",
+		LoopSeq:  42,
+		LoopType: "worker",
+		Reason:   HumanAttentionAwaitingHuman,
+		EntryKey: "run:run_system_notification",
+		Subtitle: "acme/looper",
 	})
 	if got := notificationStatus(records, "osascript"); got != "success" {
 		t.Fatalf("osascript status = %q, want success; records=%#v", got, records)
@@ -57,19 +51,13 @@ func TestGatewayActionRequiredOpensDashboardLoopDetailDeepLink(t *testing.T) {
 		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
 	}
 	osascriptCalls := string(osascriptCallsBytes)
-	assertContains(t, osascriptCalls, "Open Loop")
-	assertContains(t, osascriptCalls, "http://127.0.0.1:17310/dashboard/loops/42")
-	if strings.Contains(osascriptCalls, "token") || strings.Contains(osascriptCalls, "code=") {
-		t.Fatalf("deep link must not include auth material: %q", osascriptCalls)
+	assertContains(t, osascriptCalls, "display notification")
+	assertContains(t, osascriptCalls, "Looper Needs Attention")
+	assertContains(t, osascriptCalls, "sound name")
+	if strings.Contains(osascriptCalls, "display dialog") {
+		t.Fatalf("human-attention notification must not open a dialog: %q", osascriptCalls)
 	}
-
-	// Permanent entry dedupe: second emit for same entry is a no-op.
-	second := gateway.NotifyHumanAttention(ctx, HumanAttentionInput{
-		LoopSeq:  42,
-		Reason:   HumanAttentionAwaitingHuman,
-		EntryKey: "run:run_1",
-	})
-	if len(second) != 0 {
-		t.Fatalf("second NotifyHumanAttention records = %#v, want empty (deduped)", second)
+	if strings.Contains(osascriptCalls, "Open Log") || strings.Contains(osascriptCalls, "Open Loop") {
+		t.Fatalf("system notification must not contain dialog actions: %q", osascriptCalls)
 	}
 }

@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -61,12 +60,9 @@ func TestHumanAttentionContract_NotifyFailureIsolation(t *testing.T) {
 				ThrottleWindowSeconds: 60,
 			},
 		},
-		OsascriptPath:     failScript,
-		LogFilePath:       filepath.Join(root, "logs", "looperd.log"),
-		DashboardBaseURL:  "http://127.0.0.1:17310",
-		DashboardAuthMode: config.AuthModeNone,
-		Repositories:      repos,
-		Now:               func() time.Time { return now },
+		OsascriptPath: failScript,
+		Repositories:  repos,
+		Now:           func() time.Time { return now },
 	})
 	notifyDurableHumanAttention(ctx, failGateway, repos, failLoopID)
 
@@ -90,32 +86,5 @@ func TestHumanAttentionContract_NotifyFailureIsolation(t *testing.T) {
 	}
 	if !sawFailedOsascript {
 		t.Fatal("want audited osascript failure for notify-failure isolation case")
-	}
-}
-
-func TestResolveDashboardBaseURL_NoTokensOrSensitivePath(t *testing.T) {
-	t.Parallel()
-
-	base := notify.ResolveDashboardBaseURL(config.ServerConfig{Host: "0.0.0.0", Port: 17310})
-	if base != "http://127.0.0.1:17310" {
-		t.Fatalf("ResolveDashboardBaseURL(wildcard) = %q", base)
-	}
-	// Userinfo / query must not leak into deep links — fall back to host/port origin.
-	leaky := "https://user:secret@evil.example/?token=abc#frag"
-	if got := notify.ResolveDashboardBaseURL(config.ServerConfig{
-		Host: "0.0.0.0", Port: 17310, BaseURL: &leaky,
-	}); got != "http://127.0.0.1:17310" {
-		t.Fatalf("ResolveDashboardBaseURL(leaky) = %q, want host/port fallback", got)
-	}
-	gateway := notify.NewGateway(notify.Options{DashboardBaseURL: base})
-	u, err := gateway.DashboardLoopDetailURL(42)
-	if err != nil {
-		t.Fatalf("DashboardLoopDetailURL() error = %v", err)
-	}
-	if u != "http://127.0.0.1:17310/dashboard/loops/42" {
-		t.Fatalf("DashboardLoopDetailURL() = %q", u)
-	}
-	if strings.Contains(u, "token") || strings.Contains(u, "code=") || strings.Contains(u, "answer") || strings.Contains(u, "secret") {
-		t.Fatalf("deep link must not contain secrets: %q", u)
 	}
 }

@@ -5,12 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net"
-	"net/url"
-	"strconv"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/loops"
@@ -95,18 +91,6 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		body = fmt.Sprintf("%s (%s) requires operator attention (%s).", loopLabel, loopType, humanAttentionReasonLabel(reason))
 	}
 
-	// Bare Dashboard deep links are only usable when the SPA does not require a
-	// session token. Under local-token auth a fresh osascript tab has neither
-	// sessionStorage nor a one-shot ?code=, so loop-detail API calls 401 — offer
-	// Open Log instead of an unusable Open Loop action. Deep links never carry
-	// tokens or bootstrap codes (CLI mint remains the supported auth bootstrap).
-	openURL := ""
-	if input.LoopSeq > 0 && g.dashboardDeepLinkUsable() {
-		if u, err := g.DashboardLoopDetailURL(input.LoopSeq); err == nil {
-			openURL = u
-		}
-	}
-
 	entityType := strings.TrimSpace(input.EntityType)
 	entityID := strings.TrimSpace(input.EntityID)
 	if entityType == "" {
@@ -124,21 +108,19 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 	localOnly := reason == HumanAttentionAwaitingHuman && g.feishuAskDeliveredForLoop(ctx, input.LoopID)
 
 	payload := SystemNotificationPayload{
-		ID:                humanAttentionReservationID(dedupeKey),
-		ProjectID:         input.ProjectID,
-		LoopID:            input.LoopID,
-		RunID:             input.RunID,
-		Level:             "action_required",
-		Title:             "Looper Needs Attention",
-		Subtitle:          strings.TrimSpace(input.Subtitle),
-		Body:              body,
-		Sound:             "Funk",
-		EntityType:        entityType,
-		EntityID:          entityID,
-		DedupeKey:         dedupeKey,
-		OpenURL:           openURL,
-		OperatorAttention: true,
-		LocalOnly:         localOnly,
+		ID:         humanAttentionReservationID(dedupeKey),
+		ProjectID:  input.ProjectID,
+		LoopID:     input.LoopID,
+		RunID:      input.RunID,
+		Level:      "action_required",
+		Title:      "Looper Needs Attention",
+		Subtitle:   strings.TrimSpace(input.Subtitle),
+		Body:       body,
+		Sound:      "Funk",
+		EntityType: entityType,
+		EntityID:   entityID,
+		DedupeKey:  dedupeKey,
+		LocalOnly:  localOnly,
 	}
 
 	// Atomic permanent entry claim before any channel delivery so concurrent
@@ -276,110 +258,6 @@ func (g *Gateway) hasOpenFeishuAskCard(loopID string) bool {
 // HumanAttentionDedupeKey builds the durable dedupe key for one human-attention entry.
 func HumanAttentionDedupeKey(reason HumanAttentionReason, entryKey string) string {
 	return fmt.Sprintf("human_attention:%s:%s", strings.TrimSpace(string(reason)), strings.TrimSpace(entryKey))
-}
-
-// DashboardLoopDetailURL builds a local Dashboard Loop Detail URL from the gateway's
-// configured base. The URL contains only the loop seq path segment — no auth token,
-// bootstrap code, answer text, or failure detail.
-func (g *Gateway) DashboardLoopDetailURL(loopSeq int64) (string, error) {
-	if g == nil {
-		return "", fmt.Errorf("notification gateway is not configured")
-	}
-	if loopSeq <= 0 {
-		return "", fmt.Errorf("loop seq is required for dashboard deep link")
-	}
-	base := strings.TrimRight(strings.TrimSpace(g.dashboardBaseURL), "/")
-	if base == "" {
-		return "", fmt.Errorf("dashboard base URL is not configured")
-	}
-	return base + "/dashboard/loops/" + strconv.FormatInt(loopSeq, 10), nil
-}
-
-// dashboardDeepLinkUsable reports whether a bare origin + loop path can load loop
-// detail APIs in a newly opened browser tab without bypassing dashboard open policy.
-//
-// local-token requires session bootstrap that osascript does not mint, so deep
-// links are never offered in that mode. Non-loopback origins are also rejected:
-// the supported dashboard open path (allowDashboardOpen) only permits non-loopback
-// when using HTTPS with local-token, and this notification path suppresses every
-// local-token link — so non-loopback would otherwise open a remote/plain-HTTP
-// dashboard the CLI refuses. Fall back to Open Log instead.
-func (g *Gateway) dashboardDeepLinkUsable() bool {
-	if g == nil {
-		return false
-	}
-	if g.dashboardAuthMode == config.AuthModeLocalToken {
-		return false
-	}
-	return isDashboardDeepLinkOriginSafe(g.dashboardBaseURL)
-}
-
-// isDashboardDeepLinkOriginSafe mirrors CLI dashboard open host policy for bare
-// deep links: only loopback origins are safe without local-token bootstrap.
-func isDashboardDeepLinkOriginSafe(baseURL string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil || parsed.Host == "" {
-		return false
-	}
-	return isLoopbackHostname(parsed.Hostname())
-}
-
-func isLoopbackHostname(host string) bool {
-	host = strings.Trim(strings.TrimSpace(host), "[]")
-	if host == "" {
-		return false
-	}
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-// ResolveDashboardBaseURL derives a browser-openable local origin for Dashboard
-// deep links from server config. Matches CLI dashboard host mapping for wildcards.
-// Never includes path prefixes, userinfo, tokens, query parameters, or fragments.
-func ResolveDashboardBaseURL(server config.ServerConfig) string {
-	if server.BaseURL != nil {
-		if origin, ok := parseDashboardOrigin(*server.BaseURL); ok {
-			return origin
-		}
-	}
-	host := strings.TrimSpace(server.Host)
-	switch host {
-	case "", "0.0.0.0", "::", "[::]":
-		host = "127.0.0.1"
-	}
-	port := server.Port
-	if port <= 0 {
-		port = 17310
-	}
-	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
-}
-
-// parseDashboardOrigin accepts only a bare HTTP(S) origin: scheme + host[:port],
-// with no userinfo, path, query, or fragment. Rejected values fall back to
-// host/port construction so credentials never reach OpenURL or osascript.
-func parseDashboardOrigin(raw string) (string, bool) {
-	base := strings.TrimRight(strings.TrimSpace(raw), "/")
-	if base == "" {
-		return "", false
-	}
-	parsed, err := url.Parse(base)
-	if err != nil {
-		return "", false
-	}
-	scheme := strings.ToLower(parsed.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return "", false
-	}
-	if parsed.Host == "" || parsed.User != nil {
-		return "", false
-	}
-	if strings.Trim(parsed.Path, "/") != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", false
-	}
-	return scheme + "://" + parsed.Host, true
 }
 
 // IsHumanAttentionLoopStatus reports whether the loop status itself is a

@@ -13,7 +13,7 @@ import (
 )
 
 // Recovery quarantine must not deliver human-attention notifications on the
-// critical path (interactive dialogs can take tens of seconds per loop).
+// critical path (notification transports can be slow or unavailable).
 func TestHumanAttentionContract_QuarantineDoesNotNotifySynchronously(t *testing.T) {
 	t.Parallel()
 
@@ -100,7 +100,7 @@ func TestHumanAttentionContract_QuarantineDoesNotNotifySynchronously(t *testing.
 	if !quarantined || !wrote {
 		t.Fatalf("quarantineRecoveryEvidence() quarantined=%v wrote=%v, want true/true", quarantined, wrote)
 	}
-	// Budget well under a single interactive dialog (~30s) and command timeout (~35s).
+	// Budget well under the local notification command timeout.
 	if elapsed > 2*time.Second {
 		t.Fatalf("quarantineRecoveryEvidence took %v; must not run interactive notify on the critical path", elapsed)
 	}

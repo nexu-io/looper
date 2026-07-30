@@ -24,8 +24,8 @@ func TestHumanAttentionContract_PostClaimNotifyCanceledOnShutdown(t *testing.T) 
 	root := t.TempDir()
 	startedPath := filepath.Join(root, "osascript.started")
 	scriptPath := filepath.Join(root, "osascript")
-	// Block until SIGTERM/SIGINT (shell.Run kill on ctx cancel). Without cancel
-	// this would sleep ~30s like a real dialog and outlive shutdownTimeout.
+	// Block until SIGTERM/SIGINT (shell.Run kill on ctx cancel). Without cancel,
+	// a hung notification helper would outlive shutdownTimeout.
 	script := "#!/bin/sh\n: > \"" + startedPath + "\"\ntrap 'exit 0' TERM INT\nwhile true; do sleep 0.05; done\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile(osascript) error = %v", err)
@@ -101,7 +101,7 @@ func TestHumanAttentionContract_PostClaimNotifyCanceledOnShutdown(t *testing.T) 
 	rt.stopHumanAttentionRecoveryNotify()
 	elapsed := time.Since(start)
 	if elapsed > 3*time.Second {
-		t.Fatalf("stopHumanAttentionRecoveryNotify() elapsed = %v, want cancel-bounded (not full osascript dialog)", elapsed)
+		t.Fatalf("stopHumanAttentionRecoveryNotify() elapsed = %v, want cancel-bounded", elapsed)
 	}
 
 	// After cancel+drain, SQLite close must not race a still-running persist.

@@ -3071,13 +3071,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and
 	// webhook nil-runner checks.
 	notificationGateway := notificationGateways.New(notify.Options{
-		Config:            cfg.Notifications,
-		OsascriptPath:     derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:       filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		DashboardBaseURL:  notify.ResolveDashboardBaseURL(cfg.Server),
-		DashboardAuthMode: cfg.Server.AuthMode,
-		Repositories:      repos,
-		Now:               now,
+		Config:        cfg.Notifications,
+		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
+		Repositories:  repos,
+		Now:           now,
 	})
 	notifyHumanAttention := func(ctx context.Context, loopID string) {
 		notifyDurableHumanAttention(ctx, notificationGateway, repos, loopID)
@@ -3117,8 +3114,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		// Hard holds are owned by the central human-attention path after claim
 		// finalization and lease release (runOwnedQueueClaims post-observer).
 		// Do not notify here: OnRunCompleted still holds the operation lease and
-		// the loop is still running, so an interactive osascript dialog would
-		// block a concurrency slot for up to ~35s before durable pause.
+		// the loop is still running, so a slow local or remote notifier would
+		// hold a concurrency slot before the durable pause.
 		// Still record the Feishu milestone / refresh below.
 		if input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention {
 			if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
@@ -4684,7 +4681,7 @@ func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input def
 			// Never affects claim finalization or recovery.
 			//
 			// The dispatch ctx is WithoutCancel so finalize survives shutdown;
-			// do not keep interactive osascript on that detached lifetime.
+			// do not keep notification transports on that detached lifetime.
 			// Daemon wiring (notifyHumanAttentionPostClaim) ignores this ctx and
 			// uses a runtime-owned cancelable parent that BeginShutdown cancels
 			// and Stop drains before SQLite close. Tests may pass a direct

@@ -48,12 +48,9 @@ func TestHumanAttentionContract_SkipManualAlertAfterTerminalLoop(t *testing.T) {
 				ThrottleWindowSeconds: 60,
 			},
 		},
-		OsascriptPath:     scriptPath,
-		LogFilePath:       filepath.Join(root, "logs", "looperd.log"),
-		DashboardBaseURL:  "http://127.0.0.1:17310",
-		DashboardAuthMode: config.AuthModeNone,
-		Repositories:      repos,
-		Now:               func() time.Time { return now },
+		OsascriptPath: scriptPath,
+		Repositories:  repos,
+		Now:           func() time.Time { return now },
 	})
 
 	seedManualPark := func(t *testing.T, loopID string, seq int64, loopStatus string) {
