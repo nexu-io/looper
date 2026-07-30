@@ -887,6 +887,55 @@ func TestFixerGitHubAdapterTagsRemoteAPIFailuresAsGitHubBoundary(t *testing.T) {
 	}
 }
 
+func TestFixerGitHubAdapterTreatsForgejoPR404AsTerminal(t *testing.T) {
+	// Deleted Forgejo PRs return typed HTTP 404 from ViewPullRequest. After the
+	// adapter tags them BoundaryGitHubAPI, Classify must keep them non_retryable
+	// so unlimited fixer queues park instead of requeueing forever.
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+	input := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath}
+
+	_, err := adapter.GetPullRequestAuthor(context.Background(), input)
+	if err == nil {
+		t.Fatal("GetPullRequestAuthor() error = nil, want Forgejo PR 404")
+	}
+	var boundaryErr *failureclass.BoundaryError
+	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
+		t.Fatalf("GetPullRequestAuthor() boundary = %#v, want BoundaryGitHubAPI", err)
+	}
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+		t.Fatalf("GetPullRequestAuthor Classify() = %s, want non_retryable for typed HTTP 404", kind)
+	}
+	// Runner re-wraps adapter errors with BoundaryGitHubAPI; existing boundary and
+	// typed status must still classify as terminal.
+	rewrapped := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+	if kind := failureclass.Classify(rewrapped, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+		t.Fatalf("re-wrapped Classify() = %s, want non_retryable", kind)
+	}
+
+	_, err = adapter.ViewPullRequest(context.Background(), input)
+	if err == nil {
+		t.Fatal("ViewPullRequest() error = nil, want Forgejo PR 404")
+	}
+	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
+		t.Fatalf("ViewPullRequest() boundary = %#v, want BoundaryGitHubAPI", err)
+	}
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+		t.Fatalf("ViewPullRequest Classify() = %s, want non_retryable for typed HTTP 404", kind)
+	}
+}
+
 func TestFixerGitHubAdapterForgejoResolveNativeReviewComment(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var calledPath string

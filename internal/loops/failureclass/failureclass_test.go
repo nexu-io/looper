@@ -139,6 +139,56 @@ func TestClassifyGenericGitHub404StaysRetryable(t *testing.T) {
 	}
 }
 
+// typedHTTPStatusError mirrors provider errors such as forge.ForgejoHTTPError
+// that expose the original HTTP status without importing provider packages.
+type typedHTTPStatusError struct {
+	status  int
+	message string
+}
+
+func (e *typedHTTPStatusError) Error() string {
+	return e.message
+}
+
+func (e *typedHTTPStatusError) HTTPStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.status
+}
+
+func TestClassifyTypedHostingAPIClientFailuresAreTerminal(t *testing.T) {
+	// Forgejo (and similar providers) return typed HTTP errors. When the fixer
+	// tags them BoundaryGitHubAPI, a deleted PR's 404 must stay non_retryable
+	// so unlimited queues park instead of requeueing forever.
+	tests := []struct {
+		name   string
+		status int
+		msg    string
+	}{
+		{name: "forgejo pr 404", status: 404, msg: "forgejo API GET /api/v1/repos/acme/looper/pulls/42 returned HTTP 404: Not Found"},
+		{name: "typed 400", status: 400, msg: "forgejo API POST /api/v1/repos/acme/looper/issues returned HTTP 400: bad request"},
+		{name: "typed 422", status: 422, msg: "forgejo API PATCH /api/v1/repos/acme/looper/pulls/1 returned HTTP 422: unprocessable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := WithBoundary(&typedHTTPStatusError{status: tt.status, message: tt.msg}, BoundaryGitHubAPI)
+			got := Classify(err, Context{Runner: RunnerFixer, Boundary: BoundaryUnknown})
+			if got != NonRetryable {
+				t.Fatalf("Classify() = %s, want %s for typed HTTP %d", got, NonRetryable, tt.status)
+			}
+		})
+	}
+}
+
+func TestClassifyTypedHostingAPIServerFailuresStayRetryable(t *testing.T) {
+	err := WithBoundary(&typedHTTPStatusError{status: 502, message: "forgejo API GET /user returned HTTP 502: bad gateway"}, BoundaryGitHubAPI)
+	got := Classify(err, Context{Runner: RunnerFixer, Boundary: BoundaryUnknown})
+	if got != RetryableTransient {
+		t.Fatalf("Classify() = %s, want %s for typed HTTP 502", got, RetryableTransient)
+	}
+}
+
 func TestClassifyIssueREST404StaysRetryable(t *testing.T) {
 	tests := []struct {
 		name    string

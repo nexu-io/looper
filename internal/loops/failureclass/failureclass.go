@@ -101,7 +101,7 @@ func Classify(err error, ctx Context) Kind {
 	if ctx.Boundary == BoundaryGitHubAPI && isRetryableGitHubGraphQLUnauthorized(message) {
 		return RetryableTransient
 	}
-	if isDeterministicDenial(message) || isGitHubAPIDeterministicDenial(message, ctx.Boundary) || isInternalDeterministicBoundary(ctx.Boundary) {
+	if isDeterministicDenial(message) || isGitHubAPIDeterministicDenial(err, message, ctx.Boundary) || isInternalDeterministicBoundary(ctx.Boundary) {
 		return NonRetryable
 	}
 	if isExternalBoundary(ctx.Boundary) {
@@ -151,9 +151,17 @@ func isDeterministicDenial(message string) bool {
 	return false
 }
 
-func isGitHubAPIDeterministicDenial(message string, boundary Boundary) bool {
+func isGitHubAPIDeterministicDenial(err error, message string, boundary Boundary) bool {
 	if boundary != BoundaryGitHubAPI {
 		return false
+	}
+	// Typed provider status codes (e.g. ForgejoHTTPError) are authoritative for
+	// permanent client failures. String "HTTP 404" alone stays retryable for
+	// GitHub CLI errors because generic REST 404s are ambiguous; missing PR
+	// targets on GitHub use "Could not resolve" instead.
+	switch httpStatusCode(err) {
+	case 400, 404, 422:
+		return true
 	}
 	for _, fragment := range []string{
 		"http 400",
@@ -166,6 +174,20 @@ func isGitHubAPIDeterministicDenial(message string, boundary Boundary) bool {
 		}
 	}
 	return false
+}
+
+// httpStatusCoder is implemented by provider HTTP errors that expose the
+// original response status without requiring string parsing.
+type httpStatusCoder interface {
+	HTTPStatusCode() int
+}
+
+func httpStatusCode(err error) int {
+	var coder httpStatusCoder
+	if errors.As(err, &coder) {
+		return coder.HTTPStatusCode()
+	}
+	return 0
 }
 
 func isRetryableGitHubGraphQLUnauthorized(message string) bool {
