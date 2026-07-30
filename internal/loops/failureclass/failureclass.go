@@ -177,7 +177,26 @@ func isGitHubAPIDeterministicDenial(err error, message string, boundary Boundary
 }
 
 // httpStatusCoder is implemented by provider HTTP errors that expose the
-// original response status without requiring string parsing.
+// original response status without requiring string parsing (e.g. Forgejo
+// ForgejoHTTPError). Classification uses errors.As so wrapped values still
+// match.
+//
+// Trade-off (typed status classification):
+//   - Prevents: Forgejo/provider permanent client failures (400/404/422) from
+//     being treated as retryable_transient when the fixer tags them
+//     BoundaryGitHubAPI, which would requeue deleted/missing PRs forever on
+//     unlimited queues.
+//   - Cost: a second classification path beside message fragments; providers
+//     must implement HTTPStatusCode() or they fall through to string rules.
+//     Only 400/404/422 are terminal via this path — 401/403/5xx stay on
+//     existing message/boundary rules (auth denials vs transient outages).
+//   - Why not string "HTTP 404" alone: generic GitHub CLI REST 404s are
+//     ambiguous (missing issue vs missing endpoint vs temporary routing) and
+//     must stay retryable; missing GitHub PR targets use "Could not resolve"
+//     instead. Typed status is authoritative only when the provider preserves
+//     the numeric code on the error value.
+//   - Why not import provider packages here: failureclass stays free of
+//     forge/github concrete types; the small interface is the extension point.
 type httpStatusCoder interface {
 	HTTPStatusCode() int
 }

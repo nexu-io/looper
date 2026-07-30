@@ -69,8 +69,24 @@ func (e *CommandExecutionError) Error() string { return e.Message }
 // IsStartFailure reports whether err is a process-launch failure from Run
 // (missing executable, inaccessible CWD, fork/exec failure). These occur
 // before any command output and are local environment problems, not remote
-// command or API results. Run always prefixes launch failures with
-// "start command:".
+// command or API results.
+//
+// Trade-off (string-marker classification):
+//   - Prevents: local CLI launch failures (missing/moved gh, bad CWD) being
+//     tagged BoundaryGitHubAPI and retried forever on unlimited fixer queues.
+//   - Cost: couples classification to Run's stable "start command:" prefix.
+//     False positives require an unrelated error whose text contains that
+//     exact marker; false negatives occur if a wrapper rewrites Error() and
+//     drops both the prefix and the unwrap chain (mitigated by walking Unwrap
+//     then falling back to a full-message contains check).
+//   - Why not a typed StartError only: Run already emits the prefix via
+//     fmt.Errorf("start command: %w", err) for diagnostics and other
+//     string-based local-path classifiers. A parallel typed error would
+//     duplicate the launch contract and force every wrap site to remember
+//     both forms. The marker is the existing authority for "failed before
+//     any command output"; this helper only exposes it.
+//   - Why not trust gateway/API error shape alone: gh CLI launch failures
+//     surface as plain exec errors before any hosting response exists.
 func IsStartFailure(err error) bool {
 	if err == nil {
 		return false
