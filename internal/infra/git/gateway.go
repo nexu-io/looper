@@ -241,6 +241,17 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		return *restored, nil
 	}
 
+	// Unregistered hollow leftovers block `git worktree add`. Clear only when
+	// local metadata proves the path is not a usable checkout; preserve any
+	// other content for manual intervention.
+	if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+		WorktreePath: worktreePath,
+		RepoPath:     input.RepoPath,
+		WorktreeRoot: input.WorktreeRoot,
+	}, worktreePath); err != nil {
+		return storage.WorktreeRecord{}, err
+	}
+
 	if checkoutMode == CheckoutModeDetached {
 		startPoint, err := g.resolveDetachedStartPoint(ctx, input)
 		if err != nil {
@@ -373,6 +384,16 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 			}
 			if !storedHealthy {
 				g.tryRemoveWorktree(ctx, input.RepoPath, stored.WorktreePath)
+				// Hollow/unregistered leftovers survive `worktree remove`. Clear
+				// empty or metadata-only paths so Create can recreate; preserve
+				// populated unusable paths as MI instead of infinite retry.
+				if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+					WorktreePath: stored.WorktreePath,
+					RepoPath:     input.RepoPath,
+					WorktreeRoot: input.WorktreeRoot,
+				}, stored.WorktreePath); err != nil {
+					return nil, err
+				}
 			} else {
 				storedCheckoutMatches, err := g.matchesRestoreCheckoutMode(ctx, stored.WorktreePath, checkoutMode, input.Branch)
 				if err != nil {
@@ -445,6 +466,13 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	}
 	if !healthy {
 		g.tryRemoveWorktree(ctx, input.RepoPath, match.Path)
+		if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+			WorktreePath: match.Path,
+			RepoPath:     input.RepoPath,
+			WorktreeRoot: input.WorktreeRoot,
+		}, match.Path); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -1004,6 +1032,15 @@ func (g *Gateway) isHealthyWorktree(ctx context.Context, worktreePath string) (b
 			return false, nil
 		}
 		return false, err
+	}
+
+	// Confirmed local-unusable (hollow/corrupt metadata): treat as unhealthy
+	// without propagating git status. Restore can remove + clear + recreate
+	// instead of infinite retryable_transient storms.
+	// Usable local metadata with a failing `git status` still propagates —
+	// that may be locks, permissions, or other non-hollow failures.
+	if !worktreesafety.LocalCheckoutUsable(worktreePath) {
+		return false, nil
 	}
 
 	_, err := g.runGitResult(ctx, worktreePath, nil, "status", "--porcelain", "--untracked-files=all")
