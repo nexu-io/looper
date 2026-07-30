@@ -25,6 +25,7 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
@@ -2103,7 +2104,7 @@ func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string)
 	}
 	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
 	if err != nil {
-		return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		return "", withHostingAPIBoundary(err)
 	}
 	return login, nil
 }
@@ -2121,7 +2122,7 @@ func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixe
 	}
 	author, err := a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		return "", withHostingAPIBoundary(err)
 	}
 	return author, nil
 }
@@ -2143,9 +2144,23 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		return fixer.PullRequestDetail{}, withHostingAPIBoundary(err)
 	}
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+// withHostingAPIBoundary tags remote GitHub/hosting transport failures as
+// BoundaryGitHubAPI. Local CLI launch failures (missing/moved gh, inaccessible
+// working directory) keep BoundaryConfig so unlimited fixer queues request
+// intervention instead of retrying forever.
+func withHostingAPIBoundary(err error) error {
+	if err == nil {
+		return nil
+	}
+	if shell.IsStartFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
+	return failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 }
 
 func forgeCommentsToObjects(items []forge.Comment) []map[string]any {

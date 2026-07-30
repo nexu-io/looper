@@ -35,6 +35,39 @@ func TestRunCapturesStdoutAndStderr(t *testing.T) {
 	}
 }
 
+func TestIsStartFailureDetectsMissingExecutableAndBadCWD(t *testing.T) {
+	t.Parallel()
+	missing := filepath.Join(t.TempDir(), "no-such-binary")
+	_, err := Run(context.Background(), Options{Command: missing, Args: []string{"--help"}, CWD: t.TempDir()})
+	if err == nil {
+		t.Fatal("Run() error = nil, want missing executable launch failure")
+	}
+	if !IsStartFailure(err) {
+		t.Fatalf("IsStartFailure(%v) = false, want true", err)
+	}
+
+	badCWD := filepath.Join(t.TempDir(), "missing-dir")
+	_, err = Run(context.Background(), Options{Command: "/bin/sh", Args: []string{"-c", "true"}, CWD: badCWD})
+	if err == nil {
+		t.Fatal("Run() error = nil, want inaccessible CWD launch failure")
+	}
+	if !IsStartFailure(err) {
+		t.Fatalf("IsStartFailure(%v) = false, want true for bad CWD", err)
+	}
+
+	// Completed non-zero exit is not a launch failure.
+	_, err = Run(context.Background(), Options{Command: "/bin/sh", Args: []string{"-c", "exit 1"}})
+	if err == nil {
+		t.Fatal("Run() error = nil, want non-zero exit")
+	}
+	if IsStartFailure(err) {
+		t.Fatalf("IsStartFailure(%v) = true, want false for completed command", err)
+	}
+	if IsStartFailure(nil) {
+		t.Fatal("IsStartFailure(nil) = true, want false")
+	}
+}
+
 // Contract (#592 review): StartGate wraps cmd.Start so callers can hold an
 // external critical section across process launch only (not Wait).
 func TestRunStartGateWrapsProcessStart(t *testing.T) {

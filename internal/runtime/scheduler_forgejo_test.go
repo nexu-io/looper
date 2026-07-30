@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
@@ -884,6 +886,67 @@ func TestFixerGitHubAdapterTagsRemoteAPIFailuresAsGitHubBoundary(t *testing.T) {
 	}
 	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.RetryableTransient {
 		t.Fatalf("Classify() = %s, want retryable_transient for remote hosting API failure", kind)
+	}
+}
+
+func TestFixerGitHubAdapterTagsLocalCLILaunchFailuresAsConfigBoundary(t *testing.T) {
+	// Exercise the real gateway + shell.Run contract: a missing gh binary produces
+	// "start command: ..." before any API call. That must stay BoundaryConfig so
+	// unlimited fixer queues park instead of retrying forever under BoundaryGitHubAPI.
+	missingGH := filepath.Join(t.TempDir(), "no-such-gh")
+	gateway := githubinfra.New(githubinfra.Options{GHPath: missingGH})
+	adapter := fixerGitHubAdapter{gateway: gateway}
+	cwd := t.TempDir()
+	input := fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd}
+
+	assertLocalCLILaunchBoundary := func(t *testing.T, name string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s error = nil, want local CLI launch failure", name)
+		}
+		var boundaryErr *failureclass.BoundaryError
+		if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+			t.Fatalf("%s boundary = %#v, want BoundaryConfig for start command failure", name, err)
+		}
+		// Runner re-wraps with BoundaryGitHubAPI; local boundary must be preserved.
+		preserved := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		if !errors.As(preserved, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+			t.Fatalf("%s preserved boundary = %#v, want BoundaryConfig", name, preserved)
+		}
+		if kind := failureclass.Classify(preserved, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+			t.Fatalf("%s Classify() = %s, want non_retryable for local CLI launch failure", name, kind)
+		}
+	}
+
+	_, err := adapter.GetCurrentUserLogin(context.Background(), cwd)
+	assertLocalCLILaunchBoundary(t, "GetCurrentUserLogin", err)
+	_, err = adapter.GetPullRequestAuthor(context.Background(), input)
+	assertLocalCLILaunchBoundary(t, "GetPullRequestAuthor", err)
+	_, err = adapter.ViewPullRequest(context.Background(), input)
+	assertLocalCLILaunchBoundary(t, "ViewPullRequest", err)
+}
+
+func TestFixerGitHubAdapterTagsInaccessibleCWDLaunchAsConfigBoundary(t *testing.T) {
+	// Real gateway launch with an inaccessible working directory is also local.
+	// Prefer a resolvable gh path so the failure is CWD rather than missing binary.
+	ghPath := "gh"
+	if resolved, err := exec.LookPath("gh"); err == nil {
+		ghPath = resolved
+	}
+	gateway := githubinfra.New(githubinfra.Options{GHPath: ghPath})
+	adapter := fixerGitHubAdapter{gateway: gateway}
+	missingCWD := filepath.Join(t.TempDir(), "missing-worktree")
+
+	_, err := adapter.GetCurrentUserLogin(context.Background(), missingCWD)
+	if err == nil {
+		t.Fatal("GetCurrentUserLogin() error = nil, want inaccessible CWD launch failure")
+	}
+	var boundaryErr *failureclass.BoundaryError
+	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+		t.Fatalf("GetCurrentUserLogin() boundary = %#v, want BoundaryConfig for inaccessible CWD", err)
+	}
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+		t.Fatalf("Classify() = %s, want non_retryable for inaccessible CWD launch failure", kind)
 	}
 }
 

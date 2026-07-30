@@ -66,6 +66,26 @@ type CommandExecutionError struct {
 
 func (e *CommandExecutionError) Error() string { return e.Message }
 
+// IsStartFailure reports whether err is a process-launch failure from Run
+// (missing executable, inaccessible CWD, fork/exec failure). These occur
+// before any command output and are local environment problems, not remote
+// command or API results. Run always prefixes launch failures with
+// "start command:".
+func IsStartFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Walk the unwrap chain so wrappers that preserve Error() semantics still
+	// match. errors.Join does not unwrap linearly, so also check the full
+	// message once for the stable launch marker.
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if strings.HasPrefix(e.Error(), "start command:") {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "start command:")
+}
+
 // Run starts a command under process containment (ADR-0015 / #577).
 //
 // The spawn boundary is Configure + Start + Bind. Cancel and timeout use
