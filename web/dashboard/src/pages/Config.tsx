@@ -6,6 +6,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { RefreshCw, Settings } from "lucide-react";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PanelError } from "@/components/PanelError";
 import { Button } from "@/components/ui/button";
@@ -1609,7 +1610,14 @@ export function ConfigPage() {
     <div className={`flex flex-col gap-3 ${dockVisible ? "pb-24" : ""}`}>
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h1 className="m-0 text-[15px] font-semibold">Configuration</h1>
+          <h1 className="m-0 inline-flex items-center gap-1.5 text-[15px] font-semibold">
+            <Settings
+              size={15}
+              className="shrink-0 text-[var(--text-muted)]"
+              aria-hidden
+            />
+            Configuration
+          </h1>
           <p className="m-0 mt-0.5 text-[11px] text-[var(--text-muted)]">
             Hot-safe global policy. Common settings are shown first; the rest
             live under Advanced. Changes apply to new runs only.
@@ -1627,6 +1635,7 @@ export function ConfigPage() {
           <Button
             variant="ghost"
             size="sm"
+            className="gap-1.5"
             disabled={editorLocked || formDirtyCount > 0}
             onClick={() => void load(false)}
             title={
@@ -1635,6 +1644,7 @@ export function ConfigPage() {
                 : undefined
             }
           >
+            <RefreshCw size={13} className="shrink-0" aria-hidden />
             Refresh
           </Button>
         </div>

@@ -1,13 +1,23 @@
-import type { KeyboardEvent, ReactNode } from "react";
+import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 export type Column<T> = {
   key: string;
   header: string;
   className?: string;
+  /**
+   * Fixed column width (CSS length). Used with table-layout:fixed so content
+   * changes don't reflow neighboring columns.
+   */
+  width?: string;
   /** When true, clicks inside this cell do not trigger onRowClick. */
   stopRowClick?: boolean;
   cell: (row: T) => ReactNode;
 };
+
+function colStyle(width?: string): CSSProperties | undefined {
+  if (!width) return undefined;
+  return { width, minWidth: width, maxWidth: width };
+}
 
 export function DataTable<T>({
   columns,
@@ -32,13 +42,19 @@ export function DataTable<T>({
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full border-collapse text-left text-[12px]">
+      <table className="w-full table-fixed border-collapse text-left text-[12px]">
+        <colgroup>
+          {columns.map((col) => (
+            <col key={col.key} style={colStyle(col.width)} />
+          ))}
+        </colgroup>
         <thead>
           <tr className="border-b border-[var(--border)] text-[11px] uppercase tracking-wide text-[var(--text-muted)]">
             {columns.map((col) => (
               <th
                 key={col.key}
                 className={`px-2 py-1.5 align-middle font-medium ${col.className ?? ""}`}
+                style={colStyle(col.width)}
               >
                 {col.header}
               </th>
@@ -72,7 +88,8 @@ export function DataTable<T>({
               {columns.map((col) => (
                 <td
                   key={col.key}
-                  className={`px-2 py-1.5 align-middle ${col.className ?? ""}`}
+                  className={`overflow-hidden px-2 py-1.5 align-middle ${col.className ?? ""}`}
+                  style={colStyle(col.width)}
                   onClick={
                     col.stopRowClick
                       ? (e) => {
@@ -88,7 +105,9 @@ export function DataTable<T>({
                       : undefined
                   }
                 >
-                  <div className="flex min-h-7 items-center">{col.cell(row)}</div>
+                  <div className="flex min-h-7 min-w-0 items-center">
+                    {col.cell(row)}
+                  </div>
                 </td>
               ))}
             </tr>
