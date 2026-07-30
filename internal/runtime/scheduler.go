@@ -2150,11 +2150,16 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 }
 
 // withHostingAPIBoundary tags remote GitHub/hosting transport failures as
-// BoundaryGitHubAPI. Deterministic local CLI launch failures (missing/moved
-// gh, inaccessible working directory, bad permissions) keep BoundaryConfig so
-// unlimited fixer queues request intervention instead of retrying forever.
-// Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY after the
-// short shell retry) stay BoundaryGitHubAPI so Classify leaves them retryable.
+// BoundaryGitHubAPI. Deterministic local CLI failures keep BoundaryConfig so
+// unlimited fixer queues request intervention instead of retrying forever:
+//   - launch failures: missing/moved gh, inaccessible CWD, bad permissions
+//   - completed CLI contract failures: incompatible gh schema/invocation
+//     (e.g. unknown --json field), which are not IsStartFailure but still
+//     local and non-retryable
+//
+// Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY, EMFILE,
+// ENFILE after the short shell retry) stay BoundaryGitHubAPI so Classify
+// leaves them retryable.
 func withHostingAPIBoundary(err error) error {
 	if err == nil {
 		return nil
@@ -2162,7 +2167,50 @@ func withHostingAPIBoundary(err error) error {
 	if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
 		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 	}
+	if isLocalCLIContractFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
 	return failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+}
+
+// isLocalCLIContractFailure reports whether err is a successfully-launched
+// CLI failure from local invocation/schema incompatibility rather than a
+// remote hosting API response. Example: gh pr view --json rejects a field
+// with `unknown JSON field: "statusCheckRollup"` — the process started and
+// exited nonzero, so it is not IsStartFailure, but retrying forever under
+// BoundaryGitHubAPI cannot fix a deterministic local CLI contract mismatch.
+func isLocalCLIContractFailure(err error) bool {
+	if err == nil || shell.IsStartFailure(err) {
+		return false
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	message := strings.ToLower(strings.Join([]string{
+		commandErr.Message,
+		commandErr.Result.Stdout,
+		commandErr.Result.Stderr,
+	}, "\n"))
+	return isLocalCLIContractMessage(message)
+}
+
+func isLocalCLIContractMessage(message string) bool {
+	for _, fragment := range []string{
+		"unknown json field",
+		"unknown flag",
+		"flag provided but not defined",
+		"unknown command",
+		"accepts at most",
+		"accepts between",
+		"requires at least",
+		"required flag",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func forgeCommentsToObjects(items []forge.Comment) []map[string]any {

@@ -113,6 +113,8 @@ func IsStartFailure(err error) bool {
 //   - EAGAIN / EWOULDBLOCK: process table or resource temporarily unavailable
 //   - ENOMEM: cannot allocate memory for the new process
 //   - ETXTBSY: text file busy (binary/script still open for write)
+//   - EMFILE: process file-descriptor table temporarily exhausted
+//   - ENFILE: system-wide file-descriptor table temporarily exhausted
 //
 // These still match IsStartFailure (same "start command:" marker) but a later
 // launch may succeed, so classifiers must not park them as BoundaryConfig.
@@ -131,7 +133,9 @@ func isTransientStartErrno(err error) bool {
 	return errors.Is(err, syscall.EAGAIN) ||
 		errors.Is(err, syscall.EWOULDBLOCK) ||
 		errors.Is(err, syscall.ENOMEM) ||
-		errors.Is(err, syscall.ETXTBSY)
+		errors.Is(err, syscall.ETXTBSY) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE)
 }
 
 // Run starts a command under process containment (ADR-0015 / #577).
