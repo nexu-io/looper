@@ -4565,6 +4565,51 @@ func TestProcessClaimedQueueItemRequeuesNetworkFailureDuringOwnershipCheck(t *te
 	}
 }
 
+func TestProcessClaimedQueueItemRequeuesNetworkFailureDuringAuthorLookup(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	// GetCurrentUserLogin succeeds; GetPullRequestAuthor fails with the observed connectivity error.
+	// This covers the second WithBoundary return in pullRequestOwnershipSkipReason.
+	github := &fakeGitHubGateway{
+		currentUser: "looper",
+		authorErr:   errors.New("Command exited with code 1: error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com"),
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_author_lookup_network_error", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_author_lookup_network_error", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:author-lookup-network-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable transient author-lookup failure", result)
+	}
+	requeued, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if requeued == nil || requeued.Status != "queued" || requeued.Attempts != 2 || requeued.LastErrorKind == nil || *requeued.LastErrorKind != string(FailureRetryableTransient) || requeued.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want queued retryable transient item", requeued)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if updatedLoop == nil || updatedLoop.Status != "queued" || updatedLoop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop with next run", updatedLoop)
+	}
+}
+
 func TestProcessClaimedQueueItemRequeuesNetworkFailureDuringLabelAuthorityCheck(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -6184,6 +6229,7 @@ func (f *runnerFixture) nowISO() string {
 type fakeGitHubGateway struct {
 	currentUser           string
 	currentUserErr        error
+	authorErr             error
 	listOpen              []PullRequestSummary
 	listOpenByLabel       map[string][]PullRequestSummary
 	listCalls             []ListOpenPullRequestsInput
@@ -6248,6 +6294,9 @@ func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string
 }
 
 func (f *fakeGitHubGateway) GetPullRequestAuthor(_ context.Context, input ViewPullRequestInput) (string, error) {
+	if f.authorErr != nil {
+		return "", f.authorErr
+	}
 	for _, detail := range f.viewResponses {
 		if detail.Number == input.PRNumber && detail.Author != "" {
 			return detail.Author, nil
