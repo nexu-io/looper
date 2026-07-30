@@ -1622,11 +1622,11 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 		if !info.IsDir() {
 			return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, "path exists but is not a directory")
 		}
-		if _, gitErr := os.Stat(filepath.Join(worktree.Path, ".git")); gitErr != nil {
-			if errors.Is(gitErr, os.ErrNotExist) {
-				return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, "path is not a usable git worktree")
-			}
-			return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree git metadata at %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), gitErr), kind: FailureRetryableTransient}
+		// Resume at execute/validate/open_pr skips prepare-worktree, so apply the
+		// same shared integrity probe: any existing .git entry is not enough —
+		// malformed gitfiles and corrupt linked metadata must recover too.
+		if !worktreesafety.LocalCheckoutUsable(worktree.Path) {
+			return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, "path is not a usable git worktree")
 		}
 		return worktree, nil
 	}
