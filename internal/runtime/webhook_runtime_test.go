@@ -506,7 +506,7 @@ func TestWebhookRuntimeAdmitForwarderStartRefusesAfterStop(t *testing.T) {
 }
 
 // Contract: Stop that wins the pre-persist boundary must refuse store.Upsert
-// under the same lock that observes stopped.
+// before any database write begins.
 func TestWebhookRuntimeAdmitForwarderPersistRefusesAfterStop(t *testing.T) {
 	repositories := openWebhookRuntimeTestRepositories(t)
 	persistGate := make(chan struct{})
@@ -565,6 +565,86 @@ func TestWebhookRuntimeAdmitForwarderPersistRefusesAfterStop(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("persisted %d forwarder rows after Stop, want 0", len(rows))
+	}
+}
+
+// Contract: after persist admission succeeds, Stop must still set stopped and
+// close stopCh without waiting for the (possibly blocked) database write.
+// Completing the write after Stop must not leave a durable forwarder row.
+func TestWebhookRuntimeStopUnblockedDuringAdmittedPersist(t *testing.T) {
+	repositories := openWebhookRuntimeTestRepositories(t)
+	persistGate := make(chan struct{})
+	atAdmitted := make(chan struct{})
+	originalAdmitted := webhookForwarderAdmittedPersistHook
+	webhookForwarderAdmittedPersistHook = func() {
+		close(atAdmitted)
+		<-persistGate
+	}
+	t.Cleanup(func() {
+		webhookForwarderAdmittedPersistHook = originalAdmitted
+		select {
+		case <-persistGate:
+		default:
+			close(persistGate)
+		}
+	})
+
+	rt := &webhookRuntime{
+		stopCh:         make(chan struct{}),
+		now:            time.Now,
+		forwarderStore: repositories.WebhookForwarders,
+	}
+	record := storage.WebhookForwarderRecord{
+		Repo: "nexu-io/looper", PID: 1, ProcessStart: 1, Fingerprint: "fp",
+		Endpoint: "http://127.0.0.1/webhook/forward", Events: "push", GHPath: "/usr/bin/gh",
+		DaemonID: "daemon", SpawnedAt: 1, UpdatedAt: 1,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.admitForwarderPersist(repositories.WebhookForwarders, record)
+	}()
+
+	select {
+	case <-atAdmitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitForwarderPersist did not reach post-admission persist boundary")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		rt.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop blocked while admitted forwarder persist held only the DB path")
+	}
+	select {
+	case <-rt.stopCh:
+	default:
+		t.Fatal("stopCh not closed after Stop during admitted persist")
+	}
+
+	close(persistGate)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errWebhookRuntimeStopped) {
+			t.Fatalf("admitForwarderPersist() error = %v, want errWebhookRuntimeStopped after Stop", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitForwarderPersist did not return after Stop released admitted gate")
+	}
+
+	rows, err := repositories.WebhookForwarders.List(context.Background())
+	if err != nil {
+		t.Fatalf("WebhookForwarders.List() error = %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("persisted %d forwarder rows after admitted write followed by Stop, want 0", len(rows))
 	}
 }
 

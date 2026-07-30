@@ -938,8 +938,12 @@ func (w *webhookRuntime) admitForwarderStart(cmd *exec.Cmd) error {
 	return cmd.Start()
 }
 
-// admitForwarderPersist linearizes store.Upsert with Stop the same way so a
-// forwarder row is never written after shutdown has begun.
+// admitForwarderPersist admits a forwarder row write against Stop without
+// holding w.mu across database I/O. Stop must be able to set stopped and close
+// stopCh while a slow or busy SQLite Upsert is in flight so unrelated
+// forwarders and reconcile cancellation are not blocked behind pooled I/O.
+// Persistence is bounded, and a write that finishes after Stop began is
+// rolled back so durable rows do not outlive shutdown admission.
 func (w *webhookRuntime) admitForwarderPersist(store *storage.WebhookForwardersRepository, record storage.WebhookForwarderRecord) error {
 	if store == nil {
 		return nil
@@ -948,11 +952,26 @@ func (w *webhookRuntime) admitForwarderPersist(store *storage.WebhookForwardersR
 		webhookForwarderPrePersistHook()
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.stopped {
+		w.mu.Unlock()
 		return errWebhookRuntimeStopped
 	}
-	return store.Upsert(context.Background(), record)
+	w.mu.Unlock()
+	if webhookForwarderAdmittedPersistHook != nil {
+		webhookForwarderAdmittedPersistHook()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), w.shutdownTimeout())
+	defer cancel()
+	if err := store.Upsert(ctx, record); err != nil {
+		return err
+	}
+	if w.isStopped() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), w.shutdownTimeout())
+		_ = store.Delete(cleanupCtx, record.Repo)
+		cleanupCancel()
+		return errWebhookRuntimeStopped
+	}
+	return nil
 }
 
 func (w *webhookRuntime) runForwarder(repo string) {
@@ -1009,8 +1028,8 @@ func (w *webhookRuntime) runForwarder(repo string) {
 		}
 		if store := w.currentForwarderStore(); store != nil {
 			record := webhookForwarderRecordFromState(repo, pid, processStart, state.Command, w.daemonID, w.currentTime())
-			// Persist admission is also linearized with Stop so shutdown cannot
-			// interleave between the stopped check and the store write.
+			// Persist admits under Stop briefly, then releases the mutex before
+			// bounded SQLite I/O so shutdown signaling is not blocked by DB wait.
 			if err := w.admitForwarderPersist(store, record); err != nil {
 				w.killAndWait(cmd)
 				if errors.Is(err, errWebhookRuntimeStopped) {
@@ -1390,10 +1409,14 @@ var execCommand = exec.Command
 
 var webhookForwarderStartedHook func()
 
-// Test hooks invoked just before stop-linearized start/persist admission so
-// lifecycle tests can pause at the exact interleaving boundary.
+// Test hooks invoked at stop-linearized start/persist boundaries so lifecycle
+// tests can pause at the exact interleaving points.
 var webhookForwarderPreStartHook func()
 var webhookForwarderPrePersistHook func()
+
+// webhookForwarderAdmittedPersistHook runs after Stop admission succeeds and
+// before the bounded store write so tests can prove Stop is not blocked by DB I/O.
+var webhookForwarderAdmittedPersistHook func()
 
 var osFindProcess = func(pid int) (*os.Process, error) {
 	return os.FindProcess(pid)
