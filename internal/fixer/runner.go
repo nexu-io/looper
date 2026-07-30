@@ -2409,11 +2409,11 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storag
 	}
 	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
 	if err != nil {
-		return "", err
+		return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 	}
 	author, err := r.github.GetPullRequestAuthor(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
-		return "", err
+		return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 	}
 	if sameGitHubLogin(author, currentUser) {
 		return "", nil
@@ -2428,7 +2428,7 @@ func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, loop s
 	policy := r.discoveryPolicyForProject(projectID)
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
-		return "", runtimeSkipNone, err
+		return "", runtimeSkipNone, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 	}
 	if domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
 		return fmt.Sprintf("Fixer stopped because %s#%d is currently held", repo, prNumber), runtimeSkipHold, nil

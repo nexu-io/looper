@@ -35,6 +35,83 @@ func TestRunCapturesStdoutAndStderr(t *testing.T) {
 	}
 }
 
+func TestIsStartFailureDetectsMissingExecutableAndBadCWD(t *testing.T) {
+	t.Parallel()
+	missing := filepath.Join(t.TempDir(), "no-such-binary")
+	_, err := Run(context.Background(), Options{Command: missing, Args: []string{"--help"}, CWD: t.TempDir()})
+	if err == nil {
+		t.Fatal("Run() error = nil, want missing executable launch failure")
+	}
+	if !IsStartFailure(err) {
+		t.Fatalf("IsStartFailure(%v) = false, want true", err)
+	}
+	if IsTransientStartFailure(err) {
+		t.Fatalf("IsTransientStartFailure(%v) = true, want false for missing executable", err)
+	}
+
+	badCWD := filepath.Join(t.TempDir(), "missing-dir")
+	_, err = Run(context.Background(), Options{Command: "/bin/sh", Args: []string{"-c", "true"}, CWD: badCWD})
+	if err == nil {
+		t.Fatal("Run() error = nil, want inaccessible CWD launch failure")
+	}
+	if !IsStartFailure(err) {
+		t.Fatalf("IsStartFailure(%v) = false, want true for bad CWD", err)
+	}
+	if IsTransientStartFailure(err) {
+		t.Fatalf("IsTransientStartFailure(%v) = true, want false for bad CWD", err)
+	}
+
+	// Completed non-zero exit is not a launch failure.
+	_, err = Run(context.Background(), Options{Command: "/bin/sh", Args: []string{"-c", "exit 1"}})
+	if err == nil {
+		t.Fatal("Run() error = nil, want non-zero exit")
+	}
+	if IsStartFailure(err) {
+		t.Fatalf("IsStartFailure(%v) = true, want false for completed command", err)
+	}
+	if IsStartFailure(nil) {
+		t.Fatal("IsStartFailure(nil) = true, want false")
+	}
+	if IsTransientStartFailure(nil) {
+		t.Fatal("IsTransientStartFailure(nil) = true, want false")
+	}
+}
+
+func TestIsTransientStartFailureDetectsHostPressureErrnos(t *testing.T) {
+	t.Parallel()
+
+	// Synthetic Run-shaped wrappers: cmd.Start errno values wrap under the
+	// stable "start command:" marker after local ETXTBSY retries are exhausted.
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "EAGAIN", err: fmt.Errorf("start command: %w", syscall.EAGAIN), want: true},
+		{name: "ENOMEM", err: fmt.Errorf("start command: %w", syscall.ENOMEM), want: true},
+		{name: "ETXTBSY", err: fmt.Errorf("start command: %w", syscall.ETXTBSY), want: true},
+		{name: "EMFILE", err: fmt.Errorf("start command: %w", syscall.EMFILE), want: true},
+		{name: "ENFILE", err: fmt.Errorf("start command: %w", syscall.ENFILE), want: true},
+		{name: "path EAGAIN", err: fmt.Errorf("start command: %w", &os.PathError{Op: "fork/exec", Path: "/tmp/x", Err: syscall.EAGAIN}), want: true},
+		{name: "path EMFILE", err: fmt.Errorf("start command: %w", &os.PathError{Op: "fork/exec", Path: "/tmp/x", Err: syscall.EMFILE}), want: true},
+		{name: "ENOENT config", err: fmt.Errorf("start command: %w", &os.PathError{Op: "fork/exec", Path: "/missing", Err: syscall.ENOENT}), want: false},
+		{name: "permission", err: fmt.Errorf("start command: %w", syscall.EACCES), want: false},
+		{name: "non-start", err: syscall.EAGAIN, want: false},
+		{name: "completed command", err: &CommandExecutionError{Message: "Command exited with code 1"}, want: false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsTransientStartFailure(tc.err); got != tc.want {
+				t.Fatalf("IsTransientStartFailure(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+			if tc.want && !IsStartFailure(tc.err) {
+				t.Fatalf("IsStartFailure(%v) = false, want true when transient", tc.err)
+			}
+		})
+	}
+}
+
 // Contract (#592 review): StartGate wraps cmd.Start so callers can hold an
 // external critical section across process launch only (not Wait).
 func TestRunStartGateWrapsProcessStart(t *testing.T) {

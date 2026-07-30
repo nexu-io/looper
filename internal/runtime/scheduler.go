@@ -25,6 +25,8 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -2090,48 +2092,141 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	if client, ok, err := a.forgejoForCWD(ctx, cwd); ok || err != nil {
 		if err != nil {
-			return "", err
+			// Client construction / project resolution failures are local and
+			// deterministic; do not tag them as hosting-API transport errors.
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
+		if err != nil {
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		return identity.Login, nil
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", withHostingAPIBoundary(err)
+	}
+	return login, nil
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		return pr.User.Login, nil
 	}
-	return a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	author, err := a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return "", withHostingAPIBoundary(err)
+	}
+	return author, nil
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		comments, err := client.ListIssueComments(ctx, input.PRNumber)
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return fixer.PullRequestDetail{}, err
+		return fixer.PullRequestDetail{}, withHostingAPIBoundary(err)
 	}
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+// withHostingAPIBoundary tags remote GitHub/hosting transport failures as
+// BoundaryGitHubAPI. Deterministic local CLI failures keep BoundaryConfig so
+// unlimited fixer queues request intervention instead of retrying forever:
+//   - launch failures: missing/moved gh, inaccessible CWD, bad permissions
+//   - completed CLI contract failures: incompatible gh schema/invocation
+//     (e.g. unknown --json field), zero-exit invalidJSONError payloads
+//     ("Invalid gh JSON payload"), and local shell capture truncation
+//     ("GitHub command output truncated" / Result truncation flags)
+//
+// Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY, EMFILE,
+// ENFILE after the short shell retry) stay BoundaryGitHubAPI so Classify
+// leaves them retryable.
+func withHostingAPIBoundary(err error) error {
+	if err == nil {
+		return nil
+	}
+	if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
+	if isLocalCLIContractFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
+	return failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+}
+
+// isLocalCLIContractFailure reports whether err is a successfully-launched
+// CLI failure from local invocation/schema/output-contract incompatibility
+// rather than a remote hosting API response. Examples:
+//   - gh pr view --json rejects a field (`unknown JSON field: "..."`) and
+//     exits nonzero — not IsStartFailure, but deterministic local mismatch
+//   - gh exits 0 with malformed/empty JSON and gateway emits
+//     `Invalid gh JSON payload` via invalidJSONError — still local decode
+//     contract, not a remote transport outage
+//   - shell capture exceeds the 256 KiB bound: runGhWithTimeout returns
+//     CommandExecutionError with StdoutTruncated/StderrTruncated and message
+//     "GitHub command output truncated" — local buffer limit, not API outage
+//
+// Retrying forever under BoundaryGitHubAPI cannot fix these deterministic
+// CLI-output contract failures.
+func isLocalCLIContractFailure(err error) bool {
+	if err == nil || shell.IsStartFailure(err) {
+		return false
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	// Prefer structural truncation flags from the shell Result; gateway
+	// runGhWithTimeout sets these when the local capture limit is hit.
+	if commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return true
+	}
+	message := strings.ToLower(strings.Join([]string{
+		commandErr.Message,
+		commandErr.Result.Stdout,
+		commandErr.Result.Stderr,
+	}, "\n"))
+	return isLocalCLIContractMessage(message)
+}
+
+func isLocalCLIContractMessage(message string) bool {
+	for _, fragment := range []string{
+		"unknown json field",
+		"invalid gh json payload",         // zero-exit decode/shape failures from invalidJSONError
+		"github command output truncated", // local shell capture limit (flags may be lost after wrap)
+		"unknown flag",
+		"flag provided but not defined",
+		"unknown command",
+		"accepts at most",
+		"accepts between",
+		"requires at least",
+		"required flag",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func forgeCommentsToObjects(items []forge.Comment) []map[string]any {

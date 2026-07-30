@@ -66,6 +66,78 @@ type CommandExecutionError struct {
 
 func (e *CommandExecutionError) Error() string { return e.Message }
 
+// IsStartFailure reports whether err is a process-launch failure from Run
+// (missing executable, inaccessible CWD, fork/exec failure). These occur
+// before any command output and are local environment problems, not remote
+// command or API results.
+//
+// Trade-off (string-marker classification):
+//   - Prevents: local CLI launch failures (missing/moved gh, bad CWD) being
+//     tagged BoundaryGitHubAPI and retried forever on unlimited fixer queues.
+//   - Cost: couples classification to Run's stable "start command:" prefix.
+//     False positives require an unrelated error whose text contains that
+//     exact marker; false negatives occur if a wrapper rewrites Error() and
+//     drops both the prefix and the unwrap chain (mitigated by walking Unwrap
+//     then falling back to a full-message contains check).
+//   - Why not a typed StartError only: Run already emits the prefix via
+//     fmt.Errorf("start command: %w", err) for diagnostics and other
+//     string-based local-path classifiers. A parallel typed error would
+//     duplicate the launch contract and force every wrap site to remember
+//     both forms. The marker is the existing authority for "failed before
+//     any command output"; this helper only exposes it.
+//   - Why not trust gateway/API error shape alone: gh CLI launch failures
+//     surface as plain exec errors before any hosting response exists.
+//
+// Callers that park failures as non-retryable config must also check
+// IsTransientStartFailure: host-pressure launch errors share the same
+// "start command:" marker but should remain retryable.
+func IsStartFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Walk the unwrap chain so wrappers that preserve Error() semantics still
+	// match. errors.Join does not unwrap linearly, so also check the full
+	// message once for the stable launch marker.
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if strings.HasPrefix(e.Error(), "start command:") {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "start command:")
+}
+
+// IsTransientStartFailure reports whether err is a process-launch failure
+// caused by temporary host pressure rather than deterministic local config.
+//
+// Covered errno values (after Run's short local ETXTBSY retry is exhausted):
+//   - EAGAIN / EWOULDBLOCK: process table or resource temporarily unavailable
+//   - ENOMEM: cannot allocate memory for the new process
+//   - ETXTBSY: text file busy (binary/script still open for write)
+//   - EMFILE: process file-descriptor table temporarily exhausted
+//   - ENFILE: system-wide file-descriptor table temporarily exhausted
+//
+// These still match IsStartFailure (same "start command:" marker) but a later
+// launch may succeed, so classifiers must not park them as BoundaryConfig.
+func IsTransientStartFailure(err error) bool {
+	if !IsStartFailure(err) {
+		return false
+	}
+	return isTransientStartErrno(err)
+}
+
+func isTransientStartErrno(err error) bool {
+	if err == nil {
+		return false
+	}
+	// EWOULDBLOCK is often identical to EAGAIN; check both for portability.
+	return errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EWOULDBLOCK) ||
+		errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.ETXTBSY) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE)
+}
+
 // Run starts a command under process containment (ADR-0015 / #577).
 //
 // The spawn boundary is Configure + Start + Bind. Cancel and timeout use
