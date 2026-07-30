@@ -25,6 +25,7 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -2090,46 +2091,59 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	if client, ok, err := a.forgejoForCWD(ctx, cwd); ok || err != nil {
 		if err != nil {
-			return "", err
+			// Client construction / project resolution failures are local and
+			// deterministic; do not tag them as hosting-API transport errors.
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
+		if err != nil {
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		return identity.Login, nil
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+	}
+	return login, nil
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		return pr.User.Login, nil
 	}
-	return a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	author, err := a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+	}
+	return author, nil
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
 	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		comments, err := client.ListIssueComments(ctx, input.PRNumber)
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return fixer.PullRequestDetail{}, err
+		return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 	}
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }

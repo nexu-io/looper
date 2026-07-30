@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/worker"
@@ -817,6 +819,71 @@ func TestForgejoSupportsFixerDiscoveryWithoutOpeningCoordinatorLane(t *testing.T
 	}
 	if providerHasGitHubPullRequests(config.ProviderKindForgejo) {
 		t.Fatal("providerHasGitHubPullRequests(forgejo) = true, coordinator lane must remain disabled")
+	}
+}
+
+func TestFixerGitHubAdapterTagsLocalConstructionAsConfigBoundary(t *testing.T) {
+	// Missing token env fails before any remote API call.
+	t.Setenv("FORGEJO_TOKEN", "")
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forge.example", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+
+	_, err := adapter.GetCurrentUserLogin(context.Background(), repoPath)
+	if err == nil {
+		t.Fatal("GetCurrentUserLogin() error = nil, want missing token construction failure")
+	}
+	var boundaryErr *failureclass.BoundaryError
+	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+		t.Fatalf("GetCurrentUserLogin() boundary = %#v, want BoundaryConfig", err)
+	}
+	// Re-applying the hosting API boundary must not promote local construction failures.
+	preserved := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+	if !errors.As(preserved, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+		t.Fatalf("preserved boundary = %#v, want BoundaryConfig", preserved)
+	}
+	if kind := failureclass.Classify(preserved, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.NonRetryable {
+		t.Fatalf("Classify() = %s, want non_retryable for local construction failure", kind)
+	}
+
+	_, err = adapter.GetPullRequestAuthor(context.Background(), fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath})
+	if err == nil || !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+		t.Fatalf("GetPullRequestAuthor() = %v, want BoundaryConfig construction failure", err)
+	}
+	_, err = adapter.ViewPullRequest(context.Background(), fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath})
+	if err == nil || !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryConfig {
+		t.Fatalf("ViewPullRequest() = %v, want BoundaryConfig construction failure", err)
+	}
+}
+
+func TestFixerGitHubAdapterTagsRemoteAPIFailuresAsGitHubBoundary(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("bad gateway"))
+	}))
+	defer server.Close()
+
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: repoPath}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+
+	_, err := adapter.GetCurrentUserLogin(context.Background(), repoPath)
+	if err == nil {
+		t.Fatal("GetCurrentUserLogin() error = nil, want remote API failure")
+	}
+	var boundaryErr *failureclass.BoundaryError
+	if !errors.As(err, &boundaryErr) || boundaryErr.Boundary != failureclass.BoundaryGitHubAPI {
+		t.Fatalf("GetCurrentUserLogin() boundary = %#v, want BoundaryGitHubAPI after client construction", err)
+	}
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryUnknown}); kind != failureclass.RetryableTransient {
+		t.Fatalf("Classify() = %s, want retryable_transient for remote hosting API failure", kind)
 	}
 }
 

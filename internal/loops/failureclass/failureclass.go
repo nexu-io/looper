@@ -54,9 +54,17 @@ type BoundaryError struct {
 	Err      error
 }
 
+// WithBoundary attaches a failure boundary used by Classify when the caller's
+// context boundary is unknown. If err is already wrapped with a non-empty
+// boundary, that boundary is preserved so local construction/config failures
+// are not reclassified as external (retryable) transport boundaries.
 func WithBoundary(err error, boundary Boundary) error {
 	if err == nil {
 		return nil
+	}
+	var existing *BoundaryError
+	if errors.As(err, &existing) && existing.Boundary != "" {
+		return err
 	}
 	return &BoundaryError{Boundary: boundary, Err: err}
 }

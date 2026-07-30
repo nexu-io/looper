@@ -20,6 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -4562,6 +4563,53 @@ func TestProcessClaimedQueueItemRequeuesNetworkFailureDuringOwnershipCheck(t *te
 	}
 	if updatedLoop == nil || updatedLoop.Status != "queued" || updatedLoop.NextRunAt == nil {
 		t.Fatalf("loop = %#v, want queued loop with next run", updatedLoop)
+	}
+}
+
+func TestProcessClaimedQueueItemDoesNotRetryLocalProviderConstructionDuringOwnershipCheck(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	// Simulate Forgejo client construction failure already tagged as local/config.
+	// The ownership check must preserve that boundary instead of promoting it to
+	// BoundaryGitHubAPI (which would leave unlimited queues retrying forever).
+	github := &fakeGitHubGateway{currentUserErr: failureclass.WithBoundary(
+		errors.New("forgejo client: environment variable FORGEJO_TOKEN is required"),
+		failureclass.BoundaryConfig,
+	)}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_ownership_local_config_error", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_ownership_local_config_error", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:ownership-local-config-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
+		t.Fatalf("result = %#v, want non-retryable local construction failure", result)
+	}
+	failed, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	// Queue.Fail parks terminal items as manual_intervention; the kind remains non_retryable.
+	if failed == nil || failed.Status != "manual_intervention" || failed.LastErrorKind == nil || *failed.LastErrorKind != string(FailureNonRetryable) || failed.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want manual_intervention non-retryable item (not infinite requeue)", failed)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if updatedLoop == nil || updatedLoop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused loop after non-retryable ownership failure", updatedLoop)
 	}
 }
 

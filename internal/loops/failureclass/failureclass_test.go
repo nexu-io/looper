@@ -39,6 +39,27 @@ func TestClassifyUsesWrappedBoundaryAuthority(t *testing.T) {
 	}
 }
 
+func TestWithBoundaryPreservesExistingBoundary(t *testing.T) {
+	local := WithBoundary(errors.New("forgejo client: environment variable FORGEJO_TOKEN is required"), BoundaryConfig)
+	wrapped := WithBoundary(local, BoundaryGitHubAPI)
+	var boundaryErr *BoundaryError
+	if !errors.As(wrapped, &boundaryErr) || boundaryErr.Boundary != BoundaryConfig {
+		t.Fatalf("WithBoundary() = %#v, want preserved BoundaryConfig", wrapped)
+	}
+	got := Classify(wrapped, Context{Runner: RunnerFixer, Boundary: BoundaryUnknown})
+	if got != NonRetryable {
+		t.Fatalf("Classify() = %s, want %s for preserved local config boundary", got, NonRetryable)
+	}
+}
+
+func TestWithBoundaryAppliesWhenAbsent(t *testing.T) {
+	wrapped := WithBoundary(errors.New("error connecting to api.github.com"), BoundaryGitHubAPI)
+	var boundaryErr *BoundaryError
+	if !errors.As(wrapped, &boundaryErr) || boundaryErr.Boundary != BoundaryGitHubAPI {
+		t.Fatalf("WithBoundary() = %#v, want BoundaryGitHubAPI", wrapped)
+	}
+}
+
 func TestClassifyRetriesGitHubGraphQLUnauthorizedAtGitHubBoundary(t *testing.T) {
 	got := Classify(errors.New(`Post "https://api.github.com/graphql": HTTP 401 Unauthorized`), Context{Runner: RunnerReviewer, Boundary: BoundaryGitHubAPI})
 	if got != RetryableTransient {
