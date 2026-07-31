@@ -1805,6 +1805,142 @@ func TestLooperReviewEngagementHeadRequiresOutcomeEventPolicyConsistency(t *test
 	}
 }
 
+func TestLooperReviewEngagementHeadRejectsNonCanonicalOutcomeCasing(t *testing.T) {
+	t.Parallel()
+	// Publish verification (isValidReviewMarkerOutcome / runtimeValidReviewMarkerOutcome)
+	// accepts only exact lowercase outcomes. Case variants must not authorize
+	// lastPublishedHeadSha backfill and bypass requireReviewRequest.
+	const loopID = "loop_engagement_outcome_case"
+	allowed := []ReviewEvent{ReviewEventComment, ReviewEventRequestChanges}
+	for _, outcome := range []string{"BLOCKING", "Blocking", "CLEAN", "NON_BLOCKING", "Actionable"} {
+		reviews := []map[string]any{{
+			"author": map[string]any{"login": "bob"},
+			"commit": map[string]any{"oid": "old-head"},
+			"state":  "CHANGES_REQUESTED",
+			"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=" + outcome + " -->",
+		}}
+		if got := looperReviewEngagementHead(reviews, "bob", loopID, "new-head", allowed, false); got != "" {
+			t.Fatalf("outcome=%q engagement head = %q, want empty (publish verification would reject)", outcome, got)
+		}
+		if reviewMarkerOutcomeEventAllowed(outcome, ReviewEventRequestChanges, allowed, false) {
+			t.Fatalf("reviewMarkerOutcomeEventAllowed(%q) = true, want false", outcome)
+		}
+	}
+	if !isRecognizedReviewOutcome("blocking") || isRecognizedReviewOutcome("BLOCKING") {
+		t.Fatal("isRecognizedReviewOutcome must match exact lowercase publish-verification tokens")
+	}
+}
+
+func TestDiscoverPullRequestsRejectsNonCanonicalOutcomeCasingEngagement(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	const loopID = "loop_reject_outcome_BLOCKING"
+	github := &fakeGitHubGateway{
+		currentLogin:   "bob",
+		reviewRequests: []string{},
+		viewHeadSHA:    "new-head",
+		reviews: []map[string]any{{
+			"author": map[string]any{"login": "bob"},
+			"commit": map[string]any{"oid": "old-head"},
+			"state":  "CHANGES_REQUESTED",
+			"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=BLOCKING -->",
+		}},
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll},
+		ReviewEvents:    config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges},
+		LoopConfig:      testReviewerLoopConfig(),
+	})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","headSha":"old-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("len(QueueItems) = %d, want 0 (outcome=BLOCKING must not authorize follow-up)", len(result.QueueItems))
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persistedLoop == nil || persistedLoop.MetadataJSON == nil {
+		t.Fatalf("loop after discovery = %#v, want preserved metadata", persistedLoop)
+	}
+	if contains(*persistedLoop.MetadataJSON, `"lastPublishedHeadSha"`) {
+		t.Fatalf("loop metadata = %s, want no lastPublishedHeadSha backfill from case-variant outcome", *persistedLoop.MetadataJSON)
+	}
+}
+
+func TestReviewsForEngagementBackfillTreatsEmptyPresentListAsAuthoritative(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	const loopID = "loop_empty_reviews_no_reload"
+	github := &fakeGitHubGateway{
+		currentLogin:   "bob",
+		reviewRequests: []string{},
+		viewHeadSHA:    "new-head",
+		// Present but empty reviews list (reviewer profile with no submissions).
+		reviews: []map[string]any{},
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll},
+		ReviewEvents:    config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges},
+		LoopConfig:      testReviewerLoopConfig(),
+	})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+	}
+
+	// Empty but non-nil reviews must not trigger LoadPullRequestReviews.
+	got, err := runner.reviewsForEngagementBackfill(context.Background(), *project, loop, PullRequestDetail{
+		Number: prNumber, HeadSHA: "new-head", Reviews: []map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("reviewsForEngagementBackfill(empty present) error = %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("reviewsForEngagementBackfill(empty present) = %#v, want empty non-nil slice", got)
+	}
+	if github.loadReviewsCalls != 0 {
+		t.Fatalf("LoadPullRequestReviews calls = %d, want 0 when reviews list is present and empty", github.loadReviewsCalls)
+	}
+
+	// Omitted (nil) reviews still load via the recovery path.
+	got, err = runner.reviewsForEngagementBackfill(context.Background(), *project, loop, PullRequestDetail{
+		Number: prNumber, HeadSHA: "new-head", Reviews: nil,
+	})
+	if err != nil {
+		t.Fatalf("reviewsForEngagementBackfill(nil) error = %v", err)
+	}
+	if got == nil {
+		t.Fatal("reviewsForEngagementBackfill(nil) = nil, want loaded empty list from gateway")
+	}
+	if github.loadReviewsCalls != 1 {
+		t.Fatalf("LoadPullRequestReviews calls = %d, want 1 when reviews field is omitted", github.loadReviewsCalls)
+	}
+}
+
 func TestDiscoverPullRequestsSkipsDraftFollowUpWithoutTerminatingLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

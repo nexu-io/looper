@@ -1179,7 +1179,11 @@ type pullRequestReviewsLoader interface {
 }
 
 func (r *Runner) reviewsForEngagementBackfill(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, detail PullRequestDetail) ([]map[string]any, error) {
-	if len(detail.Reviews) > 0 {
+	// A present reviews list (including empty) is authoritative. Only reload when
+	// the field was omitted (nil), e.g. fixer-profile / DiscoverySnapshot views.
+	// Treating len==0 as omitted double-fetches every discovery tick for loops
+	// with no reviews and aborts discovery if the redundant load fails.
+	if detail.Reviews != nil {
 		return detail.Reviews, nil
 	}
 	if r.github == nil || loop.Repo == nil || loop.PRNumber == nil {
@@ -1285,17 +1289,26 @@ func reviewEventFromSubmittedState(state string) ReviewEvent {
 // that event is allowed, outcome=blocking requires REQUEST_CHANGES when allowed,
 // and COMMENT only matches non_blocking/actionable (or the explicit clean-comment
 // self-approval fallback).
+//
+// Outcome matching is exact (no case folding), matching github.isValidReviewMarkerOutcome
+// and runtimeValidReviewMarkerOutcome. Publish verification rejects outcome=BLOCKING
+// and similar variants; engagement recovery must not accept them either.
 func reviewMarkerOutcomeEventAllowed(outcome string, event ReviewEvent, allowed []ReviewEvent, allowCleanComment bool) bool {
 	if event == "" {
 		return false
 	}
+	// Same gate as the canonical marker parsers: only exact lowercase outcomes
+	// that publish verification would accept can authorize ownership backfill.
+	if !isRecognizedReviewOutcome(outcome) {
+		return false
+	}
 	if len(allowed) == 0 {
-		return isRecognizedReviewOutcome(outcome)
+		return true
 	}
 	if !reviewEventInAllowed(event, allowed) {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	switch outcome {
 	case "clean":
 		if allowCleanComment && event == ReviewEventComment {
 			return true
@@ -1316,8 +1329,10 @@ func reviewMarkerOutcomeEventAllowed(outcome string, event ReviewEvent, allowed 
 	}
 }
 
+// isRecognizedReviewOutcome mirrors github.isValidReviewMarkerOutcome and
+// runtimeValidReviewMarkerOutcome: exact lowercase tokens only.
 func isRecognizedReviewOutcome(outcome string) bool {
-	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	switch outcome {
 	case "clean", "non_blocking", "blocking", "actionable":
 		return true
 	default:
