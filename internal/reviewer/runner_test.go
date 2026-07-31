@@ -1613,6 +1613,78 @@ func TestDiscoverPullRequestsRequeuesLooperEngagedFollowUpWithoutPublishedHeadMe
 	}
 }
 
+func TestDiscoverPullRequestsBackfillsEngagementWhenDiscoveryViewOmitsReviews(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	const loopID = "loop_follow_engaged_snapshot_omits_reviews"
+	// Simulate daemon DiscoverySnapshot lifecycle: discovery ViewPullRequest uses a
+	// fixer-profile detail without reviews, so engagement recovery must load
+	// reviews via LoadPullRequestReviews rather than trusting detail.Reviews.
+	github := &fakeGitHubGateway{
+		currentLogin:      "bob",
+		reviewRequests:    []string{},
+		viewHeadSHA:       "new-head",
+		omitReviewsOnView: true,
+		reviews: []map[string]any{{
+			"author": map[string]any{"login": "bob"},
+			"commit": map[string]any{"oid": "old-head"},
+			"state":  "CHANGES_REQUESTED",
+			"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=blocking -->",
+		}},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"posted clean follow-up review"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","headSha":"old-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Attach a non-nil snapshot the same way the scheduler tick does, so this
+	// covers the daemon discovery lifecycle rather than only direct runner use.
+	// The snapshot gateway is unused by the fake adapter; omitReviewsOnView is
+	// what models the fixer-profile empty-reviews detail shape.
+	snapshotGateway := githubinfra.New(githubinfra.Options{GHRun: func(context.Context, shell.Options) (shell.Result, error) {
+		return shell.Result{}, errors.New("discovery snapshot gateway should not be called by fake reviewer path")
+	}})
+	snapshot := githubinfra.NewDiscoverySnapshot(snapshotGateway, githubinfra.NewDiscoveryTickState(), githubinfra.DiscoverySnapshotOptions{})
+	if snapshot == nil {
+		t.Fatal("NewDiscoverySnapshot() = nil, want non-nil scheduler-style snapshot")
+	}
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo, Snapshot: snapshot})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("len(QueueItems) = %d, want 1 engaged follow-up after review reload", len(result.QueueItems))
+	}
+	if github.loadReviewsCalls < 1 {
+		t.Fatalf("LoadPullRequestReviews calls = %d, want >= 1 when discovery view omits reviews", github.loadReviewsCalls)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persistedLoop == nil || persistedLoop.MetadataJSON == nil || !contains(*persistedLoop.MetadataJSON, `"lastPublishedHeadSha":"old-head"`) {
+		t.Fatalf("loop after discovery = %#v, want engagement head backfilled from reloaded reviews", persistedLoop)
+	}
+	fixture.advance(time.Hour)
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want engaged follow-up", claimed, err)
+	}
+	processed, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if processed.Status != "success" || len(agent.starts) != 1 {
+		t.Fatalf("ProcessClaimedItem() = %#v, agent starts = %d; want full follow-up review", processed, len(agent.starts))
+	}
+}
+
 func TestDiscoverPullRequestsSkipsDraftFollowUpWithoutTerminatingLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -9906,6 +9978,11 @@ type fakeGitHubGateway struct {
 	listHeadSHA                     string
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
+	loadReviewsCalls                int
+	// omitReviewsOnView simulates DiscoverySnapshot/fixer-profile views that
+	// intentionally omit the reviews field while engagement recovery can still
+	// load them via LoadPullRequestReviews.
+	omitReviewsOnView               bool
 	author                          string
 	labels                          []string
 	reviewDecision                  string
@@ -10079,7 +10156,16 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 			users = append(users, networkpolicy.GitHubUser{Login: login})
 		}
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+	reviews := cloneCommentMaps(g.reviews)
+	if g.omitReviewsOnView {
+		reviews = nil
+	}
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: reviews}, nil
+}
+
+func (g *fakeGitHubGateway) LoadPullRequestReviews(context.Context, ViewPullRequestInput) ([]map[string]any, error) {
+	g.loadReviewsCalls++
+	return cloneCommentMaps(g.reviews), nil
 }
 
 func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {

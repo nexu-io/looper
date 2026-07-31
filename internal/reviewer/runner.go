@@ -1123,7 +1123,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		return nil
 	}
 	var err error
-	loop, err = r.backfillPublishedHeadFromLooperReview(ctx, loop, detail, *currentLogin)
+	loop, err = r.backfillPublishedHeadFromLooperReview(ctx, project, loop, detail, *currentLogin)
 	if err != nil {
 		return err
 	}
@@ -1143,12 +1143,16 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, allowThreadResolutionFollowUp, result)
 }
 
-func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, loop storage.LoopRecord, detail PullRequestDetail, currentLogin string) (storage.LoopRecord, error) {
+func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, detail PullRequestDetail, currentLogin string) (storage.LoopRecord, error) {
 	meta := parseJSONObject(loop.MetadataJSON)
 	if lastPublished, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && strings.TrimSpace(lastPublished) != "" {
 		return loop, nil
 	}
-	engagedHead := looperReviewEngagementHead(detail.Reviews, currentLogin, loop.ID, detail.HeadSHA)
+	reviews, err := r.reviewsForEngagementBackfill(ctx, project, loop, detail)
+	if err != nil {
+		return loop, err
+	}
+	engagedHead := looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA)
 	if engagedHead == "" {
 		return loop, nil
 	}
@@ -1158,6 +1162,34 @@ func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, loop
 			updated.MetadataJSON = stringPtr(metadataJSON)
 		}
 	})
+}
+
+// pullRequestReviewsLoader loads submitted PR reviews for engagement recovery.
+// Discovery profiles (and DiscoverySnapshot's fixer-profile view) may omit reviews;
+// loaders must return the reviewer-profile review payload instead of reusing that cache.
+type pullRequestReviewsLoader interface {
+	LoadPullRequestReviews(context.Context, ViewPullRequestInput) ([]map[string]any, error)
+}
+
+func (r *Runner) reviewsForEngagementBackfill(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, detail PullRequestDetail) ([]map[string]any, error) {
+	if len(detail.Reviews) > 0 {
+		return detail.Reviews, nil
+	}
+	if r.github == nil || loop.Repo == nil || loop.PRNumber == nil {
+		return nil, nil
+	}
+	input := ViewPullRequestInput{Repo: *loop.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath}
+	if loader, ok := r.github.(pullRequestReviewsLoader); ok {
+		return loader.LoadPullRequestReviews(ctx, input)
+	}
+	// Fallback for gateways that only expose ViewPullRequest: try a fresh detail
+	// fetch. Callers that attach DiscoverySnapshot and resolve ViewPullRequest to
+	// the fixer profile still omit reviews; prefer implementing pullRequestReviewsLoader.
+	refreshed, err := r.github.ViewPullRequest(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return refreshed.Reviews, nil
 }
 
 func looperReviewEngagementHead(reviews []map[string]any, login string, loopID string, currentHeadSHA string) string {

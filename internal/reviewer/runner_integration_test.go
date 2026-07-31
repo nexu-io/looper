@@ -244,7 +244,9 @@ func (a reviewerIntegrationGatewayAdapter) GetCurrentUserLogin(ctx context.Conte
 }
 
 func (a reviewerIntegrationGatewayAdapter) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	detail, err := a.Gateway.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	// Match production reviewerGitHubAdapter: use the reviewer profile so reviews
+	// are present even when a DiscoverySnapshot is attached to ctx.
+	detail, err := a.Gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -254,6 +256,14 @@ func (a reviewerIntegrationGatewayAdapter) ViewPullRequest(ctx context.Context, 
 		issueComments = append(issueComments, map[string]any{"body": comment.Body})
 	}
 	return PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), HasConflicts: detail.HasConflicts, Diff: diff, Comments: detail.Comments, IssueComments: issueComments, Reviews: detail.Reviews}, nil
+}
+
+func (a reviewerIntegrationGatewayAdapter) LoadPullRequestReviews(ctx context.Context, input ViewPullRequestInput) ([]map[string]any, error) {
+	detail, err := a.ViewPullRequest(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return detail.Reviews, nil
 }
 
 func (a reviewerIntegrationGatewayAdapter) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {

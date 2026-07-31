@@ -1224,11 +1224,25 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
 	}
+	// Always use the reviewer profile (includes reviews). Do not route through
+	// DiscoverySnapshot/ViewPullRequest, which intentionally uses the fixer
+	// profile and omits reviews for shared discovery caching.
 	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
 	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
+}
+
+// LoadPullRequestReviews implements reviewer engagement recovery. It always uses
+// the reviewer profile so DiscoverySnapshot's fixer-profile cache cannot strip
+// the submitted reviews needed to restore lastPublishedHeadSha.
+func (a reviewerGitHubAdapter) LoadPullRequestReviews(ctx context.Context, input reviewer.ViewPullRequestInput) ([]map[string]any, error) {
+	detail, err := a.ViewPullRequest(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return detail.Reviews, nil
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
