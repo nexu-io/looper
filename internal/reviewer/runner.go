@@ -1241,26 +1241,19 @@ func looperReviewEngagementHead(reviews []map[string]any, login string, loopID s
 			continue
 		}
 		body, _ := stringFromAny(review["body"])
-		for _, rawMarker := range reviewMarkerCommentPattern.FindAllString(body, -1) {
-			fields := map[string]string{}
-			segment := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(rawMarker), "<!--"), "-->"))
-			segment = strings.TrimSpace(strings.TrimPrefix(segment, "looper:review"))
-			for _, field := range strings.Fields(segment) {
-				key, value, ok := strings.Cut(field, "=")
-				if ok {
-					fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
-				}
-			}
-			id := fields["id"]
+		for _, marker := range githubinfra.ParseReviewMarkers(body) {
+			id := marker.ID
+			head := marker.Head
+			outcome := marker.Outcome
 			if id != wantID && !strings.HasPrefix(id, wantID+":") {
 				continue
 			}
-			if strings.TrimSpace(fields["head"]) != commitSHA {
+			if head != commitSHA {
 				continue
 			}
 			// Reuse the publish verifier's outcome/event/policy rules so a marker
 			// that verification would reject cannot authorize follow-up ownership.
-			if !reviewMarkerOutcomeEventAllowed(fields["outcome"], event, allowedEvents, allowCleanComment) {
+			if !reviewMarkerOutcomeEventAllowed(outcome, event, allowedEvents, allowCleanComment) {
 				continue
 			}
 			engagedHead = commitSHA

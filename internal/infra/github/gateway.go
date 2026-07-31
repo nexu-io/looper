@@ -2461,7 +2461,26 @@ type reviewIdempotencyMarker struct {
 	Outcome string
 }
 
+// ParsedReviewMarker is the canonical Looper review marker shape shared by
+// publish verification and reviewer engagement recovery.
+type ParsedReviewMarker struct {
+	ID      string
+	Head    string
+	Outcome string
+}
+
 var reviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
+
+// ParseReviewMarkers returns only markers accepted by publish verification's
+// case-sensitive grammar and required field validation.
+func ParseReviewMarkers(body string) []ParsedReviewMarker {
+	parsed := parseReviewIdempotencyMarkers(body)
+	markers := make([]ParsedReviewMarker, 0, len(parsed))
+	for _, marker := range parsed {
+		markers = append(markers, ParsedReviewMarker{ID: marker.ID, Head: marker.Head, Outcome: marker.Outcome})
+	}
+	return markers
+}
 
 func findReviewIdempotencyMarker(body string, marker string) (reviewIdempotencyMarker, bool) {
 	marker = strings.TrimSpace(marker)
