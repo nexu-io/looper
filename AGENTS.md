@@ -66,7 +66,3 @@ If a subsystem receives a second `fix:` PR shortly after the first, default to r
 ### Prefer deletion over another layer
 
 Before adding durability, recovery, persistence, confirmation, or a new gate, first attempt the opposite direction: can a layer be removed to make the problem disappear? Record the result in the PR description, even if the conclusion is "no". A strongly positive net diff on a path that has already been patched is suspect by default.
-
-### Test-file growth is a design smell
-
-A single PR that adds more than 300 lines to one `*_test.go` file for a runner or subsystem is a design smell. Explosive test growth usually means an internal state machine is being propped up rather than simplified.
