@@ -1122,6 +1122,11 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		result.Skipped++
 		return nil
 	}
+	var err error
+	loop, err = r.backfillPublishedHeadFromLooperReview(ctx, loop, detail, *currentLogin)
+	if err != nil {
+		return err
+	}
 	requireReviewRequest := requireReviewRequestForLoop(loop, reviewRequestRequiredForCandidate(policy, detail.Labels), detail.HeadSHA)
 	allowThreadResolutionFollowUp := false
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) {
@@ -1136,6 +1141,83 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		return nil
 	}
 	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, allowThreadResolutionFollowUp, result)
+}
+
+func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, loop storage.LoopRecord, detail PullRequestDetail, currentLogin string) (storage.LoopRecord, error) {
+	meta := parseJSONObject(loop.MetadataJSON)
+	if lastPublished, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && strings.TrimSpace(lastPublished) != "" {
+		return loop, nil
+	}
+	engagedHead := looperReviewEngagementHead(detail.Reviews, currentLogin, loop.ID, detail.HeadSHA)
+	if engagedHead == "" {
+		return loop, nil
+	}
+	return r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": engagedHead})
+		if err == nil {
+			updated.MetadataJSON = stringPtr(metadataJSON)
+		}
+	})
+}
+
+func looperReviewEngagementHead(reviews []map[string]any, login string, loopID string, currentHeadSHA string) string {
+	login = normalizeLogin(login)
+	loopID = strings.TrimSpace(loopID)
+	currentHeadSHA = strings.TrimSpace(currentHeadSHA)
+	if login == "" || loopID == "" {
+		return ""
+	}
+	wantID := "reviewer:" + loopID
+	engagedHead := ""
+	for _, review := range reviews {
+		author, _ := review["author"].(map[string]any)
+		if author == nil {
+			author, _ = review["user"].(map[string]any)
+		}
+		authorLogin, _ := stringFromAny(author["login"])
+		if normalizeLogin(authorLogin) != login {
+			continue
+		}
+		state, _ := stringFromAny(review["state"])
+		if !isSubmittedReviewState(state) {
+			continue
+		}
+		commitSHA := ""
+		if commit, ok := review["commit"].(map[string]any); ok {
+			commitSHA, _ = stringFromAny(commit["oid"])
+		}
+		if commitSHA == "" {
+			commitSHA, _ = stringFromAny(review["commit_id"])
+		}
+		commitSHA = strings.TrimSpace(commitSHA)
+		if commitSHA == "" || commitSHA == currentHeadSHA {
+			continue
+		}
+		body, _ := stringFromAny(review["body"])
+		for _, rawMarker := range reviewMarkerCommentPattern.FindAllString(body, -1) {
+			fields := map[string]string{}
+			segment := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(rawMarker), "<!--"), "-->"))
+			segment = strings.TrimSpace(strings.TrimPrefix(segment, "looper:review"))
+			for _, field := range strings.Fields(segment) {
+				key, value, ok := strings.Cut(field, "=")
+				if ok {
+					fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+				}
+			}
+			id := fields["id"]
+			if id != wantID && !strings.HasPrefix(id, wantID+":") {
+				continue
+			}
+			if strings.TrimSpace(fields["head"]) != commitSHA {
+				continue
+			}
+			switch fields["outcome"] {
+			case "clean", "non_blocking", "blocking", "actionable":
+				engagedHead = commitSHA
+			}
+		}
+	}
+	return engagedHead
 }
 
 func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
@@ -3392,6 +3474,11 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON))
 	allowCleanComment := sameReviewAuthorLogin(currentLogin, prAuthorLogin)
 	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	if err != nil || found.Found {
+		return found, err
+	}
+	bareLoopMarker := agentNativeBareLoopReviewMarker(input.Loop.ID, headSHA)
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: bareLoopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}
@@ -6811,6 +6898,10 @@ func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey strin
 		idempotencyKey = fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
 	}
 	return fmt.Sprintf("looper:review id=%s head=%s", idempotencyKey, headSHA)
+}
+
+func agentNativeBareLoopReviewMarker(loopID string, headSHA string) string {
+	return fmt.Sprintf("looper:review id=reviewer:%s head=%s", loopID, headSHA)
 }
 
 func agentNativeLoopReviewMarker(loopID string, headSHA string) string {
