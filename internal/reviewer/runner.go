@@ -1152,7 +1152,14 @@ func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, proj
 	if err != nil {
 		return loop, err
 	}
-	engagedHead := looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA)
+	// Match publish verification: only promote ownership from markers that the
+	// effective clean/blocking policy would have accepted as a published review.
+	// A COMMENTED review with outcome=clean|blocking is rejected when policy
+	// requires APPROVE|REQUEST_CHANGES, so it must not backfill lastPublishedHeadSha.
+	policy := r.effectiveReviewEvents(project.ID, loop.MetadataJSON)
+	allowedEvents := r.allowedReviewEventsForPolicy(policy)
+	allowCleanComment := sameReviewAuthorLogin(currentLogin, detail.Author)
+	engagedHead := looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, allowedEvents, allowCleanComment)
 	if engagedHead == "" {
 		return loop, nil
 	}
@@ -1192,7 +1199,7 @@ func (r *Runner) reviewsForEngagementBackfill(ctx context.Context, project stora
 	return refreshed.Reviews, nil
 }
 
-func looperReviewEngagementHead(reviews []map[string]any, login string, loopID string, currentHeadSHA string) string {
+func looperReviewEngagementHead(reviews []map[string]any, login string, loopID string, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment bool) string {
 	login = normalizeLogin(login)
 	loopID = strings.TrimSpace(loopID)
 	currentHeadSHA = strings.TrimSpace(currentHeadSHA)
@@ -1212,6 +1219,10 @@ func looperReviewEngagementHead(reviews []map[string]any, login string, loopID s
 		}
 		state, _ := stringFromAny(review["state"])
 		if !isSubmittedReviewState(state) {
+			continue
+		}
+		event := reviewEventFromSubmittedState(state)
+		if event == "" {
 			continue
 		}
 		commitSHA := ""
@@ -1243,13 +1254,84 @@ func looperReviewEngagementHead(reviews []map[string]any, login string, loopID s
 			if strings.TrimSpace(fields["head"]) != commitSHA {
 				continue
 			}
-			switch fields["outcome"] {
-			case "clean", "non_blocking", "blocking", "actionable":
-				engagedHead = commitSHA
+			// Reuse the publish verifier's outcome/event/policy rules so a marker
+			// that verification would reject cannot authorize follow-up ownership.
+			if !reviewMarkerOutcomeEventAllowed(fields["outcome"], event, allowedEvents, allowCleanComment) {
+				continue
 			}
+			engagedHead = commitSHA
 		}
 	}
 	return engagedHead
+}
+
+// reviewEventFromSubmittedState maps a submitted GitHub/Forgejo review state to
+// the review-submit event token used by publish verification.
+func reviewEventFromSubmittedState(state string) ReviewEvent {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED":
+		return ReviewEventApprove
+	case "CHANGES_REQUESTED":
+		return ReviewEventRequestChanges
+	case "COMMENTED":
+		return ReviewEventComment
+	default:
+		return ""
+	}
+}
+
+// reviewMarkerOutcomeEventAllowed mirrors github.reviewMarkerEventAllowedForOutcome
+// (and forgejoNativeReviewMarkerEventAllowed): outcome=clean requires APPROVE when
+// that event is allowed, outcome=blocking requires REQUEST_CHANGES when allowed,
+// and COMMENT only matches non_blocking/actionable (or the explicit clean-comment
+// self-approval fallback).
+func reviewMarkerOutcomeEventAllowed(outcome string, event ReviewEvent, allowed []ReviewEvent, allowCleanComment bool) bool {
+	if event == "" {
+		return false
+	}
+	if len(allowed) == 0 {
+		return isRecognizedReviewOutcome(outcome)
+	}
+	if !reviewEventInAllowed(event, allowed) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean":
+		if allowCleanComment && event == ReviewEventComment {
+			return true
+		}
+		if reviewEventInAllowed(ReviewEventApprove, allowed) {
+			return event == ReviewEventApprove
+		}
+		return event == ReviewEventComment
+	case "blocking":
+		if reviewEventInAllowed(ReviewEventRequestChanges, allowed) {
+			return event == ReviewEventRequestChanges
+		}
+		return event == ReviewEventComment
+	case "non_blocking", "actionable":
+		return event == ReviewEventComment
+	default:
+		return false
+	}
+}
+
+func isRecognizedReviewOutcome(outcome string) bool {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
+}
+
+func reviewEventInAllowed(event ReviewEvent, allowed []ReviewEvent) bool {
+	for _, candidate := range allowed {
+		if candidate == event {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {

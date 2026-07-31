@@ -1575,7 +1575,7 @@ func TestDiscoverPullRequestsRequeuesLooperEngagedFollowUpWithoutPublishedHeadMe
 		}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"posted clean follow-up review"}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}, LoopConfig: testReviewerLoopConfig()})
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
 	prNumber := int64(42)
@@ -1633,7 +1633,7 @@ func TestDiscoverPullRequestsBackfillsEngagementWhenDiscoveryViewOmitsReviews(t 
 		}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"posted clean follow-up review"}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}, LoopConfig: testReviewerLoopConfig()})
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
 	prNumber := int64(42)
@@ -1682,6 +1682,126 @@ func TestDiscoverPullRequestsBackfillsEngagementWhenDiscoveryViewOmitsReviews(t 
 	}
 	if processed.Status != "success" || len(agent.starts) != 1 {
 		t.Fatalf("ProcessClaimedItem() = %#v, agent starts = %d; want full follow-up review", processed, len(agent.starts))
+	}
+}
+
+func TestDiscoverPullRequestsRejectsPolicyInconsistentEngagementMarkers(t *testing.T) {
+	t.Parallel()
+	// Publish verification rejects COMMENTED reviews that carry clean/blocking
+	// when policy requires APPROVE/REQUEST_CHANGES. Engagement backfill must
+	// apply the same outcome/event/policy gate so those rejected markers cannot
+	// restore lastPublishedHeadSha and bypass requireReviewRequest.
+	cases := []struct {
+		name    string
+		state   string
+		outcome string
+		policy  config.ReviewerReviewEventsConfig
+	}{
+		{
+			name:    "commented_blocking_under_request_changes_policy",
+			state:   "COMMENTED",
+			outcome: "blocking",
+			policy:  config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges},
+		},
+		{
+			name:    "commented_clean_under_approve_policy",
+			state:   "COMMENTED",
+			outcome: "clean",
+			policy:  config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			loopID := "loop_reject_inconsistent_" + tc.name
+			github := &fakeGitHubGateway{
+				currentLogin:   "bob",
+				reviewRequests: []string{},
+				viewHeadSHA:    "new-head",
+				reviews: []map[string]any{{
+					"author": map[string]any{"login": "bob"},
+					"commit": map[string]any{"oid": "old-head"},
+					"state":  tc.state,
+					"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=" + tc.outcome + " -->",
+				}},
+			}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+				AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+				DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll},
+				ReviewEvents:    tc.policy,
+				LoopConfig:      testReviewerLoopConfig(),
+			})
+			nowISO := fixture.nowISO()
+			repo := "acme/looper"
+			prNumber := int64(42)
+			metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","headSha":"old-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+			loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("DiscoverPullRequests() error = %v", err)
+			}
+			if len(result.QueueItems) != 0 {
+				t.Fatalf("len(QueueItems) = %d, want 0 (policy-inconsistent marker must not authorize follow-up)", len(result.QueueItems))
+			}
+			persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if err != nil {
+				t.Fatalf("Loops.GetByID() error = %v", err)
+			}
+			if persistedLoop == nil || persistedLoop.MetadataJSON == nil {
+				t.Fatalf("loop after discovery = %#v, want preserved metadata", persistedLoop)
+			}
+			if contains(*persistedLoop.MetadataJSON, `"lastPublishedHeadSha"`) {
+				t.Fatalf("loop metadata = %s, want no lastPublishedHeadSha backfill from rejected marker", *persistedLoop.MetadataJSON)
+			}
+		})
+	}
+}
+
+func TestLooperReviewEngagementHeadRequiresOutcomeEventPolicyConsistency(t *testing.T) {
+	t.Parallel()
+	const loopID = "loop_engagement_policy"
+	reviews := []map[string]any{{
+		"author": map[string]any{"login": "bob"},
+		"commit": map[string]any{"oid": "old-head"},
+		"state":  "COMMENTED",
+		"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=blocking -->",
+	}}
+	allowedWithRequestChanges := []ReviewEvent{ReviewEventComment, ReviewEventRequestChanges}
+	if got := looperReviewEngagementHead(reviews, "bob", loopID, "new-head", allowedWithRequestChanges, false); got != "" {
+		t.Fatalf("COMMENTED+blocking under REQUEST_CHANGES policy = %q, want empty", got)
+	}
+	allowedCommentOnly := []ReviewEvent{ReviewEventComment}
+	if got := looperReviewEngagementHead(reviews, "bob", loopID, "new-head", allowedCommentOnly, false); got != "old-head" {
+		t.Fatalf("COMMENTED+blocking under COMMENT policy = %q, want old-head", got)
+	}
+	requestChangesReviews := []map[string]any{{
+		"author": map[string]any{"login": "bob"},
+		"commit": map[string]any{"oid": "old-head"},
+		"state":  "CHANGES_REQUESTED",
+		"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=blocking -->",
+	}}
+	if got := looperReviewEngagementHead(requestChangesReviews, "bob", loopID, "new-head", allowedWithRequestChanges, false); got != "old-head" {
+		t.Fatalf("CHANGES_REQUESTED+blocking under REQUEST_CHANGES policy = %q, want old-head", got)
+	}
+	cleanCommented := []map[string]any{{
+		"author": map[string]any{"login": "bob"},
+		"commit": map[string]any{"oid": "old-head"},
+		"state":  "COMMENTED",
+		"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=clean -->",
+	}}
+	allowedWithApprove := []ReviewEvent{ReviewEventComment, ReviewEventApprove}
+	if got := looperReviewEngagementHead(cleanCommented, "bob", loopID, "new-head", allowedWithApprove, false); got != "" {
+		t.Fatalf("COMMENTED+clean under APPROVE policy without self-approval = %q, want empty", got)
+	}
+	if got := looperReviewEngagementHead(cleanCommented, "bob", loopID, "new-head", allowedWithApprove, true); got != "old-head" {
+		t.Fatalf("COMMENTED+clean under APPROVE policy with self-approval fallback = %q, want old-head", got)
 	}
 }
 
