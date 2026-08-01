@@ -1,0 +1,469 @@
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  fetchAgentModels,
+  type AgentModelEntry,
+  type AgentModelsData,
+} from "@/lib/api";
+
+const controlClass =
+  "w-full rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[12px] text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-60";
+
+/**
+ * Advisory suggestion cache. Backend already caches ~60s per vendor; this just
+ * avoids extra round trips on repeated focus and keeps the previous list on
+ * screen while a refresh probe is in flight. Cache freshness (timestamp) is
+ * the sole authority for whether we skip a fetch — no separate "fetched"
+ * ref that could strand the control after an aborted request.
+ */
+const CACHE_TTL_MS = 60_000;
+const cache = new Map<string, { at: number; data: AgentModelsData }>();
+
+type SpecialKind = "inherit" | "vendor-default";
+type Row =
+  | { kind: "special"; special: SpecialKind; label: string; hint?: string }
+  | { kind: "model"; entry: AgentModelEntry }
+  | { kind: "custom"; value: string };
+
+export type ModelComboboxProps = {
+  id?: string;
+  ariaLabel?: string;
+  /** Effective vendor resolved by the caller (nullable). */
+  vendor: string | null;
+  /** Current draft (or published) string. Empty string = vendor default. */
+  value: string;
+  /** True when caller has staged an unset (inherit). Displayed as read-only. */
+  unset: boolean;
+  disabled: boolean;
+  /** True to include an "Inherit" row (profile / role scopes). */
+  allowInherit: boolean;
+  placeholder?: string;
+  /**
+   * Stage a value as free entry / id pick / vendor default. Caller decides how
+   * to map "" (vendor default suppress vs no-op) based on scope semantics — see
+   * buildConfigPatch tri-state rules.
+   */
+  onCommitValue: (value: string) => void;
+  /**
+   * Stage an inherit (unset). Required when allowInherit=true.
+   */
+  onInherit?: () => void;
+};
+
+export function ModelCombobox({
+  id,
+  ariaLabel,
+  vendor,
+  value,
+  unset,
+  disabled,
+  allowInherit,
+  placeholder,
+  onCommitValue,
+  onInherit,
+}: ModelComboboxProps) {
+  const generatedId = useId();
+  const listboxId = `${id ?? generatedId}-listbox`;
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState<string | null>(null);
+  // null = no keyboard navigation yet. Enter with null commits the typed
+  // value (or does nothing) rather than blindly selecting row zero.
+  const [active, setActive] = useState<number | null>(null);
+  const [entries, setEntries] = useState<AgentModelEntry[] | null>(null);
+  const [probeError, setProbeError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<HTMLUListElement | null>(null);
+
+  // Single close path: clear popup, transient query, and navigation state.
+  // Parent `value` is authoritative once closed.
+  const close = useCallback(() => {
+    setOpen(false);
+    setQuery(null);
+    setActive(null);
+  }, []);
+
+  // Load / refresh suggestions when the popup opens (or vendor changes while
+  // open). Fresh cache serves synchronously; stale cache is shown while a
+  // background probe refreshes it.
+  useEffect(() => {
+    if (!open || !vendor) return;
+    const cached = cache.get(vendor);
+    if (cached) setEntries(cached.data.models);
+    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+      setProbeError(
+        cached.data.sources.probe === "error"
+          ? cached.data.sources.probeError ??
+              "Using built-in list; CLI probe failed"
+          : null,
+      );
+      return;
+    }
+    const controller = new AbortController();
+    setLoading(true);
+    fetchAgentModels(vendor, { signal: controller.signal })
+      .then((data) => {
+        if (controller.signal.aborted) return;
+        cache.set(vendor, { at: Date.now(), data });
+        setEntries(data.models);
+        setProbeError(
+          data.sources.probe === "error"
+            ? data.sources.probeError ??
+                "Using built-in list; CLI probe failed"
+            : null,
+        );
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        setProbeError(
+          err instanceof Error
+            ? `Model suggestions unavailable (${err.message})`
+            : "Model suggestions unavailable",
+        );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => {
+      controller.abort();
+      setLoading(false);
+    };
+  }, [open, vendor]);
+
+  // Vendor change: drop stale suggestions immediately.
+  useEffect(() => {
+    setEntries(null);
+    setProbeError(null);
+    setLoading(false);
+  }, [vendor]);
+
+  // Close on outside click via the unified close path.
+  useEffect(() => {
+    if (!open) return;
+    const handler = (event: MouseEvent) => {
+      if (!rootRef.current) return;
+      if (!rootRef.current.contains(event.target as Node)) close();
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open, close]);
+
+  const rows = useMemo<Row[]>(() => {
+    const specials: Row[] = [];
+    if (allowInherit) {
+      specials.push({
+        kind: "special",
+        special: "inherit",
+        label: "Inherit",
+        hint: "Fall back to the previous layer (profile / global / vendor default).",
+      });
+    }
+    specials.push({
+      kind: "special",
+      special: "vendor-default",
+      label: "Vendor default",
+      hint: "Suppress inherited model; use the vendor CLI default.",
+    });
+
+    const q = (query ?? "").trim().toLowerCase();
+    const source = entries ?? [];
+    const filtered = q
+      ? source.filter(
+          (m) =>
+            m.id.toLowerCase().includes(q) ||
+            m.label.toLowerCase().includes(q),
+        )
+      : source;
+
+    const modelRows: Row[] = filtered.map((entry) => ({
+      kind: "model",
+      entry,
+    }));
+
+    // Custom / free-entry row when the current query is a novel id.
+    let customRow: Row | null = null;
+    if (
+      q &&
+      !filtered.some((m) => m.id.toLowerCase() === q) &&
+      // Skip "custom" when the query happens to equal a special label.
+      q !== "inherit" &&
+      q !== "vendor default"
+    ) {
+      customRow = { kind: "custom", value: (query ?? "").trim() };
+    }
+
+    return customRow ? [...specials, customRow, ...modelRows] : [...specials, ...modelRows];
+  }, [entries, query, allowInherit]);
+
+  // Keep active index in range as rows change. Null (untouched) stays null.
+  useEffect(() => {
+    if (active !== null && active >= rows.length) {
+      setActive(rows.length > 0 ? rows.length - 1 : null);
+    }
+  }, [rows.length, active]);
+
+  // Scroll the active option into view on keyboard navigation.
+  useEffect(() => {
+    if (!open || active === null || !listRef.current) return;
+    const el = listRef.current.children[active] as HTMLElement | undefined;
+    // scrollIntoView is a browser API; jsdom stubs it out — guard for tests.
+    if (typeof el?.scrollIntoView === "function") {
+      el.scrollIntoView({ block: "nearest" });
+    }
+  }, [active, open]);
+
+  // What to render inside the input. When closed, defer to the controlled
+  // `value` so a discarded/rebased parent draft never leaves stale query
+  // text on screen. When open, show the current query (or fall back to value).
+  const displayValue = open ? query ?? value : unset ? "" : value;
+
+  // Which row represents the current parent state (for aria-selected when the
+  // operator hasn't navigated yet).
+  const stateRowIndex = useMemo<number | null>(() => {
+    if (unset) {
+      const idx = rows.findIndex(
+        (r) => r.kind === "special" && r.special === "inherit",
+      );
+      return idx >= 0 ? idx : null;
+    }
+    if (value === "") {
+      const idx = rows.findIndex(
+        (r) => r.kind === "special" && r.special === "vendor-default",
+      );
+      return idx >= 0 ? idx : null;
+    }
+    const idx = rows.findIndex(
+      (r) => r.kind === "model" && r.entry.id === value,
+    );
+    return idx >= 0 ? idx : null;
+  }, [rows, value, unset]);
+
+  const commitRow = useCallback(
+    (row: Row) => {
+      if (row.kind === "special") {
+        if (row.special === "inherit") {
+          if (onInherit) onInherit();
+        } else {
+          onCommitValue("");
+        }
+      } else if (row.kind === "model") {
+        onCommitValue(row.entry.id);
+      } else {
+        onCommitValue(row.value);
+      }
+      close();
+    },
+    [onCommitValue, onInherit, close],
+  );
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setOpen(true);
+      setActive((idx) => {
+        // First arrow press: start navigation from the row that reflects
+        // current parent state (Inherit when unset, Vendor default when "",
+        // or the matching model), falling back to row 0.
+        if (idx === null) return stateRowIndex ?? 0;
+        return Math.min(rows.length - 1, idx + 1);
+      });
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setOpen(true);
+      setActive((idx) => {
+        if (idx === null) return stateRowIndex ?? 0;
+        return Math.max(0, idx - 1);
+      });
+    } else if (event.key === "Enter") {
+      // Only commit a row when the operator has explicitly arrow-navigated
+      // to it. An untouched Enter with typed text commits the typed value;
+      // with no typed text it does nothing (keeps the current parent value).
+      if (open && active !== null && rows[active]) {
+        event.preventDefault();
+        commitRow(rows[active]);
+      } else if (query !== null && query.trim() !== "") {
+        event.preventDefault();
+        onCommitValue(query.trim());
+        close();
+      } else if (open) {
+        event.preventDefault();
+        close();
+      }
+    } else if (event.key === "Escape") {
+      if (open) {
+        event.preventDefault();
+        close();
+      }
+    } else if (event.key === "Tab") {
+      // Tab commits nothing but exits cleanly.
+      if (open) close();
+    }
+  };
+
+  // aria-activedescendant: prefer explicit keyboard-navigated active row.
+  // When the operator has not navigated, expose the row that reflects current
+  // parent state (if any) so screen readers announce the current selection.
+  const ariaActiveIdx = active ?? stateRowIndex;
+  const activeId =
+    open && ariaActiveIdx !== null && rows[ariaActiveIdx]
+      ? `${listboxId}-opt-${ariaActiveIdx}`
+      : undefined;
+
+  // Placeholder reflects tri-state when the input renders empty and closed.
+  const closedPlaceholder = unset
+    ? "Inherit"
+    : value === ""
+      ? "Vendor default"
+      : placeholder;
+
+  return (
+    <div ref={rootRef} className="relative min-w-0">
+      <input
+        id={id}
+        aria-label={ariaLabel}
+        role="combobox"
+        aria-expanded={open}
+        aria-controls={listboxId}
+        aria-autocomplete="list"
+        aria-activedescendant={activeId}
+        className={`${controlClass} mono ${unset ? "opacity-50" : ""}`}
+        type="text"
+        spellCheck={false}
+        autoComplete="off"
+        placeholder={open ? placeholder : closedPlaceholder}
+        disabled={disabled || unset}
+        value={displayValue}
+        onFocus={() => setOpen(true)}
+        onClick={() => setOpen(true)}
+        onBlur={(event) => {
+          // Ignore blur when focus moves to our own popup (listbox mousedown).
+          if (
+            rootRef.current &&
+            event.relatedTarget instanceof Node &&
+            rootRef.current.contains(event.relatedTarget)
+          ) {
+            return;
+          }
+          close();
+        }}
+        onChange={(event) => {
+          const next = event.currentTarget.value;
+          // Preserve tri-state: stage typed text as-is (free entry). Empty text
+          // is legitimate — caller decides how "" maps to buildConfigPatch.
+          setQuery(next);
+          setOpen(true);
+          setActive(null);
+          onCommitValue(next);
+        }}
+        onKeyDown={onKeyDown}
+      />
+      {open && !disabled && !unset ? (
+        <div
+          className="absolute left-0 right-0 z-30 mt-1 max-h-64 overflow-auto rounded border border-[var(--border)] bg-[var(--bg-elevated)] shadow-lg"
+          data-testid="model-combobox-popup"
+        >
+          {!vendor ? (
+            <p className="m-0 px-2 py-1.5 text-[11px] text-[var(--text-muted)]">
+              Select a vendor first — suggestions will load automatically. You
+              can still type any model id.
+            </p>
+          ) : null}
+          {probeError ? (
+            <p
+              className="m-0 border-b border-[var(--border)] px-2 py-1 text-[10px] text-[var(--warn)]"
+              role="status"
+            >
+              {probeError}
+            </p>
+          ) : null}
+          {loading && (!entries || entries.length === 0) ? (
+            <p className="m-0 px-2 py-1.5 text-[11px] text-[var(--text-muted)]">
+              Loading suggestions…
+            </p>
+          ) : null}
+          <ul
+            id={listboxId}
+            ref={listRef}
+            role="listbox"
+            className="m-0 list-none p-0"
+          >
+            {rows.map((row, idx) => {
+              const isActive = idx === active;
+              const isCurrent = active === null && idx === stateRowIndex;
+              const label =
+                row.kind === "special"
+                  ? row.label
+                  : row.kind === "model"
+                    ? row.entry.label || row.entry.id
+                    : `Use "${row.value}"`;
+              const sub =
+                row.kind === "special"
+                  ? row.hint
+                  : row.kind === "model"
+                    ? row.entry.id !== label
+                      ? row.entry.id
+                      : row.entry.source
+                    : "Custom model id";
+              return (
+                <li
+                  key={
+                    row.kind === "special"
+                      ? `sp-${row.special}`
+                      : row.kind === "model"
+                        ? `m-${row.entry.id}`
+                        : `c-${row.value}`
+                  }
+                  id={`${listboxId}-opt-${idx}`}
+                  role="option"
+                  aria-selected={isActive || isCurrent}
+                  className={`flex cursor-pointer flex-col gap-0.5 px-2 py-1 text-[12px] ${
+                    isActive
+                      ? "bg-[color-mix(in_srgb,var(--accent)_20%,transparent)]"
+                      : isCurrent
+                        ? "bg-[color-mix(in_srgb,var(--accent)_10%,transparent)]"
+                        : "hover:bg-[var(--bg-muted)]"
+                  }`}
+                  // Use mousedown so the input's blur does not close first.
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    commitRow(row);
+                  }}
+                  onMouseEnter={() => setActive(idx)}
+                >
+                  <span
+                    className={
+                      row.kind === "model" ? "mono" : "font-medium"
+                    }
+                  >
+                    {label}
+                  </span>
+                  {sub ? (
+                    <span className="text-[10px] text-[var(--text-muted)]">
+                      {sub}
+                    </span>
+                  ) : null}
+                </li>
+              );
+            })}
+            {rows.length === 0 && vendor && !loading ? (
+              <li
+                role="option"
+                aria-selected={false}
+                aria-disabled
+                className="px-2 py-1.5 text-[11px] text-[var(--text-muted)]"
+              >
+                No suggestions. Type a model id to use it directly.
+              </li>
+            ) : null}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}

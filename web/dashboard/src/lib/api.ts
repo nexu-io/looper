@@ -461,6 +461,43 @@ export function fetchConfig(signal?: AbortSignal): Promise<ConfigData> {
   return apiFetch<ConfigData>("/api/v1/config", { signal });
 }
 
+export type AgentModelSource = "static" | "probe" | "merged";
+export type AgentModelProbeStatus = "ok" | "skipped" | "error" | "unsupported";
+
+export type AgentModelEntry = {
+  id: string;
+  label: string;
+  source: AgentModelSource;
+};
+
+export type AgentModelsData = {
+  vendor: string;
+  models: AgentModelEntry[];
+  sources: {
+    static: boolean;
+    probe: AgentModelProbeStatus;
+    probeError?: string;
+  };
+  probedAt?: string;
+};
+
+/**
+ * Read the agent model suggestion catalog for a vendor. Advisory — never blocks
+ * config save. Backend serves a merged static+probe list with a short cache;
+ * pass `refresh: true` to bypass it.
+ */
+export function fetchAgentModels(
+  vendor: string,
+  opts?: { refresh?: boolean; signal?: AbortSignal },
+): Promise<AgentModelsData> {
+  const params = new URLSearchParams({ vendor });
+  if (opts?.refresh) params.set("refresh", "1");
+  return apiFetch<AgentModelsData>(
+    `/api/v1/agent/models?${params.toString()}`,
+    { signal: opts?.signal },
+  );
+}
+
 export function patchConfig(
   body: PatchConfigBody,
   signal?: AbortSignal,

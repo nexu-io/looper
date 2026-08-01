@@ -1965,6 +1965,14 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// ResolveCommand returns the agent binary used for spawn for vendor + params.
+// When params["command"] is a non-empty string it wins; otherwise vendor defaults
+// apply (claude, codex, opencode, agent for cursor-cli, grok for grok-build).
+// Same resolution as process spawn — callers may LookPath for an absolute path.
+func ResolveCommand(vendor config.AgentVendor, params map[string]any) string {
+	return resolveCommand(ExecutorConfig{Vendor: vendor, Params: params})
+}
+
 func resolveCommand(cfg ExecutorConfig) string {
 	if override, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(override) != "" {
 		return override

@@ -276,6 +276,16 @@ A role is runnable only when the overlay leaves a non-empty vendor. Missing glob
 
 After the full overlay, an empty-string model is kept as an explicit empty binding (not the same as unset): the vendor CLI uses its own default, and any global `agent.params` `--model`/`-m` flags are stripped so they cannot override the suppression.
 
+### Model suggestions
+
+Dashboard Config model fields offer searchable suggestions drawn from a built-in static list per vendor, optionally merged with a best-effort probe of the local vendor CLI. The same list is available via `GET /api/v1/agent/models?vendor=...`.
+
+The catalog is **advisory only** — not an allowlist. Arbitrary model IDs remain valid config values; save and claim never require membership in the catalog. See [ADR-0016](adr/0016-agent-model-catalog-is-advisory.md).
+
+Claude Code is static-only (no non-interactive list command). Other vendors may probe the same resolved local CLI binary used for spawn when available; probe failure falls back to the built-in list and does not block config load or save.
+
+Empty-string vs unset model semantics are unchanged (see [Model semantics](#model-semantics) above).
+
 ### Coordinator triage
 
 Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.model`, plus global params/env/timeouts). It does not read `roles.coordinator.agent` or coding-role profile bindings. If global `agent.vendor` is unset, triage LLM is skipped; coding roles that resolve via profile or role bindings can still run.
