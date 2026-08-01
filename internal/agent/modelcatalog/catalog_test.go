@@ -729,6 +729,125 @@ func TestListBareAndAbsoluteCommandsStillProbe(t *testing.T) {
 	}
 }
 
+func TestListCursorCLISkipsAmbiguousBareAgent(t *testing.T) {
+	// Default ResolveCommand for cursor-cli is bare "agent" — must not LookPath
+	// or execute whatever is first on PATH (ADR-0016 / takeover exclusion).
+	var runnerCalls atomic.Int32
+	var lookPathCalls atomic.Int32
+	svc := NewService(Options{
+		Runner: runnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
+			runnerCalls.Add(1)
+			return []byte("should-not-run\n"), nil
+		}),
+		LookPath: func(s string) (string, error) {
+			lookPathCalls.Add(1)
+			return "/evil/path/" + s, nil
+		},
+		Now: func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+
+	got, err := svc.List(context.Background(), ListOptions{Vendor: config.AgentVendorCursorCLI})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got.Sources.Probe != ProbeError {
+		t.Fatalf("probe = %q, want error", got.Sources.Probe)
+	}
+	if got.Sources.ProbeError != ambiguousBareAgentProbeError {
+		t.Fatalf("probeError = %q, want %q", got.Sources.ProbeError, ambiguousBareAgentProbeError)
+	}
+	if !got.Sources.Static || len(got.Models) == 0 {
+		t.Fatalf("expected static models, got %#v", got)
+	}
+	for _, m := range got.Models {
+		if m.Source != SourceStatic {
+			t.Fatalf("model source = %q, want static only", m.Source)
+		}
+	}
+	if runnerCalls.Load() != 0 {
+		t.Fatalf("runner calls = %d, want 0", runnerCalls.Load())
+	}
+	if lookPathCalls.Load() != 0 {
+		t.Fatalf("LookPath calls = %d, want 0", lookPathCalls.Load())
+	}
+
+	// Explicit bare "agent" override is still ambiguous.
+	got, err = svc.List(context.Background(), ListOptions{
+		Vendor:  config.AgentVendorCursorCLI,
+		Params:  map[string]any{"command": "agent"},
+		Refresh: true,
+	})
+	if err != nil {
+		t.Fatalf("List(explicit agent) error = %v", err)
+	}
+	if got.Sources.ProbeError != ambiguousBareAgentProbeError {
+		t.Fatalf("explicit agent probeError = %q", got.Sources.ProbeError)
+	}
+	if runnerCalls.Load() != 0 || lookPathCalls.Load() != 0 {
+		t.Fatalf("explicit agent still probed (runner=%d lookPath=%d)", runnerCalls.Load(), lookPathCalls.Load())
+	}
+}
+
+func TestListCursorCLIProbesWhenIdentityEstablished(t *testing.T) {
+	var saw []string
+	svc := NewService(Options{
+		Runner: runnerFunc(func(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
+			saw = append(saw, name)
+			return []byte("composer-1\ngpt-5\n"), nil
+		}),
+		LookPath: func(s string) (string, error) {
+			if s == "cursor-agent" {
+				return "/usr/local/bin/cursor-agent", nil
+			}
+			return s, nil
+		},
+	})
+
+	// Explicit cursor-agent binary name.
+	if _, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorCursorCLI,
+		Params: map[string]any{"command": "cursor-agent"},
+	}); err != nil {
+		t.Fatalf("List(cursor-agent) error = %v", err)
+	}
+	// Path containing "cursor" even when basename is agent.
+	if _, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorCursorCLI,
+		Params: map[string]any{"command": "/Applications/Cursor.app/Contents/Resources/app/bin/agent"},
+	}); err != nil {
+		t.Fatalf("List(Cursor.app agent) error = %v", err)
+	}
+	want := []string{
+		"/usr/local/bin/cursor-agent",
+		"/Applications/Cursor.app/Contents/Resources/app/bin/agent",
+	}
+	if !reflect.DeepEqual(saw, want) {
+		t.Fatalf("probed binaries = %#v, want %#v", saw, want)
+	}
+}
+
+func TestIsAmbiguousBareAgentCommand(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"agent", true},
+		{"agent.exe", true},
+		{"AGENT", true},
+		{"cursor-agent", false},
+		{"/usr/local/bin/cursor-agent", false},
+		{"/usr/local/bin/agent", true},
+		{"/Applications/Cursor.app/bin/agent", false},
+		{"codex", false},
+	}
+	for _, tc := range cases {
+		if got := isAmbiguousBareAgentCommand(tc.in); got != tc.want {
+			t.Fatalf("isAmbiguousBareAgentCommand(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestIsRelativePathCommand(t *testing.T) {
 	cases := []struct {
 		in   string

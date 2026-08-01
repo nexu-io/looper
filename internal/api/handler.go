@@ -1173,6 +1173,18 @@ func (h *Handler) handleAgentModelsRoute(w http.ResponseWriter, r *http.Request,
 
 	refreshRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("refresh")))
 	refresh := refreshRaw == "1" || refreshRaw == "true" || refreshRaw == "yes"
+	// refresh=1 bypasses the probe cache and launches the vendor CLI. Under
+	// authMode=none, originless no-CORS GETs to loopback are Host-allowed; a
+	// cross-site page could therefore force repeated probes. Reject forced
+	// refresh when browser fetch metadata marks the request cross-site.
+	if refresh && !allowForcedModelCatalogRefresh(r) {
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "forced model catalog refresh is not allowed for cross-site requests",
+		})
+		return
+	}
 
 	cfg := h.effectiveConfig()
 	// Spawn-equivalent params ownership: when global agent.vendor owns

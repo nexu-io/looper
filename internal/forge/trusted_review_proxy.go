@@ -299,19 +299,20 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: err.Error()})
 		return
 	}
-	handle, bindErr := processcontainment.Bind(cmd, processcontainment.Options{
+	handle, bindErr := bindTrustedReviewCmd(cmd, processcontainment.Options{
 		GracePeriod:  2 * time.Second,
 		DrainTimeout: 20 * time.Second,
 	})
 	if bindErr != nil {
+		_ = configReader.Close()
+		_ = configWriter.Close()
+		// Bind failed after Start: force-kill and reap the orphaned process
+		// group before endTrack so BeginShutdown cannot observe a closed
+		// reservation while emergency cleanup is still running.
+		killTrustedReviewStartedWithoutHandle(cmd)
 		if endTrack != nil {
 			endTrack()
 		}
-		_ = configReader.Close()
-		_ = configWriter.Close()
-		// Bind failed after Start: force-kill the orphaned process group so it
-		// does not outlive the proxy request (same emergency path as shell bind).
-		killTrustedReviewStartedWithoutHandle(cmd)
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: "bind trusted review containment handle: " + bindErr.Error()})
 		return
 	}
@@ -496,11 +497,21 @@ func mergeTrustedReviewTruncationError(existing string) string {
 	return existing + "; " + trustedReviewOutputTruncatedMsg
 }
 
+// bindTrustedReviewCmd attaches a containment Handle after cmd.Start. Tests may
+// override to force post-Start Bind failures without relying on rare getpgid
+// errors (same seam as processcontainment.startBind).
+var bindTrustedReviewCmd = processcontainment.Bind
+
+// afterTrustedReviewEmergencyKill is invoked after the Bind-failure emergency
+// kill/reap finishes (tests assert endTrack ordering against this hook).
+var afterTrustedReviewEmergencyKill = func(*exec.Cmd) {}
+
 // killTrustedReviewStartedWithoutHandle is only used when Bind fails after
 // Start so the orphaned process group is not left live. Production stop paths
 // use Handle.Kill. Mirrors shell.killStartedWithoutHandle: SIGKILL the group
 // first, then fall back to Process.Kill + Wait on the leader.
 func killTrustedReviewStartedWithoutHandle(cmd *exec.Cmd) {
+	defer afterTrustedReviewEmergencyKill(cmd)
 	if cmd == nil || cmd.Process == nil {
 		return
 	}

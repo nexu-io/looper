@@ -18,6 +18,19 @@ import (
 // binaries leave this false so a real Host: example.com is not rewritten.
 var rewriteHTTPtestDefaultHost bool
 
+// allowForcedModelCatalogRefresh reports whether GET .../agent/models?refresh=1
+// may bypass the probe cache and launch a vendor CLI. Cross-site browser
+// requests (Sec-Fetch-Site: cross-site), including originless no-CORS loads such
+// as <img>, must not force repeated probes under authMode=none loopback Host
+// acceptance. CLI and same-origin dashboard fetches are allowed.
+func allowForcedModelCatalogRefresh(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	return site != "cross-site"
+}
+
 // validateBrowserRequest enforces Host allowlisting and Origin matching for
 // browser requests, including safe methods (GET/HEAD) that expose dashboard
 // state.

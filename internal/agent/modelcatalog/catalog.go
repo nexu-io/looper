@@ -167,6 +167,12 @@ func (s *Service) List(ctx context.Context, opts ListOptions) (Result, error) {
 	}
 
 	command := agent.ResolveCommand(opts.Vendor, opts.Params)
+	// ADR-0016: never discover via ambiguous bare `agent` (Cursor default
+	// ResolveCommand name; also excluded from takeover autodetection). Skip
+	// LookPath/probe unless the command path establishes Cursor identity.
+	if opts.Vendor == config.AgentVendorCursorCLI && isAmbiguousBareAgentCommand(command) {
+		return s.listAmbiguousCursorAgent(command), nil
+	}
 	// Relative path overrides (e.g. ./tools/codex-wrapper) resolve against each
 	// run's worktree at spawn time (executor sets cmd.Dir). Catalog probes have
 	// no worktree context; do not LookPath/run them from looperd's CWD.
@@ -364,6 +370,53 @@ func resolveBinaryPath(command string, lookPath func(string) (string, error)) st
 // relativeCommandProbeError is returned when agent.params.command is a
 // worktree-relative path. Probes cannot supply spawn's WorkingDirectory.
 const relativeCommandProbeError = "relative command override cannot be probed outside a run worktree"
+
+// ambiguousBareAgentProbeError is returned when cursor-cli would probe via the
+// default/unqualified bare name "agent" (ADR-0016).
+const ambiguousBareAgentProbeError = "cursor-cli command \"agent\" is ambiguous; set agent.params.command to an explicit cursor-agent path to enable probing"
+
+// listAmbiguousCursorAgent returns static suggestions only without LookPath or
+// running PATH's first "agent" binary.
+func (s *Service) listAmbiguousCursorAgent(command string) Result {
+	staticModels := append([]Model(nil), s.static[config.AgentVendorCursorCLI]...)
+	for i := range staticModels {
+		staticModels[i].Source = SourceStatic
+	}
+	result := Result{
+		Vendor: string(config.AgentVendorCursorCLI),
+		Models: staticModels,
+		Sources: Sources{
+			Static:     true,
+			Probe:      ProbeError,
+			ProbeError: ambiguousBareAgentProbeError,
+		},
+		ProbedAt: s.now().UTC().Format(time.RFC3339),
+	}
+	// Cache the skip so repeated combobox opens do not re-evaluate PATH.
+	cacheKey := string(config.AgentVendorCursorCLI) + "\x00" + command
+	s.cachePut(cacheKey, result)
+	return result
+}
+
+// isAmbiguousBareAgentCommand reports whether command is the unqualified bare
+// name "agent" (or agent.exe). Paths that include "cursor" (e.g. cursor-agent
+// or .../Cursor.app/.../agent) establish Cursor identity and may be probed.
+func isAmbiguousBareAgentCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return false
+	}
+	base := filepath.Base(command)
+	base = strings.TrimSuffix(base, ".exe")
+	if !strings.EqualFold(base, "agent") {
+		return false
+	}
+	// Path or basename establishes Cursor identity (cursor-agent, Cursor.app, …).
+	if strings.Contains(strings.ToLower(command), "cursor") {
+		return false
+	}
+	return true
+}
 
 // isRelativePathCommand reports whether command is a path that agent spawn
 // resolves relative to the run worktree (cmd.Dir). Bare PATH names and

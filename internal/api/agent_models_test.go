@@ -198,6 +198,87 @@ func TestHandlerAgentModelsMethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandlerAgentModelsRefreshRejectedForCrossSite(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	var probes int
+	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
+		Runner: modelCatalogRunnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
+			probes++
+			return []byte(`{"models":[{"id":"gpt-5.4","name":"GPT-5.4","visibility":"list"}]}`), nil
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/models?vendor=codex&refresh=1", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+	if probes != 0 {
+		t.Fatalf("probes = %d, want 0 for cross-site refresh", probes)
+	}
+	body := parseJSONMap(t, rec.Body.Bytes())
+	errObj := body["error"].(map[string]any)
+	assertEqual(t, errObj["code"], string(pkgapi.ErrorCodeUnauthorized))
+}
+
+func TestHandlerAgentModelsRefreshAllowedSameOriginAndCLI(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	var probes int
+	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
+		Runner: modelCatalogRunnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
+			probes++
+			return []byte(`{"models":[{"id":"gpt-5.4","name":"GPT-5.4","visibility":"list"}]}`), nil
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+
+	// CLI / non-browser: no Sec-Fetch-Site.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/models?vendor=codex&refresh=1", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("CLI refresh status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Same-origin dashboard fetch.
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/agent/models?vendor=codex&refresh=1", nil)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same-origin refresh status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if probes != 2 {
+		t.Fatalf("probes = %d, want 2", probes)
+	}
+}
+
+func TestAllowForcedModelCatalogRefresh(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/models?refresh=1", nil)
+	if !allowForcedModelCatalogRefresh(req) {
+		t.Fatal("CLI without Sec-Fetch-Site must allow forced refresh")
+	}
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	if !allowForcedModelCatalogRefresh(req) {
+		t.Fatal("same-origin must allow forced refresh")
+	}
+	req.Header.Set("Sec-Fetch-Site", "none")
+	if !allowForcedModelCatalogRefresh(req) {
+		t.Fatal("Sec-Fetch-Site none must allow forced refresh")
+	}
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	if allowForcedModelCatalogRefresh(req) {
+		t.Fatal("cross-site must reject forced refresh")
+	}
+}
+
 func TestHandlerAgentModelsSameVendorUsesParamsCommand(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	vendor := config.AgentVendorCodex
