@@ -98,6 +98,22 @@ describe("ModelCombobox", () => {
     expect(onCommit).toHaveBeenLastCalledWith("custom-id");
   });
 
+  it("commits an empty clear on Enter when the query was edited to blank", () => {
+    const onCommit = vi.fn();
+    const props = {
+      ...commonProps,
+      value: "gpt-5",
+      onCommitValue: onCommit,
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    // Operator deletes the bound id then presses Enter — same clear as blur/Tab.
+    fireEvent.change(input, { target: { value: "" } });
+    expect(onCommit).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onCommit).toHaveBeenLastCalledWith("");
+  });
+
   it("commits free-entry text on blur without Enter", () => {
     const onCommit = vi.fn();
     const props = { ...commonProps, value: "", onCommitValue: onCommit };
@@ -158,6 +174,36 @@ describe("ModelCombobox", () => {
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onCommit).toHaveBeenLastCalledWith("");
+  });
+
+  it("keyboard navigation: with a filter, ArrowDown starts at the first matching suggestion", async () => {
+    const onCommit = vi.fn();
+    const onInherit = vi.fn();
+    const props = {
+      ...commonProps,
+      // Bound model is not in the filtered set, so stateRowIndex is null.
+      value: "gpt-5",
+      onCommitValue: onCommit,
+      onInherit,
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    fireEvent.focus(input);
+    await screen.findByText("O4");
+
+    // Exact id match so no free-entry custom row precedes the model suggestion.
+    fireEvent.change(input, { target: { value: "o4" } });
+    await waitFor(() => {
+      expect(screen.queryByText("GPT-5")).toBeNull();
+    });
+    expect(screen.getByText("O4")).toBeTruthy();
+
+    // Must not land on Inherit (row 0) and commit unset — start on the first
+    // custom/model choice in the filtered list.
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onInherit).not.toHaveBeenCalled();
+    expect(onCommit).toHaveBeenLastCalledWith("o4");
   });
 
   it("untouched Enter with a typed custom id commits the typed value, not row zero", async () => {

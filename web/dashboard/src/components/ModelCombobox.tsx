@@ -296,32 +296,47 @@ export function ModelCombobox({
     [onCommitValue, onInherit, close],
   );
 
+  // First keyboard step when the operator has not arrow-navigated yet.
+  // With a typed filter, start on the first custom/model suggestion so
+  // ArrowDown+Enter does not land on Inherit / Vendor default (specials
+  // always precede filtered rows, and stateRowIndex is often null once the
+  // current binding is filtered out). Without a filter, start on the row
+  // that reflects parent state.
+  const initialNavIndex = (): number => {
+    const hasFilter = query !== null && query.trim() !== "";
+    if (hasFilter) {
+      const firstChoice = rows.findIndex(
+        (r) => r.kind === "model" || r.kind === "custom",
+      );
+      if (firstChoice >= 0) return firstChoice;
+    }
+    return stateRowIndex ?? 0;
+  };
+
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setOpen(true);
       setActive((idx) => {
-        // First arrow press: start navigation from the row that reflects
-        // current parent state (Inherit when unset/absent, Vendor default
-        // when "", or the matching model), falling back to row 0.
-        if (idx === null) return stateRowIndex ?? 0;
+        if (idx === null) return initialNavIndex();
         return Math.min(rows.length - 1, idx + 1);
       });
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
       setOpen(true);
       setActive((idx) => {
-        if (idx === null) return stateRowIndex ?? 0;
+        if (idx === null) return initialNavIndex();
         return Math.max(0, idx - 1);
       });
     } else if (event.key === "Enter") {
       // Only commit a row when the operator has explicitly arrow-navigated
-      // to it. An untouched Enter with typed text commits the typed value;
-      // with no typed text it does nothing (keeps the current parent value).
+      // to it. An untouched Enter commits any edited query — including an
+      // empty clear (same as blur/Tab). query === null means no edit, so
+      // keep the parent value.
       if (open && active !== null && rows[active]) {
         event.preventDefault();
         commitRow(rows[active]);
-      } else if (query !== null && query.trim() !== "") {
+      } else if (query !== null) {
         event.preventDefault();
         commitTypedAndClose();
       } else if (open) {
