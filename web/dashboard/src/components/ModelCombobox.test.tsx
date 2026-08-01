@@ -249,6 +249,65 @@ describe("ModelCombobox", () => {
     );
   });
 
+  it("keyboard navigation: preserves active option by identity when catalog replaces custom row", async () => {
+    let resolveFetch: ((value: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ),
+    );
+
+    const onCommit = vi.fn();
+    const onInherit = vi.fn();
+    // Saved binding that will appear in the catalog once the probe returns.
+    // While loading it is shown as a temporary custom row; ArrowDown lands on
+    // it by index. After load the custom row collapses into a model entry at a
+    // different index — active must follow identity, not the old numeric slot.
+    const props = {
+      ...commonProps,
+      vendor: "identity-remap-vendor",
+      value: "gpt-5-mini",
+      onCommitValue: onCommit,
+      onInherit,
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    fireEvent.focus(input);
+
+    expect(await screen.findByText(/Loading suggestions/i)).toBeTruthy();
+    expect(screen.getByText('Use "gpt-5-mini"')).toBeTruthy();
+
+    // Activate the temporary custom row (index after Inherit + Vendor default).
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    const customOpt = screen
+      .getByText('Use "gpt-5-mini"')
+      .closest("[role='option']");
+    expect(customOpt?.getAttribute("aria-selected")).toBe("true");
+
+    resolveFetch?.(
+      jsonEnvelope({
+        ...MODELS,
+        vendor: "identity-remap-vendor",
+      }),
+    );
+
+    // Catalog includes gpt-5-mini; custom row is gone. Active should still
+    // highlight that model (now a catalog row), not the next row at the old index.
+    await waitFor(() => {
+      expect(screen.queryByText('Use "gpt-5-mini"')).toBeNull();
+    });
+    const modelOpt = screen.getByText("GPT-5 mini").closest("[role='option']");
+    expect(modelOpt?.getAttribute("aria-selected")).toBe("true");
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onInherit).not.toHaveBeenCalled();
+    expect(onCommit).toHaveBeenLastCalledWith("gpt-5-mini");
+  });
+
   it("keyboard navigation: with a filter, ArrowDown starts at the first matching suggestion", async () => {
     const onCommit = vi.fn();
     const onInherit = vi.fn();

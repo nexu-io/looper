@@ -31,6 +31,18 @@ type Row =
   | { kind: "model"; entry: AgentModelEntry }
   | { kind: "custom"; value: string };
 
+/**
+ * Stable logical identity for a listbox row. Custom free-entry rows and catalog
+ * model rows that share the same id map to the same key so keyboard `active`
+ * can be remapped when a temporary custom binding row is replaced by the real
+ * catalog entry (or vice versa) without retaining a stale numeric index.
+ */
+function rowIdentity(row: Row): string {
+  if (row.kind === "special") return `special:${row.special}`;
+  if (row.kind === "model") return `value:${row.entry.id}`;
+  return `value:${row.value}`;
+}
+
 export type ModelComboboxProps = {
   id?: string;
   ariaLabel?: string;
@@ -94,6 +106,9 @@ export function ModelCombobox({
   const [loading, setLoading] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLUListElement | null>(null);
+  // Previous row snapshot for remapping `active` by identity when the list
+  // changes under an open popup (catalog load, filter, custom-row collapse).
+  const prevRowsRef = useRef<Row[]>([]);
 
   // Single close path: clear popup, transient query, and navigation state.
   // Parent `value` is authoritative once closed. Escape uses this path without
@@ -269,12 +284,39 @@ export function ModelCombobox({
     boundValue,
   ]);
 
-  // Keep active index in range as rows change. Null (untouched) stays null.
+  // Keep keyboard `active` on the same logical option when the row set
+  // changes. Range-only clamping is insufficient: while the catalog loads we
+  // may insert a temporary custom row for the saved binding; ArrowDown can
+  // land on it by index, then the real catalog entry replaces that custom
+  // row and the same numeric index points at a different model. Remap by
+  // identity (custom value ≡ model id); if the option disappeared, clear
+  // navigation so Enter does not commit an unrelated row.
   useEffect(() => {
-    if (active !== null && active >= rows.length) {
-      setActive(rows.length > 0 ? rows.length - 1 : null);
+    const prevRows = prevRowsRef.current;
+    prevRowsRef.current = rows;
+    if (active === null) return;
+
+    if (prevRows === rows) {
+      // Rows unchanged (e.g. pure active update): only clamp out-of-range.
+      if (active >= rows.length) {
+        setActive(rows.length > 0 ? rows.length - 1 : null);
+      }
+      return;
     }
-  }, [rows.length, active]);
+
+    const prev = prevRows[active];
+    if (prev) {
+      const id = rowIdentity(prev);
+      const nextIdx = rows.findIndex((r) => rowIdentity(r) === id);
+      if (nextIdx >= 0) {
+        if (nextIdx !== active) setActive(nextIdx);
+        return;
+      }
+    }
+
+    // Previously active option is gone — reset rather than keep a stale index.
+    setActive(null);
+  }, [rows, active]);
 
   // Scroll the active option into view on keyboard navigation.
   useEffect(() => {
