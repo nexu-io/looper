@@ -817,9 +817,18 @@ func TestListCursorCLIProbesWhenIdentityEstablished(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("List(Cursor.app agent) error = %v", err)
 	}
+	// Explicit absolute path named "agent" without "cursor" in any component —
+	// still an intentional override (spawn uses it); must probe, not treat as bare.
+	if _, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorCursorCLI,
+		Params: map[string]any{"command": "/usr/local/bin/agent"},
+	}); err != nil {
+		t.Fatalf("List(/usr/local/bin/agent) error = %v", err)
+	}
 	want := []string{
 		"/usr/local/bin/cursor-agent",
 		"/Applications/Cursor.app/Contents/Resources/app/bin/agent",
+		"/usr/local/bin/agent",
 	}
 	if !reflect.DeepEqual(saw, want) {
 		t.Fatalf("probed binaries = %#v, want %#v", saw, want)
@@ -837,8 +846,10 @@ func TestIsAmbiguousBareAgentCommand(t *testing.T) {
 		{"AGENT", true},
 		{"cursor-agent", false},
 		{"/usr/local/bin/cursor-agent", false},
-		{"/usr/local/bin/agent", true},
+		// Explicit absolute path is not bare, even without "cursor" in the path.
+		{"/usr/local/bin/agent", false},
 		{"/Applications/Cursor.app/bin/agent", false},
+		{"./bin/agent", false},
 		{"codex", false},
 	}
 	for _, tc := range cases {

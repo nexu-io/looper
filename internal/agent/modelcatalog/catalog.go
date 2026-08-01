@@ -167,9 +167,10 @@ func (s *Service) List(ctx context.Context, opts ListOptions) (Result, error) {
 	}
 
 	command := agent.ResolveCommand(opts.Vendor, opts.Params)
-	// ADR-0016: never discover via ambiguous bare `agent` (Cursor default
-	// ResolveCommand name; also excluded from takeover autodetection). Skip
-	// LookPath/probe unless the command path establishes Cursor identity.
+	// ADR-0016: never discover via unqualified bare `agent` (Cursor default
+	// ResolveCommand name; also excluded from takeover autodetection). Explicit
+	// path overrides (absolute or with separators) are intentional and may be
+	// probed even when the basename is still "agent".
 	if opts.Vendor == config.AgentVendorCursorCLI && isAmbiguousBareAgentCommand(command) {
 		return s.listAmbiguousCursorAgent(command), nil
 	}
@@ -399,23 +400,23 @@ func (s *Service) listAmbiguousCursorAgent(command string) Result {
 }
 
 // isAmbiguousBareAgentCommand reports whether command is the unqualified bare
-// name "agent" (or agent.exe). Paths that include "cursor" (e.g. cursor-agent
-// or .../Cursor.app/.../agent) establish Cursor identity and may be probed.
+// PATH name "agent" (or agent.exe). Explicit path overrides — absolute paths
+// such as /usr/local/bin/agent, or any command with path separators — are not
+// ambiguous: the operator chose a specific binary, matching spawn behavior.
+// Only the bare default/unqualified name is rejected (ADR-0016).
 func isAmbiguousBareAgentCommand(command string) bool {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return false
 	}
+	// Explicit path overrides are intentional; do not require "cursor" in the path.
+	if filepath.IsAbs(command) || strings.ContainsRune(command, '/') ||
+		(filepath.Separator != '/' && strings.ContainsRune(command, filepath.Separator)) {
+		return false
+	}
 	base := filepath.Base(command)
 	base = strings.TrimSuffix(base, ".exe")
-	if !strings.EqualFold(base, "agent") {
-		return false
-	}
-	// Path or basename establishes Cursor identity (cursor-agent, Cursor.app, …).
-	if strings.Contains(strings.ToLower(command), "cursor") {
-		return false
-	}
-	return true
+	return strings.EqualFold(base, "agent")
 }
 
 // isRelativePathCommand reports whether command is a path that agent spawn
