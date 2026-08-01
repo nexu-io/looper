@@ -307,29 +307,54 @@ describe("ModelCombobox", () => {
 
   it("keeps global absence distinct from explicit Vendor default suppress", async () => {
     const onCommit = vi.fn();
+    const onUnbound = vi.fn();
     const props = {
       ...commonProps,
       value: null as string | null,
       allowInherit: false,
       onInherit: undefined,
+      onUnbound,
       onCommitValue: onCommit,
-      placeholder: "Model id (empty = inherit CLI default)",
+      placeholder: "Model id (empty = vendor default / suppress)",
     };
     render(<ModelCombobox {...props} />);
     const input = screen.getByLabelText("agent.model") as HTMLInputElement;
     // Absent global model is unbound (params --model may still apply), not
     // the Vendor default suppress row.
-    expect(input.placeholder).toBe("Model id (empty = inherit CLI default)");
+    expect(input.placeholder).toBe("Unbound");
     expect(input.placeholder).not.toBe("Vendor default");
 
     fireEvent.focus(input);
     await screen.findByText("GPT-5");
-    // No current-state row: Vendor default is not aria-selected as current.
+    // Unbound is the current-state row; Vendor default is not.
+    const unbound = screen.getByText("Unbound").closest("[role='option']");
+    expect(unbound?.getAttribute("aria-selected")).toBe("true");
     const vendorDefault = screen.getByText("Vendor default").closest("[role='option']");
     expect(vendorDefault?.getAttribute("aria-selected")).toBe("false");
 
     // Untouched Enter must not stage explicit "" suppress.
     fireEvent.keyDown(input, { key: "Enter" });
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(onUnbound).not.toHaveBeenCalled();
+  });
+
+  it("offers Unbound restore for global scope and calls onUnbound", async () => {
+    const onCommit = vi.fn();
+    const onUnbound = vi.fn();
+    const props = {
+      ...commonProps,
+      value: "gpt-5",
+      allowInherit: false,
+      onInherit: undefined,
+      onUnbound,
+      onCommitValue: onCommit,
+      placeholder: "Model id (empty = vendor default / suppress)",
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model");
+    fireEvent.focus(input);
+    fireEvent.mouseDown(await screen.findByText("Unbound"));
+    expect(onUnbound).toHaveBeenCalledTimes(1);
     expect(onCommit).not.toHaveBeenCalled();
   });
 
@@ -339,6 +364,7 @@ describe("ModelCombobox", () => {
       value: "",
       allowInherit: false,
       onInherit: undefined,
+      onUnbound: vi.fn(),
     };
     render(<ModelCombobox {...props} />);
     const input = screen.getByLabelText("agent.model") as HTMLInputElement;

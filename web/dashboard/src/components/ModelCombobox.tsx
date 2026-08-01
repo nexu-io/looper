@@ -25,7 +25,7 @@ const controlClass =
 const CACHE_TTL_MS = 60_000;
 const cache = new Map<string, { at: number; data: AgentModelsData }>();
 
-type SpecialKind = "inherit" | "vendor-default";
+type SpecialKind = "inherit" | "unbound" | "vendor-default";
 type Row =
   | { kind: "special"; special: SpecialKind; label: string; hint?: string }
   | { kind: "model"; entry: AgentModelEntry }
@@ -61,6 +61,12 @@ export type ModelComboboxProps = {
    * Stage an inherit (unset). Required when allowInherit=true.
    */
   onInherit?: () => void;
+  /**
+   * Restore global absence (null). Required for the global scope where Inherit
+   * is not offered: clears a draft back to published null, or stages unset when
+   * a binding exists. Distinct from Vendor default (`""` suppress).
+   */
+  onUnbound?: () => void;
 };
 
 export function ModelCombobox({
@@ -74,6 +80,7 @@ export function ModelCombobox({
   placeholder,
   onCommitValue,
   onInherit,
+  onUnbound,
 }: ModelComboboxProps) {
   const generatedId = useId();
   const listboxId = `${id ?? generatedId}-listbox`;
@@ -180,6 +187,15 @@ export function ModelCombobox({
         label: "Inherit",
         hint: "Fall back to the previous layer (profile / global / vendor default).",
       });
+    } else if (onUnbound) {
+      // Global scope: restore absence (null), not layer inherit. Needed when
+      // the published leaf is default-sourced so FieldFrame has no Unset.
+      specials.push({
+        kind: "special",
+        special: "unbound",
+        label: "Unbound",
+        hint: "No agent.model binding; agent.params.args --model/-m may still apply.",
+      });
     }
     specials.push({
       kind: "special",
@@ -210,13 +226,14 @@ export function ModelCombobox({
       !filtered.some((m) => m.id.toLowerCase() === q) &&
       // Skip "custom" when the query happens to equal a special label.
       q !== "inherit" &&
+      q !== "unbound" &&
       q !== "vendor default"
     ) {
       customRow = { kind: "custom", value: (query ?? "").trim() };
     }
 
     return customRow ? [...specials, customRow, ...modelRows] : [...specials, ...modelRows];
-  }, [entries, query, allowInherit]);
+  }, [entries, query, allowInherit, onUnbound]);
 
   // Keep active index in range as rows change. Null (untouched) stays null.
   useEffect(() => {
@@ -243,8 +260,9 @@ export function ModelCombobox({
   // (!allowInherit), absence stays unbound: agent.params.args --model/-m may
   // still apply. Only explicit "" is Vendor default; collapsing null → ""
   // would reaffirm as suppress and strip params model flags on save.
-  const inheritsByAbsence = value === null && allowInherit;
-  const isInheritState = unset || inheritsByAbsence;
+  const absenceState = unset || value === null;
+  const isInheritState = allowInherit && absenceState;
+  const isUnboundState = !allowInherit && absenceState;
   const isVendorDefaultState = !unset && value === "";
   const boundValue = value ?? "";
 
@@ -253,7 +271,7 @@ export function ModelCombobox({
   // text on screen. When open, show the current query (or fall back to value).
   const displayValue = open
     ? (query ?? boundValue)
-    : isInheritState
+    : isInheritState || isUnboundState
       ? ""
       : boundValue;
 
@@ -263,6 +281,12 @@ export function ModelCombobox({
     if (isInheritState) {
       const idx = rows.findIndex(
         (r) => r.kind === "special" && r.special === "inherit",
+      );
+      return idx >= 0 ? idx : null;
+    }
+    if (isUnboundState) {
+      const idx = rows.findIndex(
+        (r) => r.kind === "special" && r.special === "unbound",
       );
       return idx >= 0 ? idx : null;
     }
@@ -276,13 +300,15 @@ export function ModelCombobox({
       (r) => r.kind === "model" && r.entry.id === value,
     );
     return idx >= 0 ? idx : null;
-  }, [rows, value, isInheritState, isVendorDefaultState]);
+  }, [rows, value, isInheritState, isUnboundState, isVendorDefaultState]);
 
   const commitRow = useCallback(
     (row: Row) => {
       if (row.kind === "special") {
         if (row.special === "inherit") {
           if (onInherit) onInherit();
+        } else if (row.special === "unbound") {
+          if (onUnbound) onUnbound();
         } else {
           onCommitValue("");
         }
@@ -293,7 +319,7 @@ export function ModelCombobox({
       }
       close();
     },
-    [onCommitValue, onInherit, close],
+    [onCommitValue, onInherit, onUnbound, close],
   );
 
   // First keyboard step when the operator has not arrow-navigated yet.
@@ -366,13 +392,15 @@ export function ModelCombobox({
       : undefined;
 
   // Placeholder reflects tri-state when the input renders empty and closed.
-  // Staged unset locks the control; natural absence still shows Inherit but
-  // remains editable so operators can pick a model without an Undo first.
+  // Staged unset locks the control; natural absence still shows Inherit /
+  // Unbound but remains editable so operators can pick a model without Undo.
   const closedPlaceholder = isInheritState
     ? "Inherit"
-    : isVendorDefaultState
-      ? "Vendor default"
-      : placeholder;
+    : isUnboundState
+      ? "Unbound"
+      : isVendorDefaultState
+        ? "Vendor default"
+        : placeholder;
 
   return (
     <div ref={rootRef} className="relative min-w-0">

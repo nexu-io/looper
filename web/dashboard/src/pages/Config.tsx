@@ -1383,6 +1383,35 @@ export function ConfigPage() {
     [clearPathError, retireLoad],
   );
 
+  // Global agent.model: restore absence (null). When the leaf is already
+  // absent/default-sourced, FieldFrame has no Unset and Inherit is disabled —
+  // clearing the draft is the only field-local path back to unbound (so
+  // params/CLI --model may still apply). When a binding is published, stage
+  // unset instead of set "".
+  const onRestoreModelAbsence = useCallback(
+    (path: string) => {
+      retireLoad();
+      const published = data ? getConfigValue(data, path) : undefined;
+      setDrafts((current) => {
+        if (!Object.hasOwn(current, path)) return current;
+        const next = { ...current };
+        delete next[path];
+        return next;
+      });
+      setUnsetPaths((current) => {
+        const next = new Set(current);
+        if (published == null) {
+          next.delete(path);
+        } else {
+          next.add(path);
+        }
+        return next;
+      });
+      clearPathError(path);
+    },
+    [clearPathError, data, retireLoad],
+  );
+
   const onSecretSet = useCallback(
     (key: string, value: string) => {
       retireLoad();
@@ -1613,12 +1642,17 @@ export function ConfigPage() {
             allowInherit={modelScope.kind !== "global"}
             placeholder={
               modelScope.kind === "global"
-                ? "Model id (empty = inherit CLI default)"
+                ? "Model id (empty = vendor default / suppress)"
                 : "Model id (empty = vendor default; Inherit = previous layer)"
             }
             onCommitValue={(next) => onDraft(path, next)}
             onInherit={
               modelScope.kind === "global" ? undefined : () => onToggleUnset(path)
+            }
+            onUnbound={
+              modelScope.kind === "global"
+                ? () => onRestoreModelAbsence(path)
+                : undefined
             }
           />
         ) : (
