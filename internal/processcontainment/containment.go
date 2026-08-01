@@ -142,6 +142,10 @@ func Bind(cmd *exec.Cmd, opts Options) (*Handle, error) {
 // Start is Configure + cmd.Start + Bind. Wait is not armed before Start
 // returns, so short-lived producers that use StdoutPipe/StderrPipe can begin
 // draining before the reaper closes the pipes.
+//
+// When cmd.Start succeeds but Bind fails, Start force-kills and reaps the
+// orphaned process group so the child cannot outlive the caller without a
+// Handle (StartTracked probes, short-lived tools, etc.).
 func Start(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	if cmd == nil {
 		return nil, fmt.Errorf("process containment: command is required")
@@ -150,7 +154,35 @@ func Start(cmd *exec.Cmd, opts Options) (*Handle, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("process containment: start: %w", err)
 	}
-	return Bind(cmd, opts)
+	handle, err := startBind(cmd, opts)
+	if err != nil {
+		// Process is live without a Handle: emergency group kill + reap.
+		// Production stop paths use Handle.Kill once Bind succeeds.
+		killStartedWithoutHandle(cmd)
+		return nil, err
+	}
+	return handle, nil
+}
+
+// startBind attaches a Handle after a successful cmd.Start. Production always
+// uses Bind; tests may override to force post-Start Bind failures without
+// relying on rare getpgid errors.
+var startBind = Bind
+
+// killStartedWithoutHandle is only used when Bind fails after Start so the
+// orphaned process group is not left live. Production stop paths use Handle.Kill.
+// Configure guarantees the child is (or was) its process-group leader, so
+// SIGKILL -pid targets the owned group first; Process.Kill + Wait reaps the leader.
+func killStartedWithoutHandle(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
 }
 
 func newHandle(cmd *exec.Cmd, pid, pgid int, opts Options) *Handle {

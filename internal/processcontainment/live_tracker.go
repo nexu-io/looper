@@ -49,8 +49,10 @@ type LiveTracker interface {
 
 // StartTracked admits a tracker window (when tracker != nil), Starts the
 // command, Tracks the handle, then ends the admit window. On Start failure the
-// admit window is ended without Track. When tracker is nil this is Start with
-// a no-op release.
+// admit window is ended without Track; Start itself kills/reaps the process
+// group when Bind fails after a successful cmd.Start, so the child cannot
+// outlive the admission window without a tracked Handle. When tracker is nil
+// this is Start with a no-op release.
 func StartTracked(tracker LiveTracker, cmd *exec.Cmd, opts Options) (*Handle, func(), error) {
 	end, err := beginTrackOptional(tracker)
 	if err != nil {
@@ -58,6 +60,7 @@ func StartTracked(tracker LiveTracker, cmd *exec.Cmd, opts Options) (*Handle, fu
 	}
 	handle, err := Start(cmd, opts)
 	if err != nil {
+		// Start already cleaned up any orphaned process group on Bind failure.
 		end()
 		return nil, nil, err
 	}
