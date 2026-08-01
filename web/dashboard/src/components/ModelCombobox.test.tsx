@@ -86,15 +86,27 @@ describe("ModelCombobox", () => {
     expect(onCommit).toHaveBeenCalledWith("gpt-5");
   });
 
-  it("commits a custom typed id", () => {
+  it("commits a custom typed id on Enter (keystrokes stay local)", () => {
     const onCommit = vi.fn();
     const props = { ...commonProps, value: "", onCommitValue: onCommit };
     render(<ModelCombobox {...props} />);
     const input = screen.getByLabelText("agent.model");
     fireEvent.change(input, { target: { value: "custom-id" } });
-    // Every keystroke stages the draft so the tri-state contract is preserved
-    // even without hitting Enter — the last call carries the full string.
+    // Typing is local until commit so Escape can cancel without a parent draft.
+    expect(onCommit).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
     expect(onCommit).toHaveBeenLastCalledWith("custom-id");
+  });
+
+  it("commits free-entry text on blur without Enter", () => {
+    const onCommit = vi.fn();
+    const props = { ...commonProps, value: "", onCommitValue: onCommit };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model");
+    fireEvent.change(input, { target: { value: "blur-commit" } });
+    expect(onCommit).not.toHaveBeenCalled();
+    fireEvent.blur(input);
+    expect(onCommit).toHaveBeenLastCalledWith("blur-commit");
   });
 
   it("Inherit special row calls onInherit; Vendor default commits empty", async () => {
@@ -120,14 +132,17 @@ describe("ModelCombobox", () => {
   });
 
   it("does not fetch when vendor is null; prompts to select a vendor", async () => {
-    const props = { ...commonProps, value: "", vendor: null };
+    const onCommit = vi.fn();
+    const props = { ...commonProps, value: "", vendor: null, onCommitValue: onCommit };
     render(<ModelCombobox {...props} />);
     const input = screen.getByLabelText("agent.model");
     fireEvent.focus(input);
     expect(await screen.findByText(/Select a vendor first/i)).toBeTruthy();
-    // Free entry still works.
+    // Free entry still works (commit on Enter when no vendor).
     fireEvent.change(input, { target: { value: "custom" } });
-    expect(commonProps.onCommitValue).toHaveBeenLastCalledWith("custom");
+    expect(onCommit).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onCommit).toHaveBeenLastCalledWith("custom");
   });
 
   it("keyboard navigation: ArrowDown starts at the current-state row", async () => {
@@ -157,9 +172,8 @@ describe("ModelCombobox", () => {
     render(<ModelCombobox {...props} />);
     const input = screen.getByLabelText("agent.model");
     fireEvent.change(input, { target: { value: "my-model" } });
-    // Keystrokes stage the draft; the last onCommitValue is the typed value.
-    expect(onCommit).toHaveBeenLastCalledWith("my-model");
-    onCommit.mockClear();
+    // Keystrokes stay local; only Enter/pick/blur/Tab stage the draft.
+    expect(onCommit).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: "Enter" });
     // Untouched Enter must not select Inherit (row 0) — it commits the typed
     // value (or falls back to no-op) so custom ids are not overwritten.
@@ -185,7 +199,7 @@ describe("ModelCombobox", () => {
     expect(onInherit).not.toHaveBeenCalled();
   });
 
-  it("closes on Escape and restores parent value (clears stale query)", async () => {
+  it("closes on Escape without staging, restoring parent value", async () => {
     const onCommit = vi.fn();
     const props = {
       ...commonProps,
@@ -197,10 +211,13 @@ describe("ModelCombobox", () => {
     fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "typing…" } });
     expect(input.value).toBe("typing…");
+    expect(onCommit).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: "Escape" });
-    // Popup dismissed; input reverts to controlled parent value.
+    // Popup dismissed; input reverts to controlled parent value and Escape
+    // must not leave a half-edited draft on the parent.
     expect(screen.queryByTestId("model-combobox-popup")).toBeNull();
     expect(input.value).toBe("gpt-5");
+    expect(onCommit).not.toHaveBeenCalled();
   });
 
   it("shows the vendor-default placeholder when value is empty and not unset", () => {
@@ -280,5 +297,75 @@ describe("ModelCombobox", () => {
     render(<ModelCombobox {...props} />);
     const input = screen.getByLabelText("agent.model") as HTMLInputElement;
     expect(input.placeholder).toBe("Vendor default");
+  });
+
+  it("keeps cached suggestions when switching back to a fresh vendor while open", async () => {
+    const codexModels = {
+      vendor: "codex",
+      models: [
+        { id: "gpt-5", label: "GPT-5", source: "static" as const },
+        { id: "o4", label: "O4", source: "probe" as const },
+      ],
+      sources: { static: true, probe: "ok" as const },
+      probedAt: "2026-08-01T00:00:00Z",
+    };
+    const opencodeModels = {
+      vendor: "opencode",
+      models: [
+        { id: "big-pickle", label: "Big Pickle", source: "static" as const },
+      ],
+      sources: { static: true, probe: "ok" as const },
+      probedAt: "2026-08-01T00:00:00Z",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path.includes("vendor=codex")) return jsonEnvelope(codexModels);
+        if (path.includes("vendor=opencode")) return jsonEnvelope(opencodeModels);
+        throw new Error(`unexpected: ${path}`);
+      }),
+    );
+
+    const onCommit = vi.fn();
+    const { rerender } = render(
+      <ModelCombobox
+        {...commonProps}
+        value=""
+        vendor="codex"
+        onCommitValue={onCommit}
+      />,
+    );
+    const input = screen.getByLabelText("agent.model");
+    fireEvent.focus(input);
+    await screen.findByText("GPT-5");
+
+    // Visit opencode so both vendors are warm in the module cache.
+    rerender(
+      <ModelCombobox
+        {...commonProps}
+        value=""
+        vendor="opencode"
+        onCommitValue={onCommit}
+      />,
+    );
+    await screen.findByText("Big Pickle");
+    expect(screen.queryByText("GPT-5")).toBeNull();
+
+    // Switch back to codex while still open. Fresh cache must be restored and
+    // must not be wiped by a later vendor-clear effect (only specials left).
+    rerender(
+      <ModelCombobox
+        {...commonProps}
+        value=""
+        vendor="codex"
+        onCommitValue={onCommit}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByText("GPT-5")).toBeTruthy();
+    });
+    expect(screen.getByText("O4")).toBeTruthy();
+    expect(screen.queryByText("Big Pickle")).toBeNull();
   });
 });

@@ -89,18 +89,34 @@ export function ModelCombobox({
   const listRef = useRef<HTMLUListElement | null>(null);
 
   // Single close path: clear popup, transient query, and navigation state.
-  // Parent `value` is authoritative once closed.
+  // Parent `value` is authoritative once closed. Escape uses this path without
+  // staging, so discarded keystrokes never reach the draft.
   const close = useCallback(() => {
     setOpen(false);
     setQuery(null);
     setActive(null);
   }, []);
 
+  // Commit free-entry text (or empty clear) then close. Used by Enter, Tab,
+  // and blur — not Escape, which cancels without staging.
+  const commitTypedAndClose = useCallback(() => {
+    if (query !== null) {
+      onCommitValue(query.trim());
+    }
+    close();
+  }, [query, onCommitValue, close]);
+
   // Load / refresh suggestions when the popup opens (or vendor changes while
-  // open). Fresh cache serves synchronously; stale cache is shown while a
-  // background probe refreshes it.
+  // open). Clear prior UI state first, then restore from the module cache or
+  // fetch — a separate vendor-clear effect used to run *after* a fresh cache
+  // hit and wipe the restored list for the rest of the open session.
   useEffect(() => {
+    setEntries(null);
+    setProbeError(null);
+    setLoading(false);
+
     if (!open || !vendor) return;
+
     const cached = cache.get(vendor);
     if (cached) setEntries(cached.data.models);
     if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
@@ -143,23 +159,17 @@ export function ModelCombobox({
     };
   }, [open, vendor]);
 
-  // Vendor change: drop stale suggestions immediately.
-  useEffect(() => {
-    setEntries(null);
-    setProbeError(null);
-    setLoading(false);
-  }, [vendor]);
-
-  // Close on outside click via the unified close path.
+  // Outside click stages free-entry text then closes (not cancel). Escape is
+  // the only path that discards the local query without committing.
   useEffect(() => {
     if (!open) return;
     const handler = (event: MouseEvent) => {
       if (!rootRef.current) return;
-      if (!rootRef.current.contains(event.target as Node)) close();
+      if (!rootRef.current.contains(event.target as Node)) commitTypedAndClose();
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [open, close]);
+  }, [open, commitTypedAndClose]);
 
   const rows = useMemo<Row[]>(() => {
     const specials: Row[] = [];
@@ -313,20 +323,21 @@ export function ModelCombobox({
         commitRow(rows[active]);
       } else if (query !== null && query.trim() !== "") {
         event.preventDefault();
-        onCommitValue(query.trim());
-        close();
+        commitTypedAndClose();
       } else if (open) {
         event.preventDefault();
         close();
       }
     } else if (event.key === "Escape") {
+      // Cancel: discard local query without staging. Parent draft stays at
+      // the pre-edit value because keystrokes no longer call onCommitValue.
       if (open) {
         event.preventDefault();
         close();
       }
     } else if (event.key === "Tab") {
-      // Tab commits nothing but exits cleanly.
-      if (open) close();
+      // Tab away stages free-entry text (same as blur) but does not pick a row.
+      if (open) commitTypedAndClose();
     }
   };
 
@@ -376,16 +387,20 @@ export function ModelCombobox({
           ) {
             return;
           }
-          close();
+          // Stage free-entry text on leave so Save without Enter still works;
+          // Escape uses close() only and never reaches here with a pending query
+          // that should be discarded (Escape closes first without blur commit
+          // when the input keeps focus).
+          commitTypedAndClose();
         }}
         onChange={(event) => {
           const next = event.currentTarget.value;
-          // Preserve tri-state: stage typed text as-is (free entry). Empty text
-          // is legitimate — caller decides how "" maps to buildConfigPatch.
+          // Keep typing local until commit (Enter / pick / Tab / blur). Staging
+          // every keystroke made Escape unable to cancel: parent draft already
+          // held the half-edited id, so closing only cleared the local query.
           setQuery(next);
           setOpen(true);
           setActive(null);
-          onCommitValue(next);
         }}
         onKeyDown={onKeyDown}
       />

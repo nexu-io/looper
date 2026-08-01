@@ -1246,9 +1246,12 @@ describe("ConfigPage", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderPage();
 
-    fireEvent.change(await screen.findByLabelText("agent.profiles.fast.model"), {
+    const modelInput = await screen.findByLabelText("agent.profiles.fast.model");
+    fireEvent.change(modelInput, {
       target: { value: "gpt-5" },
     });
+    // ModelCombobox keeps keystrokes local until commit (blur / Enter / pick).
+    fireEvent.blur(modelInput);
     clickSaveChanges();
     fireEvent.click(
       await screen.findByRole("button", {
@@ -1385,9 +1388,11 @@ describe("ConfigPage", () => {
     expect(screen.queryByLabelText(/params/i)).toBeNull();
     expect(screen.queryByText(/params map/i)).toBeNull();
 
-    fireEvent.change(screen.getByLabelText("agent.profiles.fast.model"), {
+    const profileModel = screen.getByLabelText("agent.profiles.fast.model");
+    fireEvent.change(profileModel, {
       target: { value: "gpt-5" },
     });
+    fireEvent.blur(profileModel);
     fireEvent.change(screen.getByLabelText("New profile id"), {
       target: { value: "cheap" },
     });
@@ -1545,6 +1550,7 @@ describe("ConfigPage", () => {
     ) as HTMLInputElement;
     expect(modelInput.disabled).toBe(false);
     fireEvent.change(modelInput, { target: { value: "gpt-5" } });
+    fireEvent.blur(modelInput);
 
     fireEvent.change(screen.getByLabelText("New profile id"), {
       target: { value: "cheap" },
