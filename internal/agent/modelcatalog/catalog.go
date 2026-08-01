@@ -4,6 +4,8 @@ package modelcatalog
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -165,7 +167,13 @@ func (s *Service) List(ctx context.Context, opts ListOptions) (Result, error) {
 	}
 
 	command := agent.ResolveCommand(opts.Vendor, opts.Params)
-	resolved := resolveBinaryPath(command, s.lookPath)
+	// Relative path overrides (e.g. ./tools/codex-wrapper) resolve against each
+	// run's worktree at spawn time (executor sets cmd.Dir). Catalog probes have
+	// no worktree context; do not LookPath/run them from looperd's CWD.
+	resolved := command
+	if !isRelativePathCommand(command) {
+		resolved = resolveBinaryPath(command, s.lookPath)
+	}
 	cacheKey := string(opts.Vendor) + "\x00" + resolved
 
 	if !opts.Refresh {
@@ -270,6 +278,15 @@ func (s *Service) listUncached(ctx context.Context, vendor config.AgentVendor, r
 	probedAt := s.now().UTC()
 	result.ProbedAt = probedAt.Format(time.RFC3339)
 
+	// Relative command overrides are not spawn-equivalent here: agent launch
+	// sets cmd.Dir to the run worktree; this endpoint has no such directory.
+	// Reject rather than resolving/running from looperd's current directory.
+	if isRelativePathCommand(resolvedBinary) {
+		result.Sources.Probe = ProbeError
+		result.Sources.ProbeError = relativeCommandProbeError
+		return result
+	}
+
 	env := buildProbeEnv(agentEnv)
 	probeModels, err := s.probe(ctx, vendor, resolvedBinary, env)
 	if err != nil {
@@ -342,4 +359,23 @@ func resolveBinaryPath(command string, lookPath func(string) (string, error)) st
 		return path
 	}
 	return command
+}
+
+// relativeCommandProbeError is returned when agent.params.command is a
+// worktree-relative path. Probes cannot supply spawn's WorkingDirectory.
+const relativeCommandProbeError = "relative command override cannot be probed outside a run worktree"
+
+// isRelativePathCommand reports whether command is a path that agent spawn
+// resolves relative to the run worktree (cmd.Dir). Bare PATH names and
+// absolute paths do not need a worktree to resolve and may be probed as-is.
+func isRelativePathCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" || filepath.IsAbs(command) {
+		return false
+	}
+	// PATH lookup names have no path separators.
+	if !strings.ContainsRune(command, '/') && (filepath.Separator == '/' || !strings.ContainsRune(command, filepath.Separator)) {
+		return false
+	}
+	return true
 }

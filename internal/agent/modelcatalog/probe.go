@@ -44,6 +44,12 @@ func (r defaultRunner) Run(ctx context.Context, env []string, name string, args 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Defense in depth: relative path commands need a worktree Dir (spawn sets
+	// cmd.Dir). Catalog List rejects these before probe; refuse here too so a
+	// direct Run cannot resolve them from looperd's CWD.
+	if isRelativePathCommand(name) {
+		return nil, fmt.Errorf("%s", relativeCommandProbeError)
+	}
 
 	cmd := exec.Command(name, args...)
 	// Always set Env so ambient daemon credentials cannot leak into vendor CLIs.

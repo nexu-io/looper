@@ -647,6 +647,118 @@ func TestListUsesParamsCommand(t *testing.T) {
 	}
 }
 
+func TestListRelativeCommandOverrideSkipsProbe(t *testing.T) {
+	// Spawn resolves ./tools/... against the run worktree (cmd.Dir). Catalog
+	// probes have no worktree — must not LookPath/run against looperd CWD.
+	var runnerCalls atomic.Int32
+	var lookPathCalls atomic.Int32
+	svc := NewService(Options{
+		Runner: runnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
+			runnerCalls.Add(1)
+			return []byte("should-not-run\n"), nil
+		}),
+		LookPath: func(s string) (string, error) {
+			lookPathCalls.Add(1)
+			// If this path were used, LookPath would wrongly pin to daemon CWD.
+			return "/wrong-daemon-cwd/" + s, nil
+		},
+		Now: func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+
+	for _, command := range []string{"./tools/codex-wrapper", "tools/codex-wrapper", "../bin/codex"} {
+		got, err := svc.List(context.Background(), ListOptions{
+			Vendor:  config.AgentVendorCodex,
+			Params:  map[string]any{"command": command},
+			Refresh: true,
+		})
+		if err != nil {
+			t.Fatalf("List(%q) error = %v", command, err)
+		}
+		if got.Sources.Probe != ProbeError {
+			t.Fatalf("List(%q) probe = %q, want error", command, got.Sources.Probe)
+		}
+		if got.Sources.ProbeError != relativeCommandProbeError {
+			t.Fatalf("List(%q) probeError = %q, want %q", command, got.Sources.ProbeError, relativeCommandProbeError)
+		}
+		if !got.Sources.Static || len(got.Models) == 0 {
+			t.Fatalf("List(%q) expected static models, got %#v", command, got)
+		}
+		if got.ProbedAt != "2026-08-01T12:00:00Z" {
+			t.Fatalf("List(%q) probedAt = %q", command, got.ProbedAt)
+		}
+		for _, m := range got.Models {
+			if m.Source != SourceStatic {
+				t.Fatalf("List(%q) model source = %q, want static only", command, m.Source)
+			}
+		}
+	}
+	if runnerCalls.Load() != 0 {
+		t.Fatalf("runner calls = %d, want 0", runnerCalls.Load())
+	}
+	if lookPathCalls.Load() != 0 {
+		t.Fatalf("LookPath calls = %d, want 0 (must not resolve relative against daemon CWD)", lookPathCalls.Load())
+	}
+}
+
+func TestListBareAndAbsoluteCommandsStillProbe(t *testing.T) {
+	var saw []string
+	svc := NewService(Options{
+		Runner: runnerFunc(func(_ context.Context, _ []string, name string, _ ...string) ([]byte, error) {
+			saw = append(saw, name)
+			return []byte(`{"models":[{"id":"gpt-5.4","name":"GPT-5.4","visibility":"list"}]}`), nil
+		}),
+		LookPath: func(s string) (string, error) {
+			if s == "codex" {
+				return "/usr/bin/codex", nil
+			}
+			return s, nil
+		},
+	})
+
+	if _, err := svc.List(context.Background(), ListOptions{Vendor: config.AgentVendorCodex}); err != nil {
+		t.Fatalf("bare List() error = %v", err)
+	}
+	if _, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorCodex,
+		Params: map[string]any{"command": "/opt/custom-codex"},
+	}); err != nil {
+		t.Fatalf("absolute List() error = %v", err)
+	}
+	if !reflect.DeepEqual(saw, []string{"/usr/bin/codex", "/opt/custom-codex"}) {
+		t.Fatalf("probed binaries = %#v, want bare resolved + absolute", saw)
+	}
+}
+
+func TestIsRelativePathCommand(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"codex", false},
+		{"my.codex-wrapper", false},
+		{"/opt/custom-codex", false},
+		{"./tools/codex-wrapper", true},
+		{"tools/codex-wrapper", true},
+		{"../bin/codex", true},
+	}
+	for _, tc := range cases {
+		if got := isRelativePathCommand(tc.in); got != tc.want {
+			t.Fatalf("isRelativePathCommand(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestDefaultRunnerRejectsRelativeCommand(t *testing.T) {
+	_, err := defaultRunner{}.Run(context.Background(), nil, "./tools/codex-wrapper", "debug", "models")
+	if err == nil {
+		t.Fatal("expected error for relative command")
+	}
+	if !strings.Contains(err.Error(), relativeCommandProbeError) {
+		t.Fatalf("error = %q, want %q", err, relativeCommandProbeError)
+	}
+}
+
 func TestListProbeOutputOverflowIsError(t *testing.T) {
 	// Fake runner simulates defaultRunner overflow failure.
 	svc := NewService(Options{
