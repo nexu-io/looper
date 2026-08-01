@@ -242,10 +242,38 @@ describe("ModelCombobox", () => {
     expect(onCommit).not.toHaveBeenCalled();
   });
 
-  it("treats null value as Vendor default when inherit is not allowed", () => {
+  it("keeps global absence distinct from explicit Vendor default suppress", async () => {
+    const onCommit = vi.fn();
     const props = {
       ...commonProps,
       value: null as string | null,
+      allowInherit: false,
+      onInherit: undefined,
+      onCommitValue: onCommit,
+      placeholder: "Model id (empty = inherit CLI default)",
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    // Absent global model is unbound (params --model may still apply), not
+    // the Vendor default suppress row.
+    expect(input.placeholder).toBe("Model id (empty = inherit CLI default)");
+    expect(input.placeholder).not.toBe("Vendor default");
+
+    fireEvent.focus(input);
+    await screen.findByText("GPT-5");
+    // No current-state row: Vendor default is not aria-selected as current.
+    const vendorDefault = screen.getByText("Vendor default").closest("[role='option']");
+    expect(vendorDefault?.getAttribute("aria-selected")).toBe("false");
+
+    // Untouched Enter must not stage explicit "" suppress.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("explicit empty string still shows Vendor default when inherit is not allowed", () => {
+    const props = {
+      ...commonProps,
+      value: "",
       allowInherit: false,
       onInherit: undefined,
     };

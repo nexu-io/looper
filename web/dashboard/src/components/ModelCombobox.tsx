@@ -38,7 +38,9 @@ export type ModelComboboxProps = {
   vendor: string | null;
   /**
    * Current draft (or published) binding:
-   * - `null` = persisted absence (inherits previous layer; not the same as `""`)
+   * - `null` = persisted absence (not the same as `""`)
+   *   - with allowInherit: Inherit from previous layer
+   *   - without (global): unbound — params/CLI model may still apply
    * - `""` = explicit vendor-default suppress
    * - non-empty = model id
    */
@@ -223,12 +225,17 @@ export function ModelCombobox({
     }
   }, [active, open]);
 
-  // Absent leaf (null) is inherit when Inherit is offered; without allowInherit
-  // (global model) absence collapses to vendor/CLI default like explicit "".
+  // Tri-state binding:
+  // - null = persisted absence (not the same as explicit "")
+  // - ""   = explicit vendor-default suppress
+  // - id   = model id
+  // When Inherit is offered (profile/role), absence is Inherit. For global
+  // (!allowInherit), absence stays unbound: agent.params.args --model/-m may
+  // still apply. Only explicit "" is Vendor default; collapsing null → ""
+  // would reaffirm as suppress and strip params model flags on save.
   const inheritsByAbsence = value === null && allowInherit;
   const isInheritState = unset || inheritsByAbsence;
-  const isVendorDefaultState =
-    !unset && (value === "" || (value === null && !allowInherit));
+  const isVendorDefaultState = !unset && value === "";
   const boundValue = value ?? "";
 
   // What to render inside the input. When closed, defer to the controlled

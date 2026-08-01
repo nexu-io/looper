@@ -1580,8 +1580,9 @@ export function ConfigPage() {
     const dirty = Object.hasOwn(drafts, path);
     const unset = unsetPaths.has(path);
     const modelScope = agentModelScope(path);
-    // Model leaves: keep absence (null) distinct from explicit "" suppress so
-    // profile/role comboboxes show Inherit rather than Vendor default.
+    // Model leaves: keep absence (null) distinct from explicit "" suppress.
+    // Profile/role: null → Inherit. Global: null → unbound (params/CLI may
+    // still supply --model); only "" is Vendor default suppress.
     const modelValue: string | null = unset
       ? null
       : Object.hasOwn(drafts, path)
