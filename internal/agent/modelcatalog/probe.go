@@ -56,18 +56,17 @@ func (r defaultRunner) Run(ctx context.Context, env []string, name string, args 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
-	handle, err := processcontainment.Start(cmd, processcontainment.Options{
+	// BeginTrack before Start so BeginShutdown cannot snapshot an empty handle
+	// set while Start→Track is in flight (admission-closed refuse kills in Track).
+	handle, release, err := processcontainment.StartTracked(r.tracker, cmd, processcontainment.Options{
 		GracePeriod:  probeGracePeriod,
 		DrainTimeout: probeGracePeriod + probeCleanupSlack,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start probe: %w", err)
 	}
-	if r.tracker != nil {
-		release := r.tracker.Track(handle)
-		if release != nil {
-			defer release()
-		}
+	if release != nil {
+		defer release()
 	}
 
 	waitDone := make(chan error, 1)

@@ -797,6 +797,9 @@ func TestDefaultRunnerTracksHandleWithLiveTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
+	if tracker.begins.Load() != 1 {
+		t.Fatalf("BeginTrack calls = %d, want 1", tracker.begins.Load())
+	}
 	if tracker.tracks.Load() != 1 {
 		t.Fatalf("Track calls = %d, want 1", tracker.tracks.Load())
 	}
@@ -818,8 +821,14 @@ func envSliceToMap(env []string) map[string]string {
 }
 
 type recordingTracker struct {
+	begins   atomic.Int32
 	tracks   atomic.Int32
 	releases atomic.Int32
+}
+
+func (t *recordingTracker) BeginTrack() (end func(), err error) {
+	t.begins.Add(1)
+	return func() {}, nil
 }
 
 func (t *recordingTracker) Track(handle *processcontainment.Handle) (release func()) {

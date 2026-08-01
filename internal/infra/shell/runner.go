@@ -161,12 +161,28 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	stdoutBuffer := newBoundedBuffer(maxCapturedBytes)
 	stderrBuffer := newBoundedBuffer(maxCapturedBytes)
 
+	// BeginTrack before Start so BeginShutdown waits across the Start→Track
+	// window (and Track refuse-kills if admission closed mid-start).
+	var endTrack func()
+	if options.Tracker != nil {
+		end, trackErr := options.Tracker.BeginTrack()
+		if trackErr != nil {
+			return Result{}, fmt.Errorf("start command: %w", trackErr)
+		}
+		endTrack = end
+	}
 	handle, err := startContainedCommand(ctx, options, gracefulShutdown, stdoutBuffer, stderrBuffer)
 	if err != nil {
+		if endTrack != nil {
+			endTrack()
+		}
 		return Result{}, fmt.Errorf("start command: %w", err)
 	}
 	if options.Tracker != nil {
 		release := options.Tracker.Track(handle)
+		if endTrack != nil {
+			endTrack()
+		}
 		if release != nil {
 			defer release()
 		}

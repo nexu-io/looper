@@ -278,7 +278,22 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	stderr := newTrustedReviewBoundedBuffer(maxTrustedReviewProxyOutputBytes)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	// BeginTrack before Start so BeginShutdown waits across Start→Bind→Track.
+	var endTrack func()
+	if tracker != nil {
+		end, trackErr := tracker.BeginTrack()
+		if trackErr != nil {
+			_ = configReader.Close()
+			_ = configWriter.Close()
+			_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: trackErr.Error()})
+			return
+		}
+		endTrack = end
+	}
 	if err := cmd.Start(); err != nil {
+		if endTrack != nil {
+			endTrack()
+		}
 		_ = configReader.Close()
 		_ = configWriter.Close()
 		_ = json.NewEncoder(conn).Encode(trustedReviewProxyResponse{ExitCode: 1, Error: err.Error()})
@@ -289,6 +304,9 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 		DrainTimeout: 20 * time.Second,
 	})
 	if bindErr != nil {
+		if endTrack != nil {
+			endTrack()
+		}
 		_ = configReader.Close()
 		_ = configWriter.Close()
 		// Bind failed after Start: force-kill the orphaned process group so it
@@ -299,6 +317,9 @@ func handleTrustedReviewProxyConn(ctx context.Context, conn net.Conn, realLooper
 	}
 	if tracker != nil {
 		release := tracker.Track(handle)
+		if endTrack != nil {
+			endTrack()
+		}
 		if release != nil {
 			defer release()
 		}
