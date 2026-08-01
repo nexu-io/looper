@@ -36,8 +36,13 @@ export type ModelComboboxProps = {
   ariaLabel?: string;
   /** Effective vendor resolved by the caller (nullable). */
   vendor: string | null;
-  /** Current draft (or published) string. Empty string = vendor default. */
-  value: string;
+  /**
+   * Current draft (or published) binding:
+   * - `null` = persisted absence (inherits previous layer; not the same as `""`)
+   * - `""` = explicit vendor-default suppress
+   * - non-empty = model id
+   */
+  value: string | null;
   /** True when caller has staged an unset (inherit). Displayed as read-only. */
   unset: boolean;
   disabled: boolean;
@@ -218,21 +223,33 @@ export function ModelCombobox({
     }
   }, [active, open]);
 
+  // Absent leaf (null) is inherit when Inherit is offered; without allowInherit
+  // (global model) absence collapses to vendor/CLI default like explicit "".
+  const inheritsByAbsence = value === null && allowInherit;
+  const isInheritState = unset || inheritsByAbsence;
+  const isVendorDefaultState =
+    !unset && (value === "" || (value === null && !allowInherit));
+  const boundValue = value ?? "";
+
   // What to render inside the input. When closed, defer to the controlled
   // `value` so a discarded/rebased parent draft never leaves stale query
   // text on screen. When open, show the current query (or fall back to value).
-  const displayValue = open ? query ?? value : unset ? "" : value;
+  const displayValue = open
+    ? (query ?? boundValue)
+    : isInheritState
+      ? ""
+      : boundValue;
 
   // Which row represents the current parent state (for aria-selected when the
   // operator hasn't navigated yet).
   const stateRowIndex = useMemo<number | null>(() => {
-    if (unset) {
+    if (isInheritState) {
       const idx = rows.findIndex(
         (r) => r.kind === "special" && r.special === "inherit",
       );
       return idx >= 0 ? idx : null;
     }
-    if (value === "") {
+    if (isVendorDefaultState) {
       const idx = rows.findIndex(
         (r) => r.kind === "special" && r.special === "vendor-default",
       );
@@ -242,7 +259,7 @@ export function ModelCombobox({
       (r) => r.kind === "model" && r.entry.id === value,
     );
     return idx >= 0 ? idx : null;
-  }, [rows, value, unset]);
+  }, [rows, value, isInheritState, isVendorDefaultState]);
 
   const commitRow = useCallback(
     (row: Row) => {
@@ -268,8 +285,8 @@ export function ModelCombobox({
       setOpen(true);
       setActive((idx) => {
         // First arrow press: start navigation from the row that reflects
-        // current parent state (Inherit when unset, Vendor default when "",
-        // or the matching model), falling back to row 0.
+        // current parent state (Inherit when unset/absent, Vendor default
+        // when "", or the matching model), falling back to row 0.
         if (idx === null) return stateRowIndex ?? 0;
         return Math.min(rows.length - 1, idx + 1);
       });
@@ -316,9 +333,11 @@ export function ModelCombobox({
       : undefined;
 
   // Placeholder reflects tri-state when the input renders empty and closed.
-  const closedPlaceholder = unset
+  // Staged unset locks the control; natural absence still shows Inherit but
+  // remains editable so operators can pick a model without an Undo first.
+  const closedPlaceholder = isInheritState
     ? "Inherit"
-    : value === ""
+    : isVendorDefaultState
       ? "Vendor default"
       : placeholder;
 

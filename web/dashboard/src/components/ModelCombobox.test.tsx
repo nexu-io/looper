@@ -218,4 +218,39 @@ describe("ModelCombobox", () => {
     expect(input.placeholder).toBe("Inherit");
     expect(input.disabled).toBe(true);
   });
+
+  it("treats null value as Inherit (absent leaf) without locking the control", async () => {
+    const onCommit = vi.fn();
+    const onInherit = vi.fn();
+    const props = {
+      ...commonProps,
+      value: null as string | null,
+      onCommitValue: onCommit,
+      onInherit,
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    expect(input.placeholder).toBe("Inherit");
+    expect(input.disabled).toBe(false);
+
+    fireEvent.focus(input);
+    await screen.findByText("GPT-5");
+    // ArrowDown starts on Inherit (current state); Enter calls onInherit, not "".
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onInherit).toHaveBeenCalledTimes(1);
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("treats null value as Vendor default when inherit is not allowed", () => {
+    const props = {
+      ...commonProps,
+      value: null as string | null,
+      allowInherit: false,
+      onInherit: undefined,
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    expect(input.placeholder).toBe("Vendor default");
+  });
 });

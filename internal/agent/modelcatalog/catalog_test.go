@@ -379,6 +379,148 @@ func TestListCoalescesInflightSameKey(t *testing.T) {
 	}
 }
 
+func TestListCanceledCallerDoesNotPoisonCache(t *testing.T) {
+	// Request cancel (popup close) must not abort the shared probe or cache a
+	// "probe canceled" failure that later Lists would serve for the full TTL.
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	svc := NewService(Options{
+		Runner: runnerFunc(func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+			calls.Add(1)
+			close(started)
+			select {
+			case <-release:
+				return []byte("good-model\n"), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan Result, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, err := svc.List(ctx, ListOptions{Vendor: config.AgentVendorOpenCode})
+		errCh <- err
+		done <- got
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe did not start")
+	}
+	cancel()
+	// Give the leader a chance to observe cancel if it still used the request ctx.
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("List() after cancel error = %v (probe should outlive request cancel)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("List() did not return")
+	}
+	leader := <-done
+	if leader.Sources.Probe != ProbeOK {
+		t.Fatalf("leader probe = %q err=%q, want ok", leader.Sources.Probe, leader.Sources.ProbeError)
+	}
+
+	// Cache must hold the successful probe, not a cancel failure.
+	second, err := svc.List(context.Background(), ListOptions{Vendor: config.AgentVendorOpenCode})
+	if err != nil {
+		t.Fatalf("second List() error = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("runner calls = %d, want 1 (cached success)", calls.Load())
+	}
+	if second.Sources.Probe != ProbeOK {
+		t.Fatalf("cached probe = %q err=%q, want ok", second.Sources.Probe, second.Sources.ProbeError)
+	}
+	found := false
+	for _, m := range second.Models {
+		if m.ID == "good-model" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected good-model in cached result %#v", second.Models)
+	}
+}
+
+func TestListCanceledLeaderDoesNotPoisonLiveWaiters(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	svc := NewService(Options{
+		Runner: runnerFunc(func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+			calls.Add(1)
+			close(started)
+			select {
+			case <-release:
+				return []byte("shared-model\n"), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_, _ = svc.List(leaderCtx, ListOptions{Vendor: config.AgentVendorOpenCode})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe did not start")
+	}
+
+	// Waiter joins while probe is in flight; leader cancel must not poison it.
+	waiterErr := make(chan error, 1)
+	waiterResult := make(chan Result, 1)
+	go func() {
+		got, err := svc.List(context.Background(), ListOptions{Vendor: config.AgentVendorOpenCode})
+		waiterErr <- err
+		waiterResult <- got
+	}()
+	time.Sleep(30 * time.Millisecond)
+	leaderCancel()
+	close(release)
+
+	select {
+	case <-leaderDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("leader List() did not return")
+	}
+	select {
+	case err := <-waiterErr:
+		if err != nil {
+			t.Fatalf("waiter List() error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter List() did not return")
+	}
+	got := <-waiterResult
+	if got.Sources.Probe != ProbeOK {
+		t.Fatalf("waiter probe = %q err=%q, want ok", got.Sources.Probe, got.Sources.ProbeError)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("runner calls = %d, want 1", calls.Load())
+	}
+}
+
 func TestListUnknownVendor(t *testing.T) {
 	svc := NewService(Options{})
 	_, err := svc.List(context.Background(), ListOptions{Vendor: config.AgentVendor("nope")})

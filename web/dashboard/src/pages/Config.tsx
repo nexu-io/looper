@@ -499,13 +499,16 @@ function AgentProfiles({
                 : published?.vendor == null
                   ? ""
                   : String(published.vendor);
-          const modelValue =
+          // null = persisted absence (Inherit); "" = explicit vendor-default
+          // suppress. Do not collapse absence to "" — that mis-highlights
+          // Vendor default and ArrowDown+Enter would stage set model:"".
+          const modelValue: string | null =
             modelUnset || pendingRemoval
-              ? ""
+              ? null
               : Object.hasOwn(drafts, modelPath)
                 ? String(drafts[modelPath] ?? "")
                 : published?.model == null
-                  ? ""
+                  ? null
                   : String(published.model);
           const canUnsetVendor =
             vendorEditable &&
@@ -1577,6 +1580,15 @@ export function ConfigPage() {
     const dirty = Object.hasOwn(drafts, path);
     const unset = unsetPaths.has(path);
     const modelScope = agentModelScope(path);
+    // Model leaves: keep absence (null) distinct from explicit "" suppress so
+    // profile/role comboboxes show Inherit rather than Vendor default.
+    const modelValue: string | null = unset
+      ? null
+      : Object.hasOwn(drafts, path)
+        ? String(drafts[path] ?? "")
+        : effective == null
+          ? null
+          : String(effective);
     return (
       <FieldFrame
         key={path}
@@ -1594,7 +1606,7 @@ export function ConfigPage() {
             id={`config-${path}`}
             ariaLabel={path}
             vendor={effectiveAgentVendor(data, drafts, unsetPaths, modelScope)}
-            value={String(value ?? "")}
+            value={modelValue}
             unset={unset}
             disabled={editorLocked || !metaIsEditable(meta)}
             allowInherit={modelScope.kind !== "global"}

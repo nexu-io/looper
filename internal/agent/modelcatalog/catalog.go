@@ -158,9 +158,18 @@ func (s *Service) List(ctx context.Context, opts ListOptions) (Result, error) {
 	s.inflight[cacheKey] = call
 	s.mu.Unlock()
 
-	result := s.listUncached(ctx, opts.Vendor, resolved)
+	// Shared probe work must outlive any single request cancel (popup close /
+	// AbortController). Tying listUncached to the leader's ctx would mark the
+	// probe as canceled, cache that failure for the full TTL, and poison every
+	// waiter coalesced behind this call even when their contexts are still live.
+	probeCtx := context.WithoutCancel(ctx)
+	result := s.listUncached(probeCtx, opts.Vendor, resolved)
 
-	s.cachePut(cacheKey, result)
+	// Defensive: never populate the shared cache with a cancel-sourced probe
+	// error (e.g. if a future caller re-introduces request cancel into probeCtx).
+	if !isCancelPoisonedProbe(result) {
+		s.cachePut(cacheKey, result)
+	}
 
 	s.mu.Lock()
 	call.result = result
@@ -170,6 +179,16 @@ func (s *Service) List(ctx context.Context, opts ListOptions) (Result, error) {
 	s.mu.Unlock()
 
 	return cloneResult(result), nil
+}
+
+// isCancelPoisonedProbe reports whether the result is a probe failure caused by
+// context cancellation. Those must not be cached or they starve later callers.
+func isCancelPoisonedProbe(result Result) bool {
+	if result.Sources.Probe != ProbeError {
+		return false
+	}
+	msg := result.Sources.ProbeError
+	return msg == "probe canceled" || msg == context.Canceled.Error()
 }
 
 func (s *Service) waitInflight(ctx context.Context, call *inflightCall) (Result, error) {
