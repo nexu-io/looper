@@ -178,6 +178,24 @@ export function ModelCombobox({
     return () => document.removeEventListener("mousedown", handler);
   }, [open, commitTypedAndClose]);
 
+  // Tri-state binding:
+  // - null = persisted absence (not the same as explicit "")
+  // - ""   = explicit vendor-default suppress
+  // - id   = model id
+  // When Inherit is offered (profile/role), absence is Inherit. For global
+  // (!allowInherit), absence stays unbound: agent.params.args --model/-m may
+  // still apply. Only explicit "" is Vendor default; collapsing null → ""
+  // would reaffirm as suppress and strip params model flags on save.
+  // Computed before `rows` so a concrete binding missing from the catalog
+  // can still be represented as a current-state custom row.
+  const absenceState = unset || value === null;
+  const isInheritState = allowInherit && absenceState;
+  const isUnboundState = !allowInherit && absenceState;
+  const isVendorDefaultState = !unset && value === "";
+  const boundValue = value ?? "";
+  const hasConcreteBinding =
+    !isInheritState && !isUnboundState && !isVendorDefaultState && boundValue !== "";
+
   const rows = useMemo<Row[]>(() => {
     const specials: Row[] = [];
     if (allowInherit) {
@@ -219,21 +237,37 @@ export function ModelCombobox({
       entry,
     }));
 
-    // Custom / free-entry row when the current query is a novel id.
+    // Custom / free-entry row when the typed query is a novel id, or when the
+    // parent already binds a concrete id that is absent from the (possibly
+    // still-loading) catalog. Without the latter, stateRowIndex is null and
+    // first ArrowDown falls through to special row 0 (Inherit/Unbound).
     let customRow: Row | null = null;
-    if (
-      q &&
-      !filtered.some((m) => m.id.toLowerCase() === q) &&
-      // Skip "custom" when the query happens to equal a special label.
-      q !== "inherit" &&
-      q !== "unbound" &&
-      q !== "vendor default"
+    if (q) {
+      if (
+        !filtered.some((m) => m.id.toLowerCase() === q) &&
+        // Skip "custom" when the query happens to equal a special label.
+        q !== "inherit" &&
+        q !== "unbound" &&
+        q !== "vendor default"
+      ) {
+        customRow = { kind: "custom", value: (query ?? "").trim() };
+      }
+    } else if (
+      hasConcreteBinding &&
+      !source.some((m) => m.id === boundValue)
     ) {
-      customRow = { kind: "custom", value: (query ?? "").trim() };
+      customRow = { kind: "custom", value: boundValue };
     }
 
     return customRow ? [...specials, customRow, ...modelRows] : [...specials, ...modelRows];
-  }, [entries, query, allowInherit, onUnbound]);
+  }, [
+    entries,
+    query,
+    allowInherit,
+    onUnbound,
+    hasConcreteBinding,
+    boundValue,
+  ]);
 
   // Keep active index in range as rows change. Null (untouched) stays null.
   useEffect(() => {
@@ -252,20 +286,6 @@ export function ModelCombobox({
     }
   }, [active, open]);
 
-  // Tri-state binding:
-  // - null = persisted absence (not the same as explicit "")
-  // - ""   = explicit vendor-default suppress
-  // - id   = model id
-  // When Inherit is offered (profile/role), absence is Inherit. For global
-  // (!allowInherit), absence stays unbound: agent.params.args --model/-m may
-  // still apply. Only explicit "" is Vendor default; collapsing null → ""
-  // would reaffirm as suppress and strip params model flags on save.
-  const absenceState = unset || value === null;
-  const isInheritState = allowInherit && absenceState;
-  const isUnboundState = !allowInherit && absenceState;
-  const isVendorDefaultState = !unset && value === "";
-  const boundValue = value ?? "";
-
   // What to render inside the input. When closed, defer to the controlled
   // `value` so a discarded/rebased parent draft never leaves stale query
   // text on screen. When open, show the current query (or fall back to value).
@@ -276,7 +296,8 @@ export function ModelCombobox({
       : boundValue;
 
   // Which row represents the current parent state (for aria-selected when the
-  // operator hasn't navigated yet).
+  // operator hasn't navigated yet). Matches model suggestions and the
+  // synthetic custom row for out-of-catalog / still-loading bindings.
   const stateRowIndex = useMemo<number | null>(() => {
     if (isInheritState) {
       const idx = rows.findIndex(
@@ -297,7 +318,9 @@ export function ModelCombobox({
       return idx >= 0 ? idx : null;
     }
     const idx = rows.findIndex(
-      (r) => r.kind === "model" && r.entry.id === value,
+      (r) =>
+        (r.kind === "model" && r.entry.id === value) ||
+        (r.kind === "custom" && r.value === value),
     );
     return idx >= 0 ? idx : null;
   }, [rows, value, isInheritState, isUnboundState, isVendorDefaultState]);
@@ -322,21 +345,27 @@ export function ModelCombobox({
     [onCommitValue, onInherit, onUnbound, close],
   );
 
+  // First non-special row (custom free-entry or model suggestion). Used when
+  // a filter is active or when a concrete binding has no state row yet.
+  const firstChoiceIndex = (): number => {
+    const idx = rows.findIndex((r) => r.kind === "model" || r.kind === "custom");
+    return idx >= 0 ? idx : 0;
+  };
+
   // First keyboard step when the operator has not arrow-navigated yet.
   // With a typed filter, start on the first custom/model suggestion so
   // ArrowDown+Enter does not land on Inherit / Vendor default (specials
   // always precede filtered rows, and stateRowIndex is often null once the
   // current binding is filtered out). Without a filter, start on the row
-  // that reflects parent state.
+  // that reflects parent state; if that is still missing for a concrete
+  // binding, prefer the first non-special row over special row 0 so Enter
+  // cannot unexpectedly clear the binding to Inherit/Unbound.
   const initialNavIndex = (): number => {
     const hasFilter = query !== null && query.trim() !== "";
-    if (hasFilter) {
-      const firstChoice = rows.findIndex(
-        (r) => r.kind === "model" || r.kind === "custom",
-      );
-      if (firstChoice >= 0) return firstChoice;
-    }
-    return stateRowIndex ?? 0;
+    if (hasFilter) return firstChoiceIndex();
+    if (stateRowIndex !== null) return stateRowIndex;
+    if (hasConcreteBinding) return firstChoiceIndex();
+    return 0;
   };
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {

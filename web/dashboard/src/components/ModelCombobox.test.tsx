@@ -176,6 +176,79 @@ describe("ModelCombobox", () => {
     expect(onCommit).toHaveBeenLastCalledWith("");
   });
 
+  it("keyboard navigation: out-of-catalog binding is a current-state row, not Inherit", async () => {
+    const onCommit = vi.fn();
+    const onInherit = vi.fn();
+    const props = {
+      ...commonProps,
+      // Free-typed id absent from the advisory catalog.
+      value: "my-custom-model",
+      onCommitValue: onCommit,
+      onInherit,
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    fireEvent.focus(input);
+    await screen.findByText("GPT-5");
+
+    // Synthetic custom row represents the current binding so aria-selected
+    // and first ArrowDown land on it rather than special row 0 (Inherit).
+    const custom = screen
+      .getByText('Use "my-custom-model"')
+      .closest("[role='option']");
+    expect(custom?.getAttribute("aria-selected")).toBe("true");
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onInherit).not.toHaveBeenCalled();
+    expect(onCommit).toHaveBeenLastCalledWith("my-custom-model");
+  });
+
+  it("keyboard navigation: while catalog is loading, ArrowDown does not clear a concrete binding", async () => {
+    let resolveFetch: ((value: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ),
+    );
+
+    const onCommit = vi.fn();
+    const onInherit = vi.fn();
+    // Distinct vendor so the module-level suggestion cache from earlier tests
+    // cannot short-circuit the hanging fetch into a warm hit.
+    const props = {
+      ...commonProps,
+      vendor: "loading-vendor",
+      value: "still-loading-model",
+      onCommitValue: onCommit,
+      onInherit,
+    };
+    render(<ModelCombobox {...props} />);
+    const input = screen.getByLabelText("agent.model") as HTMLInputElement;
+    fireEvent.focus(input);
+
+    expect(await screen.findByText(/Loading suggestions/i)).toBeTruthy();
+    // Before models arrive there is no catalog row for the binding; the
+    // synthetic custom row must still be the current-state target so
+    // ArrowDown+Enter re-commits the id instead of Inherit (row 0).
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onInherit).not.toHaveBeenCalled();
+    expect(onCommit).toHaveBeenLastCalledWith("still-loading-model");
+
+    // Unblock the hanging fetch so the effect cleanup does not leak.
+    resolveFetch?.(
+      jsonEnvelope({
+        ...MODELS,
+        vendor: "loading-vendor",
+      }),
+    );
+  });
+
   it("keyboard navigation: with a filter, ArrowDown starts at the first matching suggestion", async () => {
     const onCommit = vi.fn();
     const onInherit = vi.fn();
