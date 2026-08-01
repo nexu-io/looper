@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -301,11 +302,16 @@ func (s *Service) probe(ctx context.Context, vendor config.AgentVendor, binary s
 	}
 }
 
-func shortProbeError(err error) string {
+// shortProbeError turns a probe failure into a short, client-safe hint for
+// sources.probeError. Configured agent.env values are write-only in the config
+// API (envKeys only); redact them here so CLI stderr that echoes credentials
+// cannot leak those values into cached API responses.
+func shortProbeError(err error, agentEnv map[string]string) string {
 	if err == nil {
 		return ""
 	}
 	msg := strings.TrimSpace(err.Error())
+	msg = redactConfiguredEnvValues(msg, agentEnv)
 	// Collapse multi-line noise; keep a short operator-facing hint.
 	if i := strings.IndexByte(msg, '\n'); i >= 0 {
 		msg = msg[:i]
@@ -316,6 +322,36 @@ func shortProbeError(err error) string {
 	}
 	if msg == "" {
 		return "probe failed"
+	}
+	return msg
+}
+
+// redactConfiguredEnvValues replaces every non-empty agent.env value that
+// appears in msg with [REDACTED]. Longer values are applied first so a secret
+// that is a substring of another is fully covered. Empty values are skipped.
+func redactConfiguredEnvValues(msg string, agentEnv map[string]string) string {
+	if msg == "" || len(agentEnv) == 0 {
+		return msg
+	}
+	vals := make([]string, 0, len(agentEnv))
+	seen := make(map[string]struct{}, len(agentEnv))
+	for _, v := range agentEnv {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		vals = append(vals, v)
+	}
+	sort.Slice(vals, func(i, j int) bool {
+		return len(vals[i]) > len(vals[j])
+	})
+	for _, v := range vals {
+		if strings.Contains(msg, v) {
+			msg = strings.ReplaceAll(msg, v, "[REDACTED]")
+		}
 	}
 	return msg
 }

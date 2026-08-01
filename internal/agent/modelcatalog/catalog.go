@@ -274,7 +274,8 @@ func (s *Service) listUncached(ctx context.Context, vendor config.AgentVendor, r
 	probeModels, err := s.probe(ctx, vendor, resolvedBinary, env)
 	if err != nil {
 		result.Sources.Probe = ProbeError
-		result.Sources.ProbeError = shortProbeError(err)
+		// Redact agent.env values before caching / returning to API clients.
+		result.Sources.ProbeError = shortProbeError(err, agentEnv)
 		return result
 	}
 

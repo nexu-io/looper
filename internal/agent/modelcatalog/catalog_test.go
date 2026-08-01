@@ -224,6 +224,102 @@ func TestListProbeFailureReturnsStaticAndError(t *testing.T) {
 	}
 }
 
+func TestListProbeErrorRedactsConfiguredEnvValues(t *testing.T) {
+	// Mirrors the write-only agent.env contract: config API exposes envKeys only;
+	// probe diagnostics must not re-surface credential values via probeError.
+	const secret = "sk-super-secret-token-value-xyz"
+	svc := NewService(Options{
+		Runner: runnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
+			return nil, fmt.Errorf("authentication failed: invalid token %s for user", secret)
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+	got, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorCodex,
+		Env:    map[string]string{"OPENAI_API_KEY": secret, "EMPTY": ""},
+	})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got.Sources.Probe != ProbeError {
+		t.Fatalf("probe = %q, want error", got.Sources.Probe)
+	}
+	if strings.Contains(got.Sources.ProbeError, secret) {
+		t.Fatalf("probeError leaked agent.env value: %q", got.Sources.ProbeError)
+	}
+	if !strings.Contains(got.Sources.ProbeError, "[REDACTED]") {
+		t.Fatalf("probeError = %q, want [REDACTED] placeholder", got.Sources.ProbeError)
+	}
+	if !strings.Contains(got.Sources.ProbeError, "authentication failed") {
+		t.Fatalf("probeError = %q, want non-secret diagnostic preserved", got.Sources.ProbeError)
+	}
+
+	// Cached response must also stay redacted (listUncached redacts before cachePut).
+	cached, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorCodex,
+		Env:    map[string]string{"OPENAI_API_KEY": secret},
+	})
+	if err != nil {
+		t.Fatalf("cached List() error = %v", err)
+	}
+	if strings.Contains(cached.Sources.ProbeError, secret) {
+		t.Fatalf("cached probeError leaked agent.env value: %q", cached.Sources.ProbeError)
+	}
+}
+
+func TestShortProbeErrorRedactsLongestSecretsFirst(t *testing.T) {
+	err := errors.New("token=abc-longer-secret and short=abc")
+	got := shortProbeError(err, map[string]string{
+		"LONG":  "abc-longer-secret",
+		"SHORT": "abc",
+	})
+	if strings.Contains(got, "abc-longer-secret") || strings.Contains(got, "token=abc") {
+		t.Fatalf("shortProbeError = %q, secrets still present", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("shortProbeError = %q, want redaction", got)
+	}
+}
+
+func TestDefaultRunnerStderrRedactedInListProbeError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess stderr redaction test")
+	}
+	const secret = "probe-stderr-secret-must-not-leak-42"
+	// Resolve a real bash so defaultRunner runs; override vendor command via params.
+	// Probe always passes vendor-specific args; use a wrapper script that ignores
+	// args and prints the secret on stderr then exits nonzero.
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "fake-cli")
+	script := "#!/bin/sh\necho \"auth error: bad key " + secret + "\" >&2\nexit 1\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	svc := NewService(Options{
+		// Production defaultRunner path (no fake Runner).
+		LookPath: func(string) (string, error) { return wrapper, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+	got, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorOpenCode,
+		Params: map[string]any{"command": wrapper},
+		Env:    map[string]string{"OPENCODE_API_KEY": secret},
+	})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got.Sources.Probe != ProbeError {
+		t.Fatalf("probe = %q err=%q, want error", got.Sources.Probe, got.Sources.ProbeError)
+	}
+	if strings.Contains(got.Sources.ProbeError, secret) {
+		t.Fatalf("probeError leaked stderr secret: %q", got.Sources.ProbeError)
+	}
+	if !strings.Contains(got.Sources.ProbeError, "[REDACTED]") {
+		t.Fatalf("probeError = %q, want [REDACTED]", got.Sources.ProbeError)
+	}
+}
+
 func TestListProbeOKMergesAndCaches(t *testing.T) {
 	var now atomic.Value
 	now.Store(time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
