@@ -236,7 +236,11 @@ func TestFixerHITLPromptIsLimitedToNonNativeReviewThreads(t *testing.T) {
 	regular := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
 	instruction := fixerHITLPromptFor(regular)
 	if !strings.Contains(instruction, "only to non-native comment fix items") ||
-		!strings.Contains(instruction, "Never use \"needs_human\" in Forgejo repair_results") {
+		!strings.Contains(instruction, "Never use \"needs_human\" in Forgejo repair_results") ||
+		!strings.Contains(instruction, "Classify every listed item before editing") ||
+		!strings.Contains(instruction, "the same behavior needs a second repair") ||
+		!strings.Contains(instruction, "STOP THE ENTIRE TURN BEFORE MAKING EDITS") ||
+		!strings.Contains(instruction, "a correct result, not a failure") {
 		t.Fatalf("regular HITL instruction missing source boundary: %q", instruction)
 	}
 }
