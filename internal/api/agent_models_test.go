@@ -51,7 +51,7 @@ func TestHandlerAgentModelsClaudeCodeStaticUnsupported(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
-		Runner: modelCatalogRunnerFunc(func(context.Context, string, ...string) ([]byte, error) {
+		Runner: modelCatalogRunnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
 			t.Fatal("claude-code must not probe")
 			return nil, nil
 		}),
@@ -92,7 +92,7 @@ func TestHandlerAgentModelsProbeFailureStill200(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
-		Runner: modelCatalogRunnerFunc(func(context.Context, string, ...string) ([]byte, error) {
+		Runner: modelCatalogRunnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
 			return nil, errors.New("codex: command failed")
 		}),
 		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
@@ -124,7 +124,7 @@ func TestHandlerAgentModelsProbeOK(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
 	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
-		Runner: modelCatalogRunnerFunc(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		Runner: modelCatalogRunnerFunc(func(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
 			if name != "/usr/bin/opencode" {
 				t.Fatalf("name = %q", name)
 			}
@@ -207,7 +207,7 @@ func TestHandlerAgentModelsSameVendorUsesParamsCommand(t *testing.T) {
 
 	var saw string
 	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
-		Runner: modelCatalogRunnerFunc(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		Runner: modelCatalogRunnerFunc(func(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
 			saw = name
 			if len(args) < 1 || args[0] != "debug" {
 				t.Fatalf("args = %#v, want codex debug models", args)
@@ -231,6 +231,56 @@ func TestHandlerAgentModelsSameVendorUsesParamsCommand(t *testing.T) {
 	}
 }
 
+func TestHandlerAgentModelsPassesAgentEnvToCatalog(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.Agent.Env = map[string]string{
+		"OPENCODE_API_KEY": "handler-agent-env-secret",
+		"GROK_API_KEY":     "also-present",
+	}
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+
+	var sawEnv []string
+	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
+		Runner: modelCatalogRunnerFunc(func(_ context.Context, env []string, name string, args ...string) ([]byte, error) {
+			sawEnv = append([]string(nil), env...)
+			return []byte("openai/gpt-4.1\n"), nil
+		}),
+		LookPath: func(s string) (string, error) {
+			if s == "opencode" {
+				return "/usr/bin/opencode", nil
+			}
+			return s, nil
+		},
+		Now: func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/models?vendor=opencode", nil)
+	rec := httptest.NewRecorder()
+	h.serveHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(sawEnv) == 0 {
+		t.Fatal("runner received empty env; want sanitized env with agent.env")
+	}
+	foundKey := false
+	foundGrok := false
+	for _, e := range sawEnv {
+		if e == "OPENCODE_API_KEY=handler-agent-env-secret" {
+			foundKey = true
+		}
+		if e == "GROK_API_KEY=also-present" {
+			foundGrok = true
+		}
+	}
+	if !foundKey {
+		t.Fatalf("OPENCODE_API_KEY from agent.env missing in probe env: %#v", sawEnv)
+	}
+	if !foundGrok {
+		t.Fatalf("GROK_API_KEY from agent.env missing in probe env: %#v", sawEnv)
+	}
+}
+
 func TestHandlerAgentModelsCrossVendorStripsParamsCommand(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	global := config.AgentVendorCodex
@@ -240,7 +290,7 @@ func TestHandlerAgentModelsCrossVendorStripsParamsCommand(t *testing.T) {
 
 	var saw string
 	h.modelCatalog = modelcatalog.NewService(modelcatalog.Options{
-		Runner: modelCatalogRunnerFunc(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		Runner: modelCatalogRunnerFunc(func(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
 			saw = name
 			if len(args) != 1 || args[0] != "models" {
 				t.Fatalf("args = %#v, want opencode models", args)
@@ -271,8 +321,8 @@ func TestHandlerAgentModelsCrossVendorStripsParamsCommand(t *testing.T) {
 	}
 }
 
-type modelCatalogRunnerFunc func(ctx context.Context, name string, args ...string) ([]byte, error)
+type modelCatalogRunnerFunc func(ctx context.Context, env []string, name string, args ...string) ([]byte, error)
 
-func (f modelCatalogRunnerFunc) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return f(ctx, name, args...)
+func (f modelCatalogRunnerFunc) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+	return f(ctx, env, name, args...)
 }

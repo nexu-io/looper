@@ -191,6 +191,89 @@ func TestShutdownRetainsStorageWhenNonAgentDrainFailureReported(t *testing.T) {
 	}
 }
 
+// Contract (PR #630): model catalog shared probes are Supervisor-owned non-agent
+// work. BeginShutdown must cancel their daemon-owned parent (OnBeginShutdown)
+// before waiting on tracked handles so HTTP-stop's short budget cannot leave
+// vendor CLI descendants orphaned after process exit.
+func TestBeginShutdownCancelsModelCatalogProbeBeforeNonAgentDrain(t *testing.T) {
+	t.Parallel()
+
+	reg := NewActiveExecutionRegistry()
+	reg.killTimeout = 3 * time.Second
+
+	hookFired := make(chan struct{})
+	rt := &Runtime{
+		admission:        NewAdmission(),
+		activeExecutions: reg,
+		shutdownCh:       make(chan struct{}),
+	}
+	if err := rt.admission.MarkReady("test"); err != nil {
+		t.Fatalf("MarkReady: %v", err)
+	}
+	rt.OnBeginShutdown(func() { close(hookFired) })
+
+	// Simulate a model-catalog probe: long sleep tracked as non-agent, canceled
+	// only when OnBeginShutdown runs (same shape as probeCtx cancel → Kill).
+	probeCtx, probeCancel := context.WithCancel(context.Background())
+	rt.OnBeginShutdown(probeCancel)
+
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := shell.Run(probeCtx, shell.Options{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "sleep 60"},
+			GracefulShutdown: 100 * time.Millisecond,
+			Tracker:          reg,
+		})
+		done <- err
+	}()
+	<-started
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		reg.mu.Lock()
+		n := len(reg.nonAgentHandles)
+		reg.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			probeCancel()
+			t.Fatal("timed out waiting for probe handle Track")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	start := time.Now()
+	rt.BeginShutdown("test model-catalog probe cancel")
+	elapsed := time.Since(start)
+
+	select {
+	case <-hookFired:
+	default:
+		t.Fatal("OnBeginShutdown hook did not fire")
+	}
+	if elapsed >= reg.killTimeout {
+		t.Fatalf("BeginShutdown took %v (>= killTimeout %v); probe cancel likely after non-agent wait", elapsed, reg.killTimeout)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("BeginShutdown took %v, want prompt cancel/drain well under 1s", elapsed)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if !strings.Contains(err.Error(), context.Canceled.Error()) {
+				t.Fatalf("probe shell.Run error = %v, want context.Canceled", err)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe did not finish after BeginShutdown")
+	}
+}
+
 // Contract (#590 review): BeginShutdown cancels producer contexts before
 // waiting on tracked non-agent handles. Validation shell.Run only Kill/Drains
 // after its owner ctx is canceled; waiting first would burn killBudget then

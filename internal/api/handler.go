@@ -33,6 +33,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
@@ -216,13 +217,32 @@ func NewHandler(context Context) *Handler {
 	bootstrap := newBootstrapCodes()
 	bootstrap.now = now
 
+	// Model catalog probes are Supervisor-owned non-agent work: track handles
+	// for shutdown drain and cancel shared probe lifetime on BeginShutdown
+	// (independent of popup/request AbortController cancel).
+	var tracker processcontainment.LiveTracker
+	if context.Runtime != nil {
+		if ae := context.Runtime.Services().ActiveExecutions; ae != nil {
+			tracker = ae
+		}
+	}
+	modelCatalog := modelcatalog.NewService(modelcatalog.Options{
+		Now:     now,
+		Tracker: tracker,
+	})
+	if register, ok := any(context.Runtime).(interface {
+		OnBeginShutdown(func())
+	}); ok {
+		register.OnBeginShutdown(modelCatalog.Shutdown)
+	}
+
 	return &Handler{
 		context:          context,
 		now:              now,
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
 		bootstrap:        bootstrap,
-		modelCatalog:     modelcatalog.NewService(modelcatalog.Options{Now: now}),
+		modelCatalog:     modelCatalog,
 	}
 }
 
@@ -1164,9 +1184,12 @@ func (h *Handler) handleAgentModelsRoute(w http.ResponseWriter, r *http.Request,
 	if svc == nil {
 		svc = modelcatalog.NewService(modelcatalog.Options{Now: h.now})
 	}
+	// Pass agent.env so vendor CLIs that authenticate via configured env
+	// (OpenCode/Grok API keys, etc.) probe with the same credentials as spawn.
 	result, err := svc.List(r.Context(), modelcatalog.ListOptions{
 		Vendor:  vendor,
 		Params:  params,
+		Env:     cfg.Agent.Env,
 		Refresh: refresh,
 	})
 	if err != nil {

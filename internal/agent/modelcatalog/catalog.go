@@ -9,6 +9,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
 const (
@@ -49,10 +50,17 @@ type Result struct {
 
 // Options configures a Service. Zero values use defaults.
 type Options struct {
-	TTL      time.Duration
-	Timeout  time.Duration
-	Now      func() time.Time
-	Runner   Runner
+	TTL     time.Duration
+	Timeout time.Duration
+	Now     func() time.Time
+	Runner  Runner
+	// BaseContext bounds shared probe lifetime. Request cancel (popup close)
+	// must not cancel shared probes; BaseContext cancel (daemon BeginShutdown)
+	// must. Defaults to a service-owned cancelable background context.
+	BaseContext context.Context
+	// Tracker registers probe containment handles with the Supervisor for
+	// shutdown drain / retain-storage (ADR-0015 / #577). Optional.
+	Tracker  processcontainment.LiveTracker
 	LookPath func(string) (string, error)
 }
 
@@ -64,6 +72,11 @@ type Service struct {
 	runner   Runner
 	lookPath func(string) (string, error)
 	static   map[config.AgentVendor][]Model
+
+	// probeCtx is the daemon-owned parent for shared probes: independent of
+	// per-request cancel, canceled by Shutdown (BeginShutdown path).
+	probeCtx    context.Context
+	probeCancel context.CancelFunc
 
 	mu       sync.Mutex
 	cache    map[string]cacheEntry
@@ -97,30 +110,49 @@ func NewService(opts Options) *Service {
 	if now == nil {
 		now = time.Now
 	}
+	parent := opts.BaseContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	probeCtx, probeCancel := context.WithCancel(parent)
+
 	runner := opts.Runner
 	if runner == nil {
-		runner = defaultRunner{}
+		runner = defaultRunner{tracker: opts.Tracker}
 	}
 	lookPath := opts.LookPath
 	if lookPath == nil {
 		lookPath = execLookPath
 	}
 	return &Service{
-		ttl:      ttl,
-		timeout:  timeout,
-		now:      now,
-		runner:   runner,
-		lookPath: lookPath,
-		static:   loadStaticCatalog(),
-		cache:    make(map[string]cacheEntry),
-		inflight: make(map[string]*inflightCall),
+		ttl:         ttl,
+		timeout:     timeout,
+		now:         now,
+		runner:      runner,
+		lookPath:    lookPath,
+		static:      loadStaticCatalog(),
+		probeCtx:    probeCtx,
+		probeCancel: probeCancel,
+		cache:       make(map[string]cacheEntry),
+		inflight:    make(map[string]*inflightCall),
 	}
+}
+
+// Shutdown cancels the daemon-owned shared probe parent so in-flight vendor
+// CLIs observe cancel and enter process-group Kill. Idempotent. Call from
+// BeginShutdown before non-agent drain waits so probes drain promptly.
+func (s *Service) Shutdown() {
+	if s == nil || s.probeCancel == nil {
+		return
+	}
+	s.probeCancel()
 }
 
 // ListOptions controls a single catalog request.
 type ListOptions struct {
 	Vendor  config.AgentVendor
-	Params  map[string]any // spawn-filtered agent.params (command override)
+	Params  map[string]any    // spawn-filtered agent.params (command override)
+	Env     map[string]string // configured agent.env (auth/config for vendor CLIs)
 	Refresh bool
 }
 
@@ -159,14 +191,16 @@ func (s *Service) List(ctx context.Context, opts ListOptions) (Result, error) {
 	s.mu.Unlock()
 
 	// Shared probe work must outlive any single request cancel (popup close /
-	// AbortController). Tying listUncached to the leader's ctx would mark the
-	// probe as canceled, cache that failure for the full TTL, and poison every
-	// waiter coalesced behind this call even when their contexts are still live.
-	probeCtx := context.WithoutCancel(ctx)
-	result := s.listUncached(probeCtx, opts.Vendor, resolved)
+	// AbortController) but must still observe daemon shutdown via probeCtx.
+	// Using WithoutCancel(request) would also ignore BeginShutdown/HTTP stop.
+	probeCtx := s.probeCtx
+	if probeCtx == nil {
+		probeCtx = context.Background()
+	}
+	result := s.listUncached(probeCtx, opts.Vendor, resolved, opts.Env)
 
 	// Defensive: never populate the shared cache with a cancel-sourced probe
-	// error (e.g. if a future caller re-introduces request cancel into probeCtx).
+	// error (e.g. daemon shutdown cancel during probe) so later Lists retry.
 	if !isCancelPoisonedProbe(result) {
 		s.cachePut(cacheKey, result)
 	}
@@ -212,7 +246,7 @@ func (s *Service) waitInflight(ctx context.Context, call *inflightCall) (Result,
 	}
 }
 
-func (s *Service) listUncached(ctx context.Context, vendor config.AgentVendor, resolvedBinary string) Result {
+func (s *Service) listUncached(ctx context.Context, vendor config.AgentVendor, resolvedBinary string, agentEnv map[string]string) Result {
 	staticModels := append([]Model(nil), s.static[vendor]...)
 	for i := range staticModels {
 		staticModels[i].Source = SourceStatic
@@ -236,7 +270,8 @@ func (s *Service) listUncached(ctx context.Context, vendor config.AgentVendor, r
 	probedAt := s.now().UTC()
 	result.ProbedAt = probedAt.Format(time.RFC3339)
 
-	probeModels, err := s.probe(ctx, vendor, resolvedBinary)
+	env := buildProbeEnv(agentEnv)
+	probeModels, err := s.probe(ctx, vendor, resolvedBinary, env)
 	if err != nil {
 		result.Sources.Probe = ProbeError
 		result.Sources.ProbeError = shortProbeError(err)

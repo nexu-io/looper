@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
 func TestLoadStaticCatalog(t *testing.T) {
@@ -167,7 +168,7 @@ func TestParseLineModelsRejectsLoggedOutWarning(t *testing.T) {
 func TestListClaudeCodeUnsupportedProbeStaticOnly(t *testing.T) {
 	var calls atomic.Int32
 	svc := NewService(Options{
-		Runner: runnerFunc(func(context.Context, string, ...string) ([]byte, error) {
+		Runner: runnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
 			calls.Add(1)
 			return nil, errors.New("should not probe")
 		}),
@@ -199,7 +200,7 @@ func TestListClaudeCodeUnsupportedProbeStaticOnly(t *testing.T) {
 
 func TestListProbeFailureReturnsStaticAndError(t *testing.T) {
 	svc := NewService(Options{
-		Runner: runnerFunc(func(context.Context, string, ...string) ([]byte, error) {
+		Runner: runnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
 			return nil, errors.New("exit status 1: not logged in")
 		}),
 		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
@@ -229,7 +230,7 @@ func TestListProbeOKMergesAndCaches(t *testing.T) {
 	var calls atomic.Int32
 	svc := NewService(Options{
 		TTL: 60 * time.Second,
-		Runner: runnerFunc(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		Runner: runnerFunc(func(_ context.Context, _ []string, name string, args ...string) ([]byte, error) {
 			calls.Add(1)
 			if name != "/usr/bin/opencode" {
 				t.Fatalf("binary = %q, want resolved path", name)
@@ -320,7 +321,7 @@ func TestListCoalescesInflightSameKey(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	svc := NewService(Options{
-		Runner: runnerFunc(func(context.Context, string, ...string) ([]byte, error) {
+		Runner: runnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
 			n := calls.Add(1)
 			if n == 1 {
 				close(started)
@@ -386,7 +387,7 @@ func TestListCanceledCallerDoesNotPoisonCache(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	svc := NewService(Options{
-		Runner: runnerFunc(func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		Runner: runnerFunc(func(ctx context.Context, _ []string, _ string, _ ...string) ([]byte, error) {
 			calls.Add(1)
 			close(started)
 			select {
@@ -460,7 +461,7 @@ func TestListCanceledLeaderDoesNotPoisonLiveWaiters(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	svc := NewService(Options{
-		Runner: runnerFunc(func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		Runner: runnerFunc(func(ctx context.Context, _ []string, _ string, _ ...string) ([]byte, error) {
 			calls.Add(1)
 			close(started)
 			select {
@@ -532,7 +533,7 @@ func TestListUnknownVendor(t *testing.T) {
 func TestListUsesParamsCommand(t *testing.T) {
 	var saw string
 	svc := NewService(Options{
-		Runner: runnerFunc(func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		Runner: runnerFunc(func(_ context.Context, _ []string, name string, _ ...string) ([]byte, error) {
 			saw = name
 			return []byte("custom-model\n"), nil
 		}),
@@ -553,7 +554,7 @@ func TestListUsesParamsCommand(t *testing.T) {
 func TestListProbeOutputOverflowIsError(t *testing.T) {
 	// Fake runner simulates defaultRunner overflow failure.
 	svc := NewService(Options{
-		Runner: runnerFunc(func(context.Context, string, ...string) ([]byte, error) {
+		Runner: runnerFunc(func(context.Context, []string, string, ...string) ([]byte, error) {
 			return nil, fmt.Errorf("probe output exceeded %d bytes", maxProbeOutputBytes)
 		}),
 		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
@@ -594,7 +595,7 @@ func TestDefaultRunnerTimeoutKillsProcessGroup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := defaultRunner{}.Run(ctx, "bash", "-c", `
+	_, err := defaultRunner{}.Run(ctx, nil, "bash", "-c", `
 trap '' TERM
 sleep 60 &
 sleep 60
@@ -622,7 +623,7 @@ func TestDefaultRunnerBoundsHugeOutput(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := defaultRunner{}.Run(ctx, "bash", "-c", script)
+	_, err := defaultRunner{}.Run(ctx, nil, "bash", "-c", script)
 	if err == nil {
 		t.Fatal("expected overflow error")
 	}
@@ -656,10 +657,182 @@ func TestBoundedBufferDiscardsAfterCap(t *testing.T) {
 	}
 }
 
-type runnerFunc func(ctx context.Context, name string, args ...string) ([]byte, error)
+func TestListShutdownCancelsSharedProbeNotRequestCancel(t *testing.T) {
+	// Daemon Shutdown must cancel shared probes; request cancel must not.
+	var calls atomic.Int32
+	started := make(chan struct{})
+	sawCancel := make(chan struct{})
+	svc := NewService(Options{
+		Runner: runnerFunc(func(ctx context.Context, _ []string, _ string, _ ...string) ([]byte, error) {
+			calls.Add(1)
+			close(started)
+			<-ctx.Done()
+			close(sawCancel)
+			return nil, ctx.Err()
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
 
-func (f runnerFunc) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return f(ctx, name, args...)
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	done := make(chan Result, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, err := svc.List(reqCtx, ListOptions{Vendor: config.AgentVendorOpenCode})
+		errCh <- err
+		done <- got
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe did not start")
+	}
+	// Request cancel (popup) must not abort the shared probe.
+	reqCancel()
+	select {
+	case <-sawCancel:
+		t.Fatal("probe observed cancel after request cancel; want daemon-owned lifetime")
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	// Daemon shutdown cancels probeCtx → runner sees cancel.
+	svc.Shutdown()
+	select {
+	case <-sawCancel:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe did not observe Shutdown cancel")
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("List() error = %v, want soft probe error result", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("List() did not return after Shutdown")
+	}
+	got := <-done
+	if got.Sources.Probe != ProbeError {
+		t.Fatalf("probe = %q, want error after shutdown cancel", got.Sources.Probe)
+	}
+	if got.Sources.ProbeError != "probe canceled" && !strings.Contains(got.Sources.ProbeError, "canceled") {
+		t.Fatalf("probeError = %q, want cancel", got.Sources.ProbeError)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestListPassesAgentEnvToRunner(t *testing.T) {
+	var sawEnv []string
+	svc := NewService(Options{
+		Runner: runnerFunc(func(_ context.Context, env []string, _ string, _ ...string) ([]byte, error) {
+			sawEnv = append([]string(nil), env...)
+			return []byte("from-env-model\n"), nil
+		}),
+		LookPath: func(s string) (string, error) { return "/usr/bin/" + s, nil },
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	})
+	got, err := svc.List(context.Background(), ListOptions{
+		Vendor: config.AgentVendorOpenCode,
+		Env:    map[string]string{"OPENCODE_API_KEY": "secret-from-agent-env", "CUSTOM_PROBE": "1"},
+	})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if got.Sources.Probe != ProbeOK {
+		t.Fatalf("probe = %q err=%q", got.Sources.Probe, got.Sources.ProbeError)
+	}
+	envMap := envSliceToMap(sawEnv)
+	if envMap["OPENCODE_API_KEY"] != "secret-from-agent-env" {
+		t.Fatalf("OPENCODE_API_KEY = %q, want agent.env value", envMap["OPENCODE_API_KEY"])
+	}
+	if envMap["CUSTOM_PROBE"] != "1" {
+		t.Fatalf("CUSTOM_PROBE = %q", envMap["CUSTOM_PROBE"])
+	}
+	// Ambient secrets must not be inherited wholesale: require allowlist shape
+	// (PATH may be present; arbitrary LOOPER_TEST_SECRET must not unless configured).
+	if _, ok := envMap["LOOPER_TEST_SECRET_SHOULD_NOT_LEAK"]; ok {
+		t.Fatal("ambient secret leaked into probe env")
+	}
+}
+
+func TestDefaultRunnerUsesSanitizedEnvNotAmbient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess env sanitization test")
+	}
+	t.Setenv("LOOPER_PROBE_AMBIENT_SECRET", "daemon-credential-must-not-leak")
+	t.Setenv("OPENCODE_API_KEY", "ambient-key-must-not-leak")
+
+	// Child prints whether ambient secret is visible and whether configured key is.
+	script := `python3 -c 'import os; print("ambient="+("yes" if os.environ.get("LOOPER_PROBE_AMBIENT_SECRET") else "no")); print("cfg="+os.environ.get("OPENCODE_API_KEY",""))'`
+	if _, err := exec.LookPath("python3"); err != nil {
+		script = `sh -c 'if [ -n "$LOOPER_PROBE_AMBIENT_SECRET" ]; then echo ambient=yes; else echo ambient=no; fi; echo cfg=$OPENCODE_API_KEY'`
+	}
+	env := buildProbeEnv(map[string]string{"OPENCODE_API_KEY": "from-agent-env"})
+	out, err := defaultRunner{}.Run(context.Background(), env, "bash", "-c", script)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	text := string(out)
+	if !strings.Contains(text, "ambient=no") {
+		t.Fatalf("ambient secret leaked into probe; output=%q", text)
+	}
+	if !strings.Contains(text, "cfg=from-agent-env") {
+		t.Fatalf("configured agent.env not present; output=%q", text)
+	}
+	// Double-check ambient OPENCODE_API_KEY was replaced by agent.env, not ambient.
+	if strings.Contains(text, "ambient-key-must-not-leak") {
+		t.Fatalf("ambient OPENCODE_API_KEY leaked; output=%q", text)
+	}
+}
+
+func TestDefaultRunnerTracksHandleWithLiveTracker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess tracker test")
+	}
+	tracker := &recordingTracker{}
+	runner := defaultRunner{tracker: tracker}
+	_, err := runner.Run(context.Background(), buildProbeEnv(nil), "bash", "-c", "echo ok")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if tracker.tracks.Load() != 1 {
+		t.Fatalf("Track calls = %d, want 1", tracker.tracks.Load())
+	}
+	if tracker.releases.Load() != 1 {
+		t.Fatalf("release calls = %d, want 1", tracker.releases.Load())
+	}
+}
+
+func envSliceToMap(env []string) map[string]string {
+	out := make(map[string]string, len(env))
+	for _, e := range env {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok || k == "" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+type recordingTracker struct {
+	tracks   atomic.Int32
+	releases atomic.Int32
+}
+
+func (t *recordingTracker) Track(handle *processcontainment.Handle) (release func()) {
+	t.tracks.Add(1)
+	return func() { t.releases.Add(1) }
+}
+
+func (t *recordingTracker) ReportDrainFailure(error) {}
+
+type runnerFunc func(ctx context.Context, env []string, name string, args ...string) ([]byte, error)
+
+func (f runnerFunc) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+	return f(ctx, env, name, args...)
 }
 
 func readTestdata(t *testing.T, name string) []byte {

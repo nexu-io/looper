@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/processcontainment"
 )
@@ -25,19 +26,31 @@ const (
 )
 
 // Runner executes a short-lived CLI probe. Tests inject fakes; production uses
-// defaultRunner (exec with timeout + process group kill).
+// defaultRunner (exec with timeout + process group kill + sanitized env).
+// env is the full sanitized process environment (KEY=value entries), never nil
+// for production probes — use buildProbeEnv.
 type Runner interface {
-	Run(ctx context.Context, name string, args ...string) (stdout []byte, err error)
+	Run(ctx context.Context, env []string, name string, args ...string) (stdout []byte, err error)
 }
 
-type defaultRunner struct{}
+// defaultRunner spawns vendor CLIs under process containment with an allowlisted
+// environment matching agent spawn (not the daemon ambient environment).
+type defaultRunner struct {
+	tracker processcontainment.LiveTracker
+}
 
-func (defaultRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+func (r defaultRunner) Run(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	cmd := exec.Command(name, args...)
+	// Always set Env so ambient daemon credentials cannot leak into vendor CLIs.
+	// Empty env still means "explicit empty" rather than inherit (exec default).
+	if env == nil {
+		env = buildProbeEnv(nil)
+	}
+	cmd.Env = env
 	stdout := newBoundedBuffer(maxProbeOutputBytes)
 	stderr := newBoundedBuffer(maxProbeOutputBytes)
 	cmd.Stdout = stdout
@@ -50,11 +63,18 @@ func (defaultRunner) Run(ctx context.Context, name string, args ...string) ([]by
 	if err != nil {
 		return nil, fmt.Errorf("start probe: %w", err)
 	}
+	if r.tracker != nil {
+		release := r.tracker.Track(handle)
+		if release != nil {
+			defer release()
+		}
+	}
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- handle.Wait(ctx) }()
 
 	waitErr, killErr, drainErr := awaitProbeCommand(handle, ctx, waitDone)
+	reportProbeContainmentFailure(r.tracker, killErr, drainErr)
 
 	if stdout.Truncated() || stderr.Truncated() {
 		return nil, fmt.Errorf("probe output exceeded %d bytes", maxProbeOutputBytes)
@@ -88,6 +108,24 @@ func (defaultRunner) Run(ctx context.Context, name string, args ...string) ([]by
 		return out, killErr
 	}
 	return out, nil
+}
+
+func reportProbeContainmentFailure(tracker processcontainment.LiveTracker, errs ...error) {
+	if tracker == nil {
+		return
+	}
+	for _, err := range errs {
+		if err != nil {
+			tracker.ReportDrainFailure(err)
+		}
+	}
+}
+
+// buildProbeEnv builds the sanitized environment for a model catalog probe,
+// matching agent spawn allowlisting (BuildCommandEnv) and merging configured
+// agent.env. Working directory and prompt are empty: probes are not agents.
+func buildProbeEnv(agentEnv map[string]string) []string {
+	return agent.BuildCommandEnv("", "", agentEnv)
 }
 
 // awaitProbeCommand finishes a contained probe without hanging on cmd.Wait's
@@ -221,7 +259,7 @@ func execLookPath(file string) (string, error) {
 	return exec.LookPath(file)
 }
 
-func (s *Service) probe(ctx context.Context, vendor config.AgentVendor, binary string) ([]Model, error) {
+func (s *Service) probe(ctx context.Context, vendor config.AgentVendor, binary string, env []string) ([]Model, error) {
 	timeout := s.timeout
 	if timeout <= 0 {
 		timeout = defaultProbeTimeout
@@ -231,22 +269,22 @@ func (s *Service) probe(ctx context.Context, vendor config.AgentVendor, binary s
 
 	switch vendor {
 	case config.AgentVendorOpenCode:
-		out, err := s.runner.Run(runCtx, binary, "models")
+		out, err := s.runner.Run(runCtx, env, binary, "models")
 		if err != nil {
 			return nil, err
 		}
 		return parseOpenCodeModels(out), nil
 	case config.AgentVendorCodex:
-		out, err := s.runner.Run(runCtx, binary, "debug", "models", "--bundled")
+		out, err := s.runner.Run(runCtx, env, binary, "debug", "models", "--bundled")
 		if err != nil {
 			return nil, err
 		}
 		return parseCodexModels(out)
 	case config.AgentVendorCursorCLI:
-		out, err := s.runner.Run(runCtx, binary, "models")
+		out, err := s.runner.Run(runCtx, env, binary, "models")
 		if err != nil {
 			// Fallback flag used by some cursor-agent builds.
-			out2, err2 := s.runner.Run(runCtx, binary, "--list-models")
+			out2, err2 := s.runner.Run(runCtx, env, binary, "--list-models")
 			if err2 != nil {
 				return nil, err
 			}
@@ -254,7 +292,7 @@ func (s *Service) probe(ctx context.Context, vendor config.AgentVendor, binary s
 		}
 		return parseCursorModels(out), nil
 	case config.AgentVendorGrokBuild:
-		out, err := s.runner.Run(runCtx, binary, "models")
+		out, err := s.runner.Run(runCtx, env, binary, "models")
 		if err != nil {
 			return nil, err
 		}
