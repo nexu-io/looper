@@ -82,6 +82,117 @@ export function isValidAgentProfileId(id: string): boolean {
   return /^[A-Za-z0-9_-]+$/.test(id);
 }
 
+export type AgentModelScope =
+  | { kind: "global" }
+  | { kind: "profile"; id: string }
+  | { kind: "role"; role: CodingRole };
+
+const agentProfileModelPath = /^agent\.profiles\.([A-Za-z0-9_-]+)\.model$/;
+const roleAgentModelPath =
+  /^roles\.(planner|worker|reviewer|fixer)\.agent\.model$/;
+
+/** Which model binding (if any) this dotted path represents, for combobox wiring. */
+export function agentModelScope(path: string): AgentModelScope | null {
+  if (path === "agent.model") return { kind: "global" };
+  const profile = agentProfileModelPath.exec(path);
+  if (profile) return { kind: "profile", id: profile[1] };
+  const role = roleAgentModelPath.exec(path);
+  if (role) return { kind: "role", role: role[1] as CodingRole };
+  return null;
+}
+
+function readOverlayVendor(
+  data: ConfigData,
+  drafts: Record<string, ConfigDraft>,
+  unset: Set<string>,
+  path: string,
+): string | null {
+  if (unset.has(path)) return null;
+  if (Object.hasOwn(drafts, path)) {
+    const draft = drafts[path];
+    if (typeof draft !== "string") return null;
+    const trimmed = draft.trim();
+    return trimmed === "" ? null : trimmed;
+  }
+  const value = getConfigValue(data, path);
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/**
+ * Effective agent vendor for a model binding, mirroring ResolveAgent overlay
+ * but using current form state (published + drafts + unsetPaths). Returns null
+ * when no vendor resolves — the combobox should still allow free entry and
+ * prompt the operator to pick a vendor before requesting suggestions.
+ *
+ * Order (per ADR-0016 / spec §6):
+ *   1. Inline vendor on the binding (if set and not pending unset).
+ *   2. For role scope, the selected profile's vendor (if any and not removed).
+ *   3. Global agent.vendor.
+ */
+export function effectiveAgentVendor(
+  data: ConfigData,
+  drafts: Record<string, ConfigDraft>,
+  unsetPaths: Iterable<string>,
+  scope: AgentModelScope,
+): string | null {
+  const unset =
+    unsetPaths instanceof Set
+      ? unsetPaths
+      : new Set<string>(unsetPaths as Iterable<string>);
+  const global = () => readOverlayVendor(data, drafts, unset, "agent.vendor");
+
+  if (scope.kind === "global") return global();
+
+  if (scope.kind === "profile") {
+    if (unset.has(`agent.profiles.${scope.id}`)) return global();
+    const own = readOverlayVendor(
+      data,
+      drafts,
+      unset,
+      agentProfilePath(scope.id, "vendor"),
+    );
+    return own ?? global();
+  }
+
+  // role
+  const roleVendor = readOverlayVendor(
+    data,
+    drafts,
+    unset,
+    roleAgentPath(scope.role, "vendor"),
+  );
+  if (roleVendor) return roleVendor;
+
+  // Resolve selected profile through the same overlay.
+  const profileFieldPath = roleAgentPath(scope.role, "profile");
+  let profileId: string | null = null;
+  if (!unset.has(profileFieldPath)) {
+    if (Object.hasOwn(drafts, profileFieldPath)) {
+      const draft = drafts[profileFieldPath];
+      if (typeof draft === "string" && draft.trim() !== "") {
+        profileId = draft.trim();
+      }
+    } else {
+      const value = getConfigValue(data, profileFieldPath);
+      if (typeof value === "string" && value.trim() !== "") {
+        profileId = value.trim();
+      }
+    }
+  }
+  if (profileId && !unset.has(`agent.profiles.${profileId}`)) {
+    const pv = readOverlayVendor(
+      data,
+      drafts,
+      unset,
+      agentProfilePath(profileId, "vendor"),
+    );
+    if (pv) return pv;
+  }
+  return global();
+}
+
 /**
  * Curated common-operator settings shown in the Essentials section, in the
  * intended display order. Anything else falls under Advanced. Role agent
@@ -547,13 +658,13 @@ export function buildConfigPatch(
       continue;
     }
     // Model empty draft: stage explicit vendor-default suppress (non-nil "").
-    // Profile/role empty models are distinct from unset (inherit) in
-    // overlayAgentIdentity, so a blank draft stages set "" even when the leaf
-    // is currently absent — operators can create suppress without first saving
-    // a non-empty model. Global agent.model only stages "" when replacing a
-    // non-empty published value (absent already means no model). Use Unset to
-    // go from suppress/value back to inherit. Vendor-switch companion logic may
-    // still set "" itself.
+    // Global agent.model, profile models, and role models all treat "" as an
+    // explicit suppress binding distinct from absent/unset (inherit). A blank
+    // draft therefore stages set "" even when the leaf is currently absent —
+    // operators can create suppress from the "Vendor default" combobox row
+    // without first saving a non-empty model. Skip only when the published
+    // value is already explicit "". Use Unset to go from suppress/value back
+    // to inherit. Vendor-switch companion logic may still set "" itself.
     if (
       parsed.value === "" &&
       (path === "agent.model" ||
@@ -561,17 +672,7 @@ export function buildConfigPatch(
           path.endsWith(".model"))
     ) {
       const current = getConfigValue(data, path);
-      if (current === "") {
-        // Already an explicit suppress binding.
-        continue;
-      }
-      if (path === "agent.model") {
-        if (typeof current === "string" && current !== "") {
-          set[path] = "";
-        }
-        continue;
-      }
-      // Profile / role model: create or replace with suppress even if absent.
+      if (current === "") continue; // already suppress
       set[path] = "";
       continue;
     }

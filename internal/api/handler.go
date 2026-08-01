@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/agent/modelcatalog"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -32,6 +33,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
@@ -161,6 +163,7 @@ type Handler struct {
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
 	bootstrap        *bootstrapCodes
+	modelCatalog     *modelcatalog.Service
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -214,12 +217,32 @@ func NewHandler(context Context) *Handler {
 	bootstrap := newBootstrapCodes()
 	bootstrap.now = now
 
+	// Model catalog probes are Supervisor-owned non-agent work: track handles
+	// for shutdown drain and cancel shared probe lifetime on BeginShutdown
+	// (independent of popup/request AbortController cancel).
+	var tracker processcontainment.LiveTracker
+	if context.Runtime != nil {
+		if ae := context.Runtime.Services().ActiveExecutions; ae != nil {
+			tracker = ae
+		}
+	}
+	modelCatalog := modelcatalog.NewService(modelcatalog.Options{
+		Now:     now,
+		Tracker: tracker,
+	})
+	if register, ok := any(context.Runtime).(interface {
+		OnBeginShutdown(func())
+	}); ok {
+		register.OnBeginShutdown(modelCatalog.Shutdown)
+	}
+
 	return &Handler{
 		context:          context,
 		now:              now,
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
 		bootstrap:        bootstrap,
+		modelCatalog:     modelCatalog,
 	}
 }
 
@@ -359,6 +382,9 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
+		return
+	case apiBasePath + "/agent/models":
+		h.handleAgentModelsRoute(w, r, requestID)
 		return
 	case apiBasePath + "/webhook/status":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
@@ -1117,6 +1143,80 @@ type statusTools struct {
 	Git       bool `json:"git"`
 	GH        bool `json:"gh"`
 	Osascript bool `json:"osascript"`
+}
+
+func (h *Handler) handleAgentModelsRoute(w http.ResponseWriter, r *http.Request, requestID string) {
+	if !assertMethod(r.Method, http.MethodGet, apiBasePath+"/agent/models", w, requestID, h.writeError) {
+		return
+	}
+	vendorRaw := strings.TrimSpace(r.URL.Query().Get("vendor"))
+	if vendorRaw == "" {
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "vendor query parameter is required",
+		})
+		return
+	}
+	vendor := config.AgentVendor(vendorRaw)
+	switch vendor {
+	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode,
+		config.AgentVendorCursorCLI, config.AgentVendorGrokBuild:
+	default:
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build",
+		})
+		return
+	}
+
+	refreshRaw := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("refresh")))
+	refresh := refreshRaw == "1" || refreshRaw == "true" || refreshRaw == "yes"
+	// refresh=1 bypasses the probe cache and launches the vendor CLI. Under
+	// authMode=none, originless no-CORS GETs to loopback are Host-allowed; a
+	// cross-site page could therefore force repeated probes. Reject forced
+	// refresh when browser fetch metadata marks the request cross-site.
+	if refresh && !allowForcedModelCatalogRefresh(r) {
+		h.writeError(w, requestID, apiError{
+			code:    pkgapi.ErrorCodeUnauthorized,
+			status:  http.StatusForbidden,
+			message: "forced model catalog refresh is not allowed for cross-site requests",
+		})
+		return
+	}
+
+	cfg := h.effectiveConfig()
+	// Spawn-equivalent params ownership: when global agent.vendor owns
+	// agent.params and the catalog vendor diverges, strip command/args so a
+	// Codex wrapper is never used to probe OpenCode (or vice versa).
+	params := agent.ParamsForRoleVendor(cfg.Agent.Params, cfg.Agent.Vendor, vendor, nil)
+
+	svc := h.modelCatalog
+	if svc == nil {
+		svc = modelcatalog.NewService(modelcatalog.Options{Now: h.now})
+	}
+	// Pass agent.env so vendor CLIs that authenticate via configured env
+	// (OpenCode/Grok API keys, etc.) probe with the same credentials as spawn.
+	result, err := svc.List(r.Context(), modelcatalog.ListOptions{
+		Vendor:  vendor,
+		Params:  params,
+		Env:     cfg.Agent.Env,
+		Refresh: refresh,
+	})
+	if err != nil {
+		if errors.Is(err, modelcatalog.ErrUnknownVendor) {
+			h.writeError(w, requestID, apiError{
+				code:    pkgapi.ErrorCodeValidationFailed,
+				status:  http.StatusBadRequest,
+				message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build",
+			})
+			return
+		}
+		h.writeError(w, requestID, internalServerError(err))
+		return
+	}
+	h.writeSuccess(w, requestID, result)
 }
 
 func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {

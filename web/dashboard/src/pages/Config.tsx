@@ -8,11 +8,13 @@ import {
 } from "react";
 import { RefreshCw, Settings } from "lucide-react";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ModelCombobox } from "@/components/ModelCombobox";
 import { PanelError } from "@/components/PanelError";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
   ApiError,
+  fetchAgentModels,
   fetchConfig,
   patchConfig,
   type ConfigData,
@@ -21,6 +23,7 @@ import {
 } from "@/lib/api";
 import {
   AGENT_VENDOR_OPTIONS,
+  agentModelScope,
   agentProfilePath,
   buildConfigPatch,
   CODING_ROLES,
@@ -32,6 +35,7 @@ import {
   configSelectOptions,
   draftFromValue,
   draftStagesConfigChange,
+  effectiveAgentVendor,
   ESSENTIAL_PATHS,
   getConfigValue,
   highImpactChanges,
@@ -328,6 +332,38 @@ function ConfigControl({
   );
 }
 
+function NewProfileModelSuggestions({ vendor }: { vendor: string }) {
+  const [entries, setEntries] = useState<
+    Array<{ id: string; label: string }>
+  >([]);
+  useEffect(() => {
+    // Drop the previous vendor's suggestions immediately so the datalist
+    // does not offer stale ids while the next probe is in flight or fails.
+    setEntries([]);
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const data = await fetchAgentModels(vendor, {
+          signal: controller.signal,
+        });
+        if (!controller.signal.aborted) setEntries(data.models);
+      } catch {
+        // Advisory only — silent. Do not restore previous vendor's entries.
+      }
+    })();
+    return () => controller.abort();
+  }, [vendor]);
+  return (
+    <datalist id="new-profile-model-suggestions">
+      {entries.map((entry) => (
+        <option key={entry.id} value={entry.id}>
+          {entry.label && entry.label !== entry.id ? entry.label : ""}
+        </option>
+      ))}
+    </datalist>
+  );
+}
+
 function AgentProfiles({
   data,
   drafts,
@@ -463,13 +499,16 @@ function AgentProfiles({
                 : published?.vendor == null
                   ? ""
                   : String(published.vendor);
-          const modelValue =
+          // null = persisted absence (Inherit); "" = explicit vendor-default
+          // suppress. Do not collapse absence to "" — that mis-highlights
+          // Vendor default and ArrowDown+Enter would stage set model:"".
+          const modelValue: string | null =
             modelUnset || pendingRemoval
-              ? ""
+              ? null
               : Object.hasOwn(drafts, modelPath)
                 ? String(drafts[modelPath] ?? "")
                 : published?.model == null
-                  ? ""
+                  ? null
                   : String(published.model);
           const canUnsetVendor =
             vendorEditable &&
@@ -606,23 +645,29 @@ function AgentProfiles({
                 </div>
                 <div className="min-w-0">
                   <div className="flex items-start gap-1.5">
-                    <label className="min-w-0 flex-1 text-[11px]">
+                    <div className="min-w-0 flex-1 text-[11px]">
                       <span className="text-[var(--text-muted)]">Model</span>
-                      <input
-                        aria-label={modelPath}
-                        className={`${controlClass} mt-0.5 mono ${modelUnset ? "opacity-50" : ""}`}
-                        value={modelValue}
-                        disabled={
-                          !modelEditable || pendingRemoval || modelUnset
-                        }
-                        placeholder="optional (empty = vendor default; Unset = inherit)"
-                        onChange={(event) => {
-                          // Empty draft stages model:"" (vendor default suppress).
-                          // Use Unset for inheritance. Do not auto-unset on clear.
-                          onDraft(modelPath, event.currentTarget.value);
-                        }}
-                      />
-                    </label>
+                      <div className="mt-0.5">
+                        <ModelCombobox
+                          ariaLabel={modelPath}
+                          vendor={effectiveAgentVendor(data, drafts, unsetPaths, {
+                            kind: "profile",
+                            id,
+                          })}
+                          value={modelValue}
+                          unset={modelUnset}
+                          disabled={!modelEditable || pendingRemoval}
+                          allowInherit
+                          placeholder="Model id (empty = vendor default; Inherit = previous layer)"
+                          onCommitValue={(next) => {
+                            // Empty draft stages model:"" (vendor default suppress).
+                            // Use Unset for inheritance. Do not auto-unset on clear.
+                            onDraft(modelPath, next);
+                          }}
+                          onInherit={() => toggleProfileLeafUnset("model")}
+                        />
+                      </div>
+                    </div>
                     {canUnsetModel ? (
                       <Button
                         variant="ghost"
@@ -700,9 +745,17 @@ function AgentProfiles({
           className={`${controlClass} mono`}
           value={newModel}
           disabled={!canEdit}
-          placeholder="Model (optional)"
+          placeholder={
+            newVendor
+              ? "Model (optional; type or pick from suggestions)"
+              : "Model (optional)"
+          }
+          list={newVendor ? "new-profile-model-suggestions" : undefined}
           onChange={(event) => setNewModel(event.currentTarget.value)}
         />
+        {newVendor ? (
+          <NewProfileModelSuggestions vendor={newVendor} />
+        ) : null}
         <Button variant="ghost" size="sm" disabled={!canEdit} onClick={stageNew}>
           Add profile
         </Button>
@@ -1330,6 +1383,35 @@ export function ConfigPage() {
     [clearPathError, retireLoad],
   );
 
+  // Global agent.model: restore absence (null). When the leaf is already
+  // absent/default-sourced, FieldFrame has no Unset and Inherit is disabled —
+  // clearing the draft is the only field-local path back to unbound (so
+  // params/CLI --model may still apply). When a binding is published, stage
+  // unset instead of set "".
+  const onRestoreModelAbsence = useCallback(
+    (path: string) => {
+      retireLoad();
+      const published = data ? getConfigValue(data, path) : undefined;
+      setDrafts((current) => {
+        if (!Object.hasOwn(current, path)) return current;
+        const next = { ...current };
+        delete next[path];
+        return next;
+      });
+      setUnsetPaths((current) => {
+        const next = new Set(current);
+        if (published == null) {
+          next.delete(path);
+        } else {
+          next.add(path);
+        }
+        return next;
+      });
+      clearPathError(path);
+    },
+    [clearPathError, data, retireLoad],
+  );
+
   const onSecretSet = useCallback(
     (key: string, value: string) => {
       retireLoad();
@@ -1526,6 +1608,17 @@ export function ConfigPage() {
     const meta = resolveFieldMeta(data, path);
     const dirty = Object.hasOwn(drafts, path);
     const unset = unsetPaths.has(path);
+    const modelScope = agentModelScope(path);
+    // Model leaves: keep absence (null) distinct from explicit "" suppress.
+    // Profile/role: null → Inherit. Global: null → unbound (params/CLI may
+    // still supply --model); only "" is Vendor default suppress.
+    const modelValue: string | null = unset
+      ? null
+      : Object.hasOwn(drafts, path)
+        ? String(drafts[path] ?? "")
+        : effective == null
+          ? null
+          : String(effective);
     return (
       <FieldFrame
         key={path}
@@ -1538,15 +1631,41 @@ export function ConfigPage() {
         disabled={editorLocked}
         onUnset={() => onToggleUnset(path)}
       >
-        <ConfigControl
-          path={path}
-          kind={kind}
-          value={value}
-          options={configSelectOptions(path)}
-          disabled={editorLocked || !metaIsEditable(meta)}
-          unset={unset}
-          onChange={(next) => onDraft(path, next)}
-        />
+        {modelScope ? (
+          <ModelCombobox
+            id={`config-${path}`}
+            ariaLabel={path}
+            vendor={effectiveAgentVendor(data, drafts, unsetPaths, modelScope)}
+            value={modelValue}
+            unset={unset}
+            disabled={editorLocked || !metaIsEditable(meta)}
+            allowInherit={modelScope.kind !== "global"}
+            placeholder={
+              modelScope.kind === "global"
+                ? "Model id (empty = vendor default / suppress)"
+                : "Model id (empty = vendor default; Inherit = previous layer)"
+            }
+            onCommitValue={(next) => onDraft(path, next)}
+            onInherit={
+              modelScope.kind === "global" ? undefined : () => onToggleUnset(path)
+            }
+            onUnbound={
+              modelScope.kind === "global"
+                ? () => onRestoreModelAbsence(path)
+                : undefined
+            }
+          />
+        ) : (
+          <ConfigControl
+            path={path}
+            kind={kind}
+            value={value}
+            options={configSelectOptions(path)}
+            disabled={editorLocked || !metaIsEditable(meta)}
+            unset={unset}
+            onChange={(next) => onDraft(path, next)}
+          />
+        )}
       </FieldFrame>
     );
   };

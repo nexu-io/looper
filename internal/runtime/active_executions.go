@@ -30,11 +30,18 @@ type ownedExecution struct {
 }
 
 // nonAgentTracked is one Supervisor-owned non-agent containment handle
-// (shell validation, trusted review child). Owners register while the handle
-// is live and release after their confirmed Kill/Drain path finishes.
+// (shell validation, trusted review child, model-catalog probe). Owners
+// register while the handle is live and release after their confirmed
+// Kill/Drain path finishes.
 type nonAgentTracked struct {
 	handle *processcontainment.Handle
 	done   chan struct{}
+}
+
+// nonAgentAdmit is a BeginTrack reservation: BeginShutdown waits on done so
+// Start→Track cannot race past an empty nonAgentHandles snapshot.
+type nonAgentAdmit struct {
+	done chan struct{}
 }
 
 // ActiveExecutionRegistry is the in-process Supervisor registry for live agent
@@ -87,6 +94,11 @@ type ActiveExecutionRegistry struct {
 	// registered via Track (processcontainment.LiveTracker).
 	nonAgentHandles map[uint64]*nonAgentTracked
 	nextNonAgentID  uint64
+	// nonAgentPending holds BeginTrack reservations until end is called.
+	// BeginShutdown waits on these so Start→Track cannot orphan a just-started
+	// process after an empty handle snapshot.
+	nonAgentPending   map[uint64]*nonAgentAdmit
+	nextNonAgentAdmit uint64
 	// nonAgentDrainErr accumulates ReportDrainFailure and force-kill failures
 	// from non-agent handles so Runtime.Stop can retain SQLite.
 	nonAgentDrainErr error
@@ -122,6 +134,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 		boundOps:         make(map[uint64]*operationLease),
 		boundByQueueItem: make(map[string]uint64),
 		nonAgentHandles:  make(map[uint64]*nonAgentTracked),
+		nonAgentPending:  make(map[uint64]*nonAgentAdmit),
 	}
 }
 
@@ -810,14 +823,55 @@ func (r *ActiveExecutionRegistry) LoopStopActive(loopID string) bool {
 // not reach confirmed-dead. Callers must retain storage and fail loud (#577).
 var errShutdownDrainTimeout = errors.New("shutdown: containment drain timed out or failed")
 
+// BeginTrack implements processcontainment.LiveTracker. Reserves a shutdown-wait
+// slot before Start/Bind so BeginShutdown cannot miss a Start→Track window.
+func (r *ActiveExecutionRegistry) BeginTrack() (end func(), err error) {
+	if r == nil {
+		return nil, processcontainment.ErrTrackerAdmissionClosed
+	}
+	r.mu.Lock()
+	if r.admissionClosed {
+		r.mu.Unlock()
+		return nil, processcontainment.ErrTrackerAdmissionClosed
+	}
+	if r.nonAgentPending == nil {
+		r.nonAgentPending = make(map[uint64]*nonAgentAdmit)
+	}
+	r.nextNonAgentAdmit++
+	id := r.nextNonAgentAdmit
+	admit := &nonAgentAdmit{done: make(chan struct{})}
+	r.nonAgentPending[id] = admit
+	r.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if _, ok := r.nonAgentPending[id]; ok {
+				delete(r.nonAgentPending, id)
+			}
+			r.mu.Unlock()
+			close(admit.done)
+		})
+	}, nil
+}
+
 // Track implements processcontainment.LiveTracker for Supervisor-owned non-agent
-// handles (validation/shell, trusted review). release is idempotent.
+// handles (validation/shell, trusted review, model-catalog probes). release is
+// idempotent. When admission is already closed, Track confirmed-drains the
+// handle (agent BindHandle refuse shape) and returns a no-op release so a
+// just-started process cannot outlive BeginShutdown's pending-admit wait.
 func (r *ActiveExecutionRegistry) Track(handle *processcontainment.Handle) (release func()) {
 	if r == nil || handle == nil {
 		return func() {}
 	}
-	entry := &nonAgentTracked{handle: handle, done: make(chan struct{})}
 	r.mu.Lock()
+	if r.admissionClosed {
+		r.mu.Unlock()
+		r.killUntrackedNonAgent(handle)
+		return func() {}
+	}
+	entry := &nonAgentTracked{handle: handle, done: make(chan struct{})}
 	if r.nonAgentHandles == nil {
 		r.nonAgentHandles = make(map[uint64]*nonAgentTracked)
 	}
@@ -836,6 +890,20 @@ func (r *ActiveExecutionRegistry) Track(handle *processcontainment.Handle) (rele
 			r.mu.Unlock()
 			close(entry.done)
 		})
+	}
+}
+
+// killUntrackedNonAgent confirmed-drains a handle that lost the Track race with
+// BeginShutdown (admission already closed). Failures feed retain-storage.
+func (r *ActiveExecutionRegistry) killUntrackedNonAgent(handle *processcontainment.Handle) {
+	if r == nil || handle == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), r.killBudget())
+	err := handle.Kill(ctx)
+	cancel()
+	if err != nil {
+		r.ReportDrainFailure(err)
 	}
 }
 
@@ -905,6 +973,14 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 			rebindWait = append(rebindWait, lease.rebindDone)
 		}
 	}
+	// Non-agent BeginTrack windows: wait before handle drain so Track refuse
+	// Kill (or successful Track registration) cannot race past an empty snapshot.
+	nonAgentAdmitWait := make([]<-chan struct{}, 0, len(r.nonAgentPending))
+	for _, admit := range r.nonAgentPending {
+		if admit != nil && admit.done != nil {
+			nonAgentAdmitWait = append(nonAgentAdmitWait, admit.done)
+		}
+	}
 	entries := make([]*ownedExecution, 0, len(r.executions))
 	for _, entry := range r.executions {
 		entries = append(entries, entry)
@@ -927,10 +1003,11 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 		}
 	}
 	budget := r.killBudget()
-	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait)+len(opWait))
+	waitChans := make([]<-chan struct{}, 0, len(spawnWait)+len(rebindWait)+len(opWait)+len(nonAgentAdmitWait))
 	waitChans = append(waitChans, spawnWait...)
 	waitChans = append(waitChans, rebindWait...)
 	waitChans = append(waitChans, opWait...)
+	waitChans = append(waitChans, nonAgentAdmitWait...)
 	for _, done := range waitChans {
 		if done == nil {
 			continue
@@ -966,6 +1043,8 @@ func (r *ActiveExecutionRegistry) BeginShutdown(reason string) error {
 	// Non-agent Supervisor-owned handles: prefer owner cancel path (shell.Run /
 	// trusted-review Kill) so we do not race concurrent Kill. Wait for release,
 	// then force-kill stragglers and join reported drain failures.
+	// Snapshot is after BeginTrack waits so Track that registered during the
+	// admit window is visible here.
 	if err := r.drainNonAgentHandles(budget); err != nil {
 		drainErr = errors.Join(drainErr, err)
 	}
