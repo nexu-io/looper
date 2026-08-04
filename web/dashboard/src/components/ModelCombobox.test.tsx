@@ -297,11 +297,15 @@ describe("ModelCombobox", () => {
 
     // Catalog includes gpt-5-mini; custom row is gone. Active should still
     // highlight that model (now a catalog row), not the next row at the old index.
+    // Wait for both the custom-row collapse and the remapped selection so the
+    // assertion is not sensitive to a one-frame stale index.
     await waitFor(() => {
       expect(screen.queryByText('Use "gpt-5-mini"')).toBeNull();
+      const modelOpt = screen
+        .getByText("GPT-5 mini")
+        .closest("[role='option']");
+      expect(modelOpt?.getAttribute("aria-selected")).toBe("true");
     });
-    const modelOpt = screen.getByText("GPT-5 mini").closest("[role='option']");
-    expect(modelOpt?.getAttribute("aria-selected")).toBe("true");
 
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onInherit).not.toHaveBeenCalled();
