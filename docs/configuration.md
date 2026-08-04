@@ -652,6 +652,24 @@ Effective resolution: `projects[].roles.<role>.behavior.loop.quietPeriodSeconds`
 
 When quiet and a separate backoff both apply, eligible time is the **max** of the constraints. Recommended fixer starters are `60`–`120` seconds once you want burst protection; leave `0` for historical immediate enqueue.
 
+#### Concept trade-off
+
+**Failure prevented:** Bursty review/CI signals (multiple threads, check re-runs, rapid head updates) cause role loops to start work mid-storm. That produces thrash: duplicate agent runs, wasted budget, and fix sets that go stale before the agent finishes. Quiet period delays eligibility until the discovery signal has stopped changing.
+
+**What it costs:**
+
+- **New config surface:** `defaults.loop` plus per-role `behavior.loop.quietPeriodSeconds`, inheritance when a role field is unset, project overlays, env/CLI, API contract, and restart-bound classification all stay in sync.
+- **Persisted signal identity:** Fixer discovery keys settle windows on `fixItemsStateHash` (and related queue metadata). Wrong or unstable hashing over-delays, under-delays, or restarts the window on noise.
+- **Queue coalesce / gating:** Mid-delay hash changes update the active loop-scoped queue item in place so a new `fixItemsHash` cannot bypass the delay via a second enqueue. That path must not drop work, lose backoff composition, or extend forever on unchanged polls.
+- **Edge cases to keep correct:** `quiet=0` remains immediate (migration-safe); quiet never shortens an existing later `AvailableAt`; quiet composes with no-op/retry backoff via `max`; first discovery vs rediscovery vs post-run re-queue all apply the same helper.
+- **Failure modes:** Overflowing seconds→`time.Duration` would schedule in the past (rejected at validation); daemon restart mid-window re-reads durable `AvailableAt` / `NextRunAt` (authority stays on those fields, not the agent).
+
+**Why simpler alternatives are insufficient:**
+
+- **Delete the layer / no debounce:** Reintroduces mid-storm starts—the failure this feature exists to stop.
+- **Trust agent structured output** ("wait until settled"): The agent cannot observe future GitHub review bursts; settlement is an infra timing concern. Queue `AvailableAt` / loop `NextRunAt` remain scheduler authority; quiet period only delays eligibility after discovery signal changes.
+- **Fail loud on burst:** Bursty GitHub events are normal, not errors; failing would thrash operators without improving fix quality.
+
 ### Reviewer auto-merge settings
 
 Reviewer auto-merge lives under `roles.reviewer.autoMerge.*`:

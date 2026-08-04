@@ -396,6 +396,9 @@ type ProjectNetworkConfig struct {
 type DefaultsLoopConfig struct {
 	// QuietPeriodSeconds is the shared default settle window for role loops.
 	// 0 disables quiet-period debounce. Role overrides win when set.
+	// Must be >= 0 and fit in time.Duration when converted from seconds.
+	// Design trade-off (failure prevented, costs, alternatives): see
+	// docs/configuration.md § Quiet-period debounce → Concept trade-off.
 	QuietPeriodSeconds int `json:"quietPeriodSeconds"`
 }
 

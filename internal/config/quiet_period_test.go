@@ -1,7 +1,9 @@
 package config
 
 import (
+	"strconv"
 	"testing"
+	"time"
 )
 
 func TestDefaultQuietPeriodValues(t *testing.T) {
@@ -139,6 +141,79 @@ func TestQuietPeriodValidationRejectsNegative(t *testing.T) {
 	}
 	assertValidationIssue(t, validationErr, "defaults.loop.quietPeriodSeconds", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "roles.fixer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
+}
+
+func TestQuietPeriodValidationRejectsDurationOverflow(t *testing.T) {
+	t.Parallel()
+	if strconv.IntSize < 64 {
+		t.Skip("overflow quiet-period value requires 64-bit int")
+	}
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	overflow := int(maxDuration/time.Second) + 1
+	cfg.Defaults.Loop.QuietPeriodSeconds = overflow
+	cfg.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds = overflow
+	cfg.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds = overflow
+	err = Validate(cfg)
+	if err == nil {
+		t.Fatal("Validate() = nil, want validation error for duration overflow")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("Validate() error type = %T, want *ConfigValidationError", err)
+	}
+	msg := "must fit within time.Duration when converted from seconds"
+	assertValidationIssue(t, validationErr, "defaults.loop.quietPeriodSeconds", msg)
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.quietPeriodSeconds", msg)
+	assertValidationIssue(t, validationErr, "roles.fixer.behavior.loop.quietPeriodSeconds", msg)
+}
+
+func TestQuietPeriodValidationRejectsDurationOverflowProjectOverride(t *testing.T) {
+	t.Parallel()
+	if strconv.IntSize < 64 {
+		t.Skip("overflow quiet-period value requires 64-bit int")
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	overflow := int(maxDuration/time.Second) + 1
+	repoPath := t.TempDir()
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Projects: &[]PartialProjectRefConfig{
+			{
+				ID:       "demo",
+				Name:     "Demo",
+				RepoPath: repoPath,
+				Roles: &PartialRoleConfigs{
+					Fixer: &PartialFixerRoleConfig{
+						Behavior: &PartialFixerBehaviorConfig{
+							Loop: &PartialFixerLoopConfig{QuietPeriodSeconds: &overflow},
+						},
+					},
+					Reviewer: &PartialReviewerRoleConfig{
+						Behavior: &PartialReviewerConfig{
+							Loop: &PartialReviewerLoopConfig{QuietPeriodSeconds: &overflow},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = Validate(cfg)
+	if err == nil {
+		t.Fatal("Validate() = nil, want validation error for project quiet-period overflow")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("Validate() error type = %T, want *ConfigValidationError", err)
+	}
+	msg := "must fit within time.Duration when converted from seconds"
+	assertValidationIssue(t, validationErr, "projects[0].roles.fixer.behavior.loop.quietPeriodSeconds", msg)
+	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.loop.quietPeriodSeconds", msg)
 }
 
 func TestQuietPeriodValidationRejectsNegativeProjectOverride(t *testing.T) {
