@@ -894,6 +894,28 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
 			index = nextIndex
+		case matchesFlag(arg, "--defaults-loop-quiet-period-seconds"):
+			value, nextIndex, err := takeValue(index, "--defaults-loop-quiet-period-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --defaults-loop-quiet-period-seconds: %q is not an integer", value)
+			}
+			ensureDefaultsLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--roles-fixer-behavior-loop-quiet-period-seconds"):
+			value, nextIndex, err := takeValue(index, "--roles-fixer-behavior-loop-quiet-period-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-fixer-behavior-loop-quiet-period-seconds: %q is not an integer", value)
+			}
+			ensureFixerLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
+			index = nextIndex
 		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-min-publish-interval-seconds", "--reviewer-min-publish-interval-seconds"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-min-publish-interval-seconds")
 			if err != nil {
@@ -1185,6 +1207,20 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS: %q is not an integer", value)
 		}
 		ensureReviewerLoopConfig(&overrides).QuietPeriodSeconds = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_DEFAULTS_LOOP_QUIET_PERIOD_SECONDS"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_DEFAULTS_LOOP_QUIET_PERIOD_SECONDS: %q is not an integer", value)
+		}
+		ensureDefaultsLoopConfig(&overrides).QuietPeriodSeconds = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS: %q is not an integer", value)
+		}
+		ensureFixerLoopConfig(&overrides).QuietPeriodSeconds = parsed
 	}
 	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MIN_PUBLISH_INTERVAL_SECONDS", "LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS"); ok {
 		parsed, err := parseInteger(value)
@@ -1566,6 +1602,14 @@ func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {
 	return partial.Defaults
 }
 
+func ensureDefaultsLoopConfig(partial *PartialConfig) *PartialDefaultsLoopConfig {
+	defaults := ensureDefaultsConfig(partial)
+	if defaults.Loop == nil {
+		defaults.Loop = &PartialDefaultsLoopConfig{}
+	}
+	return defaults.Loop
+}
+
 func ensureReviewerConfig(partial *PartialConfig) *PartialReviewerConfig {
 	reviewer := ensureReviewerRoleConfig(partial)
 	if reviewer.Behavior == nil {
@@ -1692,4 +1736,20 @@ func ensureFixerRoleTriggersConfig(partial *PartialConfig) *PartialFixerRoleTrig
 		fixer.Triggers = &PartialFixerRoleTriggersConfig{}
 	}
 	return fixer.Triggers
+}
+
+func ensureFixerBehaviorConfig(partial *PartialConfig) *PartialFixerBehaviorConfig {
+	fixer := ensureFixerRoleConfig(partial)
+	if fixer.Behavior == nil {
+		fixer.Behavior = &PartialFixerBehaviorConfig{}
+	}
+	return fixer.Behavior
+}
+
+func ensureFixerLoopConfig(partial *PartialConfig) *PartialFixerLoopConfig {
+	behavior := ensureFixerBehaviorConfig(partial)
+	if behavior.Loop == nil {
+		behavior.Loop = &PartialFixerLoopConfig{}
+	}
+	return behavior.Loop
 }

@@ -111,7 +111,7 @@ Profile and role agent vendor/model fields are hot-safe curated identity fields:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `defaults.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.fixer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and quiet-period / Reviewer timing fields are durable queue-scheduling inputs (`AvailableAt` / `NextRunAt`); Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -623,6 +623,7 @@ publishMode = "single_review"
 
 [roles.reviewer.behavior.loop]
 enabledByDefault = true
+# Continuous follow-up debounce after a published review. Inherits defaults.loop when unset.
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
 
@@ -636,6 +637,20 @@ reReviewPromptOnHeadChange = false
 ```
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
+
+### Quiet-period debounce (shared + per-role)
+
+Quiet period **settles new actionable signals** before starting work: wait N seconds after a signal change, and **reset the wait** if another signal arrives in the window. It is **not** retry backoff, fixer no-op follow-up backoff, coordinator dispatch delay, or reviewer `minPublishIntervalSeconds`.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `defaults.loop.quietPeriodSeconds` | Shared default when a role field is unset | `60` |
+| `roles.reviewer.behavior.loop.quietPeriodSeconds` | Reviewer continuous follow-up debounce | `60` |
+| `roles.fixer.behavior.loop.quietPeriodSeconds` | Fixer new/changed fixable-set settle window | `0` (opt-in) |
+
+Effective resolution: `projects[].roles.<role>.behavior.loop.quietPeriodSeconds` → role global → `defaults.loop` → role-specific hardcoded default. Fields are restart-bound because they feed durable queue `AvailableAt` / loop `NextRunAt`. Env examples: `LOOPER_DEFAULTS_LOOP_QUIET_PERIOD_SECONDS`, `LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS`; existing reviewer quiet env/flag paths remain valid.
+
+When quiet and a separate backoff both apply, eligible time is the **max** of the constraints. Recommended fixer starters are `60`–`120` seconds once you want burst protection; leave `0` for historical immediate enqueue.
 
 ### Reviewer auto-merge settings
 
@@ -816,6 +831,12 @@ allowRiskyFixes = false
 openPrStrategy = "all_done"
 addSnapshotMode = "async"
 
+[defaults.loop]
+# Shared quiet-period default for role signal-settling debounce.
+# Role overrides: roles.<role>.behavior.loop.quietPeriodSeconds
+# 0 = off. Restart-bound (feeds durable queue AvailableAt / NextRunAt).
+quietPeriodSeconds = 60
+
 # `allowAutoApprove` is a legacy compatibility alias.
 # Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
 
@@ -893,6 +914,10 @@ strategy = "squash"
 requireBranchProtection = true
 transientRetries = 3
 scope = "looper-only"
+
+[roles.fixer.behavior.loop]
+# Opt-in quiet period (default 0 = immediate enqueue). Recommended starter: 60–120.
+quietPeriodSeconds = 0
 
 [roles.fixer.discovery]
 autoDiscovery = true

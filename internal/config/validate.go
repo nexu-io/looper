@@ -218,8 +218,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
 	}
 
+	if config.Defaults.Loop.QuietPeriodSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "defaults.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
+	}
 	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
+	}
+	if config.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds < 0 {
+		issues = append(issues, ValidationIssue{Path: "roles.fixer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
 	}
 	if config.Roles.Reviewer.Behavior.Loop.MinPublishIntervalSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
