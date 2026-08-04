@@ -2432,6 +2432,38 @@ func TestConfigShowSourceDetectsQuietPeriodConfigFileAndCLI(t *testing.T) {
 	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "cli")
 }
 
+func TestConfigShowSourceAttributesInheritedFixerQuietPeriod(t *testing.T) {
+	// Only defaults.loop is set; fixer inherits 120 but must report the shared source.
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"loop": map[string]any{
+				"quietPeriodSeconds": 120,
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldValue(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", float64(120))
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source",
+		"--defaults-loop-quiet-period-seconds=45",
+		"--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source with defaults quiet flag]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldValue(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", float64(45))
+}
+
 func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testing.T) {
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{
@@ -2775,6 +2807,22 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 
 func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 	t.Helper()
+	field := configShowSourceField(t, stdout, key)
+	if got := field["source"]; got != wantSource {
+		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
+	}
+}
+
+func assertConfigFieldValue(t *testing.T, stdout, key string, wantValue any) {
+	t.Helper()
+	field := configShowSourceField(t, stdout, key)
+	if got := field["value"]; got != wantValue {
+		t.Fatalf("%s value = %#v, want %#v", key, got, wantValue)
+	}
+}
+
+func configShowSourceField(t *testing.T, stdout, key string) map[string]any {
+	t.Helper()
 	var decoded map[string]any
 	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
 		t.Fatalf("unmarshal source output: %v", err)
@@ -2787,9 +2835,7 @@ func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 	if !ok {
 		t.Fatalf("%s = %#v, want object", key, fields[key])
 	}
-	if got := field["source"]; got != wantSource {
-		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
-	}
+	return field
 }
 
 func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {

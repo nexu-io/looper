@@ -169,6 +169,62 @@ func TestDiscoverChangedSetResetsQuietWindow(t *testing.T) {
 	}
 }
 
+func TestDiscoverHeadSHAChangeResetsQuietWindow(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	// Same fix-item contents; only head SHA advances (new commit while review set is unchanged).
+	firstDetail := PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-old", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	secondDetail := PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-new", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{firstDetail, secondDetail}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		CustomInstructions: fixerConfigWithQuiet(t, 120),
+	})
+
+	first, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequest() error = %v", err)
+	}
+	if len(first.QueueItems) != 1 {
+		t.Fatalf("first len = %d, want 1", len(first.QueueItems))
+	}
+	firstAvailableAt := first.QueueItems[0].AvailableAt
+	firstDedupe := first.QueueItems[0].DedupeKey
+
+	fixture.advance(30 * time.Second)
+	second, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequest() error = %v", err)
+	}
+	if len(second.QueueItems) != 1 {
+		t.Fatalf("second len = %d, want 1 (loop-scoped coalesce)", len(second.QueueItems))
+	}
+	extended := eventlog.FormatJavaScriptISOString(fixture.now().Add(120 * time.Second))
+	if second.QueueItems[0].AvailableAt != extended {
+		t.Fatalf("AvailableAt after head SHA change = %q, want extended %q (was %q)", second.QueueItems[0].AvailableAt, extended, firstAvailableAt)
+	}
+	if second.QueueItems[0].DedupeKey == firstDedupe {
+		t.Fatalf("dedupe key unchanged after head SHA change: %q", firstDedupe)
+	}
+	if got := headShaFromQueueItem(second.QueueItems[0]); got != "head-new" {
+		t.Fatalf("queued headSha = %q, want head-new", got)
+	}
+	items, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("len(queue) = %d, want 1 coalesced item", len(items))
+	}
+	if items[0].AvailableAt != extended {
+		t.Fatalf("coalesced AvailableAt = %q, want %q", items[0].AvailableAt, extended)
+	}
+	if got := headShaFromQueueItem(items[0]); got != "head-new" {
+		t.Fatalf("persisted headSha = %q, want head-new", got)
+	}
+}
+
 func TestDiscoverMidRunPendingAppliesQuietOnScheduleAfterRun(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

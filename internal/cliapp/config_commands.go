@@ -283,19 +283,42 @@ func (r *commandRuntime) configShowSource(cmd *cobra.Command) error {
 	}
 	values := make(map[string]map[string]any, len(configFieldRegistry))
 	for key, field := range configFieldRegistry {
-		source := "default"
-		if configFieldSet(loaded.Partial, key) {
-			source = "config-file"
-		}
-		if field.overrideFromEnv() {
-			source = "env"
-		}
-		if field.overrideFromFlag(cmd) {
-			source = "cli"
-		}
+		source := resolveConfigFieldSource(cmd, loaded.Partial, key, field)
 		values[key] = map[string]any{"value": field.get(loaded.Config), "source": source}
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"configPath": loaded.Metadata.ConfigPath, "fields": values})
+}
+
+// resolveConfigFieldSource reports the winning precedence layer for a registry key.
+// For roles.fixer.behavior.loop.quietPeriodSeconds, when the fixer role field is not
+// directly set by file/env/CLI, attribute the effective value to defaults.loop
+// (the shared inheritance source) rather than the role's DefaultConfig baseline.
+func resolveConfigFieldSource(cmd *cobra.Command, partial config.PartialConfig, key string, field configField) string {
+	source := "default"
+	if configFieldSet(partial, key) {
+		source = "config-file"
+	}
+	if field.overrideFromEnv() {
+		source = "env"
+	}
+	if field.overrideFromFlag(cmd) {
+		source = "cli"
+	}
+	if key == "roles.fixer.behavior.loop.quietPeriodSeconds" && !fixerQuietPeriodDirectlyOverridden(cmd, partial, field) {
+		defaultsField := configFieldRegistry["defaults.loop.quietPeriodSeconds"]
+		return resolveConfigFieldSource(cmd, partial, "defaults.loop.quietPeriodSeconds", defaultsField)
+	}
+	return source
+}
+
+func fixerQuietPeriodDirectlyOverridden(cmd *cobra.Command, partial config.PartialConfig, field configField) bool {
+	if partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Behavior != nil && partial.Roles.Fixer.Behavior.Loop != nil && partial.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds != nil {
+		return true
+	}
+	if field.overrideFromEnv() || field.overrideFromFlag(cmd) {
+		return true
+	}
+	return false
 }
 
 func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {

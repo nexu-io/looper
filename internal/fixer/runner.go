@@ -5073,8 +5073,12 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if activeQueue != nil && activeQueue.Status == "queued" {
 			existingAvailableAt = parseRFC3339OrZero(activeQueue.AvailableAt)
 			queuedHash := fixItemsHashFromQueueItem(*activeQueue)
-			// Identical fixable-set polls must not push AvailableAt out forever.
-			signalChanged = queuedHash == "" || queuedHash != strings.TrimSpace(fixItemsStateHash)
+			queuedHead := headShaFromQueueItem(*activeQueue)
+			// Identical fixable-set + head polls must not push AvailableAt out forever.
+			// Head SHA changes are debounce signals even when fix-item content is unchanged,
+			// so the quiet window resets and loop-scoped enqueue can replace the payload.
+			signalChanged = queuedHash == "" || queuedHash != strings.TrimSpace(fixItemsStateHash) ||
+				queuedHead == "" || queuedHead != strings.TrimSpace(headSHA)
 		}
 		availableAt := now
 		if signalChanged {
@@ -5542,6 +5546,21 @@ func fixItemsHashFromQueueItem(item storage.QueueItemRecord) string {
 	parts := strings.Split(item.DedupeKey, ":")
 	if len(parts) >= 1 {
 		return strings.TrimSpace(parts[len(parts)-1])
+	}
+	return ""
+}
+
+func headShaFromQueueItem(item storage.QueueItemRecord) string {
+	if item.PayloadJSON != nil {
+		payload := parseJSONObject(item.PayloadJSON)
+		if head, ok := stringFromAny(payload["headSha"]); ok && strings.TrimSpace(head) != "" {
+			return strings.TrimSpace(head)
+		}
+	}
+	// Fallback: buildFixerDedupeKey ends with :headSHA:fixItemsHash
+	parts := strings.Split(item.DedupeKey, ":")
+	if len(parts) >= 2 {
+		return strings.TrimSpace(parts[len(parts)-2])
 	}
 	return ""
 }
