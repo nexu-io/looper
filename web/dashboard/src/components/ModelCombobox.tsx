@@ -108,7 +108,8 @@ export function ModelCombobox({
   const listRef = useRef<HTMLUListElement | null>(null);
   // Previous row snapshot for remapping `active` by identity when the list
   // changes under an open popup (catalog load, filter, custom-row collapse).
-  const prevRowsRef = useRef<Row[]>([]);
+  // Tracked in state (not a ref) so concurrent render discard stays correct.
+  const [prevRows, setPrevRows] = useState<Row[]>([]);
 
   // Single close path: clear popup, transient query, and navigation state.
   // Parent `value` is authoritative once closed. Escape uses this path without
@@ -291,32 +292,30 @@ export function ModelCombobox({
   // row and the same numeric index points at a different model. Remap by
   // identity (custom value ≡ model id); if the option disappeared, clear
   // navigation so Enter does not commit an unrelated row.
-  useEffect(() => {
-    const prevRows = prevRowsRef.current;
-    prevRowsRef.current = rows;
-    if (active === null) return;
-
-    if (prevRows === rows) {
-      // Rows unchanged (e.g. pure active update): only clamp out-of-range.
-      if (active >= rows.length) {
+  //
+  // Adjust during render (React "adjusting state when a prop changes") so the
+  // highlighted option matches the new list in the same commit as the catalog
+  // swap. An effect-based remap painted one frame with a stale index and made
+  // the identity-remap test flake under CI timing.
+  if (rows !== prevRows) {
+    setPrevRows(rows);
+    if (active !== null) {
+      const prev = prevRows[active];
+      if (prev) {
+        const id = rowIdentity(prev);
+        const nextIdx = rows.findIndex((r) => rowIdentity(r) === id);
+        if (nextIdx >= 0) {
+          if (nextIdx !== active) setActive(nextIdx);
+        } else {
+          setActive(null);
+        }
+      } else if (active >= rows.length) {
         setActive(rows.length > 0 ? rows.length - 1 : null);
-      }
-      return;
-    }
-
-    const prev = prevRows[active];
-    if (prev) {
-      const id = rowIdentity(prev);
-      const nextIdx = rows.findIndex((r) => rowIdentity(r) === id);
-      if (nextIdx >= 0) {
-        if (nextIdx !== active) setActive(nextIdx);
-        return;
+      } else {
+        setActive(null);
       }
     }
-
-    // Previously active option is gone — reset rather than keep a stale index.
-    setActive(null);
-  }, [rows, active]);
+  }
 
   // Scroll the active option into view on keyboard navigation.
   useEffect(() => {

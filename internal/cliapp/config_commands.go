@@ -37,9 +37,19 @@ var configFieldRegistry = map[string]configField{
 	"defaults.allowRiskyFixes":    boolField("defaults.allowRiskyFixes", "", "", func(c config.Config) any { return c.Defaults.AllowRiskyFixes }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).AllowRiskyFixes }),
 	"defaults.fixAllPullRequests": boolField("defaults.fixAllPullRequests", "LOOPER_FIX_ALL_PULL_REQUESTS", "fix-all-pull-requests", func(c config.Config) any { return c.Defaults.FixAllPullRequests }, func(p *config.PartialConfig) **bool { return &ensurePartialDefaults(p).FixAllPullRequests }),
 	"defaults.openPrStrategy":     openPRStrategyField(),
-	"instructions.enabled":        boolFieldWithAlias("instructions.enabled", "", "", "instructions-enabled", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
-	"package.autoUpgradeEnabled":  boolFieldWithAlias("package.autoUpgradeEnabled", "LOOPER_AUTO_UPGRADE_ENABLED", "", "package-auto-upgrade-enabled", "no-auto-upgrade", func(c config.Config) any { return c.Package.AutoUpgradeEnabled }, func(p *config.PartialConfig) **bool { return &ensurePartialPackage(p).AutoUpgradeEnabled }),
-	"instructions.maxBytes":       positiveIntField("instructions.maxBytes", "", "", func(c config.Config) any { return c.Instructions.MaxBytes }, func(p *config.PartialConfig) **int { return &ensurePartialInstructions(p).MaxBytes }),
+	"defaults.loop.quietPeriodSeconds": nonNegativeIntField("defaults.loop.quietPeriodSeconds", "LOOPER_DEFAULTS_LOOP_QUIET_PERIOD_SECONDS", "defaults-loop-quiet-period-seconds", func(c config.Config) any {
+		return c.Defaults.Loop.QuietPeriodSeconds
+	}, func(p *config.PartialConfig) **int {
+		return &ensurePartialDefaultsLoop(p).QuietPeriodSeconds
+	}),
+	"roles.fixer.behavior.loop.quietPeriodSeconds": nonNegativeIntField("roles.fixer.behavior.loop.quietPeriodSeconds", "LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS", "roles-fixer-behavior-loop-quiet-period-seconds", func(c config.Config) any {
+		return c.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds
+	}, func(p *config.PartialConfig) **int {
+		return &ensurePartialFixerLoop(p).QuietPeriodSeconds
+	}),
+	"instructions.enabled":       boolFieldWithAlias("instructions.enabled", "", "", "instructions-enabled", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
+	"package.autoUpgradeEnabled": boolFieldWithAlias("package.autoUpgradeEnabled", "LOOPER_AUTO_UPGRADE_ENABLED", "", "package-auto-upgrade-enabled", "no-auto-upgrade", func(c config.Config) any { return c.Package.AutoUpgradeEnabled }, func(p *config.PartialConfig) **bool { return &ensurePartialPackage(p).AutoUpgradeEnabled }),
+	"instructions.maxBytes":      positiveIntField("instructions.maxBytes", "", "", func(c config.Config) any { return c.Instructions.MaxBytes }, func(p *config.PartialConfig) **int { return &ensurePartialInstructions(p).MaxBytes }),
 	"roles.reviewer.behavior.reviewEvents.clean": reviewerReviewEventField("roles.reviewer.behavior.reviewEvents.clean", "LOOPER_ROLES_REVIEWER_BEHAVIOR_REVIEW_EVENTS_CLEAN", "LOOPER_REVIEWER_REVIEW_EVENTS_CLEAN", "roles-reviewer-behavior-review-events-clean", "reviewer-clean-review-event", func(c config.Config) any { return c.Roles.Reviewer.Behavior.ReviewEvents.Clean }, func(p *config.PartialConfig) **config.ReviewerReviewEvent {
 		return &ensurePartialReviewerReviewEvents(p).Clean
 	}),
@@ -273,19 +283,42 @@ func (r *commandRuntime) configShowSource(cmd *cobra.Command) error {
 	}
 	values := make(map[string]map[string]any, len(configFieldRegistry))
 	for key, field := range configFieldRegistry {
-		source := "default"
-		if configFieldSet(loaded.Partial, key) {
-			source = "config-file"
-		}
-		if field.overrideFromEnv() {
-			source = "env"
-		}
-		if field.overrideFromFlag(cmd) {
-			source = "cli"
-		}
+		source := resolveConfigFieldSource(cmd, loaded.Partial, key, field)
 		values[key] = map[string]any{"value": field.get(loaded.Config), "source": source}
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"configPath": loaded.Metadata.ConfigPath, "fields": values})
+}
+
+// resolveConfigFieldSource reports the winning precedence layer for a registry key.
+// For roles.fixer.behavior.loop.quietPeriodSeconds, when the fixer role field is not
+// directly set by file/env/CLI, attribute the effective value to defaults.loop
+// (the shared inheritance source) rather than the role's DefaultConfig baseline.
+func resolveConfigFieldSource(cmd *cobra.Command, partial config.PartialConfig, key string, field configField) string {
+	source := "default"
+	if configFieldSet(partial, key) {
+		source = "config-file"
+	}
+	if field.overrideFromEnv() {
+		source = "env"
+	}
+	if field.overrideFromFlag(cmd) {
+		source = "cli"
+	}
+	if key == "roles.fixer.behavior.loop.quietPeriodSeconds" && !fixerQuietPeriodDirectlyOverridden(cmd, partial, field) {
+		defaultsField := configFieldRegistry["defaults.loop.quietPeriodSeconds"]
+		return resolveConfigFieldSource(cmd, partial, "defaults.loop.quietPeriodSeconds", defaultsField)
+	}
+	return source
+}
+
+func fixerQuietPeriodDirectlyOverridden(cmd *cobra.Command, partial config.PartialConfig, field configField) bool {
+	if partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Behavior != nil && partial.Roles.Fixer.Behavior.Loop != nil && partial.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds != nil {
+		return true
+	}
+	if field.overrideFromEnv() || field.overrideFromFlag(cmd) {
+		return true
+	}
+	return false
 }
 
 func (r *commandRuntime) configEdit(cmd *cobra.Command, args []string) error {
@@ -1186,6 +1219,19 @@ func positiveIntField(key, env, flag string, get func(config.Config) any, target
 	}}
 }
 
+func nonNegativeIntField(key, env, flag string, get func(config.Config) any, target func(*config.PartialConfig) **int) configField {
+	return configField{key: key, valueType: "integer", env: env, flag: flag, get: get, set: func(p *config.PartialConfig, raw string) error {
+		value, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || value < 0 {
+			return fmt.Errorf("invalid value for %s: must be an integer >= 0", key)
+		}
+		*target(p) = &value
+		return nil
+	}, unset: func(p *config.PartialConfig) {
+		*target(p) = nil
+	}}
+}
+
 func stringListField(key, env string, get func(config.Config) any, target func(*config.PartialConfig) **[]string) configField {
 	return configField{key: key, valueType: "string-list", env: env, get: get, set: func(p *config.PartialConfig, raw string) error {
 		items, err := parseConfigStringList(raw)
@@ -1536,6 +1582,30 @@ func ensurePartialFixerRoleTriggers(partial *config.PartialConfig) *config.Parti
 	return fixer.Triggers
 }
 
+func ensurePartialFixerBehavior(partial *config.PartialConfig) *config.PartialFixerBehaviorConfig {
+	fixer := ensurePartialFixerRole(partial)
+	if fixer.Behavior == nil {
+		fixer.Behavior = &config.PartialFixerBehaviorConfig{}
+	}
+	return fixer.Behavior
+}
+
+func ensurePartialFixerLoop(partial *config.PartialConfig) *config.PartialFixerLoopConfig {
+	behavior := ensurePartialFixerBehavior(partial)
+	if behavior.Loop == nil {
+		behavior.Loop = &config.PartialFixerLoopConfig{}
+	}
+	return behavior.Loop
+}
+
+func ensurePartialDefaultsLoop(partial *config.PartialConfig) *config.PartialDefaultsLoopConfig {
+	defaults := ensurePartialDefaults(partial)
+	if defaults.Loop == nil {
+		defaults.Loop = &config.PartialDefaultsLoopConfig{}
+	}
+	return defaults.Loop
+}
+
 func configFieldSet(partial config.PartialConfig, key string) bool {
 	switch key {
 	case "defaults.baseBranch":
@@ -1578,6 +1648,10 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 			return false
 		}
 		return partial.Defaults.OpenPRStrategy != nil
+	case "defaults.loop.quietPeriodSeconds":
+		return partial.Defaults != nil && partial.Defaults.Loop != nil && partial.Defaults.Loop.QuietPeriodSeconds != nil
+	case "roles.fixer.behavior.loop.quietPeriodSeconds":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Behavior != nil && partial.Roles.Fixer.Behavior.Loop != nil && partial.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds != nil
 	case "instructions.enabled":
 		return partial.Instructions != nil && partial.Instructions.Enabled != nil
 	case "package.autoUpgradeEnabled":

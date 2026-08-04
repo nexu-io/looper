@@ -1594,6 +1594,17 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: roles.Fixer.AutoDiscovery, IncludeDrafts: roles.Fixer.Triggers.IncludeDrafts, AuthorFilter: roles.Fixer.Triggers.AuthorFilter, Labels: append([]string(nil), roles.Fixer.Triggers.Labels...), LabelMode: roles.Fixer.Triggers.LabelMode}
 }
 
+// quietPeriodSeconds returns the effective fixer quiet period for a project.
+// Resolution: projects[].roles.fixer.behavior.loop ?? roles.fixer.behavior.loop
+// (defaults.loop inheritance is applied during config Normalize).
+func (r *Runner) quietPeriodSeconds(projectID string) int {
+	if r.projectRoleConfig != nil {
+		roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+		return roles.Fixer.Behavior.Loop.QuietPeriodSeconds
+	}
+	return 0
+}
+
 func (r *Runner) isForgejoProject(projectID string) bool {
 	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
 }
@@ -1740,13 +1751,14 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		headSHA = "unknown"
 	}
 	queueItem, err := r.enqueue(ctx, enqueueInput{
-		ProjectID:    project.ID,
-		LoopID:       loopResult.record.ID,
-		Repo:         repo,
-		PRNumber:     detail.Number,
-		HeadSHA:      headSHA,
-		FixItemsHash: fixItemsStateHash,
-		AvailableAt:  loopResult.availableAt,
+		ProjectID:      project.ID,
+		LoopID:         loopResult.record.ID,
+		Repo:           repo,
+		PRNumber:       detail.Number,
+		HeadSHA:        headSHA,
+		FixItemsHash:   fixItemsStateHash,
+		AvailableAt:    loopResult.availableAt,
+		DebounceExtend: loopResult.signalChanged || loopResult.created,
 	})
 	if err != nil {
 		return err
@@ -2280,9 +2292,12 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if current.Status == "paused" {
 		return false, nil
 	}
-	availableAt := r.now()
+	// Pending rediscovery after a run is a new scheduling decision for the
+	// still-actionable set: apply quiet period before the next start.
+	// Retry / no-op follow-up backoff remain separate and compose via max.
+	availableAt := loops.DebounceSchedule(r.now(), r.quietPeriodSeconds(current.ProjectID), time.Time{})
 	availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
-	queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: repo, PRNumber: prNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})
+	queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: repo, PRNumber: prNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt, DebounceExtend: true})
 	if err != nil {
 		return false, err
 	}
@@ -4968,16 +4983,18 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 }
 
 type loopUpsertResult struct {
-	record      storage.LoopRecord
-	created     bool
-	skipped     bool
-	availableAt time.Time
-	pending     bool
+	record        storage.LoopRecord
+	created       bool
+	skipped       bool
+	availableAt   time.Time
+	pending       bool
+	signalChanged bool
 }
 
 func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, headSHA, fixItemsHash, fixItemsStateHash string, fixItems []FixItem, unresolvedThreadIDs []string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	now := r.now()
+	quiet := r.quietPeriodSeconds(project.ID)
 	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
@@ -5025,14 +5042,11 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if decision.Action == rediscoveryActionSuppress {
 			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
 		}
-		availableAt := now
+		// No-op / follow-up backoff remains a separate constraint; compose via max later.
+		backoffAt := time.Time{}
 		if decision.Action == rediscoveryActionDefer {
-			availableAt = parseRFC3339OrZero(decision.NextEligibleAt)
-			if availableAt.IsZero() {
-				availableAt = now
-			}
+			backoffAt = parseRFC3339OrZero(decision.NextEligibleAt)
 		}
-		availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
 		activeRun, err := r.latestActiveRunningRun(ctx, updatedLoop.ID)
 		if err != nil {
 			return loopUpsertResult{}, err
@@ -5050,24 +5064,56 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			}
 			return loopUpsertResult{record: updatedLoop, created: false, pending: true}, nil
 		}
+		activeQueue, err := r.repos.Queue.FindActiveByLoopID(ctx, updatedLoop.ID)
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
+		existingAvailableAt := time.Time{}
+		signalChanged := true
+		if activeQueue != nil && activeQueue.Status == "queued" {
+			existingAvailableAt = parseRFC3339OrZero(activeQueue.AvailableAt)
+			queuedHash := fixItemsHashFromQueueItem(*activeQueue)
+			queuedHead := headShaFromQueueItem(*activeQueue)
+			// Identical fixable-set + head polls must not push AvailableAt out forever.
+			// Head SHA changes are debounce signals even when fix-item content is unchanged,
+			// so the quiet window resets and loop-scoped enqueue can replace the payload.
+			signalChanged = queuedHash == "" || queuedHash != strings.TrimSpace(fixItemsStateHash) ||
+				queuedHead == "" || queuedHead != strings.TrimSpace(headSHA)
+		}
+		availableAt := now
+		if signalChanged {
+			// New/changed signal: quiet-period extend (never shorten due to debounce).
+			availableAt = loops.DebounceSchedule(now, quiet, existingAvailableAt)
+		} else if !existingAvailableAt.IsZero() {
+			availableAt = existingAvailableAt
+		}
+		// Compose quiet period with no-op/follow-up backoff: eligible = max(constraints).
+		availableAt = loops.MaxTime(availableAt, backoffAt)
+		if availableAt.IsZero() {
+			availableAt = now
+		}
+		availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
 		updatedLoop.Status = "queued"
 		updatedLoop.NextRunAt = &availableAtISO
 		updatedLoop.UpdatedAt = nowISO
 		if err := r.repos.Loops.Upsert(ctx, updatedLoop); err != nil {
 			return loopUpsertResult{}, err
 		}
-		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
+		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt, signalChanged: signalChanged}, nil
 	}
 	seq, err := r.repos.Loops.AllocateSeq(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
+	// First discovery of a new fixable set: apply quiet period when configured.
+	availableAt := loops.DebounceSchedule(now, quiet, time.Time{})
+	availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
 	targetID := buildPullRequestTargetID(repo, prNumber)
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &availableAtISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
 		return loopUpsertResult{}, err
 	}
-	return loopUpsertResult{record: loop, created: true, availableAt: now}, nil
+	return loopUpsertResult{record: loop, created: true, availableAt: availableAt, signalChanged: true}, nil
 }
 
 func (r *Runner) resumePausedZeroProgressLoopIfStateChanged(ctx context.Context, projectID, repo string, prNumber int64, headSHA, fixItemsStateHash string) error {
@@ -5382,6 +5428,10 @@ type enqueueInput struct {
 	HeadSHA      string
 	FixItemsHash string
 	AvailableAt  time.Time
+	// DebounceExtend requests extend-only AvailableAt updates on new/changed
+	// signals (never pull earlier due to quiet period). Same-dedupe urgency
+	// pull-earlier remains available when DebounceExtend is false.
+	DebounceExtend bool
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
@@ -5395,35 +5445,70 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		availableAt = eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
 	}
 	if existing != nil {
-		if existing.Status == "queued" && isoTimeBefore(availableAt, existing.AvailableAt) {
-			updated := *existing
-			updated.AvailableAt = availableAt
-			updated.UpdatedAt = r.nowISO()
-			persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
-			if err != nil {
-				return storage.QueueItemRecord{}, err
+		if existing.Status == "queued" {
+			if input.DebounceExtend {
+				// Same fixable set: only extend AvailableAt when the candidate is later.
+				if isoTimeAfter(availableAt, existing.AvailableAt) {
+					updated := *existing
+					updated.AvailableAt = availableAt
+					updated.UpdatedAt = r.nowISO()
+					persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+					if err != nil {
+						return storage.QueueItemRecord{}, err
+					}
+					updated = persisted
+					r.wakeSchedulerAfterEnqueue()
+					return updated, nil
+				}
+				return *existing, nil
 			}
-			updated = persisted
-			r.wakeSchedulerAfterEnqueue()
-			return updated, nil
+			// Historical urgency path: same-dedupe items may pull earlier.
+			if isoTimeBefore(availableAt, existing.AvailableAt) {
+				updated := *existing
+				updated.AvailableAt = availableAt
+				updated.UpdatedAt = r.nowISO()
+				persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+				if err != nil {
+					return storage.QueueItemRecord{}, err
+				}
+				updated = persisted
+				r.wakeSchedulerAfterEnqueue()
+				return updated, nil
+			}
 		}
 		return *existing, nil
 	}
-	payload := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)})
+	payload := mustMarshalJSON(map[string]any{
+		"discoveryFingerprint": buildFixerDiscoveryFingerprint(input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash),
+		"fixItemsStateHash":    input.FixItemsHash,
+		"headSha":              input.HeadSHA,
+	})
+	// Loop-scoped coalesce: a fixItemsHash change must not create a second
+	// immediately-runnable queue item beside a delayed one for the same loop.
 	activeForLoop, err := r.repos.Queue.FindActiveByLoopID(ctx, input.LoopID)
 	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
 	if activeForLoop != nil {
 		if activeForLoop.Status == "queued" {
-			if !queueItemRequiresLabelAuthority(*activeForLoop) {
+			if !queueItemRequiresLabelAuthority(*activeForLoop) && !input.DebounceExtend {
 				return *activeForLoop, nil
 			}
 			updated := *activeForLoop
 			updated.DedupeKey = dedupeKey
-			updated.AvailableAt = availableAt
 			updated.PayloadJSON = &payload
 			updated.UpdatedAt = r.nowISO()
+			if input.DebounceExtend {
+				// Loop-scoped coalesce on hash change: update payload/dedupe in place
+				// and only extend AvailableAt (never shorten due to debounce).
+				if isoTimeAfter(availableAt, activeForLoop.AvailableAt) {
+					updated.AvailableAt = availableAt
+				} else {
+					updated.AvailableAt = activeForLoop.AvailableAt
+				}
+			} else {
+				updated.AvailableAt = availableAt
+			}
 			persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
 			if err != nil {
 				return storage.QueueItemRecord{}, err
@@ -5448,6 +5533,45 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		r.wakeSchedulerAfterEnqueue()
 	}
 	return persisted, nil
+}
+
+func fixItemsHashFromQueueItem(item storage.QueueItemRecord) string {
+	if item.PayloadJSON != nil {
+		payload := parseJSONObject(item.PayloadJSON)
+		if hash, ok := stringFromAny(payload["fixItemsStateHash"]); ok && strings.TrimSpace(hash) != "" {
+			return strings.TrimSpace(hash)
+		}
+	}
+	// Fallback: buildFixerDedupeKey ends with :headSHA:fixItemsHash
+	parts := strings.Split(item.DedupeKey, ":")
+	if len(parts) >= 1 {
+		return strings.TrimSpace(parts[len(parts)-1])
+	}
+	return ""
+}
+
+func headShaFromQueueItem(item storage.QueueItemRecord) string {
+	if item.PayloadJSON != nil {
+		payload := parseJSONObject(item.PayloadJSON)
+		if head, ok := stringFromAny(payload["headSha"]); ok && strings.TrimSpace(head) != "" {
+			return strings.TrimSpace(head)
+		}
+	}
+	// Fallback: buildFixerDedupeKey ends with :headSHA:fixItemsHash
+	parts := strings.Split(item.DedupeKey, ":")
+	if len(parts) >= 2 {
+		return strings.TrimSpace(parts[len(parts)-2])
+	}
+	return ""
+}
+
+func isoTimeAfter(candidate, current string) bool {
+	parsedCandidate := parseRFC3339OrZero(candidate)
+	parsedCurrent := parseRFC3339OrZero(current)
+	if parsedCandidate.IsZero() || parsedCurrent.IsZero() {
+		return false
+	}
+	return parsedCandidate.After(parsedCurrent)
 }
 
 func (r *Runner) wakeSchedulerAfterEnqueue() {

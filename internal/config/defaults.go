@@ -165,6 +165,11 @@ func DefaultConfig(cwd string) (Config, error) {
 			FixAllPullRequests: false,
 			OpenPRStrategy:     OpenPRStrategyAllDone,
 			AddSnapshotMode:    AddSnapshotModeAsync,
+			Loop: DefaultsLoopConfig{
+				// Shared quiet-period default. Reviewer inherits when its role
+				// field is unset; fixer defaults to 0 at the role level (opt-in).
+				QuietPeriodSeconds: 60,
+			},
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
@@ -272,6 +277,12 @@ func DefaultConfig(cwd string) (Config, error) {
 					AuthorFilter:  FixerAuthorFilterCurrentUser,
 					Labels:        []string{},
 					LabelMode:     LabelModeAll,
+				},
+				Behavior: FixerBehaviorConfig{
+					Loop: FixerLoopConfig{
+						// Opt-in: keep historical immediate-start behavior until operators enable quiet period.
+						QuietPeriodSeconds: 0,
+					},
 				},
 			},
 			Worker: WorkerRoleConfig{

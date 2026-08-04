@@ -86,6 +86,8 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"defaults.baseBranch",
 		"roles.reviewer.behavior.loop.minPublishIntervalSeconds",
 		"roles.reviewer.behavior.loop.quietPeriodSeconds",
+		"defaults.loop.quietPeriodSeconds",
+		"roles.fixer.behavior.loop.quietPeriodSeconds",
 		"roles.reviewer.behavior.retry.maxDelayMs",
 		"roles.planner.triggers.planeAssigneeId",
 		"roles.coordinator.mergeWatch.transientRetries",

@@ -393,16 +393,26 @@ type ProjectNetworkConfig struct {
 	Mode NetworkMode `json:"mode,omitempty"`
 }
 
+type DefaultsLoopConfig struct {
+	// QuietPeriodSeconds is the shared default settle window for role loops.
+	// 0 disables quiet-period debounce. Role overrides win when set.
+	// Must be >= 0 and fit in time.Duration when converted from seconds.
+	// Design trade-off (failure prevented, costs, alternatives): see
+	// docs/configuration.md § Quiet-period debounce → Concept trade-off.
+	QuietPeriodSeconds int `json:"quietPeriodSeconds"`
+}
+
 type DefaultsConfig struct {
-	BaseBranch         string          `json:"baseBranch"`
-	AllowAutoCommit    bool            `json:"allowAutoCommit"`
-	AllowAutoPush      bool            `json:"allowAutoPush"`
-	AllowAutoApprove   bool            `json:"allowAutoApprove"`
-	AllowAutoMerge     bool            `json:"allowAutoMerge"`
-	AllowRiskyFixes    bool            `json:"allowRiskyFixes"`
-	FixAllPullRequests bool            `json:"fixAllPullRequests"`
-	OpenPRStrategy     OpenPRStrategy  `json:"openPrStrategy"`
-	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
+	BaseBranch         string             `json:"baseBranch"`
+	AllowAutoCommit    bool               `json:"allowAutoCommit"`
+	AllowAutoPush      bool               `json:"allowAutoPush"`
+	AllowAutoApprove   bool               `json:"allowAutoApprove"`
+	AllowAutoMerge     bool               `json:"allowAutoMerge"`
+	AllowRiskyFixes    bool               `json:"allowRiskyFixes"`
+	FixAllPullRequests bool               `json:"fixAllPullRequests"`
+	OpenPRStrategy     OpenPRStrategy     `json:"openPrStrategy"`
+	AddSnapshotMode    AddSnapshotMode    `json:"addSnapshotMode"`
+	Loop               DefaultsLoopConfig `json:"loop"`
 }
 
 type ReviewerLoopConfig struct {
@@ -533,9 +543,20 @@ type ReviewerRoleConfig struct {
 	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
 }
 
+type FixerLoopConfig struct {
+	// QuietPeriodSeconds delays fixer work after a new/changed fixable set.
+	// 0 disables quiet-period debounce (immediate enqueue). Default is 0.
+	QuietPeriodSeconds int `json:"quietPeriodSeconds"`
+}
+
+type FixerBehaviorConfig struct {
+	Loop FixerLoopConfig `json:"loop"`
+}
+
 type FixerRoleConfig struct {
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      FixerRoleTriggersConfig `json:"triggers"`
+	Behavior      FixerBehaviorConfig     `json:"behavior"`
 	Instructions  string                  `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
@@ -867,16 +888,21 @@ type PartialNetworkConfig struct {
 	GitHubUserID     *int64  `json:"githubUserId,omitempty"`
 }
 
+type PartialDefaultsLoopConfig struct {
+	QuietPeriodSeconds *int `json:"quietPeriodSeconds,omitempty"`
+}
+
 type PartialDefaultsConfig struct {
-	BaseBranch         *string          `json:"baseBranch,omitempty"`
-	AllowAutoCommit    *bool            `json:"allowAutoCommit,omitempty"`
-	AllowAutoPush      *bool            `json:"allowAutoPush,omitempty"`
-	AllowAutoApprove   *bool            `json:"allowAutoApprove,omitempty"`
-	AllowAutoMerge     *bool            `json:"allowAutoMerge,omitempty"`
-	AllowRiskyFixes    *bool            `json:"allowRiskyFixes,omitempty"`
-	FixAllPullRequests *bool            `json:"fixAllPullRequests,omitempty"`
-	OpenPRStrategy     *OpenPRStrategy  `json:"openPrStrategy,omitempty"`
-	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
+	BaseBranch         *string                    `json:"baseBranch,omitempty"`
+	AllowAutoCommit    *bool                      `json:"allowAutoCommit,omitempty"`
+	AllowAutoPush      *bool                      `json:"allowAutoPush,omitempty"`
+	AllowAutoApprove   *bool                      `json:"allowAutoApprove,omitempty"`
+	AllowAutoMerge     *bool                      `json:"allowAutoMerge,omitempty"`
+	AllowRiskyFixes    *bool                      `json:"allowRiskyFixes,omitempty"`
+	FixAllPullRequests *bool                      `json:"fixAllPullRequests,omitempty"`
+	OpenPRStrategy     *OpenPRStrategy            `json:"openPrStrategy,omitempty"`
+	AddSnapshotMode    *AddSnapshotMode           `json:"addSnapshotMode,omitempty"`
+	Loop               *PartialDefaultsLoopConfig `json:"loop,omitempty"`
 }
 
 type PartialReviewerLoopConfig struct {
@@ -1030,9 +1056,18 @@ type PartialReviewerRoleConfig struct {
 	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
 }
 
+type PartialFixerLoopConfig struct {
+	QuietPeriodSeconds *int `json:"quietPeriodSeconds,omitempty"`
+}
+
+type PartialFixerBehaviorConfig struct {
+	Loop *PartialFixerLoopConfig `json:"loop,omitempty"`
+}
+
 type PartialFixerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
+	Behavior      *PartialFixerBehaviorConfig     `json:"behavior,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }

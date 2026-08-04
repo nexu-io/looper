@@ -143,7 +143,10 @@
         "allowRiskyFixes": false,
         "fixAllPullRequests": false,
         "openPrStrategy": "all_done",
-        "addSnapshotMode": "async"
+        "addSnapshotMode": "async",
+        "loop": {
+          "quietPeriodSeconds": 60
+        }
       },
       "instructions": {
         "enabled": true,
@@ -273,6 +276,11 @@
             "labels": [],
             "labelMode": "all",
             "authorFilter": "current_user"
+          },
+          "behavior": {
+            "loop": {
+              "quietPeriodSeconds": 0
+            }
           }
         },
         "worker": {

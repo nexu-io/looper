@@ -218,9 +218,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
 	}
 
-	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
-	}
+	validateQuietPeriodSeconds(config.Defaults.Loop.QuietPeriodSeconds, "defaults.loop.quietPeriodSeconds", &issues)
+	validateQuietPeriodSeconds(config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds, "roles.reviewer.behavior.loop.quietPeriodSeconds", &issues)
+	validateQuietPeriodSeconds(config.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds, "roles.fixer.behavior.loop.quietPeriodSeconds", &issues)
 	if config.Roles.Reviewer.Behavior.Loop.MinPublishIntervalSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
 	}
@@ -646,6 +646,20 @@ func validateAgentTimeoutSeconds(seconds int, path string, issues *[]ValidationI
 	}
 }
 
+// validateQuietPeriodSeconds rejects negatives and values that overflow time.Duration
+// when converted from seconds (now.Add(time.Duration(seconds) * time.Second)).
+func validateQuietPeriodSeconds(seconds int, path string, issues *[]ValidationIssue) {
+	if seconds < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be an integer >= 0"})
+		return
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	maxSeconds := int64(maxDuration / time.Second)
+	if int64(seconds) > maxSeconds {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must fit within time.Duration when converted from seconds"})
+	}
+}
+
 func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxInstructionBytes int, issues *[]ValidationIssue) {
 	if roles == nil {
 		return
@@ -684,6 +698,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 			}
 		}
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.Loop != nil && roles.Reviewer.Behavior.Loop.QuietPeriodSeconds != nil {
+			validateQuietPeriodSeconds(*roles.Reviewer.Behavior.Loop.QuietPeriodSeconds, prefix+".reviewer.behavior.loop.quietPeriodSeconds", issues)
+		}
 		if roles.Reviewer.AutoMerge != nil {
 			validatePartialReviewerAutoMerge(*roles.Reviewer.AutoMerge, prefix+".reviewer.autoMerge", issues)
 		}
@@ -692,6 +709,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		validateProjectRoleInstruction(prefix+".fixer.instructions", "fixer", roles.Fixer.Instructions, maxInstructionBytes, issues)
 		if roles.Fixer.Triggers != nil {
 			validateFixerRoleTriggers(partialFixerRoleTriggers(*roles.Fixer.Triggers), prefix+".fixer.triggers", issues)
+		}
+		if roles.Fixer.Behavior != nil && roles.Fixer.Behavior.Loop != nil && roles.Fixer.Behavior.Loop.QuietPeriodSeconds != nil {
+			validateQuietPeriodSeconds(*roles.Fixer.Behavior.Loop.QuietPeriodSeconds, prefix+".fixer.behavior.loop.quietPeriodSeconds", issues)
 		}
 	}
 	if roles.Coordinator != nil {
