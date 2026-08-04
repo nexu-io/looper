@@ -1625,6 +1625,10 @@ func configFieldSet(partial config.PartialConfig, key string) bool {
 			return false
 		}
 		return partial.Defaults.OpenPRStrategy != nil
+	case "defaults.loop.quietPeriodSeconds":
+		return partial.Defaults != nil && partial.Defaults.Loop != nil && partial.Defaults.Loop.QuietPeriodSeconds != nil
+	case "roles.fixer.behavior.loop.quietPeriodSeconds":
+		return partial.Roles != nil && partial.Roles.Fixer != nil && partial.Roles.Fixer.Behavior != nil && partial.Roles.Fixer.Behavior.Loop != nil && partial.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds != nil
 	case "instructions.enabled":
 		return partial.Instructions != nil && partial.Instructions.Enabled != nil
 	case "package.autoUpgradeEnabled":

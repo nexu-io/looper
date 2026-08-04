@@ -1169,6 +1169,9 @@ func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
 		"--roles-reviewer-discovery-triggers-enable-self-review",
 		"true",
 		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--defaults-loop-quiet-period-seconds",
+		"90",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=30",
 		"--instructions-enabled=true",
 		"--project",
 		"demo",
@@ -1182,6 +1185,9 @@ func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
 		"--roles-reviewer-discovery-triggers-enable-self-review",
 		"true",
 		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--defaults-loop-quiet-period-seconds",
+		"90",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=30",
 		"--instructions-enabled=true",
 	}
 
@@ -2385,6 +2391,45 @@ func TestConfigShowSourceDetectsFixerAuthorFilterCLIOverride(t *testing.T) {
 		t.Fatalf("Run([config show --source --roles-fixer-triggers-author-filter]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
 	assertConfigFieldSource(t, stdout, "roles.fixer.triggers.authorFilter", "cli")
+}
+
+func TestConfigShowSourceDetectsQuietPeriodConfigFileAndCLI(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"loop": map[string]any{
+				"quietPeriodSeconds": 90,
+			},
+		},
+		"roles": map[string]any{
+			"fixer": map[string]any{
+				"behavior": map[string]any{
+					"loop": map[string]any{
+						"quietPeriodSeconds": 15,
+					},
+				},
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "config-file")
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source",
+		"--defaults-loop-quiet-period-seconds=120",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=45",
+		"--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source with quiet-period flags]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "cli")
 }
 
 func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testing.T) {
