@@ -141,6 +141,50 @@ func TestQuietPeriodValidationRejectsNegative(t *testing.T) {
 	assertValidationIssue(t, validationErr, "roles.fixer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
 }
 
+func TestQuietPeriodValidationRejectsNegativeProjectOverride(t *testing.T) {
+	t.Parallel()
+	repoPath := t.TempDir()
+	negativeQuiet := -5
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Projects: &[]PartialProjectRefConfig{
+			{
+				ID:       "demo",
+				Name:     "Demo",
+				RepoPath: repoPath,
+				Roles: &PartialRoleConfigs{
+					Fixer: &PartialFixerRoleConfig{
+						Behavior: &PartialFixerBehaviorConfig{
+							Loop: &PartialFixerLoopConfig{QuietPeriodSeconds: &negativeQuiet},
+						},
+					},
+					Reviewer: &PartialReviewerRoleConfig{
+						Behavior: &PartialReviewerConfig{
+							Loop: &PartialReviewerLoopConfig{QuietPeriodSeconds: &negativeQuiet},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	// Global values remain valid; only project overrides are negative.
+	if cfg.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds < 0 {
+		t.Fatalf("global fixer quiet = %d, want non-negative before project validation", cfg.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds)
+	}
+	err = Validate(cfg)
+	if err == nil {
+		t.Fatal("Validate() = nil, want validation error for project quiet-period overrides")
+	}
+	validationErr, ok := err.(*ConfigValidationError)
+	if !ok {
+		t.Fatalf("Validate() error type = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].roles.fixer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.loop.quietPeriodSeconds", "must be an integer >= 0")
+}
+
 func TestQuietPeriodNoInheritanceWhenDefaultsLoopUnset(t *testing.T) {
 	t.Parallel()
 	// Without an explicit defaults.loop partial, role defaults stay at DefaultConfig values.

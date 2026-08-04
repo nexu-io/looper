@@ -690,6 +690,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 			}
 		}
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.Loop != nil && roles.Reviewer.Behavior.Loop.QuietPeriodSeconds != nil {
+			if *roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
+			}
+		}
 		if roles.Reviewer.AutoMerge != nil {
 			validatePartialReviewerAutoMerge(*roles.Reviewer.AutoMerge, prefix+".reviewer.autoMerge", issues)
 		}
@@ -698,6 +703,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		validateProjectRoleInstruction(prefix+".fixer.instructions", "fixer", roles.Fixer.Instructions, maxInstructionBytes, issues)
 		if roles.Fixer.Triggers != nil {
 			validateFixerRoleTriggers(partialFixerRoleTriggers(*roles.Fixer.Triggers), prefix+".fixer.triggers", issues)
+		}
+		if roles.Fixer.Behavior != nil && roles.Fixer.Behavior.Loop != nil && roles.Fixer.Behavior.Loop.QuietPeriodSeconds != nil {
+			if *roles.Fixer.Behavior.Loop.QuietPeriodSeconds < 0 {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".fixer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
+			}
 		}
 	}
 	if roles.Coordinator != nil {
