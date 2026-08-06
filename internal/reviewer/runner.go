@@ -4633,6 +4633,15 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if err != nil {
 		return resumedRunContext{}, err
 	}
+	if latestRun != nil && latestRun.Status == "running" {
+		// Another processor already owns the running slot for this loop. Do not
+		// insert a second running run; map to retryable_transient (issue #634).
+		// Stale orphans are ReconcileStaleRuns' job — this path only refuses the race.
+		return resumedRunContext{}, &loopError{
+			message: fmt.Sprintf("loop %s already has a running reviewer run %s", loop.ID, latestRun.ID),
+			kind:    FailureRetryableTransient,
+		}
+	}
 	checkpoint := parseCheckpoint(nil)
 	lastCompleted := ReviewerStep("")
 	failedStep := ReviewerStep("")
@@ -4699,6 +4708,18 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
+		if hasRunning, checkErr := r.repos.Runs.HasRunningByLoopID(ctx, loop.ID); checkErr == nil && hasRunning {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running reviewer run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
+		if failureclass.IsOneRunningRunPerLoopViolation(err) {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running reviewer run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil

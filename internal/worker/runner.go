@@ -2486,6 +2486,12 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if err != nil {
 		return resumedRunContext{}, err
 	}
+	if latestRun != nil && latestRun.Status == "running" {
+		return resumedRunContext{}, &loopError{
+			message: fmt.Sprintf("loop %s already has a running worker run %s", loop.ID, latestRun.ID),
+			kind:    FailureRetryableTransient,
+		}
+	}
 	checkpoint := workerCheckpoint{}
 	var lastCompletedStep WorkerStep
 	var failedStep WorkerStep
@@ -2543,6 +2549,18 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		}
 	}
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
+		if hasRunning, checkErr := r.repos.Runs.HasRunningByLoopID(ctx, loop.ID); checkErr == nil && hasRunning {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running worker run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
+		if failureclass.IsOneRunningRunPerLoopViolation(err) {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running worker run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
 		return resumedRunContext{}, err
 	}
 	parsedCheckpoint, err := parseCheckpoint(run.CheckpointJSON)
