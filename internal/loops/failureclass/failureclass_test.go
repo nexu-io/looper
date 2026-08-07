@@ -139,6 +139,29 @@ func TestClassifyGenericGitHub404StaysRetryable(t *testing.T) {
 	}
 }
 
+func TestClassifyOneRunningRunPerLoopUniqueIsRetryable(t *testing.T) {
+	// Leaked SQLite UNIQUE from idx_runs_one_running_per_loop must never become
+	// non_retryable/MI when createRun race mapping is skipped (issue #634).
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{name: "wrapped upsert", message: "upsert run: UNIQUE constraint failed: runs.loop_id"},
+		{name: "index name", message: "UNIQUE constraint failed: idx_runs_one_running_per_loop"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Classify(errors.New(tt.message), Context{Runner: RunnerReviewer, Boundary: BoundaryStorage})
+			if got != RetryableTransient {
+				t.Fatalf("Classify() = %s, want %s", got, RetryableTransient)
+			}
+			if !IsOneRunningRunPerLoopViolation(errors.New(tt.message)) {
+				t.Fatalf("IsOneRunningRunPerLoopViolation(%q) = false, want true", tt.message)
+			}
+		})
+	}
+}
+
 // typedHTTPStatusError mirrors provider errors such as forge.ForgejoHTTPError
 // that expose the original HTTP status without importing provider packages.
 type typedHTTPStatusError struct {

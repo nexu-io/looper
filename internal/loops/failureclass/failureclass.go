@@ -95,6 +95,12 @@ func Classify(err error, ctx Context) Kind {
 	if message == "" {
 		message = strings.ToLower(err.Error())
 	}
+	// Concurrent createRunContext races hit idx_runs_one_running_per_loop. The
+	// durable index is correct; treat a leaked UNIQUE as retryable so it cannot
+	// park the queue in manual_intervention (issue #634).
+	if isOneRunningRunPerLoopViolation(message) {
+		return RetryableTransient
+	}
 	if isManualWorktreeMessage(message) || ctx.Boundary == BoundaryLocalWorktree {
 		return ManualIntervention
 	}
@@ -126,6 +132,24 @@ func isInternalDeterministicBoundary(boundary Boundary) bool {
 	default:
 		return false
 	}
+}
+
+// IsOneRunningRunPerLoopViolation reports whether err is the partial unique
+// index on runs(loop_id) WHERE status='running'. Exported so runners can map
+// the conflict to a typed busy error without string-matching in three places.
+func IsOneRunningRunPerLoopViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isOneRunningRunPerLoopViolation(strings.ToLower(err.Error()))
+}
+
+func isOneRunningRunPerLoopViolation(message string) bool {
+	if !strings.Contains(message, "unique constraint failed") {
+		return false
+	}
+	return strings.Contains(message, "runs.loop_id") ||
+		strings.Contains(message, "idx_runs_one_running_per_loop")
 }
 
 func isManualWorktreeMessage(message string) bool {
