@@ -328,7 +328,7 @@ export function LoopActionBar({
       case "retry-unusable":
         return {
           title: "Unusable worktree path — clear and retry?",
-          body: "This path is not a usable git checkout. Removing it deletes the entire managed directory (including leftover agent files), then re-queues the loop. Inspect first if unsure.",
+          body: "Looper could not verify this as a usable checkout. Confirming will delete the entire managed path, including uncommitted or leftover files, then re-queue the loop. Inspect first if unsure.",
           confirmLabel: "Clear path & retry",
           danger: true,
           cancelLabel: "Inspect first",
@@ -471,7 +471,7 @@ export function LoopActionBar({
               {inspectGuidance.offerDiscard
                 ? "Review local changes in the worktree, then retry again. Use jump from a terminal on this machine."
                 : inspectGuidance.offerClear
-                  ? "This path is not a usable git checkout. Inspect leftovers, then clear the path and retry if appropriate."
+                  ? "Looper could not verify this as a usable checkout. Inspect leftovers, then clear the path and retry if appropriate."
                   : "This path is not a Looper-managed worktree, so discard is unavailable. Inspect manually, then retry only after the tree is clean or the path is fixed."}
             </p>
             {inspectGuidance.worktree.branch ? (

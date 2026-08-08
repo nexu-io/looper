@@ -629,9 +629,9 @@ export function RecoveryCard({
               onConfirm={() => void onClearRetry()}
             >
               <p className="m-0 text-[var(--text-muted)]">
-                This path is not a usable git checkout. Looper will remove the entire
-                managed directory (including any leftover agent files), then re-queue
-                the loop. Inspect first if you are unsure.
+                Looper could not verify this as a usable checkout. Confirming will
+                delete the entire managed path, including uncommitted or leftover
+                files, then re-queue the loop. Inspect first if you are unsure.
               </p>
               {worktree?.worktreePath ? (
                 <div className="mt-2 rounded border border-[var(--border)] bg-[var(--bg)] p-2">

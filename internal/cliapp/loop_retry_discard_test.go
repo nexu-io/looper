@@ -105,6 +105,88 @@ func TestLoopRetryClearUnusableWorktreeWiresAPIBodyAndHumanOutput(t *testing.T) 
 	}
 }
 
+func TestLoopRetryClearUnusableWorktreeRejectsDaemonWithoutAck(t *testing.T) {
+	t.Parallel()
+
+	// Pre-change daemon ignores clearUnusableWorktreePath and echoes a plain retry.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/loops/3146/retry" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_retry_plain", map[string]any{
+			"loop": map[string]any{
+				"id": "loop_retry_plain", "seq": 3146, "projectId": "project_1",
+				"type": "fixer", "targetType": "pull_request", "status": "queued",
+			},
+			"queueItemId":            "queue_new",
+			"mode":                   "auto",
+			"resetAttempts":          true,
+			"discardWorktreeChanges": false,
+			// clearUnusableWorktreePath omitted — older daemon contract
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, HTTPClient: server.Client()})
+	args := []string{"--config", configPath, "loop", "retry", "3146", "--clear-unusable-worktree", "--confirm"}
+	if exitCode := app.Run(context.Background(), args); exitCode == 0 {
+		t.Fatalf("Run() exit code = 0, want failure when daemon omits clear ack; stdout=%q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "did not acknowledge clearUnusableWorktreePath") {
+		t.Fatalf("stderr = %q, want clear acknowledgement error", stderr.String())
+	}
+}
+
+func TestLoopRetryClearUnusableWorktreeRejectsFalseAck(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/loops/3147/retry" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_retry_false_ack", map[string]any{
+			"loop": map[string]any{
+				"id": "loop_retry_false_ack", "seq": 3147, "projectId": "project_1",
+				"type": "fixer", "targetType": "pull_request", "status": "queued",
+			},
+			"queueItemId":               "queue_new",
+			"mode":                      "auto",
+			"resetAttempts":             true,
+			"discardWorktreeChanges":    false,
+			"clearUnusableWorktreePath": false,
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, HTTPClient: server.Client()})
+	args := []string{"--config", configPath, "loop", "retry", "3147", "--clear-unusable-worktree", "--confirm"}
+	if exitCode := app.Run(context.Background(), args); exitCode == 0 {
+		t.Fatalf("Run() exit code = 0, want failure when daemon echoes false; stdout=%q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "did not acknowledge clearUnusableWorktreePath") {
+		t.Fatalf("stderr = %q, want clear acknowledgement error", stderr.String())
+	}
+}
+
+func TestRequireClearUnusableWorktreeAck(t *testing.T) {
+	t.Parallel()
+	if err := requireClearUnusableWorktreeAck(json.RawMessage(`{"clearUnusableWorktreePath":true}`)); err != nil {
+		t.Fatalf("true ack error = %v", err)
+	}
+	if err := requireClearUnusableWorktreeAck(json.RawMessage(`{}`)); err == nil {
+		t.Fatal("omitted field: want error")
+	}
+	if err := requireClearUnusableWorktreeAck(json.RawMessage(`{"clearUnusableWorktreePath":false}`)); err == nil {
+		t.Fatal("false ack: want error")
+	}
+}
+
 func TestLoopRetryDiscardWorktreeChangesWiresAPIBodyAndHumanOutput(t *testing.T) {
 	t.Parallel()
 
@@ -240,7 +322,7 @@ func TestLoopRetryWorktreePreflight(t *testing.T) {
 				"managed":      true, "reason": "unusable_path",
 			},
 			expectExitOK: true, expectClear: &trueVal, expectDiscard: &falseVal,
-			errContains:    []string{"unusable"},
+			errContains:    []string{"could not verify a usable checkout"},
 			stdoutContains: []string{"Loop retry queued"},
 		},
 		{
@@ -281,19 +363,34 @@ func TestLoopRetryWorktreePreflight(t *testing.T) {
 					}
 					raw, _ := io.ReadAll(r.Body)
 					_ = json.Unmarshal(raw, &gotBody)
-					writeEnvelope(t, w, pkgapi.Success("req_retry", map[string]any{
+					clearRequested := gotBody["clearUnusableWorktreePath"] == true
+					discardRequested := gotBody["discardWorktreeChanges"] == true
+					resp := map[string]any{
 						"loop": map[string]any{
 							"id": "loop_" + tc.selector, "seq": 3491, "projectId": "project_1",
 							"type": "fixer", "targetType": "pull_request", "status": "queued",
 						},
-						"queueItemId": "queue_new", "mode": "auto", "resetAttempts": true,
-						"discardWorktreeChanges": gotBody["discardWorktreeChanges"] == true,
-						"worktreeDiscard": map[string]any{
+						"queueItemId":               "queue_new",
+						"mode":                      "auto",
+						"resetAttempts":             true,
+						"discardWorktreeChanges":    discardRequested,
+						"clearUnusableWorktreePath": clearRequested,
+					}
+					if discardRequested {
+						resp["worktreeDiscard"] = map[string]any{
 							"worktreePath": "/tmp/managed/dirty-wt",
-							"discarded":    gotBody["discardWorktreeChanges"] == true,
+							"discarded":    true,
 							"noOp":         false, "reason": "discarded",
-						},
-					}))
+						}
+					}
+					if clearRequested {
+						resp["worktreeClearUnusable"] = map[string]any{
+							"worktreePath": "/tmp/managed/hollow-wt",
+							"cleared":      true,
+							"noOp":         false, "reason": "cleared",
+						}
+					}
+					writeEnvelope(t, w, pkgapi.Success("req_retry", resp))
 				default:
 					t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 				}

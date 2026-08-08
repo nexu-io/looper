@@ -104,7 +104,7 @@ export function recoveryGuidance(
     case "offer-discard":
       return "Managed worktree has local uncommitted changes. Inspect or jump first, or confirm Discard & Retry to drop them and re-queue.";
     case "offer-clear":
-      return "Managed path is not a usable git checkout (hollow leftovers). Inspect first if unsure — leftovers may include agent output — then confirm Clear unusable path & Retry.";
+      return "Looper could not verify this managed path as a usable checkout (hollow leftovers). Inspect first if unsure — leftovers may include agent output — then confirm Clear unusable path & Retry.";
     case "inspect-only":
       return "Worktree is unmanaged or its dirty state cannot be verified. Inspect manually; Dashboard discard is unavailable.";
   }

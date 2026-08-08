@@ -161,8 +161,10 @@ var ErrUsableCheckoutRefusesClear = errors.New("usable checkout refuses clear")
 // clear of empty/metadata-only leftovers), this allows full RemoveAll of
 // non-empty hollow leftovers after explicit operator confirmation.
 //
-// Authority: LocalCheckoutUsable + Validate (managed path under worktree root).
-// Not agent output. Never used by runners automatically.
+// Authority: the operator's explicit destructive request for a daemon-resolved
+// managed path. Validate bounds the target; LocalCheckoutUsable is only a
+// defense-in-depth refusal guard (not git-status equivalence). Never used by
+// runners automatically.
 //
 // Behavior:
 //   - missing path → nil (already clear)

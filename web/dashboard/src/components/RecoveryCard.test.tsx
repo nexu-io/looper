@@ -247,7 +247,7 @@ describe("RecoveryCard", () => {
       }),
     );
 
-    await screen.findByText(/not a usable git checkout/i);
+    await screen.findByText(/could not verify this managed path as a usable checkout/i);
     expect(screen.getByText("unusable")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Discard & Retry" })).toBeNull();
     fireEvent.click(

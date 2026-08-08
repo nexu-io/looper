@@ -164,12 +164,15 @@ type loopRetryWorktreeClearUnusableOutput struct {
 }
 
 type loopRetryOutput struct {
-	Loop                      loopOutput                            `json:"loop"`
-	QueueItemID               *string                               `json:"queueItemId"`
-	Mode                      string                                `json:"mode"`
-	ResetAttempts             bool                                  `json:"resetAttempts"`
-	DiscardWorktreeChanges    bool                                  `json:"discardWorktreeChanges"`
-	ClearUnusableWorktreePath bool                                  `json:"clearUnusableWorktreePath"`
+	Loop                   loopOutput `json:"loop"`
+	QueueItemID            *string    `json:"queueItemId"`
+	Mode                   string     `json:"mode"`
+	ResetAttempts          bool       `json:"resetAttempts"`
+	DiscardWorktreeChanges bool       `json:"discardWorktreeChanges"`
+	// ClearUnusableWorktreePath is a pointer so field presence is preserved.
+	// Older daemons omit the key (nil); true is the only acknowledgement that
+	// clear-unusable was understood by the daemon.
+	ClearUnusableWorktreePath *bool                                 `json:"clearUnusableWorktreePath"`
 	WorktreeDiscard           *loopRetryWorktreeDiscardOutput       `json:"worktreeDiscard"`
 	WorktreeClearUnusable     *loopRetryWorktreeClearUnusableOutput `json:"worktreeClearUnusable"`
 }
@@ -544,7 +547,7 @@ func writeHumanLoopRetried(w io.Writer, payload json.RawMessage) error {
 			)
 		}
 	}
-	if data.ClearUnusableWorktreePath {
+	if data.ClearUnusableWorktreePath != nil && *data.ClearUnusableWorktreePath {
 		fields = append(fields, [2]any{"clearUnusableWorktreePath", true})
 		if data.WorktreeClearUnusable != nil {
 			fields = append(fields,

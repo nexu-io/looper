@@ -372,8 +372,36 @@ func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
 		if clearUnusable {
 			body["clearUnusableWorktreePath"] = true
 		}
-		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
+		payload, err := r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
+		if err != nil {
+			return nil, err
+		}
+		// Pre-change daemons ignore clearUnusableWorktreePath and queue a plain
+		// retry. Require an explicit true echo so success cannot mean "nothing cleared".
+		if clearUnusable {
+			if err := requireClearUnusableWorktreeAck(payload); err != nil {
+				return nil, err
+			}
+		}
+		return payload, nil
 	}, writeHumanLoopRetried)
+}
+
+// requireClearUnusableWorktreeAck fails when the daemon did not acknowledge
+// clearUnusableWorktreePath=true. Omitted or false means an older daemon that
+// silently ignored the request body field.
+func requireClearUnusableWorktreeAck(payload json.RawMessage) error {
+	var data loopRetryOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode loop retry response: %w", err)
+	}
+	if data.ClearUnusableWorktreePath == nil {
+		return fmt.Errorf("daemon did not acknowledge clearUnusableWorktreePath (field omitted); upgrade looperd or clear the path manually then retry without --clear-unusable-worktree")
+	}
+	if !*data.ClearUnusableWorktreePath {
+		return fmt.Errorf("daemon did not acknowledge clearUnusableWorktreePath (got false); upgrade looperd or clear the path manually then retry without --clear-unusable-worktree")
+	}
+	return nil
 }
 
 type loopWorktreeStatusOutput struct {
@@ -430,15 +458,16 @@ func promptClearUnusableWorktree(cmd *cobra.Command, selector string, status *lo
 	if status != nil && status.WorktreePath != nil {
 		path = strings.TrimSpace(*status.WorktreePath)
 	}
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Worktree path is unusable (not a git checkout) for loop %s\n", strings.TrimSpace(selector))
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Looper could not verify a usable checkout for loop %s\n", strings.TrimSpace(selector))
 	if path != "" {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  path: %s\n", path)
 	}
-	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  Leftovers may include agent output; inspect first if unsure.")
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  Confirming deletes the entire managed path, including uncommitted or leftover files.")
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  Inspect first if unsure.")
 	return promptBootstrapBool(
 		bufio.NewReader(cmd.InOrStdin()),
 		cmd.ErrOrStderr(),
-		"Remove unusable path and retry",
+		"Remove managed path and retry",
 		false,
 	)
 }
