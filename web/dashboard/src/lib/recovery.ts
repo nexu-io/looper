@@ -2,11 +2,16 @@ import type { LoopWorktreeStatus } from "@/lib/api";
 import {
   classifyRetryWorktree,
   type WorktreeActionDecision,
+  worktreeAllowsDashboardClear,
   worktreeAllowsDashboardDiscard,
 } from "@/lib/worktree";
 
 export type { WorktreeActionDecision };
-export { classifyRetryWorktree, worktreeAllowsDashboardDiscard };
+export {
+  classifyRetryWorktree,
+  worktreeAllowsDashboardClear,
+  worktreeAllowsDashboardDiscard,
+};
 
 /**
  * Whether recovery has no classifiable worktree preflight response.
@@ -45,6 +50,15 @@ export function recoveryOffersDiscard(
   return worktreeAllowsDashboardDiscard(worktree);
 }
 
+/** Whether the recovery card may offer Clear unusable path & Retry. */
+export function recoveryOffersClear(
+  worktree: LoopWorktreeStatus | null | undefined,
+  opts?: { fetchFailed?: boolean },
+): boolean {
+  if (isRecoveryWorktreeUnavailable(worktree, opts)) return false;
+  return worktreeAllowsDashboardClear(worktree);
+}
+
 /** Whether the recovery card should present Retry as the recommended action. */
 export function recoveryRecommendsRetry(
   worktree: LoopWorktreeStatus | null | undefined,
@@ -59,6 +73,10 @@ export function recoveryJumpCommand(selector: string): string {
 
 export function recoveryDiscardCliHint(selector: string): string {
   return `looper retry ${selector} --discard-worktree-changes --confirm`;
+}
+
+export function recoveryClearCliHint(selector: string): string {
+  return `looper retry ${selector} --clear-unusable-worktree --confirm`;
 }
 
 /** True when loop detail should show the manual-recovery card (not HITL decision). */
@@ -85,6 +103,8 @@ export function recoveryGuidance(
       return "Plain retry is safe (worktree clean or not required yet). Re-queue automation without discarding changes.";
     case "offer-discard":
       return "Managed worktree has local uncommitted changes. Inspect or jump first, or confirm Discard & Retry to drop them and re-queue.";
+    case "offer-clear":
+      return "Managed path is not a usable git checkout (hollow leftovers). Inspect first if unsure — leftovers may include agent output — then confirm Clear unusable path & Retry.";
     case "inspect-only":
       return "Worktree is unmanaged or its dirty state cannot be verified. Inspect manually; Dashboard discard is unavailable.";
   }

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -22,6 +23,35 @@ import (
 type worktreeDiscardResult struct {
 	WorktreePath *string `json:"worktreePath,omitempty"`
 	Discarded    bool    `json:"discarded"`
+	NoOp         bool    `json:"noOp"`
+	Reason       string  `json:"reason,omitempty"`
+}
+
+// worktreeClearUnusableResult is the operator opt-in clear of a hollow managed
+// worktree path (not a usable git checkout). Distinct from discard (git
+// reset/clean keeps the directory).
+//
+// Design trade-off (new clear flag + unusable_path reason):
+//
+// Failure prevented: operators parked on managed_worktree_integrity MI with
+// non-empty hollow leftovers had only shell rm + retry; Dashboard offered
+// "Retry without discard" which cannot clear the path, and Discard is the wrong
+// primitive (requires a valid checkout and never deletes the directory).
+//
+// Cost: new API field clearUnusableWorktreePath mutually exclusive with
+// discardWorktreeChanges; new preflight reason; CLI/dashboard must not overload
+// discard. Full RemoveAll of operator-confirmed managed paths can delete agent
+// leftovers — confirm dialog is the gate (same spirit as discard).
+//
+// Why not simpler: widen ClearUnusableManagedPath auto-delete → data-loss risk
+// already rejected by tests/oracle. Overload discardWorktreeChanges → wrong
+// semantics and fails on hollow paths. Separate endpoint then retry → worse
+// atomicity with requeue locks.
+//
+// Authority: LocalCheckoutUsable + managed-path Validate; not agent output.
+type worktreeClearUnusableResult struct {
+	WorktreePath *string `json:"worktreePath,omitempty"`
+	Cleared      bool    `json:"cleared"`
 	NoOp         bool    `json:"noOp"`
 	Reason       string  `json:"reason,omitempty"`
 }
@@ -63,8 +93,14 @@ type worktreeDiscardResult struct {
 //   - worktreePath/branch: resolved location hints even when missing on disk
 //   - managed: path is under a Looper-managed worktree root (discard-safe)
 //   - clean/dirty: set only when git status succeeds; omitted on status_unavailable
-//   - reason: no_worktree | worktree_missing | status_unavailable | already_clean |
-//     dirty | loop_type_without_worktree | unmanaged
+//     and unusable_path
+//   - reason: no_worktree | worktree_missing | status_unavailable | unusable_path |
+//     already_clean | dirty | loop_type_without_worktree | unmanaged
+//
+// unusable_path (new): present managed path fails LocalCheckoutUsable — hollow
+// leftovers that discard cannot repair. Distinct from status_unavailable (git
+// repo present but status failed). Authority: filesystem checkout probe + managed
+// Validate, not agent output.
 type loopWorktreeStatusResponse struct {
 	LoopID       string  `json:"loopId"`
 	Seq          int64   `json:"seq"`
@@ -153,6 +189,12 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 		// Still report path for inspect; discard is not offered by clients.
 		resp.Reason = "unmanaged"
 	}
+	// Hollow / non-checkout leftovers: classify before git status so clients can
+	// offer clear-unusable instead of lumping into status_unavailable.
+	if resolved.Managed && !worktreesafety.LocalCheckoutUsable(path) {
+		resp.Reason = "unusable_path"
+		return resp, nil
+	}
 	gitPath := ""
 	if h.context.Config.Tools.GitPath != nil {
 		gitPath = strings.TrimSpace(*h.context.Config.Tools.GitPath)
@@ -180,6 +222,113 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 		resp.Reason = "dirty"
 	}
 	return resp, nil
+}
+
+// clearLoopUnusableWorktreePath performs the operator opt-in RemoveAll of a
+// managed path that is not a usable local checkout. Active run/queue must
+// already be refused by the caller (same preflight as discard).
+func (h *Handler) clearLoopUnusableWorktreePath(ctx context.Context, services looperdruntime.Services, loop storage.LoopRecord) (worktreeClearUnusableResult, error) {
+	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
+		return worktreeClearUnusableResult{NoOp: true, Reason: "loop_type_without_worktree"}, nil
+	}
+	if services.Repositories == nil {
+		return worktreeClearUnusableResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, loop.ProjectID)
+	if err != nil {
+		return worktreeClearUnusableResult{}, err
+	}
+
+	resolved, err := resolveManagedWorktreeForLoop(ctx, services.Repositories, *project, loop)
+	if err != nil {
+		return worktreeClearUnusableResult{}, err
+	}
+	if resolved == nil || strings.TrimSpace(resolved.Path) == "" {
+		return worktreeClearUnusableResult{NoOp: true, Reason: "no_worktree"}, nil
+	}
+
+	path := strings.TrimSpace(resolved.Path)
+	if sameFilesystemPath(path, project.RepoPath) {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: path must not equal project repo path", loop.ID),
+		}
+	}
+	if !resolved.Managed {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: path %s is not a Looper-managed worktree", loop.ID, path),
+		}
+	}
+
+	if _, statErr := os.Stat(path); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return worktreeClearUnusableResult{
+				WorktreePath: stringPtrOrNil(path),
+				Cleared:      false,
+				NoOp:         true,
+				Reason:       "worktree_missing",
+			}, nil
+		}
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeInternalError,
+			status:  http.StatusInternalServerError,
+			message: fmt.Sprintf("Failed to stat worktree at %s: %v", path, statErr),
+		}
+	}
+
+	if err := worktreesafety.ClearManagedUnusablePathForOperator(worktreesafety.CheckInput{
+		WorktreePath: path,
+		RepoPath:     project.RepoPath,
+		WorktreeRoot: resolved.WorktreeRoot,
+	}, path); err != nil {
+		if errors.Is(err, worktreesafety.ErrUsableCheckoutRefusesClear) {
+			return worktreeClearUnusableResult{}, apiError{
+				code:    pkgapi.ErrorCodeValidationFailed,
+				status:  http.StatusBadRequest,
+				message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: path is a usable checkout (use discardWorktreeChanges or plain retry)", loop.ID),
+			}
+		}
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: %v", loop.ID, err),
+		}
+	}
+
+	result := worktreeClearUnusableResult{
+		WorktreePath: stringPtrOrNil(path),
+		Cleared:      true,
+		NoOp:         false,
+		Reason:       "cleared",
+	}
+
+	projectID := loop.ProjectID
+	loopID := loop.ID
+	payload := map[string]any{
+		"worktreePath": path,
+		"branch":       resolved.Branch,
+		"noOp":         result.NoOp,
+		"reason":       result.Reason,
+		"cleared":      result.Cleared,
+		"source":       resolved.Source,
+	}
+	if resolved.ID != "" {
+		payload["worktreeId"] = resolved.ID
+	}
+	_ = eventlog.Append(ctx, services.Repositories, eventlog.AppendInput{
+		EventType: "looper.worktree.unusable_path_cleared",
+		ProjectID: &projectID,
+		LoopID:    &loopID,
+		ActorType: stringPtrOrNil("operator"),
+		ActorID:   stringPtrOrNil("cli"),
+		Payload:   payload,
+		CreatedAt: h.now().UTC(),
+	})
+	return result, nil
 }
 
 // discardLoopWorktreeChanges performs the operator opt-in dirty-worktree discard

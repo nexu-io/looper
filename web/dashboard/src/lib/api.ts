@@ -516,6 +516,8 @@ export type RetryLoopBody = {
   resetAttempts: true;
   /** Never set on handback; optional on retry only. */
   discardWorktreeChanges?: boolean;
+  /** Never set on handback; optional on retry only. Mutually exclusive with discard. */
+  clearUnusableWorktreePath?: boolean;
 };
 
 export type RetryLoopResult = {
@@ -524,7 +526,9 @@ export type RetryLoopResult = {
   mode: string;
   resetAttempts: boolean;
   discardWorktreeChanges: boolean;
+  clearUnusableWorktreePath?: boolean;
   worktreeDiscard?: unknown;
+  worktreeClearUnusable?: unknown;
 };
 
 /** GET /loops/{sel}/worktree — retry/jump preflight. */
@@ -604,11 +608,18 @@ export function fetchLoopWorktree(
 
 export function retryLoop(
   selector: string,
-  opts?: { discardWorktreeChanges?: boolean; signal?: AbortSignal },
+  opts?: {
+    discardWorktreeChanges?: boolean;
+    clearUnusableWorktreePath?: boolean;
+    signal?: AbortSignal;
+  },
 ): Promise<RetryLoopResult> {
   const body: RetryLoopBody = {
     ...RETRY_BODY,
     ...(opts?.discardWorktreeChanges ? { discardWorktreeChanges: true } : {}),
+    ...(opts?.clearUnusableWorktreePath
+      ? { clearUnusableWorktreePath: true }
+      : {}),
   };
   return apiFetch<RetryLoopResult>(
     `/api/v1/loops/${encodeURIComponent(selector)}/retry`,

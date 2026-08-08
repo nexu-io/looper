@@ -31,6 +31,80 @@ func TestLoopRetryDiscardWorktreeChangesRequiresConfirm(t *testing.T) {
 	}
 }
 
+func TestLoopRetryClearUnusableWorktreeRequiresConfirm(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeCLIConfig(t, "http://127.0.0.1:1", "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr})
+	args := []string{"--config", configPath, "loop", "retry", "3108", "--clear-unusable-worktree"}
+	exitCode := app.Run(context.Background(), args)
+	if exitCode == 0 {
+		t.Fatalf("Run() exit code = 0, want failure; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--clear-unusable-worktree requires --confirm") {
+		t.Fatalf("stderr = %q, want confirm requirement error", stderr.String())
+	}
+}
+
+func TestLoopRetryClearUnusableWorktreeWiresAPIBodyAndHumanOutput(t *testing.T) {
+	t.Parallel()
+
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/loops/3140/retry" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(raw, &gotBody); err != nil {
+			t.Fatalf("unmarshal body: %v body=%q", err, raw)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_retry_clear", map[string]any{
+			"loop": map[string]any{
+				"id": "loop_retry_clear", "seq": 3140, "projectId": "project_1",
+				"type": "fixer", "targetType": "pull_request", "status": "queued",
+			},
+			"queueItemId":               "queue_new",
+			"mode":                      "auto",
+			"resetAttempts":             true,
+			"discardWorktreeChanges":    false,
+			"clearUnusableWorktreePath": true,
+			"worktreeClearUnusable": map[string]any{
+				"worktreePath": "/tmp/managed/hollow-wt",
+				"cleared":      true,
+				"noOp":         false,
+				"reason":       "cleared",
+			},
+		}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := New(Deps{Stdout: stdout, Stderr: stderr, HTTPClient: server.Client()})
+	args := []string{"--config", configPath, "loop", "retry", "3140", "--clear-unusable-worktree", "--confirm"}
+	if exitCode := app.Run(context.Background(), args); exitCode != 0 {
+		t.Fatalf("Run() exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if gotBody["clearUnusableWorktreePath"] != true {
+		t.Fatalf("request body = %#v, want clearUnusableWorktreePath=true", gotBody)
+	}
+	if gotBody["discardWorktreeChanges"] == true {
+		t.Fatalf("request body = %#v, discard must not be set with clear", gotBody)
+	}
+	out := stdout.String()
+	for _, needle := range []string{"Loop retry queued", "clearUnusableWorktreePath", "/tmp/managed/hollow-wt", "worktreeClearReason"} {
+		if !strings.Contains(out, needle) {
+			t.Fatalf("stdout missing %q\n%s", needle, out)
+		}
+	}
+}
+
 func TestLoopRetryDiscardWorktreeChangesWiresAPIBodyAndHumanOutput(t *testing.T) {
 	t.Parallel()
 
@@ -97,6 +171,7 @@ type retryPreflightCase struct {
 	worktreeStatus int // 0 = success envelope; else ErrorCode via Failure
 	expectExitOK   bool
 	expectDiscard  *bool // nil = field must be absent
+	expectClear    *bool // nil = field must be absent
 	errContains    []string
 	errNotContains []string
 	stdoutContains []string
@@ -156,6 +231,30 @@ func TestLoopRetryWorktreePreflight(t *testing.T) {
 		{
 			name: "old_daemon_without_worktree_route_still_retries", selector: "3108",
 			worktreeStatus: http.StatusNotFound, expectExitOK: true, expectDiscard: &falseVal,
+		},
+		{
+			name: "unusable_prompt_yes_clears", selector: "3140", stdin: "y\n",
+			worktree: map[string]any{
+				"loopId": "loop_unusable", "seq": 3140, "present": true,
+				"worktreePath": "/tmp/managed/hollow-wt",
+				"managed":      true, "reason": "unusable_path",
+			},
+			expectExitOK: true, expectClear: &trueVal, expectDiscard: &falseVal,
+			errContains:    []string{"unusable"},
+			stdoutContains: []string{"Loop retry queued"},
+		},
+		{
+			name: "unusable_json_refuses_without_clear", selector: "3140", jsonMode: true,
+			worktree: map[string]any{
+				"loopId": "loop_unusable", "seq": 3140, "present": true,
+				"worktreePath": "/tmp/managed/hollow-wt",
+				"managed":      true, "reason": "unusable_path",
+			},
+			expectExitOK: false,
+			errContains: []string{
+				"retry cancelled: worktree path is unusable",
+				"--clear-unusable-worktree --confirm",
+			},
 		},
 	}
 
@@ -227,7 +326,17 @@ func TestLoopRetryWorktreePreflight(t *testing.T) {
 				} else if _, ok := gotBody["discardWorktreeChanges"]; ok {
 					t.Fatalf("body=%#v want no discardWorktreeChanges", gotBody)
 				}
-			} else if retryCalled {
+			}
+			if tc.expectClear != nil {
+				if *tc.expectClear {
+					if gotBody["clearUnusableWorktreePath"] != true {
+						t.Fatalf("body=%#v want clearUnusableWorktreePath=true", gotBody)
+					}
+				} else if _, ok := gotBody["clearUnusableWorktreePath"]; ok {
+					t.Fatalf("body=%#v want no clearUnusableWorktreePath", gotBody)
+				}
+			}
+			if tc.expectDiscard == nil && tc.expectClear == nil && retryCalled {
 				t.Fatal("retry POST was called unexpectedly")
 			}
 			errOut := stderr.String()

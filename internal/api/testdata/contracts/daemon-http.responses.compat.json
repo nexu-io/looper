@@ -908,7 +908,8 @@
           "queueItemId": "<uuid>",
           "mode": "auto",
           "resetAttempts": true,
-          "discardWorktreeChanges": false
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
         },
         "requestId": "fixture-request-id"
       }
@@ -955,7 +956,8 @@
           "queueItemId": "<uuid>",
           "mode": "auto",
           "resetAttempts": true,
-          "discardWorktreeChanges": false
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
         },
         "requestId": "fixture-request-id"
       }

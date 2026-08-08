@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { LoopWorktreeStatus } from "@/lib/api";
 import {
   classifyRetryWorktree,
+  recoveryOffersClear,
   recoveryOffersDiscard,
   recoveryRecommendsRetry,
   recoveryWorktreeDecision,
@@ -100,6 +101,21 @@ describe("recovery worktree decisions (shared classifyRetryWorktree)", () => {
     });
     expect(classifyRetryWorktree(tree)).toBe("inspect-only");
     expect(recoveryWorktreeDecision(tree)).toBe("inspect-only");
+    expect(recoveryOffersDiscard(tree)).toBe(false);
+    expect(recoveryOffersClear(tree)).toBe(false);
+    expect(recoveryRecommendsRetry(tree)).toBe(false);
+  });
+
+  it("offers clear for managed unusable_path leftovers", () => {
+    const tree = wt({
+      present: true,
+      managed: true,
+      reason: "unusable_path",
+      worktreePath: "/tmp/hollow-wt",
+    });
+    expect(classifyRetryWorktree(tree)).toBe("offer-clear");
+    expect(recoveryWorktreeDecision(tree)).toBe("offer-clear");
+    expect(recoveryOffersClear(tree)).toBe(true);
     expect(recoveryOffersDiscard(tree)).toBe(false);
     expect(recoveryRecommendsRetry(tree)).toBe(false);
   });

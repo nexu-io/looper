@@ -231,6 +231,40 @@ describe("RecoveryCard", () => {
     expect(fetchLoopWorktree).toHaveBeenCalledTimes(2);
   });
 
+  it("offers Clear unusable path & Retry for managed unusable_path", async () => {
+    fetchLoopWorktree.mockResolvedValue({
+      loopId: "loop_1",
+      seq: 617,
+      present: true,
+      managed: true,
+      reason: "unusable_path",
+      worktreePath: "/tmp/hollow-wt",
+    });
+    renderCard(
+      baseLoop({
+        lastFailureReason:
+          "worktree path /tmp/hollow-wt is unusable and not empty; manual intervention required: unusable worktree path preserved",
+      }),
+    );
+
+    await screen.findByText(/not a usable git checkout/i);
+    expect(screen.getByText("unusable")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Discard & Retry" })).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear unusable path & Retry" }),
+    );
+    await screen.findByText(/Clear unusable worktree path and retry/i);
+    expect(retryLoop).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear path & retry" }));
+    await waitFor(() => {
+      expect(retryLoop).toHaveBeenCalledWith("617", {
+        discardWorktreeChanges: false,
+        clearUnusableWorktreePath: true,
+      });
+    });
+  });
+
   it("offers Inspect/Jump and confirmed Discard & Retry for managed dirty", async () => {
     fetchLoopWorktree.mockResolvedValue({
       loopId: "loop_1",

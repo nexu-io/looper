@@ -773,6 +773,9 @@ func recommendedActionForManualIntervention(message string) string {
 	if strings.Contains(lower, "dirty worktree") || strings.Contains(lower, "worktree is dirty") || strings.Contains(lower, "uncommitted changes") {
 		return "inspect with looper jump <seq>, or discard via looper retry <seq> --discard-worktree-changes --confirm"
 	}
+	if strings.Contains(lower, "unusable and not empty") || strings.Contains(lower, "unusable worktree path preserved") {
+		return "inspect with looper jump <seq>, or clear leftovers via looper retry <seq> --clear-unusable-worktree --confirm"
+	}
 	if strings.Contains(lower, "worktree is locked") {
 		return "unlock or remove the locked worktree, then looper retry <seq>"
 	}

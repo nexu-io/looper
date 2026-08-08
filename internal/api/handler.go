@@ -2199,18 +2199,21 @@ type activeRunView struct {
 }
 
 type retryLoopRequest struct {
-	Mode                   string `json:"mode"`
-	ResetAttempts          *bool  `json:"resetAttempts"`
-	DiscardWorktreeChanges *bool  `json:"discardWorktreeChanges"`
+	Mode                      string `json:"mode"`
+	ResetAttempts             *bool  `json:"resetAttempts"`
+	DiscardWorktreeChanges    *bool  `json:"discardWorktreeChanges"`
+	ClearUnusableWorktreePath *bool  `json:"clearUnusableWorktreePath"`
 }
 
 type retryLoopResponse struct {
-	Loop                   loopResponse           `json:"loop"`
-	QueueItemID            *string                `json:"queueItemId,omitempty"`
-	Mode                   string                 `json:"mode"`
-	ResetAttempts          bool                   `json:"resetAttempts"`
-	DiscardWorktreeChanges bool                   `json:"discardWorktreeChanges"`
-	WorktreeDiscard        *worktreeDiscardResult `json:"worktreeDiscard,omitempty"`
+	Loop                      loopResponse                 `json:"loop"`
+	QueueItemID               *string                      `json:"queueItemId,omitempty"`
+	Mode                      string                       `json:"mode"`
+	ResetAttempts             bool                         `json:"resetAttempts"`
+	DiscardWorktreeChanges    bool                         `json:"discardWorktreeChanges"`
+	ClearUnusableWorktreePath bool                         `json:"clearUnusableWorktreePath"`
+	WorktreeDiscard           *worktreeDiscardResult       `json:"worktreeDiscard,omitempty"`
+	WorktreeClearUnusable     *worktreeClearUnusableResult `json:"worktreeClearUnusable,omitempty"`
 }
 
 type activeRunTarget struct {
@@ -5800,16 +5803,22 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 // THAT session and sees their turns), clears any queue item that survived the
 // takeover race, then re-arms via the shared retry path.
 func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
-	// Reject discard before any handback mutation. retryLoop is shared with
+	// Reject discard/clear before any handback mutation. retryLoop is shared with
 	// /retry, but handback must never wipe the human's interactive worktree edits
-	// even if an API client includes discardWorktreeChanges on the handback body.
-	if discardRequested, err := retryRequestRequestsDiscard(r); err != nil {
+	// even if an API client includes destructive flags on the handback body.
+	if destructive, err := retryRequestRequestsDestructiveWorktree(r); err != nil {
 		return nil, err
-	} else if discardRequested {
+	} else if destructive.discard {
 		return nil, apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,
 			status:  http.StatusBadRequest,
 			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	} else if destructive.clearUnusable {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "clearUnusableWorktreePath is not allowed on handback; human interactive worktree edits must be preserved",
 		}
 	}
 
@@ -5848,26 +5857,35 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 	return h.retryLoop(ctx, r, loopID, true)
 }
 
-// retryRequestRequestsDiscard peeks at a retry/handback JSON body for
-// discardWorktreeChanges without consuming the request for a later retryLoop decode.
-func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
+type retryDestructiveWorktreeFlags struct {
+	discard       bool
+	clearUnusable bool
+}
+
+// retryRequestRequestsDestructiveWorktree peeks at a retry/handback JSON body for
+// discardWorktreeChanges / clearUnusableWorktreePath without consuming the
+// request for a later retryLoop decode.
+func retryRequestRequestsDestructiveWorktree(r *http.Request) (retryDestructiveWorktreeFlags, error) {
 	if r == nil || r.Body == nil {
-		return false, nil
+		return retryDestructiveWorktreeFlags{}, nil
 	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(strings.NewReader(string(raw)))
 	if err != nil {
-		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+		return retryDestructiveWorktreeFlags{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		return false, nil
+		return retryDestructiveWorktreeFlags{}, nil
 	}
 	var body retryLoopRequest
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+		return retryDestructiveWorktreeFlags{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
 	}
-	return body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges, nil
+	return retryDestructiveWorktreeFlags{
+		discard:       body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges,
+		clearUnusable: body.ClearUnusableWorktreePath != nil && *body.ClearUnusableWorktreePath,
+	}, nil
 }
 
 type respondLoopRequest struct {
@@ -6174,6 +6192,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
 	}
 	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
+	clearUnusableWorktreePath := body.ClearUnusableWorktreePath != nil && *body.ClearUnusableWorktreePath
+	if discardWorktreeChanges && clearUnusableWorktreePath {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges and clearUnusableWorktreePath are mutually exclusive",
+		}
+	}
 	if discardWorktreeChanges && fromHandback {
 		return retryLoopResponse{}, apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,
@@ -6181,10 +6207,17 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
 		}
 	}
+	if clearUnusableWorktreePath && fromHandback {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "clearUnusableWorktreePath is not allowed on handback; human interactive worktree edits must be preserved",
+		}
+	}
 
-	// Serialize per-loop retry with start/requeue so discard cannot race another
-	// retry or /loops/{id}/start that enqueues replacement work between preflight
-	// and reset (or a scheduler-started run for that replacement).
+	// Serialize per-loop retry with start/requeue so discard/clear cannot race
+	// another retry or /loops/{id}/start that enqueues replacement work between
+	// preflight and mutation (or a scheduler-started run for that replacement).
 	unlock := h.lockLoopRetry(loopID)
 	defer unlock()
 
@@ -6213,18 +6246,19 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
 	defer unlockTarget()
 
-	// Opt-in discard runs before requeue so git mutation stays outside the
-	// queue transaction. Every non-mutating retry blocker must pass first so a
-	// later precondition failure never leaves discarded worktree changes
+	// Opt-in discard/clear runs before requeue so filesystem mutation stays
+	// outside the queue transaction. Every non-mutating retry blocker must pass
+	// first so a later precondition failure never leaves a wiped worktree
 	// without creating a replacement queue item.
 	var worktreeDiscard *worktreeDiscardResult
-	if discardWorktreeChanges {
+	var worktreeClearUnusable *worktreeClearUnusableResult
+	destructiveWorktree := discardWorktreeChanges || clearUnusableWorktreePath
+	if destructiveWorktree {
 		// Runtime HITL poll requeues awaiting_human loops without the API lock
-		// (hitl_github_poll / Feishu helpers). Refuse discard so a poll-delivered
-		// answer cannot requeue between preflight and git reset, wiping the
-		// worktree for the answered continuation when the retry TX then conflicts.
+		// (hitl_github_poll / Feishu helpers). Refuse discard/clear so a poll-
+		// delivered answer cannot requeue between preflight and mutation.
 		// human_takeover pins the same worktree for interactive human edits;
-		// /handback already rejects discard, and direct /retry must match that.
+		// /handback already rejects destructive flags, and direct /retry must match.
 		if err := rejectDiscardWhileParkedForHuman(preflightLoop.Status, loopID); err != nil {
 			return retryLoopResponse{}, err
 		}
@@ -6236,11 +6270,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			}
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
-		// Same-type uniqueness is not enough for discard: PR worktrees are shared
-		// across fixer/reviewer/worker. An already queued/running/waiting/
+		// Same-type uniqueness is not enough for discard/clear: PR worktrees are
+		// shared across fixer/reviewer/worker. An already queued/running/waiting/
 		// human_takeover sibling is not held by the target mutex (that only
-		// serializes mutations), so refuse git reset/clean while any worktree-
-		// owning sibling holds the PR checkout.
+		// serializes mutations), so refuse mutation while any worktree-owning
+		// sibling holds the PR checkout.
 		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *preflightLoop); err != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -6249,11 +6283,10 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 
-		// Recheck immediately before git mutation as defense in depth. Runtime
-		// free-text enqueue now shares LockLoopRequeue with this path, so the
-		// common race is serialized; this snapshot still catches any unlocked
-		// requeue injected under discardBeforeGitHook in tests (or future
-		// callers that forget the shared guard).
+		// Recheck immediately before filesystem mutation as defense in depth.
+		// Runtime free-text enqueue now shares LockLoopRequeue with this path,
+		// so the common race is serialized; this snapshot still catches any
+		// unlocked requeue injected under discardBeforeGitHook in tests.
 		if h.discardBeforeGitHook != nil {
 			h.discardBeforeGitHook(loopID)
 		}
@@ -6283,15 +6316,27 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		}
 		preflightLoop = freshLoop
 
-		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
-		if discardErr != nil {
-			var typed apiError
-			if asAPIError(discardErr, &typed) {
-				return retryLoopResponse{}, typed
+		if discardWorktreeChanges {
+			discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
+			if discardErr != nil {
+				var typed apiError
+				if asAPIError(discardErr, &typed) {
+					return retryLoopResponse{}, typed
+				}
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: discardErr.Error()}
 			}
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: discardErr.Error()}
+			worktreeDiscard = &discardResult
+		} else {
+			clearResult, clearErr := h.clearLoopUnusableWorktreePath(ctx, services, *preflightLoop)
+			if clearErr != nil {
+				var typed apiError
+				if asAPIError(clearErr, &typed) {
+					return retryLoopResponse{}, typed
+				}
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: clearErr.Error()}
+			}
+			worktreeClearUnusable = &clearResult
 		}
-		worktreeDiscard = &discardResult
 	}
 
 	type retryResult struct {
@@ -6331,10 +6376,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		if err := h.assertLoopRetryPreconditions(ctx, repos, *loop, nowISO); err != nil {
 			return retryResult{}, err
 		}
-		// When discard already mutated the worktree, re-check shared-PR siblings
-		// inside the TX so a concurrent runtime requeue/create that raced past
-		// preflight cannot leave both an active sibling and a successful retry.
-		if discardWorktreeChanges {
+		// When discard/clear already mutated the worktree, re-check shared-PR
+		// siblings inside the TX so a concurrent runtime requeue/create that
+		// raced past preflight cannot leave both an active sibling and a
+		// successful retry.
+		if destructiveWorktree {
 			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
 				return retryResult{}, err
 			}
@@ -6437,12 +6483,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		h.context.TriggerSchedulerTick()
 	}
 	return retryLoopResponse{
-		Loop:                   serializeLoop(result.loop),
-		QueueItemID:            result.queueItemID,
-		Mode:                   mode,
-		ResetAttempts:          resetAttempts,
-		DiscardWorktreeChanges: discardWorktreeChanges,
-		WorktreeDiscard:        worktreeDiscard,
+		Loop:                      serializeLoop(result.loop),
+		QueueItemID:               result.queueItemID,
+		Mode:                      mode,
+		ResetAttempts:             resetAttempts,
+		DiscardWorktreeChanges:    discardWorktreeChanges,
+		ClearUnusableWorktreePath: clearUnusableWorktreePath,
+		WorktreeDiscard:           worktreeDiscard,
+		WorktreeClearUnusable:     worktreeClearUnusable,
 	}, nil
 }
 
