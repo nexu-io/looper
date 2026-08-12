@@ -25,7 +25,12 @@ export function classifyRetryWorktree(
 ): WorktreeActionDecision {
   if (!worktree.present) return "ok";
   if (worktree.reason === "unusable_path") {
-    return worktree.managed ? "offer-clear" : "inspect-only";
+    // Require daemon-advertised clear support so a stale dashboard against an
+    // older looperd cannot POST clear and get a silent plain retry.
+    if (worktree.managed && worktree.supportsClearUnusablePath === true) {
+      return "offer-clear";
+    }
+    return "inspect-only";
   }
   if (worktree.dirty === true) {
     return worktree.managed ? "offer-discard" : "inspect-only";

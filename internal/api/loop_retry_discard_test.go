@@ -131,6 +131,7 @@ func TestHandlerLoopWorktreeStatusUnusablePath(t *testing.T) {
 	assertEqual(t, data["managed"], true)
 	assertEqual(t, data["reason"], "unusable_path")
 	assertEqual(t, data["worktreePath"], fixture.WorktreePath)
+	assertEqual(t, data["supportsClearUnusablePath"], true)
 	if _, ok := data["dirty"]; ok {
 		t.Fatalf("unusable_path should omit dirty, got %#v", data["dirty"])
 	}
@@ -165,7 +166,11 @@ func TestHandlerLoopRetryClearUnusableWorktreePath(t *testing.T) {
 		t.Fatalf("WriteFile hollow: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3140/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true,"clearUnusableWorktreePath":true}`))
+	reqBody := fmt.Sprintf(
+		`{"mode":"auto","resetAttempts":true,"clearUnusableWorktreePath":true,"expectedWorktreePath":%q}`,
+		fixture.WorktreePath,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3140/retry", strings.NewReader(reqBody))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -226,7 +231,11 @@ func TestHandlerLoopRetryClearUnusableRejectsUsableCheckout(t *testing.T) {
 		Dirty:     true,
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3141/retry", strings.NewReader(`{"mode":"auto","clearUnusableWorktreePath":true}`))
+	reqBody := fmt.Sprintf(
+		`{"mode":"auto","clearUnusableWorktreePath":true,"expectedWorktreePath":%q}`,
+		fixture.WorktreePath,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3141/retry", strings.NewReader(reqBody))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusBadRequest {
@@ -238,6 +247,79 @@ func TestHandlerLoopRetryClearUnusableRejectsUsableCheckout(t *testing.T) {
 	// Dirty file must still exist — clear must not have run.
 	if _, err := os.Stat(filepath.Join(fixture.WorktreePath, "dirty.txt")); err != nil {
 		t.Fatalf("dirty.txt missing after refused clear: %v", err)
+	}
+}
+
+func TestHandlerLoopRetryClearUnusableRequiresExpectedPath(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_clear_need_path",
+		LoopID:    "loop_retry_clear_need_path",
+		LoopSeq:   3148,
+		LoopType:  "fixer",
+		Branch:    "feature/clear-need-path",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+	if err := os.RemoveAll(fixture.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(worktree) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(fixture.WorktreePath, ".tmp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll hollow: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3148/retry", strings.NewReader(`{"mode":"auto","clearUnusableWorktreePath":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "expectedWorktreePath is required") {
+		t.Fatalf("body = %s, want expectedWorktreePath required", recorder.Body.String())
+	}
+	if _, err := os.Stat(fixture.WorktreePath); err != nil {
+		t.Fatalf("hollow path removed without expected path bind: %v", err)
+	}
+}
+
+func TestHandlerLoopRetryClearUnusableRejectsPathDrift(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_clear_path_drift",
+		LoopID:    "loop_retry_clear_path_drift",
+		LoopSeq:   3149,
+		LoopType:  "fixer",
+		Branch:    "feature/clear-path-drift",
+		NowISO:    nowISO,
+		Dirty:     false,
+	})
+	if err := os.RemoveAll(fixture.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(worktree) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(fixture.WorktreePath, ".tmp"), 0o755); err != nil {
+		t.Fatalf("MkdirAll hollow: %v", err)
+	}
+
+	reqBody := `{"mode":"auto","clearUnusableWorktreePath":true,"expectedWorktreePath":"/tmp/stale-confirmed-path"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3149/retry", strings.NewReader(reqBody))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "does not match confirmed path") {
+		t.Fatalf("body = %s, want path drift refusal", recorder.Body.String())
+	}
+	if _, err := os.Stat(fixture.WorktreePath); err != nil {
+		t.Fatalf("hollow path removed on path drift: %v", err)
 	}
 }
 

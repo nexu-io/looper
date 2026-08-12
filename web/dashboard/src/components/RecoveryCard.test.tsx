@@ -239,6 +239,7 @@ describe("RecoveryCard", () => {
       managed: true,
       reason: "unusable_path",
       worktreePath: "/tmp/hollow-wt",
+      supportsClearUnusablePath: true,
     });
     renderCard(
       baseLoop({
@@ -261,6 +262,7 @@ describe("RecoveryCard", () => {
       expect(retryLoop).toHaveBeenCalledWith("617", {
         discardWorktreeChanges: false,
         clearUnusableWorktreePath: true,
+        expectedWorktreePath: "/tmp/hollow-wt",
       });
     });
   });

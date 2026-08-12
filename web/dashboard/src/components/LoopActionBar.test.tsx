@@ -106,8 +106,19 @@ describe("classifyRetryWorktree", () => {
         present: true,
         managed: true,
         reason: "unusable_path",
+        supportsClearUnusablePath: true,
       }),
     ).toBe("offer-clear");
+    expect(
+      classifyRetryWorktree({
+        loopId: "l",
+        seq: 1,
+        present: true,
+        managed: true,
+        reason: "unusable_path",
+        // older daemon omits capability → do not offer clear
+      }),
+    ).toBe("inspect-only");
   });
 });
 
@@ -208,6 +219,7 @@ describe("LoopActionBar retry dirty UX", () => {
       managed: true,
       reason: "unusable_path",
       worktreePath: "/tmp/hollow-wt",
+      supportsClearUnusablePath: true,
     });
     renderBar();
 
@@ -222,6 +234,7 @@ describe("LoopActionBar retry dirty UX", () => {
       expect(retryLoop).toHaveBeenCalledWith("3491", {
         discardWorktreeChanges: false,
         clearUnusableWorktreePath: true,
+        expectedWorktreePath: "/tmp/hollow-wt",
       });
     });
   });

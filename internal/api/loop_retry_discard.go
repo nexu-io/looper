@@ -111,6 +111,11 @@ type loopWorktreeStatusResponse struct {
 	Clean        *bool   `json:"clean,omitempty"`
 	Dirty        *bool   `json:"dirty,omitempty"`
 	Reason       string  `json:"reason,omitempty"`
+	// SupportsClearUnusablePath is always true on daemons that implement
+	// clearUnusableWorktreePath. Clients must require this before POST /retry
+	// with clear so pre-change daemons (which omit the field) never queue a
+	// plain retry after a failed clear acknowledgement.
+	SupportsClearUnusablePath bool `json:"supportsClearUnusablePath"`
 }
 
 type checkpointWorktreeRef struct {
@@ -145,8 +150,9 @@ type checkpointWithWorktree struct {
 // whether git status is clean. Used by CLI/dashboard retry preflight and jump.
 func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecord) (loopWorktreeStatusResponse, error) {
 	resp := loopWorktreeStatusResponse{
-		LoopID: loop.ID,
-		Seq:    loop.Seq,
+		LoopID:                    loop.ID,
+		Seq:                       loop.Seq,
+		SupportsClearUnusablePath: true,
 	}
 	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
 		resp.Reason = "loop_type_without_worktree"
@@ -227,12 +233,24 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 // clearLoopUnusableWorktreePath performs the operator opt-in RemoveAll of a
 // managed path that is not a usable local checkout. Active run/queue must
 // already be refused by the caller (same preflight as discard).
-func (h *Handler) clearLoopUnusableWorktreePath(ctx context.Context, services looperdruntime.Services, loop storage.LoopRecord) (worktreeClearUnusableResult, error) {
+// expectedWorktreePath is the path the operator confirmed (from GET /worktree);
+// clear refuses when the daemon-resolved path differs so a stale confirm cannot
+// delete a different managed leftover.
+func (h *Handler) clearLoopUnusableWorktreePath(ctx context.Context, services looperdruntime.Services, loop storage.LoopRecord, expectedWorktreePath string) (worktreeClearUnusableResult, error) {
 	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
 		return worktreeClearUnusableResult{NoOp: true, Reason: "loop_type_without_worktree"}, nil
 	}
 	if services.Repositories == nil {
 		return worktreeClearUnusableResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+
+	expectedWorktreePath = strings.TrimSpace(expectedWorktreePath)
+	if expectedWorktreePath == "" {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: expectedWorktreePath is required", loop.ID),
+		}
 	}
 
 	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, loop.ProjectID)
@@ -249,6 +267,13 @@ func (h *Handler) clearLoopUnusableWorktreePath(ctx context.Context, services lo
 	}
 
 	path := strings.TrimSpace(resolved.Path)
+	if !sameFilesystemPath(path, expectedWorktreePath) {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: resolved path %s does not match confirmed path %s (re-fetch GET /worktree and confirm again)", loop.ID, path, expectedWorktreePath),
+		}
+	}
 	if sameFilesystemPath(path, project.RepoPath) {
 		return worktreeClearUnusableResult{}, apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,

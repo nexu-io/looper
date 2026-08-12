@@ -112,12 +112,24 @@ describe("recovery worktree decisions (shared classifyRetryWorktree)", () => {
       managed: true,
       reason: "unusable_path",
       worktreePath: "/tmp/hollow-wt",
+      supportsClearUnusablePath: true,
     });
     expect(classifyRetryWorktree(tree)).toBe("offer-clear");
     expect(recoveryWorktreeDecision(tree)).toBe("offer-clear");
     expect(recoveryOffersClear(tree)).toBe(true);
     expect(recoveryOffersDiscard(tree)).toBe(false);
     expect(recoveryRecommendsRetry(tree)).toBe(false);
+  });
+
+  it("does not offer clear when daemon omits supportsClearUnusablePath", () => {
+    const tree = wt({
+      present: true,
+      managed: true,
+      reason: "unusable_path",
+      worktreePath: "/tmp/hollow-wt",
+    });
+    expect(classifyRetryWorktree(tree)).toBe("inspect-only");
+    expect(recoveryOffersClear(tree)).toBe(false);
   });
 
   it("recommends retry for legitimate missing-worktree preflight", () => {

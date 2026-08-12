@@ -131,12 +131,19 @@ export function LoopActionBar({
     async (opts?: {
       discardWorktreeChanges?: boolean;
       clearUnusableWorktreePath?: boolean;
+      expectedWorktreePath?: string;
     }) => {
       const discardWorktreeChanges = opts?.discardWorktreeChanges === true;
       const clearUnusableWorktreePath = opts?.clearUnusableWorktreePath === true;
+      const expectedWorktreePath = opts?.expectedWorktreePath?.trim() ?? "";
       await retryLoop(selector, {
         discardWorktreeChanges,
-        ...(clearUnusableWorktreePath ? { clearUnusableWorktreePath: true } : {}),
+        ...(clearUnusableWorktreePath
+          ? {
+              clearUnusableWorktreePath: true,
+              expectedWorktreePath,
+            }
+          : {}),
       });
       toast.success(
         clearUnusableWorktreePath
@@ -264,7 +271,19 @@ export function LoopActionBar({
     setPending("retry");
     setInlineError(null);
     try {
-      await finishRetry({ clearUnusableWorktreePath: true });
+      const expectedWorktreePath =
+        confirm?.action === "retry-unusable"
+          ? (confirm.worktree.worktreePath?.trim() ?? "")
+          : "";
+      if (!expectedWorktreePath) {
+        throw new Error(
+          "Confirmed worktree path is missing; re-open clear confirm from a fresh worktree status",
+        );
+      }
+      await finishRetry({
+        clearUnusableWorktreePath: true,
+        expectedWorktreePath,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setInlineError(message);
@@ -273,7 +292,7 @@ export function LoopActionBar({
       setPending(null);
       setConfirm(null);
     }
-  }, [finishRetry, toast]);
+  }, [confirm, finishRetry, toast]);
 
   const onClick = (action: LoopAction) => {
     if (busy || !enabled[action]) return;

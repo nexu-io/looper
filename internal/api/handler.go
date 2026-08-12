@@ -2203,6 +2203,10 @@ type retryLoopRequest struct {
 	ResetAttempts             *bool  `json:"resetAttempts"`
 	DiscardWorktreeChanges    *bool  `json:"discardWorktreeChanges"`
 	ClearUnusableWorktreePath *bool  `json:"clearUnusableWorktreePath"`
+	// ExpectedWorktreePath binds operator clear confirmation to the path shown
+	// by GET /worktree. Required when clearUnusableWorktreePath is true; clear
+	// refuses if the daemon-resolved path drifts before RemoveAll.
+	ExpectedWorktreePath *string `json:"expectedWorktreePath"`
 }
 
 type retryLoopResponse struct {
@@ -5803,9 +5807,12 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 // THAT session and sees their turns), clears any queue item that survived the
 // takeover race, then re-arms via the shared retry path.
 func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
-	// Reject discard/clear before any handback mutation. retryLoop is shared with
-	// /retry, but handback must never wipe the human's interactive worktree edits
-	// even if an API client includes destructive flags on the handback body.
+	// Reject discard/clear/expected-path before any handback mutation. retryLoop
+	// is shared with /retry, but handback must never wipe the human's interactive
+	// worktree edits even if an API client includes destructive flags on the
+	// handback body. expectedWorktreePath alone must also fail here so a later
+	// retryLoop validation error cannot leave handback queue/session mutations
+	// already committed.
 	if destructive, err := retryRequestRequestsDestructiveWorktree(r); err != nil {
 		return nil, err
 	} else if destructive.discard {
@@ -5819,6 +5826,12 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 			code:    pkgapi.ErrorCodeValidationFailed,
 			status:  http.StatusBadRequest,
 			message: "clearUnusableWorktreePath is not allowed on handback; human interactive worktree edits must be preserved",
+		}
+	} else if destructive.expectedWorktreePath {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "expectedWorktreePath is not allowed on handback; human interactive worktree edits must be preserved",
 		}
 	}
 
@@ -5858,13 +5871,14 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 }
 
 type retryDestructiveWorktreeFlags struct {
-	discard       bool
-	clearUnusable bool
+	discard              bool
+	clearUnusable        bool
+	expectedWorktreePath bool
 }
 
 // retryRequestRequestsDestructiveWorktree peeks at a retry/handback JSON body for
-// discardWorktreeChanges / clearUnusableWorktreePath without consuming the
-// request for a later retryLoop decode.
+// discardWorktreeChanges / clearUnusableWorktreePath / expectedWorktreePath
+// without consuming the request for a later retryLoop decode.
 func retryRequestRequestsDestructiveWorktree(r *http.Request) (retryDestructiveWorktreeFlags, error) {
 	if r == nil || r.Body == nil {
 		return retryDestructiveWorktreeFlags{}, nil
@@ -5882,9 +5896,14 @@ func retryRequestRequestsDestructiveWorktree(r *http.Request) (retryDestructiveW
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return retryDestructiveWorktreeFlags{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
 	}
+	expectedPath := ""
+	if body.ExpectedWorktreePath != nil {
+		expectedPath = strings.TrimSpace(*body.ExpectedWorktreePath)
+	}
 	return retryDestructiveWorktreeFlags{
-		discard:       body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges,
-		clearUnusable: body.ClearUnusableWorktreePath != nil && *body.ClearUnusableWorktreePath,
+		discard:              body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges,
+		clearUnusable:        body.ClearUnusableWorktreePath != nil && *body.ClearUnusableWorktreePath,
+		expectedWorktreePath: expectedPath != "",
 	}, nil
 }
 
@@ -6193,11 +6212,29 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	}
 	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
 	clearUnusableWorktreePath := body.ClearUnusableWorktreePath != nil && *body.ClearUnusableWorktreePath
+	expectedWorktreePath := ""
+	if body.ExpectedWorktreePath != nil {
+		expectedWorktreePath = strings.TrimSpace(*body.ExpectedWorktreePath)
+	}
 	if discardWorktreeChanges && clearUnusableWorktreePath {
 		return retryLoopResponse{}, apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,
 			status:  http.StatusBadRequest,
 			message: "discardWorktreeChanges and clearUnusableWorktreePath are mutually exclusive",
+		}
+	}
+	if clearUnusableWorktreePath && expectedWorktreePath == "" {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "expectedWorktreePath is required when clearUnusableWorktreePath is true (bind clear to the path shown by GET /worktree)",
+		}
+	}
+	if !clearUnusableWorktreePath && expectedWorktreePath != "" {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "expectedWorktreePath is only valid with clearUnusableWorktreePath=true",
 		}
 	}
 	if discardWorktreeChanges && fromHandback {
@@ -6327,7 +6364,7 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			}
 			worktreeDiscard = &discardResult
 		} else {
-			clearResult, clearErr := h.clearLoopUnusableWorktreePath(ctx, services, *preflightLoop)
+			clearResult, clearErr := h.clearLoopUnusableWorktreePath(ctx, services, *preflightLoop, expectedWorktreePath)
 			if clearErr != nil {
 				var typed apiError
 				if asAPIError(clearErr, &typed) {

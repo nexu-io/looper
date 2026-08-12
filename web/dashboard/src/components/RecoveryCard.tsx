@@ -186,12 +186,19 @@ export function RecoveryCard({
     async (opts?: {
       discardWorktreeChanges?: boolean;
       clearUnusableWorktreePath?: boolean;
+      expectedWorktreePath?: string;
     }) => {
       const discardWorktreeChanges = opts?.discardWorktreeChanges === true;
       const clearUnusableWorktreePath = opts?.clearUnusableWorktreePath === true;
+      const expectedWorktreePath = opts?.expectedWorktreePath?.trim() ?? "";
       await retryLoop(selector, {
         discardWorktreeChanges,
-        ...(clearUnusableWorktreePath ? { clearUnusableWorktreePath: true } : {}),
+        ...(clearUnusableWorktreePath
+          ? {
+              clearUnusableWorktreePath: true,
+              expectedWorktreePath,
+            }
+          : {}),
       });
       toast.success(
         clearUnusableWorktreePath
@@ -288,7 +295,16 @@ export function RecoveryCard({
     setPending("clear-retry");
     setInlineError(null);
     try {
-      await finishRetry({ clearUnusableWorktreePath: true });
+      const expectedWorktreePath = worktree?.worktreePath?.trim() ?? "";
+      if (!expectedWorktreePath) {
+        throw new Error(
+          "Confirmed worktree path is missing; refresh worktree status before clear",
+        );
+      }
+      await finishRetry({
+        clearUnusableWorktreePath: true,
+        expectedWorktreePath,
+      });
       setConfirmClear(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -297,7 +313,7 @@ export function RecoveryCard({
     } finally {
       setPending(null);
     }
-  }, [busy, offersClear, actions.retry, finishRetry, toast]);
+  }, [busy, offersClear, actions.retry, finishRetry, toast, worktree]);
 
   const onTakeover = useCallback(async () => {
     if (busy || !actions.takeover) return;
