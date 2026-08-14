@@ -151,6 +151,57 @@ func EnsureUnusableManagedPathCleared(input CheckInput, path string) error {
 	return ClearUnusableManagedPath(input, path)
 }
 
+// ErrUsableCheckoutRefusesClear signals that an operator clear was requested for
+// a path that is still a usable local checkout. Callers should use discard
+// (git reset/clean) or plain retry instead of RemoveAll.
+var ErrUsableCheckoutRefusesClear = errors.New("usable checkout refuses clear")
+
+// ClearManagedUnusablePathForOperator removes a managed worktree path that is
+// not a usable local checkout. Unlike ClearUnusableManagedPath (runner auto-
+// clear of empty/metadata-only leftovers), this allows full RemoveAll of
+// non-empty hollow leftovers after explicit operator confirmation.
+//
+// Authority: the operator's explicit destructive request for a daemon-resolved
+// managed path. Validate bounds the target; LocalCheckoutUsable is only a
+// defense-in-depth refusal guard (not git-status equivalence). Never used by
+// runners automatically.
+//
+// Behavior:
+//   - missing path → nil (already clear)
+//   - usable checkout → ErrUsableCheckoutRefusesClear
+//   - unusable managed path → os.RemoveAll after Validate
+func ClearManagedUnusablePathForOperator(input CheckInput, path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	check := input
+	check.WorktreePath = path
+	if err := Validate(check); err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if LocalCheckoutUsable(path) {
+		return fmt.Errorf("worktree path %s is a usable checkout; use discard or plain retry, not clear: %w", path, ErrUsableCheckoutRefusesClear)
+	}
+	if !info.IsDir() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func localGitRepositoryMetadataUsable(dir string) bool {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {

@@ -516,6 +516,13 @@ export type RetryLoopBody = {
   resetAttempts: true;
   /** Never set on handback; optional on retry only. */
   discardWorktreeChanges?: boolean;
+  /** Never set on handback; optional on retry only. Mutually exclusive with discard. */
+  clearUnusableWorktreePath?: boolean;
+  /**
+   * Required with clearUnusableWorktreePath. Must match the path shown by
+   * GET /worktree so a stale confirm cannot clear a different managed path.
+   */
+  expectedWorktreePath?: string;
 };
 
 export type RetryLoopResult = {
@@ -524,7 +531,9 @@ export type RetryLoopResult = {
   mode: string;
   resetAttempts: boolean;
   discardWorktreeChanges: boolean;
+  clearUnusableWorktreePath?: boolean;
   worktreeDiscard?: unknown;
+  worktreeClearUnusable?: unknown;
 };
 
 /** GET /loops/{sel}/worktree — retry/jump preflight. */
@@ -538,6 +547,8 @@ export type LoopWorktreeStatus = {
   clean?: boolean | null;
   dirty?: boolean | null;
   reason?: string;
+  /** True on daemons that implement clearUnusableWorktreePath. */
+  supportsClearUnusablePath?: boolean;
 };
 
 export type StopActiveRunResult = {
@@ -604,11 +615,32 @@ export function fetchLoopWorktree(
 
 export function retryLoop(
   selector: string,
-  opts?: { discardWorktreeChanges?: boolean; signal?: AbortSignal },
+  opts?: {
+    discardWorktreeChanges?: boolean;
+    clearUnusableWorktreePath?: boolean;
+    /** Required when clearUnusableWorktreePath is true. */
+    expectedWorktreePath?: string;
+    signal?: AbortSignal;
+  },
 ): Promise<RetryLoopResult> {
+  const clearUnusableWorktreePath = opts?.clearUnusableWorktreePath === true;
+  const expectedWorktreePath = opts?.expectedWorktreePath?.trim() ?? "";
+  if (clearUnusableWorktreePath && !expectedWorktreePath) {
+    return Promise.reject(
+      new Error(
+        "expectedWorktreePath is required when clearUnusableWorktreePath is true",
+      ),
+    );
+  }
   const body: RetryLoopBody = {
     ...RETRY_BODY,
     ...(opts?.discardWorktreeChanges ? { discardWorktreeChanges: true } : {}),
+    ...(clearUnusableWorktreePath
+      ? {
+          clearUnusableWorktreePath: true,
+          expectedWorktreePath,
+        }
+      : {}),
   };
   return apiFetch<RetryLoopResult>(
     `/api/v1/loops/${encodeURIComponent(selector)}/retry`,

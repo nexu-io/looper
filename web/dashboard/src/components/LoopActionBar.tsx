@@ -61,6 +61,7 @@ type PendingConfirm =
   | { action: "takeover" }
   | { action: "handback" }
   | { action: "retry-dirty"; worktree: LoopWorktreeStatus }
+  | { action: "retry-unusable"; worktree: LoopWorktreeStatus }
   | null;
 
 type InspectGuidance = {
@@ -68,6 +69,8 @@ type InspectGuidance = {
   jumpCommand: string;
   /** When false, hide discard CLI hint (unmanaged paths). */
   offerDiscard: boolean;
+  /** When true, show clear-unusable CLI hint. */
+  offerClear?: boolean;
 } | null;
 
 const LABELS: Record<LoopAction, string> = {
@@ -125,12 +128,29 @@ export function LoopActionBar({
   const busy = pending !== null;
 
   const finishRetry = useCallback(
-    async (discardWorktreeChanges: boolean) => {
-      await retryLoop(selector, { discardWorktreeChanges });
+    async (opts?: {
+      discardWorktreeChanges?: boolean;
+      clearUnusableWorktreePath?: boolean;
+      expectedWorktreePath?: string;
+    }) => {
+      const discardWorktreeChanges = opts?.discardWorktreeChanges === true;
+      const clearUnusableWorktreePath = opts?.clearUnusableWorktreePath === true;
+      const expectedWorktreePath = opts?.expectedWorktreePath?.trim() ?? "";
+      await retryLoop(selector, {
+        discardWorktreeChanges,
+        ...(clearUnusableWorktreePath
+          ? {
+              clearUnusableWorktreePath: true,
+              expectedWorktreePath,
+            }
+          : {}),
+      });
       toast.success(
-        discardWorktreeChanges
-          ? "Retry queued (worktree discarded)"
-          : "Retry queued",
+        clearUnusableWorktreePath
+          ? "Retry queued (unusable path cleared)"
+          : discardWorktreeChanges
+            ? "Retry queued (worktree discarded)"
+            : "Retry queued",
       );
       await onMutated?.();
     },
@@ -194,7 +214,7 @@ export function LoopActionBar({
       } catch (err) {
         if (isWorktreeRouteUnavailable(err)) {
           // Older daemon without /worktree — keep prior plain-retry behavior.
-          await finishRetry(false);
+          await finishRetry();
           return;
         }
         throw err;
@@ -203,6 +223,10 @@ export function LoopActionBar({
       const decision = classifyRetryWorktree(worktree);
       if (decision === "offer-discard") {
         setConfirm({ action: "retry-dirty", worktree });
+        return;
+      }
+      if (decision === "offer-clear") {
+        setConfirm({ action: "retry-unusable", worktree });
         return;
       }
       if (decision === "inspect-only") {
@@ -218,7 +242,7 @@ export function LoopActionBar({
         );
         return;
       }
-      await finishRetry(false);
+      await finishRetry();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setInlineError(message);
@@ -232,7 +256,7 @@ export function LoopActionBar({
     setPending("retry");
     setInlineError(null);
     try {
-      await finishRetry(true);
+      await finishRetry({ discardWorktreeChanges: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setInlineError(message);
@@ -242,6 +266,33 @@ export function LoopActionBar({
       setConfirm(null);
     }
   }, [finishRetry, toast]);
+
+  const onClearRetry = useCallback(async () => {
+    setPending("retry");
+    setInlineError(null);
+    try {
+      const expectedWorktreePath =
+        confirm?.action === "retry-unusable"
+          ? (confirm.worktree.worktreePath?.trim() ?? "")
+          : "";
+      if (!expectedWorktreePath) {
+        throw new Error(
+          "Confirmed worktree path is missing; re-open clear confirm from a fresh worktree status",
+        );
+      }
+      await finishRetry({
+        clearUnusableWorktreePath: true,
+        expectedWorktreePath,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setInlineError(message);
+      toast.error(message);
+    } finally {
+      setPending(null);
+      setConfirm(null);
+    }
+  }, [confirm, finishRetry, toast]);
 
   const onClick = (action: LoopAction) => {
     if (busy || !enabled[action]) return;
@@ -290,6 +341,14 @@ export function LoopActionBar({
           title: "Dirty worktree — discard and retry?",
           body: "Local uncommitted changes were found in the loop worktree. Discard them before retrying, or inspect the worktree first.",
           confirmLabel: "Discard & retry",
+          danger: true,
+          cancelLabel: "Inspect first",
+        };
+      case "retry-unusable":
+        return {
+          title: "Unusable worktree path — clear and retry?",
+          body: "Looper could not verify this as a usable checkout. Confirming will delete the entire managed path, including uncommitted or leftover files, then re-queue the loop. Inspect first if unsure.",
+          confirmLabel: "Clear path & retry",
           danger: true,
           cancelLabel: "Inspect first",
         };
@@ -355,6 +414,17 @@ export function LoopActionBar({
               });
               return;
             }
+            if (confirm.action === "retry-unusable") {
+              const wt = confirm.worktree;
+              setConfirm(null);
+              setInspectGuidance({
+                worktree: wt,
+                jumpCommand: `looper jump ${selector}`,
+                offerDiscard: false,
+                offerClear: true,
+              });
+              return;
+            }
             setConfirm(null);
           }}
           onConfirm={() => {
@@ -362,11 +432,16 @@ export function LoopActionBar({
               void onDiscardRetry();
               return;
             }
+            if (confirm.action === "retry-unusable") {
+              void onClearRetry();
+              return;
+            }
             void runAction(confirm.action);
           }}
         >
           <p className="m-0 text-[var(--text-muted)]">{confirmCopy.body}</p>
-          {confirm.action === "retry-dirty" ? (
+          {confirm.action === "retry-dirty" ||
+          confirm.action === "retry-unusable" ? (
             <div className="mt-2 flex flex-col gap-2">
               {confirm.worktree.branch ? (
                 <p className="m-0 mono text-[11px] text-[var(--text-muted)]">
@@ -376,7 +451,9 @@ export function LoopActionBar({
               <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-2">
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
-                    Worktree
+                    {confirm.action === "retry-unusable"
+                      ? "Path to remove"
+                      : "Worktree"}
                   </span>
                   <CopyButton text={confirm.worktree.worktreePath ?? ""} />
                 </div>
@@ -399,7 +476,9 @@ export function LoopActionBar({
           title={
             inspectGuidance.offerDiscard
               ? "Inspect dirty worktree"
-              : "Unmanaged dirty worktree"
+              : inspectGuidance.offerClear
+                ? "Inspect unusable worktree path"
+                : "Unmanaged dirty worktree"
           }
           confirmLabel="Close"
           showCancel={false}
@@ -410,7 +489,9 @@ export function LoopActionBar({
             <p className="m-0 text-[var(--text-muted)]">
               {inspectGuidance.offerDiscard
                 ? "Review local changes in the worktree, then retry again. Use jump from a terminal on this machine."
-                : "This path is not a Looper-managed worktree, so discard is unavailable. Inspect manually, then retry only after the tree is clean or the path is fixed."}
+                : inspectGuidance.offerClear
+                  ? "Looper could not verify this as a usable checkout. Inspect leftovers, then clear the path and retry if appropriate."
+                  : "This path is not a Looper-managed worktree, so discard is unavailable. Inspect manually, then retry only after the tree is clean or the path is fixed."}
             </p>
             {inspectGuidance.worktree.branch ? (
               <p className="m-0 mono text-[11px] text-[var(--text-muted)]">
@@ -448,6 +529,14 @@ export function LoopActionBar({
                 After fixing or deciding to drop changes: Retry again, or run{" "}
                 <span className="mono">
                   looper retry {selector} --discard-worktree-changes --confirm
+                </span>
+              </p>
+            ) : null}
+            {inspectGuidance.offerClear ? (
+              <p className="m-0 text-[11px] text-[var(--text-muted)]">
+                After inspecting leftovers: Retry again, or run{" "}
+                <span className="mono">
+                  looper retry {selector} --clear-unusable-worktree --confirm
                 </span>
               </p>
             ) : null}
