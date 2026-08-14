@@ -173,9 +173,17 @@ func TestParsePiModelsFixture(t *testing.T) {
 }
 
 func TestParsePiModelsSkipsHeaderAndNoise(t *testing.T) {
-	raw := []byte("provider model context\nNot logged in\nopenai gpt-4o 128K\n")
+	raw := []byte("provider  model  context\nNot logged in\nopenai  gpt-4o  128K\n")
 	got := parsePiModels(raw)
 	if !reflect.DeepEqual(modelIDs(got), []string{"openai/gpt-4o"}) {
+		t.Fatalf("ids = %#v", modelIDs(got))
+	}
+}
+
+func TestParsePiModelsPreservesOpaqueIdentifiers(t *testing.T) {
+	raw := []byte("provider  model  context\nAcme:Cloud  Model:Preview  128K\n")
+	got := parsePiModels(raw)
+	if !reflect.DeepEqual(modelIDs(got), []string{"Acme:Cloud/Model:Preview"}) {
 		t.Fatalf("ids = %#v", modelIDs(got))
 	}
 }

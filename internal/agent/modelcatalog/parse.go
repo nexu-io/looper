@@ -29,25 +29,24 @@ func parsePiModels(stdout []byte) []Model {
 	lines := strings.Split(string(stdout), "\n")
 	out := make([]Model, 0, len(lines))
 	seen := make(map[string]struct{})
+	inTable := false
+	columnCount := 0
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || shouldSkipDecorLine(line) {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		columns := splitPiTableColumns(line)
+		if len(columns) >= 2 && strings.EqualFold(columns[0], "provider") && strings.EqualFold(columns[1], "model") {
+			inTable = true
+			columnCount = len(columns)
 			continue
 		}
-		// Skip header row (provider model context ...).
-		if strings.EqualFold(fields[0], "provider") && strings.EqualFold(fields[1], "model") {
+		if !inTable || len(columns) != columnCount {
 			continue
 		}
-		provider := fields[0]
-		model := fields[1]
-		// Pi table tokens are lowercase ids; reject diagnostic sentences like "Not logged in".
-		if !looksLikePiTableToken(provider) || !looksLikePiTableToken(model) {
-			continue
-		}
+		provider := columns[0]
+		model := columns[1]
 		id := provider + "/" + model
 		if _, ok := seen[id]; ok {
 			continue
@@ -58,24 +57,32 @@ func parsePiModels(stdout []byte) []Model {
 	return out
 }
 
-// looksLikePiTableToken accepts provider/model column values from pi --list-models
-// (lowercase alphanumerics plus - _ . /). Uppercase English words are rejected.
-func looksLikePiTableToken(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		r := s[i]
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= '0' && r <= '9':
-		case r == '-' || r == '_' || r == '.' || r == '/':
-		default:
-			return false
+// splitPiTableColumns splits the aligned columns emitted by pi --list-models.
+// Two or more spaces (or a tab) delimit columns; single spaces stay in values.
+func splitPiTableColumns(line string) []string {
+	var columns []string
+	start := 0
+	for i := 0; i < len(line); {
+		if line[i] != '\t' && line[i] != ' ' {
+			i++
+			continue
 		}
+		end := i + 1
+		for end < len(line) && (line[end] == ' ' || line[end] == '\t') {
+			end++
+		}
+		if line[i] == '\t' || end-i >= 2 {
+			if column := strings.TrimSpace(line[start:i]); column != "" {
+				columns = append(columns, column)
+			}
+			start = end
+		}
+		i = end
 	}
-	r0 := s[0]
-	return (r0 >= 'a' && r0 <= 'z') || (r0 >= '0' && r0 <= '9')
+	if column := strings.TrimSpace(line[start:]); column != "" {
+		columns = append(columns, column)
+	}
+	return columns
 }
 
 type ompModelsPayload struct {
