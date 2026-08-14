@@ -1967,7 +1967,8 @@ func shellSingleQuote(s string) string {
 
 // ResolveCommand returns the agent binary used for spawn for vendor + params.
 // When params["command"] is a non-empty string it wins; otherwise vendor defaults
-// apply (claude, codex, opencode, agent for cursor-cli, grok for grok-build).
+// apply (claude, codex, opencode, agent for cursor-cli, grok for grok-build,
+// pi for pi, omp for omp).
 // Same resolution as process spawn — callers may LookPath for an absolute path.
 func ResolveCommand(vendor config.AgentVendor, params map[string]any) string {
 	return resolveCommand(ExecutorConfig{Vendor: vendor, Params: params})
@@ -1985,6 +1986,7 @@ func resolveCommand(cfg ExecutorConfig) string {
 	case config.AgentVendorGrokBuild:
 		return "grok"
 	default:
+		// pi, omp, codex, opencode, and any future vendor whose id matches the binary.
 		return string(cfg.Vendor)
 	}
 }
@@ -2002,6 +2004,10 @@ func resolveArgs(cfg ExecutorConfig, workingDirectory string, prompt string) []s
 		return resolveCursorArgs(cfg, resolvedArgs, prompt)
 	case config.AgentVendorGrokBuild:
 		return resolveGrokArgs(cfg, resolvedArgs, workingDirectory, prompt)
+	case config.AgentVendorPi:
+		return resolvePiArgs(cfg, resolvedArgs, prompt)
+	case config.AgentVendorOmp:
+		return resolveOmpArgs(cfg, resolvedArgs, workingDirectory, prompt)
 	default:
 		return append([]string{}, resolvedArgs...)
 	}
@@ -2075,6 +2081,38 @@ func resolveGrokArgs(cfg ExecutorConfig, args []string, workingDirectory string,
 	}
 	if !hasAnyFlag(resolved, []string{"--no-auto-update"}) {
 		resolved = append(resolved, "--no-auto-update")
+	}
+	return resolved
+}
+
+// resolvePiArgs builds argv for the Pi coding agent (https://pi.dev).
+// -p/--print is boolean; the prompt is a positional message. No --cwd flag —
+// Looper already sets process cmd.Dir to the worktree. Fresh-run only.
+func resolvePiArgs(cfg ExecutorConfig, args []string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+		// Operator-owned print/prompt: when -p/--print is already configured,
+		// do not append Looper's generated prompt (matches claude-code).
+		resolved = append(resolved, "-p", prompt)
+	}
+	if !hasAnyFlag(resolved, []string{"-a", "--approve", "-na", "--no-approve"}) {
+		resolved = append(resolved, "--approve")
+	}
+	return resolved
+}
+
+// resolveOmpArgs builds argv for Oh My Pi / omp (https://omp.sh).
+// Print mode matches pi (-p/--print boolean + positional prompt). Fresh-run only.
+func resolveOmpArgs(cfg ExecutorConfig, args []string, workingDirectory string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"--model"})
+	if !hasAnyFlag(resolved, []string{"-p", "--print"}) {
+		resolved = append(resolved, "-p", prompt)
+	}
+	if strings.TrimSpace(workingDirectory) != "" && !hasAnyFlag(resolved, []string{"--cwd"}) {
+		resolved = append(resolved, "--cwd", workingDirectory)
+	}
+	if !hasAnyFlag(resolved, []string{"--auto-approve", "--approval-mode"}) {
+		resolved = append(resolved, "--auto-approve")
 	}
 	return resolved
 }

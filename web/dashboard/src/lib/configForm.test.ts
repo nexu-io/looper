@@ -172,14 +172,24 @@ describe("config form contract", () => {
       roleAgentPath("fixer", "profile"),
     );
     expect(configFieldPaths(data, roles)).not.toContain("roles.worker.agent");
-    expect(configSelectOptions("agent.vendor")).toEqual([
-      ...AGENT_VENDOR_OPTIONS,
-    ]);
+    // Independent expected list so omissions in AGENT_VENDOR_OPTIONS fail this
+    // test instead of comparing the constant to itself.
+    const supportedVendors = [
+      "claude-code",
+      "codex",
+      "opencode",
+      "cursor-cli",
+      "grok-build",
+      "pi",
+      "omp",
+    ] as const;
+    expect([...AGENT_VENDOR_OPTIONS]).toEqual([...supportedVendors]);
+    expect(configSelectOptions("agent.vendor")).toEqual([...supportedVendors]);
     expect(configSelectOptions(roleAgentPath("worker", "vendor"))).toEqual([
-      ...AGENT_VENDOR_OPTIONS,
+      ...supportedVendors,
     ]);
     expect(configSelectOptions("agent.profiles.fast.vendor")).toEqual([
-      ...AGENT_VENDOR_OPTIONS,
+      ...supportedVendors,
     ]);
   });
 

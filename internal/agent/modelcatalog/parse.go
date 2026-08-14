@@ -19,6 +19,117 @@ func parseGrokModels(stdout []byte) []Model {
 	return parseTableOrIDLines(stdout)
 }
 
+// parsePiModels parses `pi --list-models` multi-column table output:
+//
+//	provider               model                                               context  ...
+//	openai                 gpt-4o                                              128K     ...
+//
+// Model IDs are provider/model when both columns are present (pi accepts that form).
+func parsePiModels(stdout []byte) []Model {
+	lines := strings.Split(string(stdout), "\n")
+	out := make([]Model, 0, len(lines))
+	seen := make(map[string]struct{})
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || shouldSkipDecorLine(line) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// Skip header row (provider model context ...).
+		if strings.EqualFold(fields[0], "provider") && strings.EqualFold(fields[1], "model") {
+			continue
+		}
+		provider := fields[0]
+		model := fields[1]
+		// Pi table tokens are lowercase ids; reject diagnostic sentences like "Not logged in".
+		if !looksLikePiTableToken(provider) || !looksLikePiTableToken(model) {
+			continue
+		}
+		id := provider + "/" + model
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, Model{ID: id, Source: SourceProbe})
+	}
+	return out
+}
+
+// looksLikePiTableToken accepts provider/model column values from pi --list-models
+// (lowercase alphanumerics plus - _ . /). Uppercase English words are rejected.
+func looksLikePiTableToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		r := s[i]
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.' || r == '/':
+		default:
+			return false
+		}
+	}
+	r0 := s[0]
+	return (r0 >= 'a' && r0 <= 'z') || (r0 >= '0' && r0 <= '9')
+}
+
+type ompModelsPayload struct {
+	Models []ompModelEntry `json:"models"`
+}
+
+type ompModelEntry struct {
+	Provider string `json:"provider"`
+	ID       string `json:"id"`
+	Selector string `json:"selector"`
+	Name     string `json:"name"`
+}
+
+// parseOmpModels parses `omp models --json` output. Prefer selector as Model.ID;
+// fallback provider/id or bare id. Use name as Label when present.
+func parseOmpModels(stdout []byte) ([]Model, error) {
+	trimmed := bytesTrimSpace(stdout)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	var payload ompModelsPayload
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		var arr []ompModelEntry
+		if err2 := json.Unmarshal(trimmed, &arr); err2 != nil {
+			return nil, err
+		}
+		payload.Models = arr
+	}
+	out := make([]Model, 0, len(payload.Models))
+	seen := make(map[string]struct{})
+	for _, e := range payload.Models {
+		id := strings.TrimSpace(e.Selector)
+		if id == "" {
+			provider := strings.TrimSpace(e.Provider)
+			rawID := strings.TrimSpace(e.ID)
+			switch {
+			case provider != "" && rawID != "":
+				id = provider + "/" + rawID
+			case rawID != "":
+				id = rawID
+			default:
+				continue
+			}
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		label := strings.TrimSpace(e.Name)
+		out = append(out, Model{ID: id, Label: label, Source: SourceProbe})
+	}
+	return out, nil
+}
+
 // parseLineModels is the shared text parser used by cursor/grok-style output.
 // Kept as an alias for tests and call sites that want the table-tolerant path.
 func parseLineModels(stdout []byte) []Model {

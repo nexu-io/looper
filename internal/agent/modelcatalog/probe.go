@@ -303,6 +303,18 @@ func (s *Service) probe(ctx context.Context, vendor config.AgentVendor, binary s
 			return nil, err
 		}
 		return parseGrokModels(out), nil
+	case config.AgentVendorPi:
+		out, err := s.runner.Run(runCtx, env, binary, "--list-models")
+		if err != nil {
+			return nil, err
+		}
+		return parsePiModels(out), nil
+	case config.AgentVendorOmp:
+		out, err := s.runner.Run(runCtx, env, binary, "models", "--json")
+		if err != nil {
+			return nil, err
+		}
+		return parseOmpModels(out)
 	default:
 		return nil, errors.New("probe unsupported")
 	}

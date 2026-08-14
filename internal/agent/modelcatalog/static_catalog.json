@@ -30,5 +30,17 @@
     { "id": "grok-4", "label": "Grok 4" },
     { "id": "grok-3", "label": "Grok 3" },
     { "id": "grok-code-fast-1", "label": "Grok Code Fast 1" }
+  ],
+  "pi": [
+    { "id": "sonnet", "label": "Sonnet" },
+    { "id": "opus", "label": "Opus" },
+    { "id": "haiku", "label": "Haiku" },
+    { "id": "openai/gpt-5.4", "label": "OpenAI GPT-5.4" }
+  ],
+  "omp": [
+    { "id": "sonnet", "label": "Sonnet" },
+    { "id": "opus", "label": "Opus" },
+    { "id": "haiku", "label": "Haiku" },
+    { "id": "openai/gpt-5.4", "label": "OpenAI GPT-5.4" }
   ]
 }

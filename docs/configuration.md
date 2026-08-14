@@ -369,6 +369,36 @@ For fresh unattended runs, Looper supplies `--always-approve` and `--sandbox off
 
 Grok Build support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt, and Looper never uses Grok Build's ambient `--continue`.
 
+## Pi
+
+Use `pi` as the `agent.vendor` identifier. Looper invokes the [Pi](https://pi.dev) coding agent executable as `pi`:
+
+```toml
+[agent]
+vendor = "pi"
+```
+
+Authenticate via Pi's own login/config (project-local `.pi` and vendor credentials). Prefer vendor authentication over storing secrets in Looper configuration.
+
+For fresh unattended runs, Looper supplies `-p` with the generated task prompt and `--approve` (trusts project-local `.pi` for the run). Configured `agent.params.args` override these defaults: if `-p`/`--print` is already present, Looper does not append its prompt (operator owns print/prompt); if any of `-a`/`--approve`/`-na`/`--no-approve` is present, Looper does not add `--approve`. There is no `--cwd` flag—Looper sets the process working directory to the worktree.
+
+Pi support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt.
+
+## Oh My Pi (omp)
+
+Use `omp` as the `agent.vendor` identifier (not `oh-my-pi`). Looper invokes the [Oh My Pi](https://omp.sh) executable as `omp`:
+
+```toml
+[agent]
+vendor = "omp"
+```
+
+Authenticate via omp's own login/config. Prefer vendor authentication over storing secrets in Looper configuration.
+
+For fresh unattended runs, Looper supplies `-p` with the generated task prompt, `--cwd <worktree>` when the workdir is non-empty, and `--auto-approve`. Configured arguments override defaults: if `-p`/`--print` is already present, Looper does not append its prompt; if `--cwd` is present, Looper does not add workdir; if `--auto-approve` or `--approval-mode` (including `--approval-mode=...`) is present, Looper does not add `--auto-approve`.
+
+Oh My Pi support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt.
+
 ## Provider support
 
 Looper supports three provider kinds:
