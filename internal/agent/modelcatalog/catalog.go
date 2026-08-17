@@ -338,7 +338,7 @@ func cloneResult(in Result) Result {
 func isKnownVendor(vendor config.AgentVendor) bool {
 	switch vendor {
 	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode,
-		config.AgentVendorCursorCLI, config.AgentVendorGrokBuild:
+		config.AgentVendorCursorCLI, config.AgentVendorGrokBuild, config.AgentVendorPi, config.AgentVendorOmp:
 		return true
 	default:
 		return false
@@ -347,7 +347,8 @@ func isKnownVendor(vendor config.AgentVendor) bool {
 
 func supportsProbe(vendor config.AgentVendor) bool {
 	switch vendor {
-	case config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI, config.AgentVendorGrokBuild:
+	case config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI, config.AgentVendorGrokBuild,
+		config.AgentVendorPi, config.AgentVendorOmp:
 		return true
 	default:
 		return false

@@ -1161,12 +1161,12 @@ func (h *Handler) handleAgentModelsRoute(w http.ResponseWriter, r *http.Request,
 	vendor := config.AgentVendor(vendorRaw)
 	switch vendor {
 	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode,
-		config.AgentVendorCursorCLI, config.AgentVendorGrokBuild:
+		config.AgentVendorCursorCLI, config.AgentVendorGrokBuild, config.AgentVendorPi, config.AgentVendorOmp:
 	default:
 		h.writeError(w, requestID, apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,
 			status:  http.StatusBadRequest,
-			message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build",
+			message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build, pi, omp",
 		})
 		return
 	}
@@ -1209,7 +1209,7 @@ func (h *Handler) handleAgentModelsRoute(w http.ResponseWriter, r *http.Request,
 			h.writeError(w, requestID, apiError{
 				code:    pkgapi.ErrorCodeValidationFailed,
 				status:  http.StatusBadRequest,
-				message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build",
+				message: "vendor must be one of: claude-code, codex, opencode, cursor-cli, grok-build, pi, omp",
 			})
 			return
 		}

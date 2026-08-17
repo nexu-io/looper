@@ -19,6 +19,124 @@ func parseGrokModels(stdout []byte) []Model {
 	return parseTableOrIDLines(stdout)
 }
 
+// parsePiModels parses `pi --list-models` multi-column table output:
+//
+//	provider               model                                               context  ...
+//	openai                 gpt-4o                                              128K     ...
+//
+// Model IDs are provider/model when both columns are present (pi accepts that form).
+func parsePiModels(stdout []byte) []Model {
+	lines := strings.Split(string(stdout), "\n")
+	out := make([]Model, 0, len(lines))
+	seen := make(map[string]struct{})
+	inTable := false
+	columnCount := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || shouldSkipDecorLine(line) {
+			continue
+		}
+		columns := splitPiTableColumns(line)
+		if len(columns) >= 2 && strings.EqualFold(columns[0], "provider") && strings.EqualFold(columns[1], "model") {
+			inTable = true
+			columnCount = len(columns)
+			continue
+		}
+		if !inTable || len(columns) != columnCount {
+			continue
+		}
+		provider := columns[0]
+		model := columns[1]
+		id := provider + "/" + model
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, Model{ID: id, Source: SourceProbe})
+	}
+	return out
+}
+
+// splitPiTableColumns splits the aligned columns emitted by pi --list-models.
+// Two or more spaces (or a tab) delimit columns; single spaces stay in values.
+func splitPiTableColumns(line string) []string {
+	var columns []string
+	start := 0
+	for i := 0; i < len(line); {
+		if line[i] != '\t' && line[i] != ' ' {
+			i++
+			continue
+		}
+		end := i + 1
+		for end < len(line) && (line[end] == ' ' || line[end] == '\t') {
+			end++
+		}
+		if line[i] == '\t' || end-i >= 2 {
+			if column := strings.TrimSpace(line[start:i]); column != "" {
+				columns = append(columns, column)
+			}
+			start = end
+		}
+		i = end
+	}
+	if column := strings.TrimSpace(line[start:]); column != "" {
+		columns = append(columns, column)
+	}
+	return columns
+}
+
+type ompModelsPayload struct {
+	Models []ompModelEntry `json:"models"`
+}
+
+type ompModelEntry struct {
+	Provider string `json:"provider"`
+	ID       string `json:"id"`
+	Selector string `json:"selector"`
+	Name     string `json:"name"`
+}
+
+// parseOmpModels parses `omp models --json` output. Prefer selector as Model.ID;
+// fallback provider/id or bare id. Use name as Label when present.
+func parseOmpModels(stdout []byte) ([]Model, error) {
+	trimmed := bytesTrimSpace(stdout)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	var payload ompModelsPayload
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		var arr []ompModelEntry
+		if err2 := json.Unmarshal(trimmed, &arr); err2 != nil {
+			return nil, err
+		}
+		payload.Models = arr
+	}
+	out := make([]Model, 0, len(payload.Models))
+	seen := make(map[string]struct{})
+	for _, e := range payload.Models {
+		id := strings.TrimSpace(e.Selector)
+		if id == "" {
+			provider := strings.TrimSpace(e.Provider)
+			rawID := strings.TrimSpace(e.ID)
+			switch {
+			case provider != "" && rawID != "":
+				id = provider + "/" + rawID
+			case rawID != "":
+				id = rawID
+			default:
+				continue
+			}
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		label := strings.TrimSpace(e.Name)
+		out = append(out, Model{ID: id, Label: label, Source: SourceProbe})
+	}
+	return out, nil
+}
+
 // parseLineModels is the shared text parser used by cursor/grok-style output.
 // Kept as an alias for tests and call sites that want the table-tolerant path.
 func parseLineModels(stdout []byte) []Model {

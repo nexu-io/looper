@@ -41,6 +41,8 @@ func TestLoadStaticCatalog(t *testing.T) {
 		config.AgentVendorOpenCode,
 		config.AgentVendorCursorCLI,
 		config.AgentVendorGrokBuild,
+		config.AgentVendorPi,
+		config.AgentVendorOmp,
 	} {
 		if len(catalog[vendor]) == 0 {
 			t.Fatalf("static catalog empty for %s", vendor)
@@ -154,6 +156,55 @@ func TestParseCursorAndGrokFixtures(t *testing.T) {
 	grok := parseGrokModels(readTestdata(t, "grok_models.txt"))
 	if got := modelIDs(grok); !reflect.DeepEqual(got, []string{"grok-4", "grok-3", "grok-code-fast-1"}) {
 		t.Fatalf("grok ids = %#v", got)
+	}
+}
+
+func TestParsePiModelsFixture(t *testing.T) {
+	got := parsePiModels(readTestdata(t, "pi_models.txt"))
+	want := []string{"openai/gpt-4o", "anthropic/claude-sonnet-4-5", "google/gemini-2.5-pro"}
+	if !reflect.DeepEqual(modelIDs(got), want) {
+		t.Fatalf("pi ids = %#v, want %#v", modelIDs(got), want)
+	}
+	for _, m := range got {
+		if m.Source != SourceProbe {
+			t.Fatalf("source = %q, want probe", m.Source)
+		}
+	}
+}
+
+func TestParsePiModelsSkipsHeaderAndNoise(t *testing.T) {
+	raw := []byte("provider  model  context\nNot logged in\nopenai  gpt-4o  128K\n")
+	got := parsePiModels(raw)
+	if !reflect.DeepEqual(modelIDs(got), []string{"openai/gpt-4o"}) {
+		t.Fatalf("ids = %#v", modelIDs(got))
+	}
+}
+
+func TestParsePiModelsPreservesOpaqueIdentifiers(t *testing.T) {
+	raw := []byte("provider  model  context\nAcme:Cloud  Model:Preview  128K\n")
+	got := parsePiModels(raw)
+	if !reflect.DeepEqual(modelIDs(got), []string{"Acme:Cloud/Model:Preview"}) {
+		t.Fatalf("ids = %#v", modelIDs(got))
+	}
+}
+
+func TestParseOmpModelsFixture(t *testing.T) {
+	got, err := parseOmpModels(readTestdata(t, "omp_models.json"))
+	if err != nil {
+		t.Fatalf("parseOmpModels() error = %v", err)
+	}
+	want := []string{"anthropic/claude-sonnet-4-5", "openai/gpt-5.4", "google/gemini-2.5-pro", "sonnet"}
+	if !reflect.DeepEqual(modelIDs(got), want) {
+		t.Fatalf("omp ids = %#v, want %#v", modelIDs(got), want)
+	}
+	if got[0].Label != "Claude Sonnet 4.5" {
+		t.Fatalf("label = %q, want Claude Sonnet 4.5", got[0].Label)
+	}
+	if got[2].ID != "google/gemini-2.5-pro" || got[2].Label != "Gemini 2.5 Pro" {
+		t.Fatalf("provider/id fallback entry = %#v", got[2])
+	}
+	if got[3].ID != "sonnet" || got[3].Label != "Sonnet alias" {
+		t.Fatalf("bare id entry = %#v", got[3])
 	}
 }
 

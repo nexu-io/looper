@@ -905,7 +905,7 @@ func isNilOrEmptyString(value *string) bool {
 
 func isValidAgentVendor(vendor AgentVendor) bool {
 	switch vendor {
-	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild:
+	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild, AgentVendorPi, AgentVendorOmp:
 		return true
 	default:
 		return false
@@ -913,7 +913,7 @@ func isValidAgentVendor(vendor AgentVendor) bool {
 }
 
 func agentVendorValidationMessage() string {
-	return fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild)
+	return fmt.Sprintf("must be one of: %s, %s, %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild, AgentVendorPi, AgentVendorOmp)
 }
 
 func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]ValidationIssue) {

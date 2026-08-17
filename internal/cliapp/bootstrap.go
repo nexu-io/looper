@@ -1403,7 +1403,7 @@ func writeHumanBootstrapResult(w io.Writer, result bootstrapResult) error {
 }
 
 func promptBootstrapVendor(reader *bufio.Reader, w io.Writer) (*config.AgentVendor, error) {
-	answer, err := promptBootstrapString(reader, w, "Agent vendor [claude-code/codex/opencode/cursor-cli/grok-build]", "")
+	answer, err := promptBootstrapString(reader, w, "Agent vendor [claude-code/codex/opencode/cursor-cli/grok-build/pi/omp]", "")
 	if err != nil {
 		return nil, err
 	}
@@ -1462,7 +1462,7 @@ func promptBootstrapString(reader *bufio.Reader, w io.Writer, label string, defa
 
 func isSupportedBootstrapVendor(vendor config.AgentVendor) bool {
 	switch vendor {
-	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI, config.AgentVendorGrokBuild:
+	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI, config.AgentVendorGrokBuild, config.AgentVendorPi, config.AgentVendorOmp:
 		return true
 	default:
 		return false

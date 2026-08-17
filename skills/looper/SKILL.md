@@ -1,6 +1,6 @@
 ---
 name: looper
-description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, cursor-cli, or Grok Build; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
+description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, cursor-cli, Grok Build, Pi, or Oh My Pi (omp); when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
 ---
 
 # Looper
@@ -92,6 +92,8 @@ Auto-detect installed agent CLIs in parallel before asking:
 | `opencode` | `command -v opencode` |
 | `cursor-cli` | `command -v agent` |
 | `grok-build` | `command -v grok` |
+| `pi` | `command -v pi` |
+| `omp` | `command -v omp` |
 
 Use the `question` tool to let the user pick one. List detected vendors first, marked `(installed)`, with undetected ones appended as `(not installed — needs setup)`. If multiple are installed, do not impose an opinionated default — present them in detection order and let the user choose.
 
@@ -99,9 +101,11 @@ If none are installed, ask the user which one they want to install before contin
 
 After the user picks a vendor, verify it is authenticated (run the vendor's own status command, e.g. `claude --version` followed by a quick auth check, or `agent status`). If the vendor CLI exits with an auth error, surface it and ask the user to log in via the vendor's own flow before continuing.
 
-Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). For xAI Grok Build (`agent.vendor = "grok-build"`, executable `grok`), use `grok login --device-auth` or provide `XAI_API_KEY` in the daemon environment. Prefer those vendor/daemon authentication mechanisms over storing credentials in Looper configuration. If the user explicitly manages a value through `agent.env`, treat it as a local secret: the dashboard/API returns only its key, never its value, and it must not be committed or copied into examples.
+Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). For xAI Grok Build (`agent.vendor = "grok-build"`, executable `grok`), use `grok login --device-auth` or provide `XAI_API_KEY` in the daemon environment. For Pi (`agent.vendor = "pi"`, executable `pi`) and Oh My Pi (`agent.vendor = "omp"`, executable `omp`), use each vendor's own login/config. Prefer those vendor/daemon authentication mechanisms over storing credentials in Looper configuration. If the user explicitly manages a value through `agent.env`, treat it as a local secret: the dashboard/API returns only its key, never its value, and it must not be committed or copied into examples.
 
 Grok Build fresh runs default to `--always-approve` and `--sandbox off` so the agent can update Git metadata outside a linked worktree. Configured arguments override defaults: operators can select a stricter sandbox when the repository layout permits it; `--permission-mode` may prompt or fail unattended runs; non-`plain` output can prevent direct completion-marker parsing; and `-p`/`--single` replaces Looper's generated task prompt. Daemon native resume and interactive `looper resume` takeover are unsupported for Grok Build; retries use a fresh checkpoint prompt, and Looper never uses ambient `--continue`.
+
+Pi fresh runs default to `-p <prompt> --approve` (project-local `.pi` trusted for the run). Oh My Pi (`omp`) fresh runs default to `-p <prompt> --cwd <worktree> --auto-approve`. Configured print/approve/cwd/approval-mode flags override those defaults. Daemon native resume and interactive `looper resume` takeover are unsupported for `pi` and `omp`; retries use a fresh checkpoint prompt.
 
 ### Step 2 — Pick the first project to watch
 
