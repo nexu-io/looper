@@ -2,8 +2,10 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
@@ -65,6 +67,136 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 		}
 	}
 	return answer
+}
+
+// githubHITLDeliveryDeps are the injected dependencies for posting an undelivered
+// review-fix budget ask onto its PR so the answer-poll lane can later consume it.
+type githubHITLDeliveryDeps struct {
+	createComment func(ctx contextType, repo string, prNumber int64, body, cwd string) (int64, error)
+	addLabel      func(ctx contextType, repo string, prNumber int64, label, cwd string)
+	projectCWD    func(projectID string) string
+	stampBody     func(body, runner string) string
+	mentionLogins []string
+	awaitingLabel string
+	nowISO        string
+	logWarn       func(msg string, fields map[string]any)
+}
+
+func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, records []storage.LoopRecord, repos *storage.Repositories, deps githubHITLDeliveryDeps) int {
+	if repos == nil || repos.Loops == nil || deps.createComment == nil {
+		return 0
+	}
+	delivered := 0
+	awaitingLabel := strings.TrimSpace(deps.awaitingLabel)
+	if awaitingLabel == "" {
+		awaitingLabel = "looper:awaiting-human"
+	}
+	for _, loop := range records {
+		if loop.ProjectID != projectID || loop.Status != "awaiting_human" {
+			continue
+		}
+		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+		if !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			continue
+		}
+		if ask.AskCommentID != 0 && strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
+			continue
+		}
+		prNumber := ask.PRNumber
+		if prNumber == 0 {
+			prNumber = derefLoopPRNumber(loop)
+		}
+		repo := derefLoopRepo(loop)
+		if prNumber == 0 || repo == "" {
+			continue
+		}
+		cwd := ""
+		if deps.projectCWD != nil {
+			cwd = deps.projectCWD(loop.ProjectID)
+		}
+		body := buildGitHubBudgetAskComment(loop.Seq, ask.Question, ask.Options, deps.mentionLogins)
+		if deps.stampBody != nil {
+			body = deps.stampBody(body, loop.Type)
+		}
+		commentID, err := deps.createComment(ctx, repo, prNumber, body, cwd)
+		if err != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl github: budget ask delivery failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+			}
+			continue
+		}
+		if deps.addLabel != nil {
+			deps.addLabel(ctx, repo, prNumber, awaitingLabel, cwd)
+		}
+		ask.Transport = "github"
+		ask.PRNumber = prNumber
+		ask.AskCommentID = commentID
+		meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if werr != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl github: budget ask metadata write failed", map[string]any{"loopId": loop.ID, "error": werr.Error()})
+			}
+			continue
+		}
+		updated := loop
+		updated.MetadataJSON = &meta
+		if deps.nowISO != "" {
+			updated.UpdatedAt = deps.nowISO
+		}
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl github: budget ask persist failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+			}
+			continue
+		}
+		delivered++
+	}
+	return delivered
+}
+
+func buildGitHubBudgetAskComment(loopSeq int64, question string, options []string, mentionLogins []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<!-- looper:hitl:ask v=1 loop=%d -->\n", loopSeq)
+	b.WriteString("🤔 **looper needs a decision to continue.**\n\n")
+	b.WriteString(strings.TrimSpace(question))
+	for _, option := range options {
+		if option = strings.TrimSpace(option); option != "" {
+			fmt.Fprintf(&b, "\n- %s", option)
+		}
+	}
+	b.WriteString("\n\nReply to this comment with Continue or Stop.")
+	if mentions := githubBudgetMentionLine(mentionLogins); mentions != "" {
+		b.WriteString("\n\n" + mentions)
+	}
+	return b.String()
+}
+
+func githubBudgetMentionLine(logins []string) string {
+	parts := make([]string, 0, len(logins))
+	for _, login := range logins {
+		login = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(login), "@"))
+		if login != "" {
+			parts = append(parts, "@"+login)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "/cc " + strings.Join(parts, " ")
+}
+
+func derefLoopRepo(loop storage.LoopRecord) string {
+	if loop.Repo == nil {
+		return ""
+	}
+	return strings.TrimSpace(*loop.Repo)
+}
+
+func derefLoopPRNumber(loop storage.LoopRecord) int64 {
+	if loop.PRNumber == nil {
+		return 0
+	}
+	return *loop.PRNumber
 }
 
 // githubHITLPollDeps are the injected dependencies of the answer-poll lane, kept
@@ -254,6 +386,45 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 	if err != nil {
 		return
 	}
+	awaitingLabel := "looper:awaiting-human"
+	var mentionLogins []string
+	var answerAuthors []string
+	if gh := input.Config.HITL.GitHub; gh != nil {
+		if strings.TrimSpace(gh.AwaitingLabel) != "" {
+			awaitingLabel = strings.TrimSpace(gh.AwaitingLabel)
+		}
+		mentionLogins = gh.MentionLogins
+		answerAuthors = gh.AnswerAuthors
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
+	deliveryDeps := githubHITLDeliveryDeps{
+		createComment: func(ctx contextType, repo string, pr int64, body, cwd string) (int64, error) {
+			res, err := input.GitHubGateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: repo, IssueNumber: pr, Body: body, CWD: cwd})
+			if err != nil {
+				return 0, err
+			}
+			return res.ID, nil
+		},
+		addLabel: func(ctx contextType, repo string, pr int64, label, cwd string) {
+			_ = input.GitHubGateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{label}, CWD: cwd})
+		},
+		projectCWD: func(string) string { return project.RepoPath },
+		stampBody: func(body, runner string) string {
+			return disclosure.FromConfig(*input.Config).Markdown(body, runner, disclosure.ChannelIssueComment)
+		},
+		mentionLogins: mentionLogins,
+		awaitingLabel: awaitingLabel,
+		nowISO:        nowISO,
+	}
+	if input.Logger != nil {
+		deliveryDeps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
+	}
+	if deliverUndeliveredGitHubBudgetAsks(ctx, project.ID, allLoops, input.Repos, deliveryDeps) > 0 {
+		allLoops, err = input.Repos.Loops.List(ctx)
+		if err != nil {
+			return
+		}
+	}
 	awaiting := make([]githubHITLAwaitingLoop, 0)
 	for _, l := range allLoops {
 		if l.ProjectID != project.ID || l.Status != "awaiting_human" {
@@ -276,16 +447,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		return
 	}
 
-	awaitingLabel := "looper:awaiting-human"
-	var answerAuthors []string
-	if gh := input.Config.HITL.GitHub; gh != nil {
-		if strings.TrimSpace(gh.AwaitingLabel) != "" {
-			awaitingLabel = strings.TrimSpace(gh.AwaitingLabel)
-		}
-		answerAuthors = gh.AnswerAuthors
-	}
 	gw := input.GitHubGateway
-	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
 
 	deps := githubHITLPollDeps{
 		listComments: func(ctx contextType, repo string, pr int64, cwd string) ([]githubAnswerComment, error) {

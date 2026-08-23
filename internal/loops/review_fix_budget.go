@@ -51,6 +51,7 @@ func NewReviewFixBudgetAsk(role, repo string, prNumber int64, count, cap int, no
 		Options:  []string{ReviewFixBudgetAnswerContinue, ReviewFixBudgetAnswerStop},
 		Status:   "awaiting",
 		AskedAt:  nowISO,
+		PRNumber: prNumber,
 	}
 }
 
@@ -155,7 +156,23 @@ func IsSiblingReviewFixBudgetPause(metadataJSON *string) bool {
 	return ReadReviewFixBudgetState(metadataJSON).PauseReason == ReviewFixBudgetPauseReason
 }
 
-func FindSiblingReviewFixLoop(all []storage.LoopRecord, loop storage.LoopRecord) *storage.LoopRecord {
+func isManualReviewFixLoop(loop storage.LoopRecord) bool {
+	manual, _ := parseMetadataObject(loop.MetadataJSON)["manual"].(bool)
+	return manual
+}
+
+func isTerminalReviewFixSiblingStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "terminated", "stopped", "completed", "awaiting_human", "human_takeover":
+		return true
+	default:
+		return false
+	}
+}
+
+// FindSiblingReviewFixLoops returns automatic opposite-role loops on the same
+// project/repo/PR. Manual loops are not part of the review-fix budget pair.
+func FindSiblingReviewFixLoops(all []storage.LoopRecord, loop storage.LoopRecord) []storage.LoopRecord {
 	wantType := ""
 	switch strings.TrimSpace(loop.Type) {
 	case "reviewer":
@@ -170,15 +187,33 @@ func FindSiblingReviewFixLoop(all []storage.LoopRecord, loop storage.LoopRecord)
 	if repo == "" || pr == 0 {
 		return nil
 	}
-	for i := range all {
-		candidate := all[i]
+	siblings := make([]storage.LoopRecord, 0)
+	for _, candidate := range all {
 		if candidate.ID == loop.ID || candidate.Type != wantType || candidate.ProjectID != loop.ProjectID {
 			continue
 		}
 		if derefLoopString(candidate.Repo) != repo || derefLoopInt64(candidate.PRNumber) != pr {
 			continue
 		}
-		return &all[i]
+		if isManualReviewFixLoop(candidate) {
+			continue
+		}
+		siblings = append(siblings, candidate)
+	}
+	return siblings
+}
+
+// FindSiblingReviewFixLoop returns the preferred automatic sibling: a
+// non-terminal match when one exists, otherwise the first automatic match.
+func FindSiblingReviewFixLoop(all []storage.LoopRecord, loop storage.LoopRecord) *storage.LoopRecord {
+	siblings := FindSiblingReviewFixLoops(all, loop)
+	for i := range siblings {
+		if !isTerminalReviewFixSiblingStatus(siblings[i].Status) {
+			return &siblings[i]
+		}
+	}
+	if len(siblings) > 0 {
+		return &siblings[0]
 	}
 	return nil
 }
@@ -236,12 +271,16 @@ func parkSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, 
 	if err != nil {
 		return err
 	}
-	sibling := FindSiblingReviewFixLoop(all, exhausted)
-	if sibling == nil {
-		return nil
+	for _, sibling := range FindSiblingReviewFixLoops(all, exhausted) {
+		if err := parkOneSiblingReviewFixLoop(ctx, repos, sibling, exhaustedBy, nowISO); err != nil {
+			return err
+		}
 	}
-	switch sibling.Status {
-	case "terminated", "stopped", "completed", "awaiting_human", "human_takeover":
+	return nil
+}
+
+func parkOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, sibling storage.LoopRecord, exhaustedBy, nowISO string) error {
+	if isTerminalReviewFixSiblingStatus(sibling.Status) {
 		return nil
 	}
 	state := ReadReviewFixBudgetState(sibling.MetadataJSON)
@@ -258,7 +297,7 @@ func parkSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, 
 		return err
 	}
 	text := string(encoded)
-	updated := *sibling
+	updated := sibling
 	updated.MetadataJSON = &text
 	updated.Status = "paused"
 	updated.NextRunAt = nil
@@ -343,10 +382,21 @@ func continueReviewFixBudget(ctx context.Context, repos *storage.Repositories, l
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return loop, err
 	}
+	if err := requeueReviewFixBudgetLoop(ctx, repos, updated.ID, nowISO); err != nil {
+		return updated, err
+	}
 	if err := unpauseSiblingReviewFixLoop(ctx, repos, updated, nowISO); err != nil {
 		return updated, err
 	}
 	return updated, nil
+}
+
+func requeueReviewFixBudgetLoop(ctx context.Context, repos *storage.Repositories, loopID, nowISO string) error {
+	if repos == nil || repos.Queue == nil || strings.TrimSpace(loopID) == "" {
+		return nil
+	}
+	_, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
+	return err
 }
 
 func unpauseSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, exhausted storage.LoopRecord, nowISO string) error {
@@ -354,10 +404,18 @@ func unpauseSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositorie
 	if err != nil {
 		return err
 	}
-	sibling := FindSiblingReviewFixLoop(all, exhausted)
-	if sibling == nil || sibling.Status != "paused" || !IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
-		return nil
+	for _, sibling := range FindSiblingReviewFixLoops(all, exhausted) {
+		if sibling.Status != "paused" || !IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+			continue
+		}
+		if err := unpauseOneSiblingReviewFixLoop(ctx, repos, sibling, nowISO); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func unpauseOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, sibling storage.LoopRecord, nowISO string) error {
 	state := ReadReviewFixBudgetState(sibling.MetadataJSON)
 	state.SiblingOf = ""
 	state.PauseReason = ""
@@ -372,12 +430,15 @@ func unpauseSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositorie
 		return err
 	}
 	text := string(encoded)
-	updated := *sibling
+	updated := sibling
 	updated.MetadataJSON = &text
 	updated.Status = "queued"
 	updated.NextRunAt = &nowISO
 	updated.UpdatedAt = nowISO
-	return repos.Loops.Upsert(ctx, updated)
+	if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		return err
+	}
+	return requeueReviewFixBudgetLoop(ctx, repos, updated.ID, nowISO)
 }
 
 func terminateReviewFixPair(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
@@ -389,8 +450,8 @@ func terminateReviewFixPair(ctx context.Context, repos *storage.Repositories, lo
 	if err != nil {
 		return updated, err
 	}
-	if sibling := FindSiblingReviewFixLoop(all, updated); sibling != nil {
-		if _, err := terminateReviewFixLoop(ctx, repos, *sibling, nowISO); err != nil {
+	for _, sibling := range FindSiblingReviewFixLoops(all, updated) {
+		if _, err := terminateReviewFixLoop(ctx, repos, sibling, nowISO); err != nil {
 			return updated, err
 		}
 	}
