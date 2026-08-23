@@ -62,7 +62,7 @@ func IsReviewFixBudgetAsk(ask HITLAsk) bool {
 
 func IsReviewFixBudgetContinue(answer string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(answer))
-	return normalized == strings.ToLower(ReviewFixBudgetAnswerContinue) || normalized == "continue another" || strings.HasPrefix(normalized, "continue")
+	return normalized == strings.ToLower(ReviewFixBudgetAnswerContinue) || normalized == "continue another"
 }
 
 func IsReviewFixBudgetStop(answer string) bool {

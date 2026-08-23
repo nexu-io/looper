@@ -2018,6 +2018,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
+	if parked, err := r.parkFixerBudgetIfExhausted(ctx, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
+	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
 		return ProcessResult{}, err
@@ -2322,18 +2327,18 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 	}
+	if parked, err := r.parkFixerBudgetIfExhausted(ctx, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
+	}
 	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if scheduled {
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		status := statusForSkip(checkpoint.SkipReason)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
-	}
-	if parked, err := r.parkFixerBudgetIfExhausted(ctx, *loop); err != nil {
-		return ProcessResult{}, err
-	} else if parked {
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
-		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 	}
 	if scheduled, err := r.scheduleFollowupRetryAfterSuccess(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber, checkpoint.SkipReason == ""); err != nil {
 		return ProcessResult{}, err
@@ -2376,8 +2381,15 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if !ok {
 		return false, nil
 	}
-	if current.Status == "paused" {
+	if current.Status == "paused" || current.Status == "awaiting_human" || current.Status == "human_takeover" {
 		return false, nil
+	}
+	if r.hitlEnabled && !isManualFixerLoop(*current) {
+		cap := r.maxPushesPerPR(current.ProjectID)
+		count := loops.ReadReviewFixBudgetState(current.MetadataJSON).PushCount
+		if loops.BudgetExhausted(count, cap) {
+			return false, nil
+		}
 	}
 	// Pending rediscovery after a run is a new scheduling decision for the
 	// still-actionable set: apply quiet period before the next start.

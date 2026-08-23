@@ -118,6 +118,107 @@ func TestIncrementAndParkFixerBudgetParksSibling(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemParksExhaustedBudgetBeforeRun(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	projectID := "project_1"
+	loopID := "loop_fixer_budget_entry"
+	fixer := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_entry", Seq: 2, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_budget_entry", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:budget-entry", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	cfg.HITL.Enabled = true
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: true})
+	if _, err := runner.incrementFixerPushCount(context.Background(), fixer); err != nil {
+		t.Fatalf("incrementFixerPushCount() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_budget_entry", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, Status: "running"})
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped at claim start", result)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || updated == nil || updated.Status != "awaiting_human" {
+		t.Fatalf("fixer = (%#v, %v), want awaiting_human", updated, err)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("reviewer sibling = (%#v, %v), want paused sibling hold", sibling, err)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_fixer_budget_entry")
+	if err != nil || queue == nil || queue.Status != "cancelled" {
+		t.Fatalf("queue = (%#v, %v), want cancelled claimed item", queue, err)
+	}
+}
+
+func TestParkFixerBudgetBeforePendingRediscoveryDoesNotEnqueue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(85)
+	nowISO := fixture.nowISO()
+	target := buildPullRequestTargetID(repo, prNumber)
+	projectID := "project_1"
+	loopID := "loop_fixer_budget_rediscovery"
+	metadata := mustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": "head-85", "fixItemsStateHash": "state-85", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO}})
+	fixer := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	cfg.HITL.Enabled = true
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: true})
+	if _, err := runner.incrementFixerPushCount(context.Background(), fixer); err != nil {
+		t.Fatalf("incrementFixerPushCount() error = %v", err)
+	}
+
+	parked, err := runner.parkFixerBudgetIfExhausted(context.Background(), fixer)
+	if err != nil || !parked {
+		t.Fatalf("parkFixerBudgetIfExhausted() = (%v, %v), want parked before rediscovery", parked, err)
+	}
+	scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), fixer, repo, prNumber)
+	if err != nil {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
+	}
+	if scheduled {
+		t.Fatal("schedulePendingRediscoveryAfterRun() = true, want no enqueue after budget park")
+	}
+	active, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if active != nil {
+		t.Fatalf("activeQueue = %#v, want no rediscovery item after cap park", active)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || updated == nil || updated.Status != "awaiting_human" {
+		t.Fatalf("fixer = (%#v, %v), want still awaiting_human", updated, err)
+	}
+}
+
 func TestParkFixerBudgetIfExhaustedSkipsWhenHITLDisabled(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

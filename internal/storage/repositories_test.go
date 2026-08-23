@@ -2018,6 +2018,32 @@ func TestQueueClaimNextOfTypeSkipsTerminatedAndStoppedLoops(t *testing.T) {
 	}
 }
 
+func TestQueueClaimNextOfTypeSkipsAwaitingHumanLoops(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	projectID := "project_queue_awaiting_human"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Queue Awaiting Human", RepoPath: "/tmp/repo", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_awaiting_human"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", Status: "awaiting_human", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: "queue_awaiting_human", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:awaiting", DedupeKey: "d_awaiting_human", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	claimed, err := repos.Queue.ClaimNextOfType(ctx, now, "worker", "fixer")
+	if err != nil {
+		t.Fatalf("Queue.ClaimNextOfType() error = %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("Queue.ClaimNextOfType() = %#v, want nil for awaiting_human loop", claimed)
+	}
+}
+
 func TestQueueClaimNextSkipsArchivedProjects(t *testing.T) {
 	t.Parallel()
 

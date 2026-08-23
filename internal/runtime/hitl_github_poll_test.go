@@ -42,13 +42,14 @@ func TestDetectGitHubHITLAnswerSkipsUnrelatedBudgetComments(t *testing.T) {
 	comments := []githubAnswerComment{
 		{ID: 9001, Author: "looper", Body: "<!-- looper:hitl:ask --> Continue or Stop?"},
 		{ID: 9002, Author: "operator", Body: "looking into this first"},
-		{ID: 9003, Author: "operator", Body: "Continue"},
+		{ID: 9003, Author: "operator", Body: "Continue investigating; do not resume yet"},
+		{ID: 9004, Author: "operator", Body: "Continue"},
 	}
 	accept := func(body string) bool {
 		return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
 	}
 	if got := detectGitHubHITLAnswerMatching(comments, 9001, nil, accept); got != "Continue" {
-		t.Fatalf("budget answer = %q, want Continue after skipping unrelated comment", got)
+		t.Fatalf("budget answer = %q, want exact Continue after skipping prefix-only discussion", got)
 	}
 	if got := detectGitHubHITLAnswer(comments, 9001, nil); got != "looking into this first" {
 		t.Fatalf("generic answer = %q, want earliest human comment", got)

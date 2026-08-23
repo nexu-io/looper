@@ -638,6 +638,57 @@ func TestRunScheduledQueueItemsDoesNotReopenStopGate(t *testing.T) {
 	}
 }
 
+func TestRunScheduledQueueItemsReleasesAwaitingHumanClaim(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	backupDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "awaiting-human.sqlite"), backupDir)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "project_awaiting_human"
+	loopID := "loop_awaiting_human"
+	queueID := "queue_awaiting_human"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Awaiting", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42",
+		DedupeKey: "fixer:awaiting_human", Priority: storage.QueuePriorityFixer, Status: "running",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	item := storage.QueueItemRecord{ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "fixer", Status: "running"}
+	input := defaultSchedulerTickInput{Repos: repos, Now: func() time.Time { return now }}
+	if !schedulerLoopParked(context.Background(), item, input) {
+		t.Fatal("schedulerLoopParked() = false, want true for awaiting_human")
+	}
+
+	fixerRunner := &stubFixerScheduler{}
+	if err := runScheduledQueueItems(context.Background(), []storage.QueueItemRecord{item}, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Fixer: fixerRunner,
+	}); err != nil {
+		t.Fatalf("runScheduledQueueItems() error = %v", err)
+	}
+	if fixerRunner.processItemCount() != 0 {
+		t.Fatalf("fixer processed = %d, want 0 for awaiting_human claim", fixerRunner.processItemCount())
+	}
+	queue, err := repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil || queue == nil || queue.Status != "completed" {
+		t.Fatalf("queue = (%#v, %v), want completed parked claim", queue, err)
+	}
+	loop, err := repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil || loop.Status != "awaiting_human" {
+		t.Fatalf("loop = (%#v, %v), want still awaiting_human", loop, err)
+	}
+}
+
 func TestRunScheduledQueueItemsProcessesItemsConcurrently(t *testing.T) {
 	t.Parallel()
 

@@ -21,6 +21,26 @@ func TestBudgetExhausted(t *testing.T) {
 	}
 }
 
+func TestIsReviewFixBudgetContinueRequiresExplicitOption(t *testing.T) {
+	t.Parallel()
+	for _, answer := range []string{"Continue", "continue", " Continue ", "continue another"} {
+		if !IsReviewFixBudgetContinue(answer) {
+			t.Fatalf("IsReviewFixBudgetContinue(%q) = false, want true", answer)
+		}
+	}
+	for _, answer := range []string{
+		"Continue investigating; do not resume yet",
+		"continue the investigation",
+		"continued",
+		"Stop",
+		"",
+	} {
+		if IsReviewFixBudgetContinue(answer) {
+			t.Fatalf("IsReviewFixBudgetContinue(%q) = true, want false", answer)
+		}
+	}
+}
+
 func TestParkAndContinueReviewFixBudget(t *testing.T) {
 	t.Parallel()
 	repos, nowISO := newBudgetFixture(t)
