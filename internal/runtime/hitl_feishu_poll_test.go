@@ -168,6 +168,125 @@ func TestFeishuHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 	}
 }
 
+func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_budget_feishu_typed"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Budget", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewerMeta := `{"loop":{"iterationCount":8}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_feishu_typed_reviewer", Seq: 81, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &reviewerMeta,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_feishu_typed_fixer", Seq: 82, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "queue_feishu_typed_reviewer", ProjectID: stringPtr(projectID), LoopID: &reviewer.ID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Status: "queued", Priority: storage.QueuePriorityReviewer, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, DedupeKey: "reviewer:queue_feishu_typed_reviewer"},
+		{ID: "queue_feishu_typed_fixer", ProjectID: stringPtr(projectID), LoopID: &fixer.ID, Type: "fixer", TargetType: "pull_request", TargetID: target, Status: "queued", Priority: storage.QueuePriorityFixer, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, DedupeKey: "fixer:queue_feishu_typed_fixer"},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+	}); err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+
+	all, err := repos.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	if delivered := deliverUndeliveredFeishuBudgetAsks(context.Background(), all, repos, feishuHITLDeliveryDeps{
+		sendAsk: func(_ contextType, _ storage.LoopRecord, _ loops.HITLAsk) error { return nil },
+		nowISO:  nowISO,
+	}); delivered != 1 {
+		t.Fatalf("deliverUndeliveredFeishuBudgetAsks() = %d, want 1", delivered)
+	}
+
+	deps := feishuHITLPollDeps{
+		loopByRoot: func(_ contextType, rootID string) string {
+			if rootID == "om_budget_root" {
+				return reviewer.ID
+			}
+			return ""
+		},
+		enqueueMessage: func(ctx contextType, loopID, text string) error {
+			return enqueueHumanMessageToLoop(ctx, repos, nowISO, loopID, text)
+		},
+		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+		},
+	}
+
+	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
+		ID: 30, Kind: "message", RootID: "om_budget_root", Text: "looking into this first",
+	}}, deps)
+	if n != 1 || maxID != 30 {
+		t.Fatalf("typed discussion poll = %d maxID=%d, want handled discussion", n, maxID)
+	}
+	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil || fresh.Status != "awaiting_human" || loops.ReviewerPublishCount(fresh.MetadataJSON) != 8 {
+		t.Fatalf("reviewer after typed discussion = (%#v, %v), want still parked", fresh, err)
+	}
+	if ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) || ask.Transport != "feishu" {
+		t.Fatalf("ask after typed discussion = %#v, want delivered budget ask", ask)
+	}
+	if got := loops.ReadHumanInbox(fresh.MetadataJSON); len(got) != 0 {
+		t.Fatalf("human inbox after typed discussion = %#v, want empty", got)
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("fixer after typed discussion = (%#v, %v), want still paused", sibling, err)
+	}
+
+	n, maxID = pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
+		ID: 31, Kind: "message", RootID: "om_budget_root", Text: "Continue",
+	}}, deps)
+	if n != 1 || maxID != 31 {
+		t.Fatalf("typed Continue poll = %d maxID=%d, want applied Continue", n, maxID)
+	}
+	fresh, err = repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil || fresh.Status != "queued" || loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("reviewer after typed Continue = (%#v, %v), want queued with reset count", fresh, err)
+	}
+	sibling, err = repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "queued" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("fixer after typed Continue = (%#v, %v), want queued and unpaused", sibling, err)
+	}
+}
+
 func mustCardAction(id int64, seq, answer string) feishuInboxEvent {
 	e := feishuInboxEvent{ID: id, Kind: "card_action"}
 	e.Value.LoopSeq = seq

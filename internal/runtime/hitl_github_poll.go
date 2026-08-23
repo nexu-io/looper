@@ -351,8 +351,10 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 // queued so the scheduler picks it up and the worker drains the message on its
 // next turn; a running loop drains it when the current turn ends. Terminal loops
 // are left alone (a message can't reopen a finished loop yet). Unlike a button
-// answer, a message does NOT resolve a pending ask — the agent reads it and
-// decides whether to proceed, answer, or ask again.
+// answer, a message does NOT resolve a pending mid-run ask — the agent reads it
+// and decides whether to proceed, answer, or ask again. A review-fix budget ask
+// is the exception: only Continue/Stop may unpark, and they apply the budget
+// decision instead of enqueueing conversational text.
 func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
 	// Share process-wide requeue exclusion with API discard+retry so free-text
 	// inbox delivery cannot requeue paused/waiting/manual_intervention loops
@@ -374,6 +376,17 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	// per-loop mutex and wipes the shared worktree before the retry TX.
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
+
+	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+		// Budget holds are Continue/Stop decisions, not conversational inbox
+		// turns. A typed Feishu reply must not flip awaiting_human to queued
+		// without resetting the counter or unpausing the sibling.
+		if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
+			_, err = loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, text, nowISO)
+			return err
+		}
+		return nil
+	}
 
 	meta, werr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
 	if werr != nil {
