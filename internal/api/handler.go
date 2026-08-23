@@ -5956,7 +5956,10 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		if loops.IsReviewFixBudgetAsk(ask) {
 			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO)
 			if applyErr != nil {
-				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
+				if errors.Is(applyErr, loops.ErrReviewFixBudgetInvalidAnswer) {
+					return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
+				}
+				return storage.LoopRecord{}, applyErr
 			}
 			if result.Applied {
 				return result.Loop, nil
@@ -5986,6 +5989,9 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 	}
 
 	if updated.Status != string(domain.LoopStatusAwaitingHuman) {
+		if h.context.TriggerSchedulerTick != nil {
+			h.context.TriggerSchedulerTick()
+		}
 		return h.serializeLoopWithDiagnostics(ctx, updated)
 	}
 

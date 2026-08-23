@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -412,5 +413,130 @@ func TestHandlerRespondRequiresAnswer(t *testing.T) {
 	h.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for empty answer; body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandlerRespondReviewFixBudgetContinueTriggersScheduler(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	triggered := 0
+	h := NewHandler(Context{Config: cfg, Runtime: rt, TriggerSchedulerTick: func() { triggered++ }})
+	seedReviewFixBudgetAwaitingLoop(t, rt, "project_budget_continue", "loop_budget_continue", 641)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/641/respond", strings.NewReader(`{"answer":"Continue"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if triggered != 1 {
+		t.Fatalf("TriggerSchedulerTick called %d times, want 1 after budget Continue", triggered)
+	}
+
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_budget_continue")
+	if err != nil || loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop after budget Continue = %#v, %v, want queued", loop, err)
+	}
+	active, err := rt.Services().Repositories.Queue.FindActiveByLoopID(context.Background(), "loop_budget_continue")
+	if err != nil || active == nil || active.Status != "queued" {
+		t.Fatalf("queue after budget Continue = %#v, %v, want queued", active, err)
+	}
+}
+
+func TestHandlerRespondReviewFixBudgetInvalidAnswerIsValidationError(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	triggered := 0
+	h := NewHandler(Context{Config: cfg, Runtime: rt, TriggerSchedulerTick: func() { triggered++ }})
+	seedReviewFixBudgetAwaitingLoop(t, rt, "project_budget_invalid", "loop_budget_invalid", 642)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/642/respond", strings.NewReader(`{"answer":"maybe later"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	if errMap["code"] != "VALIDATION_FAILED" {
+		t.Fatalf("error.code = %#v, want VALIDATION_FAILED", errMap["code"])
+	}
+	if !strings.Contains(fmt.Sprint(errMap["message"]), "Continue") {
+		t.Fatalf("error.message = %#v, want invalid-option text", errMap["message"])
+	}
+	if triggered != 0 {
+		t.Fatalf("TriggerSchedulerTick called %d times, want 0 for invalid budget answer", triggered)
+	}
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_budget_invalid")
+	if err != nil || loop == nil || loop.Status != "awaiting_human" {
+		t.Fatalf("loop after invalid budget answer = %#v, %v, want awaiting_human", loop, err)
+	}
+}
+
+func TestHandlerRespondReviewFixBudgetStorageFailureIsInternalError(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	triggered := 0
+	h := NewHandler(Context{Config: cfg, Runtime: rt, TriggerSchedulerTick: func() { triggered++ }})
+	seedReviewFixBudgetAwaitingLoop(t, rt, "project_budget_storage", "loop_budget_storage", 643)
+
+	if _, err := rt.Services().Coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER fail_budget_loop_update
+		BEFORE UPDATE ON loops
+		BEGIN
+			SELECT RAISE(ABORT, 'database is locked');
+		END
+	`); err != nil {
+		t.Fatalf("create storage-failure trigger: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/643/respond", strings.NewReader(`{"answer":"Continue"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	if errMap["code"] != "INTERNAL_ERROR" {
+		t.Fatalf("error.code = %#v, want INTERNAL_ERROR", errMap["code"])
+	}
+	if triggered != 0 {
+		t.Fatalf("TriggerSchedulerTick called %d times, want 0 after storage failure", triggered)
+	}
+	loop, err := rt.Services().Repositories.Loops.GetByID(context.Background(), "loop_budget_storage")
+	if err != nil || loop == nil || loop.Status != "awaiting_human" {
+		t.Fatalf("loop after storage failure = %#v, %v, want awaiting_human", loop, err)
+	}
+}
+
+func seedReviewFixBudgetAwaitingLoop(t *testing.T, rt *looperdruntime.Runtime, projectID, loopID string, seq int64) {
+	t.Helper()
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	ask := loops.NewReviewFixBudgetAsk("fixer", repo, prNumber, 8, 8, nowISO)
+	metadata, err := loops.WriteHITLAsk(nil, ask)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: seq, ProjectID: projectID, Type: "fixer", TargetType: "pull_request",
+		TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "awaiting_human",
+		MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cancelReason := loops.ReviewFixBudgetPauseReason
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_" + loopID, ProjectID: &projectID, LoopID: &loopID, Type: "fixer",
+		TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: "fixer:budget:" + loopID, Priority: storage.QueuePriorityFixer, Status: "cancelled",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LastError: &cancelReason,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 }

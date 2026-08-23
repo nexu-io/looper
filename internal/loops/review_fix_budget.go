@@ -27,6 +27,10 @@ const (
 	fixerPushCountKey          = "pushCount"
 )
 
+// ErrReviewFixBudgetInvalidAnswer is the only ApplyReviewFixBudgetAnswer
+// failure that API clients should treat as a 400 validation error.
+var ErrReviewFixBudgetInvalidAnswer = fmt.Errorf("review-fix budget answer must be %q or %q", ReviewFixBudgetAnswerContinue, ReviewFixBudgetAnswerStop)
+
 // ReviewFixBudgetState is the durable PR-scoped ledger for the new caps.
 // Authority for the cap is live config; this record only stores counts and
 // which role exhausted.
@@ -360,7 +364,7 @@ func ApplyReviewFixBudgetAnswer(ctx context.Context, repos *storage.Repositories
 		return ReviewFixBudgetAnswerResult{Applied: true, Action: "stop", Loop: updated}, nil
 	}
 	if !IsReviewFixBudgetContinue(answer) {
-		return ReviewFixBudgetAnswerResult{}, fmt.Errorf("review-fix budget answer must be %q or %q", ReviewFixBudgetAnswerContinue, ReviewFixBudgetAnswerStop)
+		return ReviewFixBudgetAnswerResult{}, ErrReviewFixBudgetInvalidAnswer
 	}
 	updated, err := continueReviewFixBudget(ctx, repos, loop, nowISO)
 	if err != nil {
