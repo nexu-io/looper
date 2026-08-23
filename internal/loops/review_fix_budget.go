@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -395,7 +396,44 @@ func requeueReviewFixBudgetLoop(ctx context.Context, repos *storage.Repositories
 	if repos == nil || repos.Queue == nil || strings.TrimSpace(loopID) == "" {
 		return nil
 	}
-	_, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
+	requeued, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
+	if err != nil {
+		return err
+	}
+	if requeued > 0 {
+		return nil
+	}
+	active, err := repos.Queue.FindActiveByLoopID(ctx, loopID)
+	if err != nil || active != nil {
+		return err
+	}
+	latest, err := repos.Queue.GetLatestByLoopID(ctx, loopID)
+	if err != nil || latest == nil {
+		return err
+	}
+	if latest.DedupeKey != "" {
+		activeDedupe, dedupeErr := repos.Queue.FindActiveByDedupe(ctx, latest.DedupeKey)
+		if dedupeErr != nil {
+			return dedupeErr
+		}
+		if activeDedupe != nil {
+			return nil
+		}
+	}
+	replacement := *latest
+	replacement.ID = eventlog.NewEventID("queue")
+	replacement.Status = "queued"
+	replacement.AvailableAt = nowISO
+	replacement.Attempts = 0
+	replacement.ClaimedBy = nil
+	replacement.ClaimedAt = nil
+	replacement.StartedAt = nil
+	replacement.FinishedAt = nil
+	replacement.LastError = nil
+	replacement.LastErrorKind = nil
+	replacement.CreatedAt = nowISO
+	replacement.UpdatedAt = nowISO
+	_, _, err = repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement)
 	return err
 }
 

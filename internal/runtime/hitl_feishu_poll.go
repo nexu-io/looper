@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worker"
 )
 
 // feishuInboxEvent is one event from the shared Cloudflare inbox (GET /events).
@@ -109,6 +111,85 @@ var feishuInboxCursor struct {
 
 var feishuInboxHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
+type feishuHITLDeliveryDeps struct {
+	sendAsk func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error
+	nowISO  string
+	logWarn func(msg string, fields map[string]any)
+}
+
+func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopRecord, repos *storage.Repositories, deps feishuHITLDeliveryDeps) int {
+	if repos == nil || repos.Loops == nil || deps.sendAsk == nil {
+		return 0
+	}
+	delivered := 0
+	for _, loop := range records {
+		if loop.Status != "awaiting_human" {
+			continue
+		}
+		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+		if !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(ask.Transport), "feishu") {
+			continue
+		}
+		if strings.TrimSpace(ask.Transport) != "" {
+			continue
+		}
+		if err := deps.sendAsk(ctx, loop, ask); err != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl feishu: budget ask delivery failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+			}
+			continue
+		}
+		ask.Transport = "feishu"
+		meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if werr != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl feishu: budget ask metadata write failed", map[string]any{"loopId": loop.ID, "error": werr.Error()})
+			}
+			continue
+		}
+		updated := loop
+		updated.MetadataJSON = &meta
+		if deps.nowISO != "" {
+			updated.UpdatedAt = deps.nowISO
+		}
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl feishu: budget ask persist failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+			}
+			continue
+		}
+		delivered++
+	}
+	return delivered
+}
+
+func sendFeishuBudgetAsk(ctx context.Context, input defaultSchedulerTickInput, loop storage.LoopRecord, ask loops.HITLAsk) error {
+	if input.OnHITLAsk == nil {
+		return fmt.Errorf("feishu HITL notifier is not configured")
+	}
+	prNumber := ask.PRNumber
+	if prNumber == 0 {
+		prNumber = derefLoopPRNumber(loop)
+	}
+	notif := worker.HITLAskNotification{
+		ProjectID: loop.ProjectID,
+		LoopID:    loop.ID,
+		LoopSeq:   loop.Seq,
+		Repo:      derefLoopRepo(loop),
+		Title:     ask.Question,
+		Question:  ask.Question,
+		Options:   ask.Options,
+	}
+	if prNumber > 0 {
+		notif.SourceType = "GitHub PR"
+		notif.SourceRef = "#" + strconv.FormatInt(prNumber, 10)
+	}
+	return input.OnHITLAsk(ctx, notif)
+}
+
 // runFeishuHITLPoll polls the shared Cloudflare inbox once and delivers any
 // answers for this looper's awaiting loops. Gated by the feishu transport +
 // cf-inbox inbound; a no-op otherwise.
@@ -129,6 +210,20 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 		return
 	}
 
+	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
+	if allLoops, err := input.Repos.Loops.List(ctx); err == nil {
+		deliveryDeps := feishuHITLDeliveryDeps{
+			sendAsk: func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error {
+				return sendFeishuBudgetAsk(ctx, input, loop, ask)
+			},
+			nowISO: nowISO,
+		}
+		if input.Logger != nil {
+			deliveryDeps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
+		}
+		_ = deliverUndeliveredFeishuBudgetAsks(ctx, allLoops, input.Repos, deliveryDeps)
+	}
+
 	feishuInboxCursor.mu.Lock()
 	since := feishuInboxCursor.v
 	feishuInboxCursor.mu.Unlock()
@@ -144,7 +239,6 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 		return
 	}
 
-	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
 	deps := feishuHITLPollDeps{
 		loopByRoot: func(ctx contextType, rootID string) string {
 			if input.Repos.FeishuThreads == nil {

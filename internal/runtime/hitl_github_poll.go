@@ -35,6 +35,10 @@ const looperCommentMarker = "<!-- looper:"
 // commenter must be on that allowlist; otherwise any human reply may answer.
 // Empty-bodied comments are ignored so ordinary reactions/edits don't count.
 func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, answerAuthors []string) string {
+	return detectGitHubHITLAnswerMatching(comments, askCommentID, answerAuthors, nil)
+}
+
+func detectGitHubHITLAnswerMatching(comments []githubAnswerComment, askCommentID int64, answerAuthors []string, accept func(string) bool) string {
 	allow := make(map[string]bool, len(answerAuthors))
 	for _, a := range answerAuthors {
 		if a = strings.TrimSpace(a); a != "" {
@@ -59,6 +63,9 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 		}
 		body := strings.TrimSpace(c.Body)
 		if body == "" {
+			continue
+		}
+		if accept != nil && !accept(body) {
 			continue
 		}
 		if bestID == 0 || c.ID < bestID {
@@ -225,15 +232,16 @@ type githubHITLAwaitingLoop struct {
 	AskStatus    string
 	PRNumber     int64
 	AskCommentID int64
+	BudgetAsk    bool
 }
 
 // pollGitHubHITLAnswersOnce runs one pass of the answer-poll lane: for each loop
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
 // simply won't be passed in again.
-func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
+func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
-	for _, loop := range loops {
+	for _, loop := range awaiting {
 		if !strings.EqualFold(strings.TrimSpace(loop.Transport), "github") || loop.PRNumber == 0 {
 			continue
 		}
@@ -255,7 +263,13 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 			}
 			continue
 		}
-		answer := detectGitHubHITLAnswer(comments, loop.AskCommentID, deps.answerAuthors)
+		var accept func(string) bool
+		if loop.BudgetAsk {
+			accept = func(body string) bool {
+				return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
+			}
+		}
+		answer := detectGitHubHITLAnswerMatching(comments, loop.AskCommentID, deps.answerAuthors, accept)
 		if answer == "" {
 			continue
 		}
@@ -441,6 +455,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		awaiting = append(awaiting, githubHITLAwaitingLoop{
 			ID: l.ID, ProjectID: l.ProjectID, Repo: repo,
 			Transport: ask.Transport, AskStatus: ask.Status, PRNumber: ask.PRNumber, AskCommentID: ask.AskCommentID,
+			BudgetAsk: loops.IsReviewFixBudgetAsk(ask),
 		})
 	}
 	if len(awaiting) == 0 {

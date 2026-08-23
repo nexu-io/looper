@@ -2,7 +2,13 @@ package runtime
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worker"
 )
 
 func TestPollFeishuHITLInboxOnce(t *testing.T) {
@@ -41,6 +47,124 @@ func TestPollFeishuHITLInboxOnce(t *testing.T) {
 	}
 	if len(answers) != 1 || answers[0] != "loop-seq71=redis" {
 		t.Fatalf("delivered answers = %v, want the button click", answers)
+	}
+}
+
+func TestFeishuHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_budget_feishu"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Budget", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewerMeta := `{"loop":{"iterationCount":8}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_feishu_reviewer", Seq: 71, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &reviewerMeta,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_feishu_fixer", Seq: 72, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "queue_feishu_reviewer", ProjectID: stringPtr(projectID), LoopID: &reviewer.ID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Status: "queued", Priority: storage.QueuePriorityReviewer, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, DedupeKey: "reviewer:queue_feishu_reviewer"},
+		{ID: "queue_feishu_fixer", ProjectID: stringPtr(projectID), LoopID: &fixer.ID, Type: "fixer", TargetType: "pull_request", TargetID: target, Status: "queued", Priority: storage.QueuePriorityFixer, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, DedupeKey: "fixer:queue_feishu_fixer"},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	parked, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	ask, ok := loops.ReadHITLAsk(parked.MetadataJSON)
+	if !ok || !loops.IsReviewFixBudgetAsk(ask) || ask.Transport != "" {
+		t.Fatalf("parked ask = %#v, want undelivered budget ask", ask)
+	}
+
+	var sent []worker.HITLAskNotification
+	all, err := repos.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	delivered := deliverUndeliveredFeishuBudgetAsks(context.Background(), all, repos, feishuHITLDeliveryDeps{
+		sendAsk: func(_ contextType, loop storage.LoopRecord, got loops.HITLAsk) error {
+			sent = append(sent, worker.HITLAskNotification{
+				LoopID: loop.ID, LoopSeq: loop.Seq, Question: got.Question, Options: got.Options,
+			})
+			if loop.ID != reviewer.ID || got.Question != ask.Question {
+				t.Fatalf("sendAsk = loop %s question %q, want reviewer budget ask", loop.ID, got.Question)
+			}
+			return nil
+		},
+		nowISO: nowISO,
+	})
+	if delivered != 1 || len(sent) != 1 {
+		t.Fatalf("deliverUndeliveredFeishuBudgetAsks() = %d sent=%d, want 1", delivered, len(sent))
+	}
+	if len(sent[0].Options) != 2 || sent[0].Options[0] != loops.ReviewFixBudgetAnswerContinue || sent[0].Options[1] != loops.ReviewFixBudgetAnswerStop {
+		t.Fatalf("sent options = %#v, want Continue/Stop", sent[0].Options)
+	}
+	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("Loops.GetByID(reviewer) = (%#v, %v)", fresh, err)
+	}
+	ask, ok = loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok || ask.Transport != "feishu" {
+		t.Fatalf("delivered ask = %#v, want feishu transport", ask)
+	}
+
+	card := mustCardAction(20, "71", "Continue")
+	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{card}, feishuHITLPollDeps{
+		loopBySeq: func(_ contextType, seq int64) string {
+			if seq == reviewer.Seq {
+				return reviewer.ID
+			}
+			return ""
+		},
+		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+		},
+	})
+	if n != 1 || maxID != 20 {
+		t.Fatalf("poll delivered = %d maxID=%d, want Continue on reviewer", n, maxID)
+	}
+	fresh, err = repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil || fresh.Status != "queued" || loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("reviewer after continue = (%#v, %v), want queued with reset count", fresh, err)
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "queued" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("fixer after continue = (%#v, %v), want queued and unpaused", sibling, err)
 	}
 }
 

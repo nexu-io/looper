@@ -76,6 +76,50 @@ func TestParkAndContinueReviewFixBudget(t *testing.T) {
 	}
 }
 
+func TestContinueReviewFixBudgetEnqueuesFreshWorkAfterCompletedClaim(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_completed", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_completed", "fixer", "queued")
+	seedBudgetQueue(t, repos, nowISO, "queue_reviewer_completed", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedBudgetQueue(t, repos, nowISO, "queue_fixer_completed", fixer.ID, "fixer", storage.QueuePriorityFixer)
+	if err := repos.Queue.Complete(context.Background(), "queue_reviewer_completed", nowISO); err != nil {
+		t.Fatalf("Queue.Complete() error = %v", err)
+	}
+
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	completed, err := repos.Queue.GetByID(context.Background(), "queue_reviewer_completed")
+	if err != nil || completed == nil || completed.Status != "completed" {
+		t.Fatalf("exhausted claim after park = (%#v, %v), want completed", completed, err)
+	}
+	siblingQueue, err := repos.Queue.GetByID(context.Background(), "queue_fixer_completed")
+	if err != nil || siblingQueue == nil || siblingQueue.Status != "cancelled" {
+		t.Fatalf("sibling queue after park = (%#v, %v), want cancelled", siblingQueue, err)
+	}
+
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+	if err != nil || !result.Applied || result.Action != "continue" {
+		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
+	}
+	active, err := repos.Queue.FindActiveByLoopID(context.Background(), reviewer.ID)
+	if err != nil || active == nil || active.Status != "queued" || active.ID == "queue_reviewer_completed" {
+		t.Fatalf("exhausted active queue = (%#v, %v), want a fresh queued item", active, err)
+	}
+	completed, err = repos.Queue.GetByID(context.Background(), "queue_reviewer_completed")
+	if err != nil || completed == nil || completed.Status != "completed" {
+		t.Fatalf("original claim after continue = (%#v, %v), want still completed", completed, err)
+	}
+	siblingQueue, err = repos.Queue.GetByID(context.Background(), "queue_fixer_completed")
+	if err != nil || siblingQueue == nil || siblingQueue.Status != "queued" {
+		t.Fatalf("sibling queue after continue = (%#v, %v), want requeued", siblingQueue, err)
+	}
+}
+
 func TestApplyReviewFixBudgetAnswerStopTerminatesPair(t *testing.T) {
 	t.Parallel()
 	repos, nowISO := newBudgetFixture(t)

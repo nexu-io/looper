@@ -850,6 +850,9 @@ type checkpointPush struct {
 	PushedAt      string       `json:"pushedAt,omitempty"`
 	SkippedReason string       `json:"skippedReason,omitempty"`
 	Evidence      *fixEvidence `json:"evidence,omitempty"`
+	// BudgetCounted is persisted with the durable push fact so a retry that
+	// short-circuits on Push.Pushed still records that successful push once.
+	BudgetCounted bool `json:"budgetCounted,omitempty"`
 }
 
 type fixEvidence struct {
@@ -3226,7 +3229,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, nil
 	}
 	if checkpoint.Push != nil && checkpoint.Push.Pushed {
-		return checkpoint, nil
+		return r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -3291,6 +3294,10 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
 		return checkpoint, err
 	}
+	checkpoint, err = r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
 	store, err := r.mergedFixEvidenceStoreV2(ctx, input.Loop, buildFixEvidenceStoreV2(checkpoint, evidence, input.Run.ID))
 	if err != nil {
 		return checkpoint, err
@@ -3333,9 +3340,6 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	// After pushing a fix, re-request the reviewers who weighed in so the PR gets
 	// re-reviewed promptly instead of waiting for the coordinator lane.
 	r.reRequestReviewersAfterFix(ctx, input)
-	if _, err := r.incrementFixerPushCount(ctx, input.Loop); err != nil {
-		return checkpoint, err
-	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -3413,6 +3417,10 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
 		return false, checkpoint, err
 	}
+	checkpoint, err = r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
+	if err != nil {
+		return false, checkpoint, err
+	}
 	store, err := r.mergedFixEvidenceStoreV2(ctx, input.Loop, buildFixEvidenceStoreV2(checkpoint, evidence, input.Run.ID))
 	if err != nil {
 		return false, checkpoint, err
@@ -3428,10 +3436,21 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 	checkpoint.Lifecycle.PRAdopted = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.appendEvent(ctx, eventInput{eventType: "fixer.push.adopted", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "headSha": adoptedHead}})
-	if _, err := r.incrementFixerPushCount(ctx, input.Loop); err != nil {
-		return false, checkpoint, err
-	}
 	return true, checkpoint, nil
+}
+
+func (r *Runner) ensureFixerPushBudgetCounted(ctx context.Context, input stepInput, checkpoint fixerCheckpoint) (fixerCheckpoint, error) {
+	if checkpoint.Push == nil || !checkpoint.Push.Pushed || checkpoint.Push.BudgetCounted {
+		return checkpoint, nil
+	}
+	if _, err := r.incrementFixerPushCount(ctx, input.Loop); err != nil {
+		return checkpoint, err
+	}
+	checkpoint.Push.BudgetCounted = true
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
+		return checkpoint, err
+	}
+	return checkpoint, nil
 }
 
 func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {

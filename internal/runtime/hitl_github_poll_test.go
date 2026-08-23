@@ -38,6 +38,23 @@ func TestDetectGitHubHITLAnswer(t *testing.T) {
 	}
 }
 
+func TestDetectGitHubHITLAnswerSkipsUnrelatedBudgetComments(t *testing.T) {
+	comments := []githubAnswerComment{
+		{ID: 9001, Author: "looper", Body: "<!-- looper:hitl:ask --> Continue or Stop?"},
+		{ID: 9002, Author: "operator", Body: "looking into this first"},
+		{ID: 9003, Author: "operator", Body: "Continue"},
+	}
+	accept := func(body string) bool {
+		return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
+	}
+	if got := detectGitHubHITLAnswerMatching(comments, 9001, nil, accept); got != "Continue" {
+		t.Fatalf("budget answer = %q, want Continue after skipping unrelated comment", got)
+	}
+	if got := detectGitHubHITLAnswer(comments, 9001, nil); got != "looking into this first" {
+		t.Fatalf("generic answer = %q, want earliest human comment", got)
+	}
+}
+
 func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	commentsByPR := map[int64][]githubAnswerComment{
 		42: {{ID: 500, Author: "lefarcen", Body: "<!-- looper:hitl:ask --> ask"}, {ID: 501, Author: "lefarcen", Body: "go with A"}},
@@ -177,12 +194,13 @@ func TestGitHubHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 	var answers []string
 	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{{
 		ID: reviewer.ID, ProjectID: projectID, Repo: repo, Transport: "github",
-		AskStatus: "awaiting", PRNumber: pr, AskCommentID: 9001,
+		AskStatus: "awaiting", PRNumber: pr, AskCommentID: 9001, BudgetAsk: true,
 	}}, githubHITLPollDeps{
 		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
 			return []githubAnswerComment{
 				{ID: 9001, Author: "looper", Body: posted[0]},
-				{ID: 9002, Author: "operator", Body: "Continue"},
+				{ID: 9002, Author: "operator", Body: "unrelated discussion"},
+				{ID: 9003, Author: "operator", Body: "Continue"},
 			}, nil
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {

@@ -117,6 +117,49 @@ func TestIncrementAndParkFixerBudgetParksSibling(t *testing.T) {
 	}
 }
 
+func TestRunPushStepCountsAlreadyPushedCheckpointOnResume(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopMetadata := `{}`
+	loopTarget := buildPullRequestTargetID("acme/looper", 42)
+	prNumber := int64(42)
+	loop := storage.LoopRecord{
+		ID: "loop_push_budget_resume", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request",
+		TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running",
+		MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_push_budget_resume", LoopID: loop.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Now: fixture.now, Logger: fixture.logger})
+	checkpoint := fixerCheckpoint{Push: &checkpointPush{Pushed: true, Branch: "feature/fix-42", HeadSHA: "fix-head"}}
+
+	updated, err := runner.runPushStep(context.Background(), stepInput{Loop: loop, Run: run, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runPushStep() error = %v", err)
+	}
+	if updated.Push == nil || !updated.Push.BudgetCounted {
+		t.Fatalf("updated.Push = %#v, want budgetCounted after resume", updated.Push)
+	}
+	fresh, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || fresh == nil || loops.ReadReviewFixBudgetState(fresh.MetadataJSON).PushCount != 1 {
+		t.Fatalf("pushCount after resume = (%#v, %v), want 1", fresh, err)
+	}
+
+	updated, err = runner.runPushStep(context.Background(), stepInput{Loop: *fresh, Run: run, Checkpoint: updated})
+	if err != nil {
+		t.Fatalf("runPushStep() second resume error = %v", err)
+	}
+	fresh, err = fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || fresh == nil || loops.ReadReviewFixBudgetState(fresh.MetadataJSON).PushCount != 1 {
+		t.Fatalf("pushCount after second resume = (%#v, %v), want still 1", fresh, err)
+	}
+}
+
 func TestNewPreservesInfiniteRetryMaxAttempts(t *testing.T) {
 	t.Parallel()
 
@@ -7537,6 +7580,12 @@ func TestRunPushStepRecordsPushEvidenceBeforePostPushHold(t *testing.T) {
 	}
 	if loop == nil || loop.MetadataJSON == nil || !strings.Contains(*loop.MetadataJSON, `"lastFixHeadSha":"fix-head"`) {
 		t.Fatalf("loop metadata = %#v, want pushed head persisted before hold skip", loop)
+	}
+	if updated.Push == nil || !updated.Push.BudgetCounted {
+		t.Fatalf("updated.Push = %#v, want budget counted before hold skip", updated.Push)
+	}
+	if loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount != 1 {
+		t.Fatalf("pushCount = %d, want 1 before hold skip", loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount)
 	}
 }
 
