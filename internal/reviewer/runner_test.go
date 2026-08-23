@@ -1934,6 +1934,67 @@ func TestEnsureLoopForPullRequestReactivatesLegacyBudgetTerminatedLoop(t *testin
 	}
 }
 
+func TestProcessClaimedItemParksExhaustedBudgetBeforeRun(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	projectID := "project_1"
+	loopID := "loop_reviewer_budget_entry"
+	metadata := `{"loop":{"iterationCount":1}}`
+	reviewer := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	fixer := storage.LoopRecord{ID: "loop_fixer_budget_entry", Seq: 2, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_budget_entry", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:budget-entry", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 1
+	cfg.HITL.Enabled = true
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_budget_entry", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, Status: "running"})
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped at claim start", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent.starts = %#v, want none after lowered-cap claim", agent.starts)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || updated == nil || updated.Status != "awaiting_human" {
+		t.Fatalf("reviewer = (%#v, %v), want awaiting_human", updated, err)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("fixer sibling = (%#v, %v), want paused sibling hold", sibling, err)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_reviewer_budget_entry")
+	if err != nil || queue == nil || queue.Status != "cancelled" {
+		t.Fatalf("queue = (%#v, %v), want cancelled claimed item", queue, err)
+	}
+	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %#v, want no run after restart/claim park", runs)
+	}
+}
+
 func TestParkReviewerBudgetIfExhaustedParksSibling(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
