@@ -131,8 +131,8 @@ func TestGitHubHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
 		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
 	}
-	seedPollBudgetQueue(t, repos, nowISO, "queue_budget_reviewer", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
-	seedPollBudgetQueue(t, repos, nowISO, "queue_budget_fixer", fixer.ID, "fixer", storage.QueuePriorityFixer)
+	seedPollBudgetQueue(t, repos, nowISO, "project_budget_github", "queue_budget_reviewer", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedPollBudgetQueue(t, repos, nowISO, "project_budget_github", "queue_budget_fixer", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
 		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
@@ -229,10 +229,235 @@ func TestGitHubHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 	}
 }
 
-func seedPollBudgetQueue(t *testing.T, repos *storage.Repositories, nowISO, id, loopID, queueType string, priority int64) {
+func TestRecoverGitHubBudgetAskCommentID(t *testing.T) {
+	marker := githubBudgetAskMarker(11)
+	comments := []githubAnswerComment{
+		{ID: 7001, Author: "looper", Body: marker + "\nfirst ask"},
+		{ID: 7002, Author: "operator", Body: "Continue"},
+		{ID: 8001, Author: "looper", Body: marker + "\nretry ask"},
+		{ID: 9001, Author: "looper", Body: githubBudgetAskMarker(99) + "\nother loop"},
+	}
+	if got := recoverGitHubBudgetAskCommentID(comments[:1], 11); got != 7001 {
+		t.Fatalf("unanswered ask = %d, want 7001", got)
+	}
+	if got := recoverGitHubBudgetAskCommentID(comments, 11); got != 8001 {
+		t.Fatalf("after prior Continue = %d, want unanswered retry ask 8001", got)
+	}
+	if got := recoverGitHubBudgetAskCommentID(comments, 12); got != 0 {
+		t.Fatalf("missing loop marker = %d, want 0", got)
+	}
+}
+
+func TestGitHubHITLPollRecoversBudgetAskAfterPersistFailure(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_budget_github_recover"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Budget", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewerMeta := `{"loop":{"iterationCount":8}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_budget_reviewer_recover", Seq: 11, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &reviewerMeta,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_budget_fixer_recover", Seq: 12, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_budget_reviewer_recover", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_budget_fixer_recover", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	parked, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	parkedAsk, ok := loops.ReadHITLAsk(parked.MetadataJSON)
+	if !ok {
+		t.Fatal("parked loop missing budget ask")
+	}
+	existingBody := buildGitHubBudgetAskComment(reviewer.Seq, parkedAsk.Question, parkedAsk.Options, nil)
+	var created int
+	all, err := repos.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	delivered := deliverUndeliveredGitHubBudgetAsks(context.Background(), projectID, all, repos, githubHITLDeliveryDeps{
+		createComment: func(_ contextType, _ string, _ int64, _ string, _ string) (int64, error) {
+			created++
+			return 9002, nil
+		},
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{{ID: 7001, Author: "looper", Body: existingBody}}, nil
+		},
+		nowISO: nowISO,
+	})
+	if delivered != 1 || created != 0 {
+		t.Fatalf("deliver after persist-failure = delivered %d created %d, want recover without repost", delivered, created)
+	}
+	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("Loops.GetByID(reviewer) = (%#v, %v)", fresh, err)
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok || ask.Transport != "github" || ask.AskCommentID != 7001 {
+		t.Fatalf("recovered ask = %#v, want github comment 7001", ask)
+	}
+
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{{
+		ID: reviewer.ID, ProjectID: projectID, Repo: repo, Transport: "github",
+		AskStatus: "awaiting", PRNumber: pr, AskCommentID: 7001, BudgetAsk: true,
+	}}, githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{
+				{ID: 7001, Author: "looper", Body: existingBody},
+				{ID: 7002, Author: "operator", Body: "Continue"},
+				{ID: 9002, Author: "looper", Body: "duplicate ask that must not become the recorded id"},
+			}, nil
+		},
+		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+		},
+		clearAwaiting: func(_ contextType, _ string, _ int64, _ string) {},
+	})
+	if n != 1 {
+		t.Fatalf("poll delivered = %d, want Continue against recovered ask", n)
+	}
+	fresh, err = repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil || fresh.Status != "queued" {
+		t.Fatalf("reviewer after recovered continue = (%#v, %v), want queued", fresh, err)
+	}
+}
+
+func TestGitHubHITLPollDeliversAndStopsReviewFixBudget(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_budget_github_stop"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Budget", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewerMeta := `{"loop":{"iterationCount":8}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_budget_reviewer_stop", Seq: 21, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &reviewerMeta,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_budget_fixer_stop", Seq: 22, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_budget_reviewer_stop", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_budget_fixer_stop", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+	}); err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	all, err := repos.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	if delivered := deliverUndeliveredGitHubBudgetAsks(context.Background(), projectID, all, repos, githubHITLDeliveryDeps{
+		createComment: func(_ contextType, _ string, _ int64, _ string, _ string) (int64, error) {
+			return 9101, nil
+		},
+		nowISO: nowISO,
+	}); delivered != 1 {
+		t.Fatalf("deliverUndeliveredGitHubBudgetAsks() = %d, want 1", delivered)
+	}
+	terminatedSibling := fixer
+	terminatedSibling.Status = "terminated"
+	terminatedSibling.UpdatedAt = nowISO
+	if err := repos.Loops.Upsert(context.Background(), terminatedSibling); err != nil {
+		t.Fatalf("Loops.Upsert(partial sibling terminate) error = %v", err)
+	}
+
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{{
+		ID: reviewer.ID, ProjectID: projectID, Repo: repo, Transport: "github",
+		AskStatus: "awaiting", PRNumber: pr, AskCommentID: 9101, BudgetAsk: true,
+	}}, githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{
+				{ID: 9101, Author: "looper", Body: "<!-- looper:hitl:ask v=1 loop=21 -->"},
+				{ID: 9102, Author: "operator", Body: "Stop"},
+			}, nil
+		},
+		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+		},
+		clearAwaiting: func(_ contextType, _ string, _ int64, _ string) {},
+	})
+	if n != 1 {
+		t.Fatalf("poll delivered = %d, want Stop on reviewer", n)
+	}
+	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil || fresh.Status != "terminated" {
+		t.Fatalf("reviewer after stop = (%#v, %v), want terminated", fresh, err)
+	}
+	if _, stillAsked := loops.ReadHITLAsk(fresh.MetadataJSON); stillAsked {
+		t.Fatal("reviewer still has a HITL ask after stop")
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "terminated" {
+		t.Fatalf("fixer after stop = (%#v, %v), want terminated", sibling, err)
+	}
+}
+
+func seedPollBudgetQueue(t *testing.T, repos *storage.Repositories, nowISO, projectID, id, loopID, queueType string, priority int64) {
 	t.Helper()
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
-		ID: id, ProjectID: stringPtr("project_budget_github"), LoopID: &loopID, Type: queueType,
+		ID: id, ProjectID: stringPtr(projectID), LoopID: &loopID, Type: queueType,
 		TargetType: "pull_request", TargetID: "pr:acme/looper:42", Status: "queued",
 		Priority: priority, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 		DedupeKey: queueType + ":" + id,

@@ -294,6 +294,83 @@ func TestContinueReviewFixBudgetRetriesAfterSiblingAlreadyUnpaused(t *testing.T)
 	}
 }
 
+func TestParkAndContinueReviewFixBudgetSkipsFailedSibling(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{"failed", "interrupted"} {
+		status := status
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			repos, nowISO := newBudgetFixture(t)
+			reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_"+status, "reviewer", "running")
+			fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_"+status, "fixer", status)
+			seedBudgetQueue(t, repos, nowISO, "queue_reviewer_"+status, reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+			seedBudgetQueue(t, repos, nowISO, "queue_fixer_"+status, fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+			parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+				Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+			})
+			if err != nil {
+				t.Fatalf("ParkReviewFixBudget() error = %v", err)
+			}
+			sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || sibling == nil || sibling.Status != status || IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+				t.Fatalf("sibling after park = (%#v, %v), want still %s", sibling, err, status)
+			}
+			siblingQueue, err := repos.Queue.GetByID(context.Background(), "queue_fixer_"+status)
+			if err != nil || siblingQueue == nil || siblingQueue.Status != "queued" {
+				t.Fatalf("sibling queue after park = (%#v, %v), want still queued", siblingQueue, err)
+			}
+
+			result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+			if err != nil || !result.Applied || result.Action != "continue" {
+				t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
+			}
+			sibling, err = repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || sibling == nil || sibling.Status != status || IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+				t.Fatalf("sibling after continue = (%#v, %v), want still %s", sibling, err, status)
+			}
+			siblingQueue, err = repos.Queue.GetByID(context.Background(), "queue_fixer_"+status)
+			if err != nil || siblingQueue == nil || siblingQueue.Status != "queued" {
+				t.Fatalf("sibling queue after continue = (%#v, %v), want not requeued as fresh work", siblingQueue, err)
+			}
+		})
+	}
+}
+
+func TestStopReviewFixBudgetRetriesAfterSiblingAlreadyTerminated(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_stop_retry", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_stop_retry", "fixer", "queued")
+	seedBudgetQueue(t, repos, nowISO, "queue_reviewer_stop_retry", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedBudgetQueue(t, repos, nowISO, "queue_fixer_stop_retry", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	if _, err := terminateReviewFixLoop(context.Background(), repos, fixer, nowISO); err != nil {
+		t.Fatalf("terminateReviewFixLoop(sibling) error = %v", err)
+	}
+
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Stop", nowISO)
+	if err != nil || !result.Applied || result.Action != "stop" {
+		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
+	}
+	if result.Loop.Status != "terminated" {
+		t.Fatalf("exhausted after retry stop = %q, want terminated", result.Loop.Status)
+	}
+	if _, ok := ReadHITLAsk(result.Loop.MetadataJSON); ok {
+		t.Fatal("exhausted loop still has a HITL ask after retry stop")
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "terminated" {
+		t.Fatalf("sibling after retry stop = (%#v, %v), want terminated", sibling, err)
+	}
+}
+
 func TestApplyReviewFixBudgetAnswerIgnoresAgentAsk(t *testing.T) {
 	t.Parallel()
 	repos, nowISO := newBudgetFixture(t)

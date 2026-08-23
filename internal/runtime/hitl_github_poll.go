@@ -80,6 +80,7 @@ func detectGitHubHITLAnswerMatching(comments []githubAnswerComment, askCommentID
 // review-fix budget ask onto its PR so the answer-poll lane can later consume it.
 type githubHITLDeliveryDeps struct {
 	createComment func(ctx contextType, repo string, prNumber int64, body, cwd string) (int64, error)
+	listComments  func(ctx contextType, repo string, prNumber int64, cwd string) ([]githubAnswerComment, error)
 	addLabel      func(ctx contextType, repo string, prNumber int64, label, cwd string)
 	projectCWD    func(projectID string) string
 	stampBody     func(body, runner string) string
@@ -121,15 +122,14 @@ func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, recor
 		if deps.projectCWD != nil {
 			cwd = deps.projectCWD(loop.ProjectID)
 		}
-		body := buildGitHubBudgetAskComment(loop.Seq, ask.Question, ask.Options, deps.mentionLogins)
-		if deps.stampBody != nil {
-			body = deps.stampBody(body, loop.Type)
-		}
-		commentID, err := deps.createComment(ctx, repo, prNumber, body, cwd)
+		commentID, err := recoverOrCreateGitHubBudgetAskComment(ctx, repo, prNumber, cwd, loop, ask, deps)
 		if err != nil {
 			if deps.logWarn != nil {
 				deps.logWarn("hitl github: budget ask delivery failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 			}
+			continue
+		}
+		if commentID == 0 {
 			continue
 		}
 		if deps.addLabel != nil {
@@ -161,9 +161,56 @@ func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, recor
 	return delivered
 }
 
+func githubBudgetAskMarker(loopSeq int64) string {
+	return fmt.Sprintf("<!-- looper:hitl:ask v=1 loop=%d -->", loopSeq)
+}
+
+func recoverOrCreateGitHubBudgetAskComment(ctx contextType, repo string, prNumber int64, cwd string, loop storage.LoopRecord, ask loops.HITLAsk, deps githubHITLDeliveryDeps) (int64, error) {
+	if deps.listComments != nil {
+		comments, err := deps.listComments(ctx, repo, prNumber, cwd)
+		if err != nil {
+			return 0, err
+		}
+		if recovered := recoverGitHubBudgetAskCommentID(comments, loop.Seq); recovered != 0 {
+			return recovered, nil
+		}
+	}
+	if deps.createComment == nil {
+		return 0, nil
+	}
+	body := buildGitHubBudgetAskComment(loop.Seq, ask.Question, ask.Options, deps.mentionLogins)
+	if deps.stampBody != nil {
+		body = deps.stampBody(body, loop.Type)
+	}
+	return deps.createComment(ctx, repo, prNumber, body, cwd)
+}
+
+func recoverGitHubBudgetAskCommentID(comments []githubAnswerComment, loopSeq int64) int64 {
+	marker := githubBudgetAskMarker(loopSeq)
+	bestID := int64(0)
+	for _, comment := range comments {
+		if !strings.Contains(comment.Body, marker) {
+			continue
+		}
+		if githubBudgetAskAlreadyAnswered(comments, comment.ID) {
+			continue
+		}
+		if bestID == 0 || comment.ID < bestID {
+			bestID = comment.ID
+		}
+	}
+	return bestID
+}
+
+func githubBudgetAskAlreadyAnswered(comments []githubAnswerComment, askCommentID int64) bool {
+	return detectGitHubHITLAnswerMatching(comments, askCommentID, nil, func(body string) bool {
+		return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
+	}) != ""
+}
+
 func buildGitHubBudgetAskComment(loopSeq int64, question string, options []string, mentionLogins []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<!-- looper:hitl:ask v=1 loop=%d -->\n", loopSeq)
+	fmt.Fprintf(&b, "%s\n", githubBudgetAskMarker(loopSeq))
 	b.WriteString("🤔 **looper needs a decision to continue.**\n\n")
 	b.WriteString(strings.TrimSpace(question))
 	for _, option := range options {
@@ -418,6 +465,17 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 				return 0, err
 			}
 			return res.ID, nil
+		},
+		listComments: func(ctx contextType, repo string, pr int64, cwd string) ([]githubAnswerComment, error) {
+			cs, err := input.GitHubGateway.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: pr, CWD: cwd})
+			if err != nil {
+				return nil, err
+			}
+			out := make([]githubAnswerComment, 0, len(cs))
+			for _, c := range cs {
+				out = append(out, githubAnswerComment{ID: c.ID, Author: c.Author, Body: c.Body})
+			}
+			return out, nil
 		},
 		addLabel: func(ctx contextType, repo string, pr int64, label, cwd string) {
 			_ = input.GitHubGateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{label}, CWD: cwd})

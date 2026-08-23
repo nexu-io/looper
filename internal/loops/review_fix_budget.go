@@ -171,6 +171,15 @@ func isTerminalReviewFixSiblingStatus(status string) bool {
 	}
 }
 
+func isReviewFixBudgetPauseApplicable(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "failed", "interrupted":
+		return false
+	default:
+		return !isTerminalReviewFixSiblingStatus(status)
+	}
+}
+
 // FindSiblingReviewFixLoops returns automatic opposite-role loops on the same
 // project/repo/PR. Manual loops are not part of the review-fix budget pair.
 func FindSiblingReviewFixLoops(all []storage.LoopRecord, loop storage.LoopRecord) []storage.LoopRecord {
@@ -293,7 +302,7 @@ func parkSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, 
 }
 
 func parkOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, sibling storage.LoopRecord, exhaustedBy, nowISO string) error {
-	if isTerminalReviewFixSiblingStatus(sibling.Status) {
+	if !isReviewFixBudgetPauseApplicable(sibling.Status) {
 		return nil
 	}
 	state := ReadReviewFixBudgetState(sibling.MetadataJSON)
@@ -493,20 +502,18 @@ func unpauseOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Reposito
 }
 
 func terminateReviewFixPair(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
-	updated, err := terminateReviewFixLoop(ctx, repos, loop, nowISO)
+	// Keep awaiting_human + the budget ask until every automatic sibling is
+	// terminated so a later GitHub/Feishu poll can retry the same Stop.
+	all, err := repos.Loops.List(ctx)
 	if err != nil {
 		return loop, err
 	}
-	all, err := repos.Loops.List(ctx)
-	if err != nil {
-		return updated, err
-	}
-	for _, sibling := range FindSiblingReviewFixLoops(all, updated) {
+	for _, sibling := range FindSiblingReviewFixLoops(all, loop) {
 		if _, err := terminateReviewFixLoop(ctx, repos, sibling, nowISO); err != nil {
-			return updated, err
+			return loop, err
 		}
 	}
-	return updated, nil
+	return terminateReviewFixLoop(ctx, repos, loop, nowISO)
 }
 
 func terminateReviewFixLoop(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
