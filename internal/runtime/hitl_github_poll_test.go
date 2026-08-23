@@ -231,21 +231,28 @@ func TestGitHubHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 }
 
 func TestRecoverGitHubBudgetAskCommentID(t *testing.T) {
-	marker := githubBudgetAskMarker(11)
+	const askedAt = "2026-04-17T12:34:56.000Z"
+	marker := githubBudgetAskMarker(11, askedAt)
 	comments := []githubAnswerComment{
 		{ID: 7001, Author: "looper", Body: marker + "\nfirst ask"},
 		{ID: 7002, Author: "operator", Body: "Continue"},
 		{ID: 8001, Author: "looper", Body: marker + "\nretry ask"},
-		{ID: 9001, Author: "looper", Body: githubBudgetAskMarker(99) + "\nother loop"},
+		{ID: 9001, Author: "looper", Body: githubBudgetAskMarker(99, askedAt) + "\nother loop"},
 	}
-	if got := recoverGitHubBudgetAskCommentID(comments[:1], 11); got != 7001 {
+	if got := recoverGitHubBudgetAskCommentID(comments[:1], 11, askedAt); got != 7001 {
 		t.Fatalf("unanswered ask = %d, want 7001", got)
 	}
-	if got := recoverGitHubBudgetAskCommentID(comments, 11); got != 8001 {
+	if got := recoverGitHubBudgetAskCommentID(comments, 11, askedAt); got != 8001 {
 		t.Fatalf("after prior Continue = %d, want unanswered retry ask 8001", got)
 	}
-	if got := recoverGitHubBudgetAskCommentID(comments, 12); got != 0 {
+	if got := recoverGitHubBudgetAskCommentID(comments, 12, askedAt); got != 0 {
 		t.Fatalf("missing loop marker = %d, want 0", got)
+	}
+	if got := recoverGitHubBudgetAskCommentID(comments[:1], 11, "2026-04-18T00:00:00.000Z"); got != 0 {
+		t.Fatalf("prior-cycle unanswered ask = %d, want 0 so a new prompt is posted", got)
+	}
+	if got := recoverGitHubBudgetAskCommentID(comments[:1], 11, ""); got != 0 {
+		t.Fatalf("missing askedAt = %d, want 0", got)
 	}
 }
 
@@ -303,7 +310,7 @@ func TestGitHubHITLPollRecoversBudgetAskAfterPersistFailure(t *testing.T) {
 	if !ok {
 		t.Fatal("parked loop missing budget ask")
 	}
-	existingBody := buildGitHubBudgetAskComment(reviewer.Seq, parkedAsk.Question, parkedAsk.Options, nil)
+	existingBody := buildGitHubBudgetAskComment(reviewer.Seq, parkedAsk.AskedAt, parkedAsk.Question, parkedAsk.Options, nil)
 	var created int
 	all, err := repos.Loops.List(context.Background())
 	if err != nil {
@@ -353,6 +360,134 @@ func TestGitHubHITLPollRecoversBudgetAskAfterPersistFailure(t *testing.T) {
 	fresh, err = repos.Loops.GetByID(context.Background(), reviewer.ID)
 	if err != nil || fresh == nil || fresh.Status != "queued" {
 		t.Fatalf("reviewer after recovered continue = (%#v, %v), want queued", fresh, err)
+	}
+}
+
+func TestGitHubHITLPollPostsNewAskAfterAPIAnsweredPriorCycle(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	firstISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	secondISO := now.Add(time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_budget_github_generation"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Budget", RepoPath: root, CreatedAt: firstISO, UpdatedAt: firstISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewerMeta := `{"loop":{"iterationCount":8}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_budget_reviewer_generation", Seq: 11, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: firstISO, UpdatedAt: firstISO, MetadataJSON: &reviewerMeta,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_budget_fixer_generation", Seq: 12, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: firstISO, UpdatedAt: firstISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	seedPollBudgetQueue(t, repos, firstISO, projectID, "queue_budget_reviewer_generation", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedPollBudgetQueue(t, repos, firstISO, projectID, "queue_budget_fixer_generation", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: firstISO,
+	}); err != nil {
+		t.Fatalf("ParkReviewFixBudget(first) error = %v", err)
+	}
+	all, err := repos.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List() error = %v", err)
+	}
+	var firstBody string
+	if delivered := deliverUndeliveredGitHubBudgetAsks(context.Background(), projectID, all, repos, githubHITLDeliveryDeps{
+		createComment: func(_ contextType, _ string, _ int64, body, _ string) (int64, error) {
+			firstBody = body
+			if !strings.Contains(body, githubBudgetAskMarker(reviewer.Seq, firstISO)) {
+				t.Fatalf("first ask missing generation marker: %s", body)
+			}
+			return 7001, nil
+		},
+		nowISO: firstISO,
+	}); delivered != 1 || firstBody == "" {
+		t.Fatalf("first deliver = %d body empty=%t, want posted ask", delivered, firstBody == "")
+	}
+
+	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("Loops.GetByID(reviewer) = (%#v, %v)", fresh, err)
+	}
+	if _, err := loops.ApplyReviewFixBudgetAnswer(context.Background(), repos, *fresh, loops.ReviewFixBudgetAnswerContinue, firstISO); err != nil {
+		t.Fatalf("ApplyReviewFixBudgetAnswer(API Continue) error = %v", err)
+	}
+
+	fresh, err = repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("Loops.GetByID(after continue) = (%#v, %v)", fresh, err)
+	}
+	reexhaustMeta := `{"loop":{"iterationCount":8}}`
+	fresh.MetadataJSON = &reexhaustMeta
+	fresh.Status = "running"
+	fresh.UpdatedAt = secondISO
+	if err := repos.Loops.Upsert(context.Background(), *fresh); err != nil {
+		t.Fatalf("Loops.Upsert(re-exhaust) error = %v", err)
+	}
+	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: *fresh, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: secondISO,
+	}); err != nil {
+		t.Fatalf("ParkReviewFixBudget(second) error = %v", err)
+	}
+
+	all, err = repos.Loops.List(context.Background())
+	if err != nil {
+		t.Fatalf("Loops.List(second) error = %v", err)
+	}
+	var created int
+	var secondBody string
+	if delivered := deliverUndeliveredGitHubBudgetAsks(context.Background(), projectID, all, repos, githubHITLDeliveryDeps{
+		createComment: func(_ contextType, _ string, _ int64, body, _ string) (int64, error) {
+			created++
+			secondBody = body
+			return 8001, nil
+		},
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{{ID: 7001, Author: "looper", Body: firstBody}}, nil
+		},
+		nowISO: secondISO,
+	}); delivered != 1 || created != 1 {
+		t.Fatalf("second deliver = delivered %d created %d, want a new prompt after API-answered prior cycle", delivered, created)
+	}
+	if !strings.Contains(secondBody, githubBudgetAskMarker(reviewer.Seq, secondISO)) {
+		t.Fatalf("second ask missing current generation marker: %s", secondBody)
+	}
+	if strings.Contains(secondBody, githubBudgetAskMarker(reviewer.Seq, firstISO)) {
+		t.Fatalf("second ask reused prior-cycle marker: %s", secondBody)
+	}
+	fresh, err = repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("Loops.GetByID(second deliver) = (%#v, %v)", fresh, err)
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok || ask.AskCommentID != 8001 || ask.AskedAt != secondISO {
+		t.Fatalf("second delivered ask = %#v, want comment 8001 at %s", ask, secondISO)
 	}
 }
 

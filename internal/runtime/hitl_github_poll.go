@@ -161,8 +161,12 @@ func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, recor
 	return delivered
 }
 
-func githubBudgetAskMarker(loopSeq int64) string {
-	return fmt.Sprintf("<!-- looper:hitl:ask v=1 loop=%d -->", loopSeq)
+func githubBudgetAskMarker(loopSeq int64, askedAt string) string {
+	askedAt = strings.TrimSpace(askedAt)
+	if askedAt == "" {
+		return fmt.Sprintf("<!-- looper:hitl:ask v=1 loop=%d -->", loopSeq)
+	}
+	return fmt.Sprintf("<!-- looper:hitl:ask v=1 loop=%d askedAt=%s -->", loopSeq, askedAt)
 }
 
 func recoverOrCreateGitHubBudgetAskComment(ctx contextType, repo string, prNumber int64, cwd string, loop storage.LoopRecord, ask loops.HITLAsk, deps githubHITLDeliveryDeps) (int64, error) {
@@ -171,22 +175,26 @@ func recoverOrCreateGitHubBudgetAskComment(ctx contextType, repo string, prNumbe
 		if err != nil {
 			return 0, err
 		}
-		if recovered := recoverGitHubBudgetAskCommentID(comments, loop.Seq); recovered != 0 {
+		if recovered := recoverGitHubBudgetAskCommentID(comments, loop.Seq, ask.AskedAt); recovered != 0 {
 			return recovered, nil
 		}
 	}
 	if deps.createComment == nil {
 		return 0, nil
 	}
-	body := buildGitHubBudgetAskComment(loop.Seq, ask.Question, ask.Options, deps.mentionLogins)
+	body := buildGitHubBudgetAskComment(loop.Seq, ask.AskedAt, ask.Question, ask.Options, deps.mentionLogins)
 	if deps.stampBody != nil {
 		body = deps.stampBody(body, loop.Type)
 	}
 	return deps.createComment(ctx, repo, prNumber, body, cwd)
 }
 
-func recoverGitHubBudgetAskCommentID(comments []githubAnswerComment, loopSeq int64) int64 {
-	marker := githubBudgetAskMarker(loopSeq)
+func recoverGitHubBudgetAskCommentID(comments []githubAnswerComment, loopSeq int64, askedAt string) int64 {
+	askedAt = strings.TrimSpace(askedAt)
+	if askedAt == "" {
+		return 0
+	}
+	marker := githubBudgetAskMarker(loopSeq, askedAt)
 	bestID := int64(0)
 	for _, comment := range comments {
 		if !strings.Contains(comment.Body, marker) {
@@ -208,9 +216,9 @@ func githubBudgetAskAlreadyAnswered(comments []githubAnswerComment, askCommentID
 	}) != ""
 }
 
-func buildGitHubBudgetAskComment(loopSeq int64, question string, options []string, mentionLogins []string) string {
+func buildGitHubBudgetAskComment(loopSeq int64, askedAt, question string, options []string, mentionLogins []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n", githubBudgetAskMarker(loopSeq))
+	fmt.Fprintf(&b, "%s\n", githubBudgetAskMarker(loopSeq, askedAt))
 	b.WriteString("🤔 **looper needs a decision to continue.**\n\n")
 	b.WriteString(strings.TrimSpace(question))
 	for _, option := range options {
