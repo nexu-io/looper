@@ -2101,6 +2101,76 @@ func TestParkReviewerBudgetIfExhaustedCompletesSiblingAfterPartialPark(t *testin
 	}
 }
 
+func TestRecordPublishedReviewProgressCountsBeforeClaimComplete(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"loop":{"iterationCount":0}}`
+	loop := storage.LoopRecord{ID: "loop_publish_count", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queueID := "queue_publish_count"
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: "pr:acme/looper:42", Status: "queued",
+		Priority: 1, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	pending := pendingReviewCheckpoint{HeadSHA: "abc123", Summary: "needs work"}
+	if err := runner.recordPublishedReviewProgress(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1"},
+		Loop:     loop,
+		Run:      storage.RunRecord{ID: "run_publish_count"},
+		Repo:     repo,
+		PRNumber: prNumber,
+	}, pending, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress() error = %v", err)
+	}
+	afterPublish, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || afterPublish == nil {
+		t.Fatalf("Loops.GetByID() after publish = (%#v, %v)", afterPublish, err)
+	}
+	if loops.ReviewerPublishCount(afterPublish.MetadataJSON) != 1 {
+		t.Fatalf("iterationCount after publish = %d, want 1 before claim complete", loops.ReviewerPublishCount(afterPublish.MetadataJSON))
+	}
+	if got, _ := stringFromAny(parseJSONObject(afterPublish.MetadataJSON)["lastPublishedHeadSha"]); got != "abc123" {
+		t.Fatalf("lastPublishedHeadSha = %q, want abc123", got)
+	}
+
+	if err := fixture.repos.Queue.Complete(context.Background(), queueID, nowISO); err != nil {
+		t.Fatalf("Queue.Complete() error = %v", err)
+	}
+	if err := runner.recordPublishedReviewProgress(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1"},
+		Loop:     *afterPublish,
+		Run:      storage.RunRecord{ID: "run_publish_count"},
+		Repo:     repo,
+		PRNumber: prNumber,
+	}, pending, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress(retry) error = %v", err)
+	}
+	successMeta, err := runner.recordLoopSuccessMetadata(afterPublish.MetadataJSON, reviewerCheckpoint{
+		Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+		PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123"},
+	}, "Published review")
+	if err != nil {
+		t.Fatalf("recordLoopSuccessMetadata() error = %v", err)
+	}
+	if loops.ReviewerPublishCount(&successMeta) != 1 {
+		t.Fatalf("iterationCount after success metadata = %d, want 1", loops.ReviewerPublishCount(&successMeta))
+	}
+	retried, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || retried == nil || loops.ReviewerPublishCount(retried.MetadataJSON) != 1 {
+		t.Fatalf("iterationCount after same-head retry = (%#v, %v), want 1", retried, err)
+	}
+}
+
 func TestRecordLoopSuccessMetadataRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{LoopConfig: testReviewerLoopConfig()})

@@ -122,6 +122,22 @@ func ReviewerPublishCount(metadataJSON *string) int {
 	return intFromMetadata(loopMeta[reviewerIterationCountKey])
 }
 
+func IncrementReviewerPublishCount(metadataJSON *string) (string, int, error) {
+	meta := parseMetadataObject(metadataJSON)
+	loopMeta, _ := meta[reviewerLoopMetadataKey].(map[string]any)
+	if loopMeta == nil {
+		loopMeta = map[string]any{}
+	}
+	count := intFromMetadata(loopMeta[reviewerIterationCountKey]) + 1
+	loopMeta[reviewerIterationCountKey] = count
+	meta[reviewerLoopMetadataKey] = loopMeta
+	out, err := json.Marshal(meta)
+	if err != nil {
+		return "", 0, err
+	}
+	return string(out), count, nil
+}
+
 func ResetReviewerPublishCount(metadataJSON *string) (string, error) {
 	meta := parseMetadataObject(metadataJSON)
 	loopMeta, _ := meta[reviewerLoopMetadataKey].(map[string]any)
@@ -307,6 +323,9 @@ func parkSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, 
 
 func parkOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, sibling storage.LoopRecord, exhaustedBy, nowISO string) error {
 	if !isReviewFixBudgetPauseApplicable(sibling.Status) {
+		return nil
+	}
+	if sibling.Status == "paused" && !IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		return nil
 	}
 	state := ReadReviewFixBudgetState(sibling.MetadataJSON)

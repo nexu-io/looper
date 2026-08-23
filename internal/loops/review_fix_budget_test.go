@@ -314,6 +314,54 @@ func TestContinueReviewFixBudgetRetriesAfterSiblingAlreadyUnpaused(t *testing.T)
 	}
 }
 
+func TestParkAndContinueReviewFixBudgetSkipsPreexistingPausedSibling(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_pre_paused", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_pre_paused", "fixer", "paused")
+	pauseMeta := `{"pauseReason":"fixer_zero_progress"}`
+	fixer.MetadataJSON = &pauseMeta
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(pre-paused fixer) error = %v", err)
+	}
+	seedBudgetQueue(t, repos, nowISO, "queue_reviewer_pre_paused", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedBudgetQueue(t, repos, nowISO, "queue_fixer_pre_paused", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("sibling after park = (%#v, %v), want still independently paused", sibling, err)
+	}
+	if reason, _ := stringFromAny(parseMetadataObject(sibling.MetadataJSON)["pauseReason"]); reason != "fixer_zero_progress" {
+		t.Fatalf("sibling pauseReason = %q, want fixer_zero_progress", reason)
+	}
+	siblingQueue, err := repos.Queue.GetByID(context.Background(), "queue_fixer_pre_paused")
+	if err != nil || siblingQueue == nil || siblingQueue.Status != "queued" {
+		t.Fatalf("sibling queue after park = (%#v, %v), want still queued", siblingQueue, err)
+	}
+
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+	if err != nil || !result.Applied || result.Action != "continue" {
+		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
+	}
+	sibling, err = repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("sibling after continue = (%#v, %v), want still independently paused", sibling, err)
+	}
+	if reason, _ := stringFromAny(parseMetadataObject(sibling.MetadataJSON)["pauseReason"]); reason != "fixer_zero_progress" {
+		t.Fatalf("sibling pauseReason after continue = %q, want fixer_zero_progress", reason)
+	}
+	siblingQueue, err = repos.Queue.GetByID(context.Background(), "queue_fixer_pre_paused")
+	if err != nil || siblingQueue == nil || siblingQueue.Status != "queued" {
+		t.Fatalf("sibling queue after continue = (%#v, %v), want not requeued as budget work", siblingQueue, err)
+	}
+}
+
 func TestParkAndContinueReviewFixBudgetSkipsFailedSibling(t *testing.T) {
 	t.Parallel()
 	for _, status := range []string{"failed", "interrupted"} {

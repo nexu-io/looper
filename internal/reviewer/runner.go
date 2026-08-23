@@ -4626,10 +4626,19 @@ func isValidBlockingReviewEvent(value string) bool {
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		previous, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
-		if err == nil {
-			updated.MetadataJSON = stringPtr(metadataJSON)
+		if err != nil {
+			return
 		}
+		if strings.TrimSpace(previous) != strings.TrimSpace(pending.HeadSHA) {
+			counted, _, countErr := loops.IncrementReviewerPublishCount(&metadataJSON)
+			if countErr != nil {
+				return
+			}
+			metadataJSON = counted
+		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
 	}); err != nil {
 		return err
 	}
@@ -6330,7 +6339,9 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	loopMeta["lastStatus"] = "success"
 	loopMeta["consecutiveFailures"] = 0
 	reviewCompleted := checkpoint.SkipReason == "" && checkpoint.PendingReview != nil
-	if reviewCompleted {
+	publishedHead, _ := stringFromAny(meta["lastPublishedHeadSha"])
+	alreadyCounted := publishedHead != "" && (head == "" || publishedHead == head)
+	if reviewCompleted && !alreadyCounted {
 		loopMeta["iterationCount"] = iterations + 1
 	}
 	if reviewCompleted && head != "" {
