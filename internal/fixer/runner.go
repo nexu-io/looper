@@ -1652,17 +1652,28 @@ func (r *Runner) parkFixerBudgetIfExhausted(ctx context.Context, loop storage.Lo
 			loop = *fresh
 		}
 	}
-	if loop.Status == "awaiting_human" || loop.Status == "terminated" || loop.Status == "stopped" {
-		return loop.Status == "awaiting_human", nil
-	}
-	if isManualFixerLoop(loop) {
+	if loop.Status == "terminated" || loop.Status == "stopped" {
 		return false, nil
+	}
+	if loop.Status == "awaiting_human" {
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			return true, nil
+		}
+	} else {
+		if !r.hitlEnabled {
+			return false, nil
+		}
+		if isManualFixerLoop(loop) {
+			return false, nil
+		}
+		cap := r.maxPushesPerPR(loop.ProjectID)
+		count := loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount
+		if !loops.BudgetExhausted(count, cap) {
+			return false, nil
+		}
 	}
 	cap := r.maxPushesPerPR(loop.ProjectID)
 	count := loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount
-	if !loops.BudgetExhausted(count, cap) {
-		return false, nil
-	}
 	_, err := loops.ParkReviewFixBudget(ctx, r.repos, loops.ParkReviewFixBudgetInput{
 		Exhausted: loop,
 		Role:      "fixer",

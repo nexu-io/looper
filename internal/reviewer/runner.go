@@ -6227,8 +6227,12 @@ func (r *Runner) maxPublishesPerPR(projectID string) int {
 	return r.loopConfig.MaxPublishesPerPR
 }
 
+func (r *Runner) reviewFixHITLEnabled() bool {
+	return r.projectRoleConfig != nil && r.projectRoleConfig.HITL.Enabled
+}
+
 func (r *Runner) shouldParkReviewerBudget(loop storage.LoopRecord, checkpoint reviewerCheckpoint) bool {
-	if isManualReviewerLoop(loop) || checkpoint.SkipReason != "" || checkpoint.PendingReview == nil {
+	if !r.reviewFixHITLEnabled() || isManualReviewerLoop(loop) || checkpoint.SkipReason != "" || checkpoint.PendingReview == nil {
 		return false
 	}
 	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
@@ -6238,19 +6242,29 @@ func (r *Runner) shouldParkReviewerBudget(loop storage.LoopRecord, checkpoint re
 }
 
 func (r *Runner) parkReviewerBudgetIfExhausted(ctx context.Context, loop storage.LoopRecord) (bool, error) {
-	if loop.Status == "awaiting_human" || loop.Status == "terminated" || loop.Status == "stopped" {
-		return loop.Status == "awaiting_human", nil
-	}
-	if isManualReviewerLoop(loop) {
+	if loop.Status == "terminated" || loop.Status == "stopped" {
 		return false, nil
 	}
-	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
-		return false, nil
+	if loop.Status == "awaiting_human" {
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			return true, nil
+		}
+	} else {
+		if !r.reviewFixHITLEnabled() {
+			return false, nil
+		}
+		if isManualReviewerLoop(loop) {
+			return false, nil
+		}
+		if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+			return false, nil
+		}
+		cap := r.maxPublishesPerPR(loop.ProjectID)
+		if !loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), cap) {
+			return false, nil
+		}
 	}
 	cap := r.maxPublishesPerPR(loop.ProjectID)
-	if !loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), cap) {
-		return false, nil
-	}
 	_, err := loops.ParkReviewFixBudget(ctx, r.repos, loops.ParkReviewFixBudgetInput{
 		Exhausted: loop,
 		Role:      "reviewer",

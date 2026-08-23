@@ -232,12 +232,21 @@ type ParkReviewFixBudgetInput struct {
 // ParkReviewFixBudget parks the exhausted loop as awaiting_human with a budget
 // HITL ask and pauses the sibling loop on the same PR. Queue items on both
 // sides are cancelled so discovery cannot immediately restart the ping-pong.
+// Re-entry on an already-awaiting budget loop finishes cancel/sibling park
+// without rewriting a delivered ask.
 func ParkReviewFixBudget(ctx context.Context, repos *storage.Repositories, input ParkReviewFixBudgetInput) (storage.LoopRecord, error) {
 	if repos == nil || repos.Loops == nil {
 		return input.Exhausted, fmt.Errorf("review-fix budget park requires loop storage")
 	}
+	exhausted := input.Exhausted
+	if ask, ok := ReadHITLAsk(exhausted.MetadataJSON); ok && IsReviewFixBudgetAsk(ask) && exhausted.Status == "awaiting_human" {
+		if err := finishReviewFixBudgetPark(ctx, repos, exhausted, input.Role, input.NowISO); err != nil {
+			return exhausted, err
+		}
+		return exhausted, nil
+	}
 	ask := NewReviewFixBudgetAsk(input.Role, input.Repo, input.PRNumber, input.Count, input.Cap, input.NowISO)
-	metadata, err := WriteHITLAsk(input.Exhausted.MetadataJSON, ask)
+	metadata, err := WriteHITLAsk(exhausted.MetadataJSON, ask)
 	if err != nil {
 		return input.Exhausted, err
 	}
@@ -247,7 +256,6 @@ func ParkReviewFixBudget(ctx context.Context, repos *storage.Repositories, input
 	if err != nil {
 		return input.Exhausted, err
 	}
-	exhausted := input.Exhausted
 	exhausted.MetadataJSON = &metadata
 	exhausted.Status = "awaiting_human"
 	exhausted.NextRunAt = nil
@@ -255,16 +263,20 @@ func ParkReviewFixBudget(ctx context.Context, repos *storage.Repositories, input
 	if err := repos.Loops.Upsert(ctx, exhausted); err != nil {
 		return input.Exhausted, err
 	}
-	reason := ReviewFixBudgetTerminationReason
-	if repos.Queue != nil {
-		if _, err := repos.Queue.CancelByLoop(ctx, exhausted.ID, input.NowISO, &reason); err != nil {
-			return exhausted, err
-		}
-	}
-	if err := parkSiblingReviewFixLoop(ctx, repos, exhausted, input.Role, input.NowISO); err != nil {
+	if err := finishReviewFixBudgetPark(ctx, repos, exhausted, input.Role, input.NowISO); err != nil {
 		return exhausted, err
 	}
 	return exhausted, nil
+}
+
+func finishReviewFixBudgetPark(ctx context.Context, repos *storage.Repositories, exhausted storage.LoopRecord, exhaustedBy, nowISO string) error {
+	if repos.Queue != nil {
+		reason := ReviewFixBudgetTerminationReason
+		if _, err := repos.Queue.CancelByLoop(ctx, exhausted.ID, nowISO, &reason); err != nil {
+			return err
+		}
+	}
+	return parkSiblingReviewFixLoop(ctx, repos, exhausted, exhaustedBy, nowISO)
 }
 
 func parkSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, exhausted storage.LoopRecord, exhaustedBy, nowISO string) error {
@@ -349,8 +361,15 @@ func ApplyReviewFixBudgetAnswer(ctx context.Context, repos *storage.Repositories
 }
 
 func continueReviewFixBudget(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
+	// Keep awaiting_human + the budget ask until sibling unpause and requeue
+	// succeed so a later GitHub/Feishu poll can retry the same answer.
+	if err := unpauseSiblingReviewFixLoop(ctx, repos, loop, nowISO); err != nil {
+		return loop, err
+	}
+	if err := requeueReviewFixBudgetLoop(ctx, repos, loop.ID, nowISO); err != nil {
+		return loop, err
+	}
 	metadata := loop.MetadataJSON
-	var err error
 	switch loop.Type {
 	case "reviewer":
 		encoded, resetErr := ResetReviewerPublishCount(metadata)
@@ -382,12 +401,6 @@ func continueReviewFixBudget(ctx context.Context, repos *storage.Repositories, l
 	updated.UpdatedAt = nowISO
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return loop, err
-	}
-	if err := requeueReviewFixBudgetLoop(ctx, repos, updated.ID, nowISO); err != nil {
-		return updated, err
-	}
-	if err := unpauseSiblingReviewFixLoop(ctx, repos, updated, nowISO); err != nil {
-		return updated, err
 	}
 	return updated, nil
 }

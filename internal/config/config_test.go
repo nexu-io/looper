@@ -318,6 +318,9 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR; got != DefaultReviewFixBudgetCap {
 		t.Fatalf("fixer maxPushesPerPR default = %d, want %d", got, DefaultReviewFixBudgetCap)
 	}
+	if cfg.HITL.Enabled {
+		t.Fatal("HITL default must be false so default caps stay inert until HITL is enabled")
+	}
 }
 
 func TestValidateReviewFixBudgetCaps(t *testing.T) {

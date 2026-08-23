@@ -1950,7 +1950,12 @@ func TestParkReviewerBudgetIfExhaustedParksSibling(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
 		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
 	}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{MaxPublishesPerPR: 8}})
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.HITL.Enabled = true
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{MaxPublishesPerPR: 8}, CustomInstructions: &cfg})
 	parked, err := runner.parkReviewerBudgetIfExhausted(context.Background(), reviewer)
 	if err != nil || !parked {
 		t.Fatalf("parkReviewerBudgetIfExhausted() = (%v, %v), want parked", parked, err)
@@ -1962,6 +1967,76 @@ func TestParkReviewerBudgetIfExhaustedParksSibling(t *testing.T) {
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		t.Fatalf("fixer sibling = (%#v, %v), want paused sibling hold", sibling, err)
+	}
+}
+
+func TestParkReviewerBudgetIfExhaustedSkipsWhenHITLDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	reviewerTarget := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":8}}`
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_no_hitl", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	fixer := storage.LoopRecord{ID: "loop_fixer_budget_no_hitl", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if cfg.HITL.Enabled {
+		t.Fatal("DefaultConfig HITL.Enabled = true, want false")
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg})
+	parked, err := runner.parkReviewerBudgetIfExhausted(context.Background(), reviewer)
+	if err != nil || parked {
+		t.Fatalf("parkReviewerBudgetIfExhausted() = (%v, %v), want skipped under default HITL-off config", parked, err)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || updated == nil || updated.Status != "running" {
+		t.Fatalf("reviewer = (%#v, %v), want still running", updated, err)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "queued" {
+		t.Fatalf("fixer sibling = (%#v, %v), want still queued", sibling, err)
+	}
+}
+
+func TestParkReviewerBudgetIfExhaustedCompletesSiblingAfterPartialPark(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	reviewerTarget := "pr:acme/looper:42"
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_retry", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	fixer := storage.LoopRecord{ID: "loop_fixer_budget_retry", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	askMeta, err := loops.WriteHITLAsk(reviewer.MetadataJSON, loops.NewReviewFixBudgetAsk("reviewer", repo, prNumber, 8, 8, nowISO))
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	reviewer.MetadataJSON = &askMeta
+	reviewer.Status = "awaiting_human"
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	parked, err := runner.parkReviewerBudgetIfExhausted(context.Background(), reviewer)
+	if err != nil || !parked {
+		t.Fatalf("parkReviewerBudgetIfExhausted() = (%v, %v), want reconciled park", parked, err)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("fixer sibling = (%#v, %v), want paused after reconcile", sibling, err)
 	}
 }
 

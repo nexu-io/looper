@@ -245,7 +245,8 @@ func DefaultConfig(cwd string) (Config, error) {
 						StopOnApproved:            false,
 						StopOnReadyLabel:          true,
 						StopOnIdenticalOutput:     true,
-						MaxPublishesPerPR:         DefaultReviewFixBudgetCap,
+						// Enforced only when HITL is enabled; park needs Continue/Stop.
+						MaxPublishesPerPR: DefaultReviewFixBudgetCap,
 					},
 					Retry:                   DefaultReviewerRetryConfig(),
 					Scope:                   ReviewerScopeChangedRanges,
@@ -284,7 +285,8 @@ func DefaultConfig(cwd string) (Config, error) {
 					Loop: FixerLoopConfig{
 						// Opt-in: keep historical immediate-start behavior until operators enable quiet period.
 						QuietPeriodSeconds: 0,
-						MaxPushesPerPR:     DefaultReviewFixBudgetCap,
+						// Enforced only when HITL is enabled; park needs Continue/Stop.
+						MaxPushesPerPR: DefaultReviewFixBudgetCap,
 					},
 				},
 			},

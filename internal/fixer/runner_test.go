@@ -99,7 +99,8 @@ func TestIncrementAndParkFixerBudgetParksSibling(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	cfg.HITL.Enabled = true
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: true})
 	if _, err := runner.incrementFixerPushCount(context.Background(), fixer); err != nil {
 		t.Fatalf("incrementFixerPushCount() error = %v", err)
 	}
@@ -114,6 +115,47 @@ func TestIncrementAndParkFixerBudgetParksSibling(t *testing.T) {
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
 	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		t.Fatalf("reviewer sibling = (%#v, %v), want paused sibling hold", sibling, err)
+	}
+}
+
+func TestParkFixerBudgetIfExhaustedSkipsWhenHITLDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	fixer := storage.LoopRecord{ID: "loop_fixer_budget_no_hitl", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_no_hitl", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if cfg.HITL.Enabled {
+		t.Fatal("DefaultConfig HITL.Enabled = true, want false")
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	if _, err := runner.incrementFixerPushCount(context.Background(), fixer); err != nil {
+		t.Fatalf("incrementFixerPushCount() error = %v", err)
+	}
+	parked, err := runner.parkFixerBudgetIfExhausted(context.Background(), fixer)
+	if err != nil || parked {
+		t.Fatalf("parkFixerBudgetIfExhausted() = (%v, %v), want skipped under default HITL-off config", parked, err)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || updated == nil || updated.Status != "running" {
+		t.Fatalf("fixer = (%#v, %v), want still running", updated, err)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || sibling == nil || sibling.Status != "waiting" {
+		t.Fatalf("reviewer sibling = (%#v, %v), want still waiting", sibling, err)
 	}
 }
 
