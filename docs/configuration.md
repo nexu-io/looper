@@ -656,6 +656,8 @@ enabledByDefault = true
 # Continuous follow-up debounce after a published review. Inherits defaults.loop when unset.
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
+# Successful reviewer publishes per PR. 0 disables. Exhaustion parks reviewer + sibling fixer via HITL.
+maxPublishesPerPR = 8
 
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
@@ -667,6 +669,19 @@ reReviewPromptOnHeadChange = false
 ```
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
+
+### Review-fix budget
+
+Unlimited reviewer ⇄ fixer ping-pong is a cost and quality problem: each side can keep inventing new work. The old `maxIterationsPerPR` / `maxIterationsPerHead` knobs are still accepted but **ignored**. The live caps are separate per role:
+
+| Path | Counts | Default |
+| --- | --- | --- |
+| `roles.reviewer.behavior.loop.maxPublishesPerPR` | Successful published reviews on one PR | `8` |
+| `roles.fixer.behavior.loop.maxPushesPerPR` | Successful fixer pushes on one PR | `8` |
+
+`0` disables that role's cap. Authority is live config plus a durable counter (`iterationCount` for reviewer, `reviewFixBudget.pushCount` for fixer). Exhaustion parks the exhausted loop as `awaiting_human` with a Continue/Stop HITL ask and pauses the sibling loop on the same PR. Continue resets the exhausted counter and unpauses the sibling; Stop terminates both. Product terminals (ready label, identical output, closed PR) still win and do not open a budget ask.
+
+**Failure prevented:** expanding-scope review/fix that never converges. **Cost:** a new persisted counter and a HITL park that must not fight discovery or the deprecated budget-strip path. **Why not reuse the old knobs:** those were reviewer-only infra counters that stranded long PRs and were explicitly demoted in #209.
 
 ### Quiet-period debounce (shared + per-role)
 
@@ -947,6 +962,7 @@ publishMode = "single_review"
 enabledByDefault = true
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
+maxPublishesPerPR = 8
 
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
@@ -966,6 +982,8 @@ scope = "looper-only"
 [roles.fixer.behavior.loop]
 # Opt-in quiet period (default 0 = immediate enqueue). Recommended starter: 60–120.
 quietPeriodSeconds = 0
+# Successful fixer pushes per PR. 0 disables. Exhaustion parks fixer + sibling reviewer via HITL.
+maxPushesPerPR = 8
 
 [roles.fixer.discovery]
 autoDiscovery = true

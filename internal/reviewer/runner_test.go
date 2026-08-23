@@ -19,6 +19,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
@@ -1930,6 +1931,37 @@ func TestEnsureLoopForPullRequestReactivatesLegacyBudgetTerminatedLoop(t *testin
 	}
 	if loopMeta["status"] != "active" {
 		t.Fatalf("loop metadata status = %#v, want active", loopMeta["status"])
+	}
+}
+
+func TestParkReviewerBudgetIfExhaustedParksSibling(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	reviewerTarget := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":8}}`
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	fixer := storage.LoopRecord{ID: "loop_fixer_budget", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{MaxPublishesPerPR: 8}})
+	parked, err := runner.parkReviewerBudgetIfExhausted(context.Background(), reviewer)
+	if err != nil || !parked {
+		t.Fatalf("parkReviewerBudgetIfExhausted() = (%v, %v), want parked", parked, err)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || updated == nil || updated.Status != "awaiting_human" {
+		t.Fatalf("reviewer = (%#v, %v), want awaiting_human", updated, err)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("fixer sibling = (%#v, %v), want paused sibling hold", sibling, err)
 	}
 }
 

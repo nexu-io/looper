@@ -215,6 +215,10 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	if !ok {
 		return nil
 	}
+	if loops.IsReviewFixBudgetAsk(ask) {
+		_, err = loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO)
+		return err
+	}
 	ask.Answer = answer
 	ask.Status = "answered"
 	ask.AnsweredAt = nowISO
