@@ -1431,20 +1431,37 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	if data, readErr := os.ReadFile(pidPath); readErr == nil {
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if parseErr != nil {
-			t.Fatalf("parse pid: %v", parseErr)
+	deadline := time.Now().Add(2 * time.Second)
+	var pid int
+	for {
+		data, readErr := os.ReadFile(pidPath)
+		if readErr != nil {
+			// Process died before creating the pid file.
+			return
 		}
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+		pidStr := strings.TrimSpace(string(data))
+		if pidStr == "" {
+			// Redirection created the file; Start reaped the child before echo flushed.
+			if time.Now().After(deadline) {
 				return
 			}
 			time.Sleep(10 * time.Millisecond)
+			continue
 		}
-		t.Fatalf("spawned process %d survived failed Start", pid)
+		parsed, parseErr := strconv.Atoi(pidStr)
+		if parseErr != nil {
+			t.Fatalf("parse pid: %v", parseErr)
+		}
+		pid = parsed
+		break
 	}
+	for time.Now().Before(deadline) {
+		if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("spawned process %d survived failed Start", pid)
 }
 
 func TestExecutorWaitSurfacesTerminalPersistenceFailure(t *testing.T) {
