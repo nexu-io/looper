@@ -166,6 +166,28 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 	return delivered
 }
 
+// enqueueFeishuHITLMessage applies a typed inbox reply and, when that reply is
+// an explicit budget Continue/Stop, invokes onAnswered so the live ask card is
+// marked resolved. Card-action delivery already does this; typed decisions must
+// too, or the cached loop-seq buttons can answer a later budget cycle.
+func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string, onAnswered func(context.Context, string, string)) error {
+	shouldResolve := false
+	if repos != nil && repos.Loops != nil && (loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text)) {
+		if loop, err := repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+			if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+				shouldResolve = true
+			}
+		}
+	}
+	if err := enqueueHumanMessageToLoop(ctx, repos, nowISO, loopID, text); err != nil {
+		return err
+	}
+	if shouldResolve && onAnswered != nil {
+		onAnswered(ctx, loopID, text)
+	}
+	return nil
+}
+
 func sendFeishuBudgetAsk(ctx context.Context, input defaultSchedulerTickInput, loop storage.LoopRecord, ask loops.HITLAsk) error {
 	if input.OnHITLAsk == nil {
 		return fmt.Errorf("feishu HITL notifier is not configured")
@@ -265,7 +287,7 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return nil
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueHumanMessageToLoop(ctx, input.Repos, nowISO, loopID, text)
+			return enqueueFeishuHITLMessage(ctx, input.Repos, nowISO, loopID, text, input.OnHITLAnswerDelivered)
 		},
 	}
 	if input.Logger != nil {

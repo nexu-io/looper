@@ -235,6 +235,7 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 		t.Fatalf("deliverUndeliveredFeishuBudgetAsks() = %d, want 1", delivered)
 	}
 
+	var resolved []string
 	deps := feishuHITLPollDeps{
 		loopByRoot: func(_ contextType, rootID string) string {
 			if rootID == "om_budget_root" {
@@ -243,7 +244,9 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 			return ""
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueHumanMessageToLoop(ctx, repos, nowISO, loopID, text)
+			return enqueueFeishuHITLMessage(ctx, repos, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
+				resolved = append(resolved, answeredLoopID+"="+answer)
+			})
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
 			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
@@ -266,6 +269,9 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 	if got := loops.ReadHumanInbox(fresh.MetadataJSON); len(got) != 0 {
 		t.Fatalf("human inbox after typed discussion = %#v, want empty", got)
 	}
+	if len(resolved) != 0 {
+		t.Fatalf("card resolution after typed discussion = %#v, want none", resolved)
+	}
 	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		t.Fatalf("fixer after typed discussion = (%#v, %v), want still paused", sibling, err)
@@ -284,6 +290,9 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 	sibling, err = repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil || sibling.Status != "queued" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		t.Fatalf("fixer after typed Continue = (%#v, %v), want queued and unpaused", sibling, err)
+	}
+	if len(resolved) != 1 || resolved[0] != reviewer.ID+"=Continue" {
+		t.Fatalf("card resolution after typed Continue = %#v, want reviewer Continue", resolved)
 	}
 }
 
