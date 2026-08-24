@@ -1675,9 +1675,40 @@ func (r *Runner) parkFixerBudgetAfterSuccessfulRun(ctx context.Context, project 
 		}
 	}
 	if r.shouldCreateFixerBudgetPark(current) && r.livePullRequestClosed(ctx, project, derefString(current.Repo), derefInt64(current.PRNumber)) {
+		if err := r.terminateLoop(ctx, current, "pr_closed_or_merged"); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	return r.parkFixerBudgetIfExhausted(ctx, current)
+}
+
+func (r *Runner) terminateLoop(ctx context.Context, loop storage.LoopRecord, reason string) error {
+	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "terminated"
+		updated.NextRunAt = nil
+		meta := parseJSONObject(updated.MetadataJSON)
+		loopMeta, _ := meta["loop"].(map[string]any)
+		if loopMeta == nil {
+			loopMeta = map[string]any{}
+		}
+		loopMeta["status"] = "terminated"
+		loopMeta["terminationReason"] = reason
+		loopMeta["lastStatus"] = "terminated"
+		meta["loop"] = loopMeta
+		if encoded, marshalErr := json.Marshal(meta); marshalErr == nil {
+			text := string(encoded)
+			updated.MetadataJSON = &text
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if r.repos == nil || r.repos.Queue == nil {
+		return nil
+	}
+	_, err = r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &reason)
+	return err
 }
 
 func (r *Runner) parkFixerBudgetIfExhausted(ctx context.Context, loop storage.LoopRecord) (bool, error) {
@@ -2371,6 +2402,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 	}
+	if current, err := r.repos.Loops.GetByID(ctx, loop.ID); err != nil {
+		return ProcessResult{}, err
+	} else if current != nil && (current.Status == "terminated" || current.Status == "stopped") {
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
+	}
 	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if scheduled {
@@ -2419,7 +2456,7 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if !ok {
 		return false, nil
 	}
-	if current.Status == "paused" || current.Status == "awaiting_human" || current.Status == "human_takeover" {
+	if current.Status == "paused" || current.Status == "awaiting_human" || current.Status == "human_takeover" || current.Status == "terminated" || current.Status == "stopped" {
 		return false, nil
 	}
 	if r.hitlEnabled && !isManualFixerLoop(*current) {
@@ -2472,6 +2509,9 @@ func (r *Runner) scheduleFollowupRetryAfterSuccess(ctx context.Context, loop sto
 		return false, err
 	}
 	if current == nil {
+		return false, nil
+	}
+	if current.Status == "terminated" || current.Status == "stopped" {
 		return false, nil
 	}
 	if !fixerFollowUpdatesEnabled(*current) {

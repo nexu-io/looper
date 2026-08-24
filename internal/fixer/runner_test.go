@@ -1719,6 +1719,15 @@ func TestProcessClaimedItemDoesNotParkBudgetWhenPushClosesPR(t *testing.T) {
 	if err != nil || claim == nil {
 		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
 	}
+	claimedLoop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
+	if err != nil || claimedLoop == nil {
+		t.Fatalf("Loops.GetByID(claimed) = (%#v, %v), want discovered fixer loop", claimedLoop, err)
+	}
+	pendingMeta := mustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": "head-followup", "fixItemsStateHash": "state-followup", "unresolvedThreadIds": []string{"t2"}, "recordedAt": nowISO}})
+	claimedLoop.MetadataJSON = &pendingMeta
+	if err := fixture.repos.Loops.Upsert(context.Background(), *claimedLoop); err != nil {
+		t.Fatalf("Loops.Upsert(pending rediscovery) error = %v", err)
+	}
 	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
@@ -1727,11 +1736,18 @@ func TestProcessClaimedItemDoesNotParkBudgetWhenPushClosesPR(t *testing.T) {
 		t.Fatalf("result = %#v, want success after pushed fix", result)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
-	if err != nil || loop == nil || loop.Status == "awaiting_human" {
-		t.Fatalf("fixer = (%#v, %v), want no budget park after closed PR", loop, err)
+	if err != nil || loop == nil || loop.Status != "terminated" {
+		t.Fatalf("fixer = (%#v, %v), want terminated product terminal after closed PR", loop, err)
+	}
+	reason := ""
+	if loopMeta, ok := parseJSONObject(loop.MetadataJSON)["loop"].(map[string]any); ok {
+		reason, _ = stringFromAny(loopMeta["terminationReason"])
+	}
+	if reason != "pr_closed_or_merged" {
+		t.Fatalf("terminationReason = %q, want pr_closed_or_merged", reason)
 	}
 	if loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount < 1 {
-		t.Fatalf("push count = %d, want cap-reaching push before closed-PR skip", loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount)
+		t.Fatalf("push count = %d, want cap-reaching push before closed-PR terminal", loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount)
 	}
 	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
 		t.Fatalf("HITL ask = %#v, want no budget ask on a closed PR", ask)
@@ -1739,6 +1755,24 @@ func TestProcessClaimedItemDoesNotParkBudgetWhenPushClosesPR(t *testing.T) {
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
 	if err != nil || sibling == nil || sibling.Status != "waiting" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		t.Fatalf("reviewer sibling = (%#v, %v), want still waiting without budget pause", sibling, err)
+	}
+	active, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if active != nil {
+		t.Fatalf("activeQueue = %#v, want no follow-up after closed-PR terminal", active)
+	}
+	parked, err := runner.parkFixerBudgetIfExhausted(context.Background(), *loop)
+	if err != nil || parked {
+		t.Fatalf("parkFixerBudgetIfExhausted() = (%v, %v), want skipped on terminated closed PR", parked, err)
+	}
+	scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), *loop, repo, prNumber)
+	if err != nil {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
+	}
+	if scheduled {
+		t.Fatal("schedulePendingRediscoveryAfterRun() = true, want no enqueue after closed-PR terminal")
 	}
 }
 
