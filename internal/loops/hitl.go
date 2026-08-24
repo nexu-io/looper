@@ -14,6 +14,9 @@ const hitlMetadataKey = "hitl"
 // the answer is filled in by POST /loops/{seq}/respond. On resume the runner
 // reads Answer + SessionID to continue the same agent session.
 type HITLAsk struct {
+	// Kind distinguishes mid-run agent asks (empty) from control-plane asks
+	// such as review-fix budget exhaustion.
+	Kind        string   `json:"kind,omitempty"`
 	Question    string   `json:"question,omitempty"`
 	Options     []string `json:"options,omitempty"`
 	SessionID   string   `json:"sessionId,omitempty"`

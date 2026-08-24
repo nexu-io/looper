@@ -11,6 +11,7 @@ const DefaultServerPort = 17310
 const (
 	DefaultReviewerAutoRecoveryMaxAttempts = 3
 	DefaultReviewerRetryMaxDelayMS         = 300000
+	DefaultReviewFixBudgetCap              = 8
 )
 
 func DefaultLooperHome() (string, error) {
@@ -244,6 +245,8 @@ func DefaultConfig(cwd string) (Config, error) {
 						StopOnApproved:            false,
 						StopOnReadyLabel:          true,
 						StopOnIdenticalOutput:     true,
+						// Enforced only when HITL is enabled; park needs Continue/Stop.
+						MaxPublishesPerPR: DefaultReviewFixBudgetCap,
 					},
 					Retry:                   DefaultReviewerRetryConfig(),
 					Scope:                   ReviewerScopeChangedRanges,
@@ -282,6 +285,8 @@ func DefaultConfig(cwd string) (Config, error) {
 					Loop: FixerLoopConfig{
 						// Opt-in: keep historical immediate-start behavior until operators enable quiet period.
 						QuietPeriodSeconds: 0,
+						// Enforced only when HITL is enabled; park needs Continue/Stop.
+						MaxPushesPerPR: DefaultReviewFixBudgetCap,
 					},
 				},
 			},

@@ -1284,6 +1284,9 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	if partial.StopOnIdenticalOutput != nil {
 		config.StopOnIdenticalOutput = *partial.StopOnIdenticalOutput
 	}
+	if partial.MaxPublishesPerPR != nil {
+		config.MaxPublishesPerPR = *partial.MaxPublishesPerPR
+	}
 }
 
 func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstructionsConfig) {
@@ -1527,6 +1530,9 @@ func mergeFixerBehaviorConfig(config *FixerBehaviorConfig, partial PartialFixerB
 func mergeFixerLoopConfig(config *FixerLoopConfig, partial PartialFixerLoopConfig) {
 	if partial.QuietPeriodSeconds != nil {
 		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
+	}
+	if partial.MaxPushesPerPR != nil {
+		config.MaxPushesPerPR = *partial.MaxPushesPerPR
 	}
 }
 

@@ -61,11 +61,13 @@ Flags:
   --planner-agent-timeout-seconds <seconds> Planner agent execution timeout
   --port <port>               Server port
   --reviewer-agent-timeout-seconds <seconds> Reviewer agent execution timeout
+  --roles-fixer-behavior-loop-max-pushes-per-pr <count> Max successful fixer pushes per PR (0 disables)
   --roles-fixer-behavior-loop-quiet-period-seconds <seconds> Fixer loop quiet period
   --roles-fixer-triggers-author-filter <filter> Fixer author filter: current-user or any
   --roles-reviewer-behavior-loop-enabled-by-default <bool> Enable reviewer follow-up loops by default
   --roles-reviewer-behavior-loop-max-iterations-per-head <count> Deprecated; ignored by reviewer loop filtering
   --roles-reviewer-behavior-loop-max-iterations-per-pr <count> Deprecated; ignored by reviewer loop filtering
+  --roles-reviewer-behavior-loop-max-publishes-per-pr <count> Max successful reviewer publishes per PR (0 disables)
   --roles-reviewer-behavior-loop-min-publish-interval-seconds <seconds> Reviewer loop minimum publish interval
   --roles-reviewer-behavior-loop-quiet-period-seconds <seconds> Reviewer loop quiet period
   --roles-reviewer-behavior-review-events-blocking <event> Reviewer event for blocking findings: COMMENT or REQUEST_CHANGES

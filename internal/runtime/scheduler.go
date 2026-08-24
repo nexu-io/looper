@@ -4610,7 +4610,7 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 		return false
 	}
 	switch loop.Status {
-	case "human_takeover", "paused":
+	case "human_takeover", "paused", "awaiting_human":
 		return true
 	default:
 		return false

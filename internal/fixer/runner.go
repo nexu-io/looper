@@ -850,6 +850,9 @@ type checkpointPush struct {
 	PushedAt      string       `json:"pushedAt,omitempty"`
 	SkippedReason string       `json:"skippedReason,omitempty"`
 	Evidence      *fixEvidence `json:"evidence,omitempty"`
+	// BudgetCounted is persisted with the durable push fact so a retry that
+	// short-circuits on Push.Pushed still records that successful push once.
+	BudgetCounted bool `json:"budgetCounted,omitempty"`
 }
 
 type fixEvidence struct {
@@ -1605,6 +1608,153 @@ func (r *Runner) quietPeriodSeconds(projectID string) int {
 	return 0
 }
 
+func (r *Runner) maxPushesPerPR(projectID string) int {
+	if r.projectRoleConfig != nil {
+		return config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Fixer.Behavior.Loop.MaxPushesPerPR
+	}
+	return 0
+}
+
+func (r *Runner) incrementFixerPushCount(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	current := loop
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return loop, err
+		}
+		if fresh != nil {
+			current = *fresh
+		}
+	}
+	encoded, _, err := loops.IncrementFixerPushCount(current.MetadataJSON)
+	if err != nil {
+		return current, err
+	}
+	if r.repos == nil || r.repos.Loops == nil {
+		current.MetadataJSON = &encoded
+		return current, nil
+	}
+	current.MetadataJSON = &encoded
+	current.UpdatedAt = r.nowISO()
+	if err := r.repos.Loops.Upsert(ctx, current); err != nil {
+		return current, err
+	}
+	return current, nil
+}
+
+func (r *Runner) livePullRequestClosed(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) bool {
+	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
+		return false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false
+	}
+	return normalizePRState(detail.State) != "open"
+}
+
+func (r *Runner) shouldCreateFixerBudgetPark(loop storage.LoopRecord) bool {
+	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
+		return false
+	}
+	if !r.hitlEnabled || isManualFixerLoop(loop) {
+		return false
+	}
+	return loops.BudgetExhausted(loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount, r.maxPushesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) parkFixerBudgetAfterSuccessfulRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord) (bool, error) {
+	current := loop
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return false, err
+		}
+		if fresh != nil {
+			current = *fresh
+		}
+	}
+	if r.shouldCreateFixerBudgetPark(current) && r.livePullRequestClosed(ctx, project, derefString(current.Repo), derefInt64(current.PRNumber)) {
+		if err := r.terminateLoop(ctx, current, "pr_closed_or_merged"); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return r.parkFixerBudgetIfExhausted(ctx, current)
+}
+
+func (r *Runner) terminateLoop(ctx context.Context, loop storage.LoopRecord, reason string) error {
+	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "terminated"
+		updated.NextRunAt = nil
+		meta := parseJSONObject(updated.MetadataJSON)
+		loopMeta, _ := meta["loop"].(map[string]any)
+		if loopMeta == nil {
+			loopMeta = map[string]any{}
+		}
+		loopMeta["status"] = "terminated"
+		loopMeta["terminationReason"] = reason
+		loopMeta["lastStatus"] = "terminated"
+		meta["loop"] = loopMeta
+		if encoded, marshalErr := json.Marshal(meta); marshalErr == nil {
+			text := string(encoded)
+			updated.MetadataJSON = &text
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if r.repos == nil || r.repos.Queue == nil {
+		return nil
+	}
+	_, err = r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &reason)
+	return err
+}
+
+func (r *Runner) parkFixerBudgetIfExhausted(ctx context.Context, loop storage.LoopRecord) (bool, error) {
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return false, err
+		}
+		if fresh != nil {
+			loop = *fresh
+		}
+	}
+	if loop.Status == "terminated" || loop.Status == "stopped" {
+		return false, nil
+	}
+	if loop.Status == "awaiting_human" {
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			return true, nil
+		}
+	} else {
+		if !r.hitlEnabled {
+			return false, nil
+		}
+		if isManualFixerLoop(loop) {
+			return false, nil
+		}
+		cap := r.maxPushesPerPR(loop.ProjectID)
+		count := loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount
+		if !loops.BudgetExhausted(count, cap) {
+			return false, nil
+		}
+	}
+	cap := r.maxPushesPerPR(loop.ProjectID)
+	count := loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount
+	_, err := loops.ParkReviewFixBudget(ctx, r.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop,
+		Role:      "fixer",
+		Repo:      derefString(loop.Repo),
+		PRNumber:  derefInt64(loop.PRNumber),
+		Count:     count,
+		Cap:       cap,
+		NowISO:    r.nowISO(),
+	})
+	return err == nil, err
+}
+
 func (r *Runner) isForgejoProject(projectID string) bool {
 	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
 }
@@ -1736,7 +1886,7 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	if err != nil {
 		return err
 	}
-	if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
+	if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" || loopResult.record.Status == "human_takeover" || loopResult.skipped {
 		result.Skipped++
 		return nil
 	}
@@ -1943,6 +2093,17 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	if r.shouldCreateFixerBudgetPark(*loop) && r.livePullRequestClosed(ctx, *project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, *loop, "pr_closed_or_merged"); err != nil {
+			return ProcessResult{}, err
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "pr_closed_or_merged"}, nil
+	}
+	if parked, err := r.parkFixerBudgetIfExhausted(ctx, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -2241,6 +2402,18 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 	}
+	if parked, err := r.parkFixerBudgetAfterSuccessfulRun(ctx, *project, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
+	}
+	if current, err := r.repos.Loops.GetByID(ctx, loop.ID); err != nil {
+		return ProcessResult{}, err
+	} else if current != nil && (current.Status == "terminated" || current.Status == "stopped") {
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
+	}
 	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if scheduled {
@@ -2289,8 +2462,15 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if !ok {
 		return false, nil
 	}
-	if current.Status == "paused" {
+	if current.Status == "paused" || current.Status == "awaiting_human" || current.Status == "human_takeover" || current.Status == "terminated" || current.Status == "stopped" {
 		return false, nil
+	}
+	if r.hitlEnabled && !isManualFixerLoop(*current) {
+		cap := r.maxPushesPerPR(current.ProjectID)
+		count := loops.ReadReviewFixBudgetState(current.MetadataJSON).PushCount
+		if loops.BudgetExhausted(count, cap) {
+			return false, nil
+		}
 	}
 	// Pending rediscovery after a run is a new scheduling decision for the
 	// still-actionable set: apply quiet period before the next start.
@@ -2335,6 +2515,9 @@ func (r *Runner) scheduleFollowupRetryAfterSuccess(ctx context.Context, loop sto
 		return false, err
 	}
 	if current == nil {
+		return false, nil
+	}
+	if current.Status == "terminated" || current.Status == "stopped" {
 		return false, nil
 	}
 	if !fixerFollowUpdatesEnabled(*current) {
@@ -3153,7 +3336,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, nil
 	}
 	if checkpoint.Push != nil && checkpoint.Push.Pushed {
-		return checkpoint, nil
+		return r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -3216,6 +3399,10 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	evidence := &fixEvidence{Valid: pushedHeadSHA != "" && checkpoint.FixItemsHash != "", HeadSHA: pushedHeadSHA, CommitSHAs: cloneStrings(checkpoint.ReconcileCommits.NewCommitSHAs), BaseHeadSHA: checkpoint.ReconcileCommits.BaseHeadSHA, FixItemsHash: checkpoint.FixItemsHash, CommentRecords: buildFixCommentEvidenceRecords(checkpoint, lastNonEmptyString(checkpoint.ReconcileCommits.NewCommitSHAs, pushedHeadSHA)), Source: "fallback_push", ProducedNewCommits: roundProducedNewCommits(&checkpoint), PushedAt: pushedAt}
 	checkpoint.Push = &checkpointPush{Pushed: true, Branch: branch, Remote: "origin", HeadSHA: pushedHeadSHA, PushedAt: pushedAt, Evidence: evidence}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
+		return checkpoint, err
+	}
+	checkpoint, err = r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
+	if err != nil {
 		return checkpoint, err
 	}
 	store, err := r.mergedFixEvidenceStoreV2(ctx, input.Loop, buildFixEvidenceStoreV2(checkpoint, evidence, input.Run.ID))
@@ -3337,6 +3524,10 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
 		return false, checkpoint, err
 	}
+	checkpoint, err = r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
+	if err != nil {
+		return false, checkpoint, err
+	}
 	store, err := r.mergedFixEvidenceStoreV2(ctx, input.Loop, buildFixEvidenceStoreV2(checkpoint, evidence, input.Run.ID))
 	if err != nil {
 		return false, checkpoint, err
@@ -3353,6 +3544,20 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	r.appendEvent(ctx, eventInput{eventType: "fixer.push.adopted", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "headSha": adoptedHead}})
 	return true, checkpoint, nil
+}
+
+func (r *Runner) ensureFixerPushBudgetCounted(ctx context.Context, input stepInput, checkpoint fixerCheckpoint) (fixerCheckpoint, error) {
+	if checkpoint.Push == nil || !checkpoint.Push.Pushed || checkpoint.Push.BudgetCounted {
+		return checkpoint, nil
+	}
+	if _, err := r.incrementFixerPushCount(ctx, input.Loop); err != nil {
+		return checkpoint, err
+	}
+	checkpoint.Push.BudgetCounted = true
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
+		return checkpoint, err
+	}
+	return checkpoint, nil
 }
 
 func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -5014,6 +5219,21 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	}
 	if existing != nil {
 		updatedLoop := *existing
+		if updatedLoop.Status == "awaiting_human" || updatedLoop.Status == "human_takeover" || updatedLoop.Status == "terminated" || updatedLoop.Status == "stopped" {
+			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
+		}
+		if parked, err := r.parkFixerBudgetIfExhausted(ctx, updatedLoop); err != nil {
+			return loopUpsertResult{}, err
+		} else if parked {
+			updated, getErr := r.repos.Loops.GetByID(ctx, updatedLoop.ID)
+			if getErr != nil {
+				return loopUpsertResult{}, getErr
+			}
+			if updated != nil {
+				updatedLoop = *updated
+			}
+			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
+		}
 		if updatedLoop.Status == "paused" {
 			if resumed, updated, err := r.resumePausedZeroProgressLoop(ctx, updatedLoop, headSHA, fixItemsStateHash); err != nil {
 				return loopUpsertResult{}, err

@@ -718,7 +718,7 @@ func New(options Options) *Runner {
 	}
 	loopConfig := options.LoopConfig
 	if loopConfig == (config.ReviewerLoopConfig{}) {
-		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true, MaxPublishesPerPR: config.DefaultReviewFixBudgetCap}
 	}
 	scope := options.Scope
 	if scope == "" {
@@ -1065,6 +1065,16 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		return nil
 	}
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pr.HeadSHA && pr.HeadSHA != "" {
+		result.Skipped++
+		return nil
+	}
+	if loopResult.record.Status == "awaiting_human" || loopResult.record.Status == "human_takeover" {
+		result.Skipped++
+		return nil
+	}
+	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, loopResult.record); err != nil {
+		return err
+	} else if parked {
 		result.Skipped++
 		return nil
 	}
@@ -1601,12 +1611,24 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
+	if r.shouldCreateReviewerBudgetPark(*loop) && r.livePullRequestClosed(ctx, *project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, *loop, "pr_closed_or_merged"); err != nil {
+			return ProcessResult{}, err
+		}
+		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: pr_closed_or_merged", loop.ID)
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
+	}
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
 		var holdErr *holdSkipError
 		if errors.As(err, &holdErr) {
 			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
 		}
 		return ProcessResult{}, err
+	}
+	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -1817,12 +1839,23 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
 		}
+		if r.shouldParkReviewerBudget(*updated, checkpoint) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+			return
+		}
 		updated.Status = r.loopSuccessStatus(updated.Status, updated.MetadataJSON, checkpoint.SkipReason)
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	})
 	if err != nil {
 		return ProcessResult{}, err
+	}
+	if parked, parkErr := r.parkReviewerBudgetAfterSuccessfulRun(ctx, *project, updatedLoop); parkErr != nil {
+		return ProcessResult{}, parkErr
+	} else if parked {
+		r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
 	if reason := terminalReviewerLoopReason(updatedLoop); reason != "" {
 		if _, err := r.repos.Queue.CancelByLoop(ctx, updatedLoop.ID, r.nowISO(), &reason); err != nil {
@@ -4600,10 +4633,19 @@ func isValidBlockingReviewEvent(value string) bool {
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		previous, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
-		if err == nil {
-			updated.MetadataJSON = stringPtr(metadataJSON)
+		if err != nil {
+			return
 		}
+		if strings.TrimSpace(previous) != strings.TrimSpace(pending.HeadSHA) {
+			counted, _, countErr := loops.IncrementReviewerPublishCount(&metadataJSON)
+			if countErr != nil {
+				return
+			}
+			metadataJSON = counted
+		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
 	}); err != nil {
 		return err
 	}
@@ -6192,11 +6234,102 @@ func (r *Runner) loopSuccessStatus(currentStatus string, metadataJSON *string, s
 
 func isTerminalReviewerLoopStatus(status string) bool {
 	switch status {
-	case "terminated", "failed", "paused", "stopped":
+	case "terminated", "failed", "paused", "stopped", "awaiting_human", "human_takeover":
 		return true
 	default:
 		return false
 	}
+}
+
+func (r *Runner) maxPublishesPerPR(projectID string) int {
+	if r.projectRoleConfig != nil {
+		return config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Reviewer.Behavior.Loop.MaxPublishesPerPR
+	}
+	return r.loopConfig.MaxPublishesPerPR
+}
+
+func (r *Runner) reviewFixHITLEnabled() bool {
+	return r.projectRoleConfig != nil && r.projectRoleConfig.HITL.Enabled
+}
+
+func (r *Runner) shouldParkReviewerBudget(loop storage.LoopRecord, checkpoint reviewerCheckpoint) bool {
+	if !r.reviewFixHITLEnabled() || isManualReviewerLoop(loop) || checkpoint.SkipReason != "" || checkpoint.PendingReview == nil {
+		return false
+	}
+	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+		return false
+	}
+	return loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), r.maxPublishesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) livePullRequestClosed(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) bool {
+	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
+		return false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false
+	}
+	return normalizePRState(detail.State) != "open"
+}
+
+func (r *Runner) shouldCreateReviewerBudgetPark(loop storage.LoopRecord) bool {
+	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
+		return false
+	}
+	if !r.reviewFixHITLEnabled() || isManualReviewerLoop(loop) {
+		return false
+	}
+	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+		return false
+	}
+	return loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), r.maxPublishesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) parkReviewerBudgetAfterSuccessfulRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord) (bool, error) {
+	if r.shouldCreateReviewerBudgetPark(loop) && r.livePullRequestClosed(ctx, project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return r.parkReviewerBudgetIfExhausted(ctx, loop)
+}
+
+func (r *Runner) parkReviewerBudgetIfExhausted(ctx context.Context, loop storage.LoopRecord) (bool, error) {
+	if loop.Status == "terminated" || loop.Status == "stopped" {
+		return false, nil
+	}
+	if loop.Status == "awaiting_human" {
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			return true, nil
+		}
+	} else {
+		if !r.reviewFixHITLEnabled() {
+			return false, nil
+		}
+		if isManualReviewerLoop(loop) {
+			return false, nil
+		}
+		if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+			return false, nil
+		}
+		cap := r.maxPublishesPerPR(loop.ProjectID)
+		if !loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), cap) {
+			return false, nil
+		}
+	}
+	cap := r.maxPublishesPerPR(loop.ProjectID)
+	_, err := loops.ParkReviewFixBudget(ctx, r.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop,
+		Role:      "reviewer",
+		Repo:      derefString(loop.Repo),
+		PRNumber:  derefInt64(loop.PRNumber),
+		Count:     loops.ReviewerPublishCount(loop.MetadataJSON),
+		Cap:       cap,
+		NowISO:    r.nowISO(),
+	})
+	return err == nil, err
 }
 
 func terminalReviewerLoopReason(loop storage.LoopRecord) string {
@@ -6247,7 +6380,9 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	loopMeta["lastStatus"] = "success"
 	loopMeta["consecutiveFailures"] = 0
 	reviewCompleted := checkpoint.SkipReason == "" && checkpoint.PendingReview != nil
-	if reviewCompleted {
+	publishedHead, _ := stringFromAny(meta["lastPublishedHeadSha"])
+	alreadyCounted := publishedHead != "" && (head == "" || publishedHead == head)
+	if reviewCompleted && !alreadyCounted {
 		loopMeta["iterationCount"] = iterations + 1
 	}
 	if reviewCompleted && head != "" {

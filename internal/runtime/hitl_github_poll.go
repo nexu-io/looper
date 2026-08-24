@@ -2,8 +2,10 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/loops"
@@ -33,6 +35,10 @@ const looperCommentMarker = "<!-- looper:"
 // commenter must be on that allowlist; otherwise any human reply may answer.
 // Empty-bodied comments are ignored so ordinary reactions/edits don't count.
 func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, answerAuthors []string) string {
+	return detectGitHubHITLAnswerMatching(comments, askCommentID, answerAuthors, nil)
+}
+
+func detectGitHubHITLAnswerMatching(comments []githubAnswerComment, askCommentID int64, answerAuthors []string, accept func(string) bool) string {
 	allow := make(map[string]bool, len(answerAuthors))
 	for _, a := range answerAuthors {
 		if a = strings.TrimSpace(a); a != "" {
@@ -59,12 +65,200 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 		if body == "" {
 			continue
 		}
+		if accept != nil && !accept(body) {
+			continue
+		}
 		if bestID == 0 || c.ID < bestID {
 			bestID = c.ID
 			answer = body
 		}
 	}
 	return answer
+}
+
+// githubHITLDeliveryDeps are the injected dependencies for posting an undelivered
+// review-fix budget ask onto its PR so the answer-poll lane can later consume it.
+type githubHITLDeliveryDeps struct {
+	createComment func(ctx contextType, repo string, prNumber int64, body, cwd string) (int64, error)
+	listComments  func(ctx contextType, repo string, prNumber int64, cwd string) ([]githubAnswerComment, error)
+	addLabel      func(ctx contextType, repo string, prNumber int64, label, cwd string)
+	projectCWD    func(projectID string) string
+	stampBody     func(body, runner string) string
+	mentionLogins []string
+	awaitingLabel string
+	nowISO        string
+	logWarn       func(msg string, fields map[string]any)
+}
+
+func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, records []storage.LoopRecord, repos *storage.Repositories, deps githubHITLDeliveryDeps) int {
+	if repos == nil || repos.Loops == nil || deps.createComment == nil {
+		return 0
+	}
+	delivered := 0
+	awaitingLabel := strings.TrimSpace(deps.awaitingLabel)
+	if awaitingLabel == "" {
+		awaitingLabel = "looper:awaiting-human"
+	}
+	for _, loop := range records {
+		if loop.ProjectID != projectID || loop.Status != "awaiting_human" {
+			continue
+		}
+		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+		if !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			continue
+		}
+		if ask.AskCommentID != 0 && strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
+			continue
+		}
+		prNumber := ask.PRNumber
+		if prNumber == 0 {
+			prNumber = derefLoopPRNumber(loop)
+		}
+		repo := derefLoopRepo(loop)
+		if prNumber == 0 || repo == "" {
+			continue
+		}
+		cwd := ""
+		if deps.projectCWD != nil {
+			cwd = deps.projectCWD(loop.ProjectID)
+		}
+		commentID, err := recoverOrCreateGitHubBudgetAskComment(ctx, repo, prNumber, cwd, loop, ask, deps)
+		if err != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl github: budget ask delivery failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+			}
+			continue
+		}
+		if commentID == 0 {
+			continue
+		}
+		if deps.addLabel != nil {
+			deps.addLabel(ctx, repo, prNumber, awaitingLabel, cwd)
+		}
+		ask.Transport = "github"
+		ask.PRNumber = prNumber
+		ask.AskCommentID = commentID
+		meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if werr != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl github: budget ask metadata write failed", map[string]any{"loopId": loop.ID, "error": werr.Error()})
+			}
+			continue
+		}
+		updated := loop
+		updated.MetadataJSON = &meta
+		if deps.nowISO != "" {
+			updated.UpdatedAt = deps.nowISO
+		}
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			if deps.logWarn != nil {
+				deps.logWarn("hitl github: budget ask persist failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+			}
+			continue
+		}
+		delivered++
+	}
+	return delivered
+}
+
+func githubBudgetAskMarker(loopSeq int64, askedAt string) string {
+	askedAt = strings.TrimSpace(askedAt)
+	if askedAt == "" {
+		return fmt.Sprintf("<!-- looper:hitl:ask v=1 loop=%d -->", loopSeq)
+	}
+	return fmt.Sprintf("<!-- looper:hitl:ask v=1 loop=%d askedAt=%s -->", loopSeq, askedAt)
+}
+
+func recoverOrCreateGitHubBudgetAskComment(ctx contextType, repo string, prNumber int64, cwd string, loop storage.LoopRecord, ask loops.HITLAsk, deps githubHITLDeliveryDeps) (int64, error) {
+	if deps.listComments != nil {
+		comments, err := deps.listComments(ctx, repo, prNumber, cwd)
+		if err != nil {
+			return 0, err
+		}
+		if recovered := recoverGitHubBudgetAskCommentID(comments, loop.Seq, ask.AskedAt); recovered != 0 {
+			return recovered, nil
+		}
+	}
+	if deps.createComment == nil {
+		return 0, nil
+	}
+	body := buildGitHubBudgetAskComment(loop.Seq, ask.AskedAt, ask.Question, ask.Options, deps.mentionLogins)
+	if deps.stampBody != nil {
+		body = deps.stampBody(body, loop.Type)
+	}
+	return deps.createComment(ctx, repo, prNumber, body, cwd)
+}
+
+func recoverGitHubBudgetAskCommentID(comments []githubAnswerComment, loopSeq int64, askedAt string) int64 {
+	askedAt = strings.TrimSpace(askedAt)
+	if askedAt == "" {
+		return 0
+	}
+	marker := githubBudgetAskMarker(loopSeq, askedAt)
+	bestID := int64(0)
+	for _, comment := range comments {
+		if !strings.Contains(comment.Body, marker) {
+			continue
+		}
+		if githubBudgetAskAlreadyAnswered(comments, comment.ID) {
+			continue
+		}
+		if bestID == 0 || comment.ID < bestID {
+			bestID = comment.ID
+		}
+	}
+	return bestID
+}
+
+func githubBudgetAskAlreadyAnswered(comments []githubAnswerComment, askCommentID int64) bool {
+	return detectGitHubHITLAnswerMatching(comments, askCommentID, nil, func(body string) bool {
+		return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
+	}) != ""
+}
+
+func buildGitHubBudgetAskComment(loopSeq int64, askedAt, question string, options []string, mentionLogins []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n", githubBudgetAskMarker(loopSeq, askedAt))
+	b.WriteString("🤔 **looper needs a decision to continue.**\n\n")
+	b.WriteString(strings.TrimSpace(question))
+	for _, option := range options {
+		if option = strings.TrimSpace(option); option != "" {
+			fmt.Fprintf(&b, "\n- %s", option)
+		}
+	}
+	b.WriteString("\n\nReply to this comment with Continue or Stop.")
+	if mentions := githubBudgetMentionLine(mentionLogins); mentions != "" {
+		b.WriteString("\n\n" + mentions)
+	}
+	return b.String()
+}
+
+func githubBudgetMentionLine(logins []string) string {
+	parts := make([]string, 0, len(logins))
+	for _, login := range logins {
+		login = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(login), "@"))
+		if login != "" {
+			parts = append(parts, "@"+login)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "/cc " + strings.Join(parts, " ")
+}
+
+func derefLoopRepo(loop storage.LoopRecord) string {
+	if loop.Repo == nil {
+		return ""
+	}
+	return strings.TrimSpace(*loop.Repo)
+}
+
+func derefLoopPRNumber(loop storage.LoopRecord) int64 {
+	if loop.PRNumber == nil {
+		return 0
+	}
+	return *loop.PRNumber
 }
 
 // githubHITLPollDeps are the injected dependencies of the answer-poll lane, kept
@@ -93,15 +287,16 @@ type githubHITLAwaitingLoop struct {
 	AskStatus    string
 	PRNumber     int64
 	AskCommentID int64
+	BudgetAsk    bool
 }
 
 // pollGitHubHITLAnswersOnce runs one pass of the answer-poll lane: for each loop
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
 // simply won't be passed in again.
-func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
+func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
-	for _, loop := range loops {
+	for _, loop := range awaiting {
 		if !strings.EqualFold(strings.TrimSpace(loop.Transport), "github") || loop.PRNumber == 0 {
 			continue
 		}
@@ -123,7 +318,13 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 			}
 			continue
 		}
-		answer := detectGitHubHITLAnswer(comments, loop.AskCommentID, deps.answerAuthors)
+		var accept func(string) bool
+		if loop.BudgetAsk {
+			accept = func(body string) bool {
+				return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
+			}
+		}
+		answer := detectGitHubHITLAnswerMatching(comments, loop.AskCommentID, deps.answerAuthors, accept)
 		if answer == "" {
 			continue
 		}
@@ -150,8 +351,10 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 // queued so the scheduler picks it up and the worker drains the message on its
 // next turn; a running loop drains it when the current turn ends. Terminal loops
 // are left alone (a message can't reopen a finished loop yet). Unlike a button
-// answer, a message does NOT resolve a pending ask — the agent reads it and
-// decides whether to proceed, answer, or ask again.
+// answer, a message does NOT resolve a pending mid-run ask — the agent reads it
+// and decides whether to proceed, answer, or ask again. A review-fix budget ask
+// is the exception: only Continue/Stop may unpark, and they apply the budget
+// decision instead of enqueueing conversational text.
 func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
 	// Share process-wide requeue exclusion with API discard+retry so free-text
 	// inbox delivery cannot requeue paused/waiting/manual_intervention loops
@@ -173,6 +376,17 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	// per-loop mutex and wipes the shared worktree before the retry TX.
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
+
+	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+		// Budget holds are Continue/Stop decisions, not conversational inbox
+		// turns. A typed Feishu reply must not flip awaiting_human to queued
+		// without resetting the counter or unpausing the sibling.
+		if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
+			_, err = loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, text, nowISO)
+			return err
+		}
+		return nil
+	}
 
 	meta, werr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
 	if werr != nil {
@@ -215,6 +429,10 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	if !ok {
 		return nil
 	}
+	if loops.IsReviewFixBudgetAsk(ask) {
+		_, err = loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO)
+		return err
+	}
 	ask.Answer = answer
 	ask.Status = "answered"
 	ask.AnsweredAt = nowISO
@@ -250,6 +468,56 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 	if err != nil {
 		return
 	}
+	awaitingLabel := "looper:awaiting-human"
+	var mentionLogins []string
+	var answerAuthors []string
+	if gh := input.Config.HITL.GitHub; gh != nil {
+		if strings.TrimSpace(gh.AwaitingLabel) != "" {
+			awaitingLabel = strings.TrimSpace(gh.AwaitingLabel)
+		}
+		mentionLogins = gh.MentionLogins
+		answerAuthors = gh.AnswerAuthors
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
+	deliveryDeps := githubHITLDeliveryDeps{
+		createComment: func(ctx contextType, repo string, pr int64, body, cwd string) (int64, error) {
+			res, err := input.GitHubGateway.CreateIssueComment(ctx, githubinfra.IssueCommentInput{Repo: repo, IssueNumber: pr, Body: body, CWD: cwd})
+			if err != nil {
+				return 0, err
+			}
+			return res.ID, nil
+		},
+		listComments: func(ctx contextType, repo string, pr int64, cwd string) ([]githubAnswerComment, error) {
+			cs, err := input.GitHubGateway.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: pr, CWD: cwd})
+			if err != nil {
+				return nil, err
+			}
+			out := make([]githubAnswerComment, 0, len(cs))
+			for _, c := range cs {
+				out = append(out, githubAnswerComment{ID: c.ID, Author: c.Author, Body: c.Body})
+			}
+			return out, nil
+		},
+		addLabel: func(ctx contextType, repo string, pr int64, label, cwd string) {
+			_ = input.GitHubGateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{label}, CWD: cwd})
+		},
+		projectCWD: func(string) string { return project.RepoPath },
+		stampBody: func(body, runner string) string {
+			return disclosure.FromConfig(*input.Config).Markdown(body, runner, disclosure.ChannelIssueComment)
+		},
+		mentionLogins: mentionLogins,
+		awaitingLabel: awaitingLabel,
+		nowISO:        nowISO,
+	}
+	if input.Logger != nil {
+		deliveryDeps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
+	}
+	if deliverUndeliveredGitHubBudgetAsks(ctx, project.ID, allLoops, input.Repos, deliveryDeps) > 0 {
+		allLoops, err = input.Repos.Loops.List(ctx)
+		if err != nil {
+			return
+		}
+	}
 	awaiting := make([]githubHITLAwaitingLoop, 0)
 	for _, l := range allLoops {
 		if l.ProjectID != project.ID || l.Status != "awaiting_human" {
@@ -266,22 +534,14 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		awaiting = append(awaiting, githubHITLAwaitingLoop{
 			ID: l.ID, ProjectID: l.ProjectID, Repo: repo,
 			Transport: ask.Transport, AskStatus: ask.Status, PRNumber: ask.PRNumber, AskCommentID: ask.AskCommentID,
+			BudgetAsk: loops.IsReviewFixBudgetAsk(ask),
 		})
 	}
 	if len(awaiting) == 0 {
 		return
 	}
 
-	awaitingLabel := "looper:awaiting-human"
-	var answerAuthors []string
-	if gh := input.Config.HITL.GitHub; gh != nil {
-		if strings.TrimSpace(gh.AwaitingLabel) != "" {
-			awaitingLabel = strings.TrimSpace(gh.AwaitingLabel)
-		}
-		answerAuthors = gh.AnswerAuthors
-	}
 	gw := input.GitHubGateway
-	nowISO := eventlog.FormatJavaScriptISOString(input.Now().UTC())
 
 	deps := githubHITLPollDeps{
 		listComments: func(ctx contextType, repo string, pr int64, cwd string) ([]githubAnswerComment, error) {

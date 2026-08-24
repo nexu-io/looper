@@ -807,6 +807,8 @@ func globalFlags() []flagSpec {
 		stringFlag("defaults-loop-quiet-period-seconds", "seconds", "Shared default loop quiet period"),
 		stringFlag("roles-fixer-behavior-loop-quiet-period-seconds", "seconds", "Fixer loop quiet period"),
 		stringFlag("roles-reviewer-behavior-loop-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
+		stringFlag("roles-reviewer-behavior-loop-max-publishes-per-pr", "count", "Max successful reviewer publishes per PR (0 disables)"),
+		stringFlag("roles-fixer-behavior-loop-max-pushes-per-pr", "count", "Max successful fixer pushes per PR (0 disables)"),
 		hiddenStringFlag("reviewer-min-publish-interval-seconds", "seconds", "Reviewer loop minimum publish interval"),
 		stringFlag("roles-reviewer-behavior-loop-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),
 		hiddenStringFlag("reviewer-max-iterations-per-pr", "count", "Deprecated; ignored by reviewer loop filtering"),

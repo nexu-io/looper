@@ -5940,7 +5940,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
 		if err != nil {
@@ -5953,6 +5953,18 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
 		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		if loops.IsReviewFixBudgetAsk(ask) {
+			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO)
+			if applyErr != nil {
+				if errors.Is(applyErr, loops.ErrReviewFixBudgetInvalidAnswer) {
+					return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
+				}
+				return storage.LoopRecord{}, applyErr
+			}
+			if result.Applied {
+				return result.Loop, nil
+			}
+		}
 		ask.Answer = answer
 		ask.Status = "answered"
 		ask.AnsweredAt = nowISO
@@ -5974,6 +5986,13 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			return loopResponse{}, typed
 		}
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	if updated.Status != string(domain.LoopStatusAwaitingHuman) {
+		if h.context.TriggerSchedulerTick != nil {
+			h.context.TriggerSchedulerTick()
+		}
+		return h.serializeLoopWithDiagnostics(ctx, updated)
 	}
 
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)

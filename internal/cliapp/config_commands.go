@@ -47,6 +47,16 @@ var configFieldRegistry = map[string]configField{
 	}, func(p *config.PartialConfig) **int {
 		return &ensurePartialFixerLoop(p).QuietPeriodSeconds
 	}),
+	"roles.reviewer.behavior.loop.maxPublishesPerPR": nonNegativeIntField("roles.reviewer.behavior.loop.maxPublishesPerPR", "LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_PUBLISHES_PER_PR", "roles-reviewer-behavior-loop-max-publishes-per-pr", func(c config.Config) any {
+		return c.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR
+	}, func(p *config.PartialConfig) **int {
+		return &ensurePartialReviewerLoop(p).MaxPublishesPerPR
+	}),
+	"roles.fixer.behavior.loop.maxPushesPerPR": nonNegativeIntField("roles.fixer.behavior.loop.maxPushesPerPR", "LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_MAX_PUSHES_PER_PR", "roles-fixer-behavior-loop-max-pushes-per-pr", func(c config.Config) any {
+		return c.Roles.Fixer.Behavior.Loop.MaxPushesPerPR
+	}, func(p *config.PartialConfig) **int {
+		return &ensurePartialFixerLoop(p).MaxPushesPerPR
+	}),
 	"instructions.enabled":       boolFieldWithAlias("instructions.enabled", "", "", "instructions-enabled", "no-custom-instructions", func(c config.Config) any { return c.Instructions.Enabled }, func(p *config.PartialConfig) **bool { return &ensurePartialInstructions(p).Enabled }),
 	"package.autoUpgradeEnabled": boolFieldWithAlias("package.autoUpgradeEnabled", "LOOPER_AUTO_UPGRADE_ENABLED", "", "package-auto-upgrade-enabled", "no-auto-upgrade", func(c config.Config) any { return c.Package.AutoUpgradeEnabled }, func(p *config.PartialConfig) **bool { return &ensurePartialPackage(p).AutoUpgradeEnabled }),
 	"instructions.maxBytes":      positiveIntField("instructions.maxBytes", "", "", func(c config.Config) any { return c.Instructions.MaxBytes }, func(p *config.PartialConfig) **int { return &ensurePartialInstructions(p).MaxBytes }),
@@ -1516,6 +1526,22 @@ func ensurePartialReviewerRole(partial *config.PartialConfig) *config.PartialRev
 		roles.Reviewer = &config.PartialReviewerRoleConfig{}
 	}
 	return roles.Reviewer
+}
+
+func ensurePartialReviewerBehavior(partial *config.PartialConfig) *config.PartialReviewerConfig {
+	reviewer := ensurePartialReviewerRole(partial)
+	if reviewer.Behavior == nil {
+		reviewer.Behavior = &config.PartialReviewerConfig{}
+	}
+	return reviewer.Behavior
+}
+
+func ensurePartialReviewerLoop(partial *config.PartialConfig) *config.PartialReviewerLoopConfig {
+	behavior := ensurePartialReviewerBehavior(partial)
+	if behavior.Loop == nil {
+		behavior.Loop = &config.PartialReviewerLoopConfig{}
+	}
+	return behavior.Loop
 }
 
 func ensurePartialReviewerRoleDiscovery(partial *config.PartialConfig) *config.PartialReviewerRoleDiscoveryConfig {
