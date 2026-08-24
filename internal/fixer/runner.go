@@ -1642,6 +1642,44 @@ func (r *Runner) incrementFixerPushCount(ctx context.Context, loop storage.LoopR
 	return current, nil
 }
 
+func (r *Runner) livePullRequestClosed(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) bool {
+	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
+		return false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false
+	}
+	return normalizePRState(detail.State) != "open"
+}
+
+func (r *Runner) shouldCreateFixerBudgetPark(loop storage.LoopRecord) bool {
+	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
+		return false
+	}
+	if !r.hitlEnabled || isManualFixerLoop(loop) {
+		return false
+	}
+	return loops.BudgetExhausted(loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount, r.maxPushesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) parkFixerBudgetAfterSuccessfulRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord) (bool, error) {
+	current := loop
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return false, err
+		}
+		if fresh != nil {
+			current = *fresh
+		}
+	}
+	if r.shouldCreateFixerBudgetPark(current) && r.livePullRequestClosed(ctx, project, derefString(current.Repo), derefInt64(current.PRNumber)) {
+		return false, nil
+	}
+	return r.parkFixerBudgetIfExhausted(ctx, current)
+}
+
 func (r *Runner) parkFixerBudgetIfExhausted(ctx context.Context, loop storage.LoopRecord) (bool, error) {
 	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
 		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
@@ -2327,7 +2365,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 	}
-	if parked, err := r.parkFixerBudgetIfExhausted(ctx, *loop); err != nil {
+	if parked, err := r.parkFixerBudgetAfterSuccessfulRun(ctx, *project, *loop); err != nil {
 		return ProcessResult{}, err
 	} else if parked {
 		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)

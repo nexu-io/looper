@@ -1844,7 +1844,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err != nil {
 		return ProcessResult{}, err
 	}
-	if parked, parkErr := r.parkReviewerBudgetIfExhausted(ctx, updatedLoop); parkErr != nil {
+	if parked, parkErr := r.parkReviewerBudgetAfterSuccessfulRun(ctx, *project, updatedLoop); parkErr != nil {
 		return ProcessResult{}, parkErr
 	} else if parked {
 		r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
@@ -6253,6 +6253,40 @@ func (r *Runner) shouldParkReviewerBudget(loop storage.LoopRecord, checkpoint re
 		return false
 	}
 	return loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), r.maxPublishesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) livePullRequestClosed(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) bool {
+	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
+		return false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false
+	}
+	return normalizePRState(detail.State) != "open"
+}
+
+func (r *Runner) shouldCreateReviewerBudgetPark(loop storage.LoopRecord) bool {
+	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
+		return false
+	}
+	if !r.reviewFixHITLEnabled() || isManualReviewerLoop(loop) {
+		return false
+	}
+	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+		return false
+	}
+	return loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), r.maxPublishesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) parkReviewerBudgetAfterSuccessfulRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord) (bool, error) {
+	if r.shouldCreateReviewerBudgetPark(loop) && r.livePullRequestClosed(ctx, project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return r.parkReviewerBudgetIfExhausted(ctx, loop)
 }
 
 func (r *Runner) parkReviewerBudgetIfExhausted(ctx context.Context, loop storage.LoopRecord) (bool, error) {

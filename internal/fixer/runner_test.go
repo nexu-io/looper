@@ -1671,6 +1671,77 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemDoesNotParkBudgetWhenPushClosesPR(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := buildPullRequestTargetID(repo, prNumber)
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_closed_pr", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		closeAfterResolve: true,
+		listOpen:          []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
+		},
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+		inspectResults: []InspectHeadResult{
+			{HeadSHA: "base-head"},
+			{HeadSHA: "new-head", NewCommitSHAs: []string{"new-head"}},
+			{HeadSHA: "new-head"},
+		},
+	}
+	stdout := fmt.Sprintf(`__LOOPER_RESULT__={"summary":"applied fixes","review_thread_replies":[{"fixItemId":"c1","threadId":"t1","explanation":"Adjusted the off-by-one handling and verified the fix.","threadCommentsObserved":"%s"}]}`+"\n", hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}}))
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: stdout}}}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	cfg.HITL.Enabled = true
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: true})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success after pushed fix", result)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil || loop == nil || loop.Status == "awaiting_human" {
+		t.Fatalf("fixer = (%#v, %v), want no budget park after closed PR", loop, err)
+	}
+	if loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount < 1 {
+		t.Fatalf("push count = %d, want cap-reaching push before closed-PR skip", loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount)
+	}
+	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+		t.Fatalf("HITL ask = %#v, want no budget ask on a closed PR", ask)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || sibling == nil || sibling.Status != "waiting" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("reviewer sibling = (%#v, %v), want still waiting without budget pause", sibling, err)
+	}
+}
+
 func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -6539,6 +6610,7 @@ type fakeGitHubGateway struct {
 	viewThreadCalls       []ViewReviewThreadInput
 	viewIndex             int
 	resolveCalls          []ResolveReviewThreadInput
+	closeAfterResolve     bool
 	addLabelCalls         []PullRequestLabelsInput
 	removeLabelCalls      []PullRequestLabelsInput
 	reviewerRequests      []PullRequestReviewersInput
@@ -6618,6 +6690,9 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 	}
 	result := f.viewResponses[idx]
 	f.viewIndex++
+	if f.closeAfterResolve && len(f.resolveCalls) > 0 {
+		result.State = "CLOSED"
+	}
 	if result.Number == 0 {
 		result.Number = input.PRNumber
 	}
