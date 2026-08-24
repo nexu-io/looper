@@ -21,6 +21,9 @@ const (
 	HumanAttentionAwaitingHuman HumanAttentionReason = "awaiting_human"
 	// HumanAttentionManualIntervention is a durable manual_intervention hard hold.
 	HumanAttentionManualIntervention HumanAttentionReason = "manual_intervention"
+	// HumanAttentionReviewFixBudget is a no-HITL review-fix budget exhausted hold
+	// (paused + review_fix_budget_exhausted). Sibling-only pause does not notify.
+	HumanAttentionReviewFixBudget HumanAttentionReason = "review_fix_budget"
 )
 
 // HumanAttentionInput describes one durable entry into a state that requires an operator.
@@ -76,7 +79,7 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		return nil
 	}
 	reason := HumanAttentionReason(strings.TrimSpace(string(input.Reason)))
-	if reason != HumanAttentionAwaitingHuman && reason != HumanAttentionManualIntervention {
+	if reason != HumanAttentionAwaitingHuman && reason != HumanAttentionManualIntervention && reason != HumanAttentionReviewFixBudget {
 		return nil
 	}
 	entryKey := strings.TrimSpace(input.EntryKey)
@@ -291,6 +294,8 @@ func humanAttentionReasonLabel(reason HumanAttentionReason) string {
 		return "awaiting human decision"
 	case HumanAttentionManualIntervention:
 		return "manual intervention"
+	case HumanAttentionReviewFixBudget:
+		return "review-fix budget exhausted"
 	default:
 		return string(reason)
 	}

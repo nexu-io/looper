@@ -2,6 +2,9 @@ package loops
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,7 +53,7 @@ func TestParkAndContinueReviewFixBudget(t *testing.T) {
 	seedBudgetQueue(t, repos, nowISO, "queue_fixer", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -77,7 +80,7 @@ func TestParkAndContinueReviewFixBudget(t *testing.T) {
 		}
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "continue" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
@@ -108,7 +111,7 @@ func TestContinueReviewFixBudgetEnqueuesFreshWorkAfterCompletedClaim(t *testing.
 	}
 
 	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -122,7 +125,7 @@ func TestContinueReviewFixBudgetEnqueuesFreshWorkAfterCompletedClaim(t *testing.
 		t.Fatalf("sibling queue after park = (%#v, %v), want cancelled", siblingQueue, err)
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "continue" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
@@ -154,7 +157,7 @@ func TestApplyReviewFixBudgetAnswerStopTerminatesPair(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, reviewer, "Stop", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, reviewer, "Stop", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "stop" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
@@ -167,7 +170,7 @@ func TestApplyReviewFixBudgetAnswerStopTerminatesPair(t *testing.T) {
 	}
 }
 
-func TestFindSiblingReviewFixLoopPrefersActiveAutomatic(t *testing.T) {
+func TestFindSiblingReviewFixLoopsPrefersAutomaticLane(t *testing.T) {
 	t.Parallel()
 	repo := "acme/looper"
 	pr := int64(42)
@@ -177,10 +180,6 @@ func TestFindSiblingReviewFixLoopPrefersActiveAutomatic(t *testing.T) {
 	terminalFixer := storage.LoopRecord{ID: "loop_terminal_fixer", ProjectID: "project_1", Type: "fixer", Status: "terminated", Repo: &repo, PRNumber: &pr}
 	automaticFixer := storage.LoopRecord{ID: "loop_auto_fixer", ProjectID: "project_1", Type: "fixer", Status: "queued", Repo: &repo, PRNumber: &pr}
 
-	got := FindSiblingReviewFixLoop([]storage.LoopRecord{manualFixer, terminalFixer, automaticFixer}, reviewer)
-	if got == nil || got.ID != automaticFixer.ID {
-		t.Fatalf("FindSiblingReviewFixLoop() = %#v, want automatic fixer", got)
-	}
 	siblings := FindSiblingReviewFixLoops([]storage.LoopRecord{manualFixer, terminalFixer, automaticFixer}, reviewer)
 	if len(siblings) != 2 || siblings[0].ID != terminalFixer.ID || siblings[1].ID != automaticFixer.ID {
 		t.Fatalf("FindSiblingReviewFixLoops() = %#v, want automatic siblings only", siblings)
@@ -202,7 +201,7 @@ func TestParkAndStopReviewFixBudgetSkipsManualSibling(t *testing.T) {
 	seedBudgetQueue(t, repos, nowISO, "queue_fixer_auto", automatic.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -216,7 +215,7 @@ func TestParkAndStopReviewFixBudgetSkipsManualSibling(t *testing.T) {
 		t.Fatalf("automatic sibling = (%#v, %v), want paused", automaticAfter, err)
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Stop", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Stop", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "stop" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
@@ -259,7 +258,7 @@ func TestParkReviewFixBudgetCompletesSiblingAfterPartialPark(t *testing.T) {
 	}
 
 	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -289,16 +288,16 @@ func TestContinueReviewFixBudgetRetriesAfterSiblingAlreadyUnpaused(t *testing.T)
 	seedBudgetQueue(t, repos, nowISO, "queue_fixer_retry", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
 	}
-	if err := unpauseSiblingReviewFixLoop(context.Background(), repos, parked, nowISO); err != nil {
-		t.Fatalf("unpauseSiblingReviewFixLoop() error = %v", err)
+	if err := releaseOneReviewFixBudgetHold(context.Background(), repos, fixer.ID, nowISO); err != nil {
+		t.Fatalf("releaseOneReviewFixBudgetHold(sibling) error = %v", err)
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "continue" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
@@ -328,7 +327,7 @@ func TestParkAndContinueReviewFixBudgetSkipsPreexistingPausedSibling(t *testing.
 	seedBudgetQueue(t, repos, nowISO, "queue_fixer_pre_paused", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -345,7 +344,7 @@ func TestParkAndContinueReviewFixBudgetSkipsPreexistingPausedSibling(t *testing.
 		t.Fatalf("sibling queue after park = (%#v, %v), want still queued", siblingQueue, err)
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "continue" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
@@ -375,7 +374,7 @@ func TestParkAndContinueReviewFixBudgetSkipsFailedSibling(t *testing.T) {
 			seedBudgetQueue(t, repos, nowISO, "queue_fixer_"+status, fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 			parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-				Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+				Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 			})
 			if err != nil {
 				t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -389,7 +388,7 @@ func TestParkAndContinueReviewFixBudgetSkipsFailedSibling(t *testing.T) {
 				t.Fatalf("sibling queue after park = (%#v, %v), want still queued", siblingQueue, err)
 			}
 
-			result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO)
+			result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO, testBudgetCaps(8, 8))
 			if err != nil || !result.Applied || result.Action != "continue" {
 				t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 			}
@@ -414,7 +413,7 @@ func TestStopReviewFixBudgetRetriesAfterSiblingAlreadyTerminated(t *testing.T) {
 	seedBudgetQueue(t, repos, nowISO, "queue_fixer_stop_retry", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -423,7 +422,7 @@ func TestStopReviewFixBudgetRetriesAfterSiblingAlreadyTerminated(t *testing.T) {
 		t.Fatalf("terminateReviewFixLoop(sibling) error = %v", err)
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Stop", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Stop", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "stop" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
@@ -448,10 +447,481 @@ func TestApplyReviewFixBudgetAnswerIgnoresAgentAsk(t *testing.T) {
 		t.Fatalf("WriteHITLAsk() error = %v", err)
 	}
 	loop.MetadataJSON = &metadata
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, loop, "Continue", nowISO)
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, loop, "Continue", nowISO, testBudgetCaps(8, 8))
 	if err != nil || result.Applied {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v), want not applied", result, err)
 	}
+}
+
+func TestBudgetExhaustedIndependentCapsAndZeroDisablesRole(t *testing.T) {
+	t.Parallel()
+	if BudgetExhausted(3, 0) {
+		t.Fatal("cap 0 must disable only that role")
+	}
+	if !BudgetExhausted(3, 3) {
+		t.Fatal("3/3 must be exhausted")
+	}
+	if BudgetExhausted(2, 3) {
+		t.Fatal("2/3 must not be exhausted")
+	}
+	// Live cap lowered below current count halts on next admission.
+	if !BudgetExhausted(5, 3) {
+		t.Fatal("count above lowered live cap must be exhausted")
+	}
+}
+
+func TestParkNoHITLPausesPairWithoutAsk(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_nohitl", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_nohitl", "fixer", "queued")
+	seedBudgetQueue(t, repos, nowISO, "queue_reviewer_nohitl", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedBudgetQueue(t, repos, nowISO, "queue_fixer_nohitl", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	if parked.Status != "paused" || !IsReviewFixBudgetExhaustedPause(parked.MetadataJSON) {
+		t.Fatalf("exhausted = %#v, want paused with review_fix_budget_exhausted", parked)
+	}
+	if _, ok := ReadHITLAsk(parked.MetadataJSON); ok {
+		t.Fatal("no-HITL park must not write a HITL ask")
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("sibling = (%#v, %v), want paired budget pause", sibling, err)
+	}
+	for _, queueID := range []string{"queue_reviewer_nohitl", "queue_fixer_nohitl"} {
+		queue, err := repos.Queue.GetByID(context.Background(), queueID)
+		if err != nil || queue == nil || queue.Status != "cancelled" {
+			t.Fatalf("%s = (%#v, %v), want cancelled", queueID, queue, err)
+		}
+	}
+}
+
+func TestContinueNoHITLFromEitherRoleResetsOnlyExhaustedMeters(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	fixerMeta := `{"reviewFixBudget":{"pushCount":1}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_cont_nohitl", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_cont_nohitl", "fixer", "queued")
+	fixer.MetadataJSON = &fixerMeta
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	seedBudgetQueue(t, repos, nowISO, "queue_reviewer_cont_nohitl", reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+	seedBudgetQueue(t, repos, nowISO, "queue_fixer_cont_nohitl", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	// Unpause from sibling side.
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil {
+		t.Fatalf("sibling get: %v", err)
+	}
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, *sibling, "Continue", nowISO, testBudgetCaps(3, 3))
+	if err != nil || !result.Applied || result.Action != "continue" {
+		t.Fatalf("Continue from sibling = (%#v, %v)", result, err)
+	}
+	reviewerAfter, err := repos.Loops.GetByID(context.Background(), parked.ID)
+	if err != nil || reviewerAfter == nil || reviewerAfter.Status != "queued" || ReviewerPublishCount(reviewerAfter.MetadataJSON) != 0 {
+		t.Fatalf("reviewer after continue = (%#v, %v), want queued with reset count", reviewerAfter, err)
+	}
+	fixerAfter, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || fixerAfter == nil || fixerAfter.Status != "queued" || FixerPushCount(fixerAfter.MetadataJSON) != 1 {
+		t.Fatalf("fixer after continue = (%#v, %v), want queued with preserved unused push budget", fixerAfter, err)
+	}
+}
+
+func TestContinueResetsBothMetersWhenBothExhausted(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	fixerMeta := `{"reviewFixBudget":{"pushCount":3}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_both", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_both", "fixer", "queued")
+	fixer.MetadataJSON = &fixerMeta
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO, testBudgetCaps(3, 3))
+	if err != nil || !result.Applied {
+		t.Fatalf("Continue = (%#v, %v)", result, err)
+	}
+	if ReviewerPublishCount(result.Loop.MetadataJSON) != 0 {
+		t.Fatalf("reviewer count = %d, want 0", ReviewerPublishCount(result.Loop.MetadataJSON))
+	}
+	fixerAfter, _ := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if fixerAfter == nil || FixerPushCount(fixerAfter.MetadataJSON) != 0 {
+		t.Fatalf("fixer count = %#v, want reset to 0", fixerAfter)
+	}
+}
+
+func TestStopNoHITLFromEitherRoleTerminatesPair(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_stop_nohitl", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_stop_nohitl", "fixer", "queued")
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil {
+		t.Fatalf("sibling get: %v", err)
+	}
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, *sibling, "Stop", nowISO, testBudgetCaps(3, 3))
+	if err != nil || !result.Applied || result.Action != "stop" {
+		t.Fatalf("Stop from sibling = (%#v, %v)", result, err)
+	}
+	reviewerAfter, _ := repos.Loops.GetByID(context.Background(), parked.ID)
+	fixerAfter, _ := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if reviewerAfter == nil || reviewerAfter.Status != "terminated" || fixerAfter == nil || fixerAfter.Status != "terminated" {
+		t.Fatalf("pair after stop = reviewer %#v fixer %#v, want both terminated", reviewerAfter, fixerAfter)
+	}
+}
+
+func TestFindSiblingSameLanePairing(t *testing.T) {
+	t.Parallel()
+	repo := "acme/looper"
+	pr := int64(42)
+	reviewer := storage.LoopRecord{ID: "loop_reviewer", ProjectID: "project_1", Type: "reviewer", Repo: &repo, PRNumber: &pr}
+	oneShot := `{"manual":true,"followUpdates":false}`
+	continuous := `{"manual":true,"followUpdates":true}`
+	oneShotFixer := storage.LoopRecord{ID: "loop_oneshot", ProjectID: "project_1", Type: "fixer", Status: "queued", Repo: &repo, PRNumber: &pr, MetadataJSON: &oneShot}
+	continuousFixer := storage.LoopRecord{ID: "loop_continuous", ProjectID: "project_1", Type: "fixer", Status: "queued", Repo: &repo, PRNumber: &pr, MetadataJSON: &continuous}
+	autoFixer := storage.LoopRecord{ID: "loop_auto", ProjectID: "project_1", Type: "fixer", Status: "queued", Repo: &repo, PRNumber: &pr}
+
+	// Automatic reviewer pairs only with automatic fixer.
+	got := FindSiblingReviewFixLoops([]storage.LoopRecord{oneShotFixer, continuousFixer, autoFixer}, reviewer)
+	if len(got) != 1 || got[0].ID != autoFixer.ID {
+		t.Fatalf("automatic siblings = %#v, want only auto fixer", got)
+	}
+	if ParticipatesInReviewFixBudget(oneShotFixer) {
+		t.Fatal("one-shot manual must not participate")
+	}
+	if !ParticipatesInReviewFixBudget(continuousFixer) {
+		t.Fatal("continuous manual must participate")
+	}
+
+	// Continuous manual reviewer pairs only with continuous manual fixer.
+	contReviewerMeta := continuous
+	contReviewer := storage.LoopRecord{ID: "loop_cont_reviewer", ProjectID: "project_1", Type: "reviewer", Repo: &repo, PRNumber: &pr, MetadataJSON: &contReviewerMeta}
+	got = FindSiblingReviewFixLoops([]storage.LoopRecord{oneShotFixer, continuousFixer, autoFixer}, contReviewer)
+	if len(got) != 1 || got[0].ID != continuousFixer.ID {
+		t.Fatalf("continuous_manual siblings = %#v, want only continuous fixer", got)
+	}
+}
+
+func TestParkContinuousManualPairsWithSameLaneOnly(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	contMeta := `{"manual":true,"followUpdates":true,"loop":{"iterationCount":3}}`
+	autoMeta := `{"loop":{"iterationCount":0}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_cont_rev_park", "reviewer", "running")
+	reviewer.MetadataJSON = &contMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	autoFixer := seedBudgetLoop(t, repos, nowISO, "loop_auto_fix_park", "fixer", "queued")
+	autoFixer.MetadataJSON = &autoMeta
+	if err := repos.Loops.Upsert(context.Background(), autoFixer); err != nil {
+		t.Fatalf("Upsert auto fixer: %v", err)
+	}
+	contFixer := seedBudgetLoop(t, repos, nowISO, "loop_cont_fix_park", "fixer", "queued")
+	contFixerMeta := `{"manual":true,"followUpdates":true}`
+	contFixer.MetadataJSON = &contFixerMeta
+	if err := repos.Loops.Upsert(context.Background(), contFixer); err != nil {
+		t.Fatalf("Upsert cont fixer: %v", err)
+	}
+
+	_, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
+	}
+	autoAfter, _ := repos.Loops.GetByID(context.Background(), autoFixer.ID)
+	contAfter, _ := repos.Loops.GetByID(context.Background(), contFixer.ID)
+	if autoAfter == nil || autoAfter.Status != "queued" || IsSiblingReviewFixBudgetPause(autoAfter.MetadataJSON) {
+		t.Fatalf("automatic fixer = %#v, want untouched", autoAfter)
+	}
+	if contAfter == nil || contAfter.Status != "paused" || !IsSiblingReviewFixBudgetPause(contAfter.MetadataJSON) {
+		t.Fatalf("continuous fixer = %#v, want paired pause", contAfter)
+	}
+}
+
+func TestIsReviewFixBudgetHoldCoversExhaustedAndSibling(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_hold_rev", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_hold_fix", "fixer", "queued")
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	if !IsReviewFixBudgetHold(parked) {
+		t.Fatal("exhausted no-HITL hold must be detected")
+	}
+	sibling, _ := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if sibling == nil || !IsReviewFixBudgetHold(*sibling) {
+		t.Fatalf("sibling hold = %#v", sibling)
+	}
+}
+
+func TestParkSiblingFailureDoesNotLeaveSiblingRunnableWhileExhaustedHeld(t *testing.T) {
+	// Serial: uses package-level inject hook.
+	coordinator := openCoordinator(t)
+	db := coordinator.DB()
+	repos := storage.NewRepositories(db)
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	seedProject(t, repos, now)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_sib_fail_rev", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_sib_fail_fix", "fixer", "queued")
+	seedBudgetQueue(t, repos, nowISO, "queue_sib_fail_fix", fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+	reviewFixBudgetSiblingParkHook = func(sibling storage.LoopRecord) error {
+		if sibling.ID == fixer.ID {
+			return fmt.Errorf("injected sibling park failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { reviewFixBudgetSiblingParkHook = nil })
+
+	_, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: false, DB: db,
+		LiveCaps: testBudgetCaps(3, 3),
+	})
+	if err == nil {
+		t.Fatal("ParkReviewFixBudget() error = nil, want injected sibling failure")
+	}
+
+	exhausted, _ := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	sibling, _ := repos.Loops.GetByID(context.Background(), fixer.ID)
+	// TX rollback: exhausted must not be held while sibling remains runnable.
+	if exhausted != nil && IsReviewFixBudgetHold(*exhausted) && sibling != nil && (sibling.Status == "queued" || sibling.Status == "running") {
+		t.Fatalf("partial park left exhausted held and sibling runnable: exhausted=%#v sibling=%#v", exhausted, sibling)
+	}
+	if sibling != nil && sibling.Status == "queued" && exhausted != nil && exhausted.Status == "paused" {
+		t.Fatalf("sibling still queued while exhausted paused: exhausted=%#v sibling=%#v", exhausted, sibling)
+	}
+}
+
+func TestContinueFailureDoesNotLeaveSiblingQueuedWhileExhaustedHeld(t *testing.T) {
+	// Serial: uses package-level inject hook.
+	coordinator := openCoordinator(t)
+	db := coordinator.DB()
+	repos := storage.NewRepositories(db)
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	seedProject(t, repos, now)
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_cont_fail_rev", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_cont_fail_fix", "fixer", "queued")
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: true, DB: db, LiveCaps: testBudgetCaps(3, 3),
+	})
+	if err != nil {
+		t.Fatalf("park: %v", err)
+	}
+
+	// Fail after exhausted side is released (first release). With TX, both roll back.
+	released := 0
+	reviewFixBudgetReleaseHook = func(loopID string) error {
+		released++
+		if released == 1 {
+			return fmt.Errorf("injected continue failure after first release")
+		}
+		return nil
+	}
+	t.Cleanup(func() { reviewFixBudgetReleaseHook = nil })
+
+	_, err = storage.WithTransactionValue(context.Background(), db, nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		txRepos := storage.NewRepositories(tx)
+		fresh, getErr := txRepos.Loops.GetByID(context.Background(), parked.ID)
+		if getErr != nil || fresh == nil {
+			return storage.LoopRecord{}, fmt.Errorf("fresh: %v", getErr)
+		}
+		result, applyErr := ApplyReviewFixBudgetAnswer(context.Background(), txRepos, *fresh, "Continue", nowISO, testBudgetCaps(3, 3))
+		if applyErr != nil {
+			return storage.LoopRecord{}, applyErr
+		}
+		return result.Loop, nil
+	})
+	if err == nil {
+		t.Fatal("Continue TX error = nil, want injected failure")
+	}
+
+	exhausted, _ := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	sibling, _ := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if sibling != nil && sibling.Status == "queued" && exhausted != nil && IsReviewFixBudgetHold(*exhausted) {
+		t.Fatalf("sibling queued while exhausted still held after failed Continue: exhausted=%#v sibling=%#v", exhausted, sibling)
+	}
+	// TX rollback: pair should still be held.
+	if exhausted == nil || !IsReviewFixBudgetHold(*exhausted) {
+		t.Fatalf("exhausted after failed Continue = %#v, want still held (TX rollback)", exhausted)
+	}
+	if sibling == nil || !IsReviewFixBudgetHold(*sibling) {
+		t.Fatalf("sibling after failed Continue = %#v, want still held (TX rollback)", sibling)
+	}
+}
+
+func TestHandoffEventIncludesHeadAndConcreteResumeCommands(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"lastPublishedHeadSha":"abc123def","loop":{"iterationCount":3}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_handoff_head", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("upsert reviewer: %v", err)
+	}
+
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: true, LiveCaps: testBudgetCaps(3, 3),
+	})
+	if err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "loop", parked.ID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	var handoff *storage.EventLogRecord
+	for i := range events {
+		if events[i].EventType == reviewFixBudgetHandoffEventType {
+			handoff = &events[i]
+			break
+		}
+	}
+	if handoff == nil {
+		t.Fatal("missing handoff event")
+	}
+	payloadJSON := handoff.PayloadJSON
+	payload := parseMetadataObject(&payloadJSON)
+	if head, _ := payload["head"].(string); head != "abc123def" {
+		t.Fatalf("head = %q, want abc123def", head)
+	}
+	resume, _ := payload["resume"].(string)
+	wantCLI := fmt.Sprintf("looper unpause %d / looper stop %d", parked.Seq, parked.Seq)
+	if !strings.Contains(resume, "Continue / Stop") || !strings.Contains(resume, wantCLI) {
+		t.Fatalf("resume = %q, want Continue/Stop plus %q", resume, wantCLI)
+	}
+	if lane, _ := payload["lane"].(string); lane != reviewFixBudgetLaneAutomatic {
+		t.Fatalf("lane = %q, want %q", lane, reviewFixBudgetLaneAutomatic)
+	}
+}
+
+func TestHandoffEventIncludesBothRoleMetersAndRetriesOnReentry(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_handoff_rev", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("upsert reviewer: %v", err)
+	}
+	fixerMeta := `{"reviewFixBudget":{"pushCount":2}}`
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_handoff_fix", "fixer", "queued")
+	fixer.MetadataJSON = &fixerMeta
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("upsert fixer: %v", err)
+	}
+
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(3, 5),
+	})
+	if err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "loop", parked.ID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	var handoff *storage.EventLogRecord
+	for i := range events {
+		if events[i].EventType == reviewFixBudgetHandoffEventType {
+			handoff = &events[i]
+			break
+		}
+	}
+	if handoff == nil {
+		t.Fatal("missing handoff event")
+	}
+	payloadJSON := handoff.PayloadJSON
+	payload := parseMetadataObject(&payloadJSON)
+	reviewerPayload, _ := payload["reviewer"].(map[string]any)
+	fixerPayload, _ := payload["fixer"].(map[string]any)
+	if intFromMetadata(reviewerPayload["count"]) != 3 || intFromMetadata(reviewerPayload["cap"]) != 3 {
+		t.Fatalf("reviewer meters = %#v, want 3/3", reviewerPayload)
+	}
+	if intFromMetadata(fixerPayload["count"]) != 2 || intFromMetadata(fixerPayload["cap"]) != 5 {
+		t.Fatalf("fixer meters = %#v, want 2/5", fixerPayload)
+	}
+	resume, _ := payload["resume"].(string)
+	wantResume := fmt.Sprintf("looper unpause %d / looper stop %d", parked.Seq, parked.Seq)
+	if resume != wantResume {
+		t.Fatalf("resume = %q, want %q", resume, wantResume)
+	}
+	if _, ok := payload["head"]; ok {
+		t.Fatalf("head = %#v, want omitted when metadata has no head sha", payload["head"])
+	}
+
+	// Clear handoff marker and delete event to force re-entry retry.
+	state := ReadReviewFixBudgetState(parked.MetadataJSON)
+	state.HandoffEventAt = ""
+	encoded, err := WriteReviewFixBudgetState(parked.MetadataJSON, state)
+	if err != nil {
+		t.Fatalf("clear handoff marker: %v", err)
+	}
+	parked.MetadataJSON = &encoded
+	if err := repos.Loops.Upsert(context.Background(), parked); err != nil {
+		t.Fatalf("upsert cleared: %v", err)
+	}
+	// Re-entry should rewrite HandoffEventAt (event append is idempotent enough via marker).
+	if _, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: parked, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(3, 5),
+	}); err != nil {
+		t.Fatalf("re-entry park: %v", err)
+	}
+	fresh, _ := repos.Loops.GetByID(context.Background(), parked.ID)
+	if fresh == nil || strings.TrimSpace(ReadReviewFixBudgetState(fresh.MetadataJSON).HandoffEventAt) == "" {
+		t.Fatalf("re-entry did not restore handoff marker: %#v", fresh)
+	}
+}
+
+func testBudgetCaps(reviewerCap, fixerCap int) ReviewFixBudgetLiveCaps {
+	return ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: reviewerCap, FixerMaxPushes: fixerCap}
 }
 
 func newBudgetFixture(t *testing.T) (*storage.Repositories, string) {
@@ -469,8 +939,16 @@ func seedBudgetLoop(t *testing.T, repos *storage.Repositories, nowISO, id, loopT
 	pr := int64(42)
 	target := "pr:acme/looper:42"
 	metadata := `{"loop":{"iterationCount":8}}`
+	// Stable unique seq from id bytes so parallel tests and multi-loop fixtures do not collide.
+	var seq int64
+	for _, b := range id {
+		seq = seq*33 + int64(b)
+	}
+	if seq < 0 {
+		seq = -seq
+	}
 	loop := storage.LoopRecord{
-		ID: id, Seq: int64(len(id)), ProjectID: "project_1", Type: loopType, TargetType: "pull_request",
+		ID: id, Seq: seq, ProjectID: "project_1", Type: loopType, TargetType: "pull_request",
 		TargetID: &target, Repo: &repo, PRNumber: &pr, Status: status, CreatedAt: nowISO, UpdatedAt: nowISO,
 		MetadataJSON: &metadata,
 	}

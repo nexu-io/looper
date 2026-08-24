@@ -136,7 +136,7 @@ func TestGitHubHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 	seedPollBudgetQueue(t, repos, nowISO, "project_budget_github", "queue_budget_fixer", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -301,7 +301,7 @@ func TestGitHubHITLPollRecoversBudgetAskAfterPersistFailure(t *testing.T) {
 	seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_budget_fixer_recover", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	parked, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -409,7 +409,7 @@ func TestGitHubHITLPollPostsNewAskAfterAPIAnsweredPriorCycle(t *testing.T) {
 	seedPollBudgetQueue(t, repos, firstISO, projectID, "queue_budget_fixer_generation", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: firstISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: firstISO, HITLEnabled: true,
 	}); err != nil {
 		t.Fatalf("ParkReviewFixBudget(first) error = %v", err)
 	}
@@ -435,7 +435,7 @@ func TestGitHubHITLPollPostsNewAskAfterAPIAnsweredPriorCycle(t *testing.T) {
 	if err != nil || fresh == nil {
 		t.Fatalf("Loops.GetByID(reviewer) = (%#v, %v)", fresh, err)
 	}
-	if _, err := loops.ApplyReviewFixBudgetAnswer(context.Background(), repos, *fresh, loops.ReviewFixBudgetAnswerContinue, firstISO); err != nil {
+	if _, err := loops.ApplyReviewFixBudgetAnswer(context.Background(), repos, *fresh, loops.ReviewFixBudgetAnswerContinue, firstISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 8, FixerMaxPushes: 8}); err != nil {
 		t.Fatalf("ApplyReviewFixBudgetAnswer(API Continue) error = %v", err)
 	}
 
@@ -451,7 +451,7 @@ func TestGitHubHITLPollPostsNewAskAfterAPIAnsweredPriorCycle(t *testing.T) {
 		t.Fatalf("Loops.Upsert(re-exhaust) error = %v", err)
 	}
 	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: *fresh, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: secondISO,
+		Exhausted: *fresh, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: secondISO, HITLEnabled: true,
 	}); err != nil {
 		t.Fatalf("ParkReviewFixBudget(second) error = %v", err)
 	}
@@ -536,7 +536,7 @@ func TestGitHubHITLPollDeliversAndStopsReviewFixBudget(t *testing.T) {
 	seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_budget_fixer_stop", fixer.ID, "fixer", storage.QueuePriorityFixer)
 
 	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	}); err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
 	}
