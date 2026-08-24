@@ -170,6 +170,76 @@ func TestProcessClaimedItemParksExhaustedBudgetBeforeRun(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemDoesNotParkBudgetWhenClaimedAfterPRClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	projectID := "project_1"
+	loopID := "loop_fixer_budget_claim_closed"
+	fixer := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_claim_closed", Seq: 2, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_budget_claim_closed", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:budget-claim-closed", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	cfg.HITL.Enabled = true
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: prNumber, State: "MERGED"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: true})
+	if _, err := runner.incrementFixerPushCount(context.Background(), fixer); err != nil {
+		t.Fatalf("incrementFixerPushCount() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_budget_claim_closed", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, Status: "running"})
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped after closed-PR claim", result)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || updated == nil || updated.Status != "terminated" {
+		t.Fatalf("fixer = (%#v, %v), want terminated product terminal", updated, err)
+	}
+	reason := ""
+	if loopMeta, ok := parseJSONObject(updated.MetadataJSON)["loop"].(map[string]any); ok {
+		reason, _ = stringFromAny(loopMeta["terminationReason"])
+	}
+	if reason != "pr_closed_or_merged" {
+		t.Fatalf("terminationReason = %q, want pr_closed_or_merged", reason)
+	}
+	if ask, ok := loops.ReadHITLAsk(updated.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+		t.Fatalf("HITL ask = %#v, want no budget ask on a closed PR", ask)
+	}
+	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || sibling == nil || sibling.Status != "waiting" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("reviewer sibling = (%#v, %v), want still waiting without budget pause", sibling, err)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_fixer_budget_claim_closed")
+	if err != nil || queue == nil || queue.Status != "cancelled" {
+		t.Fatalf("queue = (%#v, %v), want cancelled claimed item", queue, err)
+	}
+	runs, err := fixture.repos.Runs.ListByLoop(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("runs = %#v, want no run after closed-PR claim", runs)
+	}
+}
+
 func TestParkFixerBudgetBeforePendingRediscoveryDoesNotEnqueue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

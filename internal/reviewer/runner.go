@@ -1604,11 +1604,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: %s", loop.ID, reason)
 		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
 	}
-	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, *loop); err != nil {
-		return ProcessResult{}, err
-	} else if parked {
-		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
-	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
 		return ProcessResult{}, err
@@ -1616,12 +1611,24 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
+	if r.shouldCreateReviewerBudgetPark(*loop) && r.livePullRequestClosed(ctx, *project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, *loop, "pr_closed_or_merged"); err != nil {
+			return ProcessResult{}, err
+		}
+		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: pr_closed_or_merged", loop.ID)
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
+	}
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
 		var holdErr *holdSkipError
 		if errors.As(err, &holdErr) {
 			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
 		}
 		return ProcessResult{}, err
+	}
+	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {

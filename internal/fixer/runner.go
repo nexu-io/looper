@@ -2087,17 +2087,23 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
-	if parked, err := r.parkFixerBudgetIfExhausted(ctx, *loop); err != nil {
-		return ProcessResult{}, err
-	} else if parked {
-		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
-	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
 		return ProcessResult{}, err
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	if r.shouldCreateFixerBudgetPark(*loop) && r.livePullRequestClosed(ctx, *project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, *loop, "pr_closed_or_merged"); err != nil {
+			return ProcessResult{}, err
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "pr_closed_or_merged"}, nil
+	}
+	if parked, err := r.parkFixerBudgetIfExhausted(ctx, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
