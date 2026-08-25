@@ -3163,7 +3163,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if markerErr != nil {
 			return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
 		}
-		if len(publishableCommentOnlyFindings(nativeCompletion.Findings)) > 0 && !nativeMustFixReviewMarkerActionable(found) {
+		mustFixCount := len(publishableCommentOnlyFindings(nativeCompletion.Findings))
+		if mustFixCount > 0 && !nativeMustFixReviewMarkerActionable(found, mustFixCount) {
 			return checkpoint, &loopError{
 				message: missingReviewMarkerMessage(input, pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey}) + "; mixed must_fix+needs_human requires an actionable review marker before parking scope",
 				kind:    FailureRetryableAfterResume,
@@ -3173,7 +3174,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if marshalErr != nil {
 			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
 		}
-		if nativeMustFixReviewMarkerActionable(found) {
+		if nativeMustFixReviewMarkerActionable(found, mustFixCount) {
 			summary := result.Summary
 			if strings.TrimSpace(nativeCompletion.Summary) != "" {
 				summary = nativeCompletion.Summary
@@ -3484,8 +3485,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
-	if pendingNativeMustFixRequiresActionableMarker(pending) && !nativeMustFixReviewMarkerActionable(markerResult) {
-		message := missingReviewMarkerMessage(input, pending) + "; must_fix publication requires an actionable review marker with inline comments"
+	if pendingNativeMustFixRequiresActionableMarker(pending) && !nativeMustFixReviewMarkerActionable(markerResult, pendingNativeMustFixCount(pending)) {
+		message := missingReviewMarkerMessage(input, pending) + "; must_fix publication requires an actionable review marker with inline comments for every finding"
 		if pending.MarkerVerificationMisses == 0 {
 			pending.MarkerVerificationMisses = 1
 			checkpoint.PendingReview = pending.clone()
@@ -3615,24 +3616,38 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 
 // nativeMustFixReviewMarkerActionable reports whether a verified marker can
 // stand in for published must_fix feedback. Clean/APPROVE markers, missing
-// markers, and body-only COMMENT/REQUEST_CHANGES without inline comments are
-// not actionable publication.
-func nativeMustFixReviewMarkerActionable(found ReviewMarkerResult) bool {
+// markers, body-only COMMENT/REQUEST_CHANGES, and markers with fewer non-empty
+// inline comments than structured must_fix findings are not actionable
+// publication: leftover must_fix never becomes remote feedback or Fixer input.
+func nativeMustFixReviewMarkerActionable(found ReviewMarkerResult, mustFixCount int) bool {
 	if !found.Found {
 		return false
 	}
-	return len(found.InlineCommentBodies) > 0
+	n := 0
+	for _, body := range found.InlineCommentBodies {
+		if strings.TrimSpace(body) != "" {
+			n++
+		}
+	}
+	if mustFixCount < 1 {
+		return n > 0
+	}
+	return n >= mustFixCount
 }
 
-func pendingNativeMustFixRequiresActionableMarker(pending pendingReviewCheckpoint) bool {
+func pendingNativeMustFixCount(pending pendingReviewCheckpoint) int {
 	if strings.TrimSpace(pending.ReviewerSummaryJSON) == "" {
-		return false
+		return 0
 	}
 	var completion reviewerCommentOnlyCompletion
 	if err := json.Unmarshal([]byte(pending.ReviewerSummaryJSON), &completion); err != nil {
-		return false
+		return 0
 	}
-	return len(publishableCommentOnlyFindings(completion.Findings)) > 0
+	return len(publishableCommentOnlyFindings(completion.Findings))
+}
+
+func pendingNativeMustFixRequiresActionableMarker(pending pendingReviewCheckpoint) bool {
+	return pendingNativeMustFixCount(pending) > 0
 }
 
 func sameReviewAuthorLogin(a string, b string) bool {
