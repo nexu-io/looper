@@ -94,7 +94,7 @@ func canonicalThreadFeedbackInput(threads []ReviewThread, looperLogin string) st
 		b.WriteByte('\n')
 		comments := make([]ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
-			if isValidatedThreadResolutionAudit(comment, looperLogin) {
+			if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 				continue
 			}
 			comments = append(comments, comment)
@@ -185,17 +185,23 @@ func parseThreadResolutionMarker(body string) (threadResolutionMarkerFields, boo
 }
 
 // isThreadResolutionAuditComment reports a well-formed audit marker in the body.
-// Callers that authorize actions must also check Looper identity via
-// isValidatedThreadResolutionAudit.
+// Callers that authorize actions must also check Looper identity and containing
+// thread ID via isValidatedThreadResolutionAudit.
 func isThreadResolutionAuditComment(body string) bool {
 	_, ok := parseThreadResolutionMarker(body)
 	return ok
 }
 
-// isValidatedThreadResolutionAudit requires a well-formed marker and Looper authorship.
-// When looperLogin is empty, only the marker shape is checked (unit-test / baseline paths).
-func isValidatedThreadResolutionAudit(comment ReviewThreadComment, looperLogin string) bool {
-	if !isThreadResolutionAuditComment(comment.Body) {
+// isValidatedThreadResolutionAudit requires a well-formed marker and Looper
+// authorship. When containingThreadID is non-empty, the marker's thread field
+// must match it exactly. When looperLogin is empty, only the marker shape
+// (and thread match) is checked (unit-test / baseline paths).
+func isValidatedThreadResolutionAudit(comment ReviewThreadComment, looperLogin, containingThreadID string) bool {
+	fields, ok := parseThreadResolutionMarker(comment.Body)
+	if !ok {
+		return false
+	}
+	if want := strings.TrimSpace(containingThreadID); want != "" && fields.ThreadID != want {
 		return false
 	}
 	return isLooperIdentityAuthor(comment.Author, looperLogin)
@@ -259,7 +265,7 @@ func hasThreadResolutionAuditForSignalForLogin(thread ReviewThread, threadID, he
 		return false
 	}
 	for _, comment := range thread.Comments {
-		if !isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		fields, ok := parseThreadResolutionMarker(comment.Body)

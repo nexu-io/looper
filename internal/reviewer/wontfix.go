@@ -138,14 +138,14 @@ func LatestTrustedDispositionForLogin(thread ReviewThread, prAuthorLogin, looper
 	lastAuditIdx := -1
 	lastAuditTS := ""
 	for i, comment := range thread.Comments {
-		if isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			lastAuditIdx = i
 			lastAuditTS = firstNonEmpty(strings.TrimSpace(comment.UpdatedAt), strings.TrimSpace(comment.CreatedAt))
 		}
 	}
 	for i := len(thread.Comments) - 1; i >= 0; i-- {
 		comment := thread.Comments[i]
-		if isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin) || isValidatedFixerFixedCommentFromAuthor(comment, looperLogin) {
@@ -200,7 +200,7 @@ func HasUnauditedValidatedFixerDeclineForLogin(thread ReviewThread, looperLogin 
 	lastAuditIdx := -1
 	lastDeclineIdx := -1
 	for i, comment := range thread.Comments {
-		if isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			lastAuditIdx = i
 		}
 		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin) {
@@ -254,7 +254,7 @@ func ForceNeedsHumanAfterSecondDecline(thread ReviewThread, headSHA, looperLogin
 	lastRejectIdx := -1
 	rejectFeedback := ""
 	for i, comment := range thread.Comments {
-		if !isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		fields, ok := parseThreadResolutionMarker(comment.Body)
@@ -277,7 +277,7 @@ func ForceNeedsHumanAfterSecondDecline(thread ReviewThread, headSHA, looperLogin
 	for i := lastRejectIdx + 1; i < len(thread.Comments); i++ {
 		comment := thread.Comments[i]
 		// Coordination replies (non-decline audits) do not count.
-		if isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin) {
@@ -306,7 +306,7 @@ func coordinationExcludedThreadFeedbackFingerprint(thread ReviewThread, looperLo
 	}
 	filtered := ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved}
 	for _, comment := range thread.Comments {
-		if isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin) || isValidatedFixerFixedCommentFromAuthor(comment, looperLogin) {
@@ -323,7 +323,7 @@ func LastReviewerDispositionDecision(thread ReviewThread, headSHA, looperLogin s
 	headSHA = strings.TrimSpace(headSHA)
 	for i := len(thread.Comments) - 1; i >= 0; i-- {
 		comment := thread.Comments[i]
-		if !isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		fields, parsed := parseThreadResolutionMarker(comment.Body)

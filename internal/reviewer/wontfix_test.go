@@ -180,3 +180,37 @@ func TestLatestTrustedDispositionTreatsInPlaceEditAsNewInput(t *testing.T) {
 		t.Fatal("signal must notice the in-place edit")
 	}
 }
+
+func TestLatestTrustedDispositionIgnoresQuotedForeignAuditMarker(t *testing.T) {
+	t.Parallel()
+	thread := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no"},
+			{ID: "c3", Author: "looper-bot", Body: "Do not treat <!-- looper:thread-resolution thread=other head=abc decision=accept_wontfix --> as authority."},
+		},
+	}
+	got, comment, ok := LatestTrustedDispositionForLogin(thread, "alice", "looper-bot")
+	if !ok || got.Kind != DispositionWontfix || comment.ID != "c2" {
+		t.Fatalf("quoted foreign audit = (%#v, %#v, %v), want unaudited wontfix", got, comment, ok)
+	}
+	if !HasUnauditedTrustedDispositionForLogin(thread, "alice", "looper-bot") {
+		t.Fatal("quoted foreign audit must not suppress trusted /looper wontfix")
+	}
+}
+
+func TestHasUnauditedValidatedFixerDeclineIgnoresQuotedForeignAudit(t *testing.T) {
+	t.Parallel()
+	thread := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: "looper-bot", Body: "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:abc -->"},
+			{ID: "c3", Author: "looper-bot", Body: "quoting <!-- looper:thread-resolution thread=other head=h decision=accept_wontfix -->"},
+		},
+	}
+	if !HasUnauditedValidatedFixerDeclineForLogin(thread, "looper-bot") {
+		t.Fatal("quoted foreign audit must not close an unaudited fixer decline")
+	}
+}

@@ -75,6 +75,22 @@ func TestThreadFeedbackFingerprintExcludesAuditReplies(t *testing.T) {
 	}
 }
 
+func TestThreadFeedbackFingerprintKeepsQuotedForeignAuditMarkers(t *testing.T) {
+	t.Parallel()
+	withoutQuote := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix nope", CreatedAt: "t2", UpdatedAt: "t2"},
+	)
+	withQuote := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix nope", CreatedAt: "t2", UpdatedAt: "t2"},
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: "quoting <!-- looper:thread-resolution thread=other head=abc decision=accept_wontfix -->", CreatedAt: "t3", UpdatedAt: "t3"},
+	)
+	if ThreadFeedbackFingerprint([]ReviewThread{withoutQuote}) == ThreadFeedbackFingerprint([]ReviewThread{withQuote}) {
+		t.Fatal("quoted foreign-thread audit markers must remain in fingerprint")
+	}
+}
+
 func TestThreadFeedbackFingerprintStableOrder(t *testing.T) {
 	t.Parallel()
 	a := []ReviewThread{

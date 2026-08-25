@@ -4288,7 +4288,7 @@ func hasThreadResolutionAuditForHead(thread ReviewThread, headSHA string) bool {
 func hasValidatedThreadResolutionAuditForHead(thread ReviewThread, headSHA, looperLogin string) bool {
 	headSHA = strings.TrimSpace(headSHA)
 	for _, comment := range thread.Comments {
-		if !isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		fields, ok := parseThreadResolutionMarker(comment.Body)
@@ -4311,7 +4311,7 @@ func hasSufficientThreadResolutionAuditForDecision(policy config.ReviewerThreadR
 
 func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, headSHA, looperLogin string) bool {
 	for _, comment := range thread.Comments {
-		if !isValidatedThreadResolutionAudit(comment, looperLogin) {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
 		fields, ok := parseThreadResolutionMarker(comment.Body)
