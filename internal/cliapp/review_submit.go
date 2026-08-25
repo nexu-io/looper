@@ -1104,10 +1104,10 @@ func submitReviewWithoutAnchorValidation(cmd *cobra.Command, r *commandRuntime, 
 // maxPublishesPerPR cap or is on a review-fix budget hold. One-shot manual is
 // exempt via ParticipatesInReviewFixBudget. Does not park — daemon owns park.
 //
-// Authority is the submitting loop only (--reviewer-run-id / current running
-// reviewer run). Other lanes and terminal/historical loops are ignored. When no
-// submitting loop can be resolved, skip (same optional-authority posture as a
-// missing DB).
+// Authority is the submitting loop only (--reviewer-run-id / active submit
+// run, including a budget-paused loop whose run is still running). Other lanes
+// and terminal/historical loops are ignored. When no submitting loop can be
+// resolved, skip (same optional-authority posture as a missing DB).
 //
 // Storage probe matches trustedReviewRequestSubmitBypass: only open an already-
 // materialized DB; if DB is absent, skip (optional authority lookup).
@@ -1162,12 +1162,14 @@ func refuseReviewSubmitBudgetAgainstRepos(ctx context.Context, repos *storage.Re
 }
 
 // submittingReviewerLoopForBudgetGate resolves only the submitting reviewer loop.
-// Prefer --reviewer-run-id via trustedCurrentReviewerLoopForRun; otherwise the
-// current running reviewer run's loop. Does not scan all participating loops.
+// Prefer --reviewer-run-id via the active run even when sibling parking has
+// paused the loop; otherwise the newest running reviewer run for the PR,
+// including budget-paused and awaiting-human loops. Does not scan all
+// participating loops.
 func submittingReviewerLoopForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
 	runID = strings.TrimSpace(runID)
 	if runID != "" {
-		loop, err := trustedCurrentReviewerLoopForRun(ctx, repos, repo, prNumber, runID)
+		loop, err := reviewerLoopForActiveSubmitRun(ctx, repos, repo, prNumber, runID)
 		if err != nil {
 			return nil, fmt.Errorf("check review-fix publish budget: %w", err)
 		}
@@ -1176,28 +1178,91 @@ func submittingReviewerLoopForBudgetGate(ctx context.Context, repos *storage.Rep
 	if repos.Runs == nil {
 		return nil, nil
 	}
-	currentRun, err := currentRunningReviewerRun(ctx, repos, repo, prNumber)
+	currentRun, err := currentSubmittingReviewerRunForBudgetGate(ctx, repos, repo, prNumber)
 	if err != nil {
 		return nil, fmt.Errorf("check review-fix publish budget: %w", err)
 	}
 	if currentRun == nil {
 		return nil, nil
 	}
-	loop, err := repos.Loops.GetByID(ctx, currentRun.LoopID)
-	if err != nil {
-		return nil, fmt.Errorf("check review-fix publish budget: %w", err)
+	return reviewerLoopForBudgetGate(ctx, repos, currentRun.LoopID, repo, prNumber)
+}
+
+// reviewerLoopForActiveSubmitRun returns the reviewer loop for a still-running
+// submit run even when budget parking has paused the loop. Unlike
+// trustedCurrentReviewerLoopForRun, it does not require loop status running.
+func reviewerLoopForActiveSubmitRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
+	if repos == nil || repos.Runs == nil || repos.Loops == nil {
+		return nil, fmt.Errorf("storage is not configured")
 	}
-	if loop == nil || loop.Type != string(domain.LoopTypeReviewer) {
+	run, err := repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if run == nil || run.Status != string(domain.RunStatusRunning) {
 		return nil, nil
+	}
+	return reviewerLoopForBudgetGate(ctx, repos, run.LoopID, repo, prNumber)
+}
+
+// currentSubmittingReviewerRunForBudgetGate finds the newest running reviewer
+// run for the PR even when sibling parking has moved the loop off running.
+func currentSubmittingReviewerRunForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
+	loops, err := repos.Loops.ListByStatuses(ctx, []string{
+		string(domain.LoopStatusRunning),
+		string(domain.LoopStatusPaused),
+		string(domain.LoopStatusAwaitingHuman),
+	})
+	if err != nil {
+		return nil, err
+	}
+	loopIDs := make([]string, 0, len(loops))
+	for _, loop := range loops {
+		if !reviewerLoopMatchesPR(loop, repo, prNumber) {
+			continue
+		}
+		loopIDs = append(loopIDs, loop.ID)
+	}
+	if len(loopIDs) == 0 {
+		return nil, nil
+	}
+	runs, err := repos.Runs.ListLatestByLoopIDs(ctx, loopIDs)
+	if err != nil {
+		return nil, err
+	}
+	var current *storage.RunRecord
+	for i := range runs {
+		if runs[i].Status != string(domain.RunStatusRunning) {
+			continue
+		}
+		if current == nil || reviewerRunNewer(runs[i], *current) {
+			run := runs[i]
+			current = &run
+		}
+	}
+	return current, nil
+}
+
+func reviewerLoopForBudgetGate(ctx context.Context, repos *storage.Repositories, loopID, repo string, prNumber int64) (*storage.LoopRecord, error) {
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return nil, err
+	}
+	if loop == nil || !reviewerLoopMatchesPR(*loop, repo, prNumber) {
+		return nil, nil
+	}
+	return loop, nil
+}
+
+func reviewerLoopMatchesPR(loop storage.LoopRecord, repo string, prNumber int64) bool {
+	if loop.Type != string(domain.LoopTypeReviewer) {
+		return false
 	}
 	loopRepo := ""
 	if loop.Repo != nil {
 		loopRepo = *loop.Repo
 	}
-	if !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
-		return nil, nil
-	}
-	return loop, nil
+	return strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) && loop.PRNumber != nil && *loop.PRNumber == prNumber
 }
 
 func writeReviewSubmitDiagnostic(w io.Writer, event string, fields reviewSubmitDiagnosticFields) {

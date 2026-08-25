@@ -3383,8 +3383,14 @@ func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.L
 		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		updated.Status = "queued"
 		updated.LastRunAt = stringPtr(r.nowISO())
+		// Do not revive a review-fix budget hold (or other terminal park) that
+		// the step already persisted — only ordinary label/hold skips re-queue.
+		if loops.IsReviewFixBudgetHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
+			updated.NextRunAt = nil
+			return
+		}
+		updated.Status = "queued"
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err

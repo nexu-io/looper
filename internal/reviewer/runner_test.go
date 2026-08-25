@@ -2428,6 +2428,37 @@ func TestRefusePublishIfBudgetExhaustedFailsClosedOnLedgerRead(t *testing.T) {
 	}
 }
 
+func TestFinishHeldReviewerQueueItemPreservesBudgetHold(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	projectID := "project_1"
+	holdMeta := `{"loop":{"iterationCount":0},"reviewFixBudget":{"siblingOf":"fixer","pauseReason":"sibling_review_fix_budget"},"pauseReason":"sibling_review_fix_budget"}`
+	loop := storage.LoopRecord{ID: "loop_held_finish", Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &holdMeta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_held_finish", ProjectID: &projectID, LoopID: &loop.ID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:held-finish", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	result, err := runner.finishHeldReviewerQueueItem(context.Background(), loop, nil, queue, reviewerCheckpoint{}, "Reviewer stopped because review-fix budget is held")
+	if err != nil {
+		t.Fatalf("finishHeldReviewerQueueItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+	after, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || after == nil || after.Status != "paused" || !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("reviewer after finish = (%#v, %v), want still sibling-paused hold", after, err)
+	}
+}
+
 func TestRecordPublishedReviewProgressCountsBeforeClaimComplete(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
