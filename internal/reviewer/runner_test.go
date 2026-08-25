@@ -8554,7 +8554,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`",
 		"validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`",
 		"Preserve exact anchors that fit the live diff",
-		"safely downgrade it to top-level review body feedback",
+		"Do not move must_fix findings into the top-level review body",
 		"follow-up quality-gating failure",
 		"Resolvable inline review comments are required",
 		"PR review `comments` array",
@@ -8562,7 +8562,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"create resolvable GitHub review threads",
 		"`path`, `line`, `side`",
 		"`start_line` and `start_side`",
-		"the detailed findings must live in inline `comments`",
+		"every must_fix finding must live in inline `comments`",
 		"Looper **does** parse this findings list",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -8588,10 +8588,30 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"prefer fewer deep comments",
 		"more than 15 blocking findings",
 		"more than 25 total comments",
+		"safely downgrade it to top-level review body feedback",
+		"Use top-level comments without path/line only",
+		"downgrade unanchorable feedback to a top-level review-body item",
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("prompt contains conflicting no-actionable clean-review instruction %q:\n%s", forbidden, prompt)
 		}
+	}
+}
+
+func TestBuildReviewPromptForgejoNativeKeepsMustFixInline(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper"}}
+	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	if !strings.Contains(prompt, "every must_fix must remain an inline comment") {
+		t.Fatalf("forgejo prompt missing inline-only must_fix contract:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "downgrade unanchorable feedback to a top-level review-body item") {
+		t.Fatalf("forgejo prompt still instructs body-only must_fix:\n%s", prompt)
 	}
 }
 
@@ -10103,6 +10123,55 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 	}
 }
 
+func TestValidateReviewerCommentOnlyCompletionOutcomeMatchesHighestMustFixSeverity(t *testing.T) {
+	t.Parallel()
+	mustFix := func(severity string) reviewerCommentOnlyFindingResult {
+		return reviewerCommentOnlyFindingResult{
+			Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: severity,
+			ScopeBasis: "introduced_regression", ScopeEvidence: "diff",
+		}
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Blocking issue", Outcome: "non_blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("blocking")},
+	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("blocking finding with non_blocking outcome error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Nit only", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("nit")},
+	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("nit finding with blocking outcome error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Non-blocking only", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("non_blocking")},
+	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("non_blocking finding with blocking outcome error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Blocking issue", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("blocking"), mustFix("nit")},
+	}); err != nil {
+		t.Fatalf("mixed blocking+nit with blocking outcome: %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Nit only", Outcome: "non_blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("nit")},
+	}); err != nil {
+		t.Fatalf("nit with non_blocking outcome: %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Need human", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{{
+			Title: "Ambiguous", Body: "unclear", Disposition: "needs_human", Severity: "blocking",
+			ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals",
+		}},
+	}); err != nil {
+		t.Fatalf("needs_human-only: %v", err)
+	}
+}
+
 func TestBuildReviewerSummaryFromCompletionFiltersFollowUpAndNeedsHuman(t *testing.T) {
 	t.Parallel()
 
@@ -10260,6 +10329,10 @@ func TestParseReviewerNativeCompletionFindingsAndLegacy(t *testing.T) {
 	if !commentOnlyCompletionHasNeedsHuman(ok) {
 		t.Fatalf("want needs_human: %#v", ok)
 	}
+	if _, err := parseReviewerNativeCompletion(AgentResult{Stdout: `__LOOPER_RESULT__={"summary":"Blocking issue remains","outcome":"non_blocking","findings":[{"title":"Bug","body":"fix it","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"a.go","line":1}]}`}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("native blocking finding with non_blocking outcome error = %v, want publication-contract rejection", err)
+	}
+
 }
 
 func TestCommentOnlyNeedsHumanQuestionNamesAuthority(t *testing.T) {

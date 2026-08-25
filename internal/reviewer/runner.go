@@ -4620,6 +4620,12 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 	if mustFixCount == 0 && !commentOnlyCompletionHasNeedsHuman(completion) {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one must_fix finding")
 	}
+	if mustFixCount > 0 {
+		required := requiredOutcomeForMustFixFindings(completion.Findings)
+		if required != "" && completion.Outcome != required {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome %q does not match highest must_fix severity (want %s)", completion.Outcome, required)
+		}
+	}
 	return completion, nil
 }
 
@@ -4630,6 +4636,26 @@ func commentOnlyCompletionHasNeedsHuman(completion reviewerCommentOnlyCompletion
 		}
 	}
 	return false
+}
+
+// requiredOutcomeForMustFixFindings maps the highest published must_fix severity
+// onto the completion outcome contract: blocking findings require outcome=blocking;
+// non_blocking/nit must_fix findings require outcome=non_blocking. Empty means no
+// must_fix findings were present.
+func requiredOutcomeForMustFixFindings(findings []reviewerCommentOnlyFindingResult) string {
+	required := ""
+	for _, finding := range findings {
+		if strings.TrimSpace(finding.Disposition) != reviewFindingDispositionMustFix {
+			continue
+		}
+		switch strings.TrimSpace(finding.Severity) {
+		case reviewFindingSeverityBlocking:
+			return "blocking"
+		case reviewFindingSeverityNonBlocking, reviewFindingSeverityNit:
+			required = "non_blocking"
+		}
+	}
+	return required
 }
 
 // publishableCommentOnlyFindings returns only must_fix findings for remote summary items.
@@ -7566,13 +7592,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (must be `must_fix`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up`/`needs_human` in actionable comments or the visible review body; those dispositions stay out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
 	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
-	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor."
+	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If a must_fix location is outside the live diff's exact line, attach it to the nearest anchorable changed-file location instead of submitting an invalid inline anchor. Do not move must_fix findings into the top-level review body; the trusted wrapper rejects actionable body-only reviews, and body-only markers are not published must_fix."
 	if forgejoNative {
 		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
 		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition=must_fix`, `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields, rejects `follow_up`/`needs_human` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
 		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
 		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
-		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors; downgrade unanchorable feedback to a top-level review-body item with an exact file/section/symbol reference."
+		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors. If a must_fix location is not exactly on the supplied diff, attach it to the nearest anchorable changed-file location. Do not downgrade must_fix findings to a top-level review-body item; every must_fix must remain an inline comment."
 	}
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
@@ -7605,12 +7631,12 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"For complex linting/parsing logic, prefer recommending fixture-matrix tests over isolated one-regression tests. For CSS linting specifically, consider coverage for multiple style blocks, inline styles, comments, at-rules, cascade order, custom properties, var() fallbacks, theme scopes, and px/em/rem unit handling.",
 		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
-		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback; top-level comment bodies must still name the exact file, section, symbol, or behavior they refer to.",
-		"Flag any top-level actionable comment that lacks exact file, section, symbol, or behavior context as a follow-up quality-gating failure; do not publish vague unlocated feedback.",
+		"Cross-cutting or otherwise unanchorable must_fix findings still require an inline comment on a representative changed-file location; do not submit them as body-only top-level feedback.",
+		"Flag vague unlocated must_fix feedback as a follow-up quality-gating failure; every must_fix must be an inline comment with an exact file, section, symbol, or behavior reference.",
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
-		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use them only for clean summaries or genuinely cross-cutting/unanchorable feedback.",
-		"For non-blocking or blocking finding reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
+		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use the review body only for clean summaries or a short overview of already-submitted inline must_fix findings.",
+		"For non-blocking or blocking must_fix reviews, the review body should be a short overview plus markers/disclosure; every must_fix finding must live in inline `comments` so maintainers can resolve them individually.",
 		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",
