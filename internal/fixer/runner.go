@@ -3491,6 +3491,14 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
+	if withheld, err := r.skipPushIfDispositionWithheld(ctx, input, checkpoint); err != nil {
+		return checkpoint, err
+	} else if withheld {
+		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "pending_disposition"}})
+		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "Thread withheld pending Reviewer disposition adjudication", Evidence: resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, checkpoint.FixItemsHash)}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
+	}
 	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA}); err != nil {
 		message := err.Error()
 		eventType := "fixer.push.retryable"
@@ -3855,9 +3863,12 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	// successful "fixed" decision whenever a single new thread appeared,
 	// which on PRs receiving a steady stream of bot comments produced an
 	// unbreakable drift loop.
-	looperLogin, err := r.dispositionLooperLogin(ctx, input.Project.RepoPath)
-	if err != nil {
-		return checkpoint, err
+	var looperLogin string
+	if len(commentItems) > 0 {
+		looperLogin, err = r.dispositionLooperLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
+		}
 	}
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
@@ -7498,6 +7509,21 @@ func (r *Runner) admitWithheldDispositionFixItems(ctx context.Context, input ste
 		return nil, &loopError{message: fmt.Sprintf("fixer disposition admission author lookup failed: %v", err), kind: FailureRetryableTransient}
 	}
 	return r.suppressWithheldDispositionFixItems(ctx, input.Project, input.Repo, PullRequestDetail{Number: input.PRNumber, Author: prAuthor}, fixItems)
+}
+
+// skipPushIfDispositionWithheld rechecks live withhold immediately before the
+// remote push. A trusted /looper wontfix or /looper reconsider that arrived
+// after collect-fixes must not publish the repair. Failures are retryable
+// fail-closed. Non-comment runs skip the live read.
+func (r *Runner) skipPushIfDispositionWithheld(ctx context.Context, input stepInput, checkpoint fixerCheckpoint) (bool, error) {
+	if !hasCommentFixItems(checkpoint.FixItems) {
+		return false, nil
+	}
+	admitted, err := r.admitWithheldDispositionFixItems(ctx, input, checkpoint.FixItems)
+	if err != nil {
+		return false, err
+	}
+	return len(admitted) == 0, nil
 }
 
 // suppressWithheldDispositionFixItems drops threads with unaudited trusted
