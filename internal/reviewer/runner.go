@@ -3113,6 +3113,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if commentOnlyCompletionHasNeedsHuman(completion) {
 			// Pure needs_human: park without publishing/counting.
 			if len(publishableCommentOnlyFindings(completion.Findings)) == 0 {
+				checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
+				if freshErr != nil || blocked {
+					return checkpoint, freshErr
+				}
 				if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
 					return checkpoint, err
 				}
@@ -3148,11 +3152,24 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
+		// Recheck live state/head before parking obsolete needs_human evidence.
+		checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
+		if freshErr != nil || blocked {
+			return checkpoint, freshErr
+		}
 		// Agent may already have submitted must_fix comments via review submit
 		// before completing with needs_human. Count that publish before parking.
-		if found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); markerErr != nil {
+		found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
+		if markerErr != nil {
 			return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
-		} else if found.Found {
+		}
+		if len(publishableCommentOnlyFindings(nativeCompletion.Findings)) > 0 && !nativeMustFixReviewMarkerActionable(found) {
+			return checkpoint, &loopError{
+				message: missingReviewMarkerMessage(input, pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey}) + "; mixed must_fix+needs_human requires an actionable review marker before parking scope",
+				kind:    FailureRetryableAfterResume,
+			}
+		}
+		if nativeMustFixReviewMarkerActionable(found) {
 			summary := result.Summary
 			if strings.TrimSpace(nativeCompletion.Summary) != "" {
 				summary = nativeCompletion.Summary
@@ -3565,6 +3582,24 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return found, err
 	}
 	return found, nil
+}
+
+// nativeMustFixReviewMarkerActionable reports whether a verified marker can
+// stand in for published must_fix feedback. Clean/APPROVE markers and missing
+// markers are not actionable publication.
+func nativeMustFixReviewMarkerActionable(found ReviewMarkerResult) bool {
+	if !found.Found {
+		return false
+	}
+	if len(found.InlineCommentBodies) > 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(found.Outcome)) {
+	case "blocking", "non_blocking", "actionable":
+		return found.Event != ReviewEventApprove
+	default:
+		return false
+	}
 }
 
 func sameReviewAuthorLogin(a string, b string) bool {
@@ -6884,8 +6919,8 @@ func (r *Runner) recoverPublishedNeedsHumanScopeFromLatestRun(ctx context.Contex
 
 // scopeParkRecoveryFreshnessBlockReason views the live PR and returns a non-empty
 // stale/closed reason when scope park/defer must not run. Empty reason means OK
-// to recover. Retryable view failures return an error (fail closed — do not park
-// on unknown state). Missing PRs are treated as non-open drift.
+// to park or recover. Retryable view failures return an error (fail closed — do
+// not park on unknown state). Missing PRs are treated as non-open drift.
 func (r *Runner) scopeParkRecoveryFreshnessBlockReason(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, pending pendingReviewCheckpoint, checkpoint reviewerCheckpoint) (string, error) {
 	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
 		return "", nil
@@ -6911,6 +6946,19 @@ func (r *Runner) scopeParkRecoveryFreshnessBlockReason(ctx context.Context, proj
 		return fmt.Sprintf("PR drift detected before publish: expected PR state OPEN, observed %s for %s#%d", observed, repo, prNumber), nil
 	}
 	return "", nil
+}
+
+// applyScopeParkFreshness rechecks live PR state/head before a direct needs_human
+// park. blocked=true means the run is stale/closed and must not hold the pair.
+func (r *Runner) applyScopeParkFreshness(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, headSHA string) (reviewerCheckpoint, bool, error) {
+	staleReason, err := r.scopeParkRecoveryFreshnessBlockReason(ctx, input.Project, input.Repo, input.PRNumber, pendingReviewCheckpoint{HeadSHA: headSHA}, checkpoint)
+	if err != nil {
+		return checkpoint, false, err
+	}
+	if staleReason != "" {
+		return markReviewerRunStale(checkpoint, staleReason), true, nil
+	}
+	return checkpoint, false, nil
 }
 
 func reviewerScopeOrBudgetHoldSkip(ctx context.Context, r *Runner, loop storage.LoopRecord) error {
