@@ -3192,6 +3192,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				ReviewerSummaryJSON: string(payload),
 			}
 			checkpoint.PendingReview = &pending
+			// Persist structured completion before lastPublishedHeadSha so a
+			// crash/retry can reconstruct the scope hold from the checkpoint.
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
+				return checkpoint, err
+			}
 			alreadyPublished := false
 			if last, ok := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
 				alreadyPublished = true
@@ -4598,9 +4603,6 @@ func commentOnlyPublishVisibleSummary(completion reviewerCommentOnlyCompletion) 
 		return strings.TrimSpace(completion.Summary)
 	}
 	if len(mustFix) == 0 {
-		if cleanReviewNoopSummary(completion.Summary) {
-			return strings.TrimSpace(completion.Summary)
-		}
 		return "No actionable findings"
 	}
 	parts := make([]string, 0, len(mustFix))

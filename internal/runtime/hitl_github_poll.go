@@ -299,6 +299,51 @@ func githubHITLDecisionOnlyAsk(loop storage.LoopRecord, ask loops.HITLAsk) bool 
 	return loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(loop)
 }
 
+func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) error {
+	if drain == nil || repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
+		return nil
+	}
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if loop == nil || !loops.IsReviewScopeHumanHold(*loop) {
+		return nil
+	}
+	return drain(ctx, *loop)
+}
+
+func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, executions *ActiveExecutionRegistry) error {
+	if repos == nil || repos.Loops == nil {
+		return nil
+	}
+	all, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	members := append(loops.FindSiblingReviewFixLoops(all, loop), loop)
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		if member.ID != loop.ID && !loops.IsReviewFixPairHold(member) {
+			continue
+		}
+		switch strings.TrimSpace(member.Status) {
+		case "terminated", "stopped", "completed":
+			continue
+		}
+		if executions != nil {
+			if _, err := executions.BeginLoopStop(member.ID, "Stopped by review-fix scope pair"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // pollGitHubHITLAnswersOnce runs one pass of the answer-poll lane: for each loop
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
@@ -638,6 +683,9 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return out, nil
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			if err := drainScopeHoldOnStop(ctx, input.Repos, loopID, answer, input.DrainHITLPair); err != nil {
+				return err
+			}
 			return deliverHITLAnswerToLoopWithCaps(ctx, input.Repos, input.DB, nowISO, loopID, answer, reviewFixBudgetLiveCaps(input.Config, project.ID))
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {

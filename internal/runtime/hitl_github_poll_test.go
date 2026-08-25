@@ -119,6 +119,119 @@ func TestGitHubHITLDecisionOnlyAskIncludesScopeOverlay(t *testing.T) {
 	}
 }
 
+func TestPollGitHubHITLAnswersOnceScopeOverlaySkipsUnrelatedComments(t *testing.T) {
+	comments := []githubAnswerComment{
+		{ID: 8001, Author: "looper", Body: "<!-- looper:hitl:ask --> Which approach?"},
+		{ID: 8002, Author: "operator", Body: "unrelated discussion about the PR"},
+		{ID: 8003, Author: "operator", Body: "Continue"},
+	}
+	agentAsk := loops.HITLAsk{
+		Status: "awaiting", Transport: "github", PRNumber: 42, AskCommentID: 8001,
+		Question: "unrelated agent question on the sibling",
+	}
+	meta, err := loops.WriteHITLAsk(nil, agentAsk)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	meta, err = loops.WriteReviewScopeHumanState(&meta, loops.ReviewScopeHumanState{
+		HeldBy: "reviewer", PauseReason: loops.ReviewScopeHumanSiblingPauseReason,
+		Question: "Clarify AGENTS.md vs PR non-goals before continue.",
+	})
+	if err != nil {
+		t.Fatalf("WriteReviewScopeHumanState: %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_overlay_poll", Status: "awaiting_human", MetadataJSON: &meta}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok {
+		t.Fatal("want preserved agent ask")
+	}
+	var delivered []string
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return comments, nil
+		},
+		deliverAnswer: func(_ contextType, loopID, answer string) error {
+			delivered = append(delivered, loopID+"="+answer)
+			return nil
+		},
+	}
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		{ID: loop.ID, Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 42, AskCommentID: 8001, BudgetAsk: githubHITLDecisionOnlyAsk(loop, ask)},
+	}, deps)
+	if n != 1 || len(delivered) != 1 || delivered[0] != loop.ID+"=Continue" {
+		t.Fatalf("delivered = %#v n=%d, want Continue after skipping overlay chatter", delivered, n)
+	}
+}
+
+func TestDrainScopeHoldOnStopDrainsPairBeforeScopeStop(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_scope_stop_drain"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewer := storage.LoopRecord{
+		ID: "loop_scope_drain_reviewer", Seq: 21, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_scope_drain_fixer", Seq: 22, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	parked, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md rule X before unpause",
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	reg := NewActiveExecutionRegistry()
+	var drained []string
+	drain := func(ctx context.Context, loop storage.LoopRecord) error {
+		drained = append(drained, loop.ID)
+		return drainReviewFixPairExecutions(ctx, repos, loop, reg)
+	}
+	if err := drainScopeHoldOnStop(context.Background(), repos, parked.ID, "Continue", drain); err != nil {
+		t.Fatalf("Continue drain: %v", err)
+	}
+	if len(drained) != 0 {
+		t.Fatalf("Continue drained = %v, want none", drained)
+	}
+	if err := drainScopeHoldOnStop(context.Background(), repos, parked.ID, "Stop", drain); err != nil {
+		t.Fatalf("Stop drain: %v", err)
+	}
+	if len(drained) != 1 || drained[0] != parked.ID {
+		t.Fatalf("Stop drained = %v, want [%s]", drained, parked.ID)
+	}
+	if !reg.LoopStopActive(reviewer.ID) || !reg.LoopStopActive(fixer.ID) {
+		t.Fatal("pair stop gates not closed after scope Stop drain")
+	}
+}
 
 func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	commentsByPR := map[int64][]githubAnswerComment{

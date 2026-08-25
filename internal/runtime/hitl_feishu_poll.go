@@ -289,6 +289,9 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			if loop, err := input.Repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
 				caps = reviewFixBudgetLiveCaps(input.Config, loop.ProjectID)
 			}
+			if err := drainScopeHoldOnStop(ctx, input.Repos, loopID, answer, input.DrainHITLPair); err != nil {
+				return err
+			}
 			if err := deliverHITLAnswerToLoopWithCaps(ctx, input.Repos, input.DB, nowISO, loopID, answer, caps); err != nil {
 				return err
 			}

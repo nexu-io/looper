@@ -145,6 +145,10 @@ type Context struct {
 	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
+	// NotifyHumanAttention observes a durable human-attention park after a
+	// non-claim path (budget Continue → scope promotion). Optional; Runtime
+	// NotifyHumanAttention is used when unset.
+	NotifyHumanAttention func(context.Context, string)
 }
 
 // TakeoverResult is what a takeover yields: the native session id + worktree +
@@ -6008,11 +6012,62 @@ func (h *Handler) applyReviewFixBudgetContinueIfHeld(ctx context.Context, loop s
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
+	h.observePromotedScopeHolds(ctx, updated)
 	resp, serErr := h.serializeLoopWithDiagnostics(ctx, updated)
 	if serErr != nil {
 		return nil, serErr
 	}
 	return &resp, nil
+}
+
+func (h *Handler) humanAttentionObserver() func(context.Context, string) {
+	if h.context.NotifyHumanAttention != nil {
+		return h.context.NotifyHumanAttention
+	}
+	if rt, ok := h.context.Runtime.(*looperdruntime.Runtime); ok {
+		return rt.NotifyHumanAttention
+	}
+	return nil
+}
+
+// observePromotedScopeHolds notifies after budget Continue may have created a
+// fresh no-HITL scope park. That path never finishes a claim, so the scheduler
+// observer would otherwise miss it until daemon restart.
+func (h *Handler) observePromotedScopeHolds(ctx context.Context, loop storage.LoopRecord) {
+	notify := h.humanAttentionObserver()
+	if notify == nil {
+		return
+	}
+	if h.context.Runtime == nil {
+		if loops.IsReviewScopeHumanHold(loop) {
+			notify(ctx, loop.ID)
+		}
+		return
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Loops == nil {
+		if loops.IsReviewScopeHumanHold(loop) {
+			notify(ctx, loop.ID)
+		}
+		return
+	}
+	all, err := services.Repositories.Loops.List(ctx)
+	if err != nil {
+		if loops.IsReviewScopeHumanHold(loop) {
+			notify(ctx, loop.ID)
+		}
+		return
+	}
+	seen := make(map[string]struct{})
+	for _, member := range append(loops.FindSiblingReviewFixLoops(all, loop), loop) {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		if loops.IsReviewScopeHumanHold(member) {
+			notify(ctx, member.ID)
+		}
+	}
 }
 
 // drainReviewFixBudgetPair stops live agents on both pair members before
@@ -6037,7 +6092,7 @@ func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.Loo
 			continue
 		}
 		seen[member.ID] = struct{}{}
-		if member.ID != loop.ID && !loops.IsReviewFixBudgetHold(member) {
+		if member.ID != loop.ID && !loops.IsReviewFixPairHold(member) {
 			continue
 		}
 		switch strings.TrimSpace(member.Status) {
@@ -6131,6 +6186,17 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	if services.Repositories != nil && services.Repositories.Loops != nil {
+		if peek, peekErr := services.Repositories.Loops.GetByID(ctx, loopID); peekErr == nil && peek != nil {
+			ask, _ := loops.ReadHITLAsk(peek.MetadataJSON)
+			if (loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*peek)) && loops.IsReviewFixBudgetStop(answer) {
+				if drainErr := h.drainReviewFixBudgetPair(ctx, *peek); drainErr != nil {
+					return loopResponse{}, drainErr
+				}
+			}
+		}
+	}
+
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)

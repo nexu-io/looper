@@ -33,6 +33,20 @@ func (r *Runtime) notifyHumanAttentionBestEffort(ctx context.Context, repos *sto
 	notifyDurableHumanAttention(ctx, gateway, repos, loopID)
 }
 
+// NotifyHumanAttention observes durable loop state after a non-claim park
+// (budget Continue → no-HITL scope promotion). Best-effort; never changes
+// loop/queue/run control flow.
+func (r *Runtime) NotifyHumanAttention(ctx context.Context, loopID string) {
+	if r == nil {
+		return
+	}
+	services := r.Services()
+	if services.Repositories == nil {
+		return
+	}
+	r.notifyHumanAttentionBestEffort(ctx, services.Repositories, loopID)
+}
+
 // ensureHumanAttentionNotifyCtx returns the shared cancelable parent for
 // human-attention delivery. Refuses to arm after Stop or while admission is
 // stopping so a post-claim race cannot outlive BeginShutdown's cancel snapshot.
