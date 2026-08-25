@@ -6318,9 +6318,13 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 	}
 
 	// Budget Continue may promote deferred needs_human into a fresh scope hold
-	// that is still awaiting_human. Return that park; do not treat it as the
-	// just-answered ask and implicitly Continue via mutateLoopStatus.
-	if updated.Status != string(domain.LoopStatusAwaitingHuman) || loops.IsReviewFixPairHold(updated) {
+	// that is still awaiting_human. Overlay Continue can also release the pair
+	// hold while a residual ordinary agent ask remains awaiting. Return that
+	// park; do not treat it as the just-answered ask and implicitly Continue
+	// via mutateLoopStatus.
+	residualAsk, hasResidualAsk := loops.ReadHITLAsk(updated.MetadataJSON)
+	residualAwaiting := hasResidualAsk && strings.EqualFold(strings.TrimSpace(residualAsk.Status), "awaiting")
+	if updated.Status != string(domain.LoopStatusAwaitingHuman) || loops.IsReviewFixPairHold(updated) || residualAwaiting {
 		if h.context.TriggerSchedulerTick != nil {
 			h.context.TriggerSchedulerTick()
 		}

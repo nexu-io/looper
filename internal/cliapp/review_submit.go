@@ -59,6 +59,12 @@ const (
 	reviewFindingDispositionMustFix    = "must_fix"
 	reviewFindingDispositionFollowUp   = "follow_up"
 	reviewFindingDispositionNeedsHuman = "needs_human"
+
+	reviewFindingScopeStatedIntent           = "stated_intent"
+	reviewFindingScopeIntroducedRegression   = "introduced_regression"
+	reviewFindingScopeRequiredInvariant      = "required_invariant"
+	reviewFindingScopeIndependentImprovement = "independent_improvement"
+	reviewFindingScopeAmbiguousIntent        = "ambiguous_intent"
 )
 
 type reviewSubmitDiagnosticFields struct {
@@ -833,6 +839,12 @@ func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) err
 			return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
 		default:
 			return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix)", i, disposition)
+		}
+		switch scopeBasis {
+		case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
+			// ok
+		default:
+			return fmt.Errorf("actionable review comment %d has invalid scopeBasis %q", i, scopeBasis)
 		}
 	}
 	return nil

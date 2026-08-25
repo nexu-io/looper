@@ -1604,6 +1604,14 @@ func TestValidateReviewSubmitCommentDispositionsRequiresMustFixEvidence(t *testi
 			}},
 			want: "needs_human",
 		},
+		{
+			name: "invalid scopeBasis rejected",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+				Disposition: "must_fix", ScopeBasis: "whatever", ScopeEvidence: "nil deref",
+			}},
+			want: "invalid scopeBasis",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateReviewSubmitCommentDispositions(tc.comments)

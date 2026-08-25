@@ -314,6 +314,16 @@ func githubHITLDecisionOnlyAsk(loop storage.LoopRecord, ask loops.HITLAsk) bool 
 	return loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(loop)
 }
 
+// githubHITLResidualOrdinaryAsk reports a preserved agent HITL ask that is not
+// itself a pair Continue/Stop question. Overlay siblings keep this ask while
+// the pair hold is the decision authority.
+func githubHITLResidualOrdinaryAsk(ask loops.HITLAsk) bool {
+	if loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(ask.Status), "awaiting")
+}
+
 func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) error {
 	if drain == nil || repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
 		return nil
@@ -363,9 +373,10 @@ func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositori
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
 // simply won't be passed in again. A Continue/Stop consumed by a decision-only
-// pair member is persisted onto remaining sibling GitHub asks in that same
-// review-fix lane so the next poll cannot treat that comment as an ordinary
-// answer after the overlay is gone.
+// pair member is remembered in-process for this poll. Residual ordinary sibling
+// asks keep their original AskCommentID so earlier free-text replies stay
+// visible after the overlay is released; those asks also ignore Continue/Stop
+// so the pair decision cannot become their answer.
 func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
 	consumedDecisionPairs := make(map[string]struct{})
@@ -402,6 +413,10 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 			accept = func(body string) bool {
 				return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
 			}
+		} else {
+			accept = func(body string) bool {
+				return !loops.IsReviewFixBudgetContinue(body) && !loops.IsReviewFixBudgetStop(body)
+			}
 		}
 		answer, commentID := detectGitHubHITLAnswerMatchingWithID(comments, loop.AskCommentID, deps.answerAuthors, accept)
 		if answer == "" {
@@ -418,6 +433,9 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 			}
 			for j := range awaiting {
 				if j == i || githubHITLDecisionPairKey(awaiting[j]) != pairKey {
+					continue
+				}
+				if !awaiting[j].BudgetAsk {
 					continue
 				}
 				if awaiting[j].AskCommentID < commentID {
@@ -487,6 +505,9 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 			continue
 		}
 		if ask.AskCommentID >= commentID {
+			continue
+		}
+		if githubHITLResidualOrdinaryAsk(ask) {
 			continue
 		}
 		ask.AskCommentID = commentID

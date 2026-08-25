@@ -371,7 +371,8 @@ func TestPollGitHubHITLAnswersOnceDoesNotReuseScopeContinueOnSecondPass(t *testi
 	comments := []githubAnswerComment{
 		{ID: 8001, Author: "looper", Body: "<!-- looper:hitl:ask --> Clarify AGENTS.md?"},
 		{ID: 8002, Author: "looper", Body: "<!-- looper:hitl:ask --> Which approach?"},
-		{ID: 8003, Author: "operator", Body: "Continue"},
+		{ID: 8003, Author: "operator", Body: "use approach A"},
+		{ID: 8004, Author: "operator", Body: "Continue"},
 	}
 	var delivered []string
 	deps := githubHITLPollDeps{
@@ -405,23 +406,15 @@ func TestPollGitHubHITLAnswersOnceDoesNotReuseScopeContinueOnSecondPass(t *testi
 	if !ok || remaining.Status != "awaiting" || remaining.Question != agentAsk.Question || remaining.Answer != "" {
 		t.Fatalf("fixer ask after first pass = (%#v, %v), want unanswered agent question", remaining, ok)
 	}
-	if remaining.AskCommentID < 8003 {
-		t.Fatalf("fixer AskCommentID = %d, want advanced past Continue comment 8003", remaining.AskCommentID)
+	if remaining.AskCommentID != 8002 {
+		t.Fatalf("fixer AskCommentID = %d, want original ordinary ask 8002 (not Continue 8004)", remaining.AskCommentID)
 	}
 
 	second := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
 		githubHITLAwaitingFrom(*freshFixer, remaining),
 	}, deps)
-	if second != 0 || len(delivered) != 1 {
-		t.Fatalf("second pass delivered = %#v n=%d, want no reuse of Continue", delivered, second)
-	}
-
-	comments = append(comments, githubAnswerComment{ID: 8004, Author: "operator", Body: "use approach A"})
-	third := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
-		githubHITLAwaitingFrom(*freshFixer, remaining),
-	}, deps)
-	if third != 1 || len(delivered) != 2 || delivered[1] != fixer.ID+"=use approach A" {
-		t.Fatalf("third pass delivered = %#v n=%d, want later agent answer", delivered, third)
+	if second != 1 || len(delivered) != 2 || delivered[1] != fixer.ID+"=use approach A" {
+		t.Fatalf("second pass delivered = %#v n=%d, want earlier agent answer not Continue", delivered, second)
 	}
 }
 
@@ -600,8 +593,8 @@ func TestPollGitHubHITLAnswersOnceLimitsConsumedDecisionToPairLane(t *testing.T)
 		t.Fatalf("auto fixer after Continue = (%#v, %v), want awaiting preserved ask", freshAutoFixer, err)
 	}
 	remainingAuto, ok := loops.ReadHITLAsk(freshAutoFixer.MetadataJSON)
-	if !ok || remainingAuto.AskCommentID < 8007 {
-		t.Fatalf("auto fixer AskCommentID = (%#v, %v), want advanced past pair Continue 8007", remainingAuto, ok)
+	if !ok || remainingAuto.AskCommentID != 8002 {
+		t.Fatalf("auto fixer AskCommentID = (%#v, %v), want original ordinary ask 8002", remainingAuto, ok)
 	}
 }
 

@@ -623,6 +623,75 @@ func TestHandlerRespondOrdinaryAskDoesNotReleaseScopeOverlay(t *testing.T) {
 	}
 }
 
+func TestHandlerRespondScopeContinueOnOverlayKeepsResidualAsk(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_scope_overlay_continue"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewer := storage.LoopRecord{
+		ID: "loop_scope_overlay_continue_reviewer", Seq: 649, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer): %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_scope_overlay_continue_fixer", Seq: 650, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
+		Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	midAsk := loops.HITLAsk{
+		Kind: "agent_question", Question: "Which approach should Fixer take?",
+		Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO, PRNumber: prNumber,
+	}
+	meta, err := loops.WriteHITLAsk(fixer.MetadataJSON, midAsk)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	fixer.MetadataJSON = &meta
+	if err := services.Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer): %v", err)
+	}
+	if _, err := loops.ParkReviewScopeHuman(context.Background(), services.Repositories, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md rule X before unpause",
+	}); err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/650/respond", strings.NewReader(`{"answer":"Continue"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	freshFixer, err := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || freshFixer == nil || freshFixer.Status != "awaiting_human" {
+		t.Fatalf("fixer after overlay Continue = (%#v, %v), want awaiting_human residual ask", freshFixer, err)
+	}
+	if loops.IsReviewScopeHumanHold(*freshFixer) || loops.IsReviewFixPairHold(*freshFixer) {
+		t.Fatalf("fixer still pair-held after overlay Continue: %#v", freshFixer)
+	}
+	ask, ok := loops.ReadHITLAsk(freshFixer.MetadataJSON)
+	if !ok || ask.Question != midAsk.Question || ask.Status != "awaiting" || ask.Answer != "" {
+		t.Fatalf("residual ask = (%#v, %v), want unanswered agent question", ask, ok)
+	}
+	freshReviewer, err := services.Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || freshReviewer == nil || freshReviewer.Status == "running" || loops.IsReviewScopeHumanHold(*freshReviewer) {
+		t.Fatalf("reviewer after overlay Continue = (%#v, %v), want released and not running", freshReviewer, err)
+	}
+}
+
 func TestHandlerRespondScopeStopDrainsLiveSibling(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	services := rt.Services()
