@@ -6222,6 +6222,9 @@ func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop stora
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	if updated.ID == "" {
+		// Continue already released the hold after drain. Reopen sibling
+		// gates before the route falls through to single-loop StopLoop.
+		looperdruntime.ReopenUnappliedScopeStopGates(ctx, services.Repositories, services.ActiveExecutions, loop.ID)
 		return nil, nil
 	}
 	outcome := "review_fix_budget_stop"

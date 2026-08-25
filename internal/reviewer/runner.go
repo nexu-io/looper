@@ -3073,6 +3073,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
+		if !commentOnlyCompletion {
+			if nativeCompletion, parseErr := parseReviewerNativeCompletion(result); parseErr == nil && commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
+				return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
+			}
+		}
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
@@ -3164,68 +3169,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
-		// Recheck live state/head before parking obsolete needs_human evidence.
-		checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
-		if freshErr != nil || blocked {
-			return checkpoint, freshErr
-		}
-		// Agent may already have submitted must_fix comments via review submit
-		// before completing with needs_human. Count that publish before parking.
-		found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
-		if markerErr != nil {
-			return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
-		}
-		mustFixCount := len(publishableCommentOnlyFindings(nativeCompletion.Findings))
-		if mustFixCount > 0 && !nativeMustFixReviewMarkerActionable(found, mustFixCount) {
-			return checkpoint, &loopError{
-				message: missingReviewMarkerMessage(input, pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey}) + "; mixed must_fix+needs_human requires an actionable review marker before parking scope",
-				kind:    FailureRetryableAfterResume,
-			}
-		}
-		payload, marshalErr := json.Marshal(nativeCompletion)
-		if marshalErr != nil {
-			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
-		}
-		if nativeMustFixReviewMarkerActionable(found, mustFixCount) {
-			summary := result.Summary
-			if strings.TrimSpace(nativeCompletion.Summary) != "" {
-				summary = nativeCompletion.Summary
-			}
-			outcome := normalizeCommentOnlyOutcome(found.Outcome)
-			if outcome == "" {
-				outcome = normalizeCommentOnlyOutcome(nativeCompletion.Outcome)
-			}
-			pending := pendingReviewCheckpoint{
-				HeadSHA:             checkpoint.Snapshot.HeadSHA,
-				IdempotencyKey:      idempotencyKey,
-				Event:               found.Event,
-				Summary:             summary,
-				Outcome:             outcome,
-				ContentFingerprint:  reviewMarkerFingerprint(found),
-				ReviewerSummaryJSON: string(payload),
-			}
-			checkpoint.PendingReview = &pending
-			// Persist structured completion before lastPublishedHeadSha so a
-			// crash/retry can reconstruct the scope hold from the checkpoint.
-			if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
-				return checkpoint, err
-			}
-			alreadyPublished := false
-			if last, ok := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
-				alreadyPublished = true
-			}
-			if !alreadyPublished {
-				if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
-					return checkpoint, err
-				}
-			}
-		}
-		// One authoritative hold: if publish hit the live cap, budget owns the
-		// pair; defer scope evidence without stacking a second ask/reason.
-		if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, nativeCompletion); err != nil {
-			return checkpoint, err
-		}
-		return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
+		return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
 	}
 	nativeFindingsJSON := ""
 	if len(nativeCompletion.Findings) > 0 {
@@ -3624,6 +3568,68 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return found, err
 	}
 	return found, nil
+}
+
+// finishNativeNeedsHumanCompletion parks a valid needs_human native completion,
+// counting an already-submitted must_fix marker when present. Shared by the
+// completed parse path and failed-run recovery so a later nonzero exit cannot
+// drop ReviewerSummaryJSON and skip the scope hold.
+func (r *Runner) finishNativeNeedsHumanCompletion(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, result AgentResult, nativeCompletion reviewerCommentOnlyCompletion, idempotencyKey string) (reviewerCheckpoint, error) {
+	checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
+	if freshErr != nil || blocked {
+		return checkpoint, freshErr
+	}
+	found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
+	if markerErr != nil {
+		return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
+	}
+	mustFixCount := len(publishableCommentOnlyFindings(nativeCompletion.Findings))
+	if mustFixCount > 0 && !nativeMustFixReviewMarkerActionable(found, mustFixCount) {
+		return checkpoint, &loopError{
+			message: missingReviewMarkerMessage(input, pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey}) + "; mixed must_fix+needs_human requires an actionable review marker before parking scope",
+			kind:    FailureRetryableAfterResume,
+		}
+	}
+	payload, marshalErr := json.Marshal(nativeCompletion)
+	if marshalErr != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
+	}
+	if nativeMustFixReviewMarkerActionable(found, mustFixCount) {
+		summary := result.Summary
+		if strings.TrimSpace(nativeCompletion.Summary) != "" {
+			summary = nativeCompletion.Summary
+		}
+		outcome := normalizeCommentOnlyOutcome(found.Outcome)
+		if outcome == "" {
+			outcome = normalizeCommentOnlyOutcome(nativeCompletion.Outcome)
+		}
+		pending := pendingReviewCheckpoint{
+			HeadSHA:             checkpoint.Snapshot.HeadSHA,
+			IdempotencyKey:      idempotencyKey,
+			Event:               found.Event,
+			Summary:             summary,
+			Outcome:             outcome,
+			ContentFingerprint:  reviewMarkerFingerprint(found),
+			ReviewerSummaryJSON: string(payload),
+		}
+		checkpoint.PendingReview = &pending
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
+			return checkpoint, err
+		}
+		alreadyPublished := false
+		if last, ok := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
+			alreadyPublished = true
+		}
+		if !alreadyPublished {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+				return checkpoint, err
+			}
+		}
+	}
+	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, nativeCompletion); err != nil {
+		return checkpoint, err
+	}
+	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 }
 
 // nativeMustFixReviewMarkerActionable reports whether a verified marker can

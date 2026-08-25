@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -342,6 +343,95 @@ func TestHandlerActiveStopDrainsScopeHeldSibling(t *testing.T) {
 	seen := map[string]bool{drained[0]: true, drained[1]: true}
 	if !seen[reviewer.ID] || !seen[fixer.ID] {
 		t.Fatalf("drained = %v, want %s and %s", drained, reviewer.ID, fixer.ID)
+	}
+}
+
+func TestHandlerActiveStopReopensGatesWhenContinueWinsAfterDrain(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	services := rt.Services()
+	var drained []string
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_scope_stop_continue_race"
+	repo := "acme/looper"
+	pr := int64(48)
+	target := "pr:acme/looper:48"
+	reviewerID := "loop_scope_stop_race_rev"
+	fixerID := "loop_scope_stop_race_fix"
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		StopLoop: func(ctx context.Context, loopID, _ string) (any, error) {
+			rec, err := services.Repositories.Loops.GetByID(ctx, loopID)
+			if err != nil || rec == nil {
+				t.Fatalf("StopLoop GetByID(%s) = (%v, %v)", loopID, rec, err)
+			}
+			drained = append(drained, loopID)
+			if services.ActiveExecutions != nil {
+				if _, stopErr := services.ActiveExecutions.BeginLoopStop(loopID, "test drain"); stopErr != nil {
+					return nil, stopErr
+				}
+			}
+			if len(drained) == 2 {
+				fresh, getErr := services.Repositories.Loops.GetByID(ctx, reviewerID)
+				if getErr != nil || fresh == nil {
+					t.Fatalf("racing Continue GetByID = (%v, %v)", fresh, getErr)
+				}
+				if _, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, services.Repositories, *fresh, loops.ReviewFixBudgetAnswerContinue, nowISO); applyErr != nil {
+					t.Fatalf("racing Continue: %v", applyErr)
+				}
+			}
+			return map[string]any{"stopped": true, "loopId": loopID}, nil
+		},
+	})
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewer := storage.LoopRecord{
+		ID: reviewerID, Seq: 4801, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: fixerID, Seq: 4802, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	if _, err := loops.ParkReviewScopeHuman(context.Background(), services.Repositories, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md rule X before unpause",
+	}); err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/active/"+reviewer.ID+"/stop", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("stop status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if services.ActiveExecutions == nil {
+		t.Fatal("ActiveExecutions is nil")
+	}
+	if services.ActiveExecutions.LoopStopActive(fixer.ID) {
+		t.Fatal("sibling stop gate still closed after unapplied active Stop")
+	}
+	if _, err := services.ActiveExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: fixer.ID, RunID: "run_scope_continue_fix", ExecutionID: "exec_scope_continue_fix",
+	}); err != nil {
+		t.Fatalf("AdmitSpawn fixer after unapplied active Stop: %v", err)
+	}
+	fixerAfter, err := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || fixerAfter == nil || fixerAfter.Status == "terminated" || loops.IsReviewScopeHumanHold(*fixerAfter) {
+		t.Fatalf("fixer after Continue-wins active Stop = (%#v, %v), want released pair member", fixerAfter, err)
 	}
 }
 

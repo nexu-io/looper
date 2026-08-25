@@ -12114,6 +12114,89 @@ func TestProcessClaimedItemPreservesParkedScopeHoldStatus(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemFailedRunNeedsHumanParksBeforeMarkerRecovery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopID := "loop_failed_run_needs_human"
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: loopID, Seq: 212, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber,
+		Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = false
+	stdout := `__LOOPER_RESULT__={"summary":"Mixed must_fix and needs_human","outcome":"blocking","findings":[{"title":"Bug","body":"fix it","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"a.go","line":1},{"title":"Ambiguous","body":"unclear","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"PR non-goals","path":"b.go","line":2}]}`
+	github := &fakeGitHubGateway{
+		reviewRequests:                  []string{"octocat"},
+		reviewMarkerMissing:             false,
+		reviewMarkerEvent:               ReviewEventComment,
+		reviewMarkerOutcome:             "blocking",
+		reviewMarkerInlineCommentBodies: []string{"fix it"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "failed", Summary: "posted review, later command failed", Stdout: stdout,
+	}}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg,
+		LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+	})
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped after failed-run needs_human park", result)
+	}
+	if !strings.Contains(result.Summary, "review scope requires human judgment") {
+		t.Fatalf("result.Summary = %q, want scope hold skip", result.Summary)
+	}
+	updated, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", updated, err)
+	}
+	if updated.Status != "paused" {
+		t.Fatalf("status = %q, want paused scope hold (not published-and-queued)", updated.Status)
+	}
+	if !loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("want scope hold after failed-run needs_human: %#v meta=%v", updated, updated.MetadataJSON)
+	}
+	gotHead, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
+	if gotHead == "" {
+		t.Fatalf("lastPublishedHeadSha missing; mixed must_fix should count before park: %s", derefString(updated.MetadataJSON))
+	}
+	if result.RunID == "" {
+		t.Fatal("result.RunID empty, want persisted run checkpoint")
+	}
+	persisted, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID = (%#v, %v)", persisted, err)
+	}
+	checkpoint := parseCheckpoint(persisted.CheckpointJSON)
+	if checkpoint.PendingReview == nil || !strings.Contains(checkpoint.PendingReview.ReviewerSummaryJSON, `"disposition":"needs_human"`) {
+		t.Fatalf("checkpoint pending = %#v, want persisted native completion with needs_human before marker recovery", checkpoint.PendingReview)
+	}
+}
+
 func TestProcessClaimedItemMixedNeedsHumanMissingMarkerFailsRetryable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
