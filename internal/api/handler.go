@@ -6141,6 +6141,30 @@ func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.Loo
 	return nil
 }
 
+// drainScopeHoldBeforeRespond looks up the loop before a HITL Stop mutation.
+// A lookup error must fail closed so ApplyReviewScopeHumanAnswer cannot
+// terminalize the pair without draining a live sibling.
+func drainScopeHoldBeforeRespond(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) error {
+	if repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
+		return nil
+	}
+	peek, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if peek == nil {
+		return nil
+	}
+	ask, _ := loops.ReadHITLAsk(peek.MetadataJSON)
+	if !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*peek)) {
+		return nil
+	}
+	if drain == nil {
+		return nil
+	}
+	return drain(ctx, *peek)
+}
+
 // applyReviewFixBudgetStopIfHeld delegates looper stop on a budget-held or
 // scope-held role to paired Stop (terminate both). Returns nil when not a hold.
 func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop storage.LoopRecord) (any, error) {
@@ -6221,15 +6245,12 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	if services.Repositories != nil && services.Repositories.Loops != nil {
-		if peek, peekErr := services.Repositories.Loops.GetByID(ctx, loopID); peekErr == nil && peek != nil {
-			ask, _ := loops.ReadHITLAsk(peek.MetadataJSON)
-			if (loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*peek)) && loops.IsReviewFixBudgetStop(answer) {
-				if drainErr := h.drainReviewFixBudgetPair(ctx, *peek); drainErr != nil {
-					return loopResponse{}, drainErr
-				}
-			}
+	if err := drainScopeHoldBeforeRespond(ctx, services.Repositories, loopID, answer, h.drainReviewFixBudgetPair); err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return loopResponse{}, typed
 		}
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {

@@ -181,7 +181,11 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 	shouldResolve := false
 	caps := reviewFixBudgetLiveCaps(cfg, "")
 	if repos != nil && repos.Loops != nil {
-		if loop, err := repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return err
+		}
+		if loop != nil {
 			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
 			if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
 				if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && (loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask)) {
