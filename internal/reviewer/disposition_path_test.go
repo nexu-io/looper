@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -2240,6 +2241,201 @@ func TestDispositionOnlyBatchDoesNotCoerceObjectiveDecisions(t *testing.T) {
 	}
 	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Commented != 2 || checkpoint.ThreadResolution.Resolved != 2 {
 		t.Fatalf("ThreadResolution = %#v, want two comments and two resolutions", checkpoint.ThreadResolution)
+	}
+}
+
+func TestDispositionAcceptLastThreadPublishesCommentOnlyConvergence(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	policy.RequireNewHeadSinceThread = true
+	policy.RequireCurrentReviewRequest = false
+
+	threads := []ReviewThread{{
+		ID: "thread_last",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix out of scope", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}}
+	github := &fakeGitHubGateway{
+		currentLogin:             "looper-bot",
+		author:                   "alice",
+		reviewRequests:           []string{"looper-bot"},
+		reviewThreads:            threads,
+		viewHeadSHA:              "abc123",
+		reviewMarkerMissing:      true,
+		reviewMarkerExactMissing: true,
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{
+		{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_last","decision":"accept_wontfix","evidence":"outside PR scope","confidence":"high"}]}`},
+		{Status: "completed", Summary: "internal/reviewer/runner.go: publish remaining must_fix after last-thread accept", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: publish remaining must_fix after last-thread accept","outcome":"non_blocking","findings":[{"title":"Convergence finding","body":"Comment-only same-head convergence must still publish.","files":["internal/reviewer/runner.go"],"disposition":"must_fix","severity":"non_blocking","scopeBasis":"required_invariant","scopeEvidence":"clean convergence publication"}]}`, ParseStatus: "parsed"},
+	}}
+	fixture := newRunnerFixture(t)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","lastReviewedSignalFingerprint":"old-fp","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_conv_pub", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert loop: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
+		ThreadResolution: policy, CommentOnlyPublish: true,
+		DiscoveryPolicy: DiscoveryPolicy{RequireReviewRequest: false},
+		ReviewEvents:    cfg.Roles.Reviewer.Behavior.ReviewEvents,
+		LoopConfig: config.ReviewerLoopConfig{
+			EnabledByDefault: true, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2,
+			MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, MaxPublishesPerPR: 8,
+		},
+		CustomInstructions: &cfg,
+	})
+	ctx := context.Background()
+	if _, err := runner.enqueue(ctx, enqueueInput{
+		ProjectID: "project_1", LoopID: loop.ID, Repo: "acme/looper", PRNumber: 42,
+		HeadSHA: "abc123", ReviewSignalFingerprint: "old-fp-cursor", DispositionOnly: true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(github.resolveThreadCalls) != 1 {
+		t.Fatalf("resolves = %#v, want last-thread accept", github.resolveThreadCalls)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issueCommentCalls = %#v, want comment-only convergence publish", github.issueCommentCalls)
+	}
+	if !strings.Contains(github.issueCommentCalls[0].Body, "Convergence finding") {
+		t.Fatalf("published body missing finding: %q", github.issueCommentCalls[0].Body)
+	}
+	if len(agent.starts) < 2 {
+		t.Fatalf("agent starts = %d, want thread-resolution then review", len(agent.starts))
+	}
+	reviewKey := agent.starts[len(agent.starts)-1].IdempotencyKey
+	if !isConvergenceReviewID(reviewKey) {
+		t.Fatalf("review idempotency key = %q, want distinct convergence identity", reviewKey)
+	}
+	if reviewKey == agentNativeReviewID(loop.ID, "abc123") {
+		t.Fatal("convergence pass reused head-only publication identity")
+	}
+}
+
+func TestVerifyAgentNativeReviewMarkerDoesNotReuseLoopPrefixForConvergence(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{
+		currentLogin:        "looper-bot",
+		reviewMarkerMissing: true,
+		reviews: []map[string]any{{
+			"state": "CHANGES_REQUESTED",
+			"body":  "old blocking <!-- looper:review id=reviewer:loop_native_conv:abc123 head=abc123 outcome=blocking -->",
+		}},
+	}
+	runner := New(Options{GitHub: github, Logger: &testLogger{}, Now: func() time.Time { return time.Date(2026, time.April, 11, 12, 0, 0, 0, time.UTC) }})
+	input := stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"},
+		Loop:     storage.LoopRecord{ID: "loop_native_conv"},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+	}
+	convergenceID := agentNativeConvergenceReviewID("loop_native_conv", "abc123", "sig")
+	found, err := runner.verifyAgentNativeReviewMarker(context.Background(), input, "abc123", convergenceID, "alice")
+	if err != nil {
+		t.Fatalf("verifyAgentNativeReviewMarker() error = %v", err)
+	}
+	if found.Found {
+		t.Fatalf("found = %#v, want miss so a new clean/blocking review can publish", found)
+	}
+	for _, in := range github.reviewMarkerInputs {
+		if strings.Contains(in.Marker, "id_prefix=") {
+			t.Fatalf("convergence verification reused loop-prefix marker %q", in.Marker)
+		}
+	}
+}
+
+func TestRunPublishStepPublishesSameHeadConvergenceDespiteLastPublishedHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_pub_conv", ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Convergence finding",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Late must_fix", Body: "still broken", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"a.go"}},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", viewHeadSHA: "abc123", reviewRequests: []string{"looper-bot"}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project: (%#v, %v)", project, err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA: "abc123", IdempotencyKey: agentNativeConvergenceReviewID(loop.ID, "abc123", "sig"),
+		Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome,
+		ReviewerSummaryJSON: string(payload),
+	}
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_pub_conv"},
+		Repo: repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			ConvergencePass: true,
+			Detail:          &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+			Snapshot:        &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview:   &pending,
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("SkipReason = %q, want publish", checkpoint.SkipReason)
+	}
+	if len(github.issueCommentCalls) != 1 {
+		t.Fatalf("issueCommentCalls = %#v, want 1", github.issueCommentCalls)
 	}
 }
 

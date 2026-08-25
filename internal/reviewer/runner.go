@@ -589,7 +589,11 @@ type reviewerCheckpoint struct {
 	ThreadResolutionFollowUpOnly bool                        `json:"threadResolutionFollowUpOnly,omitempty"`
 	// DispositionOnly marks a same-head thread-disposition pass that must not
 	// publish a new PR review or apply minPublishIntervalSeconds.
-	DispositionOnly         bool                     `json:"dispositionOnly,omitempty"`
+	DispositionOnly bool `json:"dispositionOnly,omitempty"`
+	// ConvergencePass is an explicitly admitted same-head full review after
+	// disposition cleared Looper blockers. It must not reuse head-only
+	// publication identity or the lastPublishedHeadSha already-published skip.
+	ConvergencePass         bool                     `json:"convergencePass,omitempty"`
 	ReviewSignalFingerprint string                   `json:"reviewSignalFingerprint,omitempty"`
 	PendingReview           *pendingReviewCheckpoint `json:"pendingReview,omitempty"`
 	SkipReason              string                   `json:"skipReason,omitempty"`
@@ -2241,7 +2245,7 @@ func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project st
 		if _, err := r.repos.Queue.CancelByLoop(ctx, updatedLoop.ID, r.nowISO(), &reason); err != nil {
 			return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 		}
-	} else if needsContinuation && hasPending {
+	} else if needsContinuation && hasPending && !alreadyPublishedSameHeadConvergence(checkpoint) {
 		if err := r.schedulePendingReviewerContinuation(ctx, project, updatedLoop, priorForContinuation, pendingHead, pendingSignal, pendingDisp); err != nil {
 			return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 		}
@@ -2588,23 +2592,28 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	if samePublishedHead || alreadyReviewedHead {
-		// Allow a thread-disposition pass when the review signal changed even
-		// though the code head (and prior review publication) did not.
-		if admitted, signal, err := r.admitSameHeadDisposition(ctx, input, checkpoint, meta); err != nil {
+		// Explicit same-head full-review continuation after disposition cleared
+		// blockers. Do not force disposition-only or head-only skip.
+		if queuedSameHeadConvergencePass(input.QueueItem.PayloadJSON) {
+			checkpoint.ConvergencePass = true
+			checkpoint.DispositionOnly = false
+			checkpoint.ThreadResolutionFollowUpOnly = false
+			if signal := reviewSignalFromQueuePayload(input.QueueItem.PayloadJSON); signal != "" {
+				checkpoint.ReviewSignalFingerprint = signal
+			}
+		} else if admitted, signal, err := r.admitSameHeadDisposition(ctx, input, checkpoint, meta); err != nil {
 			return checkpoint, err
 		} else if admitted {
 			checkpoint.DispositionOnly = true
 			checkpoint.ThreadResolutionFollowUpOnly = true
 			checkpoint.ReviewSignalFingerprint = signal
 			return checkpoint, nil
-		}
-		if alreadyReviewedHead && !samePublishedHead {
+		} else if alreadyReviewedHead && !samePublishedHead {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
 			checkpoint.SkipKind = "already_reviewed_by_current_user"
 			checkpoint.SkipReviewerLogin = currentLogin
 			return checkpoint, nil
-		}
-		if samePublishedHead {
+		} else if samePublishedHead {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
 			checkpoint.SkipKind = "already_published_head"
 			return checkpoint, nil
@@ -2722,6 +2731,19 @@ func payloadDispositionOnly(payloadJSON *string) bool {
 		return v
 	}
 	return false
+}
+
+// queuedSameHeadConvergencePass reports an explicit full-review continuation
+// (signal present, not disposition-only) scheduled after last-thread accept.
+func queuedSameHeadConvergencePass(payloadJSON *string) bool {
+	if payloadDispositionOnly(payloadJSON) {
+		return false
+	}
+	return reviewSignalFromQueuePayload(payloadJSON) != ""
+}
+
+func alreadyPublishedSameHeadConvergence(checkpoint reviewerCheckpoint) bool {
+	return checkpoint.ConvergencePass && checkpoint.PendingReview != nil && checkpoint.SkipReason == ""
 }
 
 func partialBatchContinuationFromPayload(payloadJSON *string) *threadResolutionCheckpoint {
@@ -3665,6 +3687,7 @@ func (r *Runner) finishDispositionOnlyCheckpoint(ctx context.Context, input step
 		// Clear disposition-only so skipThreadResolutionFollowUpReview does not block review.
 		checkpoint.DispositionOnly = false
 		checkpoint.ThreadResolutionFollowUpOnly = false
+		checkpoint.ConvergencePass = true
 		if err := r.enqueueDispositionConvergence(ctx, input, checkpoint); err != nil {
 			return checkpoint, err
 		}
@@ -4450,7 +4473,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
+	idempotencyKey := reviewPublicationID(input.Loop.ID, checkpoint)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Snapshot.HeadSHA)
 	reviewRequestBypassReason := ""
@@ -4734,12 +4757,14 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	pending := *checkpoint.PendingReview
 	meta := parseJSONObject(input.Loop.MetadataJSON)
-	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
+	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA && !isConvergencePublication(checkpoint, pending) {
 		// Crash/retry gap: recordPublishedReviewProgress may have written
 		// lastPublishedHeadSha (and budget park) before
 		// afterCommentOnlyPublishMaybeParkScope ran. Recover park/defer
 		// without re-publishing. Freshness gates refuse stale/closed PRs.
 		// No-ops when pending has no needs_human.
+		// Same-head convergence publications must not take this path: the
+		// prior review already recorded this head.
 		next, err := r.recoverAlreadyPublishedScopePark(ctx, input, checkpoint, pending)
 		if err != nil {
 			return next, err
@@ -5066,6 +5091,11 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
+	}
+	if isConvergenceReviewID(idempotencyKey) {
+		// Same-head convergence must not reuse the prior head-only loop-prefix
+		// marker; that would keep the previous blocking review as published.
+		return found, nil
 	}
 	loopMarker := agentNativeLoopReviewMarker(input.Loop.ID, headSHA)
 	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: loopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
@@ -9256,6 +9286,34 @@ func snapshotHeadSHA(checkpoint reviewerCheckpoint) string {
 
 func agentNativeReviewID(loopID string, headSHA string) string {
 	return fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
+}
+
+func agentNativeConvergenceReviewID(loopID, headSHA, signal string) string {
+	id := fmt.Sprintf("reviewer:%s:%s:convergence", loopID, headSHA)
+	signal = strings.TrimSpace(signal)
+	if signal == "" {
+		return id
+	}
+	return id + ":" + signal
+}
+
+func isConvergenceReviewID(id string) bool {
+	return strings.Contains(id, ":convergence:") || strings.HasSuffix(id, ":convergence")
+}
+
+func reviewPublicationID(loopID string, checkpoint reviewerCheckpoint) string {
+	headSHA := ""
+	if checkpoint.Snapshot != nil {
+		headSHA = checkpoint.Snapshot.HeadSHA
+	}
+	if checkpoint.ConvergencePass || (checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.ScheduleConvergencePass) {
+		return agentNativeConvergenceReviewID(loopID, headSHA, checkpoint.ReviewSignalFingerprint)
+	}
+	return agentNativeReviewID(loopID, headSHA)
+}
+
+func isConvergencePublication(checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint) bool {
+	return checkpoint.ConvergencePass || (checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.ScheduleConvergencePass) || isConvergenceReviewID(pending.IdempotencyKey)
 }
 
 func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey string) string {
