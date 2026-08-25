@@ -53,14 +53,12 @@ type feishuHITLPollDeps struct {
 
 // pollFeishuHITLInboxOnce delivers the answers among a batch of inbox events that
 // belong to this looper's awaiting loops, self-selecting by thread root (typed
-// replies) or loop seq (card-action clicks). Returns the highest event id seen so
-// the caller can advance its cursor. Idempotent: an event whose loop is no longer
-// awaiting is a no-op in deliverAnswer.
+// replies) or loop seq (card-action clicks). Returns the highest event id that
+// was safely consumed so the caller can advance its cursor. A delivery error
+// leaves that event and every later event unconsumed so the next poll retries.
+// Idempotent: an event whose loop is no longer awaiting is a no-op in deliverAnswer.
 func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps feishuHITLPollDeps) (delivered int, maxID int64) {
 	for _, e := range events {
-		if e.ID > maxID {
-			maxID = e.ID
-		}
 		loopID := ""
 		value := ""
 		var deliver func(contextType, string, string) error
@@ -72,6 +70,9 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 			text := strings.TrimSpace(e.Text)
 			root := strings.TrimSpace(e.RootID)
 			if text == "" || root == "" || deps.loopByRoot == nil || deps.enqueueMessage == nil {
+				if e.ID > maxID {
+					maxID = e.ID
+				}
 				continue
 			}
 			loopID = deps.loopByRoot(ctx, root)
@@ -82,24 +83,36 @@ func pollFeishuHITLInboxOnce(ctx contextType, events []feishuInboxEvent, deps fe
 			ans := strings.TrimSpace(e.Value.Answer)
 			seq, err := strconv.ParseInt(strings.TrimSpace(e.Value.LoopSeq), 10, 64)
 			if ans == "" || err != nil || deps.loopBySeq == nil {
+				if e.ID > maxID {
+					maxID = e.ID
+				}
 				continue
 			}
 			loopID = deps.loopBySeq(ctx, seq)
 			value = ans
 			deliver = deps.deliverAnswer
 		default:
+			if e.ID > maxID {
+				maxID = e.ID
+			}
 			continue
 		}
 		if strings.TrimSpace(loopID) == "" {
+			if e.ID > maxID {
+				maxID = e.ID
+			}
 			continue // belongs to another looper (or already resumed)
 		}
 		if err := deliver(ctx, loopID, value); err != nil {
 			if deps.logWarn != nil {
 				deps.logWarn("hitl feishu poll: deliver failed", map[string]any{"loopId": loopID, "kind": e.Kind, "error": err.Error()})
 			}
-			continue
+			return delivered, maxID
 		}
 		delivered++
+		if e.ID > maxID {
+			maxID = e.ID
+		}
 	}
 	return delivered, maxID
 }

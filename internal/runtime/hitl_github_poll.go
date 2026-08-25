@@ -41,11 +41,11 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 }
 
 func detectGitHubHITLAnswerMatching(comments []githubAnswerComment, askCommentID int64, answerAuthors []string, accept func(string) bool) string {
-	answer, _ := detectGitHubHITLAnswerMatchingWithID(comments, askCommentID, answerAuthors, accept)
+	answer, _ := detectGitHubHITLAnswerMatchingWithID(comments, askCommentID, answerAuthors, accept, nil)
 	return answer
 }
 
-func detectGitHubHITLAnswerMatchingWithID(comments []githubAnswerComment, askCommentID int64, answerAuthors []string, accept func(string) bool) (string, int64) {
+func detectGitHubHITLAnswerMatchingWithID(comments []githubAnswerComment, askCommentID int64, answerAuthors []string, accept func(string) bool, skipIDs map[int64]struct{}) (string, int64) {
 	allow := make(map[string]bool, len(answerAuthors))
 	for _, a := range answerAuthors {
 		if a = strings.TrimSpace(a); a != "" {
@@ -56,6 +56,9 @@ func detectGitHubHITLAnswerMatchingWithID(comments []githubAnswerComment, askCom
 	answer := ""
 	for _, c := range comments {
 		if c.ID <= askCommentID {
+			continue
+		}
+		if _, skip := skipIDs[c.ID]; skip {
 			continue
 		}
 		if strings.Contains(c.Body, looperCommentMarker) {
@@ -285,7 +288,8 @@ type githubHITLPollDeps struct {
 	// advanceAskPastComment moves remaining GitHub asks on the same
 	// review-fix pair past a consumed Continue/Stop so a later poll cannot
 	// treat that comment as an ordinary answer after a scope overlay is released.
-	advanceAskPastComment func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64) error
+	// Residual ordinary asks are advanced only when they have no earlier free-text.
+	advanceAskPastComment func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error
 	// projectCWD returns the local repo path for a project (gh runs there).
 	projectCWD    func(projectID string) string
 	answerAuthors []string
@@ -373,13 +377,14 @@ func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositori
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
 // simply won't be passed in again. A Continue/Stop consumed by a decision-only
-// pair member is remembered in-process for this poll. Residual ordinary sibling
-// asks keep their original AskCommentID so earlier free-text replies stay
-// visible after the overlay is released; those asks also ignore Continue/Stop
-// so the pair decision cannot become their answer.
+// pair member is remembered in-process for this poll and persisted onto siblings.
+// Residual ordinary sibling asks keep earlier free-text visible; they skip only
+// the consumed decision comment so a standalone ordinary ask can still answer
+// Continue or Stop.
 func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
 	consumedDecisionPairs := make(map[string]struct{})
+	consumedDecisionComments := make(map[int64]struct{})
 	for i, loop := range awaiting {
 		if !strings.EqualFold(strings.TrimSpace(loop.Transport), "github") || loop.PRNumber == 0 {
 			continue
@@ -413,18 +418,14 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 			accept = func(body string) bool {
 				return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
 			}
-		} else {
-			accept = func(body string) bool {
-				return !loops.IsReviewFixBudgetContinue(body) && !loops.IsReviewFixBudgetStop(body)
-			}
 		}
-		answer, commentID := detectGitHubHITLAnswerMatchingWithID(comments, loop.AskCommentID, deps.answerAuthors, accept)
+		answer, commentID := detectGitHubHITLAnswerMatchingWithID(comments, loop.AskCommentID, deps.answerAuthors, accept, consumedDecisionComments)
 		if answer == "" {
 			continue
 		}
 		if loop.BudgetAsk && pairKey != "" && commentID != 0 && (loops.IsReviewFixBudgetContinue(answer) || loops.IsReviewFixBudgetStop(answer)) {
 			if deps.advanceAskPastComment != nil {
-				if err := deps.advanceAskPastComment(ctx, loop.ProjectID, repo, loop.PRNumber, loop.ID, commentID); err != nil {
+				if err := deps.advanceAskPastComment(ctx, loop.ProjectID, repo, loop.PRNumber, loop.ID, commentID, comments); err != nil {
 					if deps.logWarn != nil {
 						deps.logWarn("hitl github poll: advance consumed decision failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 					}
@@ -436,12 +437,15 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 					continue
 				}
 				if !awaiting[j].BudgetAsk {
-					continue
+					if residualOrdinaryHasEarlierAnswer(comments, awaiting[j].AskCommentID, commentID) {
+						continue
+					}
 				}
 				if awaiting[j].AskCommentID < commentID {
 					awaiting[j].AskCommentID = commentID
 				}
 			}
+			consumedDecisionComments[commentID] = struct{}{}
 		}
 		if err := deps.deliverAnswer(ctx, loop.ID, answer); err != nil {
 			if deps.logWarn != nil {
@@ -460,7 +464,17 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 	return delivered
 }
 
-func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64) error {
+func residualOrdinaryHasEarlierAnswer(comments []githubAnswerComment, askCommentID, consumedID int64) bool {
+	if consumedID == 0 {
+		return false
+	}
+	_, id := detectGitHubHITLAnswerMatchingWithID(comments, askCommentID, nil, func(body string) bool {
+		return !loops.IsReviewFixBudgetContinue(body) && !loops.IsReviewFixBudgetStop(body)
+	}, map[int64]struct{}{consumedID: {}})
+	return id != 0 && id < consumedID
+}
+
+func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
 	if repos == nil || repos.Loops == nil || commentID == 0 || prNumber == 0 {
 		return nil
 	}
@@ -507,7 +521,7 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 		if ask.AskCommentID >= commentID {
 			continue
 		}
-		if githubHITLResidualOrdinaryAsk(ask) {
+		if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID) {
 			continue
 		}
 		ask.AskCommentID = commentID
@@ -880,8 +894,8 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		remainingAwaiting: func(ctx contextType, repo string, pr int64) bool {
 			return githubHITLPRHasRemainingAwaiting(ctx, input.Repos, project.ID, repo, pr)
 		},
-		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64) error {
-			return advanceSiblingGitHubHITLAsksPastComment(ctx, input.Repos, projectID, repo, prNumber, exceptLoopID, commentID)
+		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
+			return advanceSiblingGitHubHITLAsksPastComment(ctx, input.Repos, projectID, repo, prNumber, exceptLoopID, commentID, comments)
 		},
 		projectCWD:    func(string) string { return project.RepoPath },
 		answerAuthors: answerAuthors,
