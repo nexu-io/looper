@@ -2994,8 +2994,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
-	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
+	lastPublishedHeadSHA, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"])
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA)
+	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
 	metadata := map[string]any{
 		"loopType":            "reviewer",
 		"phase":               "review",
@@ -5921,14 +5922,16 @@ func (r *Runner) hasPendingHeadChangeNativeResume(ctx context.Context, loopID st
 	return ok
 }
 
-func (r *Runner) nativeResumePromptForReview(ctx context.Context, input stepInput, currentHeadSHA string, idempotencyKey string) string {
+func (r *Runner) nativeResumePromptForReview(ctx context.Context, input stepInput, currentHeadSHA string, idempotencyKey string, lastPublishedHeadSHA string) string {
 	record := r.pendingNativeResume(ctx, input.Loop.ID)
 	if record == nil {
 		return ""
 	}
 	if r.nativeResume.ReReviewPromptOnHeadChange {
 		if headChange, ok := reviewerNativeResumeHeadChange(record); ok && headChange.matches(input.Repo, input.PRNumber) {
-			return nativeResumeReReviewPrompt(input.Repo, input.PRNumber, headChange.OldHeadSHA, headChange.NewHeadSHA, currentHeadSHA, idempotencyKey)
+			// Only use repair-frontier language when a prior Looper review was
+			// published; otherwise keep the full re-review resume prompt.
+			return nativeResumeReReviewPrompt(input.Repo, input.PRNumber, headChange.OldHeadSHA, headChange.NewHeadSHA, currentHeadSHA, idempotencyKey, lastPublishedHeadSHA)
 		}
 	}
 	return nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, currentHeadSHA, idempotencyKey)
@@ -6056,7 +6059,37 @@ Before any GitHub side effect, re-check the current PR/head/idempotency guards f
 If the review or thread-resolution result was already posted, report the existing completion marker instead of posting a duplicate.`, strings.TrimSpace(phase), repo, prNumber, headSHA, idempotencyKey)
 }
 
-func nativeResumeReReviewPrompt(repo string, prNumber int64, oldHeadSHA string, interruptedHeadSHA string, currentHeadSHA string, idempotencyKey string) string {
+func nativeResumeReReviewPrompt(repo string, prNumber int64, oldHeadSHA string, interruptedHeadSHA string, currentHeadSHA string, idempotencyKey string, lastPublishedHeadSHA string) string {
+	if isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA) {
+		// Resume replaces the normal review prompt, so later-pass native resume
+		// must carry the same late-discovery dispositions and Fixer-decline
+		// adjudication contract as buildReviewPromptWithInstructions.
+		return strings.Join([]string{
+			fmt.Sprintf(`Continue the existing Looper reviewer review task in this resumed native session as a repair-frontier re-review (not a full discard-and-rescan of the original PR diff).
+
+The pull request changed while the prior review was running:
+- PR: %s#%d
+- last published/reviewed head SHA: %s
+- previous session head SHA: %s
+- head SHA observed at interruption: %s
+- current expected head SHA for this run: %s
+- idempotency key for this run: %s
+
+Use prior session context only as background. Inspect only:
+1. every unresolved prior must_fix thread;
+2. the diff from last published head %s to current head %s;
+3. directly affected call sites, contracts, tests, and lifecycle invariants;
+4. evidence that Fixer addressed each prior finding.
+
+Do not rescan untouched original diff merely to invent ordinary P2/P3 hardening. Discard findings, assumptions, anchors, or conclusions that only apply to a previous head and are no longer valid. Keep only findings that are still concrete, actionable, and valid against the current head.
+
+Before any GitHub side effect, re-check that the PR is open, the current head SHA still matches the current expected head SHA, and the current-user review-request/idempotency guards from the existing instructions still pass.
+
+If a matching review for the current expected head and idempotency key was already posted, report the existing completion marker instead of posting a duplicate.`, repo, prNumber, lastPublishedHeadSHA, oldHeadSHA, interruptedHeadSHA, currentHeadSHA, idempotencyKey, lastPublishedHeadSHA, currentHeadSHA),
+			repairFrontierPassContract(lastPublishedHeadSHA, currentHeadSHA, false),
+			fixerDeclineAdjudicationContract(),
+		}, "\n\n")
+	}
 	return fmt.Sprintf(`Continue the existing Looper reviewer review task in this resumed native session, but treat it as a PR update re-review.
 
 The pull request changed while the prior review was running:
@@ -7223,8 +7256,39 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "")
 	return prompt
+}
+
+// isRepairFrontierPass is true when a prior Looper review was published for this
+// lane and the PR head has since changed. Budget Continue must not clear
+// lastPublishedHeadSha; that field is the durable frontier base.
+func isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA string) bool {
+	last := strings.TrimSpace(lastPublishedHeadSHA)
+	current := strings.TrimSpace(currentHeadSHA)
+	return last != "" && current != "" && last != current
+}
+
+func repairFrontierPassContract(lastPublishedHeadSHA, currentHeadSHA string, commentOnly bool) string {
+	scanVerb := "publishing"
+	if commentOnly {
+		scanVerb = "finalizing"
+	}
+	return fmt.Sprintf(`Repair frontier contract (later pass): a prior Looper review was published for head %s and the current head is %s. This is not a first full-pass rescan. Before %s, inspect only:
+1. every unresolved prior must_fix thread;
+2. the diff from last reviewed head %s to current head %s;
+3. directly affected call sites, contracts, tests, and lifecycle invariants;
+4. evidence that Fixer actually addressed each prior finding.
+Do not rescan untouched original diff merely to invent ordinary new P2/P3 hardening, cleanup, style, or independent-improvement work.
+Late findings discovered in untouched old diff:
+- Clear security, data corruption/loss, broken public contract, or P0/P1 correctness blocker → disposition must_fix; mark late discovery in scopeEvidence (for example prefix with "late_discovery: …") and include it in convergence evidence.
+- Ordinary P2/P3 robustness, cleanup, style, or independent improvement → disposition follow_up; do not feed the current Fixer loop.
+- Scope or severity genuinely ambiguous → disposition needs_human.
+Budget Continue does not reset this repair frontier; lastPublishedHeadSha remains the base until a new head is published.`, lastPublishedHeadSHA, currentHeadSHA, scanVerb, lastPublishedHeadSHA, currentHeadSHA)
+}
+
+func fixerDeclineAdjudicationContract() string {
+	return `Fixer decline adjudication: a validated Fixer declined reply on an existing Looper-authored review thread is a scope dispute, not dismissal authority. Do not open a duplicate thread for the same finding. Adjudicate on the existing thread only: (1) accept the decline when the item is out of scope (leave the thread for later resolution ownership — do not invent a new thread), (2) reject the decline with new concrete authority evidence and keep the thread unresolved so Fixer remains eligible, or (3) disposition needs_human when judgment is required. A second attempted fix to the same subsystem, or a repeated reviewer–fixer scope conflict without new evidence, must be needs_human — not another automatic argument round.`
 }
 
 func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewerCheckpoint, scope config.ReviewerScope) string {
@@ -7305,7 +7369,7 @@ func reviewerProjectProviderKind(cfg config.Config, projectID string) config.Pro
 	return config.ProviderKindGitHub
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool, lastPublishedHeadSHA string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -7318,6 +7382,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if forgejoNative {
 		forgeName = "Forgejo"
 	}
+	currentHeadSHA := snapshotHeadSHA(checkpoint)
+	lastPublishedHeadSHA = strings.TrimSpace(lastPublishedHeadSHA)
+	laterPass := isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA)
 	publishInstruction := fmt.Sprintf("For actionable must_fix findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell (inline comments only for must_fix). For no-actionable-finding results, follow the clean-result publishing instructions for this run. After the agent step, finish with `__LOOPER_RESULT__` JSON that includes `summary`, optional `outcome`, and `findings` using the same disposition fields as comment-only (`disposition`, `severity`, `scopeBasis`, `scopeEvidence`, `title`, `body`, optional `path`/`line`). Looper **does** parse this findings list: `follow_up` is retained locally only and must not be submitted; `needs_human` parks the pair and must not be submitted as change-request comments. Do not smuggle follow_up/needs_human into unstructured top-level review body prose as the only carrier of a blocking finding.", forgeName)
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
@@ -7338,7 +7405,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns separate. Accumulate every independent in-scope must_fix before finalizing. If there is no concrete must_fix feedback, start the final summary with `No actionable findings`. Do not invent feedback."
 		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata and diff before invoking you. Use the prepared local worktree plus the supplied metadata/diff as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	if laterPass {
+		parts = append(parts, fmt.Sprintf("Last reviewed head SHA: %s", lastPublishedHeadSHA), fmt.Sprintf("Current head SHA for this pass: %s", currentHeadSHA), repairFrontierPassContract(lastPublishedHeadSHA, currentHeadSHA, commentOnlyPublish))
+	}
+	parts = append(parts, fixerDeclineAdjudicationContract())
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -7398,9 +7469,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
 	if commentOnlyPublish {
+		reviewPassContract := "Review pass contract: complete one full review pass before finalizing. Use the supplied PR metadata, supplied diff, and local worktree to inspect every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass."
+		if laterPass {
+			reviewPassContract = "Review pass contract (later pass / repair frontier): complete the repair-frontier inspection before finalizing. Do not perform a full first-pass rescan of untouched original diff. Focus on unresolved prior must_fix threads, the last-reviewed-head→current-head delta, directly affected contracts/tests/lifecycle invariants, and Fixer evidence. Do not stop after the first issue within that frontier."
+		}
 		parts = append(parts,
 			"Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself. Only must_fix findings become remote Reviewer Summary items; follow_up and needs_human remain in structured completion only.",
-			"Review pass contract: complete one full review pass before finalizing. Use the supplied PR metadata, supplied diff, and local worktree to inspect every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass.",
+			reviewPassContract,
 			"Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. must_fix becomes remote feedback; follow_up is retained only in structured completion; needs_human must not be published as a change request and parks the pair for human judgment.",
 			"Finding accumulator contract: accumulate candidate findings internally before finalizing. For each candidate, track disposition, severity, scopeBasis, scopeEvidence, location, problem, why it matters, and a suggested fix. Deduplicate only the same root cause or a genuinely repeated pattern; keep unrelated concerns separate. Grouping is valid only for a shared root cause with representative locations.",
 			"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
@@ -7427,11 +7502,15 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 		submitPayloadInstruction = ""
 	}
+	reviewPassContract := "Review pass contract: complete one full review pass before publishing. Collect PR metadata, changed-file list, live diffs, prior unresolved feedback, and necessary surrounding context; then scan every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass."
+	if laterPass {
+		reviewPassContract = "Review pass contract (later pass / repair frontier): complete the repair-frontier inspection before publishing. Do not perform a full first-pass rescan of untouched original diff merely to invent ordinary P2/P3 work. Collect unresolved prior must_fix threads, the last-reviewed-head→current-head delta, directly affected call sites/contracts/tests/lifecycle invariants, and Fixer evidence for each prior finding. Do not stop after the first issue within that frontier."
+	}
 	parts = append(parts,
 		idempotencyInstruction,
 		existingMarkerEventInstruction,
 		githubOperationContract,
-		"Review pass contract: complete one full review pass before publishing. Collect PR metadata, changed-file list, live diffs, prior unresolved feedback, and necessary surrounding context; then scan every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass.",
+		reviewPassContract,
 		"Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), path/line, problem, why, and suggestedChange. Emit the full candidate list in `__LOOPER_RESULT__.findings` — Looper parses this JSON. Only must_fix may be submitted through `looper review submit` as remote actionable feedback. Retain follow_up in structured completion only — do not submit follow_up as review comments. For needs_human, do not submit change-request comments; include them in `__LOOPER_RESULT__.findings` so Looper can park the pair for human judgment. Actionable/blocking reviews must carry must_fix as inline comments, not body-only prose.",
 		"Finding accumulator contract: accumulate candidate findings internally before publishing. For each candidate, track disposition, severity, scopeBasis, scopeEvidence, location, problem, why it matters, and a suggested fix. Before submitting, deduplicate only the same root cause or a genuinely repeated pattern; group repeated patterns into systemic comments with representative examples only when they share a root cause. Keep unrelated concerns as separate comments. The publication budget limits review publications, not findings per publication.",
 		"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",

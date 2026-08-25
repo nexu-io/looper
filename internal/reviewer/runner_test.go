@@ -8406,6 +8406,110 @@ func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPromptLaterPassUsesRepairFrontier(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "new-head"}}, "run_1", "reviewer:loop:new-head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "old-head")
+	for _, want := range []string{
+		"Repair frontier contract (later pass)",
+		"Last reviewed head SHA: old-head",
+		"Current head SHA for this pass: new-head",
+		"every unresolved prior must_fix thread",
+		"diff from last reviewed head old-head to current head new-head",
+		"Do not rescan untouched original diff",
+		"late_discovery:",
+		"Ordinary P2/P3 robustness",
+		"disposition follow_up",
+		"disposition needs_human",
+		"Review pass contract (later pass / repair frontier)",
+		"Fixer decline adjudication",
+		"scope dispute, not dismissal authority",
+		"Do not open a duplicate thread",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("later-pass prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, forbidden := range []string{
+		"complete one full review pass before publishing",
+		"scan every changed file/range in scope",
+		"rather than deferring it to a later pass",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("later-pass prompt retains first-pass-only language %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
+func TestBuildReviewPromptFirstPassKeepsExhaustiveContract(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
+	for _, want := range []string{
+		"Review pass contract: complete one full review pass before publishing",
+		"scan every changed file/range in scope",
+		"rather than deferring it to a later pass",
+		"Fixer decline adjudication",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("first-pass prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, forbidden := range []string{
+		"Repair frontier contract (later pass)",
+		"Do not rescan untouched original diff",
+		"late_discovery:",
+		"Review pass contract (later pass / repair frontier)",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("first-pass prompt contains later-pass-only language %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
+func TestNativeResumeReReviewPromptUsesRepairFrontierWhenLaterPass(t *testing.T) {
+	t.Parallel()
+
+	later := nativeResumeReReviewPrompt("acme/looper", 42, "sess-old", "interrupted", "new-head", "reviewer:loop:new-head", "published-old")
+	for _, want := range []string{
+		"repair-frontier re-review",
+		"not a full discard-and-rescan",
+		"last published/reviewed head SHA: published-old",
+		"diff from last published head published-old to current head new-head",
+		"every unresolved prior must_fix thread",
+		// Self-contained later-pass contracts (resume replaces the normal prompt).
+		"Repair frontier contract (later pass)",
+		"late_discovery:",
+		"disposition must_fix",
+		"Ordinary P2/P3 robustness",
+		"disposition follow_up",
+		"disposition needs_human",
+		"Fixer decline adjudication",
+		"Do not open a duplicate thread",
+		"Adjudicate on the existing thread only",
+	} {
+		if !strings.Contains(later, want) {
+			t.Fatalf("later-pass native resume prompt missing %q:\n%s", want, later)
+		}
+	}
+	first := nativeResumeReReviewPrompt("acme/looper", 42, "sess-old", "interrupted", "new-head", "reviewer:loop:new-head", "")
+	if strings.Contains(first, "repair-frontier re-review") {
+		t.Fatalf("first-pass native resume prompt unexpectedly uses frontier language:\n%s", first)
+	}
+	if !strings.Contains(first, "Discard findings, assumptions, anchors") {
+		t.Fatalf("first-pass native resume prompt missing full re-review language:\n%s", first)
+	}
+	for _, forbidden := range []string{
+		"Repair frontier contract (later pass)",
+		"late_discovery:",
+		"Fixer decline adjudication",
+	} {
+		if strings.Contains(first, forbidden) {
+			t.Fatalf("first-pass native resume prompt contains later-pass-only language %q:\n%s", forbidden, first)
+		}
+	}
+}
+
 func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	t.Parallel()
 
@@ -9479,7 +9583,7 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
@@ -9492,7 +9596,7 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail for follow-up bypass:\n%s", prompt)
@@ -9508,7 +9612,7 @@ func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 func TestBuildReviewPromptCommentOnlyOmitsGitHubPublishInstructions(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "")
 
 	for _, forbidden := range []string{"gh pr view", "gh pr diff", "gh api", "GitHub operation contract", "review request removed before publish", "trusted Looper CLI at", "review-thread resolution"} {
 		if strings.Contains(prompt, forbidden) {
@@ -9538,7 +9642,7 @@ func TestBuildReviewPromptCommentOnlyIncludesExistingReviewerSummaryAuthority(t 
 	if err != nil {
 		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
 	}
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "")
 
 	if !strings.Contains(prompt, "Existing Reviewer Summary authority") {
 		t.Fatalf("prompt missing reviewer summary authority:\n%s", prompt)
