@@ -292,6 +292,13 @@ type githubHITLAwaitingLoop struct {
 	BudgetAsk    bool
 }
 
+// githubHITLDecisionOnlyAsk reports Continue/Stop-only GitHub answer filtering.
+// Scope overlays keep a preserved agent ask; the overlay, not the ask kind, is
+// the authority that later Continue/Stop must resolve.
+func githubHITLDecisionOnlyAsk(loop storage.LoopRecord, ask loops.HITLAsk) bool {
+	return loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(loop)
+}
+
 // pollGitHubHITLAnswersOnce runs one pass of the answer-poll lane: for each loop
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
@@ -606,9 +613,10 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		awaiting = append(awaiting, githubHITLAwaitingLoop{
 			ID: l.ID, ProjectID: l.ProjectID, Repo: repo,
 			Transport: ask.Transport, AskStatus: ask.Status, PRNumber: ask.PRNumber, AskCommentID: ask.AskCommentID,
-			// Scope asks share Continue/Stop-only filtering with budget asks so
-			// unrelated PR chatter does not poison the decision.
-			BudgetAsk: loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask),
+			// Scope asks and scope overlays share Continue/Stop-only filtering
+			// with budget asks so unrelated PR chatter does not poison the
+			// decision. Overlay siblings keep a preserved agent ask kind.
+			BudgetAsk: githubHITLDecisionOnlyAsk(l, ask),
 		})
 	}
 	if len(awaiting) == 0 {

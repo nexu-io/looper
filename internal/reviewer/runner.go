@@ -3169,6 +3169,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				kind:    FailureRetryableAfterResume,
 			}
 		}
+		payload, marshalErr := json.Marshal(nativeCompletion)
+		if marshalErr != nil {
+			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
+		}
 		if nativeMustFixReviewMarkerActionable(found) {
 			summary := result.Summary
 			if strings.TrimSpace(nativeCompletion.Summary) != "" {
@@ -3179,15 +3183,23 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				outcome = normalizeCommentOnlyOutcome(nativeCompletion.Outcome)
 			}
 			pending := pendingReviewCheckpoint{
-				HeadSHA:            checkpoint.Snapshot.HeadSHA,
-				IdempotencyKey:     idempotencyKey,
-				Event:              found.Event,
-				Summary:            summary,
-				Outcome:            outcome,
-				ContentFingerprint: reviewMarkerFingerprint(found),
+				HeadSHA:             checkpoint.Snapshot.HeadSHA,
+				IdempotencyKey:      idempotencyKey,
+				Event:               found.Event,
+				Summary:             summary,
+				Outcome:             outcome,
+				ContentFingerprint:  reviewMarkerFingerprint(found),
+				ReviewerSummaryJSON: string(payload),
 			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
-				return checkpoint, err
+			checkpoint.PendingReview = &pending
+			alreadyPublished := false
+			if last, ok := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
+				alreadyPublished = true
+			}
+			if !alreadyPublished {
+				if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+					return checkpoint, err
+				}
 			}
 		}
 		// One authoritative hold: if publish hit the live cap, budget owns the

@@ -89,6 +89,37 @@ func TestPollGitHubHITLAnswersOnceScopeAskSkipsUnrelatedComments(t *testing.T) {
 	}
 }
 
+func TestGitHubHITLDecisionOnlyAskIncludesScopeOverlay(t *testing.T) {
+	t.Parallel()
+	agentAsk := loops.HITLAsk{
+		Status: "awaiting", Transport: "github", PRNumber: 42, AskCommentID: 8001,
+		Question: "unrelated agent question on the sibling",
+	}
+	meta, err := loops.WriteHITLAsk(nil, agentAsk)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	meta, err = loops.WriteReviewScopeHumanState(&meta, loops.ReviewScopeHumanState{
+		HeldBy: "reviewer", PauseReason: loops.ReviewScopeHumanSiblingPauseReason,
+		Question: "Clarify AGENTS.md vs PR non-goals before continue.",
+	})
+	if err != nil {
+		t.Fatalf("WriteReviewScopeHumanState: %v", err)
+	}
+	loop := storage.LoopRecord{ID: "loop_fix", Status: "awaiting_human", MetadataJSON: &meta}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewFixBudgetAsk(ask) {
+		t.Fatalf("ask = (%#v, %v), want preserved agent ask", ask, ok)
+	}
+	if !loops.IsReviewScopeHumanHold(loop) {
+		t.Fatal("want scope overlay hold")
+	}
+	if !githubHITLDecisionOnlyAsk(loop, ask) {
+		t.Fatal("scope overlay must force Continue/Stop-only GitHub filtering")
+	}
+}
+
+
 func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	commentsByPR := map[int64][]githubAnswerComment{
 		42: {{ID: 500, Author: "lefarcen", Body: "<!-- looper:hitl:ask --> ask"}, {ID: 501, Author: "lefarcen", Body: "go with A"}},

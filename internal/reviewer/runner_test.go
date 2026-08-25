@@ -10278,6 +10278,68 @@ func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 	}
 }
 
+func TestRunReviewStepNeedsHumanDoesNotRecountAlreadyPublishedHead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":0},"lastPublishedHeadSha":"abc123"}`
+	loop := storage.LoopRecord{
+		ID: "loop_needs_human_recount", Seq: 96, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert loop: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = false
+	stdout := `__LOOPER_RESULT__={"summary":"Mixed must_fix and needs_human","outcome":"blocking","findings":[{"title":"Bug","body":"fix it","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"a.go","line":1},{"title":"Ambiguous","body":"unclear","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"PR non-goals","path":"b.go","line":2}]}`
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
+			reviewMarkerMissing: false, reviewMarkerEvent: ReviewEventComment, reviewMarkerOutcome: "blocking",
+		}, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{
+			Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
+		}}},
+		Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+	}
+	_, err = runner.runReviewStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_needs_human_recount"},
+		Repo: repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: nowISO},
+		},
+	})
+	var hold *holdSkipError
+	if !errors.As(err, &hold) {
+		t.Fatalf("runReviewStep() error = %v, want holdSkipError", err)
+	}
+	updated, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || updated == nil {
+		t.Fatalf("after retry = (%#v, %v)", updated, getErr)
+	}
+	if got := loops.ReviewerPublishCount(updated.MetadataJSON); got != 0 {
+		t.Fatalf("ReviewerPublishCount = %d, want 0 on already-published head", got)
+	}
+	if !loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("after retry = %#v, want recovered scope hold", updated)
+	}
+}
+
+
 func TestRunReviewStepNeedsHumanAtCapBudgetHoldOnlyNoStackedScope(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
