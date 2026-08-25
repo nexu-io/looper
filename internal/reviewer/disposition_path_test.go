@@ -465,6 +465,76 @@ func TestEnqueueRunningCoalescesPendingSignal(t *testing.T) {
 	}
 }
 
+func TestEnqueueRunningConvergencePassSurvivesFinalize(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"same-head"}`
+	loop := storage.LoopRecord{
+		ID: "loop_run_converge", Seq: 1, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert loop: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: config.ReviewerLoopConfig{QuietPeriodSeconds: 60},
+	})
+	ctx := context.Background()
+	payload := reviewerQueuePayloadJSON("same-head", "sig-disp", true)
+	item := storage.QueueItemRecord{
+		ID: "queue_run_converge", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: buildReviewerDedupeKey("project_1", loop.ID, repo, prNumber),
+		Priority:  storage.QueuePriorityReviewer, Status: "running",
+		AvailableAt: fixture.nowISO(), Attempts: 0, MaxAttempts: 5,
+		PayloadJSON: &payload, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Queue.Upsert(ctx, item); err != nil {
+		t.Fatalf("Upsert queue: %v", err)
+	}
+	got, err := runner.enqueue(ctx, enqueueInput{
+		ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber,
+		HeadSHA: "same-head", ReviewSignalFingerprint: "sig-converge",
+		DispositionOnly: false, ConvergencePass: true,
+	})
+	if err != nil {
+		t.Fatalf("enqueue convergence: %v", err)
+	}
+	if got.ID != item.ID {
+		t.Fatalf("expected same running item, got %s", got.ID)
+	}
+	if got.PayloadJSON == nil || !strings.Contains(*got.PayloadJSON, `"pendingConvergencePass":true`) {
+		t.Fatalf("running payload dropped pendingConvergencePass: %v", got.PayloadJSON)
+	}
+	if strings.Contains(*got.PayloadJSON, `"pendingDispositionOnly":true`) {
+		t.Fatalf("convergence stash must not stay disposition-only: %v", got.PayloadJSON)
+	}
+	if _, err := runner.finalizeSuccessfulReviewerQueue(ctx,
+		storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp"}, loop, item, "run_converge",
+		reviewerCheckpoint{DispositionOnly: true}, "success", "disposition done"); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	active, err := fixture.repos.Queue.FindActiveByDedupe(ctx, item.DedupeKey)
+	if err != nil || active == nil {
+		t.Fatalf("active continuation = (%v, %v)", active, err)
+	}
+	if active.ID == item.ID {
+		t.Fatal("expected a new continuation item after complete")
+	}
+	if !queuedSameHeadConvergencePass(active.PayloadJSON) {
+		t.Fatalf("continuation payload missing convergencePass: %v", active.PayloadJSON)
+	}
+	if payloadDispositionOnly(active.PayloadJSON) {
+		t.Fatalf("continuation must not be disposition-only: %v", active.PayloadJSON)
+	}
+}
+
 func TestDiscoveryLastFilterSkipDoesNotSuppressChangedDisposition(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -1421,6 +1491,116 @@ func TestBudgetHeldNeedsHumanPersistsSignalNoReenqueue(t *testing.T) {
 	}
 	if decision.action != sameHeadDiscoverySkip {
 		t.Fatalf("action = %v, want skip after needs_human fingerprint", decision.action)
+	}
+}
+
+func TestBudgetHeldDispositionNeedsHumanPromotesOnContinue(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "old"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed",
+		Stdout: `{"decisions":[{"threadId":"thread_1","decision":"needs_human","evidence":"ambiguous","confidence":"low"}]}`,
+	}}}
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	revMeta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_nh_budget_continue", Seq: 21, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &revMeta,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_nh_budget_continue_fix", Seq: 22, ProjectID: "project_1", Type: "fixer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: stringPtr(`{"followUpdates":true}`),
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(parked) {
+		t.Fatalf("fixture must be budget hold: %#v", parked)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = parked
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+	if _, err := runner.runThreadResolutionStep(context.Background(), input); err != nil {
+		t.Fatalf("needs_human step: %v", err)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("get reviewer: (%#v, %v)", updated, err)
+	}
+	if !loops.IsReviewFixBudgetHold(*updated) {
+		t.Fatalf("budget hold must remain: status=%s meta=%s", updated.Status, derefString(updated.MetadataJSON))
+	}
+	if loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("must not stack active scope hold under budget: meta=%s", derefString(updated.MetadataJSON))
+	}
+	if !loops.HasPendingReviewScopeHuman(*updated) {
+		t.Fatalf("want pending scope after budget-held needs_human: meta=%s", derefString(updated.MetadataJSON))
+	}
+	if len(github.addThreadReplyCalls) != 0 {
+		t.Fatalf("needs_human must not post remote reply: %#v", github.addThreadReplyCalls)
+	}
+	continued, err := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, *updated, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
+	if err != nil || !continued.Applied {
+		t.Fatalf("ApplyReviewFixBudgetAnswer = (%#v, %v)", continued, err)
+	}
+	afterContinue, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || afterContinue == nil {
+		t.Fatalf("after continue: (%#v, %v)", afterContinue, err)
+	}
+	if loops.IsReviewFixBudgetHold(*afterContinue) {
+		t.Fatalf("budget hold should clear after Continue: %#v", afterContinue)
+	}
+	if !loops.IsReviewScopeHumanHold(*afterContinue) {
+		t.Fatalf("want scope hold after pending promote: status=%s meta=%s", afterContinue.Status, derefString(afterContinue.MetadataJSON))
+	}
+	if loops.HasPendingReviewScopeHuman(*afterContinue) {
+		t.Fatalf("pending should clear after promote: meta=%s", derefString(afterContinue.MetadataJSON))
+	}
+	fixerAfter, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || fixerAfter == nil {
+		t.Fatalf("get fixer: (%#v, %v)", fixerAfter, err)
+	}
+	if !loops.IsReviewFixPairHold(*fixerAfter) {
+		t.Fatalf("fixer sibling must stay held after scope promote: status=%s meta=%s", fixerAfter.Status, derefString(fixerAfter.MetadataJSON))
 	}
 }
 

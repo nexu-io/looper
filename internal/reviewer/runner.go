@@ -2267,14 +2267,21 @@ func promoteReviewerContinuationPayload(payloadJSON *string, head, signal string
 		return "", nil
 	}
 	merged := parseJSONObject(payloadJSON)
+	convergencePass := pendingConvergencePassFromQueuePayload(payloadJSON)
 	delete(merged, "pendingReviewSignalFingerprint")
 	delete(merged, "pendingHeadSha")
 	delete(merged, "pendingDispositionOnly")
+	delete(merged, "pendingConvergencePass")
 	merged["reviewSignalFingerprint"] = signal
 	if strings.TrimSpace(head) != "" {
 		merged["headSha"] = head
 	}
-	merged["dispositionOnly"] = dispositionOnly
+	if convergencePass {
+		merged["convergencePass"] = true
+		merged["dispositionOnly"] = false
+	} else {
+		merged["dispositionOnly"] = dispositionOnly
+	}
 	encoded, err := json.Marshal(merged)
 	if err != nil {
 		return "", err
@@ -2298,7 +2305,8 @@ func (r *Runner) schedulePendingReviewerContinuation(ctx context.Context, projec
 		PRNumber:                *prior.PRNumber,
 		HeadSHA:                 head,
 		ReviewSignalFingerprint: signal,
-		DispositionOnly:         dispositionOnly,
+		DispositionOnly:         dispositionOnly && !queuedSameHeadConvergencePass(prior.PayloadJSON),
+		ConvergencePass:         queuedSameHeadConvergencePass(prior.PayloadJSON),
 		AvailableAt:             availableAt,
 	})
 	if err != nil {
@@ -2729,6 +2737,12 @@ func pendingReviewSignalFromQueuePayload(payloadJSON *string) (head, signal stri
 		dispositionOnly = v
 	}
 	return head, signal, dispositionOnly, true
+}
+
+func pendingConvergencePassFromQueuePayload(payloadJSON *string) bool {
+	payload := parseJSONObject(payloadJSON)
+	v, ok := payload["pendingConvergencePass"].(bool)
+	return ok && v
 }
 
 func payloadDispositionOnly(payloadJSON *string) bool {
@@ -3923,18 +3937,39 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 	if r.repos == nil {
 		return nil
 	}
-	// Do not stack a scope hold over an existing budget hold — refresh handoff only.
-	if loops.IsReviewFixBudgetHold(input.Loop) {
-		if _, err := r.parkReviewerBudgetIfExhausted(ctx, input.Loop); err != nil {
-			return err
-		}
-		return loops.RefreshReviewFixPairHandoff(ctx, r.repos, input.Loop, signal, r.nowISO())
-	}
 	message := strings.TrimSpace(evidence)
 	if message == "" {
 		message = "Thread disposition requires human judgment"
 	}
 	question := fmt.Sprintf("Review thread %s needs human disposition judgment", strings.TrimSpace(threadID))
+	// Do not stack a scope hold over an existing budget hold. Persist pending
+	// evidence so budget Continue can promote it, then refresh the handoff.
+	if loops.IsReviewFixBudgetHold(input.Loop) {
+		if _, err := r.parkReviewerBudgetIfExhausted(ctx, input.Loop); err != nil {
+			return err
+		}
+		if err := loops.RefreshReviewFixPairHandoff(ctx, r.repos, input.Loop, signal, r.nowISO()); err != nil {
+			return err
+		}
+		loop := input.Loop
+		if r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+			if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+				loop = *fresh
+			}
+		}
+		encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
+			loop.MetadataJSON, question, message, r.reviewFixHITLEnabled(),
+		)
+		if err != nil {
+			return err
+		}
+		loop.MetadataJSON = &encoded
+		loop.UpdatedAt = r.nowISO()
+		if r.repos.Loops == nil {
+			return fmt.Errorf("persist pending review scope requires loop storage")
+		}
+		return r.repos.Loops.Upsert(ctx, loop)
+	}
 	_, err := loops.ParkReviewScopeHuman(ctx, r.repos, loops.ParkReviewScopeHumanInput{
 		Held:        input.Loop,
 		Role:        "reviewer",
@@ -7254,6 +7289,12 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				merged["pendingHeadSha"] = input.HeadSHA
 			}
 			merged["pendingDispositionOnly"] = input.DispositionOnly
+			if input.ConvergencePass {
+				merged["pendingConvergencePass"] = true
+				merged["pendingDispositionOnly"] = false
+			} else {
+				delete(merged, "pendingConvergencePass")
+			}
 			encoded, err := json.Marshal(merged)
 			if err != nil {
 				return storage.QueueItemRecord{}, err
