@@ -34,7 +34,7 @@ const noConfiguredWebhookReposReason = "no configured GitHub repos are available
 
 var webhookReconcileRetryDelay = 5 * time.Second
 
-var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "push", "check_run"}
+var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread", "push", "check_run"}
 
 const (
 	webhookForwarderStdoutTailLines = 20

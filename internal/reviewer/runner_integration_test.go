@@ -337,7 +337,7 @@ func (a reviewerIntegrationGatewayAdapter) RemoveIssueLabels(ctx context.Context
 }
 
 func (a reviewerIntegrationGatewayAdapter) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
-	threads, err := a.Gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	threads, err := a.Gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit, AllPages: input.AllPages})
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +345,7 @@ func (a reviewerIntegrationGatewayAdapter) ListReviewThreads(ctx context.Context
 	for _, thread := range threads {
 		comments := make([]ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
-			comments = append(comments, ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
+			comments = append(comments, ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
 		}
 		out = append(out, ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Path: thread.Path, Line: thread.Line, URL: thread.URL, Comments: comments})
 	}

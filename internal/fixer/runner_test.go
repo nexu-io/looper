@@ -6978,6 +6978,7 @@ func (f *runnerFixture) nowISO() string {
 
 type fakeGitHubGateway struct {
 	currentUser           string
+	currentUserEmpty      bool // when true, GetCurrentUserLogin returns ("", nil) without defaulting
 	currentUserErr        error
 	authorErr             error
 	listOpen              []PullRequestSummary
@@ -6986,6 +6987,9 @@ type fakeGitHubGateway struct {
 	viewResponses         []PullRequestDetail
 	viewErr               error
 	threads               []ReviewThread
+	listThreadsErr        error
+	listThreadsCalls      []ListReviewThreadsInput
+	viewThreadErr         error
 	viewThreadCalls       []ViewReviewThreadInput
 	viewIndex             int
 	resolveCalls          []ResolveReviewThreadInput
@@ -7041,6 +7045,9 @@ func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string
 	if f.currentUserErr != nil {
 		return "", f.currentUserErr
 	}
+	if f.currentUserEmpty {
+		return "", nil
+	}
 	return firstNonEmpty(f.currentUser, "looper"), nil
 }
 
@@ -7089,7 +7096,11 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 	return result, nil
 }
 
-func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, _ ListReviewThreadsInput) ([]ReviewThread, error) {
+func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
+	f.listThreadsCalls = append(f.listThreadsCalls, input)
+	if f.listThreadsErr != nil {
+		return nil, f.listThreadsErr
+	}
 	if f.threads != nil {
 		return append([]ReviewThread(nil), f.threads...), nil
 	}
@@ -7115,7 +7126,13 @@ func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, _ ListReviewThr
 
 func (f *fakeGitHubGateway) ViewReviewThread(_ context.Context, input ViewReviewThreadInput) (ReviewThread, error) {
 	f.viewThreadCalls = append(f.viewThreadCalls, input)
-	threads, _ := f.ListReviewThreads(context.Background(), ListReviewThreadsInput{})
+	if f.viewThreadErr != nil {
+		return ReviewThread{}, f.viewThreadErr
+	}
+	threads, err := f.ListReviewThreads(context.Background(), ListReviewThreadsInput{})
+	if err != nil {
+		return ReviewThread{}, err
+	}
 	for _, thread := range threads {
 		if thread.ID == input.ThreadID {
 			return thread, nil
@@ -7133,7 +7150,11 @@ func (f *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddRev
 	f.replyCalls = append(f.replyCalls, input)
 	for i := range f.threads {
 		if f.threads[i].ID == input.ThreadID {
-			f.threads[i].Comments = append(f.threads[i].Comments, ReviewThreadComment{ID: fmt.Sprintf("reply-%d", len(f.replyCalls)), Body: input.Body})
+			f.threads[i].Comments = append(f.threads[i].Comments, ReviewThreadComment{
+				ID:     fmt.Sprintf("reply-%d", len(f.replyCalls)),
+				Author: firstNonEmpty(f.currentUser, "looper"),
+				Body:   input.Body,
+			})
 			return f.replyErr
 		}
 	}

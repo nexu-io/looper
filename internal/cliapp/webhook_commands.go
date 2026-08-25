@@ -788,11 +788,23 @@ func (r *commandRuntime) updateWebhookHookSecret(ctx context.Context, ghPath, re
 	return nil
 }
 
+// webhookHookEvents is the managed-hook subscription set. Keep identical to
+// runtime webhookForwardEvents / webhookForwarderEvents (order may differ).
+var webhookHookEvents = []string{
+	"check_run",
+	"issue_comment",
+	"pull_request",
+	"pull_request_review",
+	"pull_request_review_comment",
+	"pull_request_review_thread",
+	"push",
+}
+
 func webhookHookMutationBodyForCLI(managedURL string, secret string) []byte {
 	body := map[string]any{
 		"name":   "web",
 		"active": true,
-		"events": []string{"check_run", "issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment", "push"},
+		"events": append([]string{}, webhookHookEvents...),
 		"config": map[string]string{"url": managedURL, "content_type": "json", "insecure_ssl": "0", "secret": secret},
 	}
 	encoded, _ := json.Marshal(body)

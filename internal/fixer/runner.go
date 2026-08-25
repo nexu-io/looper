@@ -212,6 +212,10 @@ type ListReviewThreadsInput struct {
 	PRNumber int64
 	CWD      string
 	Limit    int
+	// AllPages requests full pagination for authority reads (withhold
+	// admission). When true, Limit is ignored as a stop condition.
+	// Existing Limit<=0 callers keep the historical default page cap.
+	AllPages bool
 }
 
 type ViewReviewThreadInput struct {
@@ -226,11 +230,12 @@ type ReviewThread struct {
 }
 
 type ReviewThreadComment struct {
-	ID        string
-	Body      string
-	Author    string
-	CreatedAt string
-	UpdatedAt string
+	ID                string
+	Body              string
+	Author            string
+	AuthorAssociation string
+	CreatedAt         string
+	UpdatedAt         string
 }
 
 type ResolveReviewThreadInput struct {
@@ -1950,6 +1955,10 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	}
 	allFixItemsStateHash := hashFixItemsState(allFixItems)
 	fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, repo, detail.Number), detail.HeadSHA, allFixItems)
+	fixItems, err = r.suppressWithheldDispositionFixItems(ctx, project, repo, detail, fixItems)
+	if err != nil {
+		return err
+	}
 	if len(fixItems) == 0 {
 		if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, repo, detail.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
 			return err
@@ -2846,6 +2855,13 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	fixItems, err = r.unsatisfiedForgejoSummaryItems(input.Project.ID, checkpoint.Detail, fixItems)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	// Claim / pre-agent admission: re-evaluate disposition withhold before any
+	// worktree mutation or agent run so already-queued items that gained a
+	// trusted disposition after discovery are not edited or pushed.
+	fixItems, err = r.admitWithheldDispositionFixItems(ctx, input, fixItems)
+	if err != nil {
+		return checkpoint, err
 	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
@@ -3839,6 +3855,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	// successful "fixed" decision whenever a single new thread appeared,
 	// which on PRs receiving a steady stream of bot comments produced an
 	// unbreakable drift loop.
+	looperLogin, err := r.dispositionLooperLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return checkpoint, err
+	}
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
@@ -3861,11 +3881,23 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 		if err != nil {
-			return checkpoint, err
+			// Fail-closed: do not mutate from stale "actionable" assumptions.
+			return checkpoint, &loopError{message: fmt.Sprintf("fixer disposition thread view failed: %v", err), kind: FailureRetryableTransient}
 		}
 		if thread.IsResolved {
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO()})
 			continue
+		}
+		// Last-line drift guard: withhold further edits while Reviewer
+		// adjudicates. Admission already suppressed withheld items before
+		// agent/worktree mutation; this catches races after the agent ran.
+		if ThreadWithheldFromFixer(thread, liveDetail.Author, looperLogin) {
+			allowDecline := normalizeReplyAction(decision.Action) == string(replyActionDeclined) &&
+				allowDeclineReplyWhileWithheld(thread, liveDetail.Author, looperLogin)
+			if !allowDecline {
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_pending_disposition", Message: "Thread withheld pending Reviewer disposition adjudication", UpdatedAt: r.nowISO()})
+				continue
+			}
 		}
 		if hasNonLooperCommentSince(thread, driftSince) {
 			driftCount++
@@ -4247,24 +4279,42 @@ func (r *Runner) replyToDeclinedComment(ctx context.Context, input stepInput, it
 	if item.ThreadID == "" {
 		return "skipped_no_thread", ""
 	}
-	for _, entry := range existing {
-		if entry.Action != string(replyActionDeclined) {
-			continue
-		}
-		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
-			if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
-				return entry.ReplyState, entry.ReplyError
-			}
-		}
-	}
-	body := buildFixerDeclinedReplyBody(item, explanation, decisionFingerprint)
-	existingRemoteReply, err := r.hasExistingFixerDeclinedReply(ctx, input, item, decisionFingerprint)
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 	if err != nil {
 		return "failed", err.Error()
 	}
-	if existingRemoteReply {
+	looperLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return "failed", err.Error()
+	}
+	looperLogin = strings.TrimSpace(looperLogin)
+	marker := declineMarkerForThread(thread, item.ThreadID, decisionFingerprint, looperLogin)
+	lastRejectIdx := lastRejectWontfixIndex(thread, looperLogin)
+	// Checkpoint idempotency only applies when we are not posting a fresh
+	// post-reject decline (new marker after Reviewer reject_wontfix).
+	if lastRejectIdx < 0 || hasValidatedDeclineWithMarkerAfter(thread, marker, looperLogin, lastRejectIdx) {
+		for _, entry := range existing {
+			if entry.Action != string(replyActionDeclined) {
+				continue
+			}
+			if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
+				if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
+					return entry.ReplyState, entry.ReplyError
+				}
+			}
+		}
+	}
+	if hasValidatedDeclineWithMarkerAfter(thread, marker, looperLogin, lastRejectIdx) {
 		return "sent", ""
 	}
+	// Before any reject, also treat the base same-fingerprint marker as sent.
+	if lastRejectIdx < 0 {
+		base := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint)
+		if hasValidatedDeclineWithMarkerAfter(thread, base, looperLogin, -1) {
+			return "sent", ""
+		}
+	}
+	body := buildFixerDeclinedReplyBodyWithMarker(item, explanation, marker)
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: item.ThreadID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return "failed", err.Error()
@@ -4290,20 +4340,21 @@ func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, ite
 }
 
 func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepInput, item FixItem, decisionFingerprint string) (bool, error) {
-	marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint)
-	if marker == "" {
-		return false, nil
-	}
 	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 	if err != nil {
 		return false, err
 	}
-	for _, comment := range thread.Comments {
-		if strings.Contains(comment.Body, marker) {
-			return true, nil
-		}
+	looperLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return false, err
 	}
-	return false, nil
+	looperLogin = strings.TrimSpace(looperLogin)
+	marker := declineMarkerForThread(thread, item.ThreadID, decisionFingerprint, looperLogin)
+	if marker == "" {
+		return false, nil
+	}
+	lastRejectIdx := lastRejectWontfixIndex(thread, looperLogin)
+	return hasValidatedDeclineWithMarkerAfter(thread, marker, looperLogin, lastRejectIdx), nil
 }
 
 func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, evidence threadFixEvidence, item FixItem) (string, PullRequestDetail, error) {
@@ -4559,6 +4610,10 @@ func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
 }
 
 func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint string) string {
+	return buildFixerDeclinedReplyBodyWithMarker(item, explanation, fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint))
+}
+
+func buildFixerDeclinedReplyBodyWithMarker(item FixItem, explanation, marker string) string {
 	var b strings.Builder
 	mention := strings.TrimSpace(item.Author)
 	if mention != "" {
@@ -4571,7 +4626,7 @@ func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint 
 		b.WriteString("\n\n")
 		b.WriteString(explanation)
 	}
-	if marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint); marker != "" {
+	if marker = strings.TrimSpace(marker); marker != "" {
 		b.WriteString("\n\n")
 		b.WriteString(marker)
 	}
@@ -4607,6 +4662,17 @@ func fixerDeclinedReplyMarker(threadID, decisionFingerprint string) string {
 		return ""
 	}
 	return fmt.Sprintf("<!-- looper-fixer-reply-declined thread:%s fingerprint:%s -->", threadID, decisionFingerprint)
+}
+
+// fixerDeclinedReplyMarkerPostReject is a distinct decline marker used once after
+// Reviewer reject_wontfix so the second same-fingerprint decline is visible.
+func fixerDeclinedReplyMarkerPostReject(threadID, decisionFingerprint string) string {
+	threadID = strings.TrimSpace(threadID)
+	decisionFingerprint = strings.TrimSpace(decisionFingerprint)
+	if threadID == "" || decisionFingerprint == "" {
+		return ""
+	}
+	return fmt.Sprintf("<!-- looper-fixer-reply-declined thread:%s fingerprint:%s attempt:post-reject -->", threadID, decisionFingerprint)
 }
 
 func summarizeFixItem(item FixItem) string {
@@ -7377,6 +7443,87 @@ func buildDeclinedThreadFingerprint(item FixItem, headSHA string) string {
 	}, "|")
 	sum := sha1.Sum([]byte(payload))
 	return hex.EncodeToString(sum[:])
+}
+
+// admitWithheldDispositionFixItems re-evaluates withhold at claim/collect-fixes
+// (before prepare-worktree and agent). Failures are retryable fail-closed.
+func (r *Runner) admitWithheldDispositionFixItems(ctx context.Context, input stepInput, fixItems []FixItem) ([]FixItem, error) {
+	if r.github == nil || len(fixItems) == 0 {
+		return fixItems, nil
+	}
+	if r.isForgejoProject(input.Project.ID) {
+		return fixItems, nil
+	}
+	prAuthor, err := r.github.GetPullRequestAuthor(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("fixer disposition admission author lookup failed: %v", err), kind: FailureRetryableTransient}
+	}
+	return r.suppressWithheldDispositionFixItems(ctx, input.Project, input.Repo, PullRequestDetail{Number: input.PRNumber, Author: prAuthor}, fixItems)
+}
+
+// suppressWithheldDispositionFixItems drops threads with unaudited trusted
+// dispositions or validated Fixer declines until Reviewer adjudicates.
+// List/identity failures are retryable fail-closed (never treat items as
+// actionable from a stale empty withhold set).
+func (r *Runner) suppressWithheldDispositionFixItems(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, fixItems []FixItem) ([]FixItem, error) {
+	if r.github == nil || len(fixItems) == 0 {
+		return fixItems, nil
+	}
+	// Forgejo and other non-native providers have no same-head disposition path.
+	if r.isForgejoProject(project.ID) {
+		return fixItems, nil
+	}
+	looperLogin, err := r.dispositionLooperLogin(ctx, project.RepoPath)
+	if err != nil {
+		return nil, err
+	}
+	threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: repo, PRNumber: detail.Number, CWD: project.RepoPath, AllPages: true})
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("fixer withheld-disposition thread listing failed: %v", err), kind: FailureRetryableTransient}
+	}
+	return SuppressWithheldDispositionFixItems(fixItems, threads, detail.Author, looperLogin), nil
+}
+
+// dispositionLooperLogin returns the live Fixer GitHub login used for withhold
+// and mutation-guard identity checks. Empty login (e.g. integration tokens
+// that cannot resolve viewer login) is retryable fail-closed so withheld
+// dispositions are never treated as unowned/actionable.
+func (r *Runner) dispositionLooperLogin(ctx context.Context, repoPath string) (string, error) {
+	if r.github == nil {
+		return "", &loopError{message: "fixer disposition identity lookup failed: github gateway is nil", kind: FailureRetryableTransient}
+	}
+	looperLogin, err := r.github.GetCurrentUserLogin(ctx, repoPath)
+	if err != nil {
+		return "", &loopError{message: fmt.Sprintf("fixer disposition identity lookup failed: %v", err), kind: FailureRetryableTransient}
+	}
+	looperLogin = strings.TrimSpace(looperLogin)
+	if looperLogin == "" {
+		return "", &loopError{message: "fixer disposition identity is empty", kind: FailureRetryableTransient}
+	}
+	return looperLogin, nil
+}
+
+// allowDeclineReplyWhileWithheld is true only when the withhold is the Fixer's
+// own pending decline (idempotent re-reply) or a reject_wontfix path that still
+// has an open post-reject decline slot. accept_wontfix and trusted human
+// dispositions must not receive Fixer decline mutations.
+func allowDeclineReplyWhileWithheld(thread ReviewThread, prAuthorLogin, looperLogin string) bool {
+	lastDecision, lastIdx, hasDecision := lastReviewerAuditDecision(thread, looperLogin)
+	if hasUnauditedValidatedFixerDeclineAfter(thread, looperLogin, lastIdx) {
+		return true
+	}
+	if hasUnauditedTrustedDispositionAfter(thread, prAuthorLogin, lastIdx) {
+		return false
+	}
+	if !hasDecision {
+		return true
+	}
+	switch lastDecision {
+	case decisionRejectWontfix, decisionNotFixed:
+		return true
+	default:
+		return false
+	}
 }
 
 func suppressDeclinedFixItems(loopMetadataJSON *string, headSHA string, fixItems []FixItem) []FixItem {

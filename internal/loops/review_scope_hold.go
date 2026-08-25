@@ -529,6 +529,9 @@ func appendReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repo
 	if head := reviewFixBudgetHandoffHead(held); head != "" {
 		payload["head"] = head
 	}
+	if signal := reviewFixHandoffSignal(held); signal != "" {
+		payload["lastReviewedSignalFingerprint"] = signal
+	}
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType:  reviewScopeHumanHandoffEventType,
 		ProjectID:  optionalBudgetString(projectID),
