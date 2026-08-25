@@ -1201,7 +1201,19 @@ func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd stri
 	if a.gateway == nil {
 		return "", fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", err
+	}
+	login = strings.TrimSpace(login)
+	if login != "" {
+		return login, nil
+	}
+	ident, identErr := a.gateway.GetCurrentUserIdentity(ctx, cwd)
+	if identErr != nil {
+		return "", identErr
+	}
+	return strings.TrimSpace(ident.Login), nil
 }
 
 func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
