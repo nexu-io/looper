@@ -8710,7 +8710,7 @@ func TestBuildReviewPromptForgejoNativeKeepsMustFixInline(t *testing.T) {
 	}
 	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
 	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper"}}
-	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
 	if !strings.Contains(prompt, "every must_fix must remain an inline comment") {
 		t.Fatalf("forgejo prompt missing inline-only must_fix contract:\n%s", prompt)
 	}
