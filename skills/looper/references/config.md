@@ -371,7 +371,7 @@ scope = "changed_ranges"
 publishMode = "single_review"
 
 [roles.reviewer.behavior.loop]
-maxPublishesPerPR = 8
+maxPublishesPerPR = 3
 
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
@@ -379,7 +379,7 @@ blocking = "REQUEST_CHANGES"
 
 [roles.fixer.behavior.loop]
 quietPeriodSeconds = 0
-maxPushesPerPR = 8
+maxPushesPerPR = 3
 
 [roles.fixer.discovery]
 autoDiscovery = true
