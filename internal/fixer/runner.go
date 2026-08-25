@@ -812,12 +812,13 @@ type checkpointRepair struct {
 }
 
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
-// auto-reply posted before resolving the review thread. Stored on the repair
-// checkpoint so resume/retry reuses the same explanation if it still maps to
-// the current fix items snapshot. Fixed decisions must include
-// ThreadCommentsObserved so resolve-comments can verify the live thread still
-// contains exactly the same target review comment IDs before auto-resolving,
-// excluding only prior Looper fixer replies.
+// auto-reply Looper posts on the review thread. Stored on the repair checkpoint
+// so resume/retry reuses the same explanation if it still maps to the current
+// fix items snapshot. Fixed decisions must include ThreadCommentsObserved so
+// resolve-comments can verify the live thread still contains exactly the same
+// target review comment IDs before auto-resolving, excluding only prior Looper
+// fixer replies. Declined decisions reply and leave the thread unresolved for
+// Reviewer adjudication.
 type replyExplanationEntry struct {
 	FixItemID              string `json:"fixItemId"`
 	ThreadID               string `json:"threadId,omitempty"`
@@ -996,9 +997,13 @@ const (
 	agentMissingThreadDecisionExplanation = "Agent did not provide a decision for this thread"
 	agentInvalidThreadDecisionExplanation = "Agent provided an unrecognized decision for this thread"
 	agentDeclinedThreadWithoutReason      = "Agent declined this thread without a substantive reason"
-	maxDeclinedThreadRecords              = 200
-	zeroProgressPauseReason               = "agent_zero_progress"
-	labelMismatchPauseReason              = "fixer_label_mismatch"
+	// declinePendingAdjudicationStatus marks a Fixer decline reply that left the
+	// review thread unresolved for Reviewer accept/reject/needs_human. It is not
+	// terminal same-head suppression and must not call ResolveReviewThread.
+	declinePendingAdjudicationStatus = "decline_pending_adjudication"
+	maxDeclinedThreadRecords         = 200
+	zeroProgressPauseReason          = "agent_zero_progress"
+	labelMismatchPauseReason         = "fixer_label_mismatch"
 )
 
 // parseReplyExplanations extracts the optional review_thread_replies array from
@@ -3778,7 +3783,6 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	resolvedCount := 0
 	contractViolationCount := 0
-	declinedUpdates := map[string]declinedThreadRecord{}
 	commentItems := make([]FixItem, 0, len(fixItems))
 	nativeCommentItems := make([]FixItem, 0, len(fixItems))
 	for _, item := range fixItems {
@@ -3880,6 +3884,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 		switch normalizeReplyAction(decision.Action) {
 		case string(replyActionDeclined):
+			// Decline is a scope dispute for Reviewer adjudication: reply with
+			// evidence, leave the thread unresolved, and do not write terminal
+			// same-head declinedThreads suppression. Legacy remotely-resolved
+			// declines are handled above via thread.IsResolved.
 			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
 			replyState, replyError := r.replyToDeclinedComment(ctx, input, item, decisionFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
 			if replyState == "failed" {
@@ -3890,24 +3898,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
 				return checkpoint, err
 			}
-			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
-				message := err.Error()
-				if strings.Contains(strings.ToLower(message), "already") {
-					if replyState == "sent" {
-						declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
-					}
-					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
-					continue
-				}
-				mutationFailureCount++
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
-				continue
-			}
-			resolvedCount++
-			if replyState == "sent" {
-				declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
-			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "agent_declined", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: declinePendingAdjudicationStatus, Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 		default:
 			replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, decision.Explanation, checkpoint.ResolvedComments.Items)
 			if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
@@ -3987,11 +3978,6 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	if contractViolationCount > 0 {
 		if _, err := r.incrementContractViolationCount(ctx, input.Loop, contractViolationCount); err != nil {
-			return checkpoint, err
-		}
-	}
-	if len(declinedUpdates) > 0 {
-		if _, err := r.persistDeclinedThreadRecords(ctx, input.Loop, declinedUpdates); err != nil {
 			return checkpoint, err
 		}
 	}
@@ -4884,7 +4870,7 @@ func summaryStatusIcon(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "resolved", "already_resolved":
 		return "✅"
-	case "agent_declined":
+	case "agent_declined", declinePendingAdjudicationStatus:
 		return "⏸️"
 	case "failed":
 		return "⚠️"
@@ -6579,7 +6565,9 @@ func hasProgressed(checkpoint fixerCheckpoint) bool {
 		return false
 	}
 	for _, item := range checkpoint.ResolvedComments.Items {
-		if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" || item.Action == string(replyActionFixed) {
+		// decline_pending_adjudication counts as progress (reply posted) but is
+		// not terminal resolution — the thread stays open for Reviewer.
+		if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" || item.Status == declinePendingAdjudicationStatus || item.Action == string(replyActionFixed) {
 			return true
 		}
 	}
@@ -7632,7 +7620,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 			`  - "fixItemId": the exact "id" of the fix item`,
 			`  - "threadId": the exact "threadId" of the same fix item`,
 			`  - "action": "fixed" or "declined"; a later HUMAN-IN-THE-LOOP instruction may additionally enable "needs_human"`,
-			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", respectfully explain why the suggestion was not adopted and cite the relevant scope, intent, repository rule, or concrete technical evidence. Make the explanation self-contained because Looper will post it as the thread reply before resolving the thread. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
+			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", respectfully explain why the suggestion was not adopted and cite the relevant scope, intent, repository rule, or concrete technical evidence. Make the explanation self-contained because Looper will post it as the thread reply and leave the thread unresolved for Reviewer adjudication. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
 			`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. The "id" MUST be the GraphQL PullRequestReviewComment node ID. If you fetched comments with REST pulls/{number}/comments, map REST "node_id" to "id" and REST "updated_at" to "updatedAt"; do not use the REST numeric "id". Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
 			"Before including an entry, re-read the relevant review thread/comment context.",
 			"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
@@ -7757,9 +7745,39 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 	if checkpoint.ReconcileCommits.FinalHeadSHA != "" && checkpoint.ReconcileCommits.BaseHeadSHA != "" && checkpoint.ReconcileCommits.FinalHeadSHA != checkpoint.ReconcileCommits.BaseHeadSHA {
 		return false
 	}
+	// Remaining open comment threads normally mean resolve was a no-op without a
+	// push. Decline-pending-adjudication threads are intentionally left open for
+	// Reviewer and must not trip this generic manual-intervention path. Do not
+	// fold them into terminal declinedThreads suppression.
 	for _, item := range fixItems {
-		if item.Type == "comment" {
+		if item.Type != "comment" {
+			continue
+		}
+		if commentExemptFromNoCommitResolveBlock(checkpoint, item) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// commentExemptFromNoCommitResolveBlock reports whether a still-open remaining
+// comment should not trigger the no-new-commits manual hold. Decline pending
+// Reviewer adjudication is the primary case; already-resolved statuses are
+// included defensively if they still appear in RemainingFixItems.
+func commentExemptFromNoCommitResolveBlock(checkpoint fixerCheckpoint, item FixItem) bool {
+	if checkpoint.ResolvedComments == nil {
+		return false
+	}
+	for _, entry := range checkpoint.ResolvedComments.Items {
+		if entry.FixItemID != item.ID && (entry.ThreadID == "" || entry.ThreadID != item.ThreadID) {
+			continue
+		}
+		switch entry.Status {
+		case declinePendingAdjudicationStatus, "already_resolved", "resolved", "agent_declined":
 			return true
+		default:
+			return false
 		}
 	}
 	return false
