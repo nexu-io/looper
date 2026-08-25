@@ -128,6 +128,9 @@ type defaultSchedulerTickInput struct {
 	// claim finishes and emits a best-effort action_required notification when
 	// the loop newly entered awaiting_human or manual_intervention.
 	NotifyHumanAttention func(context.Context, string)
+	// DrainHITLPair stops live pair agents before a scope Stop answer is
+	// applied by GitHub/Feishu poll. Optional; tests may inject a recorder.
+	DrainHITLPair func(context.Context, storage.LoopRecord) error
 }
 
 type defaultSchedulerHandlers struct {
@@ -3675,6 +3678,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			OnHITLAsk:                notifyHITLAsk,
 			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
 			NotifyHumanAttention:     notifyHumanAttention,
+			DrainHITLPair: func(ctx context.Context, loop storage.LoopRecord) error {
+				return drainReviewFixPairExecutions(ctx, services.Repositories, loop, services.ActiveExecutions)
+			},
 		}
 	}
 

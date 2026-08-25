@@ -257,6 +257,171 @@ func TestHandlerActiveStopDelegatesBudgetHoldToPairedStop(t *testing.T) {
 	}
 }
 
+func TestHandlerActiveStopDrainsScopeHeldSibling(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = false
+	services := rt.Services()
+	var drained []string
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		StopLoop: func(ctx context.Context, loopID, _ string) (any, error) {
+			rec, err := services.Repositories.Loops.GetByID(ctx, loopID)
+			if err != nil || rec == nil {
+				t.Fatalf("StopLoop GetByID(%s) = (%v, %v)", loopID, rec, err)
+			}
+			if rec.Status == "terminated" || rec.Status == "stopped" {
+				t.Fatalf("StopLoop(%s) after terminalize: status=%s", loopID, rec.Status)
+			}
+			drained = append(drained, loopID)
+			if services.ActiveExecutions != nil {
+				if _, stopErr := services.ActiveExecutions.BeginLoopStop(loopID, "test drain"); stopErr != nil {
+					return nil, stopErr
+				}
+			}
+			return map[string]any{"stopped": true, "loopId": loopID}, nil
+		},
+	})
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_scope_stop"
+	repo := "acme/looper"
+	pr := int64(46)
+	target := "pr:acme/looper:46"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewer := storage.LoopRecord{
+		ID: "loop_scope_stop_rev", Seq: 4601, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_scope_stop_fix", Seq: 4602, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	if _, err := loops.ParkReviewScopeHuman(context.Background(), services.Repositories, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: false,
+		Question: "Clarify AGENTS.md rule X before unpause",
+	}); err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/active/"+reviewer.ID+"/stop", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("stop status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v body=%s", err, recorder.Body.String())
+	}
+	if envelope.Data["outcome"] != "review_scope_human_stop" {
+		t.Fatalf("outcome = %#v, want review_scope_human_stop", envelope.Data)
+	}
+	reviewerAfter, _ := services.Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	fixerAfter, _ := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	if reviewerAfter == nil || reviewerAfter.Status != "terminated" || fixerAfter == nil || fixerAfter.Status != "terminated" {
+		t.Fatalf("pair after stop = reviewer %#v fixer %#v, want both terminated", reviewerAfter, fixerAfter)
+	}
+	if len(drained) != 2 {
+		t.Fatalf("StopLoop calls = %v, want both scope-held pair members before terminate", drained)
+	}
+	seen := map[string]bool{drained[0]: true, drained[1]: true}
+	if !seen[reviewer.ID] || !seen[fixer.ID] {
+		t.Fatalf("drained = %v, want %s and %s", drained, reviewer.ID, fixer.ID)
+	}
+}
+
+func TestHandlerNoHITLBudgetContinueNotifiesPromotedScopeHold(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = false
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 3
+	var notified []string
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		NotifyHumanAttention: func(_ context.Context, loopID string) {
+			notified = append(notified, loopID)
+		},
+	})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_budget_promote_notify"
+	repo := "acme/looper"
+	pr := int64(47)
+	target := "pr:acme/looper:47"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_budget_promote_notify_rev", Seq: 4701, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_budget_promote_notify_fix", Seq: 4702, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), services.Repositories, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	encoded, err := loops.PersistPendingReviewScopeHumanEvidence(parked.MetadataJSON, "Clarify AGENTS.md rule X before unpause", "PR non-goals exclude API expansion", false)
+	if err != nil {
+		t.Fatalf("PersistPendingReviewScopeHumanEvidence: %v", err)
+	}
+	parked.MetadataJSON = &encoded
+	if err := services.Repositories.Loops.Upsert(context.Background(), parked); err != nil {
+		t.Fatalf("Loops.Upsert pending: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+fixer.ID+"/start", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	reviewerAfter, err := services.Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || reviewerAfter == nil || !loops.IsReviewScopeHumanHold(*reviewerAfter) || loops.IsReviewFixBudgetHold(*reviewerAfter) {
+		t.Fatalf("reviewer after promote = (%#v, %v), want no-HITL scope hold", reviewerAfter, err)
+	}
+	if reviewerAfter.Status != "paused" {
+		t.Fatalf("reviewer status = %q, want paused", reviewerAfter.Status)
+	}
+	seen := map[string]bool{}
+	for _, id := range notified {
+		seen[id] = true
+	}
+	if !seen[reviewer.ID] {
+		t.Fatalf("NotifyHumanAttention = %v, want promoted scope hold %s", notified, reviewer.ID)
+	}
+}
+
 func TestHandlerActiveStopDoesNotTerminateHistoricalSibling(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = false
