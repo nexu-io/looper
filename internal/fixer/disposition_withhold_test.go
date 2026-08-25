@@ -351,6 +351,44 @@ func TestCollectFixesAdmissionWithholdsBeforeWorktree(t *testing.T) {
 	}
 }
 
+func TestStalePreRejectDeclineReplay(t *testing.T) {
+	t.Parallel()
+	reject := ReviewThreadComment{
+		ID: "c3", Author: testLooperLogin,
+		Body:      "<!-- looper:thread-resolution thread=t1 head=h feedback=f decision=reject_wontfix --> <!-- looper:stamp v=1 -->",
+		CreatedAt: "2026-08-25T08:10:00Z",
+		UpdatedAt: "2026-08-25T08:10:00Z",
+	}
+	thread := ReviewThread{ID: "t1", Comments: []ReviewThreadComment{
+		{ID: "c1", Author: testLooperLogin, Body: "Please fix <!-- looper:stamp v=1 -->"},
+		{ID: "c2", Author: testLooperLogin, Body: "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:x -->"},
+		reject,
+	}}
+	if !stalePreRejectDeclineReplay(thread, testLooperLogin, "2026-08-25T08:00:00Z") {
+		t.Fatal("repair before reject must be treated as stale replay")
+	}
+	if stalePreRejectDeclineReplay(thread, testLooperLogin, "2026-08-25T08:20:00Z") {
+		t.Fatal("repair after reject is a fresh decision, not replay")
+	}
+	if !stalePreRejectDeclineReplay(thread, testLooperLogin, "") {
+		t.Fatal("missing repair time must fail closed as stale replay")
+	}
+	untimed := thread
+	untimed.Comments = append([]ReviewThreadComment{}, thread.Comments...)
+	untimed.Comments[2].CreatedAt = ""
+	untimed.Comments[2].UpdatedAt = ""
+	if !stalePreRejectDeclineReplay(untimed, testLooperLogin, "2026-08-25T08:20:00Z") {
+		t.Fatal("missing reject time must fail closed as stale replay")
+	}
+	thread.Comments = append(thread.Comments, ReviewThreadComment{
+		ID: "c4", Author: testLooperLogin,
+		Body: "second decline <!-- looper-fixer-reply-declined thread:t1 fingerprint:x attempt:post-reject -->",
+	})
+	if stalePreRejectDeclineReplay(thread, testLooperLogin, "2026-08-25T08:00:00Z") {
+		t.Fatal("existing post-reject decline is idempotent, not stale replay")
+	}
+}
+
 func TestReplyToDeclinedAfterRejectPostsNewMarker(t *testing.T) {
 	t.Parallel()
 	fp := "deadbeef"

@@ -53,88 +53,6 @@ type ReviewFixBudgetLiveCaps struct {
 	FixerMaxPushes       int
 }
 
-// ReviewFixHandoffBrief is the operator-facing snapshot for a budget or scope
-// pair hold. Event payloads capture it at park time; CLI/dashboard rebuild it
-// from loop metadata. It never implies review approval or merge.
-type ReviewFixHandoffBrief struct {
-	Kind                          string   `json:"kind"`
-	Resume                        string   `json:"resume"`
-	NextAction                    string   `json:"nextAction"`
-	HITLEnabled                   bool     `json:"hitlEnabled"`
-	Head                          string   `json:"head,omitempty"`
-	LastReviewedSignalFingerprint string   `json:"lastReviewedSignalFingerprint,omitempty"`
-	ReviewerCount                 int      `json:"reviewerCount"`
-	FixerCount                    int      `json:"fixerCount"`
-	ExhaustedRoles                []string `json:"exhaustedRoles,omitempty"`
-	Question                      string   `json:"question,omitempty"`
-	Evidence                      string   `json:"evidence,omitempty"`
-	PauseReason                   string   `json:"pauseReason,omitempty"`
-}
-
-// BuildReviewFixHandoffBrief returns the current hold brief for inspect/dashboard.
-// ok is false when the loop is not a review-fix pair hold.
-func BuildReviewFixHandoffBrief(loop storage.LoopRecord) (ReviewFixHandoffBrief, bool) {
-	if !IsReviewFixPairHold(loop) {
-		return ReviewFixHandoffBrief{}, false
-	}
-	ask, hasAsk := ReadHITLAsk(loop.MetadataJSON)
-	hitlEnabled := hasAsk && strings.EqualFold(strings.TrimSpace(ask.Status), "awaiting") &&
-		(IsReviewFixBudgetAsk(ask) || IsReviewScopeHumanAsk(ask))
-	kind := HITLKindReviewFixBudget
-	if IsReviewScopeHumanHold(loop) && !IsReviewFixBudgetHold(loop) {
-		kind = HITLKindReviewScopeHuman
-	}
-	cli := reviewFixBudgetHandoffResume(loop, false)
-	next := cli
-	if hitlEnabled {
-		next = ReviewFixBudgetAnswerContinue + " / " + ReviewFixBudgetAnswerStop + "; " + cli
-	}
-	meta := parseMetadataObject(loop.MetadataJSON)
-	pauseReason, _ := stringFromAny(meta["pauseReason"])
-	if strings.TrimSpace(pauseReason) == "" {
-		if kind == HITLKindReviewScopeHuman {
-			pauseReason = ReadReviewScopeHumanState(loop.MetadataJSON).PauseReason
-		} else {
-			pauseReason = ReadReviewFixBudgetState(loop.MetadataJSON).PauseReason
-		}
-	}
-	question := strings.TrimSpace(ask.Question)
-	evidence := ""
-	if kind == HITLKindReviewScopeHuman {
-		scope := ReadReviewScopeHumanState(loop.MetadataJSON)
-		if question == "" {
-			question = strings.TrimSpace(scope.Question)
-		}
-		evidence = strings.TrimSpace(scope.Evidence)
-	}
-	var exhausted []string
-	if budget := ReadReviewFixBudgetState(loop.MetadataJSON); strings.TrimSpace(budget.ExhaustedBy) != "" {
-		exhausted = []string{strings.TrimSpace(budget.ExhaustedBy)}
-	}
-	return ReviewFixHandoffBrief{
-		Kind:                          kind,
-		Resume:                        reviewFixBudgetHandoffResume(loop, hitlEnabled),
-		NextAction:                    next,
-		HITLEnabled:                   hitlEnabled,
-		Head:                          reviewFixBudgetHandoffHead(loop),
-		LastReviewedSignalFingerprint: reviewFixHandoffSignal(loop),
-		ReviewerCount:                 ReviewerPublishCount(loop.MetadataJSON),
-		FixerCount:                    FixerPushCount(loop.MetadataJSON),
-		ExhaustedRoles:                exhausted,
-		Question:                      question,
-		Evidence:                      evidence,
-		PauseReason:                   strings.TrimSpace(pauseReason),
-	}, true
-}
-
-func reviewFixHandoffSignal(loop storage.LoopRecord) string {
-	meta := parseMetadataObject(loop.MetadataJSON)
-	if fp, ok := stringFromAny(meta["lastReviewedSignalFingerprint"]); ok {
-		return strings.TrimSpace(fp)
-	}
-	return ""
-}
-
 func BudgetExhausted(count, cap int) bool {
 	return cap > 0 && count >= cap
 }
@@ -700,6 +618,14 @@ func reviewFixBudgetHandoffResume(exhausted storage.LoopRecord, hitlEnabled bool
 		return ReviewFixBudgetAnswerContinue + " / " + ReviewFixBudgetAnswerStop + "; " + cli
 	}
 	return cli
+}
+
+func reviewFixHandoffSignal(loop storage.LoopRecord) string {
+	meta := parseMetadataObject(loop.MetadataJSON)
+	if fp, ok := stringFromAny(meta["lastReviewedSignalFingerprint"]); ok {
+		return strings.TrimSpace(fp)
+	}
+	return ""
 }
 
 // reviewFixBudgetHandoffHead prefers lastPublishedHeadSha (reviewer) then

@@ -3920,6 +3920,15 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			// evidence, leave the thread unresolved, and do not write terminal
 			// same-head declinedThreads suppression. Legacy remotely-resolved
 			// declines are handled above via thread.IsResolved.
+			repairCompletedAt := ""
+			if checkpoint.Repair != nil {
+				repairCompletedAt = checkpoint.Repair.CompletedAt
+			}
+			if stalePreRejectDeclineReplay(thread, looperLogin, repairCompletedAt) {
+				driftCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "skipped_thread_drift", Message: "Reviewer reject_wontfix arrived after the fixer decline decision; will rediscover for a fresh decision", UpdatedAt: r.nowISO()})
+				continue
+			}
 			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
 			replyState, replyError := r.replyToDeclinedComment(ctx, input, item, decisionFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
 			if replyState == "failed" {
@@ -4273,6 +4282,36 @@ func (r *Runner) replyToFixedComment(ctx context.Context, input stepInput, item 
 		return "failed", err.Error()
 	}
 	return "sent", ""
+}
+
+// stalePreRejectDeclineReplay is true when Reviewer reject_wontfix landed after
+// the checkpointed Fixer decline and no post-reject decline exists yet. Replay
+// must rediscover rather than promote that stale decision to a second decline.
+func stalePreRejectDeclineReplay(thread ReviewThread, looperLogin, repairCompletedAt string) bool {
+	lastReject := lastRejectWontfixIndex(thread, looperLogin)
+	if lastReject < 0 {
+		return false
+	}
+	for i := lastReject + 1; i < len(thread.Comments); i++ {
+		if isValidatedFixerDeclineComment(thread.Comments[i], looperLogin) {
+			return false
+		}
+	}
+	repairAt := parseRFC3339OrZero(repairCompletedAt)
+	rejectAt := commentLatestTime(thread.Comments[lastReject])
+	if repairAt.IsZero() || rejectAt.IsZero() {
+		return true
+	}
+	return !repairAt.After(rejectAt)
+}
+
+func commentLatestTime(comment ReviewThreadComment) time.Time {
+	created := parseRFC3339OrZero(comment.CreatedAt)
+	updated := parseRFC3339OrZero(comment.UpdatedAt)
+	if updated.After(created) {
+		return updated
+	}
+	return created
 }
 
 func (r *Runner) replyToDeclinedComment(ctx context.Context, input stepInput, item FixItem, decisionFingerprint, explanation string, existing []checkpointResolvedComment) (string, string) {

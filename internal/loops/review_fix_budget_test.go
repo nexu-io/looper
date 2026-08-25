@@ -945,17 +945,6 @@ func TestHandoffEventIncludesHeadAndConcreteResumeCommands(t *testing.T) {
 	if signal, _ := payload["lastReviewedSignalFingerprint"].(string); signal != "sig-abc" {
 		t.Fatalf("lastReviewedSignalFingerprint = %q, want sig-abc", signal)
 	}
-
-	brief, ok := BuildReviewFixHandoffBrief(parked)
-	if !ok {
-		t.Fatal("BuildReviewFixHandoffBrief() = false, want hold brief")
-	}
-	if brief.Kind != HITLKindReviewFixBudget || !brief.HITLEnabled || brief.LastReviewedSignalFingerprint != "sig-abc" {
-		t.Fatalf("brief = %#v, want budget HITL brief with signal", brief)
-	}
-	if !strings.Contains(brief.NextAction, wantCLI) || !strings.Contains(brief.NextAction, "Continue") {
-		t.Fatalf("nextAction = %q, want Continue plus %q", brief.NextAction, wantCLI)
-	}
 }
 
 func TestHandoffEventIncludesBothRoleMetersAndRetriesOnReentry(t *testing.T) {
