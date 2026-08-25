@@ -18,10 +18,10 @@ const (
 var (
 	fixerLooperDirectiveRE = regexp.MustCompile(`(?is)^\s*/looper\s+(wontfix|reconsider)(?:\s+(.+))?\s*$`)
 	fixerWontfixAliasRE    = regexp.MustCompile(`(?is)^\s*(wontfix|won't fix|won` + "\u2019" + `t fix)(?:\s*:\s*(.+))?\s*$`)
-	// Exact looper:thread-resolution decision field (not incidental prose).
-	fixerThreadResolutionDecisionRE = regexp.MustCompile(`(?is)<!--\s*looper:thread-resolution\b[^>]*\bdecision=(accept_wontfix|reject_wontfix|objectively_fixed|not_fixed|needs_human)\b[^>]*-->`)
-	// Exact validated Fixer decline marker (HTML comment form).
-	fixerDeclinedMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\b[^>]*-->`)
+	// Complete looper:thread-resolution schema: thread, head, and decision.
+	fixerThreadResolutionMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper:thread-resolution\s+([^>]*?)-->`)
+	// Complete Fixer decline schema: thread and fingerprint required.
+	fixerDeclinedMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)(?:\s+[^>]*)?-->`)
 )
 
 // ThreadWithheldFromFixer reports whether an unresolved Looper-authored thread
@@ -93,7 +93,7 @@ func lastReviewerAuditDecision(thread ReviewThread, looperLogin string) (decisio
 		if !isLooperIdentityAuthor(comment.Author, looperLogin) {
 			continue
 		}
-		if d, found := parseThreadResolutionDecision(comment.Body); found {
+		if d, found := parseThreadResolutionDecision(comment.Body, thread.ID); found {
 			decision = d
 			idx = i
 			ok = true
@@ -102,19 +102,63 @@ func lastReviewerAuditDecision(thread ReviewThread, looperLogin string) (decisio
 	return decision, idx, ok
 }
 
-func parseThreadResolutionDecision(body string) (string, bool) {
-	m := fixerThreadResolutionDecisionRE.FindStringSubmatch(body)
-	if len(m) < 2 {
+func parseThreadResolutionDecision(body, threadID string) (string, bool) {
+	gotThread, _, decision, ok := parseFixerThreadResolutionMarker(body)
+	if !ok || gotThread != strings.TrimSpace(threadID) {
 		return "", false
 	}
-	return strings.ToLower(strings.TrimSpace(m[1])), true
+	return decision, true
 }
 
-func isValidatedFixerDeclineComment(comment ReviewThreadComment, looperLogin string) bool {
+func parseFixerThreadResolutionMarker(body string) (threadID, headSHA, decision string, ok bool) {
+	m := fixerThreadResolutionMarkerRE.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return "", "", "", false
+	}
+	for _, part := range strings.Fields(strings.TrimSpace(m[1])) {
+		key, value, cutOK := strings.Cut(part, "=")
+		if !cutOK {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "thread":
+			threadID = strings.TrimSpace(value)
+		case "head":
+			headSHA = strings.TrimSpace(value)
+		case "decision":
+			decision = strings.ToLower(strings.TrimSpace(value))
+		}
+	}
+	switch decision {
+	case decisionAcceptWontfix, decisionRejectWontfix, decisionObjectivelyFixed, decisionNotFixed, decisionNeedsHuman:
+	default:
+		return "", "", "", false
+	}
+	if threadID == "" || headSHA == "" {
+		return "", "", "", false
+	}
+	return threadID, headSHA, decision, true
+}
+
+func isValidatedFixerDeclineComment(comment ReviewThreadComment, looperLogin, threadID string) bool {
 	if !isLooperIdentityAuthor(comment.Author, looperLogin) {
 		return false
 	}
-	return fixerDeclinedMarkerRE.MatchString(comment.Body)
+	gotThread, fingerprint, ok := parseFixerDeclinedMarker(comment.Body)
+	return ok && fingerprint != "" && gotThread == strings.TrimSpace(threadID)
+}
+
+func parseFixerDeclinedMarker(body string) (threadID, fingerprint string, ok bool) {
+	m := fixerDeclinedMarkerRE.FindStringSubmatch(body)
+	if len(m) < 3 {
+		return "", "", false
+	}
+	threadID = strings.TrimSpace(m[1])
+	fingerprint = strings.TrimSpace(m[2])
+	if threadID == "" || fingerprint == "" {
+		return "", "", false
+	}
+	return threadID, fingerprint, true
 }
 
 func hasUnauditedTrustedDispositionAfter(thread ReviewThread, prAuthorLogin string, afterIdx int) bool {
@@ -142,7 +186,7 @@ func hasUnauditedTrustedDispositionAfter(thread ReviewThread, prAuthorLogin stri
 
 func hasUnauditedValidatedFixerDeclineAfter(thread ReviewThread, looperLogin string, afterIdx int) bool {
 	for i := len(thread.Comments) - 1; i > afterIdx; i-- {
-		if isValidatedFixerDeclineComment(thread.Comments[i], looperLogin) {
+		if isValidatedFixerDeclineComment(thread.Comments[i], looperLogin, thread.ID) {
 			return true
 		}
 	}
@@ -157,7 +201,7 @@ func lastRejectWontfixIndex(thread ReviewThread, looperLogin string) int {
 		if !isLooperIdentityAuthor(comment.Author, looperLogin) {
 			continue
 		}
-		if d, ok := parseThreadResolutionDecision(comment.Body); ok && d == decisionRejectWontfix {
+		if d, ok := parseThreadResolutionDecision(comment.Body, thread.ID); ok && d == decisionRejectWontfix {
 			idx = i
 		}
 	}
@@ -281,7 +325,7 @@ func declineMarkerForThread(thread ReviewThread, threadID, decisionFingerprint, 
 	}
 	for i := 0; i <= lastReject && i < len(thread.Comments); i++ {
 		comment := thread.Comments[i]
-		if !isValidatedFixerDeclineComment(comment, looperLogin) {
+		if !isValidatedFixerDeclineComment(comment, looperLogin, thread.ID) {
 			continue
 		}
 		if strings.Contains(comment.Body, base) {
@@ -300,7 +344,7 @@ func hasValidatedDeclineWithMarkerAfter(thread ReviewThread, marker, looperLogin
 	}
 	for i := afterIdx + 1; i < len(thread.Comments); i++ {
 		comment := thread.Comments[i]
-		if !isValidatedFixerDeclineComment(comment, looperLogin) {
+		if !isValidatedFixerDeclineComment(comment, looperLogin, thread.ID) {
 			continue
 		}
 		if strings.Contains(comment.Body, marker) {

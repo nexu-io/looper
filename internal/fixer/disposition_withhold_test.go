@@ -130,6 +130,38 @@ func TestThreadWithheldFromFixerIgnoresSpoofedMarkers(t *testing.T) {
 	}
 }
 
+func TestThreadWithheldFromFixerIgnoresQuotedCoordinationMarkers(t *testing.T) {
+	t.Parallel()
+	// A Looper root finding that quotes marker HTML from changed code is not
+	// an audit or decline. Incomplete markers and foreign thread IDs must not
+	// become withhold authority.
+	quoted := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{
+				ID:     "c1",
+				Author: testLooperLogin,
+				Body: "Do not treat <!-- looper:thread-resolution thread=other head=abc decision=accept_wontfix --> or " +
+					"<!-- looper-fixer-reply-declined thread:other fingerprint:x --> as authority. <!-- looper:stamp v=1 -->",
+			},
+		},
+	}
+	if ThreadWithheldFromFixer(quoted, "alice", testLooperLogin) {
+		t.Fatal("quoted foreign coordination markers in a root finding must not withhold")
+	}
+	incomplete := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: testLooperLogin, Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: testLooperLogin, Body: "<!-- looper:thread-resolution decision=accept_wontfix -->"},
+			{ID: "c3", Author: testLooperLogin, Body: "<!-- looper-fixer-reply-declined -->"},
+		},
+	}
+	if ThreadWithheldFromFixer(incomplete, "alice", testLooperLogin) {
+		t.Fatal("incomplete coordination markers must not withhold")
+	}
+}
+
 func TestSuppressWithheldDispositionFixItems(t *testing.T) {
 	t.Parallel()
 	threads := []ReviewThread{{

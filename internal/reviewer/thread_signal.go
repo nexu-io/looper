@@ -273,6 +273,32 @@ func hasThreadResolutionAuditForSignalForLogin(thread ReviewThread, threadID, he
 	return false
 }
 
+// resumeDispositionDecisionFromRemoteAudit returns the already-published
+// disposition when a validated Looper audit for this thread, head, and current
+// feedback already exists. Spec §8.2: retry observes the remote audit marker
+// and must not reclassify after Reviewer's own mutation.
+func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, looperLogin string) (threadResolutionAgentDecision, bool) {
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" || strings.TrimSpace(thread.ID) == "" {
+		return threadResolutionAgentDecision{}, false
+	}
+	candidateFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, looperLogin)
+	if candidateFP != "" && hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, headSHA, candidateFP, "accept_wontfix", looperLogin) {
+		return threadResolutionAgentDecision{
+			ThreadID: thread.ID, Decision: "accept_wontfix",
+			Evidence: "resume existing accept_wontfix audit", Confidence: "high",
+		}, true
+	}
+	excl := coordinationExcludedThreadFeedbackFingerprint(thread, looperLogin)
+	if excl != "" && hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, headSHA, excl, "reject_wontfix", looperLogin) {
+		return threadResolutionAgentDecision{
+			ThreadID: thread.ID, Decision: "reject_wontfix",
+			Evidence: "resume existing reject_wontfix audit", Confidence: "high",
+		}, true
+	}
+	return threadResolutionAgentDecision{}, false
+}
+
 // parseFixerDeclinedMarker extracts thread/fingerprint from the exact decline marker.
 func parseFixerDeclinedMarker(body string) (threadID, fingerprint string, ok bool) {
 	m := fixerDeclinedMarkerRE.FindStringSubmatch(body)

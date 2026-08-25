@@ -131,3 +131,27 @@ func TestHasThreadResolutionAuditForSignalIgnoresLegacyMarkers(t *testing.T) {
 		t.Fatal("extended marker should match")
 	}
 }
+
+func TestResumeDispositionDecisionFromRemoteAudit(t *testing.T) {
+	t.Parallel()
+	base := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+	)
+	fp := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+	if fp == "" {
+		t.Fatal("expected feedback fingerprint")
+	}
+	withAudit := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: threadResolutionMarker("t1", "abc", fp, "accept_wontfix")},
+	)
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(withAudit, "abc", "looper-bot")
+	if !ok || decision.Decision != "accept_wontfix" {
+		t.Fatalf("got %#v ok=%v, want accept resume", decision, ok)
+	}
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(base, "abc", "looper-bot"); ok {
+		t.Fatal("missing audit must not resume")
+	}
+}

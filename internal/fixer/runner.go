@@ -4304,7 +4304,7 @@ func stalePreRejectDeclineReplay(thread ReviewThread, looperLogin, repairComplet
 		return false
 	}
 	for i := lastReject + 1; i < len(thread.Comments); i++ {
-		if isValidatedFixerDeclineComment(thread.Comments[i], looperLogin) {
+		if isValidatedFixerDeclineComment(thread.Comments[i], looperLogin, thread.ID) {
 			return false
 		}
 	}

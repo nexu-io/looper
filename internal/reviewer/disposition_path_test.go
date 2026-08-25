@@ -1947,8 +1947,8 @@ func TestAcceptReplyThenResolveFailureRetriesResolve(t *testing.T) {
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{
 		{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"accept_wontfix","evidence":"scope","confidence":"high"}]}`},
-		// Second classify if short-circuit fails incorrectly — should not be needed when audit present.
-		{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"accept_wontfix","evidence":"scope","confidence":"high"}]}`},
+		// Contradictory retry classify must not run; if it did, reject would abandon the accept.
+		{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"reject_wontfix","evidence":"flip","confidence":"high"}]}`},
 	}}
 	fixture := newRunnerFixture(t)
 	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123"}`
@@ -2004,6 +2004,12 @@ func TestAcceptReplyThenResolveFailureRetriesResolve(t *testing.T) {
 	checkpoint2, err := runner.runThreadResolutionStep(context.Background(), input)
 	if err != nil {
 		t.Fatalf("retry error = %v", err)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("classifier starts = %d, want 1 (retry must resume accept audit without reclassify)", len(agent.starts))
+	}
+	if len(github.addThreadReplyCalls) != 1 {
+		t.Fatalf("replies after retry = %d, want 1 (no contradictory reject)", len(github.addThreadReplyCalls))
 	}
 	if len(github.resolveThreadCalls) != 2 {
 		t.Fatalf("resolves after retry = %d, want 2", len(github.resolveThreadCalls))

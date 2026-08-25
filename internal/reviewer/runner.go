@@ -3419,9 +3419,14 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		candidateThreads = append(candidateThreads, c.thread)
 	}
 	// Pre-classify one-rejection quota without another classifier call.
+	// Existing remote audits are decision authority on retry (spec §8.2).
 	decisionByID := map[string]threadResolutionAgentDecision{}
 	classifyThreads := make([]ReviewThread, 0, len(candidateThreads))
 	for _, thread := range candidateThreads {
+		if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin); ok {
+			decisionByID[thread.ID] = decision
+			continue
+		}
 		if ForceNeedsHumanAfterSecondDecline(thread, checkpoint.Snapshot.HeadSHA, currentLogin) {
 			decisionByID[thread.ID] = threadResolutionAgentDecision{
 				ThreadID: thread.ID, Decision: "needs_human",
