@@ -224,6 +224,43 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 	return nil
 }
 
+// deliverFeishuHITLCardAction applies a card-action click. Overlay siblings keep
+// an ordinary agent card interactive; those option clicks are not pair
+// Continue/Stop decisions and must not fail-close the inbox cursor ahead of the
+// primary scope card.
+func deliverFeishuHITLCardAction(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, answer string, drain func(context.Context, storage.LoopRecord) error, onAnswered func(context.Context, string, string)) error {
+	caps := reviewFixBudgetLiveCaps(cfg, "")
+	if repos != nil && repos.Loops != nil {
+		if loop, err := repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
+			if feishuOverlayResidualCardIsNotPairDecision(*loop, answer) {
+				return nil
+			}
+		}
+	}
+	if err := drainScopeHoldOnStop(ctx, repos, loopID, answer, drain); err != nil {
+		return err
+	}
+	if err := deliverHITLAnswerToLoopWithCaps(ctx, repos, db, nowISO, loopID, answer, caps); err != nil {
+		return err
+	}
+	if onAnswered != nil {
+		onAnswered(ctx, loopID, answer)
+	}
+	return nil
+}
+
+func feishuOverlayResidualCardIsNotPairDecision(loop storage.LoopRecord, answer string) bool {
+	if !loops.IsReviewScopeHumanHold(loop) {
+		return false
+	}
+	if loops.IsReviewFixBudgetContinue(answer) || loops.IsReviewFixBudgetStop(answer) {
+		return false
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	return ok && githubHITLResidualOrdinaryAsk(ask)
+}
+
 // feishuDecisionCardLoopID returns the loop whose Continue/Stop Feishu card
 // should be resolved for a typed decision. Overlay siblings keep an ordinary
 // agent ask, so the pair's scope/budget primary card is the one that must close.
@@ -336,21 +373,7 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return loop.ID
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			caps := reviewFixBudgetLiveCaps(input.Config, "")
-			if loop, err := input.Repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
-				caps = reviewFixBudgetLiveCaps(input.Config, loop.ProjectID)
-			}
-			if err := drainScopeHoldOnStop(ctx, input.Repos, loopID, answer, input.DrainHITLPair); err != nil {
-				return err
-			}
-			if err := deliverHITLAnswerToLoopWithCaps(ctx, input.Repos, input.DB, nowISO, loopID, answer, caps); err != nil {
-				return err
-			}
-			// Mark the ask card resolved ("✅ 已选:X", brief preserved).
-			if input.OnHITLAnswerDelivered != nil {
-				input.OnHITLAnswerDelivered(ctx, loopID, answer)
-			}
-			return nil
+			return deliverFeishuHITLCardAction(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, answer, input.DrainHITLPair, input.OnHITLAnswerDelivered)
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
 			return enqueueFeishuHITLMessage(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, text, input.OnHITLAnswerDelivered, input.DrainHITLPair)

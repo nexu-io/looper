@@ -437,7 +437,7 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 					continue
 				}
 				if !awaiting[j].BudgetAsk {
-					if residualOrdinaryHasEarlierAnswer(comments, awaiting[j].AskCommentID, commentID) {
+					if residualOrdinaryHasEarlierAnswer(comments, awaiting[j].AskCommentID, commentID, deps.answerAuthors) {
 						continue
 					}
 				}
@@ -464,17 +464,17 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 	return delivered
 }
 
-func residualOrdinaryHasEarlierAnswer(comments []githubAnswerComment, askCommentID, consumedID int64) bool {
+func residualOrdinaryHasEarlierAnswer(comments []githubAnswerComment, askCommentID, consumedID int64, answerAuthors []string) bool {
 	if consumedID == 0 {
 		return false
 	}
-	_, id := detectGitHubHITLAnswerMatchingWithID(comments, askCommentID, nil, func(body string) bool {
+	_, id := detectGitHubHITLAnswerMatchingWithID(comments, askCommentID, answerAuthors, func(body string) bool {
 		return !loops.IsReviewFixBudgetContinue(body) && !loops.IsReviewFixBudgetStop(body)
 	}, map[int64]struct{}{consumedID: {}})
 	return id != 0 && id < consumedID
 }
 
-func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
+func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment, answerAuthors []string) error {
 	if repos == nil || repos.Loops == nil || commentID == 0 || prNumber == 0 {
 		return nil
 	}
@@ -521,7 +521,7 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 		if ask.AskCommentID >= commentID {
 			continue
 		}
-		if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID) {
+		if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID, answerAuthors) {
 			continue
 		}
 		ask.AskCommentID = commentID
@@ -895,7 +895,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return githubHITLPRHasRemainingAwaiting(ctx, input.Repos, project.ID, repo, pr)
 		},
 		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
-			return advanceSiblingGitHubHITLAsksPastComment(ctx, input.Repos, projectID, repo, prNumber, exceptLoopID, commentID, comments)
+			return advanceSiblingGitHubHITLAsksPastComment(ctx, input.Repos, projectID, repo, prNumber, exceptLoopID, commentID, comments, answerAuthors)
 		},
 		projectCWD:    func(string) string { return project.RepoPath },
 		answerAuthors: answerAuthors,

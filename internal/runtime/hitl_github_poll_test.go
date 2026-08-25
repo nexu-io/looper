@@ -412,7 +412,7 @@ func TestPollGitHubHITLAnswersOnceDoesNotReuseScopeContinueOnSecondPass(t *testi
 			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
 		},
 		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
-			return advanceSiblingGitHubHITLAsksPastComment(ctx, repos, projectID, repo, prNumber, exceptLoopID, commentID, comments)
+			return advanceSiblingGitHubHITLAsksPastComment(ctx, repos, projectID, repo, prNumber, exceptLoopID, commentID, comments, nil)
 		},
 		remainingAwaiting: func(ctx contextType, repo string, pr int64) bool {
 			return githubHITLPRHasRemainingAwaiting(ctx, repos, projectID, repo, pr)
@@ -530,7 +530,7 @@ func TestPollGitHubHITLAnswersOnceDoesNotReuseConsumedContinueWithoutEarlierText
 			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
 		},
 		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
-			return advanceSiblingGitHubHITLAsksPastComment(ctx, repos, projectID, repo, prNumber, exceptLoopID, commentID, comments)
+			return advanceSiblingGitHubHITLAsksPastComment(ctx, repos, projectID, repo, prNumber, exceptLoopID, commentID, comments, nil)
 		},
 		remainingAwaiting: func(ctx contextType, repo string, pr int64) bool {
 			return githubHITLPRHasRemainingAwaiting(ctx, repos, projectID, repo, pr)
@@ -554,6 +554,127 @@ func TestPollGitHubHITLAnswersOnceDoesNotReuseConsumedContinueWithoutEarlierText
 	}
 	if remaining.AskCommentID != 8004 {
 		t.Fatalf("fixer AskCommentID = %d, want consumed Continue 8004 so it cannot answer the ordinary ask", remaining.AskCommentID)
+	}
+
+	second := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		githubHITLAwaitingFrom(*freshFixer, remaining),
+	}, deps)
+	if second != 0 || len(delivered) != 1 {
+		t.Fatalf("second pass delivered = %#v n=%d, want no reuse of consumed Continue", delivered, second)
+	}
+}
+
+func TestPollGitHubHITLAnswersOnceIgnoresUnauthorizedEarlierSiblingText(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_scope_unauthorized_earlier"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewer := storage.LoopRecord{
+		ID: "loop_scope_unauth_earlier_reviewer", Seq: 61, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_scope_unauth_earlier_fixer", Seq: 62, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	agentAsk := loops.HITLAsk{
+		Kind: "agent_question", Question: "Which approach should Fixer take?",
+		Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO,
+		Transport: "github", PRNumber: pr, AskCommentID: 8002,
+	}
+	fixerMeta, err := loops.WriteHITLAsk(nil, agentAsk)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk(fixer): %v", err)
+	}
+	fixer.MetadataJSON = &fixerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr,
+		NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md vs PR non-goals before continue.",
+	}); err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	reviewer = stampGitHubHITLAsk(t, repos, reviewer.ID, 8001)
+	fixer = stampGitHubHITLAsk(t, repos, fixer.ID, 8002)
+	reviewerAsk, ok := loops.ReadHITLAsk(reviewer.MetadataJSON)
+	if !ok || !loops.IsReviewScopeHumanAsk(reviewerAsk) {
+		t.Fatalf("reviewer ask = (%#v, %v), want scope ask", reviewerAsk, ok)
+	}
+	fixerAsk, ok := loops.ReadHITLAsk(fixer.MetadataJSON)
+	if !ok || loops.IsReviewScopeHumanAsk(fixerAsk) {
+		t.Fatalf("fixer ask = (%#v, %v), want preserved agent ask", fixerAsk, ok)
+	}
+
+	allowed := []string{"operator"}
+	comments := []githubAnswerComment{
+		{ID: 8001, Author: "looper", Body: "<!-- looper:hitl:ask --> Clarify AGENTS.md?"},
+		{ID: 8002, Author: "looper", Body: "<!-- looper:hitl:ask --> Which approach?"},
+		{ID: 8003, Author: "outsider", Body: "use approach A"},
+		{ID: 8004, Author: "operator", Body: "Continue"},
+	}
+	var delivered []string
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return comments, nil
+		},
+		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			delivered = append(delivered, loopID+"="+answer)
+			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+		},
+		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
+			return advanceSiblingGitHubHITLAsksPastComment(ctx, repos, projectID, repo, prNumber, exceptLoopID, commentID, comments, allowed)
+		},
+		remainingAwaiting: func(ctx contextType, repo string, pr int64) bool {
+			return githubHITLPRHasRemainingAwaiting(ctx, repos, projectID, repo, pr)
+		},
+		answerAuthors: allowed,
+	}
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		githubHITLAwaitingFrom(reviewer, reviewerAsk),
+		githubHITLAwaitingFrom(fixer, fixerAsk),
+	}, deps)
+	if n != 1 || len(delivered) != 1 || delivered[0] != reviewer.ID+"=Continue" {
+		t.Fatalf("first pass delivered = %#v n=%d, want reviewer Continue", delivered, n)
+	}
+
+	freshFixer, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || freshFixer == nil || freshFixer.Status != "awaiting_human" || loops.IsReviewScopeHumanHold(*freshFixer) {
+		t.Fatalf("fixer after first pass = (%#v, %v), want awaiting preserved ask", freshFixer, err)
+	}
+	remaining, ok := loops.ReadHITLAsk(freshFixer.MetadataJSON)
+	if !ok || remaining.Status != "awaiting" || remaining.Question != agentAsk.Question || remaining.Answer != "" {
+		t.Fatalf("fixer ask after first pass = (%#v, %v), want unanswered agent question", remaining, ok)
+	}
+	if remaining.AskCommentID != 8004 {
+		t.Fatalf("fixer AskCommentID = %d, want consumed Continue 8004; unauthorized earlier text is not a preserved answer", remaining.AskCommentID)
 	}
 
 	second := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
@@ -708,7 +829,7 @@ func TestPollGitHubHITLAnswersOnceLimitsConsumedDecisionToPairLane(t *testing.T)
 			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
 		},
 		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
-			return advanceSiblingGitHubHITLAsksPastComment(ctx, repos, projectID, repo, prNumber, exceptLoopID, commentID, comments)
+			return advanceSiblingGitHubHITLAsksPastComment(ctx, repos, projectID, repo, prNumber, exceptLoopID, commentID, comments, nil)
 		},
 	})
 	if n != 3 {
