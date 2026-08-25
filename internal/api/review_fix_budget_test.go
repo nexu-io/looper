@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -419,6 +420,90 @@ func TestHandlerNoHITLBudgetContinueNotifiesPromotedScopeHold(t *testing.T) {
 	}
 	if !seen[reviewer.ID] {
 		t.Fatalf("NotifyHumanAttention = %v, want promoted scope hold %s", notified, reviewer.ID)
+	}
+}
+
+func TestHandlerNoHITLBudgetContinueNotifiesPrimaryWhenSiblingListFails(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = false
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 3
+	var notified []string
+	services := rt.Services()
+	services.Repositories = storage.NewRepositories(errorInjectingQuerier{
+		db: services.Coordinator.DB(),
+		queryError: func(query string) error {
+			if strings.Contains(query, "SELECT * FROM loops") && !strings.Contains(query, "WHERE") {
+				return errors.New("database is locked")
+			}
+			return nil
+		},
+	})
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: fixedRuntimeState{services: services},
+		NotifyHumanAttention: func(_ context.Context, loopID string) {
+			notified = append(notified, loopID)
+		},
+	})
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_budget_promote_list_fail"
+	repo := "acme/looper"
+	pr := int64(48)
+	target := "pr:acme/looper:48"
+	if err := rt.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_budget_promote_list_fail_rev", Seq: 4801, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_budget_promote_list_fail_fix", Seq: 4802, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := rt.Services().Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	if err := rt.Services().Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), rt.Services().Repositories, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	encoded, err := loops.PersistPendingReviewScopeHumanEvidence(parked.MetadataJSON, "Clarify AGENTS.md rule X before unpause", "PR non-goals exclude API expansion", false)
+	if err != nil {
+		t.Fatalf("PersistPendingReviewScopeHumanEvidence: %v", err)
+	}
+	parked.MetadataJSON = &encoded
+	if err := rt.Services().Repositories.Loops.Upsert(context.Background(), parked); err != nil {
+		t.Fatalf("Loops.Upsert pending: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+fixer.ID+"/start", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("start status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	reviewerAfter, err := rt.Services().Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || reviewerAfter == nil || !loops.IsReviewScopeHumanHold(*reviewerAfter) || loops.IsReviewFixBudgetHold(*reviewerAfter) {
+		t.Fatalf("reviewer after promote = (%#v, %v), want no-HITL scope hold", reviewerAfter, err)
+	}
+	fixerAfter, err := rt.Services().Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || fixerAfter == nil || !loops.IsSiblingReviewScopeHumanPause(fixerAfter.MetadataJSON) {
+		t.Fatalf("fixer after promote = (%#v, %v), want sibling-only pause", fixerAfter, err)
+	}
+	if len(notified) != 1 || notified[0] != reviewer.ID {
+		t.Fatalf("NotifyHumanAttention = %v, want primary scope hold %s after sibling List failure", notified, reviewer.ID)
 	}
 }
 

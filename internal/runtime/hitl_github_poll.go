@@ -424,7 +424,10 @@ func githubHITLPRHasRemainingAwaiting(ctx context.Context, repos *storage.Reposi
 	}
 	all, err := repos.Loops.List(ctx)
 	if err != nil {
-		return false
+		// Unknown remaining state must keep looper:awaiting-human. A transient
+		// List error after one delivery must not clear the label while another
+		// GitHub-backed ask may still be open on the PR.
+		return true
 	}
 	repo = strings.TrimSpace(repo)
 	for _, loop := range all {

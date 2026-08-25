@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -303,6 +305,141 @@ func TestPollGitHubHITLAnswersOnceConsumesOneScopeDecisionPerPair(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestPollGitHubHITLAnswersOnceKeepsLabelWhenRemainingLookupFails(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_remaining_list_fail"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewer := storage.LoopRecord{
+		ID: "loop_remaining_list_fail_rev", Seq: 41, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_remaining_list_fail_fix", Seq: 42, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	agentAsk := loops.HITLAsk{
+		Kind: "agent_question", Question: "Which approach should Fixer take?",
+		Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO,
+		Transport: "github", PRNumber: pr, AskCommentID: 8002,
+	}
+	fixerMeta, err := loops.WriteHITLAsk(nil, agentAsk)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk(fixer): %v", err)
+	}
+	fixer.MetadataJSON = &fixerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr,
+		NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md vs PR non-goals before continue.",
+	}); err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	reviewer = stampGitHubHITLAsk(t, repos, reviewer.ID, 8001)
+	fixer = stampGitHubHITLAsk(t, repos, fixer.ID, 8002)
+	reviewerAsk, ok := loops.ReadHITLAsk(reviewer.MetadataJSON)
+	if !ok {
+		t.Fatal("reviewer missing scope ask")
+	}
+	fixerAsk, ok := loops.ReadHITLAsk(fixer.MetadataJSON)
+	if !ok {
+		t.Fatal("fixer missing preserved agent ask")
+	}
+
+	failingRepos := storage.NewRepositories(failLoopsListQuerier{db: coordinator.DB()})
+	if githubHITLPRHasRemainingAwaiting(context.Background(), failingRepos, projectID, repo, pr) != true {
+		t.Fatal("remaining lookup must treat a List error as remaining")
+	}
+
+	var cleared []int64
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		{
+			ID: reviewer.ID, ProjectID: projectID, Repo: repo, Transport: "github",
+			AskStatus: reviewerAsk.Status, PRNumber: pr, AskCommentID: reviewerAsk.AskCommentID,
+			BudgetAsk: githubHITLDecisionOnlyAsk(reviewer, reviewerAsk),
+		},
+		{
+			ID: fixer.ID, ProjectID: projectID, Repo: repo, Transport: "github",
+			AskStatus: fixerAsk.Status, PRNumber: pr, AskCommentID: fixerAsk.AskCommentID,
+			BudgetAsk: githubHITLDecisionOnlyAsk(fixer, fixerAsk),
+		},
+	}, githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return []githubAnswerComment{
+				{ID: 8001, Author: "looper", Body: "<!-- looper:hitl:ask --> Clarify AGENTS.md?"},
+				{ID: 8002, Author: "looper", Body: "<!-- looper:hitl:ask --> Which approach?"},
+				{ID: 8003, Author: "operator", Body: "Continue"},
+			}, nil
+		},
+		deliverAnswer: func(ctx contextType, loopID, answer string) error {
+			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+		},
+		clearAwaiting: func(_ contextType, _ string, gotPR int64, _ string) {
+			cleared = append(cleared, gotPR)
+		},
+		remainingAwaiting: func(ctx contextType, gotRepo string, gotPR int64) bool {
+			return githubHITLPRHasRemainingAwaiting(ctx, failingRepos, projectID, gotRepo, gotPR)
+		},
+	})
+	if n != 1 {
+		t.Fatalf("delivered = %d, want one pair-level Continue", n)
+	}
+	freshFixer, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || freshFixer == nil || freshFixer.Status != "awaiting_human" {
+		t.Fatalf("fixer after Continue = (%#v, %v), want awaiting preserved agent ask", freshFixer, err)
+	}
+	if len(cleared) != 0 {
+		t.Fatalf("cleared = %v, want empty when remaining-ask List fails", cleared)
+	}
+}
+
+type failLoopsListQuerier struct {
+	db *sql.DB
+}
+
+func (q failLoopsListQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q failLoopsListQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if strings.Contains(query, "SELECT * FROM loops") && !strings.Contains(query, "WHERE") {
+		return nil, errors.New("database is locked")
+	}
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q failLoopsListQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
 }
 
 func stampGitHubHITLAsk(t *testing.T, repos *storage.Repositories, loopID string, commentID int64) storage.LoopRecord {
