@@ -1525,6 +1525,68 @@ func TestBudgetHeldHITLDispositionOnlyDiscoveryEnqueues(t *testing.T) {
 	}
 }
 
+func TestBudgetHeldHITLPollingFollowUpAfterReviewRequestGone(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	baseMeta := `{"followUpdates":true,"lastPublishedHeadSha":"same-head","lastReviewedSignalFingerprint":"old","loop":{"enabled":true},"reviewFixBudget":{"exhaustedBy":"reviewer","pauseReason":"review_fix_budget_exhausted"}}`
+	meta, err := loops.WriteHITLAsk(&baseMeta, loops.NewReviewFixBudgetAsk("reviewer", repo, prNumber, 8, 8, fixture.nowISO()))
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	loop := storage.LoopRecord{
+		ID: "loop_budget_hitl_poll", Seq: 1, ProjectID: "project_1", Type: "reviewer", Status: "awaiting_human",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(loop) {
+		t.Fatal("fixture must be HITL budget hold")
+	}
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "same-head"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}}
+	github := &fakeGitHubGateway{
+		currentLogin:                "looper-bot",
+		reviewRequests:              []string{},
+		reviewRequestedPullRequests: []PullRequestSummary{},
+		reviewThreads:               threads,
+		viewHeadSHA:                 "same-head",
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy:  DiscoveryPolicy{AutoDiscovery: true, RequireReviewRequest: true, EnableSelfReview: true, Labels: []string{}, LabelMode: config.LabelModeAll},
+		LoopConfig:       testReviewerLoopConfig(),
+		ThreadResolution: config.ReviewerThreadResolutionConfig{Enabled: false, MaxThreadsPerRun: 10},
+	})
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(github.listReviewRequestedCalls) == 0 {
+		t.Fatal("want request-filtered initial query to miss the PR")
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want disposition-only via HITL budget-hold follow-up polling", result.QueueItems)
+	}
+	if result.QueueItems[0].PayloadJSON == nil || !strings.Contains(*result.QueueItems[0].PayloadJSON, `"dispositionOnly":true`) {
+		t.Fatalf("payload = %v", result.QueueItems[0].PayloadJSON)
+	}
+	after, _ := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if after == nil || after.Status != "awaiting_human" || !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("HITL hold not preserved: %#v", after)
+	}
+}
+
 func TestSameHeadDiscoveryIdentityLookupFailureIsRetryable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

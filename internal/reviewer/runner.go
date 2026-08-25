@@ -7183,10 +7183,10 @@ func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) 
 		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil || loop.Status == "failed" {
 			continue
 		}
-		// Budget-held paused loops stay visible so discovery can enqueue
-		// disposition-only work (§8.7) without releasing the hold. Other paused
-		// / terminal statuses remain excluded.
-		if loop.Status == "paused" {
+		// Budget-held paused / awaiting_human (HITL) loops stay visible so
+		// discovery can enqueue disposition-only work (§8.7) without releasing
+		// the hold. Other paused / terminal statuses remain excluded.
+		if loop.Status == "paused" || loop.Status == "awaiting_human" {
 			if !loops.IsReviewFixBudgetHold(loop) {
 				continue
 			}
