@@ -867,7 +867,7 @@ func TestFeishuHITLPollTypedScopeDecisionResolvesPrimaryPreservesSiblingAgentCar
 	}
 }
 
-func TestFeishuHITLPollOverlayResidualCardDoesNotBlockScopeContinue(t *testing.T) {
+func TestFeishuHITLPollOverlayResidualCardPreservedThroughScopeContinue(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
 	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
@@ -947,40 +947,46 @@ func TestFeishuHITLPollOverlayResidualCardDoesNotBlockScopeContinue(t *testing.T
 	}
 	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{
 		mustCardAction(60, "102", "A"),
+	}, deps)
+	if n != 1 || maxID != 60 {
+		t.Fatalf("overlay residual poll = %d maxID=%d, want A consumed while held", n, maxID)
+	}
+	if len(resolved) != 1 || resolved[0] != fixer.ID+"=A" {
+		t.Fatalf("card resolution after residual A = %#v, want sibling A only", resolved)
+	}
+	heldReviewer, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || heldReviewer == nil || !loops.IsReviewScopeHumanHold(*heldReviewer) {
+		t.Fatalf("reviewer after residual A = (%#v, %v), want still scope-held", heldReviewer, err)
+	}
+	heldSibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || heldSibling == nil || heldSibling.Status != "awaiting_human" || !loops.IsReviewScopeHumanHold(*heldSibling) {
+		t.Fatalf("fixer after residual A = (%#v, %v), want held awaiting ordinary ask", heldSibling, err)
+	}
+	stored, ok := loops.ReadHITLAsk(heldSibling.MetadataJSON)
+	if !ok || stored.Question != agentAsk.Question || stored.Answer != "A" || stored.Status != "answered" {
+		t.Fatalf("fixer ask after residual A = (%#v, %v), want durable answered A while held", stored, ok)
+	}
+
+	n, maxID = pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{
 		mustCardAction(61, "101", "Continue"),
 	}, deps)
-	if n != 2 || maxID != 61 {
-		t.Fatalf("overlay residual then Continue poll = %d maxID=%d, want both consumed", n, maxID)
+	if n != 1 || maxID != 61 {
+		t.Fatalf("scope Continue poll = %d maxID=%d, want primary Continue consumed", n, maxID)
 	}
-	if len(resolved) != 1 || resolved[0] != reviewer.ID+"=Continue" {
-		t.Fatalf("card resolution = %#v, want primary Continue only", resolved)
+	if len(resolved) != 2 || resolved[1] != reviewer.ID+"=Continue" {
+		t.Fatalf("card resolution after Continue = %#v, want residual A then primary Continue", resolved)
 	}
 	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
 	if err != nil || fresh == nil || fresh.Status != "queued" || loops.IsReviewScopeHumanHold(*fresh) {
 		t.Fatalf("reviewer after Continue = (%#v, %v), want queued and released", fresh, err)
 	}
 	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
-	if err != nil || sibling == nil || sibling.Status != "awaiting_human" || loops.IsReviewScopeHumanHold(*sibling) {
-		t.Fatalf("fixer after Continue = (%#v, %v), want awaiting preserved agent ask", sibling, err)
-	}
-	remaining, ok := loops.ReadHITLAsk(sibling.MetadataJSON)
-	if !ok || remaining.Question != agentAsk.Question || remaining.Answer != "" || remaining.Status != "awaiting" {
-		t.Fatalf("fixer ask after overlay A+Continue = (%#v, %v), want unanswered agent question", remaining, ok)
-	}
-
-	n, maxID = pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{
-		mustCardAction(62, "102", "A"),
-	}, deps)
-	if n != 1 || maxID != 62 {
-		t.Fatalf("post-release residual card poll = %d maxID=%d, want ordinary A delivered", n, maxID)
-	}
-	sibling, err = repos.Loops.GetByID(context.Background(), fixer.ID)
-	if err != nil || sibling == nil || sibling.Status != "running" {
-		t.Fatalf("fixer after post-release A = (%#v, %v), want running ordinary answer", sibling, err)
+	if err != nil || sibling == nil || sibling.Status != "queued" || loops.IsReviewScopeHumanHold(*sibling) {
+		t.Fatalf("fixer after Continue = (%#v, %v), want queued resume from stored A", sibling, err)
 	}
 	answered, ok := loops.ReadHITLAsk(sibling.MetadataJSON)
-	if !ok || answered.Answer != "A" || answered.Status != "answered" {
-		t.Fatalf("fixer ask after post-release A = (%#v, %v), want answered A", answered, ok)
+	if !ok || answered.Question != agentAsk.Question || answered.Answer != "A" || answered.Status != "answered" {
+		t.Fatalf("fixer ask after Continue = (%#v, %v), want stored A applied without a second click", answered, ok)
 	}
 }
 

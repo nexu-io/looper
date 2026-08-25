@@ -227,13 +227,20 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 // deliverFeishuHITLCardAction applies a card-action click. Overlay siblings keep
 // an ordinary agent card interactive; those option clicks are not pair
 // Continue/Stop decisions and must not fail-close the inbox cursor ahead of the
-// primary scope card.
+// primary scope card. The ordinary answer is recorded on the residual HITL ask
+// while the pair stays held, then Continue resumes from that stored answer.
 func deliverFeishuHITLCardAction(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, answer string, drain func(context.Context, storage.LoopRecord) error, onAnswered func(context.Context, string, string)) error {
 	caps := reviewFixBudgetLiveCaps(cfg, "")
 	if repos != nil && repos.Loops != nil {
 		if loop, err := repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
 			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
 			if feishuOverlayResidualCardIsNotPairDecision(*loop, answer) {
+				if err := preserveFeishuOverlayResidualCardAnswer(ctx, repos, loopID, answer, nowISO); err != nil {
+					return err
+				}
+				if onAnswered != nil {
+					onAnswered(ctx, loopID, answer)
+				}
 				return nil
 			}
 		}
@@ -258,7 +265,47 @@ func feishuOverlayResidualCardIsNotPairDecision(loop storage.LoopRecord, answer 
 		return false
 	}
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-	return ok && githubHITLResidualOrdinaryAsk(ask)
+	if !ok || loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask) {
+		return false
+	}
+	return true
+}
+
+// preserveFeishuOverlayResidualCardAnswer records an ordinary card option on the
+// preserved agent ask without treating it as a scope Continue/Stop. The pair
+// stays held; releaseOneReviewScopeHumanHold later queues the answered sibling.
+func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage.Repositories, loopID, answer, nowISO string) error {
+	if repos == nil || repos.Loops == nil {
+		return nil
+	}
+	unlock := LockLoopRequeue(loopID)
+	defer unlock()
+	fresh, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if fresh == nil || !feishuOverlayResidualCardIsNotPairDecision(*fresh, answer) {
+		return nil
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok {
+		return nil
+	}
+	status := strings.TrimSpace(ask.Status)
+	if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
+		return nil
+	}
+	ask.Answer = answer
+	ask.Status = "answered"
+	ask.AnsweredAt = nowISO
+	meta, err := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+	if err != nil {
+		return err
+	}
+	updated := *fresh
+	updated.MetadataJSON = &meta
+	updated.UpdatedAt = nowISO
+	return repos.Loops.Upsert(ctx, updated)
 }
 
 // feishuDecisionCardLoopID returns the loop whose Continue/Stop Feishu card
