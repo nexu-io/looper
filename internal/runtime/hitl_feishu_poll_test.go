@@ -605,103 +605,120 @@ func TestFeishuHITLPollTypedScopeContinueResolvesOverlayCard(t *testing.T) {
 	}
 }
 
-func TestFeishuHITLPollTypedScopeContinuePreservesSiblingAgentCard(t *testing.T) {
-	root := t.TempDir()
-	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
-	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
-	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
-		Now: func() time.Time { return now },
-	})
-	if err != nil {
-		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
-	}
-	t.Cleanup(func() { _ = coordinator.Close() })
-	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
-		t.Fatalf("RunPending() error = %v", err)
-	}
-	repos := storage.NewRepositories(coordinator.DB())
-	const projectID = "project_scope_feishu_sibling_card"
-	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-	repo := "acme/looper"
-	pr := int64(42)
-	target := "pr:acme/looper:42"
-	reviewer := storage.LoopRecord{
-		ID: "loop_feishu_sibling_card_rev", Seq: 97, ProjectID: projectID, Type: "reviewer",
-		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
-		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
-	}
-	agentAsk := loops.HITLAsk{
-		Kind: "agent_question", Question: "Which approach should Fixer take?",
-		Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO,
-		Transport: "feishu",
-	}
-	fixerMeta, err := loops.WriteHITLAsk(nil, agentAsk)
-	if err != nil {
-		t.Fatalf("WriteHITLAsk(fixer): %v", err)
-	}
-	fixer := storage.LoopRecord{
-		ID: "loop_feishu_sibling_card_fix", Seq: 98, ProjectID: projectID, Type: "fixer",
-		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
-		Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &fixerMeta,
-	}
-	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
-		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
-	}
-	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
-		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
-	}
-	if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
-		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
-		Question: "Clarify AGENTS.md rule X before unpause",
-	}); err != nil {
-		t.Fatalf("ParkReviewScopeHuman: %v", err)
-	}
-	overlaid, err := repos.Loops.GetByID(context.Background(), fixer.ID)
-	if err != nil || overlaid == nil || !loops.IsReviewScopeHumanHold(*overlaid) {
-		t.Fatalf("fixer after overlay = (%#v, %v), want preserved ask under scope hold", overlaid, err)
-	}
-	if ask, ok := loops.ReadHITLAsk(overlaid.MetadataJSON); !ok || loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewFixBudgetAsk(ask) {
-		t.Fatalf("overlaid ask = (%#v, %v), want ordinary agent question", ask, ok)
-	}
-
-	var resolved []string
-	deps := feishuHITLPollDeps{
-		loopByRoot: func(_ contextType, rootID string) string {
-			if rootID == "om_scope_sibling_root" {
-				return fixer.ID
+func TestFeishuHITLPollTypedScopeDecisionResolvesPrimaryPreservesSiblingAgentCard(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		text           string
+		reviewerStatus string
+		fixerStatus    string
+	}{
+		{name: "continue", text: "Continue", reviewerStatus: "queued", fixerStatus: "awaiting_human"},
+		{name: "stop", text: "Stop", reviewerStatus: "terminated", fixerStatus: "terminated"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+			nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+			coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+				Now: func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
 			}
-			return ""
-		},
-		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
-				resolved = append(resolved, answeredLoopID+"="+answer)
-			}, nil)
-		},
-	}
-	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
-		ID: 42, Kind: "message", RootID: "om_scope_sibling_root", Text: "Continue",
-	}}, deps)
-	if n != 1 || maxID != 42 {
-		t.Fatalf("typed sibling Continue poll = %d maxID=%d, want applied Continue", n, maxID)
-	}
-	if len(resolved) != 0 {
-		t.Fatalf("card resolution after sibling-root Continue = %#v, want preserved agent card", resolved)
-	}
-	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
-	if err != nil || fresh == nil || fresh.Status != "queued" || loops.IsReviewScopeHumanHold(*fresh) {
-		t.Fatalf("reviewer after sibling Continue = (%#v, %v), want queued and released", fresh, err)
-	}
-	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
-	if err != nil || sibling == nil || sibling.Status != "awaiting_human" || loops.IsReviewScopeHumanHold(*sibling) {
-		t.Fatalf("fixer after sibling Continue = (%#v, %v), want awaiting preserved agent ask", sibling, err)
-	}
-	remaining, ok := loops.ReadHITLAsk(sibling.MetadataJSON)
-	if !ok || remaining.Question != agentAsk.Question || remaining.Answer != "" {
-		t.Fatalf("fixer ask after sibling Continue = (%#v, %v), want unanswered agent question", remaining, ok)
+			t.Cleanup(func() { _ = coordinator.Close() })
+			if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+				t.Fatalf("RunPending() error = %v", err)
+			}
+			repos := storage.NewRepositories(coordinator.DB())
+			projectID := "project_scope_feishu_sibling_card_" + tc.name
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+				ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			repo := "acme/looper"
+			pr := int64(42)
+			target := "pr:acme/looper:42"
+			reviewer := storage.LoopRecord{
+				ID: "loop_feishu_sibling_card_rev_" + tc.name, Seq: 97, ProjectID: projectID, Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			agentAsk := loops.HITLAsk{
+				Kind: "agent_question", Question: "Which approach should Fixer take?",
+				Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO,
+				Transport: "feishu",
+			}
+			fixerMeta, err := loops.WriteHITLAsk(nil, agentAsk)
+			if err != nil {
+				t.Fatalf("WriteHITLAsk(fixer): %v", err)
+			}
+			fixer := storage.LoopRecord{
+				ID: "loop_feishu_sibling_card_fix_" + tc.name, Seq: 98, ProjectID: projectID, Type: "fixer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &fixerMeta,
+			}
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+			}
+			if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+			}
+			if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+				Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+				Question: "Clarify AGENTS.md rule X before unpause",
+			}); err != nil {
+				t.Fatalf("ParkReviewScopeHuman: %v", err)
+			}
+			overlaid, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || overlaid == nil || !loops.IsReviewScopeHumanHold(*overlaid) {
+				t.Fatalf("fixer after overlay = (%#v, %v), want preserved ask under scope hold", overlaid, err)
+			}
+			if ask, ok := loops.ReadHITLAsk(overlaid.MetadataJSON); !ok || loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewFixBudgetAsk(ask) {
+				t.Fatalf("overlaid ask = (%#v, %v), want ordinary agent question", ask, ok)
+			}
+
+			threadRoot := "om_scope_sibling_root_" + tc.name
+			var resolved []string
+			deps := feishuHITLPollDeps{
+				loopByRoot: func(_ contextType, rootID string) string {
+					if rootID == threadRoot {
+						return fixer.ID
+					}
+					return ""
+				},
+				enqueueMessage: func(ctx contextType, loopID, text string) error {
+					return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
+						resolved = append(resolved, answeredLoopID+"="+answer)
+					}, nil)
+				},
+			}
+			n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
+				ID: 42, Kind: "message", RootID: threadRoot, Text: tc.text,
+			}}, deps)
+			if n != 1 || maxID != 42 {
+				t.Fatalf("typed sibling %s poll = %d maxID=%d, want applied %s", tc.text, n, maxID, tc.text)
+			}
+			if len(resolved) != 1 || resolved[0] != reviewer.ID+"="+tc.text {
+				t.Fatalf("card resolution after sibling-root %s = %#v, want primary %s only", tc.text, resolved, tc.text)
+			}
+			fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+			if err != nil || fresh == nil || fresh.Status != tc.reviewerStatus || loops.IsReviewScopeHumanHold(*fresh) {
+				t.Fatalf("reviewer after sibling %s = (%#v, %v), want %s and released", tc.text, fresh, err, tc.reviewerStatus)
+			}
+			sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || sibling == nil || sibling.Status != tc.fixerStatus || loops.IsReviewScopeHumanHold(*sibling) {
+				t.Fatalf("fixer after sibling %s = (%#v, %v), want %s without overlay", tc.text, sibling, err, tc.fixerStatus)
+			}
+			if tc.fixerStatus != "awaiting_human" {
+				return
+			}
+			remaining, ok := loops.ReadHITLAsk(sibling.MetadataJSON)
+			if !ok || remaining.Question != agentAsk.Question || remaining.Answer != "" {
+				t.Fatalf("fixer ask after sibling Continue = (%#v, %v), want unanswered agent question", remaining, ok)
+			}
+		})
 	}
 }
 

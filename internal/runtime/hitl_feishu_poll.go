@@ -174,11 +174,14 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 // too, or the cached loop-seq buttons can answer a later budget cycle.
 // Typed Stop on a scope hold drains live pair agents before records terminalize,
 // matching card-action deliverAnswer.
+// Overlay siblings keep an ordinary agent card: Continue/Stop typed in that
+// thread must resolve the pair's scope-primary card, not the sibling card.
 func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, text string, onAnswered func(context.Context, string, string), drain func(context.Context, storage.LoopRecord) error) error {
 	if err := drainScopeHoldOnStop(ctx, repos, loopID, text, drain); err != nil {
 		return err
 	}
 	shouldResolve := false
+	resolveLoopID := loopID
 	caps := reviewFixBudgetLiveCaps(cfg, "")
 	if repos != nil && repos.Loops != nil {
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -188,8 +191,13 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 		if loop != nil {
 			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
 			if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
-				if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && (loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask)) {
+				cardLoopID, err := feishuDecisionCardLoopID(ctx, repos, *loop)
+				if err != nil {
+					return err
+				}
+				if cardLoopID != "" {
 					shouldResolve = true
+					resolveLoopID = cardLoopID
 				}
 			}
 		}
@@ -198,9 +206,32 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 		return err
 	}
 	if shouldResolve && onAnswered != nil {
-		onAnswered(ctx, loopID, text)
+		onAnswered(ctx, resolveLoopID, text)
 	}
 	return nil
+}
+
+// feishuDecisionCardLoopID returns the loop whose Continue/Stop Feishu card
+// should be resolved for a typed decision. Overlay siblings keep an ordinary
+// agent ask, so the pair's scope/budget primary card is the one that must close.
+func feishuDecisionCardLoopID(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) (string, error) {
+	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && (loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask)) {
+		return loop.ID, nil
+	}
+	if !loops.IsReviewScopeHumanHold(loop) || repos == nil || repos.Loops == nil {
+		return "", nil
+	}
+	all, err := repos.Loops.List(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, sibling := range loops.FindSiblingReviewFixLoops(all, loop) {
+		ask, ok := loops.ReadHITLAsk(sibling.MetadataJSON)
+		if ok && (loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask)) {
+			return sibling.ID, nil
+		}
+	}
+	return "", nil
 }
 
 func sendFeishuBudgetAsk(ctx context.Context, input defaultSchedulerTickInput, loop storage.LoopRecord, ask loops.HITLAsk) error {
