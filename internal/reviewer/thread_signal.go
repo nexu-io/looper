@@ -320,8 +320,13 @@ func isValidatedFixerDeclinedComment(body string) bool {
 }
 
 // isValidatedFixerDeclinedCommentFromAuthor requires exact marker + Looper/Fixer identity.
-func isValidatedFixerDeclinedCommentFromAuthor(comment ReviewThreadComment, looperLogin string) bool {
-	if !isValidatedFixerDeclinedComment(comment.Body) {
+// When containingThreadID is non-empty, the marker's thread field must match it exactly.
+func isValidatedFixerDeclinedCommentFromAuthor(comment ReviewThreadComment, looperLogin, containingThreadID string) bool {
+	threadID, fingerprint, ok := parseFixerDeclinedMarker(comment.Body)
+	if !ok || fingerprint == "" {
+		return false
+	}
+	if want := strings.TrimSpace(containingThreadID); want != "" && threadID != want {
 		return false
 	}
 	return isLooperIdentityAuthor(comment.Author, looperLogin)

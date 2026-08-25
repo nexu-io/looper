@@ -214,3 +214,40 @@ func TestHasUnauditedValidatedFixerDeclineIgnoresQuotedForeignAudit(t *testing.T
 		t.Fatal("quoted foreign audit must not close an unaudited fixer decline")
 	}
 }
+
+func TestHasUnauditedValidatedFixerDeclineIgnoresQuotedForeignDecline(t *testing.T) {
+	t.Parallel()
+	thread := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: "looper-bot", Body: "quoting <!-- looper-fixer-reply-declined thread:other fingerprint:abc -->"},
+		},
+	}
+	if HasUnauditedValidatedFixerDeclineForLogin(thread, "looper-bot") {
+		t.Fatal("quoted foreign-thread decline must not count as a decline for this thread")
+	}
+}
+
+func TestForceNeedsHumanIgnoresQuotedForeignDecline(t *testing.T) {
+	t.Parallel()
+	baseComments := []ReviewThreadComment{
+		{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->"},
+		{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+	}
+	base := ReviewThread{ID: "t1", Comments: append([]ReviewThreadComment{}, baseComments...)}
+	runner := &Runner{}
+	rejectBody := runner.buildThreadResolutionReplyWithFeedback(
+		"t1", "abc",
+		coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot"),
+		threadResolutionAgentDecision{Decision: "reject_wontfix", Evidence: "still needed", Confidence: "high"},
+		config.ReviewerThreadResolutionConfig{},
+	)
+	quoted := ReviewThread{ID: "t1", Comments: append(append([]ReviewThreadComment{}, baseComments...),
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
+		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "quoting <!-- looper-fixer-reply-declined thread:other fingerprint:x -->", CreatedAt: "t4", UpdatedAt: "t4"},
+	)}
+	if ForceNeedsHumanAfterSecondDecline(quoted, "abc", "looper-bot") {
+		t.Fatal("quoted foreign-thread decline must not force needs_human")
+	}
+}
