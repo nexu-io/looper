@@ -3,6 +3,7 @@ package loops
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -968,6 +969,107 @@ func TestHandoffEventIncludesBothRoleMetersAndRetriesOnReentry(t *testing.T) {
 	fresh, _ := repos.Loops.GetByID(context.Background(), parked.ID)
 	if fresh == nil || strings.TrimSpace(ReadReviewFixBudgetState(fresh.MetadataJSON).HandoffEventAt) == "" {
 		t.Fatalf("re-entry did not restore handoff marker: %#v", fresh)
+	}
+}
+
+func TestContinueClearsHandoffMarkerWithoutMeterReset(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_cap_raise", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("upsert reviewer: %v", err)
+	}
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_cap_raise", "fixer", "queued")
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(3, 3),
+	})
+	if err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	freshParked, err := repos.Loops.GetByID(context.Background(), parked.ID)
+	if err != nil || freshParked == nil {
+		t.Fatalf("GetByID parked = (%v, %v)", freshParked, err)
+	}
+	parked = *freshParked
+	if strings.TrimSpace(ReadReviewFixBudgetState(parked.MetadataJSON).HandoffEventAt) == "" {
+		t.Fatal("expected handoff marker after first park")
+	}
+
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Continue", nowISO, testBudgetCaps(8, 8))
+	if err != nil || !result.Applied {
+		t.Fatalf("Continue after cap raise = (%#v, %v)", result, err)
+	}
+	if ReviewerPublishCount(result.Loop.MetadataJSON) != 3 {
+		t.Fatalf("reviewer count = %d, want 3 (no reset under raised cap)", ReviewerPublishCount(result.Loop.MetadataJSON))
+	}
+	if strings.TrimSpace(ReadReviewFixBudgetState(result.Loop.MetadataJSON).HandoffEventAt) != "" {
+		t.Fatalf("HandoffEventAt survived Continue without meter reset: %#v", result.Loop.MetadataJSON)
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || strings.TrimSpace(ReadReviewFixBudgetState(sibling.MetadataJSON).HandoffEventAt) != "" {
+		t.Fatalf("sibling marker after Continue = (%#v, %v), want cleared", sibling, err)
+	}
+
+	continued := result.Loop
+	meta := parseMetadataObject(continued.MetadataJSON)
+	loopMeta, _ := meta[reviewerLoopMetadataKey].(map[string]any)
+	if loopMeta == nil {
+		loopMeta = map[string]any{}
+	}
+	loopMeta[reviewerIterationCountKey] = 8
+	meta[reviewerLoopMetadataKey] = loopMeta
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal raised count: %v", err)
+	}
+	raised := string(encoded)
+	continued.MetadataJSON = &raised
+	if err := repos.Loops.Upsert(context.Background(), continued); err != nil {
+		t.Fatalf("upsert raised count: %v", err)
+	}
+	if _, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: continued, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8,
+		NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(8, 8),
+	}); err != nil {
+		t.Fatalf("re-park after cap raise: %v", err)
+	}
+	fresh, err := repos.Loops.GetByID(context.Background(), continued.ID)
+	if err != nil || fresh == nil || strings.TrimSpace(ReadReviewFixBudgetState(fresh.MetadataJSON).HandoffEventAt) == "" {
+		t.Fatalf("new hold episode did not emit a handoff marker: (%#v, %v)", fresh, err)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "loop", continued.ID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	handoffs := 0
+	for i := range events {
+		if events[i].EventType == reviewFixBudgetHandoffEventType {
+			handoffs++
+		}
+	}
+	if handoffs < 2 {
+		t.Fatalf("handoff events = %d, want a fresh event for the new hold episode", handoffs)
+	}
+}
+
+func TestParkReviewFixBudgetFailsClosedWhenRefreshErrors(t *testing.T) {
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	seedProject(t, repos, now)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_refresh_err", "reviewer", "running")
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("close coordinator: %v", err)
+	}
+	if _, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(3, 3),
+	}); err == nil {
+		t.Fatal("ParkReviewFixBudget error = nil, want refresh error")
 	}
 }
 

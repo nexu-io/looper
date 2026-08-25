@@ -551,9 +551,9 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 //   - the current trusted run is a manual reviewer loop (--reviewer-run-id), or
 //   - the current trusted reviewer loop is an enabled follow-up reviewing a head
 //     that differs from lastPublishedHeadSha (matching requireReviewRequestForLoop
-//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic follow-up
-//     runs do not pass --reviewer-run-id, so that path resolves the current
-//     running reviewer loop for the PR when the flag is absent.
+//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic prompts now
+//     pass --reviewer-run-id; the no-flag path still resolves the current running
+//     reviewer loop for the PR when the flag is absent.
 func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string) (bool, error) {
 	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
 	if dbPath == "" {
@@ -928,8 +928,7 @@ func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repos
 
 // trustedCurrentFollowUpNewHeadReviewerBypass honors the runner's
 // follow_up_new_head requireReviewRequest bypass when agents submit without
-// --reviewer-run-id (automatic reviewer prompts only pass that flag for manual
-// runs). Authority is the current running reviewer loop for the PR.
+// --reviewer-run-id. Authority is the current running reviewer loop for the PR.
 func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, headSHA string) (bool, error) {
 	if repos == nil || repos.Runs == nil || repos.Loops == nil {
 		return false, fmt.Errorf("validate follow-up review request bypass: storage is not configured")
@@ -1163,9 +1162,9 @@ func refuseReviewSubmitBudgetAgainstRepos(ctx context.Context, repos *storage.Re
 
 // submittingReviewerLoopForBudgetGate resolves only the submitting reviewer loop.
 // Prefer --reviewer-run-id via the active run even when sibling parking has
-// paused the loop; otherwise the newest running reviewer run for the PR,
-// including budget-paused and awaiting-human loops. Does not scan all
-// participating loops.
+// paused the loop; otherwise the single running reviewer run for the PR,
+// including budget-paused and awaiting-human loops. Multiple running reviewer
+// runs without a run ID are fail-closed so a held lane cannot be masked.
 func submittingReviewerLoopForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
 	runID = strings.TrimSpace(runID)
 	if runID != "" {
@@ -1205,8 +1204,10 @@ func reviewerLoopForActiveSubmitRun(ctx context.Context, repos *storage.Reposito
 	return reviewerLoopForBudgetGate(ctx, repos, run.LoopID, repo, prNumber)
 }
 
-// currentSubmittingReviewerRunForBudgetGate finds the newest running reviewer
+// currentSubmittingReviewerRunForBudgetGate finds the single running reviewer
 // run for the PR even when sibling parking has moved the loop off running.
+// Two independently budgeted lanes can both have running runs; recency is not
+// authority, so more than one candidate is an error.
 func currentSubmittingReviewerRunForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
 	loops, err := repos.Loops.ListByStatuses(ctx, []string{
 		string(domain.LoopStatusRunning),
@@ -1235,10 +1236,11 @@ func currentSubmittingReviewerRunForBudgetGate(ctx context.Context, repos *stora
 		if runs[i].Status != string(domain.RunStatusRunning) {
 			continue
 		}
-		if current == nil || reviewerRunNewer(runs[i], *current) {
-			run := runs[i]
-			current = &run
+		if current != nil {
+			return nil, fmt.Errorf("multiple running reviewer runs for %s#%d; pass --reviewer-run-id", repo, prNumber)
 		}
+		run := runs[i]
+		current = &run
 	}
 	return current, nil
 }

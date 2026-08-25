@@ -1980,7 +1980,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		allowedPR := reviewerAllowedPRRef(input.Metadata)
 		allowedCwd := strings.TrimSpace(input.WorkingDirectory)
 		policy := reviewerAllowedReviewPolicy(input.Metadata)
-		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
+		if policy.ReviewerRunID != "" && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
 		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)

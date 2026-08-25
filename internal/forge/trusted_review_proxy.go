@@ -734,7 +734,10 @@ func applyTrustedReviewProxyPolicy(argv []string, policy TrustedReviewProxyPolic
 		"--commit-id", policy.ExpectedCommitID,
 	)
 	if policy.ReviewerManual {
-		bound = append(bound, "--reviewer-manual", "--reviewer-run-id", policy.ReviewerRunID)
+		bound = append(bound, "--reviewer-manual")
+	}
+	if policy.ReviewerRunID != "" {
+		bound = append(bound, "--reviewer-run-id", policy.ReviewerRunID)
 	}
 	return bound
 }

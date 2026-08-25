@@ -98,6 +98,13 @@ func TestApplyTrustedReviewProxyPolicyRewritesAgentFlags(t *testing.T) {
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("applyTrustedReviewProxyPolicy(automatic) = %#v, want %#v", got, want)
 	}
+	// Daemon-authored automatic run identity is still bound.
+	automaticBound := TrustedReviewProxyPolicy{Clean: "COMMENT", Blocking: "COMMENT", ExpectedCommitID: "automatic-head", ReviewerRunID: "run_auto"}
+	got = applyTrustedReviewProxyPolicy([]string{"review", "submit", "acme/looper#1", "--reviewer-run-id=run_agent"}, automaticBound)
+	want = []string{"review", "submit", "acme/looper#1", "--clean-review-event", "COMMENT", "--blocking-review-event", "COMMENT", "--commit-id", "automatic-head", "--reviewer-run-id", "run_auto"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("applyTrustedReviewProxyPolicy(automatic bound) = %#v, want %#v", got, want)
+	}
 }
 
 func testTrustedReviewPolicy() TrustedReviewProxyPolicy {

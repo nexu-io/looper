@@ -8484,7 +8484,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"do not write or publish a bare LGTM review body",
 		"Group related findings by file, subsystem, function, or rule",
 		"fixture-matrix tests",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT`",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --reviewer-run-id run_1 --clean-review-event APPROVE --blocking-review-event COMMENT`",
 		"wrapper validates inline anchors against the live PR diff before it calls GitHub",
 		"Review pass contract",
 		"Do not stop after the first issue",
@@ -8520,7 +8520,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"ANSI escape sequences",
 		"file-read traces",
 		"submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT`",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123 --reviewer-run-id run_1 --clean-review-event APPROVE --blocking-review-event COMMENT`",
 		"never use an LGTM, empty, or disclosure-only clean body as a fallback",
 		"visible body must start with `@<PR-author-login>`",
 		"briefly summarize what changed or what you verified",
@@ -8699,7 +8699,7 @@ func TestBuildReviewPromptRestrictsExistingMarkerSkipWhenApprovalsDisallowed(t *
 	for _, want := range []string{
 		"only treat an existing `outcome=clean` marker as satisfied when it is on a COMMENTED review if clean policy is COMMENT",
 		"Treat `outcome=non_blocking` or legacy `outcome=actionable` markers as satisfied only when they are on a COMMENTED review",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event COMMENT --blocking-review-event COMMENT",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --reviewer-run-id run_1 --clean-review-event COMMENT --blocking-review-event COMMENT",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -9541,6 +9541,18 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 	}
 	if !strings.Contains(prompt, "does not require a current-user review request") {
 		t.Fatalf("prompt missing disabled review-request instruction:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPromptBindsAutomaticReviewerRunID(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_auto", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	if !strings.Contains(prompt, "--reviewer-run-id run_auto") {
+		t.Fatalf("automatic prompt missing --reviewer-run-id:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "--reviewer-manual") {
+		t.Fatalf("automatic prompt included --reviewer-manual:\n%s", prompt)
 	}
 }
 

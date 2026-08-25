@@ -335,7 +335,9 @@ func ParkReviewFixBudget(ctx context.Context, repos *storage.Repositories, input
 
 func parkReviewFixBudgetBody(ctx context.Context, repos *storage.Repositories, input ParkReviewFixBudgetInput) (storage.LoopRecord, error) {
 	exhausted := input.Exhausted
-	if fresh, err := repos.Loops.GetByID(ctx, exhausted.ID); err == nil && fresh != nil {
+	if fresh, err := repos.Loops.GetByID(ctx, exhausted.ID); err != nil {
+		return input.Exhausted, err
+	} else if fresh != nil {
 		exhausted = *fresh
 	}
 	if isReviewFixBudgetExhaustedHold(exhausted) {
@@ -748,16 +750,6 @@ func continueReviewFixBudget(ctx context.Context, repos *storage.Repositories, l
 		if encoded == nil {
 			continue
 		}
-		// Clear handoff marker on refill so a later park emits a fresh event.
-		state := ReadReviewFixBudgetState(encoded)
-		if state.HandoffEventAt != "" {
-			state.HandoffEventAt = ""
-			cleared, writeErr := WriteReviewFixBudgetState(encoded, state)
-			if writeErr != nil {
-				return loop, writeErr
-			}
-			encoded = &cleared
-		}
 		updated := *fresh
 		updated.MetadataJSON = encoded
 		updated.UpdatedAt = nowISO
@@ -853,6 +845,7 @@ func releaseOneReviewFixBudgetHold(ctx context.Context, repos *storage.Repositor
 	if state.PauseReason == ReviewFixBudgetPauseReason || state.PauseReason == ReviewFixBudgetTerminationReason {
 		state.PauseReason = ""
 	}
+	state.HandoffEventAt = ""
 	state.ExhaustedBy = ""
 	encoded, err := WriteReviewFixBudgetState(metadata, state)
 	if err != nil {

@@ -5588,18 +5588,20 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 		if preflightLoop != nil {
-			// No-HITL budget hold: looper unpause must paired-Continue, not resume one role.
-			if continued, contErr := h.applyReviewFixBudgetContinueIfHeld(ctx, *preflightLoop); contErr != nil {
-				return loopResponse{}, contErr
-			} else if continued != nil {
-				return *continued, nil
-			}
 			target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
 			if targetErr != nil {
 				return loopResponse{}, targetErr
 			}
 			unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
 			defer unlockTarget()
+			// No-HITL budget hold: looper unpause must paired-Continue, not resume one role.
+			// Take the same-target lock first so Continue cannot publish claimable
+			// queue rows while a sibling discard+retry resets the shared worktree.
+			if continued, contErr := h.applyReviewFixBudgetContinueIfHeld(ctx, *preflightLoop); contErr != nil {
+				return loopResponse{}, contErr
+			} else if continued != nil {
+				return *continued, nil
+			}
 		}
 	}
 
@@ -6000,11 +6002,47 @@ func (h *Handler) applyReviewFixBudgetContinueIfHeld(ctx context.Context, loop s
 	return &resp, nil
 }
 
+// drainReviewFixBudgetPair stops live agents on both pair members before
+// paired terminalize. A sibling park can leave a run running after the loop
+// record is paused; generic StopLoop is the daemon drain path.
+func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.LoopRecord) error {
+	if h.context.StopLoop == nil {
+		return nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Loops == nil {
+		return nil
+	}
+	all, err := services.Repositories.Loops.List(ctx)
+	if err != nil {
+		return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	members := append(loops.FindSiblingReviewFixLoops(all, loop), loop)
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		switch strings.TrimSpace(member.Status) {
+		case "terminated", "stopped", "completed":
+			continue
+		}
+		if _, err := h.context.StopLoop(ctx, member.ID, "Stopped by review-fix budget pair"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // applyReviewFixBudgetStopIfHeld delegates looper stop on a budget-held role to
 // paired Stop (terminate both). Returns nil when not a hold.
 func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop storage.LoopRecord) (any, error) {
 	if !loops.IsReviewFixBudgetHold(loop) {
 		return nil, nil
+	}
+	if err := h.drainReviewFixBudgetPair(ctx, loop); err != nil {
+		return nil, err
 	}
 	services := h.context.Runtime.Services()
 	if services.Repositories == nil || services.Coordinator == nil {

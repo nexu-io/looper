@@ -644,6 +644,59 @@ func TestRefuseReviewSubmitBudgetAgainstReposPausedSubmittingRun(t *testing.T) {
 	}
 }
 
+func TestRefuseReviewSubmitBudgetFailsClosedOnMultipleRunningRuns(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+
+	heldMeta := `{"loop":{"iterationCount":3},"reviewFixBudget":{"exhaustedBy":"reviewer","pauseReason":"review_fix_budget_exhausted"},"pauseReason":"review_fix_budget_exhausted"}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_auto_held", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &heldMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(auto held) error = %v", err)
+	}
+	cmMeta := `{"manual":true,"followUpdates":true,"loop":{"iterationCount":1}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_cm_live", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &cmMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(continuous manual) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_auto_held", LoopID: "loop_auto_held", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(auto) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_cm_live", LoopID: "loop_cm_live", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(cm) error = %v", err)
+	}
+
+	err = refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "")
+	if err == nil || !strings.Contains(err.Error(), "pass --reviewer-run-id") {
+		t.Fatalf("multiple running runs without run id error = %v, want fail-closed", err)
+	}
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_auto_held"); err == nil || !strings.Contains(err.Error(), "review-fix budget is held") {
+		t.Fatalf("held automatic via run id error = %v, want held", err)
+	}
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_cm_live"); err != nil {
+		t.Fatalf("continuous_manual via run id error = %v, want nil", err)
+	}
+}
+
 func TestSubmitReviewWithoutAnchorValidationRefusesBudgetBeforeSubmit(t *testing.T) {
 	t.Parallel()
 

@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -78,18 +80,118 @@ func TestHandlerLoopStartDelegatesNoHITLBudgetHoldToPairedContinue(t *testing.T)
 	}
 }
 
+func TestHandlerBudgetContinueWaitsForSameTargetLock(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = false
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 3
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_budget_unpause_lock"
+	repo := "acme/looper"
+	pr := int64(45)
+	targetID := "pr:acme/looper:45"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_budget_lock_rev", Seq: 4501, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &pr,
+		Status: "running", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixerMeta := `{"reviewFixBudget":{"pushCount":1}}`
+	fixer := storage.LoopRecord{
+		ID: "loop_budget_lock_fix", Seq: 4502, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &pr,
+		Status: "queued", MetadataJSON: &fixerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	if _, err := loops.ParkReviewFixBudget(context.Background(), services.Repositories, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	}); err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+
+	target, err := loopTargetFromRecordCompat(fixer)
+	if err != nil {
+		t.Fatalf("loopTargetFromRecordCompat: %v", err)
+	}
+	unlockTarget := h.lockLoopTarget(projectID, domain.LoopTypeFixer, target)
+
+	started := make(chan struct{})
+	finished := make(chan int, 1)
+	go func() {
+		close(started)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+fixer.ID+"/start", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		finished <- recorder.Code
+	}()
+	<-started
+	select {
+	case code := <-finished:
+		unlockTarget()
+		t.Fatalf("budget continue completed while target lock held: status=%d", code)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	reviewerHeld, _ := services.Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	fixerHeld, _ := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	if reviewerHeld == nil || !loops.IsReviewFixBudgetHold(*reviewerHeld) || fixerHeld == nil || !loops.IsReviewFixBudgetHold(*fixerHeld) {
+		unlockTarget()
+		t.Fatalf("pair released while target lock held: reviewer %#v fixer %#v", reviewerHeld, fixerHeld)
+	}
+
+	unlockTarget()
+	select {
+	case code := <-finished:
+		if code != http.StatusOK {
+			t.Fatalf("start status after lock release = %d, want 200", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("budget continue did not complete after target lock release")
+	}
+	reviewerAfter, _ := services.Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	fixerAfter, _ := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	if reviewerAfter == nil || reviewerAfter.Status != "queued" || fixerAfter == nil || fixerAfter.Status != "queued" {
+		t.Fatalf("pair after locked continue = reviewer %#v fixer %#v, want queued", reviewerAfter, fixerAfter)
+	}
+}
+
 func TestHandlerActiveStopDelegatesBudgetHoldToPairedStop(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = false
+	services := rt.Services()
+	var drained []string
 	h := NewHandler(Context{
 		Config:  cfg,
 		Runtime: rt,
-		StopLoop: func(context.Context, string, string) (any, error) {
-			t.Fatal("generic StopLoop must not run for budget-held pair")
-			return nil, nil
+		StopLoop: func(ctx context.Context, loopID, _ string) (any, error) {
+			rec, err := services.Repositories.Loops.GetByID(ctx, loopID)
+			if err != nil || rec == nil {
+				t.Fatalf("StopLoop GetByID(%s) = (%v, %v)", loopID, rec, err)
+			}
+			if rec.Status == "terminated" || rec.Status == "stopped" {
+				t.Fatalf("StopLoop(%s) after terminalize: status=%s", loopID, rec.Status)
+			}
+			drained = append(drained, loopID)
+			if services.ActiveExecutions != nil {
+				if _, stopErr := services.ActiveExecutions.BeginLoopStop(loopID, "test drain"); stopErr != nil {
+					return nil, stopErr
+				}
+			}
+			return map[string]any{"stopped": true, "loopId": loopID}, nil
 		},
 	})
-	services := rt.Services()
 	nowISO := "2026-04-11T12:00:00.000Z"
 	projectID := "project_budget_stop"
 	repo := "acme/looper"
@@ -142,6 +244,16 @@ func TestHandlerActiveStopDelegatesBudgetHoldToPairedStop(t *testing.T) {
 	fixerAfter, _ := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
 	if reviewerAfter == nil || reviewerAfter.Status != "terminated" || fixerAfter == nil || fixerAfter.Status != "terminated" {
 		t.Fatalf("pair after stop = reviewer %#v fixer %#v, want both terminated", reviewerAfter, fixerAfter)
+	}
+	if len(drained) != 2 {
+		t.Fatalf("StopLoop calls = %v, want both pair members before terminate", drained)
+	}
+	seen := map[string]bool{drained[0]: true, drained[1]: true}
+	if !seen[reviewer.ID] || !seen[fixer.ID] {
+		t.Fatalf("drained = %v, want %s and %s", drained, reviewer.ID, fixer.ID)
+	}
+	if services.ActiveExecutions != nil && (!services.ActiveExecutions.LoopStopActive(reviewer.ID) || !services.ActiveExecutions.LoopStopActive(fixer.ID)) {
+		t.Fatal("pair stop gates not closed after drain")
 	}
 }
 

@@ -6901,8 +6901,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	specLabelInstruction := "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after it validates a matching APPROVED clean review marker for the current head."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
 	reviewerModeFlag := ""
+	if strings.TrimSpace(runID) != "" {
+		reviewerModeFlag = fmt.Sprintf(" --reviewer-run-id %s", runID)
+	}
 	if manual {
-		reviewerModeFlag = fmt.Sprintf(" --reviewer-manual --reviewer-run-id %s", runID)
+		reviewerModeFlag = " --reviewer-manual" + reviewerModeFlag
 	}
 	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" && !(autoMergeEnabled && phase != "spec") {
