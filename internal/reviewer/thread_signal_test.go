@@ -196,6 +196,17 @@ func TestResumeDispositionDecisionFromRemoteAudit(t *testing.T) {
 	if _, ok := resumeDispositionDecisionFromRemoteAudit(base, "abc", "looper-bot"); ok {
 		t.Fatal("missing audit must not resume")
 	}
+	if !hasUnresolvedAcceptWontfixAudit(withAudit, "abc", "looper-bot") {
+		t.Fatal("unresolved accept audit must be admitted for resolve resume")
+	}
+	if hasUnresolvedAcceptWontfixAudit(base, "abc", "looper-bot") {
+		t.Fatal("missing audit must not look like unresolved accept")
+	}
+	resolved := withAudit
+	resolved.IsResolved = true
+	if hasUnresolvedAcceptWontfixAudit(resolved, "abc", "looper-bot") {
+		t.Fatal("resolved accept must not stay a candidate")
+	}
 }
 
 func TestResumeRejectDoesNotSwallowPostRejectDecline(t *testing.T) {

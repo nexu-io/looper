@@ -315,6 +315,19 @@ func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, loop
 	return threadResolutionAgentDecision{}, false
 }
 
+// hasUnresolvedAcceptWontfixAudit is true when an unresolved Looper-authored
+// thread already carries a validated accept_wontfix audit for this head.
+// Spec §8.2: the remote audit is authority after a crash that lost the
+// checkpoint cursor; Reviewer must still resolve instead of promoting the
+// signal baseline and leaving Fixer permanently withheld.
+func hasUnresolvedAcceptWontfixAudit(thread ReviewThread, headSHA, looperLogin string) bool {
+	if thread.IsResolved {
+		return false
+	}
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, headSHA, looperLogin)
+	return ok && decision.Decision == "accept_wontfix"
+}
+
 // parseFixerDeclinedMarker extracts thread/fingerprint from the exact decline marker.
 func parseFixerDeclinedMarker(body string) (threadID, fingerprint string, ok bool) {
 	m := fixerDeclinedMarkerRE.FindStringSubmatch(body)

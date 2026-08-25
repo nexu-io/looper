@@ -2905,7 +2905,15 @@ func (r *Runner) hasNarrowDispositionCandidate(ctx context.Context, cwd, repo st
 		r.logWarn("reviewer disposition candidate lookup failed", map[string]any{"repo": repo, "prNumber": prNumber, "error": err.Error()})
 		return false, &loopError{message: "disposition candidate listing failed: " + err.Error(), kind: FailureRetryableTransient}
 	}
-	return ThreadsHaveChangedDispositionSignalForLogin(threads, prAuthor, looperLogin), nil
+	for _, thread := range threads {
+		if ThreadHasChangedDispositionSignalForLogin(thread, prAuthor, looperLogin) {
+			return true, nil
+		}
+		if hasUnresolvedAcceptWontfixAudit(thread, headSHA, looperLogin) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 const conflictedPRNotificationChannel = "github_pr_comment"
@@ -3326,7 +3334,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		if _, done := completedSet[thread.ID]; done {
 			continue
 		}
-		isDisposition := narrowDisposition && ThreadHasChangedDispositionSignalForLogin(thread, checkpoint.Detail.Author, currentLogin)
+		isDisposition := narrowDisposition && (ThreadHasChangedDispositionSignalForLogin(thread, checkpoint.Detail.Author, currentLogin) || hasUnresolvedAcceptWontfixAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin))
 		isObjective := policy.Enabled && r.threadResolutionCandidate(thread, checkpoint.Snapshot.HeadSHA, currentLogin, policy)
 		if !isDisposition && !isObjective {
 			continue
