@@ -257,6 +257,102 @@ func TestHandlerActiveStopDelegatesBudgetHoldToPairedStop(t *testing.T) {
 	}
 }
 
+func TestHandlerActiveStopDoesNotTerminateHistoricalSibling(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = false
+	services := rt.Services()
+	var drained []string
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: rt,
+		StopLoop: func(ctx context.Context, loopID, _ string) (any, error) {
+			rec, err := services.Repositories.Loops.GetByID(ctx, loopID)
+			if err != nil || rec == nil {
+				t.Fatalf("StopLoop GetByID(%s) = (%v, %v)", loopID, rec, err)
+			}
+			if rec.Status == "terminated" || rec.Status == "stopped" || rec.Status == "completed" {
+				t.Fatalf("StopLoop(%s) after terminalize: status=%s", loopID, rec.Status)
+			}
+			drained = append(drained, loopID)
+			if services.ActiveExecutions != nil {
+				if _, stopErr := services.ActiveExecutions.BeginLoopStop(loopID, "test drain"); stopErr != nil {
+					return nil, stopErr
+				}
+			}
+			return map[string]any{"stopped": true, "loopId": loopID}, nil
+		},
+	})
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_budget_stop_hist"
+	repo := "acme/looper"
+	pr := int64(44)
+	target := "pr:acme/looper:44"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewerMeta := `{"manual":true,"followUpdates":true,"loop":{"iterationCount":3}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_budget_stop_hist_rev", Seq: 4401, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixerMeta := `{"manual":true,"followUpdates":true,"reviewFixBudget":{"pushCount":1}}`
+	fixer := storage.LoopRecord{
+		ID: "loop_budget_stop_hist_fix", Seq: 4402, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", MetadataJSON: &fixerMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	historicalMeta := `{"manual":true,"followUpdates":true,"reviewFixBudget":{"pushCount":3,"exhaustedBy":"fixer"}}`
+	historical := storage.LoopRecord{
+		ID: "loop_budget_stop_hist_old", Seq: 4400, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "completed", MetadataJSON: &historicalMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), historical); err != nil {
+		t.Fatalf("Upsert historical fixer: %v", err)
+	}
+	if _, err := loops.ParkReviewFixBudget(context.Background(), services.Repositories, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	}); err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/runs/active/"+fixer.ID+"/stop", nil)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("stop status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	reviewerAfter, _ := services.Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	fixerAfter, _ := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	histAfter, _ := services.Repositories.Loops.GetByID(context.Background(), historical.ID)
+	if reviewerAfter == nil || reviewerAfter.Status != "terminated" || fixerAfter == nil || fixerAfter.Status != "terminated" {
+		t.Fatalf("held pair after stop = reviewer %#v fixer %#v, want both terminated", reviewerAfter, fixerAfter)
+	}
+	if histAfter == nil || histAfter.Status != "completed" || loops.FixerPushCount(histAfter.MetadataJSON) != 3 {
+		t.Fatalf("historical fixer = %#v, want completed with original pushCount 3", histAfter)
+	}
+	if histAfter.MetadataJSON == nil || *histAfter.MetadataJSON != historicalMeta {
+		t.Fatalf("historical metadata = %v, want unchanged", histAfter.MetadataJSON)
+	}
+	if len(drained) != 2 {
+		t.Fatalf("StopLoop calls = %v, want only held pair members", drained)
+	}
+	seen := map[string]bool{drained[0]: true, drained[1]: true}
+	if !seen[reviewer.ID] || !seen[fixer.ID] || seen[historical.ID] {
+		t.Fatalf("drained = %v, want %s and %s only", drained, reviewer.ID, fixer.ID)
+	}
+}
+
 func TestHandlerRetryRejectsReviewFixBudgetHold(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = false

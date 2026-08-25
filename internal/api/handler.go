@@ -6024,6 +6024,9 @@ func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.Loo
 			continue
 		}
 		seen[member.ID] = struct{}{}
+		if member.ID != loop.ID && !loops.IsReviewFixBudgetHold(member) {
+			continue
+		}
 		switch strings.TrimSpace(member.Status) {
 		case "terminated", "stopped", "completed":
 			continue

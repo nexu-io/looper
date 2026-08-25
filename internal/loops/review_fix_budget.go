@@ -925,13 +925,17 @@ func requeueReviewFixBudgetLoop(ctx context.Context, repos *storage.Repositories
 }
 
 func terminateReviewFixPair(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
-	// Keep the answered/held loop until every same-lane sibling is terminated so
-	// a later poll can retry the same Stop.
+	// Keep the answered/held loop until every currently held same-lane sibling
+	// is terminated so a later poll can retry the same Stop. Historical
+	// completed or independently finished siblings stay untouched.
 	all, err := repos.Loops.List(ctx)
 	if err != nil {
 		return loop, err
 	}
 	for _, sibling := range FindSiblingReviewFixLoops(all, loop) {
+		if !IsReviewFixBudgetHold(sibling) {
+			continue
+		}
 		if _, err := terminateReviewFixLoop(ctx, repos, sibling, nowISO); err != nil {
 			return loop, err
 		}

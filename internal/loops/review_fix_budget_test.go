@@ -147,25 +147,23 @@ func TestContinueReviewFixBudgetEnqueuesFreshWorkAfterCompletedClaim(t *testing.
 func TestApplyReviewFixBudgetAnswerStopTerminatesPair(t *testing.T) {
 	t.Parallel()
 	repos, nowISO := newBudgetFixture(t)
-	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_stop", "reviewer", "awaiting_human")
-	_ = seedBudgetLoop(t, repos, nowISO, "loop_fixer_stop", "fixer", "paused")
-	metadata, err := WriteHITLAsk(reviewer.MetadataJSON, NewReviewFixBudgetAsk("reviewer", "acme/looper", 42, 8, 8, nowISO))
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_stop", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_stop", "fixer", "queued")
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
+	})
 	if err != nil {
-		t.Fatalf("WriteHITLAsk() error = %v", err)
-	}
-	reviewer.MetadataJSON = &metadata
-	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
+		t.Fatalf("ParkReviewFixBudget() error = %v", err)
 	}
 
-	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, reviewer, "Stop", nowISO, testBudgetCaps(8, 8))
+	result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Stop", nowISO, testBudgetCaps(8, 8))
 	if err != nil || !result.Applied || result.Action != "stop" {
 		t.Fatalf("ApplyReviewFixBudgetAnswer() = (%#v, %v)", result, err)
 	}
 	if result.Loop.Status != "terminated" {
 		t.Fatalf("exhausted after stop = %q, want terminated", result.Loop.Status)
 	}
-	sibling, err := repos.Loops.GetByID(context.Background(), "loop_fixer_stop")
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil || sibling.Status != "terminated" {
 		t.Fatalf("sibling after stop = (%#v, %v), want terminated", sibling, err)
 	}
@@ -626,6 +624,60 @@ func TestContinueReviewFixBudgetDoesNotResetHistoricalSiblingMeters(t *testing.T
 			histAfter, err := repos.Loops.GetByID(context.Background(), historical.ID)
 			if err != nil || histAfter == nil || histAfter.Status != status || FixerPushCount(histAfter.MetadataJSON) != 3 {
 				t.Fatalf("historical fixer = (%#v, %v), want %s with original pushCount 3", histAfter, err, status)
+			}
+		})
+	}
+}
+
+func TestStopReviewFixBudgetDoesNotTerminateHistoricalSibling(t *testing.T) {
+	t.Parallel()
+	for _, status := range []string{"terminated", "completed"} {
+		status := status
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			repos, nowISO := newBudgetFixture(t)
+			contMeta := `{"manual":true,"followUpdates":true,"loop":{"iterationCount":3}}`
+			liveFixerMeta := `{"manual":true,"followUpdates":true,"reviewFixBudget":{"pushCount":1}}`
+			historicalMeta := `{"manual":true,"followUpdates":true,"reviewFixBudget":{"pushCount":3,"exhaustedBy":"fixer"}}`
+			reviewer := seedBudgetLoop(t, repos, nowISO, "loop_reviewer_stop_hist_"+status, "reviewer", "running")
+			reviewer.MetadataJSON = &contMeta
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("Upsert reviewer: %v", err)
+			}
+			liveFixer := seedBudgetLoop(t, repos, nowISO, "loop_fixer_stop_hist_live_"+status, "fixer", "queued")
+			liveFixer.MetadataJSON = &liveFixerMeta
+			if err := repos.Loops.Upsert(context.Background(), liveFixer); err != nil {
+				t.Fatalf("Upsert live fixer: %v", err)
+			}
+			historical := seedBudgetLoop(t, repos, nowISO, "loop_fixer_stop_hist_"+status, "fixer", status)
+			historical.MetadataJSON = &historicalMeta
+			if err := repos.Loops.Upsert(context.Background(), historical); err != nil {
+				t.Fatalf("Upsert historical fixer: %v", err)
+			}
+
+			parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+				Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: true,
+			})
+			if err != nil {
+				t.Fatalf("ParkReviewFixBudget() error = %v", err)
+			}
+			result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, parked, "Stop", nowISO, testBudgetCaps(3, 3))
+			if err != nil || !result.Applied || result.Action != "stop" {
+				t.Fatalf("Stop = (%#v, %v)", result, err)
+			}
+			if result.Loop.Status != "terminated" {
+				t.Fatalf("exhausted after stop = %q, want terminated", result.Loop.Status)
+			}
+			liveAfter, err := repos.Loops.GetByID(context.Background(), liveFixer.ID)
+			if err != nil || liveAfter == nil || liveAfter.Status != "terminated" {
+				t.Fatalf("live fixer = (%#v, %v), want terminated", liveAfter, err)
+			}
+			histAfter, err := repos.Loops.GetByID(context.Background(), historical.ID)
+			if err != nil || histAfter == nil || histAfter.Status != status || FixerPushCount(histAfter.MetadataJSON) != 3 {
+				t.Fatalf("historical fixer = (%#v, %v), want %s with original pushCount 3", histAfter, err, status)
+			}
+			if histAfter.MetadataJSON == nil || *histAfter.MetadataJSON != historicalMeta {
+				t.Fatalf("historical metadata = %v, want unchanged", histAfter.MetadataJSON)
 			}
 		})
 	}
