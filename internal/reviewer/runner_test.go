@@ -2,15 +2,10 @@ package reviewer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"testing"
-	"time"
-
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -26,6 +21,11 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
 )
 
 func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
@@ -11285,6 +11285,124 @@ func TestPublishCommentOnlyMixedMustFixNeedsHumanPublishesThenParksScope(t *test
 				}
 			}
 		})
+	}
+}
+
+// failOnceBudgetHeldLoopGet fails the first loops-by-id read after a budget
+// hold is durable, then succeeds. Models a transient storage error between
+// recordPublishedReviewProgress and parkOrDeferReviewerScopeHuman.
+type failOnceBudgetHeldLoopGet struct {
+	db         *sql.DB
+	failedOnce bool
+}
+
+func (q *failOnceBudgetHeldLoopGet) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *failOnceBudgetHeldLoopGet) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *failOnceBudgetHeldLoopGet) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if !q.failedOnce && strings.Contains(query, "SELECT * FROM loops WHERE id") && len(args) == 1 {
+		id, _ := args[0].(string)
+		var status string
+		var meta *string
+		if err := q.db.QueryRowContext(ctx, `SELECT status, metadata_json FROM loops WHERE id = ?`, id).Scan(&status, &meta); err == nil {
+			if loops.IsReviewFixBudgetHold(storage.LoopRecord{Status: status, MetadataJSON: meta}) {
+				q.failedOnce = true
+				return q.db.QueryRowContext(ctx, `SELECT * FROM loops_refresh_probe_missing WHERE id = ?`, id)
+			}
+		}
+	}
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+func TestPublishCommentOnlyMixedMustFixNeedsHumanRefreshErrorDoesNotStackHolds(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":0}}`
+	loop := storage.LoopRecord{
+		ID: "loop_mixed_refresh_fail", Seq: 99, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = true
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 1
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Mixed must_fix and needs_human",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"a.go"}},
+			{Title: "Ambiguous", Body: "unclear", Disposition: "needs_human", Severity: "blocking", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	querier := &failOnceBudgetHeldLoopGet{db: fixture.coordinator.DB()}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: storage.NewRepositories(querier), GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project: (%#v, %v)", project, err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA: "abc123", IdempotencyKey: "idem-mixed-refresh-fail", Event: reviewEventAgentNative,
+		Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+	}
+	_, err = runner.runPublishStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_mixed_refresh_fail"},
+		Repo: repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:        &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+			Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: &pending,
+		},
+	})
+	if err == nil {
+		t.Fatal("runPublishStep() error = nil, want refresh failure")
+	}
+	var hold *holdSkipError
+	if errors.As(err, &hold) {
+		t.Fatalf("runPublishStep() = holdSkipError %q, want fail-closed refresh error", hold.summary)
+	}
+	if !strings.Contains(err.Error(), "refresh loop before review scope park") {
+		t.Fatalf("runPublishStep() error = %v, want refresh loop before review scope park", err)
+	}
+	updated, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || updated == nil {
+		t.Fatalf("get loop: (%#v, %v)", updated, getErr)
+	}
+	if !loops.IsReviewFixBudgetHold(*updated) {
+		t.Fatalf("want durable budget hold after publish: status=%s meta=%s", updated.Status, derefString(updated.MetadataJSON))
+	}
+	if loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("refresh failure must not stack a scope hold: %#v", updated)
+	}
+	if loops.HasPendingReviewScopeHuman(*updated) {
+		t.Fatalf("refresh failure must not guess pending scope: meta=%s", derefString(updated.MetadataJSON))
+	}
+	if got := loops.ReviewerPublishCount(updated.MetadataJSON); got != 1 {
+		t.Fatalf("ReviewerPublishCount = %d, want 1", got)
 	}
 }
 

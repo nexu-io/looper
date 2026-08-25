@@ -6842,7 +6842,11 @@ func (r *Runner) parkReviewerScopeHuman(ctx context.Context, loop storage.LoopRe
 // without stacking a second HITL ask/primary pause reason; otherwise park scope.
 func (r *Runner) parkOrDeferReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
 	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
-		if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return fmt.Errorf("refresh loop before review scope park: %w", err)
+		}
+		if fresh != nil {
 			loop = *fresh
 		}
 	}
