@@ -3512,7 +3512,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		// does not re-enqueue unchanged input (§8.4). Legacy modes may still comment.
 		if decisionValue == "needs_human" && isDisposition {
 			candidateFeedbackFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, currentLogin)
-			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP)
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP, decisionValue)
 			if err != nil {
 				checkpoint.ThreadResolution = result
 				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
@@ -3585,7 +3585,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		}
 
 		if shouldComment {
-			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP)
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP, decisionValue)
 			if err != nil {
 				checkpoint.ThreadResolution = result
 				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
@@ -3613,7 +3613,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			mutated = true
 		}
 		if shouldResolve {
-			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP)
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP, decisionValue)
 			if err != nil {
 				checkpoint.ThreadResolution = result
 				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
@@ -4019,7 +4019,7 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 	return nil
 }
 
-func (r *Runner) refreshThreadResolutionCandidateForPath(ctx context.Context, input stepInput, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig, threadID string, dispositionPath bool, classifiedFeedbackFP string) (*ReviewThread, PullRequestDetail, error) {
+func (r *Runner) refreshThreadResolutionCandidateForPath(ctx context.Context, input stepInput, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig, threadID string, dispositionPath bool, classifiedFeedbackFP, decision string) (*ReviewThread, PullRequestDetail, error) {
 	if dispositionPath {
 		// Bypass RequireCurrentReviewRequest and RequireNewHeadSinceThread.
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
@@ -4038,8 +4038,13 @@ func (r *Runner) refreshThreadResolutionCandidateForPath(ctx context.Context, in
 				continue
 			}
 			if latest[i].IsResolved {
-				// Already resolved is idempotent success for accept path.
-				return &latest[i], detail, nil
+				// Human resolve during classify is terminal. Only accept_wontfix
+				// may treat it as idempotent success; reject/needs_human must not
+				// mutate or park on the stale classified snapshot.
+				if strings.EqualFold(strings.TrimSpace(decision), "accept_wontfix") {
+					return &latest[i], detail, nil
+				}
+				return nil, detail, nil
 			}
 			if !isLooperAuthoredThreadForLogin(latest[i], currentLogin) {
 				return nil, detail, nil
