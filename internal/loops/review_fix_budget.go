@@ -699,7 +699,7 @@ func ApplyReviewFixBudgetAnswer(ctx context.Context, repos *storage.Repositories
 		return ReviewFixBudgetAnswerResult{}, fmt.Errorf("review-fix budget answer requires loop storage")
 	}
 	if IsReviewFixBudgetStop(answer) {
-		updated, err := terminateReviewFixPair(ctx, repos, loop, nowISO)
+		updated, err := terminateReviewFixPair(ctx, repos, loop, nowISO, ReviewFixBudgetTerminationReason)
 		if err != nil {
 			return ReviewFixBudgetAnswerResult{}, err
 		}
@@ -783,6 +783,11 @@ func continueReviewFixBudget(ctx context.Context, repos *storage.Repositories, l
 			return loop, err
 		}
 	}
+	// If needs_human was deferred under the budget hold, promote to a real
+	// scope park now that budget is no longer the primary hold.
+	if err := promotePendingReviewScopeHumanAfterBudgetRelease(ctx, repos, members, nowISO); err != nil {
+		return loop, err
+	}
 	fresh, err := repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil {
 		return loop, err
@@ -791,6 +796,40 @@ func continueReviewFixBudget(ctx context.Context, repos *storage.Repositories, l
 		return loop, fmt.Errorf("review-fix budget continue lost loop %s", loop.ID)
 	}
 	return *fresh, nil
+}
+
+// promotePendingReviewScopeHumanAfterBudgetRelease parks scope when a member
+// still carries deferred needs_human evidence from a publish that hit the cap.
+func promotePendingReviewScopeHumanAfterBudgetRelease(ctx context.Context, repos *storage.Repositories, members []storage.LoopRecord, nowISO string) error {
+	for _, member := range members {
+		fresh, err := repos.Loops.GetByID(ctx, member.ID)
+		if err != nil {
+			return err
+		}
+		if fresh == nil || !HasPendingReviewScopeHuman(*fresh) {
+			continue
+		}
+		state := ReadReviewScopeHumanState(fresh.MetadataJSON)
+		role := strings.TrimSpace(fresh.Type)
+		if role == "" {
+			role = "reviewer"
+		}
+		if _, err := ParkReviewScopeHuman(ctx, repos, ParkReviewScopeHumanInput{
+			Held:        *fresh,
+			Role:        role,
+			Repo:        strings.TrimSpace(derefLoopString(fresh.Repo)),
+			PRNumber:    derefLoopInt64(fresh.PRNumber),
+			NowISO:      nowISO,
+			HITLEnabled: state.PendingHITL,
+			Question:    state.Question,
+			Evidence:    state.Evidence,
+		}); err != nil {
+			return err
+		}
+		// One primary scope park is enough for the pair.
+		return nil
+	}
+	return nil
 }
 
 func reviewFixBudgetPairMembers(all []storage.LoopRecord, loop storage.LoopRecord) []storage.LoopRecord {
@@ -936,25 +975,31 @@ func requeueReviewFixBudgetLoop(ctx context.Context, repos *storage.Repositories
 	return err
 }
 
-func terminateReviewFixPair(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
+func terminateReviewFixPair(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO, terminationReason string) (storage.LoopRecord, error) {
 	// Keep the answered/held loop until every same-lane sibling is terminated so
 	// a later poll can retry the same Stop.
+	if strings.TrimSpace(terminationReason) == "" {
+		terminationReason = ReviewFixBudgetTerminationReason
+	}
 	all, err := repos.Loops.List(ctx)
 	if err != nil {
 		return loop, err
 	}
 	for _, sibling := range FindSiblingReviewFixLoops(all, loop) {
-		if _, err := terminateReviewFixLoop(ctx, repos, sibling, nowISO); err != nil {
+		if _, err := terminateReviewFixLoop(ctx, repos, sibling, nowISO, terminationReason); err != nil {
 			return loop, err
 		}
 	}
-	return terminateReviewFixLoop(ctx, repos, loop, nowISO)
+	return terminateReviewFixLoop(ctx, repos, loop, nowISO, terminationReason)
 }
 
-func terminateReviewFixLoop(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
+func terminateReviewFixLoop(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO, terminationReason string) (storage.LoopRecord, error) {
 	switch loop.Status {
 	case "terminated", "stopped":
 		return loop, nil
+	}
+	if strings.TrimSpace(terminationReason) == "" {
+		terminationReason = ReviewFixBudgetTerminationReason
 	}
 	meta := parseMetadataObject(loop.MetadataJSON)
 	if loop.Type == "reviewer" {
@@ -963,10 +1008,10 @@ func terminateReviewFixLoop(ctx context.Context, repos *storage.Repositories, lo
 			loopMeta = map[string]any{}
 		}
 		loopMeta["status"] = "terminated"
-		loopMeta["terminationReason"] = ReviewFixBudgetTerminationReason
+		loopMeta["terminationReason"] = terminationReason
 		meta[reviewerLoopMetadataKey] = loopMeta
 	}
-	if reason, _ := stringFromAny(meta["pauseReason"]); reason == ReviewFixBudgetPauseReason || reason == ReviewFixBudgetTerminationReason {
+	if reason, _ := stringFromAny(meta["pauseReason"]); reason == ReviewFixBudgetPauseReason || reason == ReviewFixBudgetTerminationReason || reason == ReviewScopeHumanRequiredReason || reason == ReviewScopeHumanSiblingPauseReason {
 		delete(meta, "pauseReason")
 	}
 	encoded, err := json.Marshal(meta)
@@ -988,6 +1033,17 @@ func terminateReviewFixLoop(ctx context.Context, repos *storage.Repositories, lo
 	if err != nil {
 		return loop, err
 	}
+	scopeState := ReadReviewScopeHumanState(&cleared)
+	scopeState.HeldBy = ""
+	scopeState.Question = ""
+	if scopeState.PauseReason == ReviewScopeHumanSiblingPauseReason || scopeState.PauseReason == ReviewScopeHumanRequiredReason {
+		scopeState.PauseReason = ""
+	}
+	scopeState.HandoffEventAt = ""
+	cleared, err = WriteReviewScopeHumanState(&cleared, scopeState)
+	if err != nil {
+		return loop, err
+	}
 	updated := loop
 	updated.MetadataJSON = &cleared
 	updated.Status = "terminated"
@@ -997,7 +1053,7 @@ func terminateReviewFixLoop(ctx context.Context, repos *storage.Repositories, lo
 		return loop, err
 	}
 	if repos.Queue != nil {
-		reason := ReviewFixBudgetTerminationReason
+		reason := terminationReason
 		if _, err := repos.Queue.CancelByLoop(ctx, updated.ID, nowISO, &reason); err != nil {
 			return updated, err
 		}

@@ -129,7 +129,7 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 			continue
 		}
 		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-		if !ok || !loops.IsReviewFixBudgetAsk(ask) {
+		if !ok || (!loops.IsReviewFixBudgetAsk(ask) && !loops.IsReviewScopeHumanAsk(ask)) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(ask.Transport), "feishu") {
@@ -179,9 +179,9 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 		if loop, err := repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
 			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
 			if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
-				if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+				if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && (loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask)) {
 					shouldResolve = true
-				} else if loops.IsReviewFixBudgetHold(*loop) {
+				} else if loops.IsReviewFixPairHold(*loop) {
 					shouldResolve = true
 				}
 			}
