@@ -670,6 +670,17 @@ func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repos
 		if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
 			return applyReviewScopeHumanAnswerAndReopen(ctx, db, repos, executions, *loop, text, nowISO)
 		}
+		if feishuOverlayResidualCardIsNotPairDecision(*loop, text) {
+			write := func(writeRepos *storage.Repositories) error {
+				return persistOverlayResidualAskAnswer(ctx, writeRepos, loopID, text, nowISO)
+			}
+			if db != nil {
+				return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+					return write(storage.NewRepositories(tx))
+				})
+			}
+			return write(repos)
+		}
 		return nil
 	}
 

@@ -204,6 +204,15 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 		}
 		if loop != nil {
 			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
+			if feishuOverlayResidualCardIsNotPairDecision(*loop, text) {
+				if err := preserveFeishuOverlayResidualCardAnswer(ctx, repos, db, loopID, text, nowISO); err != nil {
+					return err
+				}
+				if onAnswered != nil {
+					onAnswered(ctx, loopID, text)
+				}
+				return nil
+			}
 			if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
 				cardLoopID, err := feishuDecisionCardLoopID(ctx, repos, *loop)
 				if err != nil {
@@ -304,32 +313,7 @@ func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*fresh))
 	defer unlockTarget()
 	write := func(writeRepos *storage.Repositories) error {
-		current, err := writeRepos.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return err
-		}
-		if current == nil || !feishuOverlayResidualCardIsNotPairDecision(*current, answer) {
-			return nil
-		}
-		ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
-		if !ok {
-			return nil
-		}
-		status := strings.TrimSpace(ask.Status)
-		if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
-			return nil
-		}
-		ask.Answer = answer
-		ask.Status = "answered"
-		ask.AnsweredAt = nowISO
-		meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
-		if err != nil {
-			return err
-		}
-		updated := *current
-		updated.MetadataJSON = &meta
-		updated.UpdatedAt = nowISO
-		return writeRepos.Loops.Upsert(ctx, updated)
+		return persistOverlayResidualAskAnswer(ctx, writeRepos, loopID, answer, nowISO)
 	}
 	if db != nil {
 		return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
@@ -337,6 +321,41 @@ func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage
 		})
 	}
 	return write(repos)
+}
+
+// persistOverlayResidualAskAnswer writes a residual ordinary ask answer without
+// taking pair locks. Callers must already hold requeue+target serialization or
+// be inside the preserve TX that re-reads under those locks.
+func persistOverlayResidualAskAnswer(ctx context.Context, writeRepos *storage.Repositories, loopID, answer, nowISO string) error {
+	if writeRepos == nil || writeRepos.Loops == nil {
+		return nil
+	}
+	current, err := writeRepos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if current == nil || !feishuOverlayResidualCardIsNotPairDecision(*current, answer) {
+		return nil
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok {
+		return nil
+	}
+	status := strings.TrimSpace(ask.Status)
+	if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
+		return nil
+	}
+	ask.Answer = answer
+	ask.Status = "answered"
+	ask.AnsweredAt = nowISO
+	meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+	if err != nil {
+		return err
+	}
+	updated := *current
+	updated.MetadataJSON = &meta
+	updated.UpdatedAt = nowISO
+	return writeRepos.Loops.Upsert(ctx, updated)
 }
 
 // feishuDecisionCardLoopID returns the loop whose Continue/Stop Feishu card
