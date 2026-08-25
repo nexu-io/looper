@@ -798,6 +798,12 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 
 // validateReviewSubmitCommentDispositions enforces the trusted finding contract on
 // actionable inline comments. Clean body-only APPROVE/COMMENT needs no dispositions.
+//
+// Authority for publishing a finding as remote review feedback is repository
+// instructions, PR intent, and spec 7.3 — not this gate. The gate fail-closes on
+// the agent's own structured disposition/scope fields so a prompt-only subset
+// cannot publish follow_up/needs_human or omit the declaration; it does not infer
+// disposition from GitHub or other infra state.
 func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) error {
 	if len(comments) == 0 {
 		return nil
