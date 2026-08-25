@@ -452,6 +452,34 @@ func parkOneSiblingReviewScopeHumanLoop(ctx context.Context, repos *storage.Repo
 	return nil
 }
 
+// keepReleasedBudgetLoopScopeHeld converts a just-cleared budget hold into a
+// scope park when overlay or primary scope metadata remains. Returns true when
+// the loop must stay non-runnable (no requeue). Sibling overlays become a real
+// scope sibling pause so a later scope Continue can requeue.
+func keepReleasedBudgetLoopScopeHeld(updated *storage.LoopRecord, nowISO string) (bool, error) {
+	if updated == nil || !IsReviewScopeHumanHold(*updated) {
+		return false, nil
+	}
+	updated.NextRunAt = nil
+	updated.UpdatedAt = nowISO
+	if isReviewScopeHumanPrimaryHold(*updated) {
+		if strings.TrimSpace(updated.Status) != "awaiting_human" {
+			updated.Status = "paused"
+		}
+		return true, nil
+	}
+	meta := parseMetadataObject(updated.MetadataJSON)
+	meta["pauseReason"] = ReviewScopeHumanSiblingPauseReason
+	out, err := json.Marshal(meta)
+	if err != nil {
+		return false, err
+	}
+	text := string(out)
+	updated.MetadataJSON = &text
+	updated.Status = "paused"
+	return true, nil
+}
+
 func ensureReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repositories, held storage.LoopRecord, input ParkReviewScopeHumanInput) error {
 	if repos == nil || repos.Events == nil {
 		return nil

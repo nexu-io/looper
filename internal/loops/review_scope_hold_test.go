@@ -3,6 +3,8 @@ package loops
 import (
 	"context"
 	"testing"
+
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestParkAndContinueReviewScopeHumanDoesNotResetMeters(t *testing.T) {
@@ -367,6 +369,115 @@ func TestApplyReviewScopeHumanStopUsesScopeTerminationReason(t *testing.T) {
 	}
 	if got, _ := loopMeta["terminationReason"].(string); got == ReviewFixBudgetTerminationReason {
 		t.Fatal("scope Stop must not write review_fix_budget_exhausted")
+	}
+}
+
+func TestBudgetContinueRestoresScopePausedSiblingInsteadOfQueueing(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		budgetHITL bool
+		wantBudget string
+	}{
+		{name: "awaiting_human_budget_ask", budgetHITL: true, wantBudget: "awaiting_human"},
+		{name: "paused_nohitl_budget", budgetHITL: false, wantBudget: "paused"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			repos, nowISO := newBudgetFixture(t)
+			suffix := tc.name
+			reviewer := seedBudgetLoop(t, repos, nowISO, "loop_scope_budget_ord_rev_"+suffix, "reviewer", "running")
+			fixer := seedBudgetLoop(t, repos, nowISO, "loop_scope_budget_ord_fix_"+suffix, "fixer", "queued")
+			reviewerQueueID := "queue_scope_budget_ord_rev_" + suffix
+			fixerQueueID := "queue_scope_budget_ord_fix_" + suffix
+			seedBudgetQueue(t, repos, nowISO, reviewerQueueID, reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+			seedBudgetQueue(t, repos, nowISO, fixerQueueID, fixer.ID, "fixer", storage.QueuePriorityFixer)
+
+			parkedFixer, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+				Exhausted: fixer, Role: "fixer", Repo: "acme/looper", PRNumber: 42,
+				Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: tc.budgetHITL,
+			})
+			if err != nil {
+				t.Fatalf("ParkReviewFixBudget: %v", err)
+			}
+			if parkedFixer.Status != tc.wantBudget || !IsReviewFixBudgetHold(parkedFixer) {
+				t.Fatalf("budget fixer = %#v, want status %s + budget hold", parkedFixer, tc.wantBudget)
+			}
+
+			freshReviewer, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+			if err != nil || freshReviewer == nil {
+				t.Fatalf("reviewer after budget park: (%#v, %v)", freshReviewer, err)
+			}
+			parkedReviewer, err := ParkReviewScopeHuman(context.Background(), repos, ParkReviewScopeHumanInput{
+				Held: *freshReviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42,
+				NowISO: nowISO, HITLEnabled: true,
+				Question: "Clarify AGENTS.md rule X before unpause; finding: ambiguous scope",
+			})
+			if err != nil {
+				t.Fatalf("ParkReviewScopeHuman: %v", err)
+			}
+			if !IsReviewScopeHumanHold(parkedReviewer) || IsReviewFixBudgetHold(parkedReviewer) {
+				t.Fatalf("reviewer after scope park = %#v, want scope-only hold", parkedReviewer)
+			}
+
+			overlaid, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || overlaid == nil {
+				t.Fatalf("fixer after overlay: (%#v, %v)", overlaid, err)
+			}
+			if overlaid.Status != tc.wantBudget || !IsReviewFixBudgetHold(*overlaid) || !IsReviewScopeHumanHold(*overlaid) {
+				t.Fatalf("overlaid fixer = %#v meta=%s, want preserved budget status + scope overlay", overlaid, derefMeta(overlaid.MetadataJSON))
+			}
+			if ask, ok := ReadHITLAsk(overlaid.MetadataJSON); tc.budgetHITL && (!ok || !IsReviewFixBudgetAsk(ask)) {
+				t.Fatalf("overlaid fixer ask = (%#v, %v), want preserved budget ask", ask, ok)
+			}
+
+			result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, *overlaid, "Continue", nowISO, testBudgetCaps(8, 8))
+			if err != nil || !result.Applied || result.Action != "continue" {
+				t.Fatalf("budget Continue = (%#v, %v)", result, err)
+			}
+
+			freshFixer, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || freshFixer == nil {
+				t.Fatalf("fixer after budget Continue: (%#v, %v)", freshFixer, err)
+			}
+			if freshFixer.Status == "queued" {
+				t.Fatalf("fixer queued after budget Continue while scope overlay remains: %#v", freshFixer)
+			}
+			if freshFixer.Status != "paused" || IsReviewFixBudgetHold(*freshFixer) || !IsReviewScopeHumanHold(*freshFixer) {
+				t.Fatalf("fixer after budget Continue = %#v meta=%s, want paused scope sibling", freshFixer, derefMeta(freshFixer.MetadataJSON))
+			}
+			if !IsSiblingReviewScopeHumanPause(freshFixer.MetadataJSON) {
+				t.Fatalf("fixer after budget Continue missing sibling scope pause: meta=%s", derefMeta(freshFixer.MetadataJSON))
+			}
+			if reason, _ := stringFromAny(parseMetadataObject(freshFixer.MetadataJSON)["pauseReason"]); reason != ReviewScopeHumanSiblingPauseReason {
+				t.Fatalf("fixer top-level pauseReason = %q, want %q", reason, ReviewScopeHumanSiblingPauseReason)
+			}
+			fixerQueue, err := repos.Queue.GetByID(context.Background(), fixerQueueID)
+			if err != nil || fixerQueue == nil || fixerQueue.Status != "cancelled" {
+				t.Fatalf("fixer queue after budget Continue = (%#v, %v), want cancelled", fixerQueue, err)
+			}
+
+			freshReviewer, err = repos.Loops.GetByID(context.Background(), reviewer.ID)
+			if err != nil || freshReviewer == nil || !IsReviewScopeHumanHold(*freshReviewer) {
+				t.Fatalf("reviewer after budget Continue = (%#v, %v), want still scope-held", freshReviewer, err)
+			}
+			if reason, _ := stringFromAny(parseMetadataObject(freshReviewer.MetadataJSON)["pauseReason"]); reason == ReviewFixBudgetPauseReason {
+				t.Fatalf("reviewer still has leftover budget pauseReason after budget Continue: meta=%s", derefMeta(freshReviewer.MetadataJSON))
+			}
+
+			scopeResult, err := ApplyReviewScopeHumanAnswer(context.Background(), repos, *freshReviewer, "Continue", nowISO)
+			if err != nil || !scopeResult.Applied || scopeResult.Action != "continue" {
+				t.Fatalf("scope Continue = (%#v, %v)", scopeResult, err)
+			}
+			freshFixer, err = repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || freshFixer == nil || freshFixer.Status != "queued" || IsReviewScopeHumanHold(*freshFixer) {
+				t.Fatalf("fixer after scope Continue = (%#v, %v), want queued and released", freshFixer, err)
+			}
+			if scopeResult.Loop.Status != "queued" || IsReviewScopeHumanHold(scopeResult.Loop) {
+				t.Fatalf("reviewer after scope Continue = %#v, want queued and released", scopeResult.Loop)
+			}
+		})
 	}
 }
 

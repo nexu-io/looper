@@ -860,6 +860,21 @@ func resetReviewFixBudgetMetersIfNeeded(metadataJSON *string, loopType string, c
 	}
 }
 
+func hasResidualReviewFixBudgetHoldStamps(metadataJSON *string) bool {
+	if ask, ok := ReadHITLAsk(metadataJSON); ok && IsReviewFixBudgetAsk(ask) {
+		return true
+	}
+	state := ReadReviewFixBudgetState(metadataJSON)
+	if strings.TrimSpace(state.SiblingOf) != "" || strings.TrimSpace(state.ExhaustedBy) != "" {
+		return true
+	}
+	if state.PauseReason == ReviewFixBudgetPauseReason || state.PauseReason == ReviewFixBudgetTerminationReason {
+		return true
+	}
+	reason, _ := stringFromAny(parseMetadataObject(metadataJSON)["pauseReason"])
+	return reason == ReviewFixBudgetPauseReason || reason == ReviewFixBudgetTerminationReason
+}
+
 func releaseOneReviewFixBudgetHold(ctx context.Context, repos *storage.Repositories, loopID, nowISO string) error {
 	fresh, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil {
@@ -868,7 +883,8 @@ func releaseOneReviewFixBudgetHold(ctx context.Context, repos *storage.Repositor
 	if fresh == nil {
 		return nil
 	}
-	if !IsReviewFixBudgetHold(*fresh) {
+	wasBudgetHold := IsReviewFixBudgetHold(*fresh)
+	if !wasBudgetHold && !hasResidualReviewFixBudgetHoldStamps(fresh.MetadataJSON) {
 		return nil
 	}
 	metadata := fresh.MetadataJSON
@@ -901,9 +917,38 @@ func releaseOneReviewFixBudgetHold(ctx context.Context, repos *storage.Repositor
 	text := string(out)
 	updated := *fresh
 	updated.MetadataJSON = &text
+	updated.UpdatedAt = nowISO
+	if !wasBudgetHold {
+		// Scope-primary (or other non-hold) leftover sibling/exhausted stamps
+		// from an earlier budget park. Clear them so a later scope Continue
+		// does not treat stale budget pauseReason as an independent hold.
+		return repos.Loops.Upsert(ctx, updated)
+	}
+
+	// Budget Continue must not queue a sibling that still has an unresolved
+	// scope overlay. Restore a real scope sibling pause so the loop stays
+	// non-runnable and a later scope Continue can requeue it.
+	heldForScope, holdErr := keepReleasedBudgetLoopScopeHeld(&updated, nowISO)
+	if holdErr != nil {
+		return holdErr
+	}
+	if heldForScope {
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return err
+		}
+		if repos.Queue != nil {
+			reason := ReviewScopeHumanSiblingPauseReason
+			if _, err := repos.Queue.CancelByLoop(ctx, updated.ID, nowISO, &reason); err != nil {
+				return err
+			}
+		}
+		if reviewFixBudgetReleaseHook != nil {
+			return reviewFixBudgetReleaseHook(updated.ID)
+		}
+		return nil
+	}
 	updated.Status = "queued"
 	updated.NextRunAt = &nowISO
-	updated.UpdatedAt = nowISO
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return err
 	}
