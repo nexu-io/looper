@@ -4728,8 +4728,19 @@ func reviewerSummaryPromptContext(issueComments []map[string]any) string {
 
 func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completion reviewerCommentOnlyCompletion) (forge.ReviewerSummary, error) {
 	// Remote Reviewer Summary authority is must_fix only; follow_up/needs_human
-	// stay in the structured completion and must not become open remote items.
+	// stay in the structured completion and must not become new open remote items.
+	// Existing open items referenced by needs_human stay open until the human
+	// decision is applied so Forgejo Fixer still sees them after a scope Continue.
 	publishFindings := publishableCommentOnlyFindings(completion.Findings)
+	needsHumanReferencedIDs := map[string]struct{}{}
+	for _, finding := range completion.Findings {
+		if strings.TrimSpace(finding.Disposition) != reviewFindingDispositionNeedsHuman {
+			continue
+		}
+		if id := strings.TrimSpace(finding.ReviewItemID); id != "" {
+			needsHumanReferencedIDs[id] = struct{}{}
+		}
+	}
 	reviewRoundID := 1
 	if existing.ReviewRoundID > 0 {
 		reviewRoundID = existing.ReviewRoundID + 1
@@ -4802,6 +4813,11 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 			continue
 		}
 		if item.Status == forge.ReviewItemStatusOpen {
+			if _, keepOpen := needsHumanReferencedIDs[item.ReviewItemID]; keepOpen {
+				item.LastSeenRoundID = reviewRoundID
+				finalItems = append(finalItems, item)
+				continue
+			}
 			item.Status = forge.ReviewItemStatusResolved
 			item.SupersededBy = ""
 			item.LastSeenRoundID = reviewRoundID

@@ -10097,6 +10097,70 @@ func TestBuildReviewerSummaryFromCompletionFiltersFollowUpAndNeedsHuman(t *testi
 	}
 }
 
+func TestBuildReviewerSummaryFromCompletionKeepsNeedsHumanReferencedOpenItems(t *testing.T) {
+	t.Parallel()
+
+	existing := forge.NewReviewerSummary(1, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Ambiguous scope", Body: "Is this in PR scope?", Files: []string{"a.go"}, LastSeenRoundID: 1},
+		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Stale leftover", Body: "Truly gone.", LastSeenRoundID: 1},
+		{ReviewItemID: "R-003", Status: forge.ReviewItemStatusOpen, Title: "Later rename", Body: "Follow-up only.", LastSeenRoundID: 1},
+	})
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Mixed publish and park",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Must", Body: "fix", Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "e1", Files: []string{"b.go"}},
+			{ReviewItemID: "R-001", Title: "Ambiguous scope", Body: "Still undecided.", Disposition: "needs_human", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
+			{ReviewItemID: "R-003", Title: "Later rename", Body: "Not this round.", Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "style"},
+		},
+	}
+	summary, err := buildReviewerSummaryFromCompletion(existing, completion)
+	if err != nil {
+		t.Fatalf("buildReviewerSummaryFromCompletion: %v", err)
+	}
+	byID := map[string]forge.ReviewItem{}
+	for _, item := range summary.Items {
+		byID[item.ReviewItemID] = item
+	}
+	if len(byID) != 4 {
+		t.Fatalf("items = %#v, want 4", summary.Items)
+	}
+	kept := byID["R-001"]
+	if kept.Status != forge.ReviewItemStatusOpen || kept.Title != "Ambiguous scope" || kept.Body != "Is this in PR scope?" {
+		t.Fatalf("R-001 = %#v, want original open needs_human-referenced item", kept)
+	}
+	if kept.LastSeenRoundID != 2 {
+		t.Fatalf("R-001 LastSeenRoundID = %d, want 2", kept.LastSeenRoundID)
+	}
+	if byID["R-002"].Status != forge.ReviewItemStatusResolved {
+		t.Fatalf("R-002 = %#v, want omitted leftover resolved", byID["R-002"])
+	}
+	if byID["R-003"].Status != forge.ReviewItemStatusResolved {
+		t.Fatalf("R-003 = %#v, want follow_up-referenced item resolved", byID["R-003"])
+	}
+	var publishedOpen []forge.ReviewItem
+	for _, item := range summary.Items {
+		if item.Status == forge.ReviewItemStatusOpen {
+			publishedOpen = append(publishedOpen, item)
+		}
+	}
+	if len(publishedOpen) != 2 {
+		t.Fatalf("open items = %#v, want R-001 plus new must_fix", publishedOpen)
+	}
+	foundMust := false
+	for _, item := range publishedOpen {
+		if item.Title == "Must" {
+			foundMust = true
+		}
+		if strings.Contains(item.Body, "Still undecided") {
+			t.Fatalf("needs_human content leaked into remote item: %#v", item)
+		}
+	}
+	if !foundMust {
+		t.Fatalf("open items missing must_fix: %#v", publishedOpen)
+	}
+}
+
 func TestPublishableCommentOnlyFindingsFiltersNonMustFix(t *testing.T) {
 	t.Parallel()
 	got := publishableCommentOnlyFindings([]reviewerCommentOnlyFindingResult{
@@ -11221,6 +11285,112 @@ func TestPublishCommentOnlyMixedMustFixNeedsHumanPublishesThenParksScope(t *test
 				}
 			}
 		})
+	}
+}
+
+func TestPublishCommentOnlyMixedMustFixNeedsHumanKeepsReferencedOpenItems(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":0}}`
+	loop := storage.LoopRecord{
+		ID: "loop_mixed_keep_open", Seq: 98, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	existing := forge.NewReviewerSummary(1, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Ambiguous scope", Body: "Is this in PR scope?", Files: []string{"a.go"}, LastSeenRoundID: 1},
+		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Stale leftover", Body: "Truly gone.", LastSeenRoundID: 1},
+	})
+	existingBody, err := renderReviewerSummaryComment(existing, "Previous summary")
+	if err != nil {
+		t.Fatalf("renderReviewerSummaryComment: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = true
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Mixed must_fix and needs_human",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"b.go"}},
+			{ReviewItemID: "R-001", Title: "Ambiguous scope", Body: "unclear", Disposition: "needs_human", Severity: "blocking", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	github := &fakeGitHubGateway{issueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project: (%#v, %v)", project, err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA: "abc123", IdempotencyKey: "idem-mixed-keep-open", Event: reviewEventAgentNative,
+		Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+	}
+	_, err = runner.runPublishStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_mixed_keep_open"},
+		Repo: repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:        &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+			Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: &pending,
+		},
+	})
+	var hold *holdSkipError
+	if !errors.As(err, &hold) {
+		t.Fatalf("runPublishStep() error = %v, want holdSkipError", err)
+	}
+	if len(github.updateIssueCommentCalls) != 1 {
+		t.Fatalf("updateIssueCommentCalls = %d, want 1", len(github.updateIssueCommentCalls))
+	}
+	parsed, err := forge.ParseReviewerSummary(github.updateIssueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary: %v", err)
+	}
+	byID := map[string]forge.ReviewItem{}
+	openIDs := map[string]struct{}{}
+	for _, item := range parsed.Items {
+		byID[item.ReviewItemID] = item
+		if item.Status == forge.ReviewItemStatusOpen {
+			openIDs[item.ReviewItemID] = struct{}{}
+		}
+	}
+	if byID["R-001"].Status != forge.ReviewItemStatusOpen {
+		t.Fatalf("R-001 = %#v, want still open for Forgejo Fixer after mixed publish/park", byID["R-001"])
+	}
+	if byID["R-002"].Status != forge.ReviewItemStatusResolved {
+		t.Fatalf("R-002 = %#v, want omitted leftover resolved", byID["R-002"])
+	}
+	if _, ok := openIDs["R-001"]; !ok || len(openIDs) != 2 {
+		t.Fatalf("open IDs = %#v, want R-001 plus published must_fix", openIDs)
+	}
+	if strings.Contains(github.updateIssueCommentCalls[0].Body, "unclear") {
+		t.Fatalf("published body smuggles needs_human: %s", github.updateIssueCommentCalls[0].Body)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("get loop: (%#v, %v)", updated, err)
+	}
+	if !loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("scope hold = false, want parked after mixed publish")
 	}
 }
 
