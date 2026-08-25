@@ -193,6 +193,79 @@ func TestDiscoverySameHeadChangedCommentQueuesReviewer(t *testing.T) {
 	}
 }
 
+func TestDiscoveryResolvedThreadCommentEditDoesNotQueueOrPublish(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	resolved := []ReviewThread{{
+		ID:         "thread_1",
+		IsResolved: true,
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "same-head"},
+		},
+	}}
+	baseline := ComputeReviewSignalFingerprintForLogin("same-head", resolved, "looper-bot")
+	meta := fmt.Sprintf(`{"followUpdates":true,"lastPublishedHeadSha":"same-head","lastReviewedSignalFingerprint":%q,"loop":{"enabled":true}}`, baseline)
+	loop := storage.LoopRecord{
+		ID: "loop_resolved_edit", Seq: 1, ProjectID: "project_1", Type: "reviewer", Status: "completed",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	edited := []ReviewThread{{
+		ID:         "thread_1",
+		IsResolved: true,
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "same-head"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "drive-by note on resolved thread", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}}
+	agent := &fakeAgentExecutor{}
+	github := &fakeGitHubGateway{
+		currentLogin:   "looper-bot",
+		reviewRequests: []string{"looper-bot"},
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"": {{Number: prNumber, Title: "PR", State: "OPEN", HeadSHA: "same-head", ReviewRequests: []string{"looper-bot"}}},
+		},
+		reviewThreads: edited,
+		viewHeadSHA:   "same-head",
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy:  DiscoveryPolicy{AutoDiscovery: true, RequireReviewRequest: false, EnableSelfReview: true},
+		LoopConfig:       testReviewerLoopConfig(),
+		ThreadResolution: config.ReviewerThreadResolutionConfig{Enabled: false, Mode: config.ReviewerThreadResolutionModeReportOnly, MaxThreadsPerRun: 10},
+	})
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests: %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none after resolved-thread comment edit", result.QueueItems)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil {
+		t.Fatalf("ClaimNextOfType: %v", err)
+	}
+	if claim != nil {
+		t.Fatalf("claimed %#v, want no publication work", claim)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts = %d, want none", len(agent.starts))
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want none", github.issueCommentCalls)
+	}
+	if len(github.submitReviewCalls) != 0 {
+		t.Fatalf("submitReviewCalls = %#v, want none", github.submitReviewCalls)
+	}
+}
+
 func TestMaxThreadsPerRunDoesNotPromoteSignalEarly(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)
@@ -594,10 +667,85 @@ func TestForceNeedsHumanAfterSecondDecline(t *testing.T) {
 		looperRoot("c1", "Please fix"),
 		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
 		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
-		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:t1 fingerprint:x -->", CreatedAt: "t4", UpdatedAt: "t4"},
+		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:t1 fingerprint:x attempt:post-reject -->", CreatedAt: "t4", UpdatedAt: "t4"},
 	)
 	if !ForceNeedsHumanAfterSecondDecline(thread, "abc", "looper-bot") {
 		t.Fatal("second decline after reject must force needs_human")
+	}
+}
+
+func TestPostRejectDeclineMarkerParksNeedsHumanWithoutClassifier(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	base := ReviewThread{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}
+	runnerForMarker := &Runner{}
+	rejectBody := runnerForMarker.buildThreadResolutionReplyWithFeedback(
+		"thread_1", "abc123",
+		coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot"),
+		threadResolutionAgentDecision{Decision: "reject_wontfix", Evidence: "still in scope", Confidence: "high"},
+		config.ReviewerThreadResolutionConfig{},
+	)
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+			{ID: "c3", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:thread_1 fingerprint:x -->", CreatedAt: "t3", UpdatedAt: "t3"},
+			{ID: "c4", Author: "looper-bot", Body: rejectBody, CreatedAt: "t4", UpdatedAt: "t4"},
+			{ID: "c5", Author: "looper-bot", Body: "second decline <!-- looper-fixer-reply-declined thread:thread_1 fingerprint:x attempt:post-reject -->", CreatedAt: "t5", UpdatedAt: "t5"},
+		},
+	}}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"}
+	agent := &fakeAgentExecutor{}
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_post_reject", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+	if _, err := runner.runThreadResolutionStep(context.Background(), input); err != nil {
+		t.Fatalf("runThreadResolutionStep: %v", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("classifier starts = %d, want 0 for ForceNeedsHuman on post-reject marker", len(agent.starts))
+	}
+	if len(github.addThreadReplyCalls) != 0 {
+		t.Fatalf("replies = %#v, want none for needs_human", github.addThreadReplyCalls)
+	}
+	parked, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || parked == nil {
+		t.Fatalf("parked loop = (%#v, %v)", parked, err)
+	}
+	if !loops.IsReviewScopeHumanHold(*parked) {
+		t.Fatalf("loop metadata = %v, want review-scope human hold", parked.MetadataJSON)
 	}
 }
 

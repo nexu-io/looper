@@ -22,8 +22,8 @@ const (
 var (
 	// Exact HTML comment: <!-- looper:thread-resolution thread=... head=... [feedback=...] decision=... -->
 	threadResolutionMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper:thread-resolution\s+([^>]*?)-->`)
-	// Exact Fixer decline marker.
-	fixerDeclinedMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)\s*-->`)
+	// Fixer decline marker. Optional trailing fields (e.g. attempt:post-reject) are ignored.
+	fixerDeclinedMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)(?:\s+[^>]*)?-->`)
 )
 
 // threadResolutionMarkerFields holds parsed audit marker fields.
@@ -39,7 +39,10 @@ type threadResolutionMarkerFields struct {
 // review-thread feedback set. Reviewer audit replies carrying a validated
 // looper:thread-resolution marker from Looper's identity are excluded so
 // accept/reject replies do not re-trigger themselves. Spoofed markers from
-// untrusted authors remain in the fingerprint.
+// untrusted authors remain in the fingerprint. Resolved threads contribute
+// only id and resolved state; later comments on those threads are omitted so
+// irrelevant edits cannot retrigger same-head discovery or a duplicate
+// convergence review. Reopen re-includes comments.
 func ThreadFeedbackFingerprint(threads []ReviewThread) string {
 	return ThreadFeedbackFingerprintForLogin(threads, "")
 }
@@ -92,6 +95,9 @@ func canonicalThreadFeedbackInput(threads []ReviewThread, looperLogin string) st
 			b.WriteString("unresolved")
 		}
 		b.WriteByte('\n')
+		if thread.IsResolved {
+			continue
+		}
 		comments := make([]ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
 			if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
@@ -282,10 +288,14 @@ func hasThreadResolutionAuditForSignalForLogin(thread ReviewThread, threadID, he
 // resumeDispositionDecisionFromRemoteAudit returns the already-published
 // disposition when a validated Looper audit for this thread, head, and current
 // feedback already exists. Spec §8.2: retry observes the remote audit marker
-// and must not reclassify after Reviewer's own mutation.
+// and must not reclassify after Reviewer's own mutation. A later validated
+// Fixer decline after reject_wontfix is new input (§8.4) and must not resume.
 func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, looperLogin string) (threadResolutionAgentDecision, bool) {
 	headSHA = strings.TrimSpace(headSHA)
 	if headSHA == "" || strings.TrimSpace(thread.ID) == "" {
+		return threadResolutionAgentDecision{}, false
+	}
+	if ForceNeedsHumanAfterSecondDecline(thread, headSHA, looperLogin) {
 		return threadResolutionAgentDecision{}, false
 	}
 	candidateFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, looperLogin)

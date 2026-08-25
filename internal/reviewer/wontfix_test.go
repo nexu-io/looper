@@ -116,6 +116,25 @@ func TestHasUnauditedValidatedFixerDecline(t *testing.T) {
 	}
 }
 
+func TestParseFixerDeclinedMarkerAcceptsPostRejectSchema(t *testing.T) {
+	t.Parallel()
+	body := "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef attempt:post-reject -->"
+	threadID, fp, ok := parseFixerDeclinedMarker(body)
+	if !ok || threadID != "t1" || fp != "deadbeef" {
+		t.Fatalf("got thread=%q fp=%q ok=%v, want t1/deadbeef/true", threadID, fp, ok)
+	}
+	thread := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: "looper-bot", Body: body},
+		},
+	}
+	if !HasUnauditedValidatedFixerDecline(thread) {
+		t.Fatal("post-reject decline must count as unaudited validated decline")
+	}
+}
+
 func TestForceNeedsHumanUnchangedInputOnly(t *testing.T) {
 	t.Parallel()
 	baseComments := []ReviewThreadComment{
@@ -135,7 +154,7 @@ func TestForceNeedsHumanUnchangedInputOnly(t *testing.T) {
 	// Unchanged human text + post-reject decline → true
 	unchanged := ReviewThread{ID: "t1", Comments: append(append([]ReviewThreadComment{}, baseComments...),
 		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
-		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:t1 fingerprint:x -->", CreatedAt: "t4", UpdatedAt: "t4"},
+		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:t1 fingerprint:x attempt:post-reject -->", CreatedAt: "t4", UpdatedAt: "t4"},
 	)}
 	if !ForceNeedsHumanAfterSecondDecline(unchanged, "abc", "looper-bot") {
 		t.Fatal("unchanged human + decline after reject must force needs_human")

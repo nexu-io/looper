@@ -59,6 +59,32 @@ func TestThreadFeedbackFingerprintEditReplyDeleteResolveReopen(t *testing.T) {
 	}
 }
 
+func TestThreadFeedbackFingerprintIgnoresResolvedThreadCommentEdits(t *testing.T) {
+	t.Parallel()
+	resolved := looperThread("t1", true, looperRoot("c1", "Please fix nil check"))
+	resolvedFP := ThreadFeedbackFingerprint([]ReviewThread{resolved})
+
+	edited := looperThread("t1", true,
+		ReviewThreadComment{ID: "c1", Author: "looper-bot", Body: "Please fix nil check carefully <!-- looper:stamp v=1 -->", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T01:00:00Z", CommitOID: "old-head"},
+	)
+	if ThreadFeedbackFingerprint([]ReviewThread{edited}) != resolvedFP {
+		t.Fatal("edits on a resolved thread must not change fingerprint")
+	}
+
+	replied := looperThread("t1", true,
+		looperRoot("c1", "Please fix nil check"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "MEMBER", Body: "drive-by note", CreatedAt: "2026-01-01T02:00:00Z", UpdatedAt: "2026-01-01T02:00:00Z"},
+	)
+	if ThreadFeedbackFingerprint([]ReviewThread{replied}) != resolvedFP {
+		t.Fatal("new comments on a resolved thread must not change fingerprint")
+	}
+
+	unresolved := looperThread("t1", false, looperRoot("c1", "Please fix nil check"))
+	if ThreadFeedbackFingerprint([]ReviewThread{unresolved}) == resolvedFP {
+		t.Fatal("reopen must still change fingerprint")
+	}
+}
+
 func TestThreadFeedbackFingerprintExcludesAuditReplies(t *testing.T) {
 	t.Parallel()
 	withoutAudit := looperThread("t1", false,
@@ -169,5 +195,35 @@ func TestResumeDispositionDecisionFromRemoteAudit(t *testing.T) {
 	}
 	if _, ok := resumeDispositionDecisionFromRemoteAudit(base, "abc", "looper-bot"); ok {
 		t.Fatal("missing audit must not resume")
+	}
+}
+
+func TestResumeRejectDoesNotSwallowPostRejectDecline(t *testing.T) {
+	t.Parallel()
+	base := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+	)
+	rejectBody := threadResolutionMarker("t1", "abc", coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot"), "reject_wontfix")
+	afterReject := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
+	)
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(afterReject, "abc", "looper-bot")
+	if !ok || decision.Decision != "reject_wontfix" {
+		t.Fatalf("got %#v ok=%v, want reject resume before second decline", decision, ok)
+	}
+	second := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
+		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:t1 fingerprint:x attempt:post-reject -->", CreatedAt: "t4", UpdatedAt: "t4"},
+	)
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(second, "abc", "looper-bot"); ok {
+		t.Fatal("post-reject decline must not resume reject_wontfix")
+	}
+	if !ForceNeedsHumanAfterSecondDecline(second, "abc", "looper-bot") {
+		t.Fatal("post-reject decline must force needs_human")
 	}
 }
