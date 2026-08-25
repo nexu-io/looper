@@ -2774,6 +2774,48 @@ func TestSubmitReviewLogsGhFailureDiagnostics(t *testing.T) {
 	}
 }
 
+func TestReviewThreadFingerprintFromNodesExcludesDeclineReplies(t *testing.T) {
+	t.Parallel()
+	base := []any{
+		map[string]any{"id": "c1", "updatedAt": "2026-01-01T00:00:00Z", "body": "Please fix <!-- looper:stamp v=1 -->"},
+		map[string]any{"id": "c2", "updatedAt": "2026-01-01T00:01:00Z", "body": "<!-- looper-fixer-reply thread:t1 sha:abc -->"},
+	}
+	withDecline := append(append([]any{}, base...), map[string]any{
+		"id": "c3", "updatedAt": "2026-01-01T00:02:00Z",
+		"body": "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
+	})
+	without := reviewThreadFingerprintFromNodes(base)
+	with := reviewThreadFingerprintFromNodes(withDecline)
+	if without == "" || without != with {
+		t.Fatalf("fingerprint without=%q with=%q, want decline replies excluded so retry markers stay stable", without, with)
+	}
+}
+
+func TestGatewayGetCurrentUserIdentityFallsBackToViewerForIntegrationTokens(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq {login: .login, id: .id}":
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case "api graphql -f query=query { viewer { login } }":
+			return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-app[bot]"}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	ident, err := gateway.GetCurrentUserIdentity(context.Background(), "")
+	if err != nil {
+		t.Fatalf("GetCurrentUserIdentity() error = %v", err)
+	}
+	if ident.Login != "looper-app[bot]" {
+		t.Fatalf("GetCurrentUserIdentity() login = %q, want looper-app[bot]", ident.Login)
+	}
+}
+
 type reviewSubmitDiagnosticEvent struct {
 	Name   string
 	Fields map[string]any

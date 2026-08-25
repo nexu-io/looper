@@ -133,13 +133,17 @@ func LatestTrustedDispositionForLogin(thread ReviewThread, prAuthorLogin, looper
 		return TrustedDisposition{}, ReviewThreadComment{}, false
 	}
 	// Walk newest → oldest; first non-audit trusted directive wins.
+	// GitHub in-place edits keep the original slice index, so an already-audited
+	// comment that is later edited must still count as new input.
 	lastAuditIdx := -1
+	lastAuditTS := ""
 	for i, comment := range thread.Comments {
 		if isValidatedThreadResolutionAudit(comment, looperLogin) {
 			lastAuditIdx = i
+			lastAuditTS = firstNonEmpty(strings.TrimSpace(comment.UpdatedAt), strings.TrimSpace(comment.CreatedAt))
 		}
 	}
-	for i := len(thread.Comments) - 1; i > lastAuditIdx; i-- {
+	for i := len(thread.Comments) - 1; i >= 0; i-- {
 		comment := thread.Comments[i]
 		if isValidatedThreadResolutionAudit(comment, looperLogin) {
 			continue
@@ -153,6 +157,12 @@ func LatestTrustedDispositionForLogin(thread ReviewThread, prAuthorLogin, looper
 		}
 		if !IsTrustedDispositionAuthority(comment.Author, prAuthorLogin, comment.AuthorAssociation) {
 			continue
+		}
+		if lastAuditIdx >= 0 && i <= lastAuditIdx {
+			commentTS := firstNonEmpty(strings.TrimSpace(comment.UpdatedAt), strings.TrimSpace(comment.CreatedAt))
+			if lastAuditTS == "" || commentTS == "" || !isoTimeAfter(commentTS, lastAuditTS) {
+				continue
+			}
 		}
 		return directive, comment, true
 	}

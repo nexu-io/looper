@@ -119,7 +119,6 @@ func TestGitHubHITLDecisionOnlyAskIncludesScopeOverlay(t *testing.T) {
 	}
 }
 
-
 func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	commentsByPR := map[int64][]githubAnswerComment{
 		42: {{ID: 500, Author: "lefarcen", Body: "<!-- looper:hitl:ask --> ask"}, {ID: 501, Author: "lefarcen", Body: "go with A"}},

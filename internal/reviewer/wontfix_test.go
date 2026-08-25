@@ -157,3 +157,26 @@ func TestForceNeedsHumanUnchangedInputOnly(t *testing.T) {
 		t.Fatal("head change must not force needs_human")
 	}
 }
+
+func TestLatestTrustedDispositionTreatsInPlaceEditAsNewInput(t *testing.T) {
+	t.Parallel()
+	audit := "<!-- looper:thread-resolution thread=t1 head=h feedback=f decision=reject_wontfix -->"
+	thread := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper reconsider still required", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T13:00:00Z"},
+			{ID: "c3", Author: "looper-bot", Body: audit, CreatedAt: "2026-01-01T12:00:00Z", UpdatedAt: "2026-01-01T12:00:00Z"},
+		},
+	}
+	got, comment, ok := LatestTrustedDispositionForLogin(thread, "alice", "looper-bot")
+	if !ok || got.Kind != DispositionReconsider || comment.ID != "c2" {
+		t.Fatalf("edited directive after audit = (%#v, %#v, %v)", got, comment, ok)
+	}
+	if !HasUnauditedTrustedDispositionForLogin(thread, "alice", "looper-bot") {
+		t.Fatal("edited directive must remain unaudited input")
+	}
+	if !ThreadHasChangedDispositionSignalForLogin(thread, "alice", "looper-bot") {
+		t.Fatal("signal must notice the in-place edit")
+	}
+}

@@ -3524,7 +3524,8 @@ func reviewThreadFingerprintFromNodes(nodes []any) string {
 		if comment == nil {
 			continue
 		}
-		if strings.Contains(asString(comment["body"]), "<!-- looper-fixer-reply ") {
+		body := asString(comment["body"])
+		if strings.Contains(body, "<!-- looper-fixer-reply ") || strings.Contains(body, "<!-- looper-fixer-reply-declined") {
 			continue
 		}
 		id := strings.TrimSpace(asString(comment["id"]))

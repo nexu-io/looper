@@ -3,6 +3,7 @@ package fixer
 import (
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -117,13 +118,22 @@ func isValidatedFixerDeclineComment(comment ReviewThreadComment, looperLogin str
 }
 
 func hasUnauditedTrustedDispositionAfter(thread ReviewThread, prAuthorLogin string, afterIdx int) bool {
-	for i := len(thread.Comments) - 1; i > afterIdx; i-- {
+	var afterTime time.Time
+	if afterIdx >= 0 && afterIdx < len(thread.Comments) {
+		afterTime = commentLatestTime(thread.Comments[afterIdx])
+	}
+	for i := len(thread.Comments) - 1; i >= 0; i-- {
 		comment := thread.Comments[i]
 		if !parseTrustedWontfixOrReconsider(comment.Body) {
 			continue
 		}
 		if !isTrustedDispositionAuthority(comment.Author, prAuthorLogin, commentAuthorAssociation(comment)) {
 			continue
+		}
+		if afterIdx >= 0 && i <= afterIdx {
+			if afterTime.IsZero() || !commentLatestTime(comment).After(afterTime) {
+				continue
+			}
 		}
 		return true
 	}

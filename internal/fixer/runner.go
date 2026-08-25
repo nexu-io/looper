@@ -7487,7 +7487,7 @@ func buildDeclinedThreadFingerprint(item FixItem, headSHA string) string {
 // admitWithheldDispositionFixItems re-evaluates withhold at claim/collect-fixes
 // (before prepare-worktree and agent). Failures are retryable fail-closed.
 func (r *Runner) admitWithheldDispositionFixItems(ctx context.Context, input stepInput, fixItems []FixItem) ([]FixItem, error) {
-	if r.github == nil || len(fixItems) == 0 {
+	if r.github == nil || len(fixItems) == 0 || !hasCommentFixItems(fixItems) {
 		return fixItems, nil
 	}
 	if r.isForgejoProject(input.Project.ID) {
@@ -7505,7 +7505,7 @@ func (r *Runner) admitWithheldDispositionFixItems(ctx context.Context, input ste
 // List/identity failures are retryable fail-closed (never treat items as
 // actionable from a stale empty withhold set).
 func (r *Runner) suppressWithheldDispositionFixItems(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, fixItems []FixItem) ([]FixItem, error) {
-	if r.github == nil || len(fixItems) == 0 {
+	if r.github == nil || len(fixItems) == 0 || !hasCommentFixItems(fixItems) {
 		return fixItems, nil
 	}
 	// Forgejo and other non-native providers have no same-head disposition path.

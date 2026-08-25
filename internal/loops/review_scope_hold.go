@@ -696,9 +696,14 @@ func releaseOneReviewScopeHumanHold(ctx context.Context, repos *storage.Reposito
 		updated.NextRunAt = nil
 		return repos.Loops.Upsert(ctx, updated)
 	}
-
 	updated.Status = "queued"
 	updated.NextRunAt = &nowISO
+	meta = parseMetadataObject(updated.MetadataJSON)
+	delete(meta, "lastReviewedSignalFingerprint")
+	if encoded, encErr := json.Marshal(meta); encErr == nil {
+		text := string(encoded)
+		updated.MetadataJSON = &text
+	}
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return err
 	}

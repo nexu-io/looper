@@ -2439,4 +2439,186 @@ func TestRunPublishStepPublishesSameHeadConvergenceDespiteLastPublishedHead(t *t
 	}
 }
 
+func TestQueuedSameHeadConvergencePassRequiresExplicitFlag(t *testing.T) {
+	t.Parallel()
+	signalOnly := `{"headSha":"abc123","reviewSignalFingerprint":"sig"}`
+	if queuedSameHeadConvergencePass(&signalOnly) {
+		t.Fatal("signal-bearing partial continuation must not be a convergence pass")
+	}
+	partial := `{"headSha":"abc123","reviewSignalFingerprint":"sig","partialBatchContinuation":{"partialBatch":true,"headSha":"abc123","completedThreadIds":["t1"]}}`
+	if queuedSameHeadConvergencePass(&partial) {
+		t.Fatal("MaxThreadsPerRun cursor must not be inferred as convergence")
+	}
+	explicit := `{"headSha":"abc123","reviewSignalFingerprint":"sig","convergencePass":true}`
+	if !queuedSameHeadConvergencePass(&explicit) {
+		t.Fatal("explicit convergencePass must admit a same-head full review")
+	}
+}
+
+func TestFilterDoesNotTreatPartialContinuationAsConvergence(t *testing.T) {
+	t.Parallel()
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+		},
+	}}
+	liveSignal := ComputeReviewSignalFingerprintForLogin("abc123", threads, "looper-bot")
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"}
+	fixture := newRunnerFixture(t)
+	meta := fmt.Sprintf(`{"followUpdates":true,"lastPublishedHeadSha":"abc123","lastReviewedSignalFingerprint":%q,"loop":{"enabled":true}}`, liveSignal)
+	loop := storage.LoopRecord{
+		ID: "loop_partial_not_conv", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	payload := `{"headSha":"abc123","reviewSignalFingerprint":"sig-partial","partialBatchContinuation":{"headSha":"abc123","completedThreadIds":["t1"],"capturedCandidateIds":["t1","t2"],"partialBatch":true,"capturedSignalFingerprint":"sig-partial"}}`
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(),
+	})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"},
+		Loop:      loop,
+		QueueItem: storage.QueueItemRecord{PayloadJSON: &payload},
+		Repo:      "acme/looper", PRNumber: 42,
+		Checkpoint: reviewerCheckpoint{
+			Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "alice", ReviewRequests: []string{"looper-bot"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runFilterStep: %v", err)
+	}
+	if checkpoint.ConvergencePass {
+		t.Fatal("partial-batch continuation was treated as a convergence pass")
+	}
+}
+
+func TestEnqueueCoalescePreservesPartialBatchCursor(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{
+		ID: "loop_coalesce_cursor", Seq: 1, ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert loop: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: config.ReviewerLoopConfig{QuietPeriodSeconds: 60},
+	})
+	ctx := context.Background()
+	seed := `{"headSha":"same-head","reviewSignalFingerprint":"sig-live","dispositionOnly":true,"partialBatchContinuation":{"headSha":"same-head","completedThreadIds":["t-done"],"capturedCandidateIds":["t-done","t-left"],"partialBatch":true,"dispositionOnly":true,"capturedSignalFingerprint":"sig-live"}}`
+	item := storage.QueueItemRecord{
+		ID: "queue_coalesce_cursor", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: buildReviewerDedupeKey("project_1", loop.ID, repo, prNumber),
+		Priority:  storage.QueuePriorityReviewer, Status: "queued",
+		AvailableAt: fixture.nowISO(), Attempts: 0, MaxAttempts: 5,
+		PayloadJSON: &seed, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Queue.Upsert(ctx, item); err != nil {
+		t.Fatalf("Upsert queue: %v", err)
+	}
+	got, err := runner.enqueue(ctx, enqueueInput{
+		ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber,
+		HeadSHA: "same-head", ReviewSignalFingerprint: "sig-live", DispositionOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if got.ID != item.ID {
+		t.Fatalf("coalesce id = %s, want %s", got.ID, item.ID)
+	}
+	if got.PayloadJSON == nil || !strings.Contains(*got.PayloadJSON, "partialBatchContinuation") || !strings.Contains(*got.PayloadJSON, "t-done") {
+		t.Fatalf("coalesced payload dropped cursor: %v", got.PayloadJSON)
+	}
+}
+
+func TestNeedsHumanParkContinueClearsReviewedSignal(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "old"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed",
+		Stdout: `{"decisions":[{"threadId":"thread_1","decision":"needs_human","evidence":"ambiguous","confidence":"low"}]}`,
+	}}}
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_nh_continue", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+	if _, err := runner.runThreadResolutionStep(context.Background(), input); err != nil {
+		t.Fatalf("needs_human step: %v", err)
+	}
+	parked, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || parked == nil || parked.MetadataJSON == nil {
+		t.Fatalf("parked loop = (%#v, %v)", parked, err)
+	}
+	if !strings.Contains(*parked.MetadataJSON, metadataLastReviewedSignalFingerprintKey) {
+		t.Fatalf("expected fingerprint after successful park: %s", *parked.MetadataJSON)
+	}
+	if !loops.IsReviewScopeHumanHold(*parked) {
+		t.Fatalf("parked = %#v, want scope hold", parked)
+	}
+	skip, err := runner.sameHeadDiscoveryDecision(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, repo, PullRequestSummary{Number: prNumber, HeadSHA: "abc123", Author: "alice"}, *parked, parseJSONObject(parked.MetadataJSON))
+	if err != nil {
+		t.Fatalf("discovery while parked: %v", err)
+	}
+	if skip.action != sameHeadDiscoverySkip {
+		t.Fatalf("action = %v, want skip while needs_human is unanswered", skip.action)
+	}
+	result, err := loops.ApplyReviewScopeHumanAnswer(context.Background(), fixture.repos, *parked, "Continue", fixture.nowISO())
+	if err != nil || !result.Applied {
+		t.Fatalf("Continue = (%#v, %v)", result, err)
+	}
+	if result.Loop.MetadataJSON != nil && strings.Contains(*result.Loop.MetadataJSON, metadataLastReviewedSignalFingerprintKey) {
+		t.Fatalf("Continue left lastReviewedSignalFingerprint: %s", *result.Loop.MetadataJSON)
+	}
+	admit, err := runner.sameHeadDiscoveryDecision(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, repo, PullRequestSummary{Number: prNumber, HeadSHA: "abc123", Author: "alice"}, result.Loop, parseJSONObject(result.Loop.MetadataJSON))
+	if err != nil {
+		t.Fatalf("discovery after Continue: %v", err)
+	}
+	if admit.action == sameHeadDiscoverySkip {
+		t.Fatal("Continue must re-admit the unanswered needs_human signal")
+	}
+}
+
 func int64Ptr(v int64) *int64 { return &v }

@@ -2734,12 +2734,12 @@ func payloadDispositionOnly(payloadJSON *string) bool {
 }
 
 // queuedSameHeadConvergencePass reports an explicit full-review continuation
-// (signal present, not disposition-only) scheduled after last-thread accept.
+// scheduled after last-thread accept. Signal-bearing payloads are not enough:
+// MaxThreadsPerRun partial continuations also carry reviewSignalFingerprint.
 func queuedSameHeadConvergencePass(payloadJSON *string) bool {
-	if payloadDispositionOnly(payloadJSON) {
-		return false
-	}
-	return reviewSignalFromQueuePayload(payloadJSON) != ""
+	payload := parseJSONObject(payloadJSON)
+	v, ok := payload["convergencePass"].(bool)
+	return ok && v
 }
 
 func alreadyPublishedSameHeadConvergence(checkpoint reviewerCheckpoint) bool {
@@ -3481,11 +3481,11 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			result.ThreadFeedbackFingerprint = threadFeedbackFP
 			checkpoint.ReviewSignalFingerprint = reviewSignalFP
 			checkpoint.ThreadResolution = result
-			if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP); err != nil {
-				return checkpoint, err
-			}
 			r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, decisionValue, strings.TrimSpace(decision.Evidence), thread.ID, "needs_human", "")
 			if err := r.parkDispositionNeedsHuman(ctx, input, thread.ID, decision.Evidence); err != nil {
+				return checkpoint, err
+			}
+			if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP); err != nil {
 				return checkpoint, err
 			}
 			var finErr error
@@ -3749,6 +3749,7 @@ func (r *Runner) enqueueDispositionConvergence(ctx context.Context, input stepIn
 		HeadSHA:                 head,
 		ReviewSignalFingerprint: signal,
 		DispositionOnly:         false,
+		ConvergencePass:         true,
 		AvailableAt:             availableAt,
 	})
 	return err
@@ -7161,6 +7162,7 @@ type enqueueInput struct {
 	HeadSHA                 string
 	ReviewSignalFingerprint string
 	DispositionOnly         bool
+	ConvergencePass         bool
 	AvailableAt             time.Time
 }
 
@@ -7175,6 +7177,13 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		availableAt = eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
 	}
 	payloadJSON := reviewerQueuePayloadJSON(input.HeadSHA, input.ReviewSignalFingerprint, input.DispositionOnly)
+	if input.ConvergencePass {
+		merged := parseJSONObject(&payloadJSON)
+		merged["convergencePass"] = true
+		if encoded, err := json.Marshal(merged); err == nil {
+			payloadJSON = string(encoded)
+		}
+	}
 	if existing != nil {
 		// Coalesce queued/retry-wait items in place to the latest head+signal.
 		// Retry-wait items remain status "queued" with a future AvailableAt.
@@ -7195,7 +7204,20 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				updated.AvailableAt = updatedAvailableAt
 				updated.UpdatedAt = r.nowISO()
 				if payloadJSON != "" {
-					updated.PayloadJSON = &payloadJSON
+					nextPayload := payloadJSON
+					if !headChanged && !signalChanged {
+						merged := parseJSONObject(&nextPayload)
+						if cont, ok := existingPayload["partialBatchContinuation"]; ok && cont != nil {
+							merged["partialBatchContinuation"] = cont
+						}
+						if conv, ok := existingPayload["convergencePass"].(bool); ok && conv {
+							merged["convergencePass"] = true
+						}
+						if encoded, encErr := json.Marshal(merged); encErr == nil {
+							nextPayload = string(encoded)
+						}
+					}
+					updated.PayloadJSON = &nextPayload
 				}
 				persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
 				if err != nil {

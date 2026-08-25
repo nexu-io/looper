@@ -477,3 +477,98 @@ func TestRejectWontfixRestoresExistingFixerItem(t *testing.T) {
 		t.Fatalf("got %#v, want existing t1 item restored after reject_wontfix", got)
 	}
 }
+
+func TestAdmitWithheldDispositionSkipsNonCommentWithoutAuthorityReads(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{
+		currentUserEmpty: true,
+		listThreadsErr:   errors.New("should not list threads"),
+		authorErr:        errors.New("should not look up author"),
+	}
+	runner := New(Options{GitHub: github})
+	items := []FixItem{
+		{Type: "check", ID: "ci-1", Summary: "CI failed"},
+		{Type: "conflict", ID: "merge-1", Summary: "merge conflict"},
+	}
+	got, err := runner.admitWithheldDispositionFixItems(context.Background(), stepInput{
+		Project:  storage.ProjectRecord{ID: "p1", RepoPath: t.TempDir()},
+		Repo:     "acme/looper",
+		PRNumber: 42,
+	}, items)
+	if err != nil {
+		t.Fatalf("admit error = %v, want skip authority reads for non-comment work", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %#v, want original check/conflict items", got)
+	}
+	if len(github.listThreadsCalls) != 0 {
+		t.Fatalf("listThreadsCalls = %d, want 0", len(github.listThreadsCalls))
+	}
+}
+
+func TestEditedDirectiveAfterRejectIsWithheld(t *testing.T) {
+	t.Parallel()
+	thread := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: testLooperLogin, Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix still out of scope", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T13:00:00Z"},
+			{ID: "c3", Author: testLooperLogin, Body: "<!-- looper:thread-resolution thread=t1 head=h feedback=f decision=reject_wontfix -->", CreatedAt: "2026-01-01T12:00:00Z", UpdatedAt: "2026-01-01T12:00:00Z"},
+		},
+	}
+	if !ThreadWithheldFromFixer(thread, "alice", testLooperLogin) {
+		t.Fatal("in-place edit after reject_wontfix must withhold Fixer edits")
+	}
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
+	got := SuppressWithheldDispositionFixItems(items, []ReviewThread{thread}, "alice", testLooperLogin)
+	if len(got) != 0 {
+		t.Fatalf("got %#v, want edited directive withheld", got)
+	}
+}
+
+func TestDeclineReplyCheckpointCrashKeepsStableMarker(t *testing.T) {
+	t.Parallel()
+	// Crash window: AddReviewThreadReply succeeds, resolve-comments checkpoint
+	// is not persisted, retry rebuilds the decision fingerprint from the live
+	// thread that now contains the posted decline.
+	preFingerprint := "c1@2026-01-01T00:00:00Z"
+	item := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", ThreadFingerprint: preFingerprint}
+	fp := buildDeclinedThreadFingerprint(item, "abc123")
+	marker := fixerDeclinedReplyMarker("t1", fp)
+	github := &fakeGitHubGateway{
+		currentUser: testLooperLogin,
+		threads: []ReviewThread{{
+			ID: "t1",
+			Comments: []ReviewThreadComment{
+				{ID: "c1", Author: testLooperLogin, Body: "Please fix <!-- looper:stamp v=1 -->", UpdatedAt: "2026-01-01T00:00:00Z"},
+			},
+		}},
+	}
+	runner := New(Options{GitHub: github})
+	input := stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper"}
+	state, replyErr := runner.replyToDeclinedComment(context.Background(), input, item, fp, "Out of scope.", nil)
+	if replyErr != "" || state != "sent" {
+		t.Fatalf("first reply state=%q err=%q, want sent", state, replyErr)
+	}
+	if len(github.replyCalls) != 1 || !strings.Contains(github.replyCalls[0].Body, marker) {
+		t.Fatalf("first reply = %#v, want marker %q", github.replyCalls, marker)
+	}
+	github.threads[0].Comments = append(github.threads[0].Comments, ReviewThreadComment{
+		ID: "c-decline", Author: testLooperLogin, Body: github.replyCalls[0].Body, UpdatedAt: "2026-01-01T00:02:00Z",
+	})
+	// Retry collect-fixes rebuilds ThreadFingerprint from live nodes after the
+	// gateway excludes looper-fixer-reply-declined comments.
+	retryItem := item
+	retryItem.ThreadFingerprint = preFingerprint
+	retryFP := buildDeclinedThreadFingerprint(retryItem, "abc123")
+	if retryFP != fp {
+		t.Fatalf("retry fingerprint %q != original %q", retryFP, fp)
+	}
+	state2, replyErr2 := runner.replyToDeclinedComment(context.Background(), input, retryItem, retryFP, "Out of scope.", nil)
+	if replyErr2 != "" || state2 != "sent" {
+		t.Fatalf("retry state=%q err=%q, want idempotent sent", state2, replyErr2)
+	}
+	if len(github.replyCalls) != 1 {
+		t.Fatalf("retry posted %d replies, want 1 (stable marker hit the existing decline)", len(github.replyCalls))
+	}
+}

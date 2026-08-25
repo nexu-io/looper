@@ -2109,7 +2109,15 @@ func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string)
 	if err != nil {
 		return "", withHostingAPIBoundary(err)
 	}
-	return login, nil
+	login = strings.TrimSpace(login)
+	if login != "" {
+		return login, nil
+	}
+	ident, identErr := a.gateway.GetCurrentUserIdentity(ctx, cwd)
+	if identErr != nil {
+		return "", withHostingAPIBoundary(identErr)
+	}
+	return strings.TrimSpace(ident.Login), nil
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {

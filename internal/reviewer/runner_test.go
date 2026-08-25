@@ -10443,7 +10443,6 @@ func TestRunReviewStepNeedsHumanDoesNotRecountAlreadyPublishedHead(t *testing.T)
 	}
 }
 
-
 func TestRunReviewStepNeedsHumanAtCapBudgetHoldOnlyNoStackedScope(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
