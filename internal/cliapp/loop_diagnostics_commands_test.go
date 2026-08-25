@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
@@ -536,4 +537,41 @@ func writeLoopDiagnosticsFixture(t *testing.T, serverURL string) string {
 		t.Fatalf("WriteFile(config) error = %v", err)
 	}
 	return configPath
+}
+
+func TestDiagnoseLoopBudgetHoldRecommendsUnpauseStop(t *testing.T) {
+	t.Parallel()
+	meta := `{"pauseReason":"review_fix_budget_exhausted","lastReviewedSignalFingerprint":"sig-abc","lastPublishedHeadSha":"abc123","loop":{"iterationCount":3},"reviewFixBudget":{"exhaustedBy":"reviewer","pauseReason":"review_fix_budget_exhausted"}}`
+	loop := storage.LoopRecord{ID: "loop_budget", Seq: 12, Type: "reviewer", Status: "paused", MetadataJSON: &meta}
+	diagnosis := diagnoseLoop(loop, nil, nil, parseLoopDiagnosticMetadata(loop.MetadataJSON), true)
+	if !strings.Contains(diagnosis.RecommendedAction, "looper unpause 12") || !strings.Contains(diagnosis.RecommendedAction, "looper stop 12") {
+		t.Fatalf("RecommendedAction = %q, want unpause/stop", diagnosis.RecommendedAction)
+	}
+	if strings.Contains(diagnosis.RecommendedAction, "retry") {
+		t.Fatalf("RecommendedAction = %q, must not recommend retry for budget hold", diagnosis.RecommendedAction)
+	}
+	parsed := parseLoopDiagnosticMetadata(loop.MetadataJSON)
+	if parsed.LastReviewedSignalFingerprint == nil || *parsed.LastReviewedSignalFingerprint != "sig-abc" {
+		t.Fatalf("parsed signal = %#v, want sig-abc", parsed.LastReviewedSignalFingerprint)
+	}
+	brief, ok := loops.BuildReviewFixHandoffBrief(loop)
+	if !ok {
+		t.Fatal("BuildReviewFixHandoffBrief() = false")
+	}
+	var buf strings.Builder
+	if err := writeHumanLoopInspect(&buf, loopInspectOutput{
+		Loop:      diagnosticLoopOutput(loop),
+		Metadata:  parsed,
+		Handoff:   &brief,
+		Diagnosis: diagnosis,
+	}); err != nil {
+		t.Fatalf("writeHumanLoopInspect: %v", err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "Handoff: kind=review_fix_budget hitl=false") || !strings.Contains(got, "Resume: looper unpause 12 / looper stop 12") {
+		t.Fatalf("human inspect = %q, want no-HITL budget handoff", got)
+	}
+	if strings.Contains(got, "looper retry 12") {
+		t.Fatalf("human inspect = %q, must not suggest retry", got)
+	}
 }

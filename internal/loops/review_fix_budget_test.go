@@ -797,7 +797,7 @@ func TestContinueFailureDoesNotLeaveSiblingQueuedWhileExhaustedHeld(t *testing.T
 func TestHandoffEventIncludesHeadAndConcreteResumeCommands(t *testing.T) {
 	t.Parallel()
 	repos, nowISO := newBudgetFixture(t)
-	reviewerMeta := `{"lastPublishedHeadSha":"abc123def","loop":{"iterationCount":3}}`
+	reviewerMeta := `{"lastPublishedHeadSha":"abc123def","lastReviewedSignalFingerprint":"sig-abc","loop":{"iterationCount":3}}`
 	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_handoff_head", "reviewer", "running")
 	reviewer.MetadataJSON = &reviewerMeta
 	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
@@ -837,6 +837,20 @@ func TestHandoffEventIncludesHeadAndConcreteResumeCommands(t *testing.T) {
 	}
 	if lane, _ := payload["lane"].(string); lane != reviewFixBudgetLaneAutomatic {
 		t.Fatalf("lane = %q, want %q", lane, reviewFixBudgetLaneAutomatic)
+	}
+	if signal, _ := payload["lastReviewedSignalFingerprint"].(string); signal != "sig-abc" {
+		t.Fatalf("lastReviewedSignalFingerprint = %q, want sig-abc", signal)
+	}
+
+	brief, ok := BuildReviewFixHandoffBrief(parked)
+	if !ok {
+		t.Fatal("BuildReviewFixHandoffBrief() = false, want hold brief")
+	}
+	if brief.Kind != HITLKindReviewFixBudget || !brief.HITLEnabled || brief.LastReviewedSignalFingerprint != "sig-abc" {
+		t.Fatalf("brief = %#v, want budget HITL brief with signal", brief)
+	}
+	if !strings.Contains(brief.NextAction, wantCLI) || !strings.Contains(brief.NextAction, "Continue") {
+		t.Fatalf("nextAction = %q, want Continue plus %q", brief.NextAction, wantCLI)
 	}
 }
 

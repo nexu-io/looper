@@ -576,6 +576,10 @@ type ListReviewThreadsInput struct {
 	PRNumber int64
 	CWD      string
 	Limit    int
+	// AllPages fetches every review-thread page for authority reads. When true,
+	// Limit is not used as a stop condition. Limit<=0 without AllPages still
+	// defaults to 100 so existing callers are unchanged.
+	AllPages bool
 }
 
 type ViewReviewThreadInput struct {
@@ -1770,18 +1774,31 @@ func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadIn
 }
 
 func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
+	unlimited := input.AllPages
 	limit := input.Limit
-	if limit <= 0 {
-		limit = 100
+	if !unlimited {
+		if limit <= 0 {
+			limit = 100
+		}
 	}
 	owner, name, err := parseRepo(input.Repo)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ReviewThread, 0, min(limit, 100))
+	capHint := 100
+	if !unlimited && limit > 0 {
+		capHint = min(limit, 100)
+	}
+	out := make([]ReviewThread, 0, capHint)
 	threadsCursor := ""
-	for len(out) < limit {
-		pageSize := min(100, limit-len(out))
+	for unlimited || len(out) < limit {
+		pageSize := 100
+		if !unlimited {
+			pageSize = min(100, limit-len(out))
+			if pageSize <= 0 {
+				break
+			}
+		}
 		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadPage(ctx, input.CWD, owner, name, input.PRNumber, pageSize, threadsCursor)
 		if err != nil {
 			return nil, err
@@ -1811,7 +1828,7 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 				thread.URL = thread.Comments[0].URL
 			}
 			out = append(out, thread)
-			if len(out) == limit {
+			if !unlimited && len(out) == limit {
 				break
 			}
 		}

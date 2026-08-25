@@ -27,6 +27,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
@@ -1720,7 +1721,7 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit, AllPages: input.AllPages})
 	if err != nil {
 		return nil, err
 	}
@@ -1728,7 +1729,7 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 	for _, thread := range threads {
 		converted := reviewer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Path: thread.Path, Line: thread.Line, URL: thread.URL}
 		for _, comment := range thread.Comments {
-			converted.Comments = append(converted.Comments, reviewer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
+			converted.Comments = append(converted.Comments, reviewer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
 		}
 		out = append(out, converted)
 	}
@@ -2268,7 +2269,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 		}
 		return nil, fmt.Errorf("forgejo fixer does not support native review threads")
 	}
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit, AllPages: input.AllPages})
 	if err != nil {
 		return nil, err
 	}
@@ -2276,7 +2277,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 	for _, thread := range threads {
 		comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
-			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 		}
 		out = append(out, fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments})
 	}
@@ -2296,7 +2297,7 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 	}
 	comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 	}
 	return fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments}, nil
 }
@@ -4610,6 +4611,10 @@ func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueIt
 // schedulerLoopParked reports whether a claimed queue item's loop was parked
 // (human takeover / paused) — a state the scheduler may observe AFTER the claim
 // due to a race, and must then decline to run.
+//
+// Exception: a reviewer disposition-only item on a budget-held loop must still
+// run so same-head wontfix adjudication can refresh the handoff without a
+// Continue. Scope holds / human_takeover / non-budget awaiting_human stay parked.
 func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput) bool {
 	if item.LoopID == nil || input.Repos == nil || input.Repos.Loops == nil {
 		return false
@@ -4620,10 +4625,25 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 	}
 	switch loop.Status {
 	case "human_takeover", "paused", "awaiting_human":
+		if item.Type == "reviewer" && payloadDispositionOnly(item.PayloadJSON) && loops.IsReviewFixBudgetHold(*loop) {
+			return false
+		}
 		return true
 	default:
 		return false
 	}
+}
+
+func payloadDispositionOnly(payloadJSON *string) bool {
+	if payloadJSON == nil || strings.TrimSpace(*payloadJSON) == "" {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(*payloadJSON), &payload); err != nil {
+		return false
+	}
+	v, ok := payload["dispositionOnly"].(bool)
+	return ok && v
 }
 
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {

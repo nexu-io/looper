@@ -15,6 +15,7 @@ import { RecoveryCard } from "@/components/RecoveryCard";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { CopyButton } from "@/components/CopyButton";
 import {
   fetchLoop,
   openLoopLogsStream,
@@ -45,6 +46,10 @@ import {
 } from "@/lib/logsStream";
 import { consumeSSE } from "@/lib/sse";
 import { usePolling } from "@/lib/usePolling";
+import {
+  readReviewFixHandoff,
+  reviewFixHandoffTitle,
+} from "@/lib/reviewFixHandoff";
 
 function seedFromSnapshot(snap: LoopLogsSnapshot): string {
   const agent = snap.agent;
@@ -260,6 +265,68 @@ function HITLDecisionCard({
         </Button>
       </form>
       {error ? <p className="mb-0 text-[12px] text-red-500">{error}</p> : null}
+    </Card>
+  );
+}
+
+function ReviewFixHandoffCard({ loop }: { loop: Loop }) {
+  const handoff = readReviewFixHandoff(loop);
+  if (!handoff) return null;
+  return (
+    <Card title={reviewFixHandoffTitle(handoff)}>
+      <p className="mt-0 text-[13px]">
+        This hold does not approve, resolve, or merge the PR. Continue or
+        Unpause resumes the pair against current evidence
+        {handoff.kind === "review_fix_budget"
+          ? " and refills only exhausted meters"
+          : ""}
+        . Stop terminates both roles.
+      </p>
+      {handoff.question ? (
+        <p className="whitespace-pre-wrap text-[13px]">{handoff.question}</p>
+      ) : null}
+      {handoff.evidence ? (
+        <p className="whitespace-pre-wrap text-[12px] text-[var(--text-muted)]">
+          {handoff.evidence}
+        </p>
+      ) : null}
+      <dl className="m-0 columns-1 gap-x-6 md:columns-2">
+        {handoff.reviewerCount != null ? (
+          <Kv label="Reviewer publications" value={String(handoff.reviewerCount)} />
+        ) : null}
+        {handoff.fixerCount != null ? (
+          <Kv label="Fixer pushes" value={String(handoff.fixerCount)} />
+        ) : null}
+        {handoff.exhaustedBy ? (
+          <Kv label="Exhausted by" value={handoff.exhaustedBy} />
+        ) : null}
+        {handoff.head ? <Kv label="Head" value={handoff.head} /> : null}
+        {handoff.lastReviewedSignalFingerprint ? (
+          <Kv
+            label="Last reviewed signal"
+            value={handoff.lastReviewedSignalFingerprint}
+          />
+        ) : null}
+      </dl>
+      {handoff.hitlEnabled ? (
+        <p className="mb-0 text-[12px] text-[var(--text-muted)]">
+          Answer Continue or Stop on the existing ask. Same pair commands:
+        </p>
+      ) : (
+        <p className="mb-0 text-[12px] text-[var(--text-muted)]">
+          No answer widget. Use these commands:
+        </p>
+      )}
+      <div className="mt-2 flex flex-wrap gap-2">
+        <code className="mono rounded border border-[var(--border)] px-2 py-1 text-[12px]">
+          {handoff.unpauseCommand}
+        </code>
+        <CopyButton text={handoff.unpauseCommand} label="Copy unpause" />
+        <code className="mono rounded border border-[var(--border)] px-2 py-1 text-[12px]">
+          {handoff.stopCommand}
+        </code>
+        <CopyButton text={handoff.stopCommand} label="Copy stop" />
+      </div>
     </Card>
   );
 }
@@ -819,6 +886,7 @@ export function LoopDetailPage() {
       ) : null}
 
       {data ? <HITLDecisionCard loop={data} onMutated={onMutated} /> : null}
+      {data ? <ReviewFixHandoffCard loop={data} /> : null}
 
       {data ? (
         <Card title="Actions">

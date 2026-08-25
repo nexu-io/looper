@@ -8823,7 +8823,7 @@ func TestBuildReviewPromptFullPRScopeUsesAgentSideFetchContract(t *testing.T) {
 func TestBuildThreadResolutionPromptRequiresPreparedWorktreeReuse(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildThreadResolutionPrompt("acme/looper", 42, "abc123", nil)
+	prompt := buildThreadResolutionPrompt("acme/looper", 42, "abc123", nil, reviewerCheckpoint{})
 	for _, want := range []string{
 		"canonical local checkout",
 		"Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
@@ -11600,6 +11600,8 @@ type fakeGitHubGateway struct {
 	updateIssueCommentErr           error
 	reviewThreads                   []ReviewThread
 	listReviewThreadsCalls          int
+	listReviewThreadsErr            error
+	listReviewThreadsErrAfter       int // fail on call N (1-based); 0 = always if err set
 	viewHeadSHA                     string
 	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
@@ -11610,7 +11612,11 @@ type fakeGitHubGateway struct {
 	captureSnapshotErrs             []error
 	captureSnapshotCalls            int
 	addThreadReplyCalls             []AddReviewThreadReplyInput
+	addThreadReplyErr               error
 	resolveThreadCalls              []ResolveReviewThreadInput
+	resolveThreadErr                error
+	resolveThreadErrTimes           int // fail this many times then succeed; 0 with err = always
+	resolveThreadFailCount          int
 	addReactionCalls                []PullRequestReactionInput
 	removeReactionCalls             []PullRequestReactionInput
 	addLabelCalls                   []PullRequestLabelsInput
@@ -11992,6 +11998,11 @@ func (g *fakeGitHubGateway) RemoveIssueLabels(_ context.Context, input githubinf
 
 func (g *fakeGitHubGateway) ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error) {
 	g.listReviewThreadsCalls++
+	if g.listReviewThreadsErr != nil {
+		if g.listReviewThreadsErrAfter == 0 || g.listReviewThreadsCalls == g.listReviewThreadsErrAfter {
+			return nil, g.listReviewThreadsErr
+		}
+	}
 	out := make([]ReviewThread, len(g.reviewThreads))
 	copy(out, g.reviewThreads)
 	return out, nil
@@ -11999,11 +12010,33 @@ func (g *fakeGitHubGateway) ListReviewThreads(context.Context, ListReviewThreads
 
 func (g *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddReviewThreadReplyInput) error {
 	g.addThreadReplyCalls = append(g.addThreadReplyCalls, input)
+	if g.addThreadReplyErr != nil {
+		return g.addThreadReplyErr
+	}
+	// Persist reply onto the in-memory thread so retries see audit markers.
+	for i := range g.reviewThreads {
+		if g.reviewThreads[i].ID == input.ThreadID {
+			g.reviewThreads[i].Comments = append(g.reviewThreads[i].Comments, ReviewThreadComment{
+				ID:        fmt.Sprintf("reply-%d", len(g.addThreadReplyCalls)),
+				Author:    g.currentLogin,
+				Body:      input.Body,
+				CreatedAt: "t-reply",
+				UpdatedAt: "t-reply",
+			})
+			break
+		}
+	}
 	return nil
 }
 
 func (g *fakeGitHubGateway) ResolveReviewThread(_ context.Context, input ResolveReviewThreadInput) error {
 	g.resolveThreadCalls = append(g.resolveThreadCalls, input)
+	if g.resolveThreadErr != nil {
+		if g.resolveThreadErrTimes <= 0 || g.resolveThreadFailCount < g.resolveThreadErrTimes {
+			g.resolveThreadFailCount++
+			return g.resolveThreadErr
+		}
+	}
 	for i := range g.reviewThreads {
 		if g.reviewThreads[i].ID == input.ThreadID {
 			g.reviewThreads[i].IsResolved = true

@@ -656,8 +656,9 @@ enabledByDefault = true
 # Continuous follow-up debounce after a published review. Inherits defaults.loop when unset.
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
-# Successful reviewer publishes per PR. 0 disables. Exhaustion parks reviewer + sibling fixer via HITL.
-maxPublishesPerPR = 8
+# Successful reviewer publishes per PR. 0 disables. Exhaustion always
+# holds the pair; HITL only chooses ask vs no-ask presentation.
+maxPublishesPerPR = 3
 
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
@@ -676,12 +677,35 @@ Unlimited reviewer ⇄ fixer ping-pong is a cost and quality problem: each side 
 
 | Path | Counts | Default |
 | --- | --- | --- |
-| `roles.reviewer.behavior.loop.maxPublishesPerPR` | Successful published reviews on one PR | `8` |
-| `roles.fixer.behavior.loop.maxPushesPerPR` | Successful fixer pushes on one PR | `8` |
+| `roles.reviewer.behavior.loop.maxPublishesPerPR` | Successful published reviews on one PR | `3` |
+| `roles.fixer.behavior.loop.maxPushesPerPR` | Successful fixer pushes on one PR | `3` |
 
-`0` disables that role's cap. Authority is live config plus a durable counter (`iterationCount` for reviewer, `reviewFixBudget.pushCount` for fixer). Exhaustion parks the exhausted loop as `awaiting_human` with a Continue/Stop HITL ask and pauses the sibling loop on the same PR. Continue resets the exhausted counter and unpauses the sibling; Stop terminates both. Product terminals (ready label, identical output, closed PR) still win and do not open a budget ask.
+`0` disables that role's cap. Authority is live config plus a durable counter (`iterationCount` for reviewer, `reviewFixBudget.pushCount` for fixer). Caps enforce whether or not HITL is enabled. Automatic and takeover (`manual` + `followUpdates`) loops participate; one-shot manual loops do not. Either exhausted role holds the same-lane pair:
 
-**Failure prevented:** expanding-scope review/fix that never converges. **Cost:** a new persisted counter and a HITL park that must not fight discovery or the deprecated budget-strip path. **Why not reuse the old knobs:** those were reviewer-only infra counters that stranded long PRs and were explicitly demoted in #209.
+| `hitl.enabled` | Exhausted role | Sibling | Resume |
+| --- | --- | --- | --- |
+| `true` | `awaiting_human` with Continue/Stop | budget-paused | answer the ask |
+| `false` (default) | `paused`, reason `review_fix_budget_exhausted`, no ask | paired budget-paused | `looper unpause <seq>` or `looper stop <seq>` |
+
+Continue / no-HITL `unpause` refills only meters currently at/over their live cap and releases the pair. Stop / no-HITL `looper stop` terminates both roles. Product terminals (ready label, identical output, closed PR) still win and do not open a budget ask. Budget exhaustion never approves, resolves, or merges.
+
+CLI `looper describe <seq>` / `looper loop inspect <seq>` and the dashboard loop page show the handoff brief: meters, last reviewed signal, and the exact next command. Events: `loop.review_fix_budget.exhausted` (level `action_required`) and `loop.review_scope_human.required`.
+
+**Failure prevented:** expanding-scope review/fix that never converges, including on default HITL-off installs. **Cost:** paired pause/unpause/stop plus an action-required event. **Why not reuse the old knobs:** those were reviewer-only infra counters that stranded long PRs and were explicitly demoted in #209.
+
+### Same-head disposition (always on for GitHub)
+
+Continuous GitHub Reviewer loops react to trusted `wontfix` / Fixer decline changes even when the PR head is unchanged. This path does **not** enable `roles.reviewer.behavior.threadResolution`; that setting still gates objective stale-thread reconciliation only and remains `enabled=false` by default.
+
+- Canonical command inside a Looper-authored thread: `/looper wontfix <reason>`. Compatibility aliases: a trusted human comment whose entire non-quoted body is `wontfix`, `won't fix`, or `won’t fix`.
+- `/looper reconsider <reason>` cancels the latest accepted disposition on an unresolved/reopened thread.
+- Authority is the PR author or `OWNER` / `MEMBER` / `COLLABORATOR`. Arbitrary users and bots are not disposition authorities. A Fixer `declined` reply is a dispute signal; Reviewer adjudicates it and Fixer does not resolve its own decline.
+- Reviewer decisions: `accept_wontfix` (reply + resolve), `reject_wontfix` (reply, leave open), `needs_human` (pair hold, no remote adjudication reply).
+- Discovery identity is `lastReviewedSignalFingerprint` (head + canonical Looper-thread feedback), not `lastPublishedHeadSha` alone. Queue dedupe stays `reviewer:{project}:{loop}:{repo}:{pr}`.
+- GitHub webhooks accelerate the same path: `pull_request_review_comment` create/edit/delete and `pull_request_review_thread` `resolved` route both Reviewer and Fixer. Polling remains the correctness fallback. Forgejo is exempt from same-head disposition; its role budgets still apply.
+- A budget-held pair may run disposition-only reconciliation. That cannot publish a review, push code, refill a meter, or release the hold.
+
+Disposition outcomes emit `reviewer.thread_resolution` with `disposition=true`.
 
 ### Quiet-period debounce (shared + per-role)
 
@@ -962,7 +986,7 @@ publishMode = "single_review"
 enabledByDefault = true
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
-maxPublishesPerPR = 8
+maxPublishesPerPR = 3
 
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
@@ -982,8 +1006,9 @@ scope = "looper-only"
 [roles.fixer.behavior.loop]
 # Opt-in quiet period (default 0 = immediate enqueue). Recommended starter: 60–120.
 quietPeriodSeconds = 0
-# Successful fixer pushes per PR. 0 disables. Exhaustion parks fixer + sibling reviewer via HITL.
-maxPushesPerPR = 8
+# Successful fixer pushes per PR. 0 disables. Exhaustion always holds
+# the pair; HITL only chooses ask vs no-ask presentation.
+maxPushesPerPR = 3
 
 [roles.fixer.discovery]
 autoDiscovery = true

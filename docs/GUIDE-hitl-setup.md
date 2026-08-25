@@ -9,6 +9,11 @@ milestones), and one-command local takeover. For the design rationale see
 **Everything here is off by default** — a looper with none of these flags behaves
 exactly as before. Turn them on one at a time.
 
+Review-fix budget and scope holds still fire when HITL is off. They pause the
+pair with no ask; resume with `looper unpause <seq>` or stop with
+`looper stop <seq>`. Enabling HITL only changes presentation (Continue/Stop
+card), not whether the pair halts. See [configuration.md](configuration.md#review-fix-budget).
+
 ---
 
 ## What each capability needs (at a glance)

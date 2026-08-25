@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -17,15 +18,16 @@ import (
 const defaultDiagnosticsLimit int64 = 100
 
 type loopInspectOutput struct {
-	NowISO          string                  `json:"nowIso"`
-	Selector        string                  `json:"selector"`
-	SelectorKind    string                  `json:"selectorKind"`
-	Loop            loopDiagnosticLoop      `json:"loop"`
-	Metadata        loopDiagnosticMetadata  `json:"metadata"`
-	Run             *loopDiagnosticRun      `json:"run,omitempty"`
-	LatestQueueItem *queueItemCommandOutput `json:"latestQueueItem,omitempty"`
-	Agent           *loopDiagnosticAgent    `json:"agent,omitempty"`
-	Diagnosis       loopDiagnosis           `json:"diagnosis"`
+	NowISO          string                       `json:"nowIso"`
+	Selector        string                       `json:"selector"`
+	SelectorKind    string                       `json:"selectorKind"`
+	Loop            loopDiagnosticLoop           `json:"loop"`
+	Metadata        loopDiagnosticMetadata       `json:"metadata"`
+	Handoff         *loops.ReviewFixHandoffBrief `json:"handoff,omitempty"`
+	Run             *loopDiagnosticRun           `json:"run,omitempty"`
+	LatestQueueItem *queueItemCommandOutput      `json:"latestQueueItem,omitempty"`
+	Agent           *loopDiagnosticAgent         `json:"agent,omitempty"`
+	Diagnosis       loopDiagnosis                `json:"diagnosis"`
 }
 
 type loopFailuresOutput struct {
@@ -73,14 +75,19 @@ type loopDiagnosticTarget struct {
 }
 
 type loopDiagnosticMetadata struct {
-	DecodeError          *string                     `json:"decodeError,omitempty"`
-	FollowUpdates        *bool                       `json:"followUpdates,omitempty"`
-	LastPublishedAt      *string                     `json:"lastPublishedAt,omitempty"`
-	LastPublishedHeadSHA *string                     `json:"lastPublishedHeadSha,omitempty"`
-	LastReviewEvent      *string                     `json:"lastReviewEvent,omitempty"`
-	LastReviewSummary    *string                     `json:"lastReviewSummary,omitempty"`
-	LastFilterSkip       map[string]any              `json:"lastFilterSkip,omitempty"`
-	Loop                 *loopDiagnosticLoopMetadata `json:"loop,omitempty"`
+	DecodeError                   *string                     `json:"decodeError,omitempty"`
+	FollowUpdates                 *bool                       `json:"followUpdates,omitempty"`
+	LastPublishedAt               *string                     `json:"lastPublishedAt,omitempty"`
+	LastPublishedHeadSHA          *string                     `json:"lastPublishedHeadSha,omitempty"`
+	LastFixHeadSHA                *string                     `json:"lastFixHeadSha,omitempty"`
+	LastReviewedSignalFingerprint *string                     `json:"lastReviewedSignalFingerprint,omitempty"`
+	LastReviewEvent               *string                     `json:"lastReviewEvent,omitempty"`
+	LastReviewSummary             *string                     `json:"lastReviewSummary,omitempty"`
+	PauseReason                   *string                     `json:"pauseReason,omitempty"`
+	LastFilterSkip                map[string]any              `json:"lastFilterSkip,omitempty"`
+	ReviewFixBudget               map[string]any              `json:"reviewFixBudget,omitempty"`
+	ReviewScopeHuman              map[string]any              `json:"reviewScopeHuman,omitempty"`
+	Loop                          *loopDiagnosticLoopMetadata `json:"loop,omitempty"`
 }
 
 type loopDiagnosticLoopMetadata struct {
@@ -380,6 +387,9 @@ func buildLoopInspectOutput(ctx context.Context, repos *storage.Repositories, se
 		LatestQueueItem: queueOutput,
 		Diagnosis:       diagnoseLoop(resolved.Loop, resolved.Run, queueItem, metadata, associateQueueWithDiagnosis),
 	}
+	if brief, ok := loops.BuildReviewFixHandoffBrief(resolved.Loop); ok {
+		output.Handoff = &brief
+	}
 	if resolved.Run != nil {
 		run := diagnosticRunOutput(*resolved.Run, now)
 		output.Run = &run
@@ -428,14 +438,23 @@ func parseLoopDiagnosticMetadata(raw *string) loopDiagnosticMetadata {
 		return loopDiagnosticMetadata{DecodeError: &msg}
 	}
 	output := loopDiagnosticMetadata{
-		FollowUpdates:        boolPtrFromMap(doc, "followUpdates"),
-		LastPublishedAt:      stringPtrFromMap(doc, "lastPublishedAt"),
-		LastPublishedHeadSHA: stringPtrFromMap(doc, "lastPublishedHeadSha"),
-		LastReviewEvent:      stringPtrFromMap(doc, "lastReviewEvent"),
-		LastReviewSummary:    stringPtrFromMap(doc, "lastReviewSummary"),
+		FollowUpdates:                 boolPtrFromMap(doc, "followUpdates"),
+		LastPublishedAt:               stringPtrFromMap(doc, "lastPublishedAt"),
+		LastPublishedHeadSHA:          stringPtrFromMap(doc, "lastPublishedHeadSha"),
+		LastFixHeadSHA:                stringPtrFromMap(doc, "lastFixHeadSha"),
+		LastReviewedSignalFingerprint: stringPtrFromMap(doc, "lastReviewedSignalFingerprint"),
+		LastReviewEvent:               stringPtrFromMap(doc, "lastReviewEvent"),
+		LastReviewSummary:             stringPtrFromMap(doc, "lastReviewSummary"),
+		PauseReason:                   stringPtrFromMap(doc, "pauseReason"),
 	}
 	if skip, ok := doc["lastFilterSkip"].(map[string]any); ok {
 		output.LastFilterSkip = skip
+	}
+	if budget, ok := doc["reviewFixBudget"].(map[string]any); ok {
+		output.ReviewFixBudget = budget
+	}
+	if scope, ok := doc["reviewScopeHuman"].(map[string]any); ok {
+		output.ReviewScopeHuman = scope
 	}
 	if loopDoc, ok := doc["loop"].(map[string]any); ok {
 		output.Loop = &loopDiagnosticLoopMetadata{
@@ -583,6 +602,9 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 	}
 	if diagnosis.RecommendedAction == "" {
 		diagnosis.RecommendedAction = recommendedActionForState(state)
+	}
+	if brief, ok := loops.BuildReviewFixHandoffBrief(loop); ok && strings.TrimSpace(brief.NextAction) != "" {
+		diagnosis.RecommendedAction = brief.NextAction
 	}
 	// Expand <seq> before emitting JSON/human output so operators and scripts
 	// never see the literal placeholder outside writeHumanLoopInspect.
@@ -914,12 +936,30 @@ func writeHumanLoopInspect(w io.Writer, output loopInspectOutput) error {
 			}
 		}
 	}
+	if output.Handoff != nil {
+		if _, err := fmt.Fprintf(w, "Handoff: kind=%s hitl=%t\n", output.Handoff.Kind, output.Handoff.HITLEnabled); err != nil {
+			return err
+		}
+		if output.Handoff.Question != "" {
+			if _, err := fmt.Fprintf(w, "Question: %s\n", output.Handoff.Question); err != nil {
+				return err
+			}
+		}
+		if output.Handoff.Evidence != "" {
+			if _, err := fmt.Fprintf(w, "Evidence: %s\n", output.Handoff.Evidence); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(w, "Resume: %s\n", output.Handoff.Resume); err != nil {
+			return err
+		}
+	}
 	if output.Diagnosis.RecommendedAction != "" {
 		if _, err := fmt.Fprintf(w, "Action: %s\n", formatActionWithSeq(output.Diagnosis.RecommendedAction, output.Loop.Seq)); err != nil {
 			return err
 		}
 	}
-	if requiresOperatorHold(output) {
+	if requiresOperatorHold(output) && output.Handoff == nil {
 		if _, err := fmt.Fprintf(w, "Next: after resolving the blocker, looper retry %d (see also looper logs %d)\n", output.Loop.Seq, output.Loop.Seq); err != nil {
 			return err
 		}
