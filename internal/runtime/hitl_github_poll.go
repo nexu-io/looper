@@ -282,9 +282,9 @@ type githubHITLPollDeps struct {
 	// remainingAwaiting, when set, is consulted after a successful delivery.
 	// clearAwaiting is skipped when another awaiting GitHub ask remains on the PR.
 	remainingAwaiting func(ctx contextType, repo string, prNumber int64) bool
-	// advanceAskPastComment moves remaining GitHub asks on the same repo#PR
-	// past a consumed Continue/Stop so a later poll cannot treat that comment
-	// as an ordinary answer after a scope overlay is released.
+	// advanceAskPastComment moves remaining GitHub asks on the same
+	// review-fix pair past a consumed Continue/Stop so a later poll cannot
+	// treat that comment as an ordinary answer after a scope overlay is released.
 	advanceAskPastComment func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64) error
 	// projectCWD returns the local repo path for a project (gh runs there).
 	projectCWD    func(projectID string) string
@@ -302,6 +302,9 @@ type githubHITLAwaitingLoop struct {
 	PRNumber     int64
 	AskCommentID int64
 	BudgetAsk    bool
+	// Lane is the review-fix pairing lane (automatic or continuous_manual).
+	// Empty means the loop does not pair (one-shot manual).
+	Lane string
 }
 
 // githubHITLDecisionOnlyAsk reports Continue/Stop-only GitHub answer filtering.
@@ -360,8 +363,9 @@ func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositori
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
 // simply won't be passed in again. A Continue/Stop consumed by a decision-only
-// pair member is persisted onto remaining sibling GitHub asks so the next poll
-// cannot treat that comment as an ordinary answer after the overlay is gone.
+// pair member is persisted onto remaining sibling GitHub asks in that same
+// review-fix lane so the next poll cannot treat that comment as an ordinary
+// answer after the overlay is gone.
 func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
 	consumedDecisionPairs := make(map[string]struct{})
@@ -442,28 +446,44 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 	if repos == nil || repos.Loops == nil || commentID == 0 || prNumber == 0 {
 		return nil
 	}
+	exceptLoopID = strings.TrimSpace(exceptLoopID)
+	if exceptLoopID == "" {
+		return nil
+	}
 	all, err := repos.Loops.List(ctx)
 	if err != nil {
 		return err
 	}
+	var except *storage.LoopRecord
+	for i := range all {
+		if strings.TrimSpace(all[i].ID) == exceptLoopID {
+			except = &all[i]
+			break
+		}
+	}
+	if except == nil {
+		return nil
+	}
 	repo = strings.TrimSpace(repo)
 	projectID = strings.TrimSpace(projectID)
-	exceptLoopID = strings.TrimSpace(exceptLoopID)
-	for _, loop := range all {
-		if strings.TrimSpace(loop.ID) == exceptLoopID {
+	for _, loop := range loops.FindSiblingReviewFixLoops(all, *except) {
+		if projectID != "" && strings.TrimSpace(loop.ProjectID) != projectID {
 			continue
 		}
-		if strings.TrimSpace(loop.ProjectID) != projectID {
+		if repo != "" && derefLoopRepo(loop) != repo {
 			continue
 		}
-		if derefLoopRepo(loop) != repo || derefLoopPRNumber(loop) != prNumber {
+		if derefLoopPRNumber(loop) != prNumber {
 			continue
 		}
 		if strings.TrimSpace(loop.Status) != "awaiting_human" {
 			continue
 		}
 		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") || ask.PRNumber != prNumber {
+		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
+			continue
+		}
+		if ask.PRNumber != 0 && ask.PRNumber != prNumber {
 			continue
 		}
 		if ask.AskCommentID >= commentID {
@@ -485,10 +505,11 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 
 func githubHITLDecisionPairKey(loop githubHITLAwaitingLoop) string {
 	repo := strings.TrimSpace(loop.Repo)
-	if repo == "" || loop.PRNumber == 0 {
+	lane := strings.TrimSpace(loop.Lane)
+	if repo == "" || loop.PRNumber == 0 || lane == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s#%d", repo, loop.PRNumber)
+	return fmt.Sprintf("%s#%d:%s", repo, loop.PRNumber, lane)
 }
 
 func githubHITLPRHasRemainingAwaiting(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64) bool {
@@ -805,6 +826,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			// with budget asks so unrelated PR chatter does not poison the
 			// decision. Overlay siblings keep a preserved agent ask kind.
 			BudgetAsk: githubHITLDecisionOnlyAsk(l, ask),
+			Lane:      loops.ReviewFixBudgetLane(l),
 		})
 	}
 	if len(awaiting) == 0 {

@@ -225,6 +225,12 @@ func ParticipatesInReviewFixBudget(loop storage.LoopRecord) bool {
 	return reviewFixBudgetLane(loop) != ""
 }
 
+// ReviewFixBudgetLane is the pairing lane used by FindSiblingReviewFixLoops:
+// automatic, continuous_manual, or empty for one-shot manual loops.
+func ReviewFixBudgetLane(loop storage.LoopRecord) string {
+	return reviewFixBudgetLane(loop)
+}
+
 func reviewFixBudgetLane(loop storage.LoopRecord) string {
 	meta := parseMetadataObject(loop.MetadataJSON)
 	manual, _ := meta["manual"].(bool)

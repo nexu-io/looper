@@ -190,8 +190,6 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 			if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
 				if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && (loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask)) {
 					shouldResolve = true
-				} else if loops.IsReviewFixPairHold(*loop) {
-					shouldResolve = true
 				}
 			}
 		}
