@@ -803,7 +803,8 @@ func TestValidateReviewSubmitEventAcceptsRequestChanges(t *testing.T) {
 func TestValidateReviewSubmitBodyRequiresSingleMatchingMarker(t *testing.T) {
 	t.Parallel()
 	body := "Review body\n<!-- looper:review id=abc head=def outcome=actionable -->"
-	if err := validateReviewSubmitBody(body, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+	// Actionable COMMENT requires inline comments (no body-only smuggling).
+	if err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "fix", Path: "main.go", Line: 1, Side: "RIGHT"}}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
 		t.Fatalf("validateReviewSubmitBody() error = %v", err)
 	}
 	for _, tc := range []struct {
@@ -849,12 +850,51 @@ func TestValidateReviewSubmitBodyAllowsRequestChangesOnlyForBlocking(t *testing.
 	}
 }
 
+func TestValidateReviewSubmitBodyRejectsActionableBodyOnly(t *testing.T) {
+	t.Parallel()
+	blocking := "<!-- looper:review id=abc head=def outcome=blocking -->"
+	if err := validateReviewSubmitBody(blocking, nil, "def", "REQUEST_CHANGES", decisionReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "at least one inline comment") {
+		t.Fatalf("REQUEST_CHANGES body-only error = %v, want inline comment requirement", err)
+	}
+	actionable := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	if err := validateReviewSubmitBody(actionable, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "at least one inline comment") {
+		t.Fatalf("actionable COMMENT body-only error = %v, want inline comment requirement", err)
+	}
+	// Clean body-only COMMENT remains allowed.
+	clean := "<!-- looper:review id=abc head=def outcome=clean -->"
+	if err := validateReviewSubmitBody(clean, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("clean COMMENT body-only error = %v", err)
+	}
+}
+
 func TestValidateReviewSubmitBodyRejectsCleanApproveWithInlineComments(t *testing.T) {
 	t.Parallel()
 	body := "<!-- looper:review id=abc head=def outcome=clean -->"
 	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "inline", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "APPROVE", decisionReviewPolicy, "octocat")
 	if err == nil || !strings.Contains(err.Error(), "without inline comments") {
 		t.Fatalf("validateReviewSubmitBody(APPROVE with comments) error = %v, want inline rejection", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsCleanCommentWithInlineComments(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=clean -->"
+	// Clean COMMENT must reject any inline comments (same as APPROVE).
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{{
+		Body: "must_fix smuggled", Path: "main.go", Line: 10, Side: "RIGHT",
+		Disposition: "must_fix", ScopeBasis: "required_invariant", ScopeEvidence: "rule",
+	}}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "without inline comments") {
+		t.Fatalf("validateReviewSubmitBody(clean COMMENT with comments) error = %v, want inline rejection", err)
+	}
+	// Clean body-only COMMENT remains allowed.
+	if err := validateReviewSubmitBody(body, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("validateReviewSubmitBody(clean COMMENT body-only) error = %v", err)
+	}
+	// Actionable COMMENT still requires ≥1 inline comment (must_fix enforced separately).
+	actionable := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	if err := validateReviewSubmitBody(actionable, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "at least one inline comment") {
+		t.Fatalf("actionable COMMENT body-only error = %v, want inline comment requirement", err)
 	}
 }
 
@@ -1488,5 +1528,110 @@ func TestReviewSubmitGatewayUsesStorageProjectRoles(t *testing.T) {
 	}
 	if got := strings.Join(forgeGateway.labels, ","); got != "looper:review" {
 		t.Fatalf("labels = %q, want looper:review from storage project roles", got)
+	}
+}
+
+func TestValidateReviewSubmitCommentDispositionsRequiresMustFixEvidence(t *testing.T) {
+	t.Parallel()
+
+	mustFix := []reviewSubmitComment{{
+		Body: "Null check missing", Path: "app.go", Line: 10, Side: "RIGHT",
+		Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "PR adds nil deref on happy path",
+	}}
+	if err := validateReviewSubmitCommentDispositions(mustFix); err != nil {
+		t.Fatalf("must_fix+evidence error = %v", err)
+	}
+	if err := validateReviewSubmitCommentDispositions(nil); err != nil {
+		t.Fatalf("empty comments error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		comments []reviewSubmitComment
+		want     string
+	}{
+		{
+			name: "missing fields",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+			}},
+			want: "requires disposition=must_fix",
+		},
+		{
+			name: "follow_up rejected",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+				Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "nice to have",
+			}},
+			want: "follow_up",
+		},
+		{
+			name: "needs_human rejected",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+				Disposition: "needs_human", ScopeBasis: "ambiguous_intent", ScopeEvidence: "unclear",
+			}},
+			want: "needs_human",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateReviewSubmitCommentDispositions(tc.comments)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestReviewSubmitStripsLooperOnlyFieldsAndRejectsBeforeSubmit(t *testing.T) {
+	t.Parallel()
+
+	// Unknown extra JSON keys are ignored by encoding/json into the struct.
+	raw := []byte(`{
+		"body": "Blocking\n\n<!-- looper:review id=abc head=deadbeef outcome=blocking -->",
+		"comments": [{
+			"body": "fix it",
+			"path": "app.go",
+			"line": 10,
+			"side": "RIGHT",
+			"disposition": "must_fix",
+			"severity": "blocking",
+			"scopeBasis": "introduced_regression",
+			"scopeEvidence": "nil deref",
+			"unknownExtra": true
+		}]
+	}`)
+	var payload reviewSubmitPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if err := validateReviewSubmitCommentDispositions(payload.Comments); err != nil {
+		t.Fatalf("validate dispositions: %v", err)
+	}
+	if payload.Comments[0].Disposition != "must_fix" || payload.Comments[0].ScopeBasis == "" {
+		t.Fatalf("payload comments = %#v", payload.Comments[0])
+	}
+	// Provider mapping strips Looper-only fields (same as reviewSubmit path).
+	mapped := githubinfra.ReviewComment{
+		Body: payload.Comments[0].Body, Path: payload.Comments[0].Path,
+		Line: payload.Comments[0].Line, Side: payload.Comments[0].Side,
+	}
+	if mapped.Body != "fix it" || mapped.Path != "app.go" {
+		t.Fatalf("mapped = %#v", mapped)
+	}
+
+	// Reject path: follow_up never reaches SubmitReview.
+	submitCalls := 0
+	gateway := &budgetGateSubmitGateway{onSubmit: func() { submitCalls++ }}
+	_ = gateway
+	bad := []reviewSubmitComment{{
+		Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+		Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "later",
+	}}
+	if err := validateReviewSubmitCommentDispositions(bad); err == nil {
+		t.Fatal("expected follow_up rejection")
+	}
+	if submitCalls != 0 {
+		t.Fatalf("SubmitReview calls = %d, want 0", submitCalls)
 	}
 }

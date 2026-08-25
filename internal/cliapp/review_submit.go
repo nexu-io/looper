@@ -47,7 +47,19 @@ type reviewSubmitComment struct {
 	Side      string `json:"side"`
 	StartLine int64  `json:"start_line"`
 	StartSide string `json:"start_side"`
+	// Looper-only finding contract fields. Validated on actionable comments and
+	// stripped before provider SubmitReview (GitHub/Forgejo receive body/path/line/side only).
+	Disposition   string `json:"disposition,omitempty"`
+	Severity      string `json:"severity,omitempty"`
+	ScopeBasis    string `json:"scopeBasis,omitempty"`
+	ScopeEvidence string `json:"scopeEvidence,omitempty"`
 }
+
+const (
+	reviewFindingDispositionMustFix    = "must_fix"
+	reviewFindingDispositionFollowUp   = "follow_up"
+	reviewFindingDispositionNeedsHuman = "needs_human"
+)
 
 type reviewSubmitDiagnosticFields struct {
 	Repo        string
@@ -476,6 +488,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		})
 		return err
 	}
+	if err := validateReviewSubmitCommentDispositions(payload.Comments); err != nil {
+		writeReviewSubmitDiagnostic(cmd.ErrOrStderr(), "github_review_submit_validation_failed", reviewSubmitDiagnosticFields{
+			Repo: repo, PRNumber: prNumber, Event: event, CommitID: commitID, Payload: payload, Error: err.Error(), RedactPaths: true,
+		})
+		return err
+	}
 	submissionEvent, err := r.effectiveReviewSubmitEvent(cmd, gateway, repo, prNumber, event, detail.Author, cwd)
 	if err != nil {
 		return err
@@ -511,6 +529,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 
 	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
 	for _, comment := range payload.Comments {
+		// Strip Looper-only disposition/scope fields before the provider Adapter.
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
 	// Fail closed on base/head drift between anchor resolution and mutation.
@@ -754,12 +773,49 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 		if outcome != "blocking" {
 			return fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", outcome)
 		}
+		// Body-only must not be the sole carrier of a blocking finding.
+		if len(comments) == 0 {
+			return fmt.Errorf("REQUEST_CHANGES requires at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
+		}
 	case "COMMENT":
 		if outcome == "clean" && policy.Clean == config.ReviewerReviewEventApprove {
 			return fmt.Errorf("review marker outcome=clean requires APPROVE under effective policy")
 		}
 		if outcome == "blocking" && policy.Blocking == config.ReviewerReviewEventRequestChanges {
 			return fmt.Errorf("review marker outcome=blocking requires REQUEST_CHANGES under effective policy")
+		}
+		// Clean COMMENT is body-only (same as APPROVE); inline comments imply must_fix.
+		if outcome == "clean" && len(comments) > 0 {
+			return fmt.Errorf("COMMENT reviews require clean outcome without inline comments")
+		}
+		// Actionable/blocking COMMENT with zero comments smuggles findings in body only.
+		if outcome != "clean" && len(comments) == 0 {
+			return fmt.Errorf("actionable COMMENT reviews require at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
+		}
+	}
+	return nil
+}
+
+// validateReviewSubmitCommentDispositions enforces the trusted finding contract on
+// actionable inline comments. Clean body-only APPROVE/COMMENT needs no dispositions.
+func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) error {
+	if len(comments) == 0 {
+		return nil
+	}
+	for i, comment := range comments {
+		disposition := strings.TrimSpace(comment.Disposition)
+		scopeBasis := strings.TrimSpace(comment.ScopeBasis)
+		scopeEvidence := strings.TrimSpace(comment.ScopeEvidence)
+		if disposition == "" || scopeBasis == "" || scopeEvidence == "" {
+			return fmt.Errorf("actionable review comment %d requires disposition=must_fix, non-empty scopeBasis, and non-empty scopeEvidence", i)
+		}
+		switch disposition {
+		case reviewFindingDispositionMustFix:
+			// ok
+		case reviewFindingDispositionFollowUp, reviewFindingDispositionNeedsHuman:
+			return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
+		default:
+			return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix)", i, disposition)
 		}
 	}
 	return nil
@@ -1149,7 +1205,10 @@ func refuseReviewSubmitBudgetAgainstRepos(ctx context.Context, repos *storage.Re
 		// One-shot manual (and any non-participating lane) is exempt.
 		return nil
 	}
-	if loops.IsReviewFixBudgetHold(*loop) {
+	if loops.IsReviewFixPairHold(*loop) {
+		if loops.IsReviewScopeHumanHold(*loop) && !loops.IsReviewFixBudgetHold(*loop) {
+			return fmt.Errorf("review submit refused: review scope requires human judgment for %s#%d; unpause or stop the loop before publishing", repo, prNumber)
+		}
 		return fmt.Errorf("review submit refused: review-fix budget is held for %s#%d; unpause or stop the loop before publishing", repo, prNumber)
 	}
 	cap := config.ProjectRoleConfigs(cfg, loop.ProjectID).Reviewer.Behavior.Loop.MaxPublishesPerPR

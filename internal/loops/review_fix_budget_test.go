@@ -417,7 +417,7 @@ func TestStopReviewFixBudgetRetriesAfterSiblingAlreadyTerminated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
 	}
-	if _, err := terminateReviewFixLoop(context.Background(), repos, fixer, nowISO); err != nil {
+	if _, err := terminateReviewFixLoop(context.Background(), repos, fixer, nowISO, ReviewFixBudgetTerminationReason); err != nil {
 		t.Fatalf("terminateReviewFixLoop(sibling) error = %v", err)
 	}
 

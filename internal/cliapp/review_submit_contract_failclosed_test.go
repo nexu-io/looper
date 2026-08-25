@@ -20,7 +20,7 @@ func TestReviewSubmitOrchestrationFailsClosedOnBaseHeadMismatch(t *testing.T) {
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-mismatch head=" + strings.Repeat("a", 40) + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{"body": "late change", "path": "target/late.go", "line": targetLine, "side": "RIGHT"},
+			reviewSubmitMustFixComment("late change", "target/late.go", targetLine, "RIGHT"),
 		},
 	}
 	raw, _ := json.Marshal(payload)
@@ -67,7 +67,7 @@ func TestReviewSubmitOrchestrationFailsClosedWhenRemoteOversizedAndLocalUnavaila
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-oversized head=" + headSHA + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{"body": "needs fix", "path": secretPath, "line": 1, "side": "RIGHT"},
+			reviewSubmitMustFixComment("needs fix", secretPath, 1, "RIGHT"),
 		},
 	}
 	raw, _ := json.Marshal(payload)
@@ -123,7 +123,7 @@ func TestReviewSubmitOrchestrationRetryDoesNotDuplicateAfterAuthorityRecovery(t 
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-retry head=" + headSHA + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{"body": "late change needs attention", "path": "target/late.go", "line": targetLine, "side": "RIGHT"},
+			reviewSubmitMustFixComment("late change needs attention", "target/late.go", targetLine, "RIGHT"),
 		},
 	}
 	raw, _ := json.Marshal(payload)

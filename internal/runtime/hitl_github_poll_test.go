@@ -56,6 +56,39 @@ func TestDetectGitHubHITLAnswerSkipsUnrelatedBudgetComments(t *testing.T) {
 	}
 }
 
+func TestPollGitHubHITLAnswersOnceScopeAskSkipsUnrelatedComments(t *testing.T) {
+	// Scope asks must use Continue/Stop-only filtering (same as budget asks).
+	comments := []githubAnswerComment{
+		{ID: 8001, Author: "looper", Body: "<!-- looper:hitl:ask --> Clarify AGENTS.md before unpause"},
+		{ID: 8002, Author: "operator", Body: "unrelated discussion about the PR"},
+		{ID: 8003, Author: "operator", Body: "Continue"},
+	}
+	var delivered []string
+	deps := githubHITLPollDeps{
+		listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+			return comments, nil
+		},
+		deliverAnswer: func(_ contextType, loopID, answer string) error {
+			delivered = append(delivered, loopID+"="+answer)
+			return nil
+		},
+	}
+	// BudgetAsk=true is set for scope asks at the poll assembly site.
+	n := pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		{ID: "loop-scope", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 42, AskCommentID: 8001, BudgetAsk: true},
+	}, deps)
+	if n != 1 || len(delivered) != 1 || delivered[0] != "loop-scope=Continue" {
+		t.Fatalf("delivered = %#v n=%d, want only Continue for scope ask", delivered, n)
+	}
+	// Without BudgetAsk filtering, the unrelated comment would win.
+	n = pollGitHubHITLAnswersOnce(context.Background(), []githubHITLAwaitingLoop{
+		{ID: "loop-scope-open", Repo: "acme/x", Transport: "github", AskStatus: "awaiting", PRNumber: 42, AskCommentID: 8001, BudgetAsk: false},
+	}, deps)
+	if n != 1 || len(delivered) != 2 || delivered[1] != "loop-scope-open=unrelated discussion about the PR" {
+		t.Fatalf("open ask delivered = %#v n=%d, want earliest unrelated comment", delivered, n)
+	}
+}
+
 func TestPollGitHubHITLAnswersOnce(t *testing.T) {
 	commentsByPR := map[int64][]githubAnswerComment{
 		42: {{ID: 500, Author: "lefarcen", Body: "<!-- looper:hitl:ask --> ask"}, {ID: 501, Author: "lefarcen", Body: "go with A"}},
