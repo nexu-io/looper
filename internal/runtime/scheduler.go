@@ -131,6 +131,9 @@ type defaultSchedulerTickInput struct {
 	// DrainHITLPair stops live pair agents before a scope Stop answer is
 	// applied by GitHub/Feishu poll. Optional; tests may inject a recorder.
 	DrainHITLPair func(context.Context, storage.LoopRecord) error
+	// ActiveExecutions reopens sticky pair spawn gates when a scope Stop drain
+	// loses to a concurrent Continue.
+	ActiveExecutions *ActiveExecutionRegistry
 }
 
 type defaultSchedulerHandlers struct {
@@ -3693,6 +3696,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			DrainHITLPair: func(ctx context.Context, loop storage.LoopRecord) error {
 				return drainReviewFixPairExecutions(ctx, services.Repositories, loop, services.ActiveExecutions)
 			},
+			ActiveExecutions: services.ActiveExecutions,
 		}
 	}
 

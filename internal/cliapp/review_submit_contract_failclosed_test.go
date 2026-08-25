@@ -175,3 +175,54 @@ func TestReviewSubmitOrchestrationRetryDoesNotDuplicateAfterAuthorityRecovery(t 
 		t.Fatalf("submit log lines = %d (%q), want exactly one publish after recovery", len(lines), string(data))
 	}
 }
+
+func TestReviewSubmitOrchestrationRejectsSuppressedFindingsInBody(t *testing.T) {
+	t.Parallel()
+
+	repo := t.TempDir()
+	baseSHA, headSHA, targetLine := seedReviewSubmitLargeRepo(t, repo)
+	payloadPath, configPath, submitLog, _ := writeReviewSubmitHarness(t, repo, baseSHA, headSHA, "truncated")
+
+	payload := map[string]any{
+		"body": "Valid must_fix inline, plus a follow_up rename in the body.\n<!-- looper:review id=review-body-smuggle head=" + headSHA + " outcome=actionable -->",
+		"comments": []map[string]any{
+			reviewSubmitMustFixComment("late change", "target/late.go", targetLine, "RIGHT"),
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := os.WriteFile(payloadPath, raw, 0o644); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	runtime := newCommandRuntime(New(Deps{Stdout: stdout, Stderr: stderr, Getwd: func() (string, error) { return repo, nil }}), []string{"--config", configPath})
+	cmd := newReviewSubmitTestCommand(stdout, stderr)
+	cmd.SetContext(context.Background())
+	f, err := os.Open(payloadPath)
+	if err != nil {
+		t.Fatalf("open payload: %v", err)
+	}
+	defer f.Close()
+	cmd.SetIn(f)
+	if err := cmd.Flags().Set("event", "COMMENT"); err != nil {
+		t.Fatalf("set event: %v", err)
+	}
+	if err := cmd.Flags().Set("commit-id", headSHA); err != nil {
+		t.Fatalf("set commit-id: %v", err)
+	}
+
+	err = runtime.reviewSubmit(cmd, []string{"acme/looper#42"})
+	if err == nil || !strings.Contains(err.Error(), "follow_up or needs_human") {
+		t.Fatalf("reviewSubmit() error = %v, want body disposition rejection", err)
+	}
+	if _, statErr := os.Stat(submitLog); !os.IsNotExist(statErr) {
+		data, _ := os.ReadFile(submitLog)
+		if len(bytes.TrimSpace(data)) > 0 {
+			t.Fatalf("provider SubmitReview received payload despite suppressed body finding: %s", data)
+		}
+	}
+}

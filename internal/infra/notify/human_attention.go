@@ -70,6 +70,8 @@ type HumanAttentionInput struct {
 	Reason     HumanAttentionReason
 	EntryKey   string
 	Subtitle   string
+	Question   string
+	Evidence   string
 	EntityType string
 	EntityID   string
 }
@@ -95,6 +97,12 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 	body := fmt.Sprintf("%s requires operator attention (%s).", loopLabel, humanAttentionReasonLabel(reason))
 	if loopType := strings.TrimSpace(input.LoopType); loopType != "" {
 		body = fmt.Sprintf("%s (%s) requires operator attention (%s).", loopLabel, loopType, humanAttentionReasonLabel(reason))
+	}
+	if q := strings.TrimSpace(input.Question); q != "" {
+		body += " " + q
+	}
+	if e := strings.TrimSpace(input.Evidence); e != "" {
+		body += " " + e
 	}
 
 	entityType := strings.TrimSpace(input.EntityType)

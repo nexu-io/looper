@@ -41,6 +41,11 @@ func detectGitHubHITLAnswer(comments []githubAnswerComment, askCommentID int64, 
 }
 
 func detectGitHubHITLAnswerMatching(comments []githubAnswerComment, askCommentID int64, answerAuthors []string, accept func(string) bool) string {
+	answer, _ := detectGitHubHITLAnswerMatchingWithID(comments, askCommentID, answerAuthors, accept, nil)
+	return answer
+}
+
+func detectGitHubHITLAnswerMatchingWithID(comments []githubAnswerComment, askCommentID int64, answerAuthors []string, accept func(string) bool, skipIDs map[int64]struct{}) (string, int64) {
 	allow := make(map[string]bool, len(answerAuthors))
 	for _, a := range answerAuthors {
 		if a = strings.TrimSpace(a); a != "" {
@@ -51,6 +56,9 @@ func detectGitHubHITLAnswerMatching(comments []githubAnswerComment, askCommentID
 	answer := ""
 	for _, c := range comments {
 		if c.ID <= askCommentID {
+			continue
+		}
+		if _, skip := skipIDs[c.ID]; skip {
 			continue
 		}
 		if strings.Contains(c.Body, looperCommentMarker) {
@@ -75,7 +83,7 @@ func detectGitHubHITLAnswerMatching(comments []githubAnswerComment, askCommentID
 			answer = body
 		}
 	}
-	return answer
+	return answer, bestID
 }
 
 // githubHITLDeliveryDeps are the injected dependencies for posting an undelivered
@@ -274,6 +282,14 @@ type githubHITLPollDeps struct {
 	deliverAnswer func(ctx contextType, loopID, answer string) error
 	// clearAwaiting removes the awaiting-human label from the PR after delivery.
 	clearAwaiting func(ctx contextType, repo string, prNumber int64, cwd string)
+	// remainingAwaiting, when set, is consulted after a successful delivery.
+	// clearAwaiting is skipped when another awaiting GitHub ask remains on the PR.
+	remainingAwaiting func(ctx contextType, repo string, prNumber int64) bool
+	// advanceAskPastComment moves remaining GitHub asks on the same
+	// review-fix pair past a consumed Continue/Stop so a later poll cannot
+	// treat that comment as an ordinary answer after a scope overlay is released.
+	// Residual ordinary asks are advanced only when they have no earlier free-text.
+	advanceAskPastComment func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error
 	// projectCWD returns the local repo path for a project (gh runs there).
 	projectCWD    func(projectID string) string
 	answerAuthors []string
@@ -290,6 +306,9 @@ type githubHITLAwaitingLoop struct {
 	PRNumber     int64
 	AskCommentID int64
 	BudgetAsk    bool
+	// Lane is the review-fix pairing lane (automatic or continuous_manual).
+	// Empty means the loop does not pair (one-shot manual).
+	Lane string
 }
 
 // githubHITLDecisionOnlyAsk reports Continue/Stop-only GitHub answer filtering.
@@ -299,18 +318,52 @@ func githubHITLDecisionOnlyAsk(loop storage.LoopRecord, ask loops.HITLAsk) bool 
 	return loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(loop)
 }
 
-func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) error {
+// githubHITLResidualOrdinaryAsk reports a preserved agent HITL ask that is not
+// itself a pair Continue/Stop question. Overlay siblings keep this ask while
+// the pair hold is the decision authority.
+func githubHITLResidualOrdinaryAsk(ask loops.HITLAsk) bool {
+	if loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(ask.Status), "awaiting")
+}
+
+// afterDrainScopeStopHook is test-only: runs after a scope Stop drain and before
+// the caller applies the answer, so tests can commit a racing Continue.
+var afterDrainScopeStopHook func()
+
+func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) (bool, error) {
 	if drain == nil || repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
-		return nil
+		return false, nil
 	}
 	loop, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if loop == nil || !loops.IsReviewScopeHumanHold(*loop) {
-		return nil
+		return false, nil
 	}
-	return drain(ctx, *loop)
+	if err := drain(ctx, *loop); err != nil {
+		return false, err
+	}
+	if afterDrainScopeStopHook != nil {
+		afterDrainScopeStopHook()
+	}
+	return true, nil
+}
+
+// deliverHITLAnswerAfterScopeDrain drains a live scope pair before applying Stop,
+// then reopens sticky spawn gates if that Stop did not remain applied.
+func deliverHITLAnswerAfterScopeDrain(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, answer string, caps loops.ReviewFixBudgetLiveCaps, drain func(context.Context, storage.LoopRecord) error, executions *ActiveExecutionRegistry) error {
+	drained, err := drainScopeHoldOnStop(ctx, repos, loopID, answer, drain)
+	if err != nil {
+		return err
+	}
+	deliverErr := deliverHITLAnswerToLoopWithCaps(ctx, repos, db, nowISO, loopID, answer, caps, executions)
+	if drained {
+		ReopenUnappliedScopeStopGates(ctx, repos, executions, loopID)
+	}
+	return deliverErr
 }
 
 func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, executions *ActiveExecutionRegistry) error {
@@ -347,10 +400,16 @@ func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositori
 // pollGitHubHITLAnswersOnce runs one pass of the answer-poll lane: for each loop
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
-// simply won't be passed in again.
+// simply won't be passed in again. A Continue/Stop consumed by a decision-only
+// pair member is remembered in-process for this poll and persisted onto siblings.
+// Residual ordinary sibling asks keep earlier free-text visible; they skip only
+// the consumed decision comment so a standalone ordinary ask can still answer
+// Continue or Stop.
 func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
-	for _, loop := range awaiting {
+	consumedDecisionPairs := make(map[string]struct{})
+	consumedDecisionComments := make(map[int64]struct{})
+	for i, loop := range awaiting {
 		if !strings.EqualFold(strings.TrimSpace(loop.Transport), "github") || loop.PRNumber == 0 {
 			continue
 		}
@@ -360,6 +419,12 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 		repo := strings.TrimSpace(loop.Repo)
 		if repo == "" {
 			continue
+		}
+		pairKey := githubHITLDecisionPairKey(loop)
+		if loop.BudgetAsk && pairKey != "" {
+			if _, consumed := consumedDecisionPairs[pairKey]; consumed {
+				continue
+			}
 		}
 		cwd := ""
 		if deps.projectCWD != nil {
@@ -378,9 +443,33 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 				return loops.IsReviewFixBudgetContinue(body) || loops.IsReviewFixBudgetStop(body)
 			}
 		}
-		answer := detectGitHubHITLAnswerMatching(comments, loop.AskCommentID, deps.answerAuthors, accept)
+		answer, commentID := detectGitHubHITLAnswerMatchingWithID(comments, loop.AskCommentID, deps.answerAuthors, accept, consumedDecisionComments)
 		if answer == "" {
 			continue
+		}
+		if loop.BudgetAsk && pairKey != "" && commentID != 0 && (loops.IsReviewFixBudgetContinue(answer) || loops.IsReviewFixBudgetStop(answer)) {
+			if deps.advanceAskPastComment != nil {
+				if err := deps.advanceAskPastComment(ctx, loop.ProjectID, repo, loop.PRNumber, loop.ID, commentID, comments); err != nil {
+					if deps.logWarn != nil {
+						deps.logWarn("hitl github poll: advance consumed decision failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
+					}
+					continue
+				}
+			}
+			for j := range awaiting {
+				if j == i || githubHITLDecisionPairKey(awaiting[j]) != pairKey {
+					continue
+				}
+				if !awaiting[j].BudgetAsk {
+					if residualOrdinaryHasEarlierAnswer(comments, awaiting[j].AskCommentID, commentID, deps.answerAuthors) {
+						continue
+					}
+				}
+				if awaiting[j].AskCommentID < commentID {
+					awaiting[j].AskCommentID = commentID
+				}
+			}
+			consumedDecisionComments[commentID] = struct{}{}
 		}
 		if err := deps.deliverAnswer(ctx, loop.ID, answer); err != nil {
 			if deps.logWarn != nil {
@@ -388,12 +477,146 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 			}
 			continue
 		}
-		if deps.clearAwaiting != nil {
+		if loop.BudgetAsk && pairKey != "" && (loops.IsReviewFixBudgetContinue(answer) || loops.IsReviewFixBudgetStop(answer)) {
+			consumedDecisionPairs[pairKey] = struct{}{}
+		}
+		if deps.clearAwaiting != nil && (deps.remainingAwaiting == nil || !deps.remainingAwaiting(ctx, repo, loop.PRNumber)) {
 			deps.clearAwaiting(ctx, repo, loop.PRNumber, cwd)
 		}
 		delivered++
 	}
 	return delivered
+}
+
+func residualOrdinaryHasEarlierAnswer(comments []githubAnswerComment, askCommentID, consumedID int64, answerAuthors []string) bool {
+	if consumedID == 0 {
+		return false
+	}
+	_, id := detectGitHubHITLAnswerMatchingWithID(comments, askCommentID, answerAuthors, func(body string) bool {
+		return !loops.IsReviewFixBudgetContinue(body) && !loops.IsReviewFixBudgetStop(body)
+	}, map[int64]struct{}{consumedID: {}})
+	return id != 0 && id < consumedID
+}
+
+func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment, answerAuthors []string) error {
+	if repos == nil || repos.Loops == nil || commentID == 0 || prNumber == 0 {
+		return nil
+	}
+	exceptLoopID = strings.TrimSpace(exceptLoopID)
+	if exceptLoopID == "" {
+		return nil
+	}
+	all, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	var except *storage.LoopRecord
+	for i := range all {
+		if strings.TrimSpace(all[i].ID) == exceptLoopID {
+			except = &all[i]
+			break
+		}
+	}
+	if except == nil {
+		return nil
+	}
+	repo = strings.TrimSpace(repo)
+	projectID = strings.TrimSpace(projectID)
+	for _, loop := range loops.FindSiblingReviewFixLoops(all, *except) {
+		if projectID != "" && strings.TrimSpace(loop.ProjectID) != projectID {
+			continue
+		}
+		if repo != "" && derefLoopRepo(loop) != repo {
+			continue
+		}
+		if derefLoopPRNumber(loop) != prNumber {
+			continue
+		}
+		if strings.TrimSpace(loop.Status) != "awaiting_human" {
+			continue
+		}
+		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
+			continue
+		}
+		if ask.PRNumber != 0 && ask.PRNumber != prNumber {
+			continue
+		}
+		if ask.AskCommentID >= commentID {
+			continue
+		}
+		if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID, answerAuthors) {
+			continue
+		}
+		ask.AskCommentID = commentID
+		meta, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+		if err != nil {
+			return err
+		}
+		updated := loop
+		updated.MetadataJSON = &meta
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func githubHITLDecisionPairKey(loop githubHITLAwaitingLoop) string {
+	repo := strings.TrimSpace(loop.Repo)
+	lane := strings.TrimSpace(loop.Lane)
+	if repo == "" || loop.PRNumber == 0 || lane == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s#%d:%s", repo, loop.PRNumber, lane)
+}
+
+func githubHITLPRHasRemainingAwaiting(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64) bool {
+	if repos == nil || repos.Loops == nil || prNumber == 0 {
+		return false
+	}
+	all, err := repos.Loops.List(ctx)
+	if err != nil {
+		// Unknown remaining state must keep looper:awaiting-human. A transient
+		// List error after one delivery must not clear the label while another
+		// GitHub-backed ask may still be open on the PR.
+		return true
+	}
+	repo = strings.TrimSpace(repo)
+	for _, loop := range all {
+		if strings.TrimSpace(projectID) != "" && loop.ProjectID != projectID {
+			continue
+		}
+		if loop.Status != "awaiting_human" {
+			continue
+		}
+		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+		if !ok {
+			continue
+		}
+		if s := strings.TrimSpace(ask.Status); s != "" && s != "awaiting" {
+			continue
+		}
+		askPR := ask.PRNumber
+		if askPR == 0 {
+			askPR = derefLoopPRNumber(loop)
+		}
+		if askPR != prNumber {
+			continue
+		}
+		if repo != "" {
+			loopRepo := derefLoopRepo(loop)
+			if loopRepo != "" && !strings.EqualFold(loopRepo, repo) {
+				continue
+			}
+		}
+		transport := strings.TrimSpace(ask.Transport)
+		if transport != "" && !strings.EqualFold(transport, "github") {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // deliverHITLAnswerToLoop is the runtime-side equivalent of the api
@@ -410,10 +633,10 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 // is the exception: only Continue/Stop may unpark, and they apply the budget
 // decision instead of enqueueing conversational text.
 func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
-	return enqueueHumanMessageToLoopWithCaps(ctx, repos, nil, nowISO, loopID, text, reviewFixBudgetLiveCaps(nil, ""))
+	return enqueueHumanMessageToLoopWithCaps(ctx, repos, nil, nowISO, loopID, text, reviewFixBudgetLiveCaps(nil, ""), nil)
 }
 
-func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, text string, caps loops.ReviewFixBudgetLiveCaps) error {
+func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, text string, caps loops.ReviewFixBudgetLiveCaps, executions *ActiveExecutionRegistry) error {
 	// Share process-wide requeue exclusion with API discard+retry so free-text
 	// inbox delivery cannot requeue paused/waiting/manual_intervention loops
 	// between discard preflight and git reset (see LockLoopRequeue).
@@ -445,7 +668,7 @@ func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repos
 	}
 	if loops.IsReviewScopeHumanHold(*loop) {
 		if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
-			return applyReviewScopeHumanAnswerTX(ctx, db, repos, *loop, text, nowISO)
+			return applyReviewScopeHumanAnswerAndReopen(ctx, db, repos, executions, *loop, text, nowISO)
 		}
 		return nil
 	}
@@ -506,9 +729,10 @@ func applyReviewFixBudgetAnswerTX(ctx context.Context, db *sql.DB, repos *storag
 	return err
 }
 
-func applyReviewScopeHumanAnswerTX(ctx context.Context, db *sql.DB, repos *storage.Repositories, loop storage.LoopRecord, answer, nowISO string) error {
+func applyReviewScopeHumanAnswerTX(ctx context.Context, db *sql.DB, repos *storage.Repositories, loop storage.LoopRecord, answer, nowISO string) (loops.ReviewScopeHumanAnswerResult, error) {
 	if db != nil {
-		return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+		var result loops.ReviewScopeHumanAnswerResult
+		err := storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
 			txRepos := storage.NewRepositories(tx)
 			fresh, err := txRepos.Loops.GetByID(ctx, loop.ID)
 			if err != nil {
@@ -517,19 +741,62 @@ func applyReviewScopeHumanAnswerTX(ctx context.Context, db *sql.DB, repos *stora
 			if fresh == nil {
 				return nil
 			}
-			_, err = loops.ApplyReviewScopeHumanAnswer(ctx, txRepos, *fresh, answer, nowISO)
+			result, err = loops.ApplyReviewScopeHumanAnswer(ctx, txRepos, *fresh, answer, nowISO)
 			return err
 		})
+		return result, err
 	}
-	_, err := loops.ApplyReviewScopeHumanAnswer(ctx, repos, loop, answer, nowISO)
-	return err
+	return loops.ApplyReviewScopeHumanAnswer(ctx, repos, loop, answer, nowISO)
+}
+
+func applyReviewScopeHumanAnswerAndReopen(ctx context.Context, db *sql.DB, repos *storage.Repositories, executions *ActiveExecutionRegistry, loop storage.LoopRecord, answer, nowISO string) error {
+	result, err := applyReviewScopeHumanAnswerTX(ctx, db, repos, loop, answer, nowISO)
+	if err != nil {
+		return err
+	}
+	if loops.IsReviewFixBudgetStop(answer) && !result.Applied {
+		ReopenUnappliedScopeStopGates(ctx, repos, executions, loop.ID)
+	}
+	return nil
+}
+
+// ReopenUnappliedScopeStopGates clears sticky pair spawn gates left by a Stop
+// drain when ApplyReviewScopeHumanAnswer did not apply (Continue already
+// released the hold). Terminal members stay gated.
+func ReopenUnappliedScopeStopGates(ctx context.Context, repos *storage.Repositories, executions *ActiveExecutionRegistry, loopID string) {
+	if executions == nil || repos == nil || repos.Loops == nil || strings.TrimSpace(loopID) == "" {
+		return
+	}
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	if loops.IsReviewScopeHumanHold(*loop) {
+		return
+	}
+	members := []storage.LoopRecord{*loop}
+	if all, listErr := repos.Loops.List(ctx); listErr == nil {
+		members = append(loops.FindSiblingReviewFixLoops(all, *loop), *loop)
+	}
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		switch strings.TrimSpace(member.Status) {
+		case "terminated", "stopped", "completed":
+			continue
+		}
+		executions.ClearLoopStop(member.ID)
+	}
 }
 
 func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
-	return deliverHITLAnswerToLoopWithCaps(ctx, repos, nil, nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
+	return deliverHITLAnswerToLoopWithCaps(ctx, repos, nil, nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""), nil)
 }
 
-func deliverHITLAnswerToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, answer string, caps loops.ReviewFixBudgetLiveCaps) error {
+func deliverHITLAnswerToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, answer string, caps loops.ReviewFixBudgetLiveCaps, executions *ActiveExecutionRegistry) error {
 	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
 	unlock := LockLoopRequeue(loopID)
 	defer unlock()
@@ -548,7 +815,7 @@ func deliverHITLAnswerToLoopWithCaps(ctx context.Context, repos *storage.Reposit
 		return applyReviewFixBudgetAnswerTX(ctx, db, repos, *loop, answer, nowISO, caps)
 	}
 	if loops.IsReviewScopeHumanHold(*loop) {
-		return applyReviewScopeHumanAnswerTX(ctx, db, repos, *loop, answer, nowISO)
+		return applyReviewScopeHumanAnswerAndReopen(ctx, db, repos, executions, *loop, answer, nowISO)
 	}
 	if loop.Status != "awaiting_human" {
 		return nil
@@ -662,6 +929,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			// with budget asks so unrelated PR chatter does not poison the
 			// decision. Overlay siblings keep a preserved agent ask kind.
 			BudgetAsk: githubHITLDecisionOnlyAsk(l, ask),
+			Lane:      loops.ReviewFixBudgetLane(l),
 		})
 	}
 	if len(awaiting) == 0 {
@@ -683,13 +951,16 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return out, nil
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			if err := drainScopeHoldOnStop(ctx, input.Repos, loopID, answer, input.DrainHITLPair); err != nil {
-				return err
-			}
-			return deliverHITLAnswerToLoopWithCaps(ctx, input.Repos, input.DB, nowISO, loopID, answer, reviewFixBudgetLiveCaps(input.Config, project.ID))
+			return deliverHITLAnswerAfterScopeDrain(ctx, input.Repos, input.DB, nowISO, loopID, answer, reviewFixBudgetLiveCaps(input.Config, project.ID), input.DrainHITLPair, input.ActiveExecutions)
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
 			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})
+		},
+		remainingAwaiting: func(ctx contextType, repo string, pr int64) bool {
+			return githubHITLPRHasRemainingAwaiting(ctx, input.Repos, project.ID, repo, pr)
+		},
+		advanceAskPastComment: func(ctx contextType, projectID, repo string, prNumber int64, exceptLoopID string, commentID int64, comments []githubAnswerComment) error {
+			return advanceSiblingGitHubHITLAsksPastComment(ctx, input.Repos, projectID, repo, prNumber, exceptLoopID, commentID, comments, answerAuthors)
 		},
 		projectCWD:    func(string) string { return project.RepoPath },
 		answerAuthors: answerAuthors,

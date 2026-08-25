@@ -59,6 +59,12 @@ const (
 	reviewFindingDispositionMustFix    = "must_fix"
 	reviewFindingDispositionFollowUp   = "follow_up"
 	reviewFindingDispositionNeedsHuman = "needs_human"
+
+	reviewFindingScopeStatedIntent           = "stated_intent"
+	reviewFindingScopeIntroducedRegression   = "introduced_regression"
+	reviewFindingScopeRequiredInvariant      = "required_invariant"
+	reviewFindingScopeIndependentImprovement = "independent_improvement"
+	reviewFindingScopeAmbiguousIntent        = "ambiguous_intent"
 )
 
 type reviewSubmitDiagnosticFields struct {
@@ -744,6 +750,7 @@ func validateReviewSubmitEventAllowed(event string, policy config.ReviewerReview
 var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
 var markdownHTMLCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
 var markdownReferenceDefinitionRE = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
+var reviewSubmitSuppressedFindingRE = regexp.MustCompile(`(?i)\b(?:follow_up|needs_human)\b`)
 
 func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
@@ -793,7 +800,17 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("actionable COMMENT reviews require at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
 		}
 	}
-	return nil
+	return validateReviewSubmitBodyHasNoSuppressedFindings(body)
+}
+
+// validateReviewSubmitBodyHasNoSuppressedFindings fail-closes when visible
+// review prose smuggles follow_up/needs_human findings. Spec 7.3 allows a
+// must_fix summary in the body; it does not allow suppressed dispositions.
+func validateReviewSubmitBodyHasNoSuppressedFindings(body string) error {
+	if reviewSubmitSuppressedFindingRE.FindString(cleanReviewHumanBody(body)) == "" {
+		return nil
+	}
+	return fmt.Errorf("review body must not include follow_up or needs_human findings; only must_fix may be published remotely")
 }
 
 // validateReviewSubmitCommentDispositions enforces the trusted finding contract on
@@ -822,6 +839,12 @@ func validateReviewSubmitCommentDispositions(comments []reviewSubmitComment) err
 			return fmt.Errorf("actionable review comment %d rejects disposition=%s; only must_fix may be submitted as remote feedback", i, disposition)
 		default:
 			return fmt.Errorf("actionable review comment %d has invalid disposition %q (want must_fix)", i, disposition)
+		}
+		switch scopeBasis {
+		case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
+			// ok
+		default:
+			return fmt.Errorf("actionable review comment %d has invalid scopeBasis %q", i, scopeBasis)
 		}
 	}
 	return nil

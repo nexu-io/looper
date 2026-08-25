@@ -2,15 +2,10 @@ package reviewer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"testing"
-	"time"
-
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
@@ -26,6 +21,11 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
 )
 
 func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
@@ -8605,6 +8605,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"NITs must not block merge",
 		"Finalization gate before submit",
 		"disposition=must_fix with scopeBasis/scopeEvidence",
+		"rejects `follow_up`/`needs_human` in actionable comments or the visible review body",
 		"review outcome matches the highest published severity",
 		"do not use PATH-based `looper`",
 		"repository-local `go run ./cmd/looper`",
@@ -8657,7 +8658,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`",
 		"validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`",
 		"Preserve exact anchors that fit the live diff",
-		"safely downgrade it to top-level review body feedback",
+		"Do not move must_fix findings into the top-level review body",
 		"follow-up quality-gating failure",
 		"Resolvable inline review comments are required",
 		"PR review `comments` array",
@@ -8665,7 +8666,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"create resolvable GitHub review threads",
 		"`path`, `line`, `side`",
 		"`start_line` and `start_side`",
-		"the detailed findings must live in inline `comments`",
+		"every must_fix finding must live in inline `comments`",
 		"Looper **does** parse this findings list",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -8691,10 +8692,30 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"prefer fewer deep comments",
 		"more than 15 blocking findings",
 		"more than 25 total comments",
+		"safely downgrade it to top-level review body feedback",
+		"Use top-level comments without path/line only",
+		"downgrade unanchorable feedback to a top-level review-body item",
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("prompt contains conflicting no-actionable clean-review instruction %q:\n%s", forbidden, prompt)
 		}
+	}
+}
+
+func TestBuildReviewPromptForgejoNativeKeepsMustFixInline(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper"}}
+	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	if !strings.Contains(prompt, "every must_fix must remain an inline comment") {
+		t.Fatalf("forgejo prompt missing inline-only must_fix contract:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "downgrade unanchorable feedback to a top-level review-body item") {
+		t.Fatalf("forgejo prompt still instructs body-only must_fix:\n%s", prompt)
 	}
 }
 
@@ -10133,7 +10154,7 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		Summary: "No actionable findings",
 		Outcome: "clean",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Later", Body: "Nice", Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "x"},
+			{Title: "Later", Body: "Nice", Disposition: "follow_up", Severity: "nit", ScopeBasis: "independent_improvement", ScopeEvidence: "x"},
 		},
 	}); err != nil {
 		t.Fatalf("clean with follow_up only: %v", err)
@@ -10143,7 +10164,7 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		Summary: "No actionable findings",
 		Outcome: "clean",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Bug", Body: "x", Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
 		},
 	}); err == nil || !strings.Contains(err.Error(), "must_fix") {
 		t.Fatalf("clean with must_fix error = %v", err)
@@ -10177,6 +10198,82 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "requires scopeEvidence") {
 		t.Fatalf("missing scopeEvidence error = %v", err)
 	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Missing severity",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "x", Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+		},
+	}); err == nil || !strings.Contains(err.Error(), "requires severity") {
+		t.Fatalf("missing severity error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Arbitrary severity",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "major", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+		},
+	}); err == nil || !strings.Contains(err.Error(), "invalid severity") {
+		t.Fatalf("arbitrary severity error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Unknown scopeBasis",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "vibes", ScopeEvidence: "y"},
+		},
+	}); err == nil || !strings.Contains(err.Error(), "invalid scopeBasis") {
+		t.Fatalf("unknown scopeBasis error = %v", err)
+	}
+}
+
+func TestValidateReviewerCommentOnlyCompletionOutcomeMatchesHighestMustFixSeverity(t *testing.T) {
+	t.Parallel()
+	mustFix := func(severity string) reviewerCommentOnlyFindingResult {
+		return reviewerCommentOnlyFindingResult{
+			Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: severity,
+			ScopeBasis: "introduced_regression", ScopeEvidence: "diff",
+		}
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Blocking issue", Outcome: "non_blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("blocking")},
+	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("blocking finding with non_blocking outcome error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Nit only", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("nit")},
+	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("nit finding with blocking outcome error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Non-blocking only", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("non_blocking")},
+	}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("non_blocking finding with blocking outcome error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Blocking issue", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("blocking"), mustFix("nit")},
+	}); err != nil {
+		t.Fatalf("mixed blocking+nit with blocking outcome: %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Nit only", Outcome: "non_blocking",
+		Findings: []reviewerCommentOnlyFindingResult{mustFix("nit")},
+	}); err != nil {
+		t.Fatalf("nit with non_blocking outcome: %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Need human", Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{{
+			Title: "Ambiguous", Body: "unclear", Disposition: "needs_human", Severity: "blocking",
+			ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals",
+		}},
+	}); err != nil {
+		t.Fatalf("needs_human-only: %v", err)
+	}
 }
 
 func TestBuildReviewerSummaryFromCompletionFiltersFollowUpAndNeedsHuman(t *testing.T) {
@@ -10198,6 +10295,70 @@ func TestBuildReviewerSummaryFromCompletionFiltersFollowUpAndNeedsHuman(t *testi
 	}
 	if len(summary.Items) != 1 || summary.Items[0].Title != "Must" {
 		t.Fatalf("items = %#v, want only must_fix remote item", summary.Items)
+	}
+}
+
+func TestBuildReviewerSummaryFromCompletionKeepsNeedsHumanReferencedOpenItems(t *testing.T) {
+	t.Parallel()
+
+	existing := forge.NewReviewerSummary(1, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Ambiguous scope", Body: "Is this in PR scope?", Files: []string{"a.go"}, LastSeenRoundID: 1},
+		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Stale leftover", Body: "Truly gone.", LastSeenRoundID: 1},
+		{ReviewItemID: "R-003", Status: forge.ReviewItemStatusOpen, Title: "Later rename", Body: "Follow-up only.", LastSeenRoundID: 1},
+	})
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Mixed publish and park",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Must", Body: "fix", Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "e1", Files: []string{"b.go"}},
+			{ReviewItemID: "R-001", Title: "Ambiguous scope", Body: "Still undecided.", Disposition: "needs_human", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
+			{ReviewItemID: "R-003", Title: "Later rename", Body: "Not this round.", Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "style"},
+		},
+	}
+	summary, err := buildReviewerSummaryFromCompletion(existing, completion)
+	if err != nil {
+		t.Fatalf("buildReviewerSummaryFromCompletion: %v", err)
+	}
+	byID := map[string]forge.ReviewItem{}
+	for _, item := range summary.Items {
+		byID[item.ReviewItemID] = item
+	}
+	if len(byID) != 4 {
+		t.Fatalf("items = %#v, want 4", summary.Items)
+	}
+	kept := byID["R-001"]
+	if kept.Status != forge.ReviewItemStatusOpen || kept.Title != "Ambiguous scope" || kept.Body != "Is this in PR scope?" {
+		t.Fatalf("R-001 = %#v, want original open needs_human-referenced item", kept)
+	}
+	if kept.LastSeenRoundID != 2 {
+		t.Fatalf("R-001 LastSeenRoundID = %d, want 2", kept.LastSeenRoundID)
+	}
+	if byID["R-002"].Status != forge.ReviewItemStatusResolved {
+		t.Fatalf("R-002 = %#v, want omitted leftover resolved", byID["R-002"])
+	}
+	if byID["R-003"].Status != forge.ReviewItemStatusResolved {
+		t.Fatalf("R-003 = %#v, want follow_up-referenced item resolved", byID["R-003"])
+	}
+	var publishedOpen []forge.ReviewItem
+	for _, item := range summary.Items {
+		if item.Status == forge.ReviewItemStatusOpen {
+			publishedOpen = append(publishedOpen, item)
+		}
+	}
+	if len(publishedOpen) != 2 {
+		t.Fatalf("open items = %#v, want R-001 plus new must_fix", publishedOpen)
+	}
+	foundMust := false
+	for _, item := range publishedOpen {
+		if item.Title == "Must" {
+			foundMust = true
+		}
+		if strings.Contains(item.Body, "Still undecided") {
+			t.Fatalf("needs_human content leaked into remote item: %#v", item)
+		}
+	}
+	if !foundMust {
+		t.Fatalf("open items missing must_fix: %#v", publishedOpen)
 	}
 }
 
@@ -10272,6 +10433,10 @@ func TestParseReviewerNativeCompletionFindingsAndLegacy(t *testing.T) {
 	if !commentOnlyCompletionHasNeedsHuman(ok) {
 		t.Fatalf("want needs_human: %#v", ok)
 	}
+	if _, err := parseReviewerNativeCompletion(AgentResult{Stdout: `__LOOPER_RESULT__={"summary":"Blocking issue remains","outcome":"non_blocking","findings":[{"title":"Bug","body":"fix it","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"a.go","line":1}]}`}); err == nil || !strings.Contains(err.Error(), "highest must_fix severity") {
+		t.Fatalf("native blocking finding with non_blocking outcome error = %v, want publication-contract rejection", err)
+	}
+
 }
 
 func TestCommentOnlyNeedsHumanQuestionNamesAuthority(t *testing.T) {
@@ -10294,6 +10459,227 @@ func TestCommentOnlyNeedsHumanQuestionNamesAuthority(t *testing.T) {
 	}
 }
 
+func TestNativeMustFixReviewMarkerActionableRequiresInlineComments(t *testing.T) {
+	t.Parallel()
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventComment, Outcome: "actionable"}, 1) {
+		t.Fatal("body-only COMMENT must not count as published must_fix")
+	}
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventRequestChanges, Outcome: "blocking"}, 1) {
+		t.Fatal("body-only REQUEST_CHANGES must not count as published must_fix")
+	}
+	if !nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventComment, Outcome: "actionable", InlineCommentBodies: []string{"fix it"}}, 1) {
+		t.Fatal("COMMENT with inline comments must count as published must_fix")
+	}
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventComment, Outcome: "blocking", InlineCommentBodies: []string{"fix first"}}, 2) {
+		t.Fatal("one inline comment must not cover two must_fix findings")
+	}
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventComment, Outcome: "blocking", InlineCommentBodies: []string{"fix first", ""}}, 2) {
+		t.Fatal("empty inline bodies must not count toward must_fix coverage")
+	}
+	if !nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventComment, Outcome: "blocking", InlineCommentBodies: []string{"fix first", "fix second"}}, 2) {
+		t.Fatal("two inline comments must cover two must_fix findings")
+	}
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{}, 1) {
+		t.Fatal("missing marker must not count as published must_fix")
+	}
+}
+
+func TestRunPublishStepNativeMustFixRequiresActionableMarker(t *testing.T) {
+	t.Parallel()
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Blocking must_fix only",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"a.go"}},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, tc := range []struct {
+		name         string
+		markerEvent  ReviewEvent
+		markerOut    string
+		inlineBodies []string
+		wantPublish  bool
+	}{
+		{name: "body_only_comment", markerEvent: ReviewEventComment, markerOut: "actionable"},
+		{name: "body_only_request_changes", markerEvent: ReviewEventRequestChanges, markerOut: "blocking"},
+		{name: "inline_comment", markerEvent: ReviewEventComment, markerOut: "blocking", inlineBodies: []string{"fix it"}, wantPublish: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			target := "pr:acme/looper:42"
+			metadata := `{"loop":{"iterationCount":0}}`
+			loop := storage.LoopRecord{
+				ID: "loop_native_must_fix_" + tc.name, Seq: 118, ProjectID: "project_1", Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("upsert loop: %v", err)
+			}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig: %v", err)
+			}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
+					reviewMarkerMissing:             false,
+					reviewMarkerEvent:               tc.markerEvent,
+					reviewMarkerOutcome:             tc.markerOut,
+					reviewMarkerInlineCommentBodies: tc.inlineBodies,
+				}, Git: &fakeGitGateway{},
+				Logger: fixture.logger, Now: fixture.now,
+				LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+			})
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+			}
+			_, err = runner.runPublishStep(context.Background(), stepInput{
+				Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_native_must_fix_" + tc.name},
+				Repo: repo, PRNumber: prNumber,
+				Checkpoint: reviewerCheckpoint{
+					Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+					Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+					PendingReview: &pendingReviewCheckpoint{
+						HeadSHA: "abc123", IdempotencyKey: "idem-native-must-fix-" + tc.name, Event: reviewEventAgentNative,
+						Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+					},
+				},
+			})
+			updated, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if getErr != nil || updated == nil {
+				t.Fatalf("after publish = (%#v, %v)", updated, getErr)
+			}
+			gotHead, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
+			if tc.wantPublish {
+				if err != nil {
+					t.Fatalf("runPublishStep() error = %v, want published native must_fix", err)
+				}
+				if loops.ReviewerPublishCount(updated.MetadataJSON) != 1 || gotHead != "abc123" {
+					t.Fatalf("published loop = %#v head=%q, want count=1 lastPublishedHeadSha=abc123", updated, gotHead)
+				}
+				return
+			}
+			var le *loopError
+			if !errors.As(err, &le) || le.kind != FailureRetryableAfterResume {
+				t.Fatalf("runPublishStep() error = %v, want retryable loopError", err)
+			}
+			if !strings.Contains(err.Error(), "actionable review marker") {
+				t.Fatalf("error = %q, want actionable-marker publication failure", err)
+			}
+			if loops.ReviewerPublishCount(updated.MetadataJSON) != 0 || gotHead != "" {
+				t.Fatalf("unpublished loop consumed budget/head: count=%d head=%q meta=%v", loops.ReviewerPublishCount(updated.MetadataJSON), gotHead, updated.MetadataJSON)
+			}
+		})
+	}
+}
+
+func TestRunPublishStepNativeMustFixRequiresInlineCommentPerFinding(t *testing.T) {
+	t.Parallel()
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Two blocking must_fix findings",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug one", Body: "fix first", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"a.go"}},
+			{Title: "Bug two", Body: "fix second", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"b.go"}},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, tc := range []struct {
+		name         string
+		inlineBodies []string
+		wantPublish  bool
+	}{
+		{name: "one_inline", inlineBodies: []string{"fix first"}},
+		{name: "two_inlines", inlineBodies: []string{"fix first", "fix second"}, wantPublish: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			target := "pr:acme/looper:42"
+			metadata := `{"loop":{"iterationCount":0}}`
+			loop := storage.LoopRecord{
+				ID: "loop_native_must_fix_multi_" + tc.name, Seq: 119, ProjectID: "project_1", Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("upsert loop: %v", err)
+			}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig: %v", err)
+			}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
+					reviewMarkerMissing:             false,
+					reviewMarkerEvent:               ReviewEventComment,
+					reviewMarkerOutcome:             "blocking",
+					reviewMarkerInlineCommentBodies: tc.inlineBodies,
+				}, Git: &fakeGitGateway{},
+				Logger: fixture.logger, Now: fixture.now,
+				LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+			})
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+			}
+			_, err = runner.runPublishStep(context.Background(), stepInput{
+				Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_native_must_fix_multi_" + tc.name},
+				Repo: repo, PRNumber: prNumber,
+				Checkpoint: reviewerCheckpoint{
+					Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+					Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+					PendingReview: &pendingReviewCheckpoint{
+						HeadSHA: "abc123", IdempotencyKey: "idem-native-must-fix-multi-" + tc.name, Event: reviewEventAgentNative,
+						Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+					},
+				},
+			})
+			updated, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if getErr != nil || updated == nil {
+				t.Fatalf("after publish = (%#v, %v)", updated, getErr)
+			}
+			gotHead, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
+			if tc.wantPublish {
+				if err != nil {
+					t.Fatalf("runPublishStep() error = %v, want published native must_fix", err)
+				}
+				if loops.ReviewerPublishCount(updated.MetadataJSON) != 1 || gotHead != "abc123" {
+					t.Fatalf("published loop = %#v head=%q, want count=1 lastPublishedHeadSha=abc123", updated, gotHead)
+				}
+				return
+			}
+			var le *loopError
+			if !errors.As(err, &le) || le.kind != FailureRetryableAfterResume {
+				t.Fatalf("runPublishStep() error = %v, want retryable loopError", err)
+			}
+			if !strings.Contains(err.Error(), "inline comments for every finding") {
+				t.Fatalf("error = %q, want per-finding inline publication failure", err)
+			}
+			if loops.ReviewerPublishCount(updated.MetadataJSON) != 0 || gotHead != "" {
+				t.Fatalf("partial marker consumed budget/head: count=%d head=%q meta=%v", loops.ReviewerPublishCount(updated.MetadataJSON), gotHead, updated.MetadataJSON)
+			}
+		})
+	}
+}
+
 func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -10301,14 +10687,16 @@ func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 		markerMissing bool
 		markerEvent   ReviewEvent
 		markerOutcome string
+		inlineBodies  []string
 		wantHold      bool
 		wantRetryable bool
 		wantPublish   int
 		wantLastHead  string
 	}{
-		{name: "with_marker", markerMissing: false, markerEvent: ReviewEventComment, markerOutcome: "blocking", wantHold: true, wantPublish: 1, wantLastHead: "abc123"},
+		{name: "with_marker", markerMissing: false, markerEvent: ReviewEventComment, markerOutcome: "blocking", inlineBodies: []string{"fix it"}, wantHold: true, wantPublish: 1, wantLastHead: "abc123"},
 		{name: "without_marker", markerMissing: true, wantRetryable: true, wantPublish: 0},
 		{name: "clean_marker", markerMissing: false, markerEvent: ReviewEventApprove, markerOutcome: "clean", wantRetryable: true, wantPublish: 0},
+		{name: "body_only_comment", markerMissing: false, markerEvent: ReviewEventComment, markerOutcome: "actionable", wantRetryable: true, wantPublish: 0},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -10337,9 +10725,10 @@ func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 				Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
 			}}}
 			github := &fakeGitHubGateway{
-				reviewMarkerMissing: tc.markerMissing,
-				reviewMarkerEvent:   tc.markerEvent,
-				reviewMarkerOutcome: tc.markerOutcome,
+				reviewMarkerMissing:             tc.markerMissing,
+				reviewMarkerEvent:               tc.markerEvent,
+				reviewMarkerOutcome:             tc.markerOutcome,
+				reviewMarkerInlineCommentBodies: tc.inlineBodies,
 			}
 			runner := New(Options{
 				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
@@ -10397,6 +10786,106 @@ func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 	}
 }
 
+func TestRunReviewStepMixedNativeMustFixRequiresInlineCommentPerFinding(t *testing.T) {
+	t.Parallel()
+	stdout := `__LOOPER_RESULT__={"summary":"Mixed must_fix and needs_human","outcome":"blocking","findings":[{"title":"Bug one","body":"fix first","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"a.go","line":1},{"title":"Bug two","body":"fix second","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"c.go","line":3},{"title":"Ambiguous","body":"unclear","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"PR non-goals","path":"b.go","line":2}]}`
+	for _, tc := range []struct {
+		name          string
+		inlineBodies  []string
+		wantHold      bool
+		wantRetryable bool
+		wantPublish   int
+		wantLastHead  string
+	}{
+		{name: "one_inline", inlineBodies: []string{"fix first"}, wantRetryable: true, wantPublish: 0},
+		{name: "two_inlines", inlineBodies: []string{"fix first", "fix second"}, wantHold: true, wantPublish: 1, wantLastHead: "abc123"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			target := "pr:acme/looper:42"
+			metadata := `{"loop":{"iterationCount":0}}`
+			loop := storage.LoopRecord{
+				ID: "loop_mixed_must_fix_multi_" + tc.name, Seq: 120, ProjectID: "project_1", Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("upsert loop: %v", err)
+			}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig: %v", err)
+			}
+			cfg.HITL.Enabled = false
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
+					reviewMarkerMissing:             false,
+					reviewMarkerEvent:               ReviewEventComment,
+					reviewMarkerOutcome:             "blocking",
+					reviewMarkerInlineCommentBodies: tc.inlineBodies,
+				}, Git: &fakeGitGateway{},
+				AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{
+					Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
+				}}},
+				Logger: fixture.logger, Now: fixture.now,
+				LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+			})
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+			}
+			_, err = runner.runReviewStep(context.Background(), stepInput{
+				Project:  *project,
+				Loop:     loop,
+				Run:      storage.RunRecord{ID: "run_mixed_must_fix_multi_" + tc.name},
+				Repo:     repo,
+				PRNumber: prNumber,
+				Checkpoint: reviewerCheckpoint{
+					Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+					Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+					Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: nowISO},
+				},
+			})
+			updated, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if getErr != nil || updated == nil {
+				t.Fatalf("after step = (%#v, %v)", updated, getErr)
+			}
+			if got := loops.ReviewerPublishCount(updated.MetadataJSON); got != tc.wantPublish {
+				t.Fatalf("ReviewerPublishCount = %d, want %d", got, tc.wantPublish)
+			}
+			gotHead, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
+			if gotHead != tc.wantLastHead {
+				t.Fatalf("lastPublishedHeadSha = %q, want %q", gotHead, tc.wantLastHead)
+			}
+			if tc.wantRetryable {
+				var le *loopError
+				if !errors.As(err, &le) || le.kind != FailureRetryableAfterResume {
+					t.Fatalf("runReviewStep() error = %v, want retryable loopError", err)
+				}
+				if !strings.Contains(err.Error(), "actionable review marker") {
+					t.Fatalf("error = %q, want actionable-marker publication failure", err)
+				}
+				if loops.IsReviewScopeHumanHold(*updated) || loops.HasPendingReviewScopeHuman(*updated) {
+					t.Fatalf("must not park mixed must_fix with a partial marker: meta=%s", derefString(updated.MetadataJSON))
+				}
+				return
+			}
+			var hold *holdSkipError
+			if !errors.As(err, &hold) {
+				t.Fatalf("runReviewStep() error = %v, want holdSkipError", err)
+			}
+			if !tc.wantHold || !loops.IsReviewScopeHumanHold(*updated) {
+				t.Fatalf("after park = (%#v, %v), want scope hold", updated, err)
+			}
+		})
+	}
+}
+
 func TestRunReviewStepMixedNativePersistsCompletionBeforePublishedHead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -10428,6 +10917,7 @@ func TestRunReviewStepMixedNativePersistsCompletionBeforePublishedHead(t *testin
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
 			reviewMarkerMissing: false, reviewMarkerEvent: ReviewEventComment, reviewMarkerOutcome: "blocking",
+			reviewMarkerInlineCommentBodies: []string{"fix it"},
 		}, Git: &fakeGitGateway{},
 		AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{
 			Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
@@ -10498,6 +10988,7 @@ func TestRunReviewStepNeedsHumanDoesNotRecountAlreadyPublishedHead(t *testing.T)
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
 			reviewMarkerMissing: false, reviewMarkerEvent: ReviewEventComment, reviewMarkerOutcome: "blocking",
+			reviewMarkerInlineCommentBodies: []string{"fix it"},
 		}, Git: &fakeGitGateway{},
 		AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{
 			Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
@@ -10562,9 +11053,10 @@ func TestRunReviewStepNeedsHumanAtCapBudgetHoldOnlyNoStackedScope(t *testing.T) 
 		Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
 	}}}
 	github := &fakeGitHubGateway{
-		reviewMarkerMissing: false,
-		reviewMarkerEvent:   ReviewEventComment,
-		reviewMarkerOutcome: "blocking",
+		reviewMarkerMissing:             false,
+		reviewMarkerEvent:               ReviewEventComment,
+		reviewMarkerOutcome:             "blocking",
+		reviewMarkerInlineCommentBodies: []string{"fix it"},
 	}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
@@ -10646,9 +11138,10 @@ func TestRunReviewStepNeedsHumanUnderCapScopeHoldOnly(t *testing.T) {
 		Status: "completed", Summary: "Mixed", Stdout: stdout, ParseStatus: "parsed",
 	}}}
 	github := &fakeGitHubGateway{
-		reviewMarkerMissing: false,
-		reviewMarkerEvent:   ReviewEventComment,
-		reviewMarkerOutcome: "blocking",
+		reviewMarkerMissing:             false,
+		reviewMarkerEvent:               ReviewEventComment,
+		reviewMarkerOutcome:             "blocking",
+		reviewMarkerInlineCommentBodies: []string{"fix it"},
 	}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
@@ -11328,6 +11821,230 @@ func TestPublishCommentOnlyMixedMustFixNeedsHumanPublishesThenParksScope(t *test
 	}
 }
 
+// failOnceBudgetHeldLoopGet fails the first loops-by-id read after a budget
+// hold is durable, then succeeds. Models a transient storage error between
+// recordPublishedReviewProgress and parkOrDeferReviewerScopeHuman.
+type failOnceBudgetHeldLoopGet struct {
+	db         *sql.DB
+	failedOnce bool
+}
+
+func (q *failOnceBudgetHeldLoopGet) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *failOnceBudgetHeldLoopGet) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *failOnceBudgetHeldLoopGet) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if !q.failedOnce && strings.Contains(query, "SELECT * FROM loops WHERE id") && len(args) == 1 {
+		id, _ := args[0].(string)
+		var status string
+		var meta *string
+		if err := q.db.QueryRowContext(ctx, `SELECT status, metadata_json FROM loops WHERE id = ?`, id).Scan(&status, &meta); err == nil {
+			if loops.IsReviewFixBudgetHold(storage.LoopRecord{Status: status, MetadataJSON: meta}) {
+				q.failedOnce = true
+				return q.db.QueryRowContext(ctx, `SELECT * FROM loops_refresh_probe_missing WHERE id = ?`, id)
+			}
+		}
+	}
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+func TestPublishCommentOnlyMixedMustFixNeedsHumanRefreshErrorDoesNotStackHolds(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":0}}`
+	loop := storage.LoopRecord{
+		ID: "loop_mixed_refresh_fail", Seq: 99, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = true
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 1
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Mixed must_fix and needs_human",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"a.go"}},
+			{Title: "Ambiguous", Body: "unclear", Disposition: "needs_human", Severity: "blocking", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	querier := &failOnceBudgetHeldLoopGet{db: fixture.coordinator.DB()}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: storage.NewRepositories(querier), GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project: (%#v, %v)", project, err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA: "abc123", IdempotencyKey: "idem-mixed-refresh-fail", Event: reviewEventAgentNative,
+		Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+	}
+	_, err = runner.runPublishStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_mixed_refresh_fail"},
+		Repo: repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:        &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+			Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: &pending,
+		},
+	})
+	if err == nil {
+		t.Fatal("runPublishStep() error = nil, want refresh failure")
+	}
+	var hold *holdSkipError
+	if errors.As(err, &hold) {
+		t.Fatalf("runPublishStep() = holdSkipError %q, want fail-closed refresh error", hold.summary)
+	}
+	if !strings.Contains(err.Error(), "refresh loop before review scope park") {
+		t.Fatalf("runPublishStep() error = %v, want refresh loop before review scope park", err)
+	}
+	updated, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || updated == nil {
+		t.Fatalf("get loop: (%#v, %v)", updated, getErr)
+	}
+	if !loops.IsReviewFixBudgetHold(*updated) {
+		t.Fatalf("want durable budget hold after publish: status=%s meta=%s", updated.Status, derefString(updated.MetadataJSON))
+	}
+	if loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("refresh failure must not stack a scope hold: %#v", updated)
+	}
+	if loops.HasPendingReviewScopeHuman(*updated) {
+		t.Fatalf("refresh failure must not guess pending scope: meta=%s", derefString(updated.MetadataJSON))
+	}
+	if got := loops.ReviewerPublishCount(updated.MetadataJSON); got != 1 {
+		t.Fatalf("ReviewerPublishCount = %d, want 1", got)
+	}
+}
+
+func TestPublishCommentOnlyMixedMustFixNeedsHumanKeepsReferencedOpenItems(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":0}}`
+	loop := storage.LoopRecord{
+		ID: "loop_mixed_keep_open", Seq: 98, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	existing := forge.NewReviewerSummary(1, []forge.ReviewItem{
+		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Ambiguous scope", Body: "Is this in PR scope?", Files: []string{"a.go"}, LastSeenRoundID: 1},
+		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Stale leftover", Body: "Truly gone.", LastSeenRoundID: 1},
+	})
+	existingBody, err := renderReviewerSummaryComment(existing, "Previous summary")
+	if err != nil {
+		t.Fatalf("renderReviewerSummaryComment: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = true
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Mixed must_fix and needs_human",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"b.go"}},
+			{ReviewItemID: "R-001", Title: "Ambiguous scope", Body: "unclear", Disposition: "needs_human", Severity: "blocking", ScopeBasis: "ambiguous_intent", ScopeEvidence: "PR non-goals"},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	github := &fakeGitHubGateway{issueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project: (%#v, %v)", project, err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA: "abc123", IdempotencyKey: "idem-mixed-keep-open", Event: reviewEventAgentNative,
+		Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+	}
+	_, err = runner.runPublishStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_mixed_keep_open"},
+		Repo: repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:        &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+			Snapshot:      &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview: &pending,
+		},
+	})
+	var hold *holdSkipError
+	if !errors.As(err, &hold) {
+		t.Fatalf("runPublishStep() error = %v, want holdSkipError", err)
+	}
+	if len(github.updateIssueCommentCalls) != 1 {
+		t.Fatalf("updateIssueCommentCalls = %d, want 1", len(github.updateIssueCommentCalls))
+	}
+	parsed, err := forge.ParseReviewerSummary(github.updateIssueCommentCalls[0].Body)
+	if err != nil {
+		t.Fatalf("ParseReviewerSummary: %v", err)
+	}
+	byID := map[string]forge.ReviewItem{}
+	openIDs := map[string]struct{}{}
+	for _, item := range parsed.Items {
+		byID[item.ReviewItemID] = item
+		if item.Status == forge.ReviewItemStatusOpen {
+			openIDs[item.ReviewItemID] = struct{}{}
+		}
+	}
+	if byID["R-001"].Status != forge.ReviewItemStatusOpen {
+		t.Fatalf("R-001 = %#v, want still open for Forgejo Fixer after mixed publish/park", byID["R-001"])
+	}
+	if byID["R-002"].Status != forge.ReviewItemStatusResolved {
+		t.Fatalf("R-002 = %#v, want omitted leftover resolved", byID["R-002"])
+	}
+	if _, ok := openIDs["R-001"]; !ok || len(openIDs) != 2 {
+		t.Fatalf("open IDs = %#v, want R-001 plus published must_fix", openIDs)
+	}
+	if strings.Contains(github.updateIssueCommentCalls[0].Body, "unclear") {
+		t.Fatalf("published body smuggles needs_human: %s", github.updateIssueCommentCalls[0].Body)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("get loop: (%#v, %v)", updated, err)
+	}
+	if !loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("scope hold = false, want parked after mixed publish")
+	}
+}
+
 func TestParkReviewerScopeHumanHITLOffNoAsk(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -11498,6 +12215,89 @@ func TestProcessClaimedItemPreservesParkedScopeHoldStatus(t *testing.T) {
 				t.Fatalf("want scope hold preserved: %#v meta=%v", updated, updated.MetadataJSON)
 			}
 		})
+	}
+}
+
+func TestProcessClaimedItemFailedRunNeedsHumanParksBeforeMarkerRecovery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopID := "loop_failed_run_needs_human"
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: loopID, Seq: 212, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber,
+		Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.HITL.Enabled = false
+	stdout := `__LOOPER_RESULT__={"summary":"Mixed must_fix and needs_human","outcome":"blocking","findings":[{"title":"Bug","body":"fix it","disposition":"must_fix","severity":"blocking","scopeBasis":"introduced_regression","scopeEvidence":"diff","path":"a.go","line":1},{"title":"Ambiguous","body":"unclear","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"PR non-goals","path":"b.go","line":2}]}`
+	github := &fakeGitHubGateway{
+		reviewRequests:                  []string{"octocat"},
+		reviewMarkerMissing:             false,
+		reviewMarkerEvent:               ReviewEventComment,
+		reviewMarkerOutcome:             "blocking",
+		reviewMarkerInlineCommentBodies: []string{"fix it"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "failed", Summary: "posted review, later command failed", Stdout: stdout,
+	}}}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg,
+		LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+	})
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped after failed-run needs_human park", result)
+	}
+	if !strings.Contains(result.Summary, "review scope requires human judgment") {
+		t.Fatalf("result.Summary = %q, want scope hold skip", result.Summary)
+	}
+	updated, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", updated, err)
+	}
+	if updated.Status != "paused" {
+		t.Fatalf("status = %q, want paused scope hold (not published-and-queued)", updated.Status)
+	}
+	if !loops.IsReviewScopeHumanHold(*updated) {
+		t.Fatalf("want scope hold after failed-run needs_human: %#v meta=%v", updated, updated.MetadataJSON)
+	}
+	gotHead, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
+	if gotHead == "" {
+		t.Fatalf("lastPublishedHeadSha missing; mixed must_fix should count before park: %s", derefString(updated.MetadataJSON))
+	}
+	if result.RunID == "" {
+		t.Fatal("result.RunID empty, want persisted run checkpoint")
+	}
+	persisted, err := fixture.repos.Runs.GetByID(ctx, result.RunID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID = (%#v, %v)", persisted, err)
+	}
+	checkpoint := parseCheckpoint(persisted.CheckpointJSON)
+	if checkpoint.PendingReview == nil || !strings.Contains(checkpoint.PendingReview.ReviewerSummaryJSON, `"disposition":"needs_human"`) {
+		t.Fatalf("checkpoint pending = %#v, want persisted native completion with needs_human before marker recovery", checkpoint.PendingReview)
 	}
 }
 
