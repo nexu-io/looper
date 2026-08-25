@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -1093,13 +1094,13 @@ func TestDrainScopeHoldOnStopDrainsPairBeforeScopeStop(t *testing.T) {
 		drained = append(drained, loop.ID)
 		return drainReviewFixPairExecutions(ctx, repos, loop, reg)
 	}
-	if err := drainScopeHoldOnStop(context.Background(), repos, parked.ID, "Continue", drain); err != nil {
+	if _, err := drainScopeHoldOnStop(context.Background(), repos, parked.ID, "Continue", drain); err != nil {
 		t.Fatalf("Continue drain: %v", err)
 	}
 	if len(drained) != 0 {
 		t.Fatalf("Continue drained = %v, want none", drained)
 	}
-	if err := drainScopeHoldOnStop(context.Background(), repos, parked.ID, "Stop", drain); err != nil {
+	if _, err := drainScopeHoldOnStop(context.Background(), repos, parked.ID, "Stop", drain); err != nil {
 		t.Fatalf("Stop drain: %v", err)
 	}
 	if len(drained) != 1 || drained[0] != parked.ID {
@@ -1641,6 +1642,99 @@ func TestGitHubHITLPollDeliversAndStopsReviewFixBudget(t *testing.T) {
 	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil || sibling.Status != "terminated" {
 		t.Fatalf("fixer after stop = (%#v, %v), want terminated", sibling, err)
+	}
+}
+
+func TestScopeStopReopensGatesWhenContinueWinsAfterDrain(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_scope_stop_continue_race"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewer := storage.LoopRecord{
+		ID: "loop_scope_race_reviewer", Seq: 31, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_scope_race_fixer", Seq: 32, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	parked, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md rule X before unpause",
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	reg := NewActiveExecutionRegistry()
+	drain := func(ctx context.Context, loop storage.LoopRecord) error {
+		return drainReviewFixPairExecutions(ctx, repos, loop, reg)
+	}
+	afterDrainScopeStopHook = func() {
+		fresh, getErr := repos.Loops.GetByID(context.Background(), parked.ID)
+		if getErr != nil || fresh == nil {
+			t.Errorf("hook GetByID: (%v, %v)", fresh, getErr)
+			return
+		}
+		if _, applyErr := loops.ApplyReviewScopeHumanAnswer(context.Background(), repos, *fresh, "Continue", nowISO); applyErr != nil {
+			t.Errorf("racing Continue: %v", applyErr)
+			return
+		}
+		if !reg.LoopStopActive(reviewer.ID) || !reg.LoopStopActive(fixer.ID) {
+			t.Error("pair stop gates not closed after drain and racing Continue")
+		}
+	}
+	t.Cleanup(func() { afterDrainScopeStopHook = nil })
+
+	if err := deliverHITLAnswerAfterScopeDrain(context.Background(), repos, coordinator.DB(), nowISO, parked.ID, "Stop", reviewFixBudgetLiveCaps(nil, ""), drain, reg); err != nil {
+		t.Fatalf("unapplied Stop deliver: %v", err)
+	}
+	if reg.LoopStopActive(reviewer.ID) || reg.LoopStopActive(fixer.ID) {
+		t.Fatal("pair stop gates still closed after unapplied Stop")
+	}
+	if _, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: reviewer.ID, RunID: "run_scope_continue", ExecutionID: "exec_scope_continue_rev",
+	}); err != nil {
+		t.Fatalf("AdmitSpawn reviewer after unapplied Stop: %v", err)
+	}
+	if _, err := reg.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: fixer.ID, RunID: "run_scope_continue", ExecutionID: "exec_scope_continue_fix",
+	}); err != nil {
+		t.Fatalf("AdmitSpawn fixer after unapplied Stop: %v", err)
+	}
+	freshReviewer, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || freshReviewer == nil || freshReviewer.Status != "queued" || loops.IsReviewScopeHumanHold(*freshReviewer) {
+		t.Fatalf("reviewer after Continue-wins Stop = (%#v, %v), want queued without hold", freshReviewer, err)
+	}
+	freshFixer, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || freshFixer == nil || freshFixer.Status == "terminated" || loops.IsReviewScopeHumanHold(*freshFixer) {
+		t.Fatalf("fixer after Continue-wins Stop = (%#v, %v), want released pair member", freshFixer, err)
 	}
 }
 

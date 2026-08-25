@@ -328,18 +328,42 @@ func githubHITLResidualOrdinaryAsk(ask loops.HITLAsk) bool {
 	return strings.EqualFold(strings.TrimSpace(ask.Status), "awaiting")
 }
 
-func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) error {
+// afterDrainScopeStopHook is test-only: runs after a scope Stop drain and before
+// the caller applies the answer, so tests can commit a racing Continue.
+var afterDrainScopeStopHook func()
+
+func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) (bool, error) {
 	if drain == nil || repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
-		return nil
+		return false, nil
 	}
 	loop, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if loop == nil || !loops.IsReviewScopeHumanHold(*loop) {
-		return nil
+		return false, nil
 	}
-	return drain(ctx, *loop)
+	if err := drain(ctx, *loop); err != nil {
+		return false, err
+	}
+	if afterDrainScopeStopHook != nil {
+		afterDrainScopeStopHook()
+	}
+	return true, nil
+}
+
+// deliverHITLAnswerAfterScopeDrain drains a live scope pair before applying Stop,
+// then reopens sticky spawn gates if that Stop did not remain applied.
+func deliverHITLAnswerAfterScopeDrain(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, answer string, caps loops.ReviewFixBudgetLiveCaps, drain func(context.Context, storage.LoopRecord) error, executions *ActiveExecutionRegistry) error {
+	drained, err := drainScopeHoldOnStop(ctx, repos, loopID, answer, drain)
+	if err != nil {
+		return err
+	}
+	deliverErr := deliverHITLAnswerToLoopWithCaps(ctx, repos, db, nowISO, loopID, answer, caps, executions)
+	if drained {
+		ReopenUnappliedScopeStopGates(ctx, repos, executions, loopID)
+	}
+	return deliverErr
 }
 
 func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, executions *ActiveExecutionRegistry) error {
@@ -609,10 +633,10 @@ func githubHITLPRHasRemainingAwaiting(ctx context.Context, repos *storage.Reposi
 // is the exception: only Continue/Stop may unpark, and they apply the budget
 // decision instead of enqueueing conversational text.
 func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
-	return enqueueHumanMessageToLoopWithCaps(ctx, repos, nil, nowISO, loopID, text, reviewFixBudgetLiveCaps(nil, ""))
+	return enqueueHumanMessageToLoopWithCaps(ctx, repos, nil, nowISO, loopID, text, reviewFixBudgetLiveCaps(nil, ""), nil)
 }
 
-func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, text string, caps loops.ReviewFixBudgetLiveCaps) error {
+func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, text string, caps loops.ReviewFixBudgetLiveCaps, executions *ActiveExecutionRegistry) error {
 	// Share process-wide requeue exclusion with API discard+retry so free-text
 	// inbox delivery cannot requeue paused/waiting/manual_intervention loops
 	// between discard preflight and git reset (see LockLoopRequeue).
@@ -644,7 +668,7 @@ func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repos
 	}
 	if loops.IsReviewScopeHumanHold(*loop) {
 		if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
-			return applyReviewScopeHumanAnswerTX(ctx, db, repos, *loop, text, nowISO)
+			return applyReviewScopeHumanAnswerAndReopen(ctx, db, repos, executions, *loop, text, nowISO)
 		}
 		return nil
 	}
@@ -705,9 +729,10 @@ func applyReviewFixBudgetAnswerTX(ctx context.Context, db *sql.DB, repos *storag
 	return err
 }
 
-func applyReviewScopeHumanAnswerTX(ctx context.Context, db *sql.DB, repos *storage.Repositories, loop storage.LoopRecord, answer, nowISO string) error {
+func applyReviewScopeHumanAnswerTX(ctx context.Context, db *sql.DB, repos *storage.Repositories, loop storage.LoopRecord, answer, nowISO string) (loops.ReviewScopeHumanAnswerResult, error) {
 	if db != nil {
-		return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+		var result loops.ReviewScopeHumanAnswerResult
+		err := storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
 			txRepos := storage.NewRepositories(tx)
 			fresh, err := txRepos.Loops.GetByID(ctx, loop.ID)
 			if err != nil {
@@ -716,19 +741,62 @@ func applyReviewScopeHumanAnswerTX(ctx context.Context, db *sql.DB, repos *stora
 			if fresh == nil {
 				return nil
 			}
-			_, err = loops.ApplyReviewScopeHumanAnswer(ctx, txRepos, *fresh, answer, nowISO)
+			result, err = loops.ApplyReviewScopeHumanAnswer(ctx, txRepos, *fresh, answer, nowISO)
 			return err
 		})
+		return result, err
 	}
-	_, err := loops.ApplyReviewScopeHumanAnswer(ctx, repos, loop, answer, nowISO)
-	return err
+	return loops.ApplyReviewScopeHumanAnswer(ctx, repos, loop, answer, nowISO)
+}
+
+func applyReviewScopeHumanAnswerAndReopen(ctx context.Context, db *sql.DB, repos *storage.Repositories, executions *ActiveExecutionRegistry, loop storage.LoopRecord, answer, nowISO string) error {
+	result, err := applyReviewScopeHumanAnswerTX(ctx, db, repos, loop, answer, nowISO)
+	if err != nil {
+		return err
+	}
+	if loops.IsReviewFixBudgetStop(answer) && !result.Applied {
+		ReopenUnappliedScopeStopGates(ctx, repos, executions, loop.ID)
+	}
+	return nil
+}
+
+// ReopenUnappliedScopeStopGates clears sticky pair spawn gates left by a Stop
+// drain when ApplyReviewScopeHumanAnswer did not apply (Continue already
+// released the hold). Terminal members stay gated.
+func ReopenUnappliedScopeStopGates(ctx context.Context, repos *storage.Repositories, executions *ActiveExecutionRegistry, loopID string) {
+	if executions == nil || repos == nil || repos.Loops == nil || strings.TrimSpace(loopID) == "" {
+		return
+	}
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return
+	}
+	if loops.IsReviewScopeHumanHold(*loop) {
+		return
+	}
+	members := []storage.LoopRecord{*loop}
+	if all, listErr := repos.Loops.List(ctx); listErr == nil {
+		members = append(loops.FindSiblingReviewFixLoops(all, *loop), *loop)
+	}
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		switch strings.TrimSpace(member.Status) {
+		case "terminated", "stopped", "completed":
+			continue
+		}
+		executions.ClearLoopStop(member.ID)
+	}
 }
 
 func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
-	return deliverHITLAnswerToLoopWithCaps(ctx, repos, nil, nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
+	return deliverHITLAnswerToLoopWithCaps(ctx, repos, nil, nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""), nil)
 }
 
-func deliverHITLAnswerToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, answer string, caps loops.ReviewFixBudgetLiveCaps) error {
+func deliverHITLAnswerToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, answer string, caps loops.ReviewFixBudgetLiveCaps, executions *ActiveExecutionRegistry) error {
 	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
 	unlock := LockLoopRequeue(loopID)
 	defer unlock()
@@ -747,7 +815,7 @@ func deliverHITLAnswerToLoopWithCaps(ctx context.Context, repos *storage.Reposit
 		return applyReviewFixBudgetAnswerTX(ctx, db, repos, *loop, answer, nowISO, caps)
 	}
 	if loops.IsReviewScopeHumanHold(*loop) {
-		return applyReviewScopeHumanAnswerTX(ctx, db, repos, *loop, answer, nowISO)
+		return applyReviewScopeHumanAnswerAndReopen(ctx, db, repos, executions, *loop, answer, nowISO)
 	}
 	if loop.Status != "awaiting_human" {
 		return nil
@@ -883,10 +951,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return out, nil
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			if err := drainScopeHoldOnStop(ctx, input.Repos, loopID, answer, input.DrainHITLPair); err != nil {
-				return err
-			}
-			return deliverHITLAnswerToLoopWithCaps(ctx, input.Repos, input.DB, nowISO, loopID, answer, reviewFixBudgetLiveCaps(input.Config, project.ID))
+			return deliverHITLAnswerAfterScopeDrain(ctx, input.Repos, input.DB, nowISO, loopID, answer, reviewFixBudgetLiveCaps(input.Config, project.ID), input.DrainHITLPair, input.ActiveExecutions)
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
 			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})

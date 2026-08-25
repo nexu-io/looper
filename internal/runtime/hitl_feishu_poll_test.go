@@ -197,7 +197,7 @@ func TestFeishuHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 			return ""
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
+			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""), nil)
 		},
 	})
 	if n != 1 || maxID != 20 {
@@ -291,10 +291,10 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
 			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
 				resolved = append(resolved, answeredLoopID+"="+answer)
-			}, nil)
+			}, nil, nil)
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
+			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""), nil)
 		},
 	}
 
@@ -398,7 +398,7 @@ func TestFeishuContinueUsesLiveProjectCaps(t *testing.T) {
 	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 2
 	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 5
 
-	if err := deliverHITLAnswerToLoopWithCaps(context.Background(), repos, coordinator.DB(), nowISO, reviewer.ID, "Continue", reviewFixBudgetLiveCaps(&cfg, projectID)); err != nil {
+	if err := deliverHITLAnswerToLoopWithCaps(context.Background(), repos, coordinator.DB(), nowISO, reviewer.ID, "Continue", reviewFixBudgetLiveCaps(&cfg, projectID), nil); err != nil {
 		t.Fatalf("Continue: %v", err)
 	}
 	fresh, _ := repos.Loops.GetByID(context.Background(), reviewer.ID)
@@ -526,7 +526,7 @@ func TestFeishuHITLPollTypedScopeStopDrainsLiveSibling(t *testing.T) {
 			return ""
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, nil, drain)
+			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, nil, drain, nil)
 		},
 	}
 	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
@@ -613,14 +613,14 @@ func TestFeishuHITLPollScopeStopRetriesAfterFailedDurableMutation(t *testing.T) 
 			return ""
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			if err := drainScopeHoldOnStop(ctx, repos, loopID, answer, drain); err != nil {
+			if _, err := drainScopeHoldOnStop(ctx, repos, loopID, answer, drain); err != nil {
 				return err
 			}
 			attempts++
 			if attempts == 1 {
 				return errors.New("apply review scope stop failed")
 			}
-			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
+			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""), nil)
 		},
 	}
 	events := []feishuInboxEvent{mustCardAction(50, "93", "Stop")}
@@ -724,7 +724,7 @@ func TestFeishuHITLPollTypedScopeContinueResolvesOverlayCard(t *testing.T) {
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
 			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
 				resolved = append(resolved, answeredLoopID+"="+answer)
-			}, nil)
+			}, nil, nil)
 		},
 	}
 	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
@@ -836,7 +836,7 @@ func TestFeishuHITLPollTypedScopeDecisionResolvesPrimaryPreservesSiblingAgentCar
 				enqueueMessage: func(ctx contextType, loopID, text string) error {
 					return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
 						resolved = append(resolved, answeredLoopID+"="+answer)
-					}, nil)
+					}, nil, nil)
 				},
 			}
 			n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
@@ -942,7 +942,7 @@ func TestFeishuHITLPollOverlayResidualCardPreservedThroughScopeContinue(t *testi
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
 			return deliverFeishuHITLCardAction(ctx, repos, coordinator.DB(), nil, nowISO, loopID, answer, nil, func(_ contextType, answeredLoopID, got string) {
 				resolved = append(resolved, answeredLoopID+"="+got)
-			})
+			}, nil)
 		},
 	}
 	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{
@@ -987,6 +987,107 @@ func TestFeishuHITLPollOverlayResidualCardPreservedThroughScopeContinue(t *testi
 	answered, ok := loops.ReadHITLAsk(sibling.MetadataJSON)
 	if !ok || answered.Question != agentAsk.Question || answered.Answer != "A" || answered.Status != "answered" {
 		t.Fatalf("fixer ask after Continue = (%#v, %v), want stored A applied without a second click", answered, ok)
+	}
+}
+
+func TestFeishuResidualCardDoesNotClobberPairTransition(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer string
+	}{
+		{name: "continue", answer: "Continue"},
+		{name: "stop", answer: "Stop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+			nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+			coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+				Now: func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+			}
+			t.Cleanup(func() { _ = coordinator.Close() })
+			if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+				t.Fatalf("RunPending() error = %v", err)
+			}
+			repos := storage.NewRepositories(coordinator.DB())
+			projectID := "project_residual_race_" + tc.name
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+				ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			repo := "acme/looper"
+			pr := int64(42)
+			target := "pr:acme/looper:42"
+			reviewer := storage.LoopRecord{
+				ID: "loop_residual_race_rev_" + tc.name, Seq: 201, ProjectID: projectID, Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			agentAsk := loops.HITLAsk{
+				Kind: "agent_question", Question: "Which approach should Fixer take?",
+				Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO,
+				Transport: "feishu",
+			}
+			fixerMeta, err := loops.WriteHITLAsk(nil, agentAsk)
+			if err != nil {
+				t.Fatalf("WriteHITLAsk(fixer): %v", err)
+			}
+			fixer := storage.LoopRecord{
+				ID: "loop_residual_race_fix_" + tc.name, Seq: 202, ProjectID: projectID, Type: "fixer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &fixerMeta,
+			}
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+			}
+			if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+			}
+			if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+				Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+				Question: "Clarify AGENTS.md rule X before unpause",
+			}); err != nil {
+				t.Fatalf("ParkReviewScopeHuman: %v", err)
+			}
+			afterFeishuResidualCardLoadHook = func() {
+				fresh, getErr := repos.Loops.GetByID(context.Background(), reviewer.ID)
+				if getErr != nil || fresh == nil {
+					t.Errorf("hook GetByID: (%v, %v)", fresh, getErr)
+					return
+				}
+				if _, applyErr := loops.ApplyReviewScopeHumanAnswer(context.Background(), repos, *fresh, tc.answer, nowISO); applyErr != nil {
+					t.Errorf("racing %s: %v", tc.answer, applyErr)
+				}
+			}
+			t.Cleanup(func() { afterFeishuResidualCardLoadHook = nil })
+			if err := preserveFeishuOverlayResidualCardAnswer(context.Background(), repos, coordinator.DB(), fixer.ID, "A", nowISO); err != nil {
+				t.Fatalf("preserve residual A: %v", err)
+			}
+			freshReviewer, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+			if err != nil || freshReviewer == nil || loops.IsReviewScopeHumanHold(*freshReviewer) {
+				t.Fatalf("reviewer after residual vs %s = (%#v, %v), want hold released", tc.answer, freshReviewer, err)
+			}
+			freshFixer, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || freshFixer == nil || loops.IsReviewScopeHumanHold(*freshFixer) {
+				t.Fatalf("fixer after residual vs %s = (%#v, %v), want hold not restored", tc.answer, freshFixer, err)
+			}
+			if tc.answer == "Stop" {
+				if freshReviewer.Status != "terminated" || freshFixer.Status != "terminated" {
+					t.Fatalf("pair after residual vs Stop = reviewer=%s fixer=%s, want terminated", freshReviewer.Status, freshFixer.Status)
+				}
+				return
+			}
+			if freshReviewer.Status != "queued" {
+				t.Fatalf("reviewer after residual vs Continue = %s, want queued", freshReviewer.Status)
+			}
+			if freshFixer.Status == "terminated" {
+				t.Fatalf("fixer after residual vs Continue = %s, want released sibling", freshFixer.Status)
+			}
+		})
 	}
 }
 
@@ -1043,7 +1144,7 @@ func TestEnqueueFeishuHITLMessageFailsClosedWhenLookupErrors(t *testing.T) {
 	resolved := 0
 	if err := enqueueFeishuHITLMessage(context.Background(), repos, nil, nil, nowISO, reviewer.ID, "Continue", func(context.Context, string, string) {
 		resolved++
-	}, nil); err == nil {
+	}, nil, nil); err == nil {
 		t.Fatal("enqueueFeishuHITLMessage error = nil, want lookup failure")
 	}
 	if resolved != 0 {

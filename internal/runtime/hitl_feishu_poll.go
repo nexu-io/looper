@@ -189,8 +189,9 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 // matching card-action deliverAnswer.
 // Overlay siblings keep an ordinary agent card: Continue/Stop typed in that
 // thread must resolve the pair's scope-primary card, not the sibling card.
-func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, text string, onAnswered func(context.Context, string, string), drain func(context.Context, storage.LoopRecord) error) error {
-	if err := drainScopeHoldOnStop(ctx, repos, loopID, text, drain); err != nil {
+func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, text string, onAnswered func(context.Context, string, string), drain func(context.Context, storage.LoopRecord) error, executions *ActiveExecutionRegistry) error {
+	drained, err := drainScopeHoldOnStop(ctx, repos, loopID, text, drain)
+	if err != nil {
 		return err
 	}
 	shouldResolve := false
@@ -212,10 +213,19 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 					shouldResolve = true
 					resolveLoopID = cardLoopID
 				}
+				if drained && !loops.IsReviewFixPairHold(*loop) {
+					if loops.IsReviewFixBudgetStop(text) {
+						ReopenUnappliedScopeStopGates(ctx, repos, executions, loopID)
+					}
+					if shouldResolve && onAnswered != nil {
+						onAnswered(ctx, resolveLoopID, text)
+					}
+					return nil
+				}
 			}
 		}
 	}
-	if err := enqueueHumanMessageToLoopWithCaps(ctx, repos, db, nowISO, loopID, text, caps); err != nil {
+	if err := enqueueHumanMessageToLoopWithCaps(ctx, repos, db, nowISO, loopID, text, caps, executions); err != nil {
 		return err
 	}
 	if shouldResolve && onAnswered != nil {
@@ -229,13 +239,13 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 // Continue/Stop decisions and must not fail-close the inbox cursor ahead of the
 // primary scope card. The ordinary answer is recorded on the residual HITL ask
 // while the pair stays held, then Continue resumes from that stored answer.
-func deliverFeishuHITLCardAction(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, answer string, drain func(context.Context, storage.LoopRecord) error, onAnswered func(context.Context, string, string)) error {
+func deliverFeishuHITLCardAction(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, answer string, drain func(context.Context, storage.LoopRecord) error, onAnswered func(context.Context, string, string), executions *ActiveExecutionRegistry) error {
 	caps := reviewFixBudgetLiveCaps(cfg, "")
 	if repos != nil && repos.Loops != nil {
 		if loop, err := repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
 			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
 			if feishuOverlayResidualCardIsNotPairDecision(*loop, answer) {
-				if err := preserveFeishuOverlayResidualCardAnswer(ctx, repos, loopID, answer, nowISO); err != nil {
+				if err := preserveFeishuOverlayResidualCardAnswer(ctx, repos, db, loopID, answer, nowISO); err != nil {
 					return err
 				}
 				if onAnswered != nil {
@@ -245,10 +255,7 @@ func deliverFeishuHITLCardAction(ctx context.Context, repos *storage.Repositorie
 			}
 		}
 	}
-	if err := drainScopeHoldOnStop(ctx, repos, loopID, answer, drain); err != nil {
-		return err
-	}
-	if err := deliverHITLAnswerToLoopWithCaps(ctx, repos, db, nowISO, loopID, answer, caps); err != nil {
+	if err := deliverHITLAnswerAfterScopeDrain(ctx, repos, db, nowISO, loopID, answer, caps, drain, executions); err != nil {
 		return err
 	}
 	if onAnswered != nil {
@@ -271,10 +278,14 @@ func feishuOverlayResidualCardIsNotPairDecision(loop storage.LoopRecord, answer 
 	return true
 }
 
+// afterFeishuResidualCardLoadHook is test-only: runs after the residual sibling
+// snapshot and before the pair-target lock / conditional write.
+var afterFeishuResidualCardLoadHook func()
+
 // preserveFeishuOverlayResidualCardAnswer records an ordinary card option on the
 // preserved agent ask without treating it as a scope Continue/Stop. The pair
 // stays held; releaseOneReviewScopeHumanHold later queues the answered sibling.
-func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage.Repositories, loopID, answer, nowISO string) error {
+func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage.Repositories, db *sql.DB, loopID, answer, nowISO string) error {
 	if repos == nil || repos.Loops == nil {
 		return nil
 	}
@@ -287,25 +298,45 @@ func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage
 	if fresh == nil || !feishuOverlayResidualCardIsNotPairDecision(*fresh, answer) {
 		return nil
 	}
-	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
-	if !ok {
-		return nil
+	if afterFeishuResidualCardLoadHook != nil {
+		afterFeishuResidualCardLoadHook()
 	}
-	status := strings.TrimSpace(ask.Status)
-	if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
-		return nil
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*fresh))
+	defer unlockTarget()
+	write := func(writeRepos *storage.Repositories) error {
+		current, err := writeRepos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return err
+		}
+		if current == nil || !feishuOverlayResidualCardIsNotPairDecision(*current, answer) {
+			return nil
+		}
+		ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+		if !ok {
+			return nil
+		}
+		status := strings.TrimSpace(ask.Status)
+		if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
+			return nil
+		}
+		ask.Answer = answer
+		ask.Status = "answered"
+		ask.AnsweredAt = nowISO
+		meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+		if err != nil {
+			return err
+		}
+		updated := *current
+		updated.MetadataJSON = &meta
+		updated.UpdatedAt = nowISO
+		return writeRepos.Loops.Upsert(ctx, updated)
 	}
-	ask.Answer = answer
-	ask.Status = "answered"
-	ask.AnsweredAt = nowISO
-	meta, err := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
-	if err != nil {
-		return err
+	if db != nil {
+		return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+			return write(storage.NewRepositories(tx))
+		})
 	}
-	updated := *fresh
-	updated.MetadataJSON = &meta
-	updated.UpdatedAt = nowISO
-	return repos.Loops.Upsert(ctx, updated)
+	return write(repos)
 }
 
 // feishuDecisionCardLoopID returns the loop whose Continue/Stop Feishu card
@@ -420,10 +451,10 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return loop.ID
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverFeishuHITLCardAction(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, answer, input.DrainHITLPair, input.OnHITLAnswerDelivered)
+			return deliverFeishuHITLCardAction(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, answer, input.DrainHITLPair, input.OnHITLAnswerDelivered, input.ActiveExecutions)
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueFeishuHITLMessage(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, text, input.OnHITLAnswerDelivered, input.DrainHITLPair)
+			return enqueueFeishuHITLMessage(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, text, input.OnHITLAnswerDelivered, input.DrainHITLPair, input.ActiveExecutions)
 		},
 	}
 	if input.Logger != nil {

@@ -822,7 +822,7 @@ func TestHandlerRespondScopeStopFailsClosedWhenPeekErrors(t *testing.T) {
 	}
 
 	failingRepos := storage.NewRepositories(&failFirstLoopGetByIDQuerier{db: services.Coordinator.DB(), fails: 1})
-	if err := drainScopeHoldBeforeRespond(context.Background(), failingRepos, reviewer.ID, "Stop", func(context.Context, storage.LoopRecord) error {
+	if _, err := drainScopeHoldBeforeRespond(context.Background(), failingRepos, reviewer.ID, "Stop", func(context.Context, storage.LoopRecord) error {
 		t.Fatal("drain must not run when pre-drain GetByID fails")
 		return nil
 	}); err == nil {

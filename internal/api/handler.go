@@ -6144,25 +6144,28 @@ func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.Loo
 // drainScopeHoldBeforeRespond looks up the loop before a HITL Stop mutation.
 // A lookup error must fail closed so ApplyReviewScopeHumanAnswer cannot
 // terminalize the pair without draining a live sibling.
-func drainScopeHoldBeforeRespond(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) error {
+func drainScopeHoldBeforeRespond(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) (bool, error) {
 	if repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
-		return nil
+		return false, nil
 	}
 	peek, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if peek == nil {
-		return nil
+		return false, nil
 	}
 	ask, _ := loops.ReadHITLAsk(peek.MetadataJSON)
 	if !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*peek)) {
-		return nil
+		return false, nil
 	}
 	if drain == nil {
-		return nil
+		return false, nil
 	}
-	return drain(ctx, *peek)
+	if err := drain(ctx, *peek); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // applyReviewFixBudgetStopIfHeld delegates looper stop on a budget-held or
@@ -6245,7 +6248,8 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	if err := drainScopeHoldBeforeRespond(ctx, services.Repositories, loopID, answer, h.drainReviewFixBudgetPair); err != nil {
+	drained, err := drainScopeHoldBeforeRespond(ctx, services.Repositories, loopID, answer, h.drainReviewFixBudgetPair)
+	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return loopResponse{}, typed
@@ -6267,6 +6271,12 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			// Production StopLoop pauses awaiting_human during drain.
 			// Scope Stop must still terminalize a still-held paused record.
 			if loop.Status != string(domain.LoopStatusPaused) || !loops.IsReviewFixBudgetStop(answer) || !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*loop)) {
+				if drained && loops.IsReviewFixBudgetStop(answer) && !loops.IsReviewScopeHumanHold(*loop) && !loops.IsReviewFixBudgetHold(*loop) {
+					switch strings.TrimSpace(loop.Status) {
+					case "queued", "running":
+						return *loop, nil
+					}
+				}
 				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
 			}
 		}
@@ -6309,6 +6319,9 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		}
 		return updated, nil
 	})
+	if drained {
+		looperdruntime.ReopenUnappliedScopeStopGates(ctx, services.Repositories, services.ActiveExecutions, loopID)
+	}
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {
