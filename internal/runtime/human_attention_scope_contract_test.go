@@ -89,8 +89,9 @@ func TestHumanAttentionContract_ReviewScopeHumanRequired(t *testing.T) {
 
 	notifyDurableHumanAttention(ctx, gateway, repos, reviewer.ID)
 	assertHumanAttentionInAppCount(t, repos, reviewer.ID, 1)
+	assertHumanAttentionInAppBodyContains(t, repos, reviewer.ID, "Clarify AGENTS.md rule X before unpause")
+	assertHumanAttentionInAppBodyContains(t, repos, reviewer.ID, "PR non-goals exclude API expansion")
 	assertOsascriptContains(t, capturePath, "display notification")
-
 	// Re-observe must not resend.
 	notifyDurableHumanAttention(ctx, gateway, repos, reviewer.ID)
 	assertHumanAttentionInAppCount(t, repos, reviewer.ID, 1)

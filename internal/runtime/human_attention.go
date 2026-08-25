@@ -408,6 +408,7 @@ func notifyDurableHumanAttention(ctx context.Context, gateway *notify.Gateway, r
 		if entryKey == "" {
 			return
 		}
+		state := loops.ReadReviewScopeHumanState(loop.MetadataJSON)
 		gateway.NotifyHumanAttention(ctx, notify.HumanAttentionInput{
 			ProjectID:  loop.ProjectID,
 			LoopID:     loop.ID,
@@ -417,6 +418,8 @@ func notifyDurableHumanAttention(ctx context.Context, gateway *notify.Gateway, r
 			Reason:     notify.HumanAttentionReviewScopeHuman,
 			EntryKey:   entryKey,
 			Subtitle:   humanAttentionSubtitle(*loop),
+			Question:   state.Question,
+			Evidence:   state.Evidence,
 			EntityType: "loop",
 			EntityID:   loop.ID,
 		})

@@ -274,6 +274,9 @@ type githubHITLPollDeps struct {
 	deliverAnswer func(ctx contextType, loopID, answer string) error
 	// clearAwaiting removes the awaiting-human label from the PR after delivery.
 	clearAwaiting func(ctx contextType, repo string, prNumber int64, cwd string)
+	// remainingAwaiting, when set, is consulted after a successful delivery.
+	// clearAwaiting is skipped when another awaiting GitHub ask remains on the PR.
+	remainingAwaiting func(ctx contextType, repo string, prNumber int64) bool
 	// projectCWD returns the local repo path for a project (gh runs there).
 	projectCWD    func(projectID string) string
 	answerAuthors []string
@@ -399,7 +402,7 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 		if loop.BudgetAsk && pairKey != "" && (loops.IsReviewFixBudgetContinue(answer) || loops.IsReviewFixBudgetStop(answer)) {
 			consumedDecisionPairs[pairKey] = struct{}{}
 		}
-		if deps.clearAwaiting != nil {
+		if deps.clearAwaiting != nil && (deps.remainingAwaiting == nil || !deps.remainingAwaiting(ctx, repo, loop.PRNumber)) {
 			deps.clearAwaiting(ctx, repo, loop.PRNumber, cwd)
 		}
 		delivered++
@@ -413,6 +416,51 @@ func githubHITLDecisionPairKey(loop githubHITLAwaitingLoop) string {
 		return ""
 	}
 	return fmt.Sprintf("%s#%d", repo, loop.PRNumber)
+}
+
+func githubHITLPRHasRemainingAwaiting(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64) bool {
+	if repos == nil || repos.Loops == nil || prNumber == 0 {
+		return false
+	}
+	all, err := repos.Loops.List(ctx)
+	if err != nil {
+		return false
+	}
+	repo = strings.TrimSpace(repo)
+	for _, loop := range all {
+		if strings.TrimSpace(projectID) != "" && loop.ProjectID != projectID {
+			continue
+		}
+		if loop.Status != "awaiting_human" {
+			continue
+		}
+		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+		if !ok {
+			continue
+		}
+		if s := strings.TrimSpace(ask.Status); s != "" && s != "awaiting" {
+			continue
+		}
+		askPR := ask.PRNumber
+		if askPR == 0 {
+			askPR = derefLoopPRNumber(loop)
+		}
+		if askPR != prNumber {
+			continue
+		}
+		if repo != "" {
+			loopRepo := derefLoopRepo(loop)
+			if loopRepo != "" && !strings.EqualFold(loopRepo, repo) {
+				continue
+			}
+		}
+		transport := strings.TrimSpace(ask.Transport)
+		if transport != "" && !strings.EqualFold(transport, "github") {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // deliverHITLAnswerToLoop is the runtime-side equivalent of the api
@@ -709,6 +757,9 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
 			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})
+		},
+		remainingAwaiting: func(ctx contextType, repo string, pr int64) bool {
+			return githubHITLPRHasRemainingAwaiting(ctx, input.Repos, project.ID, repo, pr)
 		},
 		projectCWD:    func(string) string { return project.RepoPath },
 		answerAuthors: answerAuthors,

@@ -6206,10 +6206,14 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		if loop == nil {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
-		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+			// Production StopLoop pauses awaiting_human during drain.
+			// Scope Stop must still terminalize a still-held paused record.
+			if loop.Status != string(domain.LoopStatusPaused) || !loops.IsReviewFixBudgetStop(answer) || !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*loop)) {
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
+			}
+		}
 		if loops.IsReviewFixBudgetAsk(ask) {
 			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO, h.reviewFixBudgetLiveCaps(loop.ProjectID))
 			if applyErr != nil {

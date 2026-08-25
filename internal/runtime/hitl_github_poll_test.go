@@ -260,6 +260,7 @@ func TestPollGitHubHITLAnswersOnceConsumesOneScopeDecisionPerPair(t *testing.T) 
 			if tc.siblingFirst {
 				awaiting = []githubHITLAwaitingLoop{overlay, primary}
 			}
+			var cleared []int64
 			n := pollGitHubHITLAnswersOnce(context.Background(), awaiting, githubHITLPollDeps{
 				listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
 					return []githubAnswerComment{
@@ -271,7 +272,12 @@ func TestPollGitHubHITLAnswersOnceConsumesOneScopeDecisionPerPair(t *testing.T) 
 				deliverAnswer: func(ctx contextType, loopID, answer string) error {
 					return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
 				},
-				clearAwaiting: func(_ contextType, _ string, _ int64, _ string) {},
+				clearAwaiting: func(_ contextType, _ string, pr int64, _ string) {
+					cleared = append(cleared, pr)
+				},
+				remainingAwaiting: func(ctx contextType, repo string, pr int64) bool {
+					return githubHITLPRHasRemainingAwaiting(ctx, repos, projectID, repo, pr)
+				},
 			})
 			if n != 1 {
 				t.Fatalf("delivered = %d, want one pair-level Continue", n)
@@ -291,6 +297,9 @@ func TestPollGitHubHITLAnswersOnceConsumesOneScopeDecisionPerPair(t *testing.T) 
 			remaining, ok := loops.ReadHITLAsk(freshFixer.MetadataJSON)
 			if !ok || remaining.Status != "awaiting" || remaining.Question != agentAsk.Question || remaining.Answer != "" {
 				t.Fatalf("fixer ask after Continue = (%#v, %v), want unanswered agent question", remaining, ok)
+			}
+			if len(cleared) != 0 {
+				t.Fatalf("cleared = %v, want empty while sibling agent ask remains", cleared)
 			}
 		})
 	}

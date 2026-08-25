@@ -637,6 +637,11 @@ func TestHandlerRespondScopeStopDrainsLiveSibling(t *testing.T) {
 			if rec.Status == "terminated" || rec.Status == "stopped" {
 				t.Fatalf("StopLoop(%s) after terminalize: status=%s", loopID, rec.Status)
 			}
+			paused := *rec
+			paused.Status = "paused"
+			if err := services.Repositories.Loops.Upsert(ctx, paused); err != nil {
+				return nil, err
+			}
 			drained = append(drained, loopID)
 			if services.ActiveExecutions != nil {
 				if _, stopErr := services.ActiveExecutions.BeginLoopStop(loopID, "test drain"); stopErr != nil {
