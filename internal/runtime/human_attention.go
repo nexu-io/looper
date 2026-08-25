@@ -278,9 +278,10 @@ func (r *Runtime) isStopped() bool {
 
 // collectHumanAttentionLoopIDs returns loop IDs that may need human-attention
 // observation after recovery: durable awaiting_human loop status, no-HITL
-// review-fix budget exhausted pauses, and latest queue rows parked as
-// manual_intervention. notifyDurableHumanAttention applies the hard-condition
-// filter and permanent entry dedupe.
+// review-fix budget exhausted pauses, no-HITL review-scope required pauses,
+// and latest queue rows parked as manual_intervention.
+// notifyDurableHumanAttention applies the hard-condition filter and permanent
+// entry dedupe.
 func collectHumanAttentionLoopIDs(ctx context.Context, repos *storage.Repositories) []string {
 	if repos == nil {
 		return nil
@@ -305,11 +306,11 @@ func collectHumanAttentionLoopIDs(ctx context.Context, repos *storage.Repositori
 				add(loop.ID)
 			}
 		}
-		// No-HITL budget exhausted holds are paused (not awaiting_human).
+		// No-HITL budget exhausted / scope-required holds are paused (not awaiting_human).
 		paused, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusPaused)})
 		if err == nil {
 			for _, loop := range paused {
-				if loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) {
+				if loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) || loops.IsReviewScopeHumanRequiredPause(loop.MetadataJSON) {
 					add(loop.ID)
 				}
 			}
@@ -378,6 +379,28 @@ func notifyDurableHumanAttention(ctx context.Context, gateway *notify.Gateway, r
 			RunID:      latestRunID(ctx, repos, loop.ID),
 			LoopType:   loop.Type,
 			Reason:     notify.HumanAttentionReviewFixBudget,
+			EntryKey:   entryKey,
+			Subtitle:   humanAttentionSubtitle(*loop),
+			EntityType: "loop",
+			EntityID:   loop.ID,
+		})
+		return
+	}
+
+	// No-HITL needs_human scope hold: paused + review_scope_human_required.
+	// Sibling-only pause does not notify separately (held role notifies).
+	if loop.Status == string(domain.LoopStatusPaused) && loops.IsReviewScopeHumanRequiredPause(loop.MetadataJSON) {
+		entryKey := humanAttentionEntryKeyForReviewScopeHuman(*loop)
+		if entryKey == "" {
+			return
+		}
+		gateway.NotifyHumanAttention(ctx, notify.HumanAttentionInput{
+			ProjectID:  loop.ProjectID,
+			LoopID:     loop.ID,
+			LoopSeq:    loop.Seq,
+			RunID:      latestRunID(ctx, repos, loop.ID),
+			LoopType:   loop.Type,
+			Reason:     notify.HumanAttentionReviewScopeHuman,
 			EntryKey:   entryKey,
 			Subtitle:   humanAttentionSubtitle(*loop),
 			EntityType: "loop",
@@ -460,6 +483,17 @@ func humanAttentionEntryKeyForReviewFixBudget(loop storage.LoopRecord) string {
 		return "budget:" + loop.ID + ":" + updated
 	}
 	return "budget:" + loop.ID
+}
+
+func humanAttentionEntryKeyForReviewScopeHuman(loop storage.LoopRecord) string {
+	state := loops.ReadReviewScopeHumanState(loop.MetadataJSON)
+	if at := strings.TrimSpace(state.HandoffEventAt); at != "" {
+		return "scope:" + loop.ID + ":" + at
+	}
+	if updated := strings.TrimSpace(loop.UpdatedAt); updated != "" {
+		return "scope:" + loop.ID + ":" + updated
+	}
+	return "scope:" + loop.ID
 }
 
 func humanAttentionEntryKeyForManualIntervention(queue storage.QueueItemRecord) string {

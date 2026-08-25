@@ -11048,6 +11048,81 @@ func TestParkReviewerScopeHumanHITLOnAskNotBudgetKind(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemPreservesParkedScopeHoldStatus(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		hitl       bool
+		wantStatus string
+	}{
+		{name: "hitl_awaiting", hitl: true, wantStatus: "awaiting_human"},
+		{name: "no_hitl_paused", hitl: false, wantStatus: "paused"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			ctx := context.Background()
+			nowISO := fixture.nowISO()
+			repo := "acme/looper"
+			prNumber := int64(42)
+			loopID := "loop_scope_finalizer_" + tc.name
+			metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+			loop := storage.LoopRecord{
+				ID: loopID, Seq: 210, ProjectID: "project_1", Type: "reviewer",
+				TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber,
+				Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig: %v", err)
+			}
+			cfg.HITL.Enabled = tc.hitl
+			stdout := `__LOOPER_RESULT__={"summary":"Need human","outcome":"blocking","findings":[{"title":"Ambiguous","body":"Unclear","disposition":"needs_human","severity":"blocking","scopeBasis":"ambiguous_intent","scopeEvidence":"AGENTS.md rule X","path":"a.go","line":1}]}`
+			agent := &fakeAgentExecutor{results: []AgentResult{{
+				Status: "completed", Summary: "Need human", Stdout: stdout, ParseStatus: "parsed",
+			}}}
+			github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+				AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg,
+				LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+			})
+			queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+			if err != nil {
+				t.Fatalf("enqueue() error = %v", err)
+			}
+			claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+			if err != nil || claimed == nil || claimed.ID != queue.ID {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+			}
+			result, err := runner.ProcessClaimedItem(ctx, *claimed)
+			if err != nil {
+				t.Fatalf("ProcessClaimedItem() error = %v", err)
+			}
+			if result.Status != "skipped" {
+				t.Fatalf("result = %#v, want skipped after in-claim needs_human park", result)
+			}
+			if !strings.Contains(result.Summary, "review scope requires human judgment") {
+				t.Fatalf("result.Summary = %q, want scope hold skip", result.Summary)
+			}
+			updated, err := fixture.repos.Loops.GetByID(ctx, loopID)
+			if err != nil || updated == nil {
+				t.Fatalf("Loops.GetByID() = (%#v, %v)", updated, err)
+			}
+			if updated.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want parked %q (not queued)", updated.Status, tc.wantStatus)
+			}
+			if !loops.IsReviewScopeHumanHold(*updated) {
+				t.Fatalf("want scope hold preserved: %#v meta=%v", updated, updated.MetadataJSON)
+			}
+		})
+	}
+}
+
 func TestProcessClaimedItemCommentOnlySkipsWhenReviewRequestRemovedBeforePublish(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

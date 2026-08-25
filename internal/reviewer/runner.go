@@ -3485,11 +3485,11 @@ func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.L
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
 		return ProcessResult{}, err
 	}
+	// Do not revive a review-fix pair hold (or other terminal park) that the
+	// step already persisted — only ordinary label/hold skips re-queue.
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
-		// Do not revive a review-fix budget hold (or other terminal park) that
-		// the step already persisted — only ordinary label/hold skips re-queue.
-		if loops.IsReviewFixBudgetHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
+		if loops.IsReviewFixPairHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
 			updated.NextRunAt = nil
 			return
 		}

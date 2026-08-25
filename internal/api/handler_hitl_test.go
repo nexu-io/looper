@@ -507,6 +507,121 @@ func TestHandlerRespondReviewFixBudgetStorageFailureIsInternalError(t *testing.T
 	}
 }
 
+func TestHandlerRespondBudgetContinueReturnsPromotedScopeHold(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	triggered := 0
+	h := NewHandler(Context{Config: cfg, Runtime: rt, TriggerSchedulerTick: func() { triggered++ }})
+	seedReviewFixBudgetAwaitingLoop(t, rt, "project_budget_promote_scope", "loop_budget_promote_scope", 644)
+
+	services := rt.Services()
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), "loop_budget_promote_scope")
+	if err != nil || loop == nil {
+		t.Fatalf("GetByID() = (%#v, %v)", loop, err)
+	}
+	encoded, err := loops.PersistPendingReviewScopeHumanEvidence(loop.MetadataJSON, "Clarify AGENTS.md rule X before unpause", "PR non-goals exclude API expansion", true)
+	if err != nil {
+		t.Fatalf("PersistPendingReviewScopeHumanEvidence: %v", err)
+	}
+	loop.MetadataJSON = &encoded
+	if err := services.Repositories.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert pending: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/644/respond", strings.NewReader(`{"answer":"Continue"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if triggered != 1 {
+		t.Fatalf("TriggerSchedulerTick called %d times, want 1 after budget Continue promote", triggered)
+	}
+
+	updated, err := services.Repositories.Loops.GetByID(context.Background(), "loop_budget_promote_scope")
+	if err != nil || updated == nil {
+		t.Fatalf("loop after promote = (%#v, %v)", updated, err)
+	}
+	if updated.Status != "awaiting_human" {
+		t.Fatalf("status = %q, want awaiting_human promoted scope hold (not running/queued)", updated.Status)
+	}
+	if !loops.IsReviewScopeHumanHold(*updated) || loops.IsReviewFixBudgetHold(*updated) {
+		t.Fatalf("hold = scope=%v budget=%v, want scope-only", loops.IsReviewScopeHumanHold(*updated), loops.IsReviewFixBudgetHold(*updated))
+	}
+	ask, ok := loops.ReadHITLAsk(updated.MetadataJSON)
+	if !ok || !loops.IsReviewScopeHumanAsk(ask) {
+		t.Fatalf("ask = (%#v, %v), want promoted scope ask", ask, ok)
+	}
+}
+
+func TestHandlerRespondOrdinaryAskDoesNotReleaseScopeOverlay(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_scope_overlay"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	reviewer := storage.LoopRecord{
+		ID: "loop_scope_overlay_reviewer", Seq: 645, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer): %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_scope_overlay_fixer", Seq: 646, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
+		Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	midAsk := loops.HITLAsk{
+		Kind: "agent_question", Question: "Which approach should Fixer take?",
+		Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO, PRNumber: prNumber,
+	}
+	meta, err := loops.WriteHITLAsk(fixer.MetadataJSON, midAsk)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk: %v", err)
+	}
+	fixer.MetadataJSON = &meta
+	if err := services.Repositories.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer): %v", err)
+	}
+	if _, err := loops.ParkReviewScopeHuman(context.Background(), services.Repositories, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md rule X before unpause",
+	}); err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/646/respond", strings.NewReader(`{"answer":"A"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for ordinary overlay answer; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	freshFixer, err := services.Repositories.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || freshFixer == nil || freshFixer.Status != "awaiting_human" {
+		t.Fatalf("fixer after ordinary answer = (%#v, %v), want awaiting_human", freshFixer, err)
+	}
+	ask, ok := loops.ReadHITLAsk(freshFixer.MetadataJSON)
+	if !ok || ask.Question != midAsk.Question || ask.Status != "awaiting" {
+		t.Fatalf("mid-run ask mutated: ok=%v ask=%#v", ok, ask)
+	}
+	if !loops.IsReviewScopeHumanHold(*freshFixer) {
+		t.Fatalf("fixer overlay released by ordinary answer: %#v", freshFixer)
+	}
+	freshReviewer, err := services.Repositories.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || freshReviewer == nil || !loops.IsReviewScopeHumanHold(*freshReviewer) {
+		t.Fatalf("reviewer hold released by sibling ordinary answer: (%#v, %v)", freshReviewer, err)
+	}
+}
+
 func seedReviewFixBudgetAwaitingLoop(t *testing.T, rt *looperdruntime.Runtime, projectID, loopID string, seq int64) {
 	t.Helper()
 	services := rt.Services()

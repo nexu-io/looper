@@ -34,6 +34,22 @@ var ErrReviewScopeHumanInvalidAnswer = fmt.Errorf("review scope answer must be %
 // ReviewScopeHumanState is durable pair-hold metadata for needs_human scope holds.
 // It does not store role meters; Continue must not refill budgets.
 //
+// Failure it prevents: dropping needs_human (or treating it as follow_up) lets
+// Fixer edit without the required authority input. A prompt-only or in-memory
+// park cannot survive claim finalization, budget Continue, or daemon restart.
+//
+// Costs: pending vs active hold, pair metadata, handoff markers, promotion
+// after budget release, and overlay on failed/awaiting siblings. Those paths
+// can disagree with live status if a later layer overwrites the park.
+//
+// Why simpler alternatives are insufficient:
+//   - Delete the hold and trust the agent: needs_human would vanish and Fixer
+//     would edit. Spec forbids suppress-and-continue.
+//   - Fail loud / terminate: operators cannot Continue against clarified
+//     evidence; the pair would need a new loop.
+//   - Reuse budget hold state: Continue would refill meters for a scope
+//     decision that is not a cap exhaustion.
+//
 // Pending marks deferred scope evidence while a budget hold is the sole primary
 // hold (no status/ask change). After budget Continue releases the pair, pending
 // is promoted to a real scope park.

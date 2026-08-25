@@ -6156,7 +6156,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 				return result.Loop, nil
 			}
 		}
-		if loops.IsReviewScopeHumanAsk(ask) {
+		if loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*loop) {
 			result, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *loop, answer, nowISO)
 			if applyErr != nil {
 				if errors.Is(applyErr, loops.ErrReviewScopeHumanInvalidAnswer) {
@@ -6191,7 +6191,10 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 
-	if updated.Status != string(domain.LoopStatusAwaitingHuman) {
+	// Budget Continue may promote deferred needs_human into a fresh scope hold
+	// that is still awaiting_human. Return that park; do not treat it as the
+	// just-answered ask and implicitly Continue via mutateLoopStatus.
+	if updated.Status != string(domain.LoopStatusAwaitingHuman) || loops.IsReviewFixPairHold(updated) {
 		if h.context.TriggerSchedulerTick != nil {
 			h.context.TriggerSchedulerTick()
 		}
