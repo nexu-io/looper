@@ -481,6 +481,47 @@ func TestBudgetContinueRestoresScopePausedSiblingInsteadOfQueueing(t *testing.T)
 	}
 }
 
+func TestScopeHandoffRecordsPendingSignalNotStaleMetadata(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"lastReviewedSignalFingerprint":"sig-old","loop":{"iterationCount":2}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_scope_pending_sig", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("upsert reviewer: %v", err)
+	}
+
+	parked, err := ParkReviewScopeHuman(context.Background(), repos, ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42,
+		NowISO: nowISO, HITLEnabled: false,
+		Question: "Is this in PR scope?",
+		Signal:   "sig-live",
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "loop", parked.ID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	var handoff storage.EventLogRecord
+	found := false
+	for i := range events {
+		if events[i].EventType == reviewScopeHumanHandoffEventType {
+			handoff = events[i]
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing scope handoff event")
+	}
+	payloadJSON := handoff.PayloadJSON
+	payload := parseMetadataObject(&payloadJSON)
+	if signal, _ := payload["lastReviewedSignalFingerprint"].(string); signal != "sig-live" {
+		t.Fatalf("handoff signal = %q, want pending sig-live not stale metadata", signal)
+	}
+}
+
 func derefMeta(m *string) string {
 	if m == nil {
 		return ""

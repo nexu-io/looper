@@ -306,6 +306,10 @@ type ParkReviewFixBudgetInput struct {
 	// LiveCaps optional; used with pair metadata to snapshot both role meters
 	// on the handoff event. Zero caps mean unknown for that role.
 	LiveCaps ReviewFixBudgetLiveCaps
+	// Signal is the current review-signal fingerprint. When set it wins over
+	// pair metadata so a budget-held disposition can refresh the handoff
+	// before lastReviewedSignalFingerprint is persisted on the Reviewer loop.
+	Signal string
 	// DB optional. When set, exhausted persist + sibling park + queue cancel
 	// run in one transaction so a partial park cannot leave one role runnable.
 	DB *sql.DB
@@ -542,11 +546,12 @@ func ensureReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repos
 	if repos == nil || repos.Events == nil {
 		return nil
 	}
+	signal := reviewFixPairHandoffSignal(ctx, repos, exhausted, input.Signal)
 	state := ReadReviewFixBudgetState(exhausted.MetadataJSON)
-	if strings.TrimSpace(state.HandoffEventAt) != "" {
+	if strings.TrimSpace(state.HandoffEventAt) != "" && lastReviewFixBudgetHandoffSignal(ctx, repos, exhausted) == signal {
 		return nil
 	}
-	if err := appendReviewFixBudgetHandoffEvent(ctx, repos, exhausted, input); err != nil {
+	if err := appendReviewFixBudgetHandoffEvent(ctx, repos, exhausted, input, signal); err != nil {
 		return err
 	}
 	state = ReadReviewFixBudgetState(exhausted.MetadataJSON)
@@ -561,7 +566,7 @@ func ensureReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repos
 	return repos.Loops.Upsert(ctx, updated)
 }
 
-func appendReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repositories, exhausted storage.LoopRecord, input ParkReviewFixBudgetInput) error {
+func appendReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repositories, exhausted storage.LoopRecord, input ParkReviewFixBudgetInput, signal string) error {
 	if repos == nil || repos.Events == nil {
 		return nil
 	}
@@ -591,7 +596,7 @@ func appendReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repos
 	if head != "" {
 		payload["head"] = head
 	}
-	if signal := reviewFixHandoffSignal(exhausted); signal != "" {
+	if signal != "" {
 		payload["lastReviewedSignalFingerprint"] = signal
 	}
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
@@ -626,6 +631,112 @@ func reviewFixHandoffSignal(loop storage.LoopRecord) string {
 		return strings.TrimSpace(fp)
 	}
 	return ""
+}
+
+func reviewFixPairHandoffSignal(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, pending string) string {
+	if signal := strings.TrimSpace(pending); signal != "" {
+		return signal
+	}
+	members := []storage.LoopRecord{loop}
+	if repos != nil && repos.Loops != nil {
+		if all, err := repos.Loops.List(ctx); err == nil {
+			members = reviewFixBudgetPairMembers(all, loop)
+		}
+	}
+	var fallback string
+	for _, member := range members {
+		signal := reviewFixHandoffSignal(member)
+		if signal == "" {
+			continue
+		}
+		if strings.TrimSpace(member.Type) == "reviewer" {
+			return signal
+		}
+		if fallback == "" {
+			fallback = signal
+		}
+	}
+	return fallback
+}
+
+func lastReviewFixBudgetHandoffSignal(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) string {
+	if repos == nil || repos.Events == nil {
+		return ""
+	}
+	events, err := repos.Events.ListByEntity(ctx, "loop", strings.TrimSpace(loop.ID))
+	if err != nil {
+		return ""
+	}
+	last := ""
+	for i := range events {
+		if events[i].EventType != reviewFixBudgetHandoffEventType {
+			continue
+		}
+		payloadJSON := events[i].PayloadJSON
+		payload := parseMetadataObject(&payloadJSON)
+		if fp, ok := stringFromAny(payload["lastReviewedSignalFingerprint"]); ok {
+			last = fp
+		} else {
+			last = ""
+		}
+	}
+	return last
+}
+
+func reviewFixBudgetHandoffOwner(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) storage.LoopRecord {
+	if repos != nil && repos.Loops != nil {
+		if fresh, err := repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+			loop = *fresh
+		}
+	}
+	if isReviewFixBudgetExhaustedHold(loop) || strings.TrimSpace(ReadReviewFixBudgetState(loop.MetadataJSON).HandoffEventAt) != "" {
+		return loop
+	}
+	if repos == nil || repos.Loops == nil {
+		return loop
+	}
+	all, err := repos.Loops.List(ctx)
+	if err != nil {
+		return loop
+	}
+	var withMarker storage.LoopRecord
+	foundMarker := false
+	for _, member := range reviewFixBudgetPairMembers(all, loop) {
+		if isReviewFixBudgetExhaustedHold(member) {
+			return member
+		}
+		if !foundMarker && strings.TrimSpace(ReadReviewFixBudgetState(member.MetadataJSON).HandoffEventAt) != "" {
+			withMarker = member
+			foundMarker = true
+		}
+	}
+	if foundMarker {
+		return withMarker
+	}
+	return loop
+}
+
+// RefreshReviewFixPairHandoff appends a new budget handoff snapshot when the
+// current pair signal differs from the last emitted event. Used after a
+// budget-held disposition changes lastReviewedSignalFingerprint.
+func RefreshReviewFixPairHandoff(ctx context.Context, repos *storage.Repositories, member storage.LoopRecord, signal, nowISO string) error {
+	if repos == nil || repos.Events == nil {
+		return nil
+	}
+	owner := reviewFixBudgetHandoffOwner(ctx, repos, member)
+	hitl := false
+	if ask, ok := ReadHITLAsk(owner.MetadataJSON); ok && IsReviewFixBudgetAsk(ask) {
+		hitl = true
+	}
+	return ensureReviewFixBudgetHandoffEvent(ctx, repos, owner, ParkReviewFixBudgetInput{
+		Exhausted:   owner,
+		Role:        strings.TrimSpace(owner.Type),
+		Repo:        derefLoopString(owner.Repo),
+		PRNumber:    derefLoopInt64(owner.PRNumber),
+		NowISO:      nowISO,
+		HITLEnabled: hitl,
+		Signal:      signal,
+	})
 }
 
 // reviewFixBudgetHandoffHead prefers lastPublishedHeadSha (reviewer) then
@@ -821,6 +932,7 @@ func promotePendingReviewScopeHumanAfterBudgetRelease(ctx context.Context, repos
 			HITLEnabled: state.PendingHITL,
 			Question:    state.Question,
 			Evidence:    state.Evidence,
+			Signal:      reviewFixHandoffSignal(*fresh),
 		}); err != nil {
 			return err
 		}

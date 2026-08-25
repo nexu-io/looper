@@ -1409,6 +1409,11 @@ func TestBudgetHeldNeedsHumanPersistsSignalNoReenqueue(t *testing.T) {
 	if checkpoint.ReviewSignalFingerprint != liveSignal {
 		t.Fatalf("checkpoint signal = %q, want %q", checkpoint.ReviewSignalFingerprint, liveSignal)
 	}
+	handoffSignal := lastLoopEventSignal(t, fixture.repos, loop.ID, "loop.review_fix_budget.exhausted")
+	if handoffSignal != liveSignal {
+		t.Fatalf("budget handoff signal = %q, want live %q", handoffSignal, liveSignal)
+	}
+
 	// Next same-head discovery with unchanged threads must skip (not re-enqueue).
 	decision, err := runner.sameHeadDiscoveryDecision(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, repo, PullRequestSummary{Number: prNumber, HeadSHA: "abc123", Author: "alice"}, *updated, parseJSONObject(updated.MetadataJSON))
 	if err != nil {
@@ -2752,6 +2757,11 @@ func TestNeedsHumanParkContinueClearsReviewedSignal(t *testing.T) {
 	if !loops.IsReviewScopeHumanHold(*parked) {
 		t.Fatalf("parked = %#v, want scope hold", parked)
 	}
+	liveSignal := ComputeReviewSignalFingerprintForLogin("abc123", threads, "looper-bot")
+	if handoffSignal := lastLoopEventSignal(t, fixture.repos, loop.ID, "loop.review_scope_human.required"); handoffSignal != liveSignal {
+		t.Fatalf("scope handoff signal = %q, want live %q before persist", handoffSignal, liveSignal)
+	}
+
 	skip, err := runner.sameHeadDiscoveryDecision(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, repo, PullRequestSummary{Number: prNumber, HeadSHA: "abc123", Author: "alice"}, *parked, parseJSONObject(parked.MetadataJSON))
 	if err != nil {
 		t.Fatalf("discovery while parked: %v", err)
@@ -2776,3 +2786,26 @@ func TestNeedsHumanParkContinueClearsReviewedSignal(t *testing.T) {
 }
 
 func int64Ptr(v int64) *int64 { return &v }
+
+func lastLoopEventSignal(t *testing.T, repos *storage.Repositories, loopID, eventType string) string {
+	t.Helper()
+	events, err := repos.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	var last storage.EventLogRecord
+	found := false
+	for i := range events {
+		if events[i].EventType == eventType {
+			last = events[i]
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing %s event", eventType)
+	}
+	payloadJSON := last.PayloadJSON
+	payload := parseJSONObject(&payloadJSON)
+	signal, _ := payload["lastReviewedSignalFingerprint"].(string)
+	return signal
+}

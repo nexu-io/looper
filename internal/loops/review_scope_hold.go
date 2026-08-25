@@ -219,7 +219,11 @@ type ParkReviewScopeHumanInput struct {
 	Question string
 	// Evidence is optional structured handoff text (authority conflict, etc.).
 	Evidence string
-	DB       *sql.DB
+	// Signal is the review-signal fingerprint being adjudicated. When set it
+	// wins over lastReviewedSignalFingerprint already stored on Held, so a
+	// needs_human park can record the current identity before persist.
+	Signal string
+	DB     *sql.DB
 }
 
 // ParkReviewScopeHuman parks the held role and pauses same-lane siblings for a
@@ -529,7 +533,7 @@ func appendReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repo
 	if head := reviewFixBudgetHandoffHead(held); head != "" {
 		payload["head"] = head
 	}
-	if signal := reviewFixHandoffSignal(held); signal != "" {
+	if signal := reviewScopeHandoffSignal(held, input.Signal); signal != "" {
 		payload["lastReviewedSignalFingerprint"] = signal
 	}
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
@@ -542,6 +546,13 @@ func appendReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repo
 		ActorID:    optionalBudgetString("review-scope-human"),
 		Payload:    payload,
 	})
+}
+
+func reviewScopeHandoffSignal(held storage.LoopRecord, pending string) string {
+	if signal := strings.TrimSpace(pending); signal != "" {
+		return signal
+	}
+	return reviewFixHandoffSignal(held)
 }
 
 type ReviewScopeHumanAnswerResult struct {

@@ -1346,13 +1346,19 @@ func (r *Runner) persistLastReviewedSignalFingerprint(ctx context.Context, loop 
 	if signal == "" || r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
 		return nil
 	}
-	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		metadataJSON, metaErr := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{metadataLastReviewedSignalFingerprintKey: signal})
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
 		}
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if !loops.IsReviewFixBudgetHold(updated) {
+		return nil
+	}
+	return loops.RefreshReviewFixPairHandoff(ctx, r.repos, updated, signal, r.nowISO())
 }
 
 func (r *Runner) allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx context.Context, cwd, repo string, pr PullRequestSummary, currentLogin string, meta map[string]any, policy DiscoveryPolicy) (bool, error) {
@@ -3487,7 +3493,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			checkpoint.ReviewSignalFingerprint = reviewSignalFP
 			checkpoint.ThreadResolution = result
 			r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, decisionValue, strings.TrimSpace(decision.Evidence), thread.ID, "needs_human", "")
-			if err := r.parkDispositionNeedsHuman(ctx, input, thread.ID, decision.Evidence); err != nil {
+			if err := r.parkDispositionNeedsHuman(ctx, input, thread.ID, decision.Evidence, reviewSignalFP); err != nil {
 				return checkpoint, err
 			}
 			if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP); err != nil {
@@ -3913,14 +3919,16 @@ func appendUniqueString(values []string, value string) []string {
 	return append(values, value)
 }
 
-func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput, threadID, evidence string) error {
+func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput, threadID, evidence, signal string) error {
 	if r.repos == nil {
 		return nil
 	}
 	// Do not stack a scope hold over an existing budget hold — refresh handoff only.
 	if loops.IsReviewFixBudgetHold(input.Loop) {
-		_, err := r.parkReviewerBudgetIfExhausted(ctx, input.Loop)
-		return err
+		if _, err := r.parkReviewerBudgetIfExhausted(ctx, input.Loop); err != nil {
+			return err
+		}
+		return loops.RefreshReviewFixPairHandoff(ctx, r.repos, input.Loop, signal, r.nowISO())
 	}
 	message := strings.TrimSpace(evidence)
 	if message == "" {
@@ -3936,6 +3944,7 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 		HITLEnabled: r.reviewFixHITLEnabled(),
 		Question:    question,
 		Evidence:    message,
+		Signal:      signal,
 		DB:          r.db,
 	})
 	if err != nil {

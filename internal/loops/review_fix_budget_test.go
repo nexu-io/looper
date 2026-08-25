@@ -947,6 +947,89 @@ func TestHandoffEventIncludesHeadAndConcreteResumeCommands(t *testing.T) {
 	}
 }
 
+func TestBudgetHandoffReadsReviewerSignalForBothExhaustedRoles(t *testing.T) {
+	t.Parallel()
+	for _, exhaustedRole := range []string{"reviewer", "fixer"} {
+		t.Run(exhaustedRole, func(t *testing.T) {
+			t.Parallel()
+			repos, nowISO := newBudgetFixture(t)
+			reviewerMeta := `{"lastPublishedHeadSha":"abc123def","lastReviewedSignalFingerprint":"sig-reviewer","loop":{"iterationCount":3}}`
+			reviewer := seedBudgetLoop(t, repos, nowISO, "loop_pair_sig_"+exhaustedRole+"_rev", "reviewer", "running")
+			reviewer.MetadataJSON = &reviewerMeta
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("upsert reviewer: %v", err)
+			}
+			fixerMeta := `{"reviewFixBudget":{"pushCount":3}}`
+			fixer := seedBudgetLoop(t, repos, nowISO, "loop_pair_sig_"+exhaustedRole+"_fix", "fixer", "queued")
+			fixer.MetadataJSON = &fixerMeta
+			if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("upsert fixer: %v", err)
+			}
+			exhausted := reviewer
+			if exhaustedRole == "fixer" {
+				exhausted = fixer
+			}
+			parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+				Exhausted: exhausted, Role: exhaustedRole, Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+				NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(3, 3),
+			})
+			if err != nil {
+				t.Fatalf("park: %v", err)
+			}
+			payload := lastBudgetHandoffPayload(t, repos, parked.ID)
+			if signal, _ := payload["lastReviewedSignalFingerprint"].(string); signal != "sig-reviewer" {
+				t.Fatalf("lastReviewedSignalFingerprint = %q, want reviewer sibling sig-reviewer", signal)
+			}
+		})
+	}
+}
+
+func TestBudgetHandoffRefreshesWhenPairSignalChanges(t *testing.T) {
+	t.Parallel()
+	for _, exhaustedRole := range []string{"reviewer", "fixer"} {
+		t.Run(exhaustedRole, func(t *testing.T) {
+			t.Parallel()
+			repos, nowISO := newBudgetFixture(t)
+			reviewerMeta := `{"lastPublishedHeadSha":"abc123def","lastReviewedSignalFingerprint":"sig-old","loop":{"iterationCount":3}}`
+			reviewer := seedBudgetLoop(t, repos, nowISO, "loop_refresh_"+exhaustedRole+"_rev", "reviewer", "running")
+			reviewer.MetadataJSON = &reviewerMeta
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("upsert reviewer: %v", err)
+			}
+			fixer := seedBudgetLoop(t, repos, nowISO, "loop_refresh_"+exhaustedRole+"_fix", "fixer", "queued")
+			exhausted := reviewer
+			if exhaustedRole == "fixer" {
+				exhausted = fixer
+			}
+			parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+				Exhausted: exhausted, Role: exhaustedRole, Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+				NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(3, 3),
+			})
+			if err != nil {
+				t.Fatalf("park: %v", err)
+			}
+			if got := lastBudgetHandoffSignal(t, repos, parked.ID); got != "sig-old" {
+				t.Fatalf("initial handoff signal = %q, want sig-old", got)
+			}
+			if err := RefreshReviewFixPairHandoff(context.Background(), repos, reviewer, "sig-new", nowISO); err != nil {
+				t.Fatalf("RefreshReviewFixPairHandoff: %v", err)
+			}
+			if count := countBudgetHandoffs(t, repos, parked.ID); count != 2 {
+				t.Fatalf("handoffs after signal change = %d, want 2", count)
+			}
+			if got := lastBudgetHandoffSignal(t, repos, parked.ID); got != "sig-new" {
+				t.Fatalf("refreshed handoff signal = %q, want sig-new", got)
+			}
+			if err := RefreshReviewFixPairHandoff(context.Background(), repos, reviewer, "sig-new", nowISO); err != nil {
+				t.Fatalf("idempotent refresh: %v", err)
+			}
+			if count := countBudgetHandoffs(t, repos, parked.ID); count != 2 {
+				t.Fatalf("handoffs after unchanged refresh = %d, want 2", count)
+			}
+		})
+	}
+}
+
 func TestHandoffEventIncludesBothRoleMetersAndRetriesOnReentry(t *testing.T) {
 	t.Parallel()
 	repos, nowISO := newBudgetFixture(t)
@@ -1178,3 +1261,46 @@ func seedBudgetQueue(t *testing.T, repos *storage.Repositories, nowISO, id, loop
 }
 
 func stringPtr(value string) *string { return &value }
+
+func lastBudgetHandoffPayload(t *testing.T, repos *storage.Repositories, loopID string) map[string]any {
+	t.Helper()
+	events, err := repos.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	var last storage.EventLogRecord
+	found := false
+	for i := range events {
+		if events[i].EventType == reviewFixBudgetHandoffEventType {
+			last = events[i]
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing budget handoff event")
+	}
+	payloadJSON := last.PayloadJSON
+	return parseMetadataObject(&payloadJSON)
+}
+
+func lastBudgetHandoffSignal(t *testing.T, repos *storage.Repositories, loopID string) string {
+	t.Helper()
+	payload := lastBudgetHandoffPayload(t, repos, loopID)
+	signal, _ := payload["lastReviewedSignalFingerprint"].(string)
+	return signal
+}
+
+func countBudgetHandoffs(t *testing.T, repos *storage.Repositories, loopID string) int {
+	t.Helper()
+	events, err := repos.Events.ListByEntity(context.Background(), "loop", loopID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	n := 0
+	for i := range events {
+		if events[i].EventType == reviewFixBudgetHandoffEventType {
+			n++
+		}
+	}
+	return n
+}
