@@ -316,16 +316,38 @@ func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, loop
 }
 
 // hasUnresolvedAcceptWontfixAudit is true when an unresolved Looper-authored
-// thread already carries a validated accept_wontfix audit for this head.
-// Spec §8.2: the remote audit is authority after a crash that lost the
+// thread already carries a validated accept_wontfix audit.
+// Spec §8.2: a same-head remote audit is authority after a crash that lost the
 // checkpoint cursor; Reviewer must still resolve instead of promoting the
 // signal baseline and leaving Fixer permanently withheld.
+// Spec §8.4: a later head is new adjudicated input, so an H1 accept must still
+// be re-admitted on H2 for re-adjudication rather than disappearing from both
+// roles while Fixer withholds the unresolved accept.
 func hasUnresolvedAcceptWontfixAudit(thread ReviewThread, headSHA, looperLogin string) bool {
 	if thread.IsResolved {
 		return false
 	}
-	decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, headSHA, looperLogin)
-	return ok && decision.Decision == "accept_wontfix"
+	if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, headSHA, looperLogin); ok && decision.Decision == "accept_wontfix" {
+		return true
+	}
+	return latestValidatedAuditDecision(thread, looperLogin) == "accept_wontfix"
+}
+
+// latestValidatedAuditDecision returns the newest complete Looper audit decision
+// on the thread, regardless of the audit's recorded head.
+func latestValidatedAuditDecision(thread ReviewThread, looperLogin string) string {
+	decision := ""
+	for _, comment := range thread.Comments {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
+			continue
+		}
+		fields, ok := parseThreadResolutionMarker(comment.Body)
+		if !ok || !fields.HasFeedback || fields.ThreadID != thread.ID {
+			continue
+		}
+		decision = fields.Decision
+	}
+	return decision
 }
 
 // parseFixerDeclinedMarker extracts thread/fingerprint from the exact decline marker.

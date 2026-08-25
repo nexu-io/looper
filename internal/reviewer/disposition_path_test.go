@@ -1215,6 +1215,89 @@ func (g *driftOnRefreshGateway) ListReviewThreads(ctx context.Context, in ListRe
 	return threads, nil
 }
 
+// changeHeadOnViewGateway reports a new PR head on ViewPullRequest so classify
+// can finish against the snapshot while park/refresh observes drift.
+type changeHeadOnViewGateway struct {
+	*fakeGitHubGateway
+	newHead string
+}
+
+func (g *changeHeadOnViewGateway) ViewPullRequest(ctx context.Context, in ViewPullRequestInput) (PullRequestDetail, error) {
+	detail, err := g.fakeGitHubGateway.ViewPullRequest(ctx, in)
+	if err != nil {
+		return detail, err
+	}
+	if strings.TrimSpace(g.newHead) != "" {
+		detail.HeadSHA = g.newHead
+	}
+	return detail, nil
+}
+
+func TestNeedsHumanParkRestartsWhenHeadChangesDuringClassify(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "old"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}}
+	github := &changeHeadOnViewGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"},
+		newHead:           "def456",
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed",
+		Stdout: `{"decisions":[{"threadId":"thread_1","decision":"needs_human","evidence":"ambiguous","confidence":"low"}]}`,
+	}}}
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_nh_head_drift", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), input)
+	if err == nil {
+		t.Fatal("expected head-change rediscovery instead of park")
+	}
+	if !strings.Contains(err.Error(), "PR changed during thread reconciliation") {
+		t.Fatalf("error = %v, want PR changed during thread reconciliation", err)
+	}
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
+	parked, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || parked == nil {
+		t.Fatalf("loop = (%#v, %v)", parked, getErr)
+	}
+	if loops.IsReviewScopeHumanHold(*parked) || loops.HasPendingReviewScopeHuman(*parked) {
+		t.Fatalf("must not park needs_human on stale head: meta=%s", derefString(parked.MetadataJSON))
+	}
+}
+
 func TestBudgetHeldDispositionOnlyDiscoveryEnqueues(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2556,6 +2639,92 @@ func TestKillAfterAcceptReplyResumesResolveWithoutCheckpoint(t *testing.T) {
 	}
 	if !github.reviewThreads[0].IsResolved {
 		t.Fatal("unresolved accept audit must be resolved after kill-after-reply resume")
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Resolved < 1 {
+		t.Fatalf("ThreadResolution = %#v, want resolved", checkpoint.ThreadResolution)
+	}
+}
+
+func TestAcceptAuditHeadChangeIsReadmittedForReadjudication(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	baseComments := []ReviewThreadComment{
+		{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+		{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+	}
+	base := ReviewThread{ID: "thread_1", Comments: baseComments}
+	fp := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+	if fp == "" {
+		t.Fatal("expected feedback fingerprint")
+	}
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: append(append([]ReviewThreadComment{}, baseComments...), ReviewThreadComment{
+			ID: "c3", Author: "looper-bot", Body: "accepted " + threadResolutionMarker("thread_1", "abc123", fp, "accept_wontfix"),
+			CreatedAt: "t3", UpdatedAt: "t3",
+		}),
+	}}
+	if ThreadHasChangedDispositionSignalForLogin(threads[0], "alice", "looper-bot") {
+		t.Fatal("H1 accept must keep the human directive audited")
+	}
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(threads[0], "def456", "looper-bot"); ok {
+		t.Fatal("H1 accept must not resume on H2")
+	}
+	if !hasUnresolvedAcceptWontfixAudit(threads[0], "def456", "looper-bot") {
+		t.Fatal("unresolved H1 accept must be a current-head candidate")
+	}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "def456"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed",
+		Stdout: `{"decisions":[{"threadId":"thread_1","decision":"accept_wontfix","evidence":"still outside PR scope","confidence":"high"}]}`,
+	}}}
+	fixture := newRunnerFixture(t)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"def456","lastReviewedSignalFingerprint":"stale-signal"}`
+	loop := storage.LoopRecord{
+		ID: "loop_accept_head_change", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	admitted, err := runner.hasNarrowDispositionCandidate(context.Background(), "/tmp/repo", "acme/looper", 42, "def456", "alice", "looper-bot")
+	if err != nil {
+		t.Fatalf("hasNarrowDispositionCandidate: %v", err)
+	}
+	if !admitted {
+		t.Fatal("discovery must re-admit the unresolved H1 accept after head change")
+	}
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "def456"
+	input.Checkpoint.Snapshot.HeadSHA = "def456"
+	input.Checkpoint.Worktree.HeadSHA = "def456"
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("classifier starts = %d, want 1 (re-adjudicate on H2)", len(agent.starts))
+	}
+	if len(github.addThreadReplyCalls) != 1 || !strings.Contains(github.addThreadReplyCalls[0].Body, "decision=accept_wontfix") {
+		t.Fatalf("replies = %#v, want current-head accept_wontfix", github.addThreadReplyCalls)
+	}
+	if !strings.Contains(github.addThreadReplyCalls[0].Body, "head=def456") {
+		t.Fatalf("reply = %q, want H2 audit marker", github.addThreadReplyCalls[0].Body)
+	}
+	if len(github.resolveThreadCalls) != 1 {
+		t.Fatalf("resolves = %d, want 1", len(github.resolveThreadCalls))
 	}
 	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Resolved < 1 {
 		t.Fatalf("ThreadResolution = %#v, want resolved", checkpoint.ThreadResolution)

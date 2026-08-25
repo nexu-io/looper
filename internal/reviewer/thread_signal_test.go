@@ -209,6 +209,35 @@ func TestResumeDispositionDecisionFromRemoteAudit(t *testing.T) {
 	}
 }
 
+func TestUnresolvedAcceptAuditIsReadmittedAfterHeadChange(t *testing.T) {
+	t.Parallel()
+	base := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+	)
+	fp := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+	if fp == "" {
+		t.Fatal("expected feedback fingerprint")
+	}
+	withAudit := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: threadResolutionMarker("t1", "abc", fp, "accept_wontfix")},
+	)
+	if ThreadHasChangedDispositionSignalForLogin(withAudit, "alice", "looper-bot") {
+		t.Fatal("H1 accept must keep the human directive audited")
+	}
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(withAudit, "def", "looper-bot"); ok {
+		t.Fatal("H1 accept must not resume as current-head authority")
+	}
+	if !hasUnresolvedAcceptWontfixAudit(withAudit, "def", "looper-bot") {
+		t.Fatal("unresolved H1 accept must be re-admitted on H2")
+	}
+	if latestValidatedAuditDecision(withAudit, "looper-bot") != "accept_wontfix" {
+		t.Fatal("latest complete audit must remain accept_wontfix")
+	}
+}
+
 func TestResumeRejectDoesNotSwallowPostRejectDecline(t *testing.T) {
 	t.Parallel()
 	base := looperThread("t1", false,

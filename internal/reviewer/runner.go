@@ -3506,9 +3506,29 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		resolved := false
 		skippedReason := ""
 		// needs_human on the narrow disposition path: halt pair; no remote
-		// adjudication reply. Persist local signal identity so same-head polling
+		// adjudication reply. Recheck live head and per-thread fingerprint
+		// first (§8.5) so a push during classify cannot park the pair on
+		// stale evidence. Persist local signal identity so same-head polling
 		// does not re-enqueue unchanged input (§8.4). Legacy modes may still comment.
 		if decisionValue == "needs_human" && isDisposition {
+			candidateFeedbackFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, currentLogin)
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP)
+			if err != nil {
+				checkpoint.ThreadResolution = result
+				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
+				return checkpoint, err
+			}
+			if latestThread == nil {
+				skippedReason = "candidate_no_longer_eligible"
+				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, decisionValue, strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
+				result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
+				continue
+			}
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				checkpoint.ThreadResolution = result
+				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+			}
+			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
 			result.ReviewSignalFingerprint = reviewSignalFP
 			result.ThreadFeedbackFingerprint = threadFeedbackFP
