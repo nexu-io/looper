@@ -277,9 +277,10 @@ func (r *Runtime) isStopped() bool {
 }
 
 // collectHumanAttentionLoopIDs returns loop IDs that may need human-attention
-// observation after recovery: durable awaiting_human loop status, and latest
-// queue rows parked as manual_intervention. notifyDurableHumanAttention applies
-// the hard-condition filter and permanent entry dedupe.
+// observation after recovery: durable awaiting_human loop status, no-HITL
+// review-fix budget exhausted pauses, and latest queue rows parked as
+// manual_intervention. notifyDurableHumanAttention applies the hard-condition
+// filter and permanent entry dedupe.
 func collectHumanAttentionLoopIDs(ctx context.Context, repos *storage.Repositories) []string {
 	if repos == nil {
 		return nil
@@ -298,10 +299,19 @@ func collectHumanAttentionLoopIDs(ctx context.Context, repos *storage.Repositori
 		ids = append(ids, id)
 	}
 	if repos.Loops != nil {
-		loops, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusAwaitingHuman)})
+		awaiting, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusAwaitingHuman)})
 		if err == nil {
-			for _, loop := range loops {
+			for _, loop := range awaiting {
 				add(loop.ID)
+			}
+		}
+		// No-HITL budget exhausted holds are paused (not awaiting_human).
+		paused, err := repos.Loops.ListByStatuses(ctx, []string{string(domain.LoopStatusPaused)})
+		if err == nil {
+			for _, loop := range paused {
+				if loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) {
+					add(loop.ID)
+				}
 			}
 		}
 	}
@@ -346,6 +356,28 @@ func notifyDurableHumanAttention(ctx context.Context, gateway *notify.Gateway, r
 			RunID:      latestRunID(ctx, repos, loop.ID),
 			LoopType:   loop.Type,
 			Reason:     notify.HumanAttentionAwaitingHuman,
+			EntryKey:   entryKey,
+			Subtitle:   humanAttentionSubtitle(*loop),
+			EntityType: "loop",
+			EntityID:   loop.ID,
+		})
+		return
+	}
+
+	// No-HITL review-fix budget exhausted: paused + review_fix_budget_exhausted.
+	// Sibling-only pause does not notify separately (exhausted role notifies).
+	if loop.Status == string(domain.LoopStatusPaused) && loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) {
+		entryKey := humanAttentionEntryKeyForReviewFixBudget(*loop)
+		if entryKey == "" {
+			return
+		}
+		gateway.NotifyHumanAttention(ctx, notify.HumanAttentionInput{
+			ProjectID:  loop.ProjectID,
+			LoopID:     loop.ID,
+			LoopSeq:    loop.Seq,
+			RunID:      latestRunID(ctx, repos, loop.ID),
+			LoopType:   loop.Type,
+			Reason:     notify.HumanAttentionReviewFixBudget,
 			EntryKey:   entryKey,
 			Subtitle:   humanAttentionSubtitle(*loop),
 			EntityType: "loop",
@@ -417,6 +449,17 @@ func humanAttentionEntryKeyForAwaitingHuman(ctx context.Context, repos *storage.
 		return "loop:" + loop.ID + ":" + updated
 	}
 	return "loop:" + loop.ID
+}
+
+func humanAttentionEntryKeyForReviewFixBudget(loop storage.LoopRecord) string {
+	state := loops.ReadReviewFixBudgetState(loop.MetadataJSON)
+	if at := strings.TrimSpace(state.HandoffEventAt); at != "" {
+		return "budget:" + loop.ID + ":" + at
+	}
+	if updated := strings.TrimSpace(loop.UpdatedAt); updated != "" {
+		return "budget:" + loop.ID + ":" + updated
+	}
+	return "budget:" + loop.ID
 }
 
 func humanAttentionEntryKeyForManualIntervention(queue storage.QueueItemRecord) string {

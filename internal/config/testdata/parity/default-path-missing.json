@@ -219,7 +219,7 @@
               "minPublishIntervalSeconds": 300,
               "maxIterationsPerPR": 20,
               "maxIterationsPerHead": 1,
-              "maxPublishesPerPR": 8,
+              "maxPublishesPerPR": 3,
               "maxWallClockSeconds": 0,
               "maxConsecutiveFailures": 3,
               "maxAgentExecutionsPerPR": 25,
@@ -281,7 +281,7 @@
           "behavior": {
             "loop": {
               "quietPeriodSeconds": 0,
-              "maxPushesPerPR": 8
+              "maxPushesPerPR": 3
             }
           }
         },

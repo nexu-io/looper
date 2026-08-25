@@ -2152,14 +2152,101 @@ func TestParkReviewerBudgetIfExhaustedParksSibling(t *testing.T) {
 	}
 }
 
-func TestParkReviewerBudgetIfExhaustedSkipsWhenHITLDisabled(t *testing.T) {
+func TestParkReviewerBudgetIfExhaustedDoesNotNotifyHumanAttention(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
 	reviewerTarget := "pr:acme/looper:42"
-	metadata := `{"loop":{"iterationCount":8}}`
+	metadata := `{"loop":{"iterationCount":3}}`
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_notify", Seq: 11, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+	var notified []string
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		NotifyHumanAttention: func(_ context.Context, loopID string) {
+			notified = append(notified, loopID)
+		},
+	})
+	parked, err := runner.parkReviewerBudgetIfExhausted(context.Background(), reviewer)
+	if err != nil || !parked {
+		t.Fatalf("parkReviewerBudgetIfExhausted() = (%v, %v), want parked", parked, err)
+	}
+	if len(notified) != 0 {
+		t.Fatalf("NotifyHumanAttention = %#v, want none from shared park", notified)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || updated == nil || !loops.IsReviewFixBudgetHold(*updated) {
+		t.Fatalf("reviewer after park = (%#v, %v), want still held", updated, err)
+	}
+}
+
+func TestReviewerDiscoveryParkNotifiesHumanAttention(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	reviewerTarget := "pr:acme/looper:42"
+	// Exhausted automatic loop — discovery enqueue should park and notify.
+	metadata := `{"loop":{"iterationCount":3,"enabled":true}}`
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_disc_notify", Seq: 12, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID = (%v, %v)", project, err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+	var notified []string
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		NotifyHumanAttention: func(_ context.Context, loopID string) {
+			notified = append(notified, loopID)
+		},
+	})
+	result := &DiscoveryResult{}
+	login := ""
+	err = runner.enqueueReviewerDiscoveryCandidate(context.Background(), *project, repo, DiscoveryPolicy{AutoDiscovery: true, RequireReviewRequest: false, EnableSelfReview: true}, &login, PullRequestSummary{Number: prNumber, HeadSHA: "new-head-for-discovery", State: "OPEN"}, &reviewer, false, result)
+	if err != nil {
+		t.Fatalf("enqueueReviewerDiscoveryCandidate() error = %v", err)
+	}
+	if result.Skipped == 0 {
+		t.Fatalf("discovery result = %#v, want skipped after budget park", result)
+	}
+	if len(notified) != 1 || notified[0] != reviewer.ID {
+		t.Fatalf("NotifyHumanAttention = %#v, want [%q] from discovery park", notified, reviewer.ID)
+	}
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || updated == nil || !loops.IsReviewFixBudgetHold(*updated) {
+		t.Fatalf("reviewer after discovery = (%#v, %v), want held", updated, err)
+	}
+}
+
+func TestParkReviewerBudgetIfExhaustedParksWhenHITLDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	reviewerTarget := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":3}}`
 	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_no_hitl", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	fixer := storage.LoopRecord{ID: "loop_fixer_budget_no_hitl", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &reviewerTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
@@ -2175,18 +2262,22 @@ func TestParkReviewerBudgetIfExhaustedSkipsWhenHITLDisabled(t *testing.T) {
 	if cfg.HITL.Enabled {
 		t.Fatal("DefaultConfig HITL.Enabled = true, want false")
 	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg})
 	parked, err := runner.parkReviewerBudgetIfExhausted(context.Background(), reviewer)
-	if err != nil || parked {
-		t.Fatalf("parkReviewerBudgetIfExhausted() = (%v, %v), want skipped under default HITL-off config", parked, err)
+	if err != nil || !parked {
+		t.Fatalf("parkReviewerBudgetIfExhausted() = (%v, %v), want no-HITL paired park", parked, err)
 	}
 	updated, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
-	if err != nil || updated == nil || updated.Status != "running" {
-		t.Fatalf("reviewer = (%#v, %v), want still running", updated, err)
+	if err != nil || updated == nil || updated.Status != "paused" || !loops.IsReviewFixBudgetExhaustedPause(updated.MetadataJSON) {
+		t.Fatalf("reviewer = (%#v, %v), want paused review_fix_budget_exhausted", updated, err)
+	}
+	if _, ok := loops.ReadHITLAsk(updated.MetadataJSON); ok {
+		t.Fatal("no-HITL park must not write a HITL ask")
 	}
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
-	if err != nil || sibling == nil || sibling.Status != "queued" {
-		t.Fatalf("fixer sibling = (%#v, %v), want still queued", sibling, err)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("fixer sibling = (%#v, %v), want paired budget pause", sibling, err)
 	}
 }
 
@@ -2219,6 +2310,152 @@ func TestParkReviewerBudgetIfExhaustedCompletesSiblingAfterPartialPark(t *testin
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		t.Fatalf("fixer sibling = (%#v, %v), want paused after reconcile", sibling, err)
+	}
+}
+
+func TestReviewerDiscoveryDoesNotReviveSiblingPausedReviewer(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	// Fixer exhausted; Reviewer sibling-paused with unused budget.
+	fixerMeta := `{"reviewFixBudget":{"pushCount":1,"exhaustedBy":"fixer","pauseReason":"review_fix_budget_exhausted"},"pauseReason":"review_fix_budget_exhausted"}`
+	reviewerMeta := `{"loop":{"iterationCount":0},"reviewFixBudget":{"siblingOf":"fixer","pauseReason":"sibling_review_fix_budget"},"pauseReason":"sibling_review_fix_budget"}`
+	fixer := storage.LoopRecord{ID: "loop_fix_exh_disc", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &fixerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	reviewer := storage.LoopRecord{ID: "loop_rev_sib_disc", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg})
+
+	if err := runner.markLoopQueuedForReview(context.Background(), reviewer, nowISO); err != nil {
+		t.Fatalf("markLoopQueuedForReview: %v", err)
+	}
+	after, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || after == nil || after.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(after.MetadataJSON) {
+		t.Fatalf("reviewer after mark = (%#v, %v), want still sibling-paused", after, err)
+	}
+	// Discovery hold check must also skip.
+	if !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatal("sibling-paused reviewer must be a budget hold")
+	}
+	parked, err := runner.parkReviewerBudgetIfExhausted(context.Background(), *after)
+	if err != nil || !parked {
+		t.Fatalf("parkReviewerBudgetIfExhausted sibling = (%v, %v), want held", parked, err)
+	}
+}
+
+func TestRefusePublishIfBudgetExhaustedAtLiveCap(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"loop":{"iterationCount":2}}`
+	loop := storage.LoopRecord{ID: "loop_pub_refuse", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 2
+	cfg.HITL.Enabled = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg, GitHub: &fakeGitHubGateway{viewState: "OPEN"}})
+	refused, err := runner.refusePublishIfBudgetExhausted(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    loop, Repo: repo, PRNumber: prNumber,
+	})
+	if !refused {
+		t.Fatalf("refused=%v err=%v, want refused at live cap", refused, err)
+	}
+	if err != nil {
+		var hold *holdSkipError
+		if !errors.As(err, &hold) {
+			t.Fatalf("error = %v, want holdSkipError", err)
+		}
+	}
+	after, _ := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if after == nil || !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("after refuse = %#v, want budget hold", after)
+	}
+}
+
+func TestRefusePublishIfBudgetExhaustedFailsClosedOnLedgerRead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	// Under the live cap: swallowing GetByID would admit the stale snapshot.
+	metadata := `{"loop":{"iterationCount":0}}`
+	loop := storage.LoopRecord{ID: "loop_pub_ledger_fail", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 2
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg, GitHub: &fakeGitHubGateway{viewState: "OPEN"}})
+	if err := fixture.coordinator.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	refused, err := runner.refusePublishIfBudgetExhausted(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    loop, Repo: repo, PRNumber: prNumber,
+	})
+	if err == nil {
+		t.Fatalf("refused=%v err=%v, want fail closed on ledger read", refused, err)
+	}
+	if !refused {
+		t.Fatalf("refused=%v, want true when ledger refresh fails", refused)
+	}
+}
+
+func TestFinishHeldReviewerQueueItemPreservesBudgetHold(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	projectID := "project_1"
+	holdMeta := `{"loop":{"iterationCount":0},"reviewFixBudget":{"siblingOf":"fixer","pauseReason":"sibling_review_fix_budget"},"pauseReason":"sibling_review_fix_budget"}`
+	loop := storage.LoopRecord{ID: "loop_held_finish", Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &holdMeta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_held_finish", ProjectID: &projectID, LoopID: &loop.ID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:held-finish", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	result, err := runner.finishHeldReviewerQueueItem(context.Background(), loop, nil, queue, reviewerCheckpoint{}, "Reviewer stopped because review-fix budget is held")
+	if err != nil {
+		t.Fatalf("finishHeldReviewerQueueItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+	after, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || after == nil || after.Status != "paused" || !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("reviewer after finish = (%#v, %v), want still sibling-paused hold", after, err)
 	}
 }
 
@@ -8247,7 +8484,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"do not write or publish a bare LGTM review body",
 		"Group related findings by file, subsystem, function, or rule",
 		"fixture-matrix tests",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT`",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --reviewer-run-id run_1 --clean-review-event APPROVE --blocking-review-event COMMENT`",
 		"wrapper validates inline anchors against the live PR diff before it calls GitHub",
 		"Review pass contract",
 		"Do not stop after the first issue",
@@ -8283,7 +8520,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"ANSI escape sequences",
 		"file-read traces",
 		"submit exactly one APPROVE review through the trusted Looper CLI wrapper with `outcome=clean`, no inline `comments`, and no extra PR conversation comment",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123 --clean-review-event APPROVE --blocking-review-event COMMENT`",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event APPROVE --commit-id abc123 --reviewer-run-id run_1 --clean-review-event APPROVE --blocking-review-event COMMENT`",
 		"never use an LGTM, empty, or disclosure-only clean body as a fallback",
 		"visible body must start with `@<PR-author-login>`",
 		"briefly summarize what changed or what you verified",
@@ -8462,7 +8699,7 @@ func TestBuildReviewPromptRestrictsExistingMarkerSkipWhenApprovalsDisallowed(t *
 	for _, want := range []string{
 		"only treat an existing `outcome=clean` marker as satisfied when it is on a COMMENTED review if clean policy is COMMENT",
 		"Treat `outcome=non_blocking` or legacy `outcome=actionable` markers as satisfied only when they are on a COMMENTED review",
-		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --clean-review-event COMMENT --blocking-review-event COMMENT",
+		"'/opt/looper/bin/looper' review submit acme/looper#42 --event COMMENT --commit-id abc123 --reviewer-run-id run_1 --clean-review-event COMMENT --blocking-review-event COMMENT",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -9304,6 +9541,18 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 	}
 	if !strings.Contains(prompt, "does not require a current-user review request") {
 		t.Fatalf("prompt missing disabled review-request instruction:\n%s", prompt)
+	}
+}
+
+func TestBuildReviewPromptBindsAutomaticReviewerRunID(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_auto", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	if !strings.Contains(prompt, "--reviewer-run-id run_auto") {
+		t.Fatalf("automatic prompt missing --reviewer-run-id:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "--reviewer-manual") {
+		t.Fatalf("automatic prompt included --reviewer-manual:\n%s", prompt)
 	}
 }
 

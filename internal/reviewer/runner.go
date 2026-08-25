@@ -487,6 +487,9 @@ type Options struct {
 	CommentOnlyPublish      bool
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
+	// NotifyHumanAttention, when set, observes durable loop state after a new
+	// review-fix budget park (including discovery-time parks before claim).
+	NotifyHumanAttention func(context.Context, string)
 }
 
 type DiscoveryPolicy struct {
@@ -537,6 +540,7 @@ type Runner struct {
 	commentOnlyPublish      bool
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
+	notifyHumanAttention    func(context.Context, string)
 }
 
 type DiscoveryInput struct {
@@ -777,6 +781,7 @@ func New(options Options) *Runner {
 		commentOnlyPublish:      options.CommentOnlyPublish,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
+		notifyHumanAttention:    options.NotifyHumanAttention,
 	}
 }
 
@@ -1072,9 +1077,21 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		result.Skipped++
 		return nil
 	}
+	// Sibling pause / exhausted hold must not be revived by discovery enqueue.
+	// Notify only from discovery after a successful park (not from shared park).
+	if loops.IsReviewFixBudgetHold(loopResult.record) {
+		if parked, err := r.parkReviewerBudgetIfExhausted(ctx, loopResult.record); err != nil {
+			return err
+		} else if parked {
+			r.notifyHumanAttentionBestEffort(ctx, loopResult.record.ID)
+		}
+		result.Skipped++
+		return nil
+	}
 	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, loopResult.record); err != nil {
 		return err
 	} else if parked {
+		r.notifyHumanAttentionBestEffort(ctx, loopResult.record.ID)
 		result.Skipped++
 		return nil
 	}
@@ -3132,6 +3149,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-published review for head %s", pending.HeadSHA)
 		return checkpoint, nil
 	}
+	// Admission at the mutation seam: refuse a counted publish when already at
+	// the live cap (observe mid-run cap lowers). PR-closed still wins later.
+	if refused, err := r.refusePublishIfBudgetExhausted(ctx, input); refused || err != nil {
+		return checkpoint, err
+	}
 	if pending.CleanNoop {
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 		if err != nil {
@@ -3361,8 +3383,14 @@ func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.L
 		return ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		updated.Status = "queued"
 		updated.LastRunAt = stringPtr(r.nowISO())
+		// Do not revive a review-fix budget hold (or other terminal park) that
+		// the step already persisted — only ordinary label/hold skips re-queue.
+		if loops.IsReviewFixBudgetHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
+			updated.NextRunAt = nil
+			return
+		}
+		updated.Status = "queued"
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
@@ -4632,7 +4660,7 @@ func isValidBlockingReviewEvent(value string) bool {
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+	updated, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		previous, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
 		if err != nil {
@@ -4646,11 +4674,60 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 			metadataJSON = counted
 		}
 		updated.MetadataJSON = stringPtr(metadataJSON)
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
+	// After a successful counted increment, park immediately when now exhausted.
+	if r.shouldCreateReviewerBudgetPark(updated) {
+		if r.livePullRequestClosed(ctx, input.Project, input.Repo, input.PRNumber) {
+			return nil
+		}
+		if _, parkErr := r.parkReviewerBudgetIfExhausted(ctx, updated); parkErr != nil {
+			return parkErr
+		}
+	}
 	return nil
+}
+
+// refusePublishIfBudgetExhausted parks and skips when the loop already sits at
+// the live publish cap before a counted mutation. Returns refused=true when the
+// publish must not proceed.
+func (r *Runner) refusePublishIfBudgetExhausted(ctx context.Context, input stepInput) (bool, error) {
+	loop := input.Loop
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return true, err
+		}
+		if fresh != nil {
+			loop = *fresh
+		}
+	}
+	if !loops.ParticipatesInReviewFixBudget(loop) {
+		return false, nil
+	}
+	if loops.IsReviewFixBudgetHold(loop) {
+		if _, err := r.parkReviewerBudgetIfExhausted(ctx, loop); err != nil {
+			return true, err
+		}
+		return true, &holdSkipError{summary: "Reviewer stopped because review-fix budget is held"}
+	}
+	cap := r.maxPublishesPerPR(loop.ProjectID)
+	if !loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), cap) {
+		return false, nil
+	}
+	if r.livePullRequestClosed(ctx, input.Project, input.Repo, input.PRNumber) {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return true, err
+		}
+		return true, &holdSkipError{summary: "Reviewer stopped because pull request is closed"}
+	}
+	if _, err := r.parkReviewerBudgetIfExhausted(ctx, loop); err != nil {
+		return true, err
+	}
+	return true, &holdSkipError{summary: "Reviewer stopped because review-fix publish budget is exhausted"}
 }
 
 type eventInput struct {
@@ -5122,6 +5199,10 @@ func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopR
 		return nil
 	}
 	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		// Never flip a budget hold (exhausted or sibling pause) back to queued.
+		if loops.IsReviewFixBudgetHold(*updated) {
+			return
+		}
 		if active, activeErr := r.hasActiveRunningRun(ctx, updated.ID); activeErr == nil && active {
 			updated.Status = "running"
 			updated.NextRunAt = nil
@@ -6253,7 +6334,7 @@ func (r *Runner) reviewFixHITLEnabled() bool {
 }
 
 func (r *Runner) shouldParkReviewerBudget(loop storage.LoopRecord, checkpoint reviewerCheckpoint) bool {
-	if !r.reviewFixHITLEnabled() || isManualReviewerLoop(loop) || checkpoint.SkipReason != "" || checkpoint.PendingReview == nil {
+	if !loops.ParticipatesInReviewFixBudget(loop) || checkpoint.SkipReason != "" || checkpoint.PendingReview == nil {
 		return false
 	}
 	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
@@ -6277,7 +6358,10 @@ func (r *Runner) shouldCreateReviewerBudgetPark(loop storage.LoopRecord) bool {
 	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
 		return false
 	}
-	if !r.reviewFixHITLEnabled() || isManualReviewerLoop(loop) {
+	if loop.Status == "paused" && loops.IsReviewFixBudgetHold(loop) {
+		return false
+	}
+	if !loops.ParticipatesInReviewFixBudget(loop) {
 		return false
 	}
 	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
@@ -6300,15 +6384,19 @@ func (r *Runner) parkReviewerBudgetIfExhausted(ctx context.Context, loop storage
 	if loop.Status == "terminated" || loop.Status == "stopped" {
 		return false, nil
 	}
+	// Sibling pause is already a hold; finish cancel/sibling work on re-entry
+	// but do not treat "not self-exhausted" as permission to proceed.
+	if loop.Status == "paused" && loops.IsSiblingReviewFixBudgetPause(loop.MetadataJSON) {
+		return true, nil
+	}
 	if loop.Status == "awaiting_human" {
 		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
 			return true, nil
 		}
+	} else if loop.Status == "paused" && loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) {
+		// Re-enter no-ask hold to finish cancel/sibling park / handoff event.
 	} else {
-		if !r.reviewFixHITLEnabled() {
-			return false, nil
-		}
-		if isManualReviewerLoop(loop) {
+		if !loops.ParticipatesInReviewFixBudget(loop) {
 			return false, nil
 		}
 		if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
@@ -6320,16 +6408,39 @@ func (r *Runner) parkReviewerBudgetIfExhausted(ctx context.Context, loop storage
 		}
 	}
 	cap := r.maxPublishesPerPR(loop.ProjectID)
+	count := loops.ReviewerPublishCount(loop.MetadataJSON)
+	fixerCap := 0
+	if r.projectRoleConfig != nil {
+		fixerCap = config.ProjectRoleConfigs(*r.projectRoleConfig, loop.ProjectID).Fixer.Behavior.Loop.MaxPushesPerPR
+	}
 	_, err := loops.ParkReviewFixBudget(ctx, r.repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: loop,
-		Role:      "reviewer",
-		Repo:      derefString(loop.Repo),
-		PRNumber:  derefInt64(loop.PRNumber),
-		Count:     loops.ReviewerPublishCount(loop.MetadataJSON),
-		Cap:       cap,
-		NowISO:    r.nowISO(),
+		Exhausted:   loop,
+		Role:        "reviewer",
+		Repo:        derefString(loop.Repo),
+		PRNumber:    derefInt64(loop.PRNumber),
+		Count:       count,
+		Cap:         cap,
+		NowISO:      r.nowISO(),
+		HITLEnabled: r.reviewFixHITLEnabled(),
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{
+			ReviewerMaxPublishes: cap,
+			FixerMaxPushes:       fixerCap,
+		},
+		DB: r.db,
 	})
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	// Notify is owned by discovery call sites (and scheduler post-claim), not
+	// shared park — in-run parks must not notify before queue finalization.
+	return true, nil
+}
+
+func (r *Runner) notifyHumanAttentionBestEffort(ctx context.Context, loopID string) {
+	if r.notifyHumanAttention == nil || strings.TrimSpace(loopID) == "" {
+		return
+	}
+	r.notifyHumanAttention(ctx, loopID)
 }
 
 func terminalReviewerLoopReason(loop storage.LoopRecord) string {
@@ -6790,8 +6901,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	specLabelInstruction := "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after it validates a matching APPROVED clean review marker for the current head."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
 	reviewerModeFlag := ""
+	if strings.TrimSpace(runID) != "" {
+		reviewerModeFlag = fmt.Sprintf(" --reviewer-run-id %s", runID)
+	}
 	if manual {
-		reviewerModeFlag = fmt.Sprintf(" --reviewer-manual --reviewer-run-id %s", runID)
+		reviewerModeFlag = " --reviewer-manual" + reviewerModeFlag
 	}
 	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" && !(autoMergeEnabled && phase != "spec") {

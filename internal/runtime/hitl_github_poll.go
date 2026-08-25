@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -356,6 +358,10 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 // is the exception: only Continue/Stop may unpark, and they apply the budget
 // decision instead of enqueueing conversational text.
 func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
+	return enqueueHumanMessageToLoopWithCaps(ctx, repos, nil, nowISO, loopID, text, reviewFixBudgetLiveCaps(nil, ""))
+}
+
+func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, text string, caps loops.ReviewFixBudgetLiveCaps) error {
 	// Share process-wide requeue exclusion with API discard+retry so free-text
 	// inbox delivery cannot requeue paused/waiting/manual_intervention loops
 	// between discard preflight and git reset (see LockLoopRequeue).
@@ -377,13 +383,11 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
 
-	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
-		// Budget holds are Continue/Stop decisions, not conversational inbox
-		// turns. A typed Feishu reply must not flip awaiting_human to queued
-		// without resetting the counter or unpausing the sibling.
+	// Budget holds (HITL ask or no-ask exhausted/sibling pause) are never
+	// conversational inbox turns. Only explicit Continue/Stop may unpark.
+	if loops.IsReviewFixBudgetHold(*loop) {
 		if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
-			_, err = loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, text, nowISO)
-			return err
+			return applyReviewFixBudgetAnswerTX(ctx, db, repos, *loop, text, nowISO, caps)
 		}
 		return nil
 	}
@@ -411,7 +415,44 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	return err
 }
 
+func reviewFixBudgetLiveCaps(cfg *config.Config, projectID string) loops.ReviewFixBudgetLiveCaps {
+	if cfg == nil {
+		return loops.ReviewFixBudgetLiveCaps{
+			ReviewerMaxPublishes: config.DefaultReviewFixBudgetCap,
+			FixerMaxPushes:       config.DefaultReviewFixBudgetCap,
+		}
+	}
+	roles := config.ProjectRoleConfigs(*cfg, projectID)
+	return loops.ReviewFixBudgetLiveCaps{
+		ReviewerMaxPublishes: roles.Reviewer.Behavior.Loop.MaxPublishesPerPR,
+		FixerMaxPushes:       roles.Fixer.Behavior.Loop.MaxPushesPerPR,
+	}
+}
+
+func applyReviewFixBudgetAnswerTX(ctx context.Context, db *sql.DB, repos *storage.Repositories, loop storage.LoopRecord, answer, nowISO string, caps loops.ReviewFixBudgetLiveCaps) error {
+	if db != nil {
+		return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+			txRepos := storage.NewRepositories(tx)
+			fresh, err := txRepos.Loops.GetByID(ctx, loop.ID)
+			if err != nil {
+				return err
+			}
+			if fresh == nil {
+				return nil
+			}
+			_, err = loops.ApplyReviewFixBudgetAnswer(ctx, txRepos, *fresh, answer, nowISO, caps)
+			return err
+		})
+	}
+	_, err := loops.ApplyReviewFixBudgetAnswer(ctx, repos, loop, answer, nowISO, caps)
+	return err
+}
+
 func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
+	return deliverHITLAnswerToLoopWithCaps(ctx, repos, nil, nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
+}
+
+func deliverHITLAnswerToLoopWithCaps(ctx context.Context, repos *storage.Repositories, db *sql.DB, nowISO, loopID, answer string, caps loops.ReviewFixBudgetLiveCaps) error {
 	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
 	unlock := LockLoopRequeue(loopID)
 	defer unlock()
@@ -420,18 +461,21 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	if err != nil || loop == nil {
 		return err
 	}
-	if loop.Status != "awaiting_human" {
+	if loop.Status != "awaiting_human" && !loops.IsReviewFixBudgetHold(*loop) {
 		return nil
 	}
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
+	if loops.IsReviewFixBudgetHold(*loop) {
+		// Budget Continue/Stop (HITL ask or no-ask hold) — fail-closed TX when DB set.
+		return applyReviewFixBudgetAnswerTX(ctx, db, repos, *loop, answer, nowISO, caps)
+	}
+	if loop.Status != "awaiting_human" {
+		return nil
+	}
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok {
 		return nil
-	}
-	if loops.IsReviewFixBudgetAsk(ask) {
-		_, err = loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO)
-		return err
 	}
 	ask.Answer = answer
 	ask.Status = "answered"
@@ -556,7 +600,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return out, nil
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
+			return deliverHITLAnswerToLoopWithCaps(ctx, input.Repos, input.DB, nowISO, loopID, answer, reviewFixBudgetLiveCaps(input.Config, project.ID))
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
 			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})

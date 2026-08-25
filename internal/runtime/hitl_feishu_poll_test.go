@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worker"
@@ -101,7 +102,7 @@ func TestFeishuHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 	}
 
 	parked, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
@@ -152,7 +153,7 @@ func TestFeishuHITLPollDeliversAndContinuesReviewFixBudget(t *testing.T) {
 			return ""
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
 		},
 	})
 	if n != 1 || maxID != 20 {
@@ -219,7 +220,7 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 	}
 
 	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO,
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 8, Cap: 8, NowISO: nowISO, HITLEnabled: true,
 	}); err != nil {
 		t.Fatalf("ParkReviewFixBudget() error = %v", err)
 	}
@@ -244,12 +245,12 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 			return ""
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueFeishuHITLMessage(ctx, repos, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
+			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
 				resolved = append(resolved, answeredLoopID+"="+answer)
 			})
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
 		},
 	}
 
@@ -293,6 +294,127 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 	}
 	if len(resolved) != 1 || resolved[0] != reviewer.ID+"=Continue" {
 		t.Fatalf("card resolution after typed Continue = %#v, want reviewer Continue", resolved)
+	}
+}
+
+func TestFeishuContinueUsesLiveProjectCaps(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_budget_feishu_caps"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Budget", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	// Reviewer at 2/2 (exhausted); fixer at 1/5 (under cap).
+	reviewerMeta := `{"loop":{"iterationCount":2}}`
+	fixerMeta := `{"reviewFixBudget":{"pushCount":1}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_feishu_caps_rev", Seq: 91, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &reviewerMeta,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_feishu_caps_fix", Seq: 92, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &fixerMeta,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 2, Cap: 2, NowISO: nowISO, HITLEnabled: true,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 2, FixerMaxPushes: 5},
+	}); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 2
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 5
+
+	if err := deliverHITLAnswerToLoopWithCaps(context.Background(), repos, coordinator.DB(), nowISO, reviewer.ID, "Continue", reviewFixBudgetLiveCaps(&cfg, projectID)); err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	fresh, _ := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if fresh == nil || fresh.Status != "queued" || loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("reviewer after Continue = %#v, want queued with reset meter", fresh)
+	}
+	sibling, _ := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if sibling == nil || sibling.Status != "queued" || loops.FixerPushCount(sibling.MetadataJSON) != 1 {
+		t.Fatalf("fixer after Continue = %#v, want queued with preserved pushCount 1", sibling)
+	}
+}
+
+func TestGenericMessageDoesNotQueueNoAskBudgetHold(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_budget_noask_msg"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Budget", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewerMeta := `{"loop":{"iterationCount":3}}`
+	reviewer := storage.LoopRecord{
+		ID: "loop_noask_msg_rev", Seq: 101, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &reviewerMeta,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := loops.ParkReviewFixBudget(context.Background(), repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+	}); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+	// Generic message must not queue a no-ask hold.
+	if err := enqueueHumanMessageToLoop(context.Background(), repos, nowISO, reviewer.ID, "please look at this"); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	fresh, _ := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if fresh == nil || fresh.Status != "paused" || !loops.IsReviewFixBudgetExhaustedPause(fresh.MetadataJSON) {
+		t.Fatalf("after generic message = %#v, want still paused exhausted hold", fresh)
+	}
+	if loops.ReviewerPublishCount(fresh.MetadataJSON) != 3 {
+		t.Fatalf("publish count = %d, want unchanged 3", loops.ReviewerPublishCount(fresh.MetadataJSON))
 	}
 }
 

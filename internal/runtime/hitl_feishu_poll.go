@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -170,16 +172,22 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 // an explicit budget Continue/Stop, invokes onAnswered so the live ask card is
 // marked resolved. Card-action delivery already does this; typed decisions must
 // too, or the cached loop-seq buttons can answer a later budget cycle.
-func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string, onAnswered func(context.Context, string, string)) error {
+func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, text string, onAnswered func(context.Context, string, string)) error {
 	shouldResolve := false
-	if repos != nil && repos.Loops != nil && (loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text)) {
+	caps := reviewFixBudgetLiveCaps(cfg, "")
+	if repos != nil && repos.Loops != nil {
 		if loop, err := repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
-			if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
-				shouldResolve = true
+			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
+			if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
+				if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+					shouldResolve = true
+				} else if loops.IsReviewFixBudgetHold(*loop) {
+					shouldResolve = true
+				}
 			}
 		}
 	}
-	if err := enqueueHumanMessageToLoop(ctx, repos, nowISO, loopID, text); err != nil {
+	if err := enqueueHumanMessageToLoopWithCaps(ctx, repos, db, nowISO, loopID, text, caps); err != nil {
 		return err
 	}
 	if shouldResolve && onAnswered != nil {
@@ -277,7 +285,11 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return loop.ID
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			if err := deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer); err != nil {
+			caps := reviewFixBudgetLiveCaps(input.Config, "")
+			if loop, err := input.Repos.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
+				caps = reviewFixBudgetLiveCaps(input.Config, loop.ProjectID)
+			}
+			if err := deliverHITLAnswerToLoopWithCaps(ctx, input.Repos, input.DB, nowISO, loopID, answer, caps); err != nil {
 				return err
 			}
 			// Mark the ask card resolved ("✅ 已选:X", brief preserved).
@@ -287,7 +299,7 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return nil
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueFeishuHITLMessage(ctx, input.Repos, nowISO, loopID, text, input.OnHITLAnswerDelivered)
+			return enqueueFeishuHITLMessage(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, text, input.OnHITLAnswerDelivered)
 		},
 	}
 	if input.Logger != nil {

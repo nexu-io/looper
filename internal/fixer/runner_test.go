@@ -79,6 +79,134 @@ func TestBackoffDelayCapsInfiniteRetryOverflow(t *testing.T) {
 	}
 }
 
+func TestRefusePushIfBudgetExhaustedDoesNotResolveComments(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	// Already at cap before push.
+	meta := `{"reviewFixBudget":{"pushCount":1}}`
+	fixer := storage.LoopRecord{ID: "loop_push_refuse", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	cfg.HITL.Enabled = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: false, GitHub: &fakeGitHubGateway{}})
+	refused, err := runner.refusePushIfBudgetExhausted(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    fixer, Repo: repo, PRNumber: prNumber,
+	})
+	if !refused {
+		t.Fatalf("refused=%v err=%v, want refused at live cap", refused, err)
+	}
+	after, _ := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if after == nil || !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("after refuse = %#v, want budget hold", after)
+	}
+}
+
+func TestRefusePushIfBudgetExhaustedFailsClosedOnLedgerRead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	// Under the live cap: swallowing GetByID would admit the stale snapshot.
+	meta := `{"reviewFixBudget":{"pushCount":0}}`
+	fixer := storage.LoopRecord{ID: "loop_push_ledger_fail", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: false, GitHub: &fakeGitHubGateway{}})
+	if err := fixture.coordinator.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	refused, err := runner.refusePushIfBudgetExhausted(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    fixer, Repo: repo, PRNumber: prNumber,
+	})
+	if err == nil {
+		t.Fatalf("refused=%v err=%v, want fail closed on ledger read", refused, err)
+	}
+	if !refused {
+		t.Fatalf("refused=%v, want true when ledger refresh fails", refused)
+	}
+}
+
+func TestEnsureFixerPushBudgetCountedParksWhenCapReached(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	// Cap 1, count 0 — after increment should park and return hold skip.
+	// Prior head must not win over the just-pushed head on handoff.
+	meta := `{"reviewFixBudget":{"pushCount":0},"lastFixHeadSha":"previous-head"}`
+	fixer := storage.LoopRecord{ID: "loop_push_count_park", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	run := storage.RunRecord{ID: "run_push_count_park", LoopID: fixer.ID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	cfg.HITL.Enabled = false
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: false, GitHub: &fakeGitHubGateway{}})
+	pushedHead := "cap-reach-head-sha"
+	checkpoint := fixerCheckpoint{Push: &checkpointPush{Pushed: true, BudgetCounted: false, HeadSHA: pushedHead, Evidence: &fixEvidence{HeadSHA: pushedHead}}}
+	_, err = runner.ensureFixerPushBudgetCounted(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    fixer, Run: run, Repo: repo, PRNumber: prNumber,
+	}, checkpoint)
+	var hold *holdSkipError
+	if err == nil || !errors.As(err, &hold) {
+		t.Fatalf("err = %v, want holdSkipError after cap-reaching push", err)
+	}
+	after, _ := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if after == nil || !loops.IsReviewFixBudgetHold(*after) || loops.FixerPushCount(after.MetadataJSON) != 1 {
+		t.Fatalf("after count+park = %#v, want held with pushCount 1", after)
+	}
+	if after.MetadataJSON == nil || !strings.Contains(*after.MetadataJSON, `"lastFixHeadSha":"`+pushedHead+`"`) {
+		t.Fatalf("lastFixHeadSha missing/stale after cap park: %v", after.MetadataJSON)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "loop", fixer.ID)
+	if err != nil {
+		t.Fatalf("ListByEntity: %v", err)
+	}
+	var handoffPayload string
+	for i := range events {
+		if events[i].EventType == "loop.review_fix_budget.exhausted" {
+			handoffPayload = events[i].PayloadJSON
+			break
+		}
+	}
+	if handoffPayload == "" {
+		t.Fatal("missing review-fix budget handoff event")
+	}
+	if !strings.Contains(handoffPayload, `"head":"`+pushedHead+`"`) {
+		t.Fatalf("handoff payload = %s, want head %q", handoffPayload, pushedHead)
+	}
+}
+
 func TestIncrementAndParkFixerBudgetParksSibling(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -289,7 +417,7 @@ func TestParkFixerBudgetBeforePendingRediscoveryDoesNotEnqueue(t *testing.T) {
 	}
 }
 
-func TestParkFixerBudgetIfExhaustedSkipsWhenHITLDisabled(t *testing.T) {
+func TestParkFixerBudgetIfExhaustedParksWhenHITLDisabled(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
@@ -317,16 +445,19 @@ func TestParkFixerBudgetIfExhaustedSkipsWhenHITLDisabled(t *testing.T) {
 		t.Fatalf("incrementFixerPushCount() error = %v", err)
 	}
 	parked, err := runner.parkFixerBudgetIfExhausted(context.Background(), fixer)
-	if err != nil || parked {
-		t.Fatalf("parkFixerBudgetIfExhausted() = (%v, %v), want skipped under default HITL-off config", parked, err)
+	if err != nil || !parked {
+		t.Fatalf("parkFixerBudgetIfExhausted() = (%v, %v), want no-HITL paired park", parked, err)
 	}
 	updated, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
-	if err != nil || updated == nil || updated.Status != "running" {
-		t.Fatalf("fixer = (%#v, %v), want still running", updated, err)
+	if err != nil || updated == nil || updated.Status != "paused" || !loops.IsReviewFixBudgetExhaustedPause(updated.MetadataJSON) {
+		t.Fatalf("fixer = (%#v, %v), want paused review_fix_budget_exhausted", updated, err)
+	}
+	if _, ok := loops.ReadHITLAsk(updated.MetadataJSON); ok {
+		t.Fatal("no-HITL park must not write a HITL ask")
 	}
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
-	if err != nil || sibling == nil || sibling.Status != "waiting" {
-		t.Fatalf("reviewer sibling = (%#v, %v), want still waiting", sibling, err)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("reviewer sibling = (%#v, %v), want paired budget pause", sibling, err)
 	}
 }
 
@@ -1741,20 +1872,20 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemDoesNotParkBudgetWhenPushClosesPR(t *testing.T) {
+func TestProcessClaimedItemParksBudgetAfterCapReachingPushWithoutResolve(t *testing.T) {
+	// Cap-reaching push must park immediately and must not continue into resolve-comments.
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
 	target := buildPullRequestTargetID(repo, prNumber)
-	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_closed_pr", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO}
+	reviewer := storage.LoopRecord{ID: "loop_reviewer_budget_cap_push", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "waiting", CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), reviewer); err != nil {
 		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
 	}
 	github := &fakeGitHubGateway{
-		closeAfterResolve: true,
-		listOpen:          []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
 		viewResponses: []PullRequestDetail{
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
 			{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}, Checks: []map[string]any{{"name": "ci", "conclusion": "FAILURE"}}},
@@ -1789,60 +1920,70 @@ func TestProcessClaimedItemDoesNotParkBudgetWhenPushClosesPR(t *testing.T) {
 	if err != nil || claim == nil {
 		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
 	}
-	claimedLoop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
-	if err != nil || claimedLoop == nil {
-		t.Fatalf("Loops.GetByID(claimed) = (%#v, %v), want discovered fixer loop", claimedLoop, err)
-	}
-	pendingMeta := mustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": "head-followup", "fixItemsStateHash": "state-followup", "unresolvedThreadIds": []string{"t2"}, "recordedAt": nowISO}})
-	claimedLoop.MetadataJSON = &pendingMeta
-	if err := fixture.repos.Loops.Upsert(context.Background(), *claimedLoop); err != nil {
-		t.Fatalf("Loops.Upsert(pending rediscovery) error = %v", err)
-	}
 	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success after pushed fix", result)
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped after cap-reaching push park", result)
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %d, want 0 (no resolve-comments after budget park)", len(github.resolveCalls))
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
-	if err != nil || loop == nil || loop.Status != "terminated" {
-		t.Fatalf("fixer = (%#v, %v), want terminated product terminal after closed PR", loop, err)
-	}
-	reason := ""
-	if loopMeta, ok := parseJSONObject(loop.MetadataJSON)["loop"].(map[string]any); ok {
-		reason, _ = stringFromAny(loopMeta["terminationReason"])
-	}
-	if reason != "pr_closed_or_merged" {
-		t.Fatalf("terminationReason = %q, want pr_closed_or_merged", reason)
+	if err != nil || loop == nil || loop.Status != "awaiting_human" {
+		t.Fatalf("fixer = (%#v, %v), want awaiting_human budget hold", loop, err)
 	}
 	if loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount < 1 {
-		t.Fatalf("push count = %d, want cap-reaching push before closed-PR terminal", loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount)
+		t.Fatalf("push count = %d, want cap-reaching push counted", loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount)
 	}
-	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
-		t.Fatalf("HITL ask = %#v, want no budget ask on a closed PR", ask)
+	if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
+		t.Fatalf("HITL ask = %#v, want budget ask", ask)
 	}
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), reviewer.ID)
-	if err != nil || sibling == nil || sibling.Status != "waiting" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
-		t.Fatalf("reviewer sibling = (%#v, %v), want still waiting without budget pause", sibling, err)
+	if err != nil || sibling == nil || sibling.Status != "paused" || !loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
+		t.Fatalf("reviewer sibling = (%#v, %v), want paused sibling hold", sibling, err)
 	}
-	active, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loop.ID)
+}
+
+func TestEnsureFixerPushBudgetCountedTerminatesWhenPRClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	meta := `{"reviewFixBudget":{"pushCount":0}}`
+	fixer := storage.LoopRecord{ID: "loop_push_closed_pr", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	run := storage.RunRecord{ID: "run_push_closed_pr", LoopID: fixer.ID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {
-		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+		t.Fatalf("DefaultConfig: %v", err)
 	}
-	if active != nil {
-		t.Fatalf("activeQueue = %#v, want no follow-up after closed-PR terminal", active)
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "MERGED", HeadSHA: "new-head"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: true, GitHub: github})
+	checkpoint := fixerCheckpoint{Push: &checkpointPush{Pushed: true, BudgetCounted: false}}
+	_, err = runner.ensureFixerPushBudgetCounted(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    fixer, Run: run, Repo: repo, PRNumber: prNumber,
+	}, checkpoint)
+	var hold *holdSkipError
+	if err == nil || !errors.As(err, &hold) {
+		t.Fatalf("err = %v, want holdSkipError for closed PR", err)
 	}
-	parked, err := runner.parkFixerBudgetIfExhausted(context.Background(), *loop)
-	if err != nil || parked {
-		t.Fatalf("parkFixerBudgetIfExhausted() = (%v, %v), want skipped on terminated closed PR", parked, err)
+	after, _ := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if after == nil || after.Status != "terminated" {
+		t.Fatalf("after = %#v, want terminated (PR-closed wins over budget park)", after)
 	}
-	scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), *loop, repo, prNumber)
-	if err != nil {
-		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
-	}
-	if scheduled {
-		t.Fatal("schedulePendingRediscoveryAfterRun() = true, want no enqueue after closed-PR terminal")
+	if ask, ok := loops.ReadHITLAsk(after.MetadataJSON); ok && loops.IsReviewFixBudgetAsk(ask) {
+		t.Fatalf("budget ask = %#v, want none when PR closed", ask)
 	}
 }
 

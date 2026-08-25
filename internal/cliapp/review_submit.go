@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
@@ -495,7 +496,7 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 			if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
 				return err
 			}
-			return submitReviewWithoutAnchorValidation(cmd, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
+			return submitReviewWithoutAnchorValidation(cmd, r, loaded.Config, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
 		}
 		// Never reach SubmitReview's content guard on this path: redact paths and
 		// never return path-bearing git/remote errors (path may be secret-shaped).
@@ -518,6 +519,12 @@ func (r *commandRuntime) reviewSubmit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if err := validateForgejoReviewSubmitRequest(cmd.Context(), gateway, prNumber, freshLabels, requestBypass); err != nil {
+		return err
+	}
+	// Budget admission before mutation: agent-native reviews must not publish when
+	// a participating reviewer loop is already at/over live maxPublishesPerPR or
+	// on a review-fix budget hold. Daemon owns park; CLI only refuses.
+	if err := r.refuseReviewSubmitIfBudgetExhausted(cmd, loaded.Config, repo, prNumber); err != nil {
 		return err
 	}
 	if err := gateway.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
@@ -544,9 +551,9 @@ func validateForgejoReviewSubmitRequest(ctx context.Context, gateway reviewSubmi
 //   - the current trusted run is a manual reviewer loop (--reviewer-run-id), or
 //   - the current trusted reviewer loop is an enabled follow-up reviewing a head
 //     that differs from lastPublishedHeadSha (matching requireReviewRequestForLoop
-//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic follow-up
-//     runs do not pass --reviewer-run-id, so that path resolves the current
-//     running reviewer loop for the PR when the flag is absent.
+//     / reviewerFollowUpHasNewHead in the reviewer runner). Automatic prompts now
+//     pass --reviewer-run-id; the no-flag path still resolves the current running
+//     reviewer loop for the PR when the flag is absent.
 func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64, headSHA string) (bool, error) {
 	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
 	if dbPath == "" {
@@ -921,8 +928,7 @@ func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repos
 
 // trustedCurrentFollowUpNewHeadReviewerBypass honors the runner's
 // follow_up_new_head requireReviewRequest bypass when agents submit without
-// --reviewer-run-id (automatic reviewer prompts only pass that flag for manual
-// runs). Authority is the current running reviewer loop for the PR.
+// --reviewer-run-id. Authority is the current running reviewer loop for the PR.
 func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, headSHA string) (bool, error) {
 	if repos == nil || repos.Runs == nil || repos.Loops == nil {
 		return false, fmt.Errorf("validate follow-up review request bypass: storage is not configured")
@@ -1082,11 +1088,183 @@ func canSubmitWithoutAnchorValidation(err error, comments []reviewSubmitComment)
 	return errors.Is(err, githubinfra.ErrDiffTooLarge) || errors.Is(err, githubinfra.ErrLocalCaptureTruncated)
 }
 
-func submitReviewWithoutAnchorValidation(cmd *cobra.Command, gh reviewSubmitGateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {
+func submitReviewWithoutAnchorValidation(cmd *cobra.Command, r *commandRuntime, cfg config.Config, gh reviewSubmitGateway, repo string, prNumber int64, event string, payload reviewSubmitPayload, commitID string, cwd string, disclosureCfg config.DisclosureConfig) error {
+	if err := r.refuseReviewSubmitIfBudgetExhausted(cmd, cfg, repo, prNumber); err != nil {
+		return err
+	}
 	if err := gh.SubmitReview(cmd.Context(), githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: event, Body: payload.Body, CommitID: commitID, Disclosure: disclosureCfg, CWD: cwd}); err != nil {
 		return wrapReviewSubmitError(cmd, repo, prNumber, event, commitID, payload, "submit PR review without anchor validation", err)
 	}
 	return writeJSON(cmd.OutOrStdout(), map[string]any{"submitted": true})
+}
+
+// refuseReviewSubmitIfBudgetExhausted refuses agent-native review publish when the
+// authoritative submitting reviewer loop is already at/over the live
+// maxPublishesPerPR cap or is on a review-fix budget hold. One-shot manual is
+// exempt via ParticipatesInReviewFixBudget. Does not park — daemon owns park.
+//
+// Authority is the submitting loop only (--reviewer-run-id / active submit
+// run, including a budget-paused loop whose run is still running). Other lanes
+// and terminal/historical loops are ignored. When no submitting loop can be
+// resolved, skip (same optional-authority posture as a missing DB).
+//
+// Storage probe matches trustedReviewRequestSubmitBypass: only open an already-
+// materialized DB; if DB is absent, skip (optional authority lookup).
+func (r *commandRuntime) refuseReviewSubmitIfBudgetExhausted(cmd *cobra.Command, cfg config.Config, repo string, prNumber int64) error {
+	dbPath := strings.TrimSpace(cfg.Storage.DBPath)
+	if dbPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("check review-fix publish budget: %w", err)
+	}
+	db, err := storage.OpenSQLiteDB(cmd.Context(), dbPath)
+	if err != nil {
+		return fmt.Errorf("check review-fix publish budget: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	runID := strings.TrimSpace(getStringFlag(cmd, "reviewer-run-id"))
+	return refuseReviewSubmitBudgetAgainstRepos(cmd.Context(), storage.NewRepositories(db), cfg, repo, prNumber, runID)
+}
+
+// refuseReviewSubmitBudgetAgainstRepos is the DB-present budget gate used by
+// refuseReviewSubmitIfBudgetExhausted and unit tests. runID is the optional
+// --reviewer-run-id binding for the submitting loop.
+func refuseReviewSubmitBudgetAgainstRepos(ctx context.Context, repos *storage.Repositories, cfg config.Config, repo string, prNumber int64, runID string) error {
+	if repos == nil || repos.Loops == nil {
+		return nil
+	}
+	loop, err := submittingReviewerLoopForBudgetGate(ctx, repos, repo, prNumber, runID)
+	if err != nil {
+		return err
+	}
+	if loop == nil {
+		// No authoritative submitting loop — optional authority, same as missing DB.
+		return nil
+	}
+	if !loops.ParticipatesInReviewFixBudget(*loop) {
+		// One-shot manual (and any non-participating lane) is exempt.
+		return nil
+	}
+	if loops.IsReviewFixBudgetHold(*loop) {
+		return fmt.Errorf("review submit refused: review-fix budget is held for %s#%d; unpause or stop the loop before publishing", repo, prNumber)
+	}
+	cap := config.ProjectRoleConfigs(cfg, loop.ProjectID).Reviewer.Behavior.Loop.MaxPublishesPerPR
+	count := loops.ReviewerPublishCount(loop.MetadataJSON)
+	if loops.BudgetExhausted(count, cap) {
+		return fmt.Errorf("review submit refused: review-fix publish budget exhausted for %s#%d (%d/%d); unpause or stop the loop before publishing", repo, prNumber, count, cap)
+	}
+	return nil
+}
+
+// submittingReviewerLoopForBudgetGate resolves only the submitting reviewer loop.
+// Prefer --reviewer-run-id via the active run even when sibling parking has
+// paused the loop; otherwise the single running reviewer run for the PR,
+// including budget-paused and awaiting-human loops. Multiple running reviewer
+// runs without a run ID are fail-closed so a held lane cannot be masked.
+func submittingReviewerLoopForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
+	runID = strings.TrimSpace(runID)
+	if runID != "" {
+		loop, err := reviewerLoopForActiveSubmitRun(ctx, repos, repo, prNumber, runID)
+		if err != nil {
+			return nil, fmt.Errorf("check review-fix publish budget: %w", err)
+		}
+		return loop, nil
+	}
+	if repos.Runs == nil {
+		return nil, nil
+	}
+	currentRun, err := currentSubmittingReviewerRunForBudgetGate(ctx, repos, repo, prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("check review-fix publish budget: %w", err)
+	}
+	if currentRun == nil {
+		return nil, nil
+	}
+	return reviewerLoopForBudgetGate(ctx, repos, currentRun.LoopID, repo, prNumber)
+}
+
+// reviewerLoopForActiveSubmitRun returns the reviewer loop for a still-running
+// submit run even when budget parking has paused the loop. Unlike
+// trustedCurrentReviewerLoopForRun, it does not require loop status running.
+func reviewerLoopForActiveSubmitRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
+	if repos == nil || repos.Runs == nil || repos.Loops == nil {
+		return nil, fmt.Errorf("storage is not configured")
+	}
+	run, err := repos.Runs.GetByID(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if run == nil || run.Status != string(domain.RunStatusRunning) {
+		return nil, nil
+	}
+	return reviewerLoopForBudgetGate(ctx, repos, run.LoopID, repo, prNumber)
+}
+
+// currentSubmittingReviewerRunForBudgetGate finds the single running reviewer
+// run for the PR even when sibling parking has moved the loop off running.
+// Two independently budgeted lanes can both have running runs; recency is not
+// authority, so more than one candidate is an error.
+func currentSubmittingReviewerRunForBudgetGate(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
+	loops, err := repos.Loops.ListByStatuses(ctx, []string{
+		string(domain.LoopStatusRunning),
+		string(domain.LoopStatusPaused),
+		string(domain.LoopStatusAwaitingHuman),
+	})
+	if err != nil {
+		return nil, err
+	}
+	loopIDs := make([]string, 0, len(loops))
+	for _, loop := range loops {
+		if !reviewerLoopMatchesPR(loop, repo, prNumber) {
+			continue
+		}
+		loopIDs = append(loopIDs, loop.ID)
+	}
+	if len(loopIDs) == 0 {
+		return nil, nil
+	}
+	runs, err := repos.Runs.ListLatestByLoopIDs(ctx, loopIDs)
+	if err != nil {
+		return nil, err
+	}
+	var current *storage.RunRecord
+	for i := range runs {
+		if runs[i].Status != string(domain.RunStatusRunning) {
+			continue
+		}
+		if current != nil {
+			return nil, fmt.Errorf("multiple running reviewer runs for %s#%d; pass --reviewer-run-id", repo, prNumber)
+		}
+		run := runs[i]
+		current = &run
+	}
+	return current, nil
+}
+
+func reviewerLoopForBudgetGate(ctx context.Context, repos *storage.Repositories, loopID, repo string, prNumber int64) (*storage.LoopRecord, error) {
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return nil, err
+	}
+	if loop == nil || !reviewerLoopMatchesPR(*loop, repo, prNumber) {
+		return nil, nil
+	}
+	return loop, nil
+}
+
+func reviewerLoopMatchesPR(loop storage.LoopRecord, repo string, prNumber int64) bool {
+	if loop.Type != string(domain.LoopTypeReviewer) {
+		return false
+	}
+	loopRepo := ""
+	if loop.Repo != nil {
+		loopRepo = *loop.Repo
+	}
+	return strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) && loop.PRNumber != nil && *loop.PRNumber == prNumber
 }
 
 func writeReviewSubmitDiagnostic(w io.Writer, event string, fields reviewSubmitDiagnosticFields) {

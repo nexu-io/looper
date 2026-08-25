@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -84,6 +85,7 @@ type schedulerAsyncRunner interface {
 
 type defaultSchedulerTickInput struct {
 	Repos             *storage.Repositories
+	DB                *sql.DB
 	GitHubGateway     *githubinfra.Gateway
 	Logger            bootstrap.Logger
 	Now               func() time.Time
@@ -1978,7 +1980,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		allowedPR := reviewerAllowedPRRef(input.Metadata)
 		allowedCwd := strings.TrimSpace(input.WorkingDirectory)
 		policy := reviewerAllowedReviewPolicy(input.Metadata)
-		if policy.ReviewerManual && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
+		if policy.ReviewerRunID != "" && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
 			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
 		}
 		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
@@ -3490,6 +3492,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
 			RetryPolicy:             cfg.Roles.Reviewer.Behavior.Retry,
 			OnQueueItemEnqueued:     requestWake,
+			NotifyHumanAttention:    notifyHumanAttention,
 			OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
@@ -3531,16 +3534,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
 				LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
 			},
-			Disclosure:          &cfg.Disclosure,
-			AgentRuntime:        string(resolved.Vendor),
-			AgentProfileID:      resolved.ProfileID,
-			CustomInstructions:  &cfg,
-			AgentModel:          agentModel,
-			AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
-			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
-			RetryBaseDelay:      retryBaseDelay,
-			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-			OnQueueItemEnqueued: requestWake,
+			Disclosure:           &cfg.Disclosure,
+			AgentRuntime:         string(resolved.Vendor),
+			AgentProfileID:       resolved.ProfileID,
+			CustomInstructions:   &cfg,
+			AgentModel:           agentModel,
+			AgentTimeout:         time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:     time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:       retryBaseDelay,
+			RetryMaxAttempts:     int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued:  requestWake,
+			NotifyHumanAttention: notifyHumanAttention,
 			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
@@ -3629,8 +3633,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if githubGateway != nil {
 			snapshotter = githubGateway
 		}
+		var tickDB *sql.DB
+		if services.Coordinator != nil {
+			tickDB = services.Coordinator.DB()
+		}
 		return defaultSchedulerTickInput{
 			Repos:                services.Repositories,
+			DB:                   tickDB,
 			GitHubGateway:        githubGateway,
 			Logger:               logger,
 			Now:                  now,

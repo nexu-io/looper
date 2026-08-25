@@ -3115,6 +3115,11 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		if err != nil {
 			return nil, err
 		}
+		if stopped, stopErr := h.applyReviewFixBudgetStopIfHeld(r.Context(), loop); stopErr != nil {
+			return nil, stopErr
+		} else if stopped != nil {
+			return stopped, nil
+		}
 		return h.context.StopLoop(r.Context(), loop.ID, fmt.Sprintf("Stopped by user via selector %s", selector))
 	case "close":
 		if r.Method != http.MethodPost {
@@ -5589,6 +5594,14 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			}
 			unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
 			defer unlockTarget()
+			// No-HITL budget hold: looper unpause must paired-Continue, not resume one role.
+			// Take the same-target lock first so Continue cannot publish claimable
+			// queue rows while a sibling discard+retry resets the shared worktree.
+			if continued, contErr := h.applyReviewFixBudgetContinueIfHeld(ctx, *preflightLoop); contErr != nil {
+				return loopResponse{}, contErr
+			} else if continued != nil {
+				return *continued, nil
+			}
 		}
 	}
 
@@ -5928,6 +5941,157 @@ func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID str
 	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
 }
 
+func (h *Handler) reviewFixBudgetLiveCaps(projectID string) loops.ReviewFixBudgetLiveCaps {
+	roles := config.ProjectRoleConfigs(h.effectiveConfig(), projectID)
+	return loops.ReviewFixBudgetLiveCaps{
+		ReviewerMaxPublishes: roles.Reviewer.Behavior.Loop.MaxPublishesPerPR,
+		FixerMaxPushes:       roles.Fixer.Behavior.Loop.MaxPushesPerPR,
+	}
+}
+
+// applyReviewFixBudgetContinueIfHeld delegates looper unpause /start on a
+// budget-held role to paired Continue. Returns nil response when not a hold.
+func (h *Handler) applyReviewFixBudgetContinueIfHeld(ctx context.Context, loop storage.LoopRecord) (*loopResponse, error) {
+	if !loops.IsReviewFixBudgetHold(loop) {
+		return nil, nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	caps := h.reviewFixBudgetLiveCaps(loop.ProjectID)
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		fresh, getErr := repos.Loops.GetByID(ctx, loop.ID)
+		if getErr != nil {
+			return storage.LoopRecord{}, getErr
+		}
+		if fresh == nil {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loop.ID)}
+		}
+		if !loops.IsReviewFixBudgetHold(*fresh) {
+			return storage.LoopRecord{}, nil
+		}
+		result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerContinue, nowISO, caps)
+		if applyErr != nil {
+			return storage.LoopRecord{}, applyErr
+		}
+		if !result.Applied {
+			return storage.LoopRecord{}, nil
+		}
+		return result.Loop, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return nil, typed
+		}
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if updated.ID == "" {
+		return nil, nil
+	}
+	if h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
+	}
+	resp, serErr := h.serializeLoopWithDiagnostics(ctx, updated)
+	if serErr != nil {
+		return nil, serErr
+	}
+	return &resp, nil
+}
+
+// drainReviewFixBudgetPair stops live agents on both pair members before
+// paired terminalize. A sibling park can leave a run running after the loop
+// record is paused; generic StopLoop is the daemon drain path.
+func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.LoopRecord) error {
+	if h.context.StopLoop == nil {
+		return nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Loops == nil {
+		return nil
+	}
+	all, err := services.Repositories.Loops.List(ctx)
+	if err != nil {
+		return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	members := append(loops.FindSiblingReviewFixLoops(all, loop), loop)
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		if member.ID != loop.ID && !loops.IsReviewFixBudgetHold(member) {
+			continue
+		}
+		switch strings.TrimSpace(member.Status) {
+		case "terminated", "stopped", "completed":
+			continue
+		}
+		if _, err := h.context.StopLoop(ctx, member.ID, "Stopped by review-fix budget pair"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyReviewFixBudgetStopIfHeld delegates looper stop on a budget-held role to
+// paired Stop (terminate both). Returns nil when not a hold.
+func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop storage.LoopRecord) (any, error) {
+	if !loops.IsReviewFixBudgetHold(loop) {
+		return nil, nil
+	}
+	if err := h.drainReviewFixBudgetPair(ctx, loop); err != nil {
+		return nil, err
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	caps := h.reviewFixBudgetLiveCaps(loop.ProjectID)
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		fresh, getErr := repos.Loops.GetByID(ctx, loop.ID)
+		if getErr != nil {
+			return storage.LoopRecord{}, getErr
+		}
+		if fresh == nil {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loop.ID)}
+		}
+		if !loops.IsReviewFixBudgetHold(*fresh) {
+			return storage.LoopRecord{}, nil
+		}
+		result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerStop, nowISO, caps)
+		if applyErr != nil {
+			return storage.LoopRecord{}, applyErr
+		}
+		if !result.Applied {
+			return storage.LoopRecord{}, nil
+		}
+		return result.Loop, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return nil, typed
+		}
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if updated.ID == "" {
+		return nil, nil
+	}
+	return map[string]any{
+		"stopped": true,
+		"loopId":  updated.ID,
+		"status":  updated.Status,
+		"outcome": "review_fix_budget_stop",
+	}, nil
+}
+
 // deliverHumanAnswer is the shared core of the HITL respond path: it validates
 // the loop is awaiting_human, stores the answer on the loop's HITL metadata, and
 // transitions the loop back to running (requeue + scheduler tick). Both the
@@ -5954,7 +6118,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
 		if loops.IsReviewFixBudgetAsk(ask) {
-			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO)
+			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO, h.reviewFixBudgetLiveCaps(loop.ProjectID))
 			if applyErr != nil {
 				if errors.Is(applyErr, loops.ErrReviewFixBudgetInvalidAnswer) {
 					return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
@@ -7025,6 +7189,14 @@ func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *stora
 	if strings.TrimSpace(loop.ProjectID) != "" {
 		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
 			return err
+		}
+	}
+	// Budget holds require paired Continue (looper unpause) or Stop — not single-role retry.
+	if loops.IsReviewFixBudgetHold(loop) {
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot retry review-fix budget hold on loop %s; use looper unpause (Continue) or looper stop", loop.ID),
 		}
 	}
 	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {

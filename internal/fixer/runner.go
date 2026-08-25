@@ -563,6 +563,9 @@ type Options struct {
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
+	// NotifyHumanAttention, when set, observes durable loop state after a new
+	// review-fix budget park (including discovery-time parks before claim).
+	NotifyHumanAttention func(context.Context, string)
 }
 
 type DiscoveryPolicy struct {
@@ -604,6 +607,7 @@ type Runner struct {
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
+	notifyHumanAttention    func(context.Context, string)
 }
 
 type DiscoveryInput struct {
@@ -1336,6 +1340,7 @@ func New(options Options) *Runner {
 		retryMaxAttempts:        retryMax,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
+		notifyHumanAttention:    options.NotifyHumanAttention,
 	}
 }
 
@@ -1657,7 +1662,10 @@ func (r *Runner) shouldCreateFixerBudgetPark(loop storage.LoopRecord) bool {
 	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
 		return false
 	}
-	if !r.hitlEnabled || isManualFixerLoop(loop) {
+	if loop.Status == "paused" && loops.IsReviewFixBudgetHold(loop) {
+		return false
+	}
+	if !loops.ParticipatesInReviewFixBudget(loop) {
 		return false
 	}
 	return loops.BudgetExhausted(loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount, r.maxPushesPerPR(loop.ProjectID))
@@ -1724,15 +1732,18 @@ func (r *Runner) parkFixerBudgetIfExhausted(ctx context.Context, loop storage.Lo
 	if loop.Status == "terminated" || loop.Status == "stopped" {
 		return false, nil
 	}
+	// Sibling pause is already a hold; do not treat "not self-exhausted" as proceed.
+	if loop.Status == "paused" && loops.IsSiblingReviewFixBudgetPause(loop.MetadataJSON) {
+		return true, nil
+	}
 	if loop.Status == "awaiting_human" {
 		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
 			return true, nil
 		}
+	} else if loop.Status == "paused" && loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) {
+		// Re-enter no-ask hold to finish cancel/sibling park / handoff event.
 	} else {
-		if !r.hitlEnabled {
-			return false, nil
-		}
-		if isManualFixerLoop(loop) {
+		if !loops.ParticipatesInReviewFixBudget(loop) {
 			return false, nil
 		}
 		cap := r.maxPushesPerPR(loop.ProjectID)
@@ -1743,16 +1754,76 @@ func (r *Runner) parkFixerBudgetIfExhausted(ctx context.Context, loop storage.Lo
 	}
 	cap := r.maxPushesPerPR(loop.ProjectID)
 	count := loops.ReadReviewFixBudgetState(loop.MetadataJSON).PushCount
+	reviewerCap := 0
+	if r.projectRoleConfig != nil {
+		reviewerCap = config.ProjectRoleConfigs(*r.projectRoleConfig, loop.ProjectID).Reviewer.Behavior.Loop.MaxPublishesPerPR
+	}
 	_, err := loops.ParkReviewFixBudget(ctx, r.repos, loops.ParkReviewFixBudgetInput{
-		Exhausted: loop,
-		Role:      "fixer",
-		Repo:      derefString(loop.Repo),
-		PRNumber:  derefInt64(loop.PRNumber),
-		Count:     count,
-		Cap:       cap,
-		NowISO:    r.nowISO(),
+		Exhausted:   loop,
+		Role:        "fixer",
+		Repo:        derefString(loop.Repo),
+		PRNumber:    derefInt64(loop.PRNumber),
+		Count:       count,
+		Cap:         cap,
+		NowISO:      r.nowISO(),
+		HITLEnabled: r.hitlEnabled,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{
+			ReviewerMaxPublishes: reviewerCap,
+			FixerMaxPushes:       cap,
+		},
+		DB: r.db,
 	})
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	// Notify is owned by discovery call sites (and scheduler post-claim), not
+	// shared park — in-run parks must not notify before queue finalization.
+	return true, nil
+}
+
+func (r *Runner) notifyHumanAttentionBestEffort(ctx context.Context, loopID string) {
+	if r.notifyHumanAttention == nil || strings.TrimSpace(loopID) == "" {
+		return
+	}
+	r.notifyHumanAttention(ctx, loopID)
+}
+
+// refusePushIfBudgetExhausted parks and skips when the loop already sits at the
+// live push cap before a counted mutation. Returns refused=true when push must not proceed.
+func (r *Runner) refusePushIfBudgetExhausted(ctx context.Context, input stepInput) (bool, error) {
+	loop := input.Loop
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return true, err
+		}
+		if fresh != nil {
+			loop = *fresh
+		}
+	}
+	if !loops.ParticipatesInReviewFixBudget(loop) {
+		return false, nil
+	}
+	if loops.IsReviewFixBudgetHold(loop) {
+		if _, err := r.parkFixerBudgetIfExhausted(ctx, loop); err != nil {
+			return true, err
+		}
+		return true, &holdSkipError{summary: "Fixer stopped because review-fix budget is held"}
+	}
+	cap := r.maxPushesPerPR(loop.ProjectID)
+	if !loops.BudgetExhausted(loops.FixerPushCount(loop.MetadataJSON), cap) {
+		return false, nil
+	}
+	if r.livePullRequestClosed(ctx, input.Project, input.Repo, input.PRNumber) {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return true, err
+		}
+		return true, &holdSkipError{summary: "Fixer stopped because pull request is closed"}
+	}
+	if _, err := r.parkFixerBudgetIfExhausted(ctx, loop); err != nil {
+		return true, err
+	}
+	return true, &holdSkipError{summary: "Fixer stopped because review-fix push budget is exhausted"}
 }
 
 func (r *Runner) isForgejoProject(projectID string) bool {
@@ -2465,7 +2536,7 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if current.Status == "paused" || current.Status == "awaiting_human" || current.Status == "human_takeover" || current.Status == "terminated" || current.Status == "stopped" {
 		return false, nil
 	}
-	if r.hitlEnabled && !isManualFixerLoop(*current) {
+	if loops.ParticipatesInReviewFixBudget(*current) {
 		cap := r.maxPushesPerPR(current.ProjectID)
 		count := loops.ReadReviewFixBudgetState(current.MetadataJSON).PushCount
 		if loops.BudgetExhausted(count, cap) {
@@ -2668,9 +2739,15 @@ func (r *Runner) finishHeldFixerQueueItem(ctx context.Context, loop storage.Loop
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
 		return ProcessResult{}, err
 	}
+	// Do not revive a review-fix budget hold (or other terminal park) that the
+	// step already persisted — only ordinary label/hold skips re-queue.
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		updated.Status = "queued"
 		updated.LastRunAt = stringPtr(r.nowISO())
+		if loops.IsReviewFixBudgetHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
+			updated.NextRunAt = nil
+			return
+		}
+		updated.Status = "queued"
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
@@ -3338,6 +3415,11 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if checkpoint.Push != nil && checkpoint.Push.Pushed {
 		return r.ensureFixerPushBudgetCounted(ctx, input, checkpoint)
 	}
+	// Admission at the mutation seam: refuse a counted push when already at the
+	// live cap (observe mid-run cap lowers). PR-closed still wins later.
+	if refused, err := r.refusePushIfBudgetExhausted(ctx, input); refused || err != nil {
+		return checkpoint, err
+	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -3550,14 +3632,52 @@ func (r *Runner) ensureFixerPushBudgetCounted(ctx context.Context, input stepInp
 	if checkpoint.Push == nil || !checkpoint.Push.Pushed || checkpoint.Push.BudgetCounted {
 		return checkpoint, nil
 	}
-	if _, err := r.incrementFixerPushCount(ctx, input.Loop); err != nil {
+	updated, err := r.incrementFixerPushCount(ctx, input.Loop)
+	if err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Push.BudgetCounted = true
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepPush, checkpoint); err != nil {
 		return checkpoint, err
 	}
+	// Persist just-pushed head before park so handoff / lastFixHeadSha sees the
+	// current head (runPushStep still merges full evidence metadata afterward).
+	if head := fixerPushBudgetHeadSHA(checkpoint); head != "" {
+		merged, mergeErr := r.mergeLoopMetadata(ctx, updated, map[string]any{"lastFixHeadSha": head})
+		if mergeErr != nil {
+			return checkpoint, mergeErr
+		}
+		updated = merged
+	}
+	// After a successful counted increment, park immediately when now exhausted
+	// and do not continue into resolve-comments / further counted work.
+	// PR-closed still wins over budget park.
+	if r.shouldCreateFixerBudgetPark(updated) {
+		if r.livePullRequestClosed(ctx, input.Project, input.Repo, input.PRNumber) {
+			if termErr := r.terminateLoop(ctx, updated, "pr_closed_or_merged"); termErr != nil {
+				return checkpoint, termErr
+			}
+			return checkpoint, &holdSkipError{summary: "Fixer stopped because pull request is closed"}
+		}
+		if _, parkErr := r.parkFixerBudgetIfExhausted(ctx, updated); parkErr != nil {
+			return checkpoint, parkErr
+		}
+		return checkpoint, &holdSkipError{summary: "Fixer stopped because review-fix push budget is exhausted"}
+	}
 	return checkpoint, nil
+}
+
+func fixerPushBudgetHeadSHA(checkpoint fixerCheckpoint) string {
+	if checkpoint.Push == nil {
+		return ""
+	}
+	if head := strings.TrimSpace(checkpoint.Push.HeadSHA); head != "" {
+		return head
+	}
+	if checkpoint.Push.Evidence != nil {
+		return strings.TrimSpace(checkpoint.Push.Evidence.HeadSHA)
+	}
+	return ""
 }
 
 func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -5222,9 +5342,20 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if updatedLoop.Status == "awaiting_human" || updatedLoop.Status == "human_takeover" || updatedLoop.Status == "terminated" || updatedLoop.Status == "stopped" {
 			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
 		}
+		// Sibling pause / exhausted hold must not be revived by discovery enqueue.
+		// Notify only from discovery after a successful park (not from shared park).
+		if loops.IsReviewFixBudgetHold(updatedLoop) {
+			if parked, err := r.parkFixerBudgetIfExhausted(ctx, updatedLoop); err != nil {
+				return loopUpsertResult{}, err
+			} else if parked {
+				r.notifyHumanAttentionBestEffort(ctx, updatedLoop.ID)
+			}
+			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
+		}
 		if parked, err := r.parkFixerBudgetIfExhausted(ctx, updatedLoop); err != nil {
 			return loopUpsertResult{}, err
 		} else if parked {
+			r.notifyHumanAttentionBestEffort(ctx, updatedLoop.ID)
 			updated, getErr := r.repos.Loops.GetByID(ctx, updatedLoop.ID)
 			if getErr != nil {
 				return loopUpsertResult{}, getErr

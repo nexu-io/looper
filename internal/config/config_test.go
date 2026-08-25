@@ -319,7 +319,7 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 		t.Fatalf("fixer maxPushesPerPR default = %d, want %d", got, DefaultReviewFixBudgetCap)
 	}
 	if cfg.HITL.Enabled {
-		t.Fatal("HITL default must be false so default caps stay inert until HITL is enabled")
+		t.Fatal("HITL default must remain false; caps enforce with a no-ask paired hold when HITL is off")
 	}
 }
 
