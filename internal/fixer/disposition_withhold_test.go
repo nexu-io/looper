@@ -561,8 +561,8 @@ func TestEditedDirectiveAfterRejectIsWithheld(t *testing.T) {
 func TestDeclineReplyCheckpointCrashKeepsStableMarker(t *testing.T) {
 	t.Parallel()
 	// Crash window: AddReviewThreadReply succeeds, resolve-comments checkpoint
-	// is not persisted, retry rebuilds the decision fingerprint from the live
-	// thread that now contains the posted decline.
+	// is not persisted, retry rebuilds the decision fingerprint via collectFixItems
+	// from live comments after the gateway excludes looper-fixer-reply-declined.
 	preFingerprint := "c1@2026-01-01T00:00:00Z"
 	item := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", ThreadFingerprint: preFingerprint}
 	fp := buildDeclinedThreadFingerprint(item, "abc123")
@@ -588,15 +588,29 @@ func TestDeclineReplyCheckpointCrashKeepsStableMarker(t *testing.T) {
 	github.threads[0].Comments = append(github.threads[0].Comments, ReviewThreadComment{
 		ID: "c-decline", Author: testLooperLogin, Body: github.replyCalls[0].Body, UpdatedAt: "2026-01-01T00:02:00Z",
 	})
-	// Retry collect-fixes rebuilds ThreadFingerprint from live nodes after the
-	// gateway excludes looper-fixer-reply-declined comments.
-	retryItem := item
-	retryItem.ThreadFingerprint = preFingerprint
-	retryFP := buildDeclinedThreadFingerprint(retryItem, "abc123")
+	// Live thread contains the posted decline. collectFixItems sees the
+	// gateway-excluded threadFingerprint (decline nodes omitted).
+	retryItems := collectFixItems(PullRequestDetail{
+		HeadSHA: "abc123",
+		Comments: []map[string]any{{
+			"id": "c1", "threadId": "t1", "author": "alice",
+			"body":              "Please fix <!-- looper:stamp v=1 -->",
+			"threadFingerprint": preFingerprint,
+		}},
+	})
+	if len(retryItems) != 1 {
+		t.Fatalf("retry items = %#v, want 1", retryItems)
+	}
+	retryFP := buildDeclinedThreadFingerprint(retryItems[0], "abc123")
 	if retryFP != fp {
 		t.Fatalf("retry fingerprint %q != original %q", retryFP, fp)
 	}
-	state2, replyErr2 := runner.replyToDeclinedComment(context.Background(), input, retryItem, retryFP, "Out of scope.", nil)
+	naive := retryItems[0]
+	naive.ThreadFingerprint = preFingerprint + "|c-decline@2026-01-01T00:02:00Z"
+	if buildDeclinedThreadFingerprint(naive, "abc123") == fp {
+		t.Fatal("including the posted decline in the source fingerprint must change the marker")
+	}
+	state2, replyErr2 := runner.replyToDeclinedComment(context.Background(), input, retryItems[0], retryFP, "Out of scope.", nil)
 	if replyErr2 != "" || state2 != "sent" {
 		t.Fatalf("retry state=%q err=%q, want idempotent sent", state2, replyErr2)
 	}

@@ -3709,6 +3709,88 @@ func TestRunResolveCommentsStepPostsDeclinedReplyAndLeavesThreadOpen(t *testing.
 	}
 }
 
+func TestRunResolveCommentsStepDeclineCrashWindowDoesNotRepost(t *testing.T) {
+	t.Parallel()
+	// Crash window: AddReviewThreadReply succeeds, resolve-comments checkpoint
+	// is not persisted, retry rebuilds FixItems from the live PR whose thread
+	// now contains the posted decline. Gateway-excluded threadFingerprint keeps
+	// the marker stable so remote idempotency does not post again.
+	preFingerprint := "c1@2026-01-01T00:00:00Z"
+	headSHA := "new-head"
+	item := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "please fix", ThreadFingerprint: preFingerprint}
+	fp := buildDeclinedThreadFingerprint(item, headSHA)
+	marker := fixerDeclinedReplyMarker("t1", fp)
+	github := &fakeGitHubGateway{
+		currentUser: testLooperLogin,
+		viewResponses: []PullRequestDetail{{
+			Number:      42,
+			State:       "OPEN",
+			HeadSHA:     headSHA,
+			HeadRefName: "feature/fix-42",
+			BaseRefName: "main",
+			BaseSHA:     "base-1",
+			Author:      "alice",
+			Comments: []map[string]any{{
+				"id":                "c1",
+				"threadId":          "t1",
+				"body":              "Please fix <!-- looper:stamp v=1 -->",
+				"author":            testLooperLogin,
+				"threadFingerprint": preFingerprint,
+			}},
+		}},
+		threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{
+			{ID: "c1", Author: testLooperLogin, Body: "Please fix <!-- looper:stamp v=1 -->", UpdatedAt: "2026-01-01T00:00:00Z"},
+		}}},
+	}
+	runner := New(Options{GitHub: github})
+	checkpoint := fixerCheckpoint{
+		FixItems:     []FixItem{item},
+		FixItemsHash: hashFixItems([]FixItem{item}),
+		Validation:   &ValidationResult{Passed: true, Summary: "ok", HeadSHA: headSHA},
+		Push:         &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair: &checkpointRepair{
+			ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionDeclined), Explanation: "Out of scope for this PR."}},
+		},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+	input := stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint}
+
+	if _, err := runner.runResolveCommentsStep(context.Background(), input); err != nil {
+		t.Fatalf("first runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.replyCalls) != 1 || !strings.Contains(github.replyCalls[0].Body, marker) {
+		t.Fatalf("first reply = %#v, want marker %q", github.replyCalls, marker)
+	}
+	if len(github.threads[0].Comments) < 2 {
+		t.Fatalf("live thread comments = %#v, want posted decline present", github.threads[0].Comments)
+	}
+
+	retryItems := collectFixItems(github.viewResponses[0])
+	if len(retryItems) != 1 {
+		t.Fatalf("retry items = %#v, want 1", retryItems)
+	}
+	retryFP := buildDeclinedThreadFingerprint(retryItems[0], headSHA)
+	if retryFP != fp {
+		t.Fatalf("retry fingerprint %q != original %q", retryFP, fp)
+	}
+	naive := retryItems[0]
+	naive.ThreadFingerprint = preFingerprint + "|reply-1@"
+	if buildDeclinedThreadFingerprint(naive, headSHA) == fp {
+		t.Fatal("including the posted decline in the source fingerprint must change the marker")
+	}
+
+	// Retry as if persist never recorded the sent decline.
+	if _, err := runner.runResolveCommentsStep(context.Background(), input); err != nil {
+		t.Fatalf("retry runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.replyCalls) != 1 {
+		t.Fatalf("retry posted %d replies, want 1 (stable marker hit the existing decline)", len(github.replyCalls))
+	}
+	if len(github.resolveCalls) != 0 {
+		t.Fatalf("resolve calls = %#v, want none", github.resolveCalls)
+	}
+}
+
 func TestRunResolveCommentsStepDoesNotReplayDeclineAfterReject(t *testing.T) {
 	t.Parallel()
 	repairCompletedAt := "2026-08-25T08:00:00Z"
