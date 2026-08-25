@@ -744,6 +744,7 @@ func validateReviewSubmitEventAllowed(event string, policy config.ReviewerReview
 var reviewSubmitMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
 var markdownHTMLCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
 var markdownReferenceDefinitionRE = regexp.MustCompile(`(?m)^\s{0,3}\[[^\]\n]+\]:[^\n]*(?:\n[ \t]+[^\n]*)*`)
+var reviewSubmitSuppressedFindingRE = regexp.MustCompile(`(?i)\b(?:follow_up|needs_human)\b`)
 
 func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commitID string, event string, policy config.ReviewerReviewEventsConfig, authorLogin string) error {
 	matches := reviewSubmitMarkerRE.FindAllStringSubmatch(body, -1)
@@ -793,7 +794,17 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("actionable COMMENT reviews require at least one inline comment; body-only reviews may only be clean COMMENT/APPROVE")
 		}
 	}
-	return nil
+	return validateReviewSubmitBodyHasNoSuppressedFindings(body)
+}
+
+// validateReviewSubmitBodyHasNoSuppressedFindings fail-closes when visible
+// review prose smuggles follow_up/needs_human findings. Spec 7.3 allows a
+// must_fix summary in the body; it does not allow suppressed dispositions.
+func validateReviewSubmitBodyHasNoSuppressedFindings(body string) error {
+	if reviewSubmitSuppressedFindingRE.FindString(cleanReviewHumanBody(body)) == "" {
+		return nil
+	}
+	return fmt.Errorf("review body must not include follow_up or needs_human findings; only must_fix may be published remotely")
 }
 
 // validateReviewSubmitCommentDispositions enforces the trusted finding contract on

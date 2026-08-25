@@ -898,6 +898,37 @@ func TestValidateReviewSubmitBodyRejectsCleanCommentWithInlineComments(t *testin
 	}
 }
 
+func TestValidateReviewSubmitBodyRejectsSuppressedFindings(t *testing.T) {
+	t.Parallel()
+
+	comments := []reviewSubmitComment{{
+		Body: "must_fix", Path: "main.go", Line: 1, Side: "RIGHT",
+		Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "nil deref",
+	}}
+	ok := "Must-fix only: guard the nil pointer.\n<!-- looper:review id=abc head=def outcome=actionable -->"
+	if err := validateReviewSubmitBody(ok, comments, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("must_fix summary body error = %v", err)
+	}
+	hidden := "<!-- follow_up: rename helper -->\nMust-fix only.\n<!-- looper:review id=abc head=def outcome=actionable -->"
+	if err := validateReviewSubmitBody(hidden, comments, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("suppressed token only in HTML comment error = %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "follow_up prose", body: "Also a follow_up rename later.\n<!-- looper:review id=abc head=def outcome=actionable -->"},
+		{name: "needs_human prose", body: "This needs_human because scope is unclear.\n<!-- looper:review id=abc head=def outcome=actionable -->"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateReviewSubmitBody(tc.body, comments, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+			if err == nil || !strings.Contains(err.Error(), "follow_up or needs_human") {
+				t.Fatalf("error = %v, want suppressed-finding rejection", err)
+			}
+		})
+	}
+}
+
 func TestValidateReviewSubmitBodyRequiresHumanCleanApproveBody(t *testing.T) {
 	t.Parallel()
 	marker := "<!-- looper:review id=abc head=def outcome=clean -->"

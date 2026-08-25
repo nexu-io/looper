@@ -667,6 +667,18 @@ const (
 	reviewFindingDispositionNeedsHuman = "needs_human"
 )
 
+const (
+	reviewFindingSeverityBlocking    = "blocking"
+	reviewFindingSeverityNonBlocking = "non_blocking"
+	reviewFindingSeverityNit         = "nit"
+
+	reviewFindingScopeStatedIntent           = "stated_intent"
+	reviewFindingScopeIntroducedRegression   = "introduced_regression"
+	reviewFindingScopeRequiredInvariant      = "required_invariant"
+	reviewFindingScopeIndependentImprovement = "independent_improvement"
+	reviewFindingScopeAmbiguousIntent        = "ambiguous_intent"
+)
+
 type threadResolutionCheckpoint struct {
 	HeadSHA   string `json:"headSha,omitempty"`
 	Processed int    `json:"processed,omitempty"`
@@ -4551,6 +4563,19 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		default:
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid disposition %q", i, finding.Disposition)
 		}
+		if finding.Severity == "" {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires severity", i)
+		}
+		switch finding.Severity {
+		case reviewFindingSeverityBlocking, reviewFindingSeverityNonBlocking, reviewFindingSeverityNit:
+		default:
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid severity %q", i, finding.Severity)
+		}
+		switch finding.ScopeBasis {
+		case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
+		default:
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid scopeBasis %q", i, finding.ScopeBasis)
+		}
 		if finding.Disposition == reviewFindingDispositionMustFix {
 			mustFixCount++
 		}
@@ -7538,13 +7563,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
-	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (must be `must_fix`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up`/`needs_human` in actionable comments; those dispositions stay out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
+	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (must be `must_fix`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up`/`needs_human` in actionable comments or the visible review body; those dispositions stay out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
 	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
 	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor."
 	if forgejoNative {
 		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
-		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition=must_fix`, `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
+		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition=must_fix`, `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields, rejects `follow_up`/`needs_human` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
 		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
 		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
 		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors; downgrade unanchorable feedback to a top-level review-body item with an exact file/section/symbol reference."

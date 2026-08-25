@@ -8501,6 +8501,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"NITs must not block merge",
 		"Finalization gate before submit",
 		"disposition=must_fix with scopeBasis/scopeEvidence",
+		"rejects `follow_up`/`needs_human` in actionable comments or the visible review body",
 		"review outcome matches the highest published severity",
 		"do not use PATH-based `looper`",
 		"repository-local `go run ./cmd/looper`",
@@ -10029,7 +10030,7 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		Summary: "No actionable findings",
 		Outcome: "clean",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Later", Body: "Nice", Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "x"},
+			{Title: "Later", Body: "Nice", Disposition: "follow_up", Severity: "nit", ScopeBasis: "independent_improvement", ScopeEvidence: "x"},
 		},
 	}); err != nil {
 		t.Fatalf("clean with follow_up only: %v", err)
@@ -10039,7 +10040,7 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		Summary: "No actionable findings",
 		Outcome: "clean",
 		Findings: []reviewerCommentOnlyFindingResult{
-			{Title: "Bug", Body: "x", Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
 		},
 	}); err == nil || !strings.Contains(err.Error(), "must_fix") {
 		t.Fatalf("clean with must_fix error = %v", err)
@@ -10072,6 +10073,33 @@ func TestValidateReviewerCommentOnlyCompletionDispositions(t *testing.T) {
 		},
 	}); err == nil || !strings.Contains(err.Error(), "requires scopeEvidence") {
 		t.Fatalf("missing scopeEvidence error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Missing severity",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "x", Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+		},
+	}); err == nil || !strings.Contains(err.Error(), "requires severity") {
+		t.Fatalf("missing severity error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Arbitrary severity",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "major", ScopeBasis: "introduced_regression", ScopeEvidence: "y"},
+		},
+	}); err == nil || !strings.Contains(err.Error(), "invalid severity") {
+		t.Fatalf("arbitrary severity error = %v", err)
+	}
+	if _, err := validateReviewerCommentOnlyCompletion(reviewerCommentOnlyCompletion{
+		Summary: "Unknown scopeBasis",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "x", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "vibes", ScopeEvidence: "y"},
+		},
+	}); err == nil || !strings.Contains(err.Error(), "invalid scopeBasis") {
+		t.Fatalf("unknown scopeBasis error = %v", err)
 	}
 }
 
