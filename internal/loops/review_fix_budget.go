@@ -737,14 +737,9 @@ func continueReviewFixBudget(ctx context.Context, repos *storage.Repositories, l
 		if fresh == nil {
 			continue
 		}
-		if !IsReviewFixBudgetHold(*fresh) && fresh.ID != loop.ID {
-			// Independently paused / failed siblings are not budget-held.
-			if fresh.Status == "paused" && !IsSiblingReviewFixBudgetPause(fresh.MetadataJSON) && !IsReviewFixBudgetExhaustedPause(fresh.MetadataJSON) {
-				continue
-			}
-			if fresh.Status == "failed" || fresh.Status == "interrupted" {
-				continue
-			}
+		if fresh.ID != loop.ID && !IsReviewFixBudgetHold(*fresh) {
+			// Reset only the answered loop and siblings currently carrying this hold.
+			continue
 		}
 		encoded, resetErr := resetReviewFixBudgetMetersIfNeeded(fresh.MetadataJSON, fresh.Type, caps)
 		if resetErr != nil {

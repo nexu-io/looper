@@ -112,6 +112,40 @@ func TestRefusePushIfBudgetExhaustedDoesNotResolveComments(t *testing.T) {
 	}
 }
 
+func TestRefusePushIfBudgetExhaustedFailsClosedOnLedgerRead(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	// Under the live cap: swallowing GetByID would admit the stale snapshot.
+	meta := `{"reviewFixBudget":{"pushCount":0}}`
+	fixer := storage.LoopRecord{ID: "loop_push_ledger_fail", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &meta, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = 1
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, HITLEnabled: false, GitHub: &fakeGitHubGateway{}})
+	if err := fixture.coordinator.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	refused, err := runner.refusePushIfBudgetExhausted(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    fixer, Repo: repo, PRNumber: prNumber,
+	})
+	if err == nil {
+		t.Fatalf("refused=%v err=%v, want fail closed on ledger read", refused, err)
+	}
+	if !refused {
+		t.Fatalf("refused=%v, want true when ledger refresh fails", refused)
+	}
+}
+
 func TestEnsureFixerPushBudgetCountedParksWhenCapReached(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

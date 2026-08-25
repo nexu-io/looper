@@ -1793,7 +1793,11 @@ func (r *Runner) notifyHumanAttentionBestEffort(ctx context.Context, loopID stri
 func (r *Runner) refusePushIfBudgetExhausted(ctx context.Context, input stepInput) (bool, error) {
 	loop := input.Loop
 	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
-		if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return true, err
+		}
+		if fresh != nil {
 			loop = *fresh
 		}
 	}
