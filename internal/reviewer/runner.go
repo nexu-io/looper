@@ -3484,6 +3484,18 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
+	if pendingNativeMustFixRequiresActionableMarker(pending) && !nativeMustFixReviewMarkerActionable(markerResult) {
+		message := missingReviewMarkerMessage(input, pending) + "; must_fix publication requires an actionable review marker with inline comments"
+		if pending.MarkerVerificationMisses == 0 {
+			pending.MarkerVerificationMisses = 1
+			checkpoint.PendingReview = pending.clone()
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, &loopError{message: message + "; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
+		}
+		checkpoint.PendingReview = nil
+		checkpoint.ResumePolicy = "rerun_review"
+		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
+	}
 	reviewPolicy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if cleanReviewNoopSummary(pending.Summary) && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
 		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
@@ -3610,6 +3622,17 @@ func nativeMustFixReviewMarkerActionable(found ReviewMarkerResult) bool {
 		return false
 	}
 	return len(found.InlineCommentBodies) > 0
+}
+
+func pendingNativeMustFixRequiresActionableMarker(pending pendingReviewCheckpoint) bool {
+	if strings.TrimSpace(pending.ReviewerSummaryJSON) == "" {
+		return false
+	}
+	var completion reviewerCommentOnlyCompletion
+	if err := json.Unmarshal([]byte(pending.ReviewerSummaryJSON), &completion); err != nil {
+		return false
+	}
+	return len(publishableCommentOnlyFindings(completion.Findings)) > 0
 }
 
 func sameReviewAuthorLogin(a string, b string) bool {

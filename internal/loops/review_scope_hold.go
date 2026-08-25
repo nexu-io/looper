@@ -242,7 +242,9 @@ func ParkReviewScopeHuman(ctx context.Context, repos *storage.Repositories, inpu
 
 func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, input ParkReviewScopeHumanInput) (storage.LoopRecord, error) {
 	held := input.Held
-	if fresh, err := repos.Loops.GetByID(ctx, held.ID); err == nil && fresh != nil {
+	if fresh, err := repos.Loops.GetByID(ctx, held.ID); err != nil {
+		return input.Held, err
+	} else if fresh != nil {
 		held = *fresh
 	}
 	if isReviewScopeHumanPrimaryHold(held) {

@@ -10270,6 +10270,105 @@ func TestNativeMustFixReviewMarkerActionableRequiresInlineComments(t *testing.T)
 	}
 }
 
+func TestRunPublishStepNativeMustFixRequiresActionableMarker(t *testing.T) {
+	t.Parallel()
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Blocking must_fix only",
+		Outcome: "blocking",
+		Findings: []reviewerCommentOnlyFindingResult{
+			{Title: "Bug", Body: "fix it", Disposition: "must_fix", Severity: "blocking", ScopeBasis: "introduced_regression", ScopeEvidence: "diff", Files: []string{"a.go"}},
+		},
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, tc := range []struct {
+		name         string
+		markerEvent  ReviewEvent
+		markerOut    string
+		inlineBodies []string
+		wantPublish  bool
+	}{
+		{name: "body_only_comment", markerEvent: ReviewEventComment, markerOut: "actionable"},
+		{name: "body_only_request_changes", markerEvent: ReviewEventRequestChanges, markerOut: "blocking"},
+		{name: "inline_comment", markerEvent: ReviewEventComment, markerOut: "blocking", inlineBodies: []string{"fix it"}, wantPublish: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			target := "pr:acme/looper:42"
+			metadata := `{"loop":{"iterationCount":0}}`
+			loop := storage.LoopRecord{
+				ID: "loop_native_must_fix_" + tc.name, Seq: 118, ProjectID: "project_1", Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("upsert loop: %v", err)
+			}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig: %v", err)
+			}
+			runner := New(Options{
+				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
+					reviewMarkerMissing:             false,
+					reviewMarkerEvent:               tc.markerEvent,
+					reviewMarkerOutcome:             tc.markerOut,
+					reviewMarkerInlineCommentBodies: tc.inlineBodies,
+				}, Git: &fakeGitGateway{},
+				Logger: fixture.logger, Now: fixture.now,
+				LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+			})
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+			}
+			_, err = runner.runPublishStep(context.Background(), stepInput{
+				Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_native_must_fix_" + tc.name},
+				Repo: repo, PRNumber: prNumber,
+				Checkpoint: reviewerCheckpoint{
+					Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+					Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+					PendingReview: &pendingReviewCheckpoint{
+						HeadSHA: "abc123", IdempotencyKey: "idem-native-must-fix-" + tc.name, Event: reviewEventAgentNative,
+						Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+					},
+				},
+			})
+			updated, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if getErr != nil || updated == nil {
+				t.Fatalf("after publish = (%#v, %v)", updated, getErr)
+			}
+			gotHead, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
+			if tc.wantPublish {
+				if err != nil {
+					t.Fatalf("runPublishStep() error = %v, want published native must_fix", err)
+				}
+				if loops.ReviewerPublishCount(updated.MetadataJSON) != 1 || gotHead != "abc123" {
+					t.Fatalf("published loop = %#v head=%q, want count=1 lastPublishedHeadSha=abc123", updated, gotHead)
+				}
+				return
+			}
+			var le *loopError
+			if !errors.As(err, &le) || le.kind != FailureRetryableAfterResume {
+				t.Fatalf("runPublishStep() error = %v, want retryable loopError", err)
+			}
+			if !strings.Contains(err.Error(), "actionable review marker") {
+				t.Fatalf("error = %q, want actionable-marker publication failure", err)
+			}
+			if loops.ReviewerPublishCount(updated.MetadataJSON) != 0 || gotHead != "" {
+				t.Fatalf("unpublished loop consumed budget/head: count=%d head=%q meta=%v", loops.ReviewerPublishCount(updated.MetadataJSON), gotHead, updated.MetadataJSON)
+			}
+		})
+	}
+}
+
 func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

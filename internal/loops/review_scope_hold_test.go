@@ -2,7 +2,9 @@ package loops
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -486,4 +488,52 @@ func derefMeta(m *string) string {
 		return ""
 	}
 	return *m
+}
+
+func TestParkReviewScopeHumanFailsClosedWhenRefreshErrors(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "loops.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{BackupDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	seedProject(t, repos, now)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_scope_refresh_err_reviewer", "reviewer", "running")
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_scope_refresh_err_fixer", "fixer", "queued")
+	if err := coordinator.Close(); err != nil {
+		t.Fatalf("close coordinator: %v", err)
+	}
+
+	if _, err := ParkReviewScopeHuman(context.Background(), repos, ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42,
+		NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md before unpause",
+	}); err == nil {
+		t.Fatal("ParkReviewScopeHuman error = nil, want refresh error")
+	}
+
+	reopened, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{BackupDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("reopen coordinator: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if _, err := reopened.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("reopen RunPending: %v", err)
+	}
+	freshRepos := storage.NewRepositories(reopened.DB())
+	freshReviewer, err := freshRepos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || freshReviewer == nil || freshReviewer.Status != "running" || IsReviewScopeHumanHold(*freshReviewer) {
+		t.Fatalf("reviewer after failed park = (%#v, %v), want still running and unparked", freshReviewer, err)
+	}
+	freshFixer, err := freshRepos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || freshFixer == nil || freshFixer.Status != "queued" || IsReviewScopeHumanHold(*freshFixer) {
+		t.Fatalf("fixer after failed park = (%#v, %v), want still queued and unparked", freshFixer, err)
+	}
 }

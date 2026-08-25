@@ -163,6 +163,165 @@ func TestPollGitHubHITLAnswersOnceScopeOverlaySkipsUnrelatedComments(t *testing.
 	}
 }
 
+func TestPollGitHubHITLAnswersOnceConsumesOneScopeDecisionPerPair(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		siblingFirst bool
+	}{
+		{name: "primary_first"},
+		{name: "sibling_first", siblingFirst: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+			nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+			coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+				Now: func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+			}
+			t.Cleanup(func() { _ = coordinator.Close() })
+			if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+				t.Fatalf("RunPending() error = %v", err)
+			}
+			repos := storage.NewRepositories(coordinator.DB())
+			projectID := "project_scope_pair_" + tc.name
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+				ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			repo := "acme/looper"
+			pr := int64(42)
+			target := "pr:acme/looper:42"
+			reviewer := storage.LoopRecord{
+				ID: "loop_scope_pair_reviewer_" + tc.name, Seq: 31, ProjectID: projectID, Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			fixer := storage.LoopRecord{
+				ID: "loop_scope_pair_fixer_" + tc.name, Seq: 32, ProjectID: projectID, Type: "fixer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			agentAsk := loops.HITLAsk{
+				Kind: "agent_question", Question: "Which approach should Fixer take?",
+				Options: []string{"A", "B"}, Status: "awaiting", AskedAt: nowISO,
+				Transport: "github", PRNumber: pr, AskCommentID: 8002,
+			}
+			fixerMeta, err := loops.WriteHITLAsk(nil, agentAsk)
+			if err != nil {
+				t.Fatalf("WriteHITLAsk(fixer): %v", err)
+			}
+			fixer.MetadataJSON = &fixerMeta
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+			}
+			if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+			}
+
+			if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+				Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr,
+				NowISO: nowISO, HITLEnabled: true,
+				Question: "Clarify AGENTS.md vs PR non-goals before continue.",
+			}); err != nil {
+				t.Fatalf("ParkReviewScopeHuman: %v", err)
+			}
+			reviewer = stampGitHubHITLAsk(t, repos, reviewer.ID, 8001)
+			fixer = stampGitHubHITLAsk(t, repos, fixer.ID, 8002)
+			reviewerAsk, ok := loops.ReadHITLAsk(reviewer.MetadataJSON)
+			if !ok || !loops.IsReviewScopeHumanAsk(reviewerAsk) {
+				t.Fatalf("reviewer ask = (%#v, %v), want scope ask", reviewerAsk, ok)
+			}
+			fixerAsk, ok := loops.ReadHITLAsk(fixer.MetadataJSON)
+			if !ok || loops.IsReviewScopeHumanAsk(fixerAsk) || fixerAsk.Question != agentAsk.Question {
+				t.Fatalf("fixer ask = (%#v, %v), want preserved agent ask", fixerAsk, ok)
+			}
+			if !githubHITLDecisionOnlyAsk(reviewer, reviewerAsk) || !githubHITLDecisionOnlyAsk(fixer, fixerAsk) {
+				t.Fatal("both pair members must snapshot as decision-only")
+			}
+
+			primary := githubHITLAwaitingLoop{
+				ID: reviewer.ID, ProjectID: projectID, Repo: repo, Transport: "github",
+				AskStatus: reviewerAsk.Status, PRNumber: pr, AskCommentID: reviewerAsk.AskCommentID,
+				BudgetAsk: githubHITLDecisionOnlyAsk(reviewer, reviewerAsk),
+			}
+			overlay := githubHITLAwaitingLoop{
+				ID: fixer.ID, ProjectID: projectID, Repo: repo, Transport: "github",
+				AskStatus: fixerAsk.Status, PRNumber: pr, AskCommentID: fixerAsk.AskCommentID,
+				BudgetAsk: githubHITLDecisionOnlyAsk(fixer, fixerAsk),
+			}
+			awaiting := []githubHITLAwaitingLoop{primary, overlay}
+			if tc.siblingFirst {
+				awaiting = []githubHITLAwaitingLoop{overlay, primary}
+			}
+			n := pollGitHubHITLAnswersOnce(context.Background(), awaiting, githubHITLPollDeps{
+				listComments: func(_ contextType, _ string, _ int64, _ string) ([]githubAnswerComment, error) {
+					return []githubAnswerComment{
+						{ID: 8001, Author: "looper", Body: "<!-- looper:hitl:ask --> Clarify AGENTS.md?"},
+						{ID: 8002, Author: "looper", Body: "<!-- looper:hitl:ask --> Which approach?"},
+						{ID: 8003, Author: "operator", Body: "Continue"},
+					}, nil
+				},
+				deliverAnswer: func(ctx contextType, loopID, answer string) error {
+					return deliverHITLAnswerToLoop(ctx, repos, nowISO, loopID, answer)
+				},
+				clearAwaiting: func(_ contextType, _ string, _ int64, _ string) {},
+			})
+			if n != 1 {
+				t.Fatalf("delivered = %d, want one pair-level Continue", n)
+			}
+
+			freshReviewer, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+			if err != nil || freshReviewer == nil || freshReviewer.Status != "queued" || loops.IsReviewScopeHumanHold(*freshReviewer) {
+				t.Fatalf("reviewer after Continue = (%#v, %v), want queued and released", freshReviewer, err)
+			}
+			if _, stillAsked := loops.ReadHITLAsk(freshReviewer.MetadataJSON); stillAsked {
+				t.Fatal("reviewer still has a HITL ask after pair Continue")
+			}
+			freshFixer, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+			if err != nil || freshFixer == nil || freshFixer.Status != "awaiting_human" || loops.IsReviewScopeHumanHold(*freshFixer) {
+				t.Fatalf("fixer after Continue = (%#v, %v), want awaiting preserved agent ask without overlay", freshFixer, err)
+			}
+			remaining, ok := loops.ReadHITLAsk(freshFixer.MetadataJSON)
+			if !ok || remaining.Status != "awaiting" || remaining.Question != agentAsk.Question || remaining.Answer != "" {
+				t.Fatalf("fixer ask after Continue = (%#v, %v), want unanswered agent question", remaining, ok)
+			}
+		})
+	}
+}
+
+func stampGitHubHITLAsk(t *testing.T, repos *storage.Repositories, loopID string, commentID int64) storage.LoopRecord {
+	t.Helper()
+	fresh, err := repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || fresh == nil {
+		t.Fatalf("Loops.GetByID(%s) = (%#v, %v)", loopID, fresh, err)
+	}
+	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+	if !ok {
+		t.Fatalf("loop %s missing HITL ask", loopID)
+	}
+	ask.Transport = "github"
+	ask.AskCommentID = commentID
+	if ask.PRNumber == 0 {
+		ask.PRNumber = 42
+	}
+	meta, err := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk(%s): %v", loopID, err)
+	}
+	fresh.MetadataJSON = &meta
+	if err := repos.Loops.Upsert(context.Background(), *fresh); err != nil {
+		t.Fatalf("Loops.Upsert(%s): %v", loopID, err)
+	}
+	return *fresh
+}
+
 func TestDrainScopeHoldOnStopDrainsPairBeforeScopeStop(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)

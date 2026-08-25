@@ -347,9 +347,11 @@ func drainReviewFixPairExecutions(ctx context.Context, repos *storage.Repositori
 // pollGitHubHITLAnswersOnce runs one pass of the answer-poll lane: for each loop
 // waiting on a GitHub HITL answer, it looks for a human's reply after the ask and
 // delivers it. It is idempotent — a loop that leaves awaiting_human on delivery
-// simply won't be passed in again.
+// simply won't be passed in again. A Continue/Stop consumed by a decision-only
+// pair member is not delivered again to the overlaid sibling in the same pass.
 func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoop, deps githubHITLPollDeps) int {
 	delivered := 0
+	consumedDecisionPairs := make(map[string]struct{})
 	for _, loop := range awaiting {
 		if !strings.EqualFold(strings.TrimSpace(loop.Transport), "github") || loop.PRNumber == 0 {
 			continue
@@ -360,6 +362,12 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 		repo := strings.TrimSpace(loop.Repo)
 		if repo == "" {
 			continue
+		}
+		pairKey := githubHITLDecisionPairKey(loop)
+		if loop.BudgetAsk && pairKey != "" {
+			if _, consumed := consumedDecisionPairs[pairKey]; consumed {
+				continue
+			}
 		}
 		cwd := ""
 		if deps.projectCWD != nil {
@@ -388,12 +396,23 @@ func pollGitHubHITLAnswersOnce(ctx contextType, awaiting []githubHITLAwaitingLoo
 			}
 			continue
 		}
+		if loop.BudgetAsk && pairKey != "" && (loops.IsReviewFixBudgetContinue(answer) || loops.IsReviewFixBudgetStop(answer)) {
+			consumedDecisionPairs[pairKey] = struct{}{}
+		}
 		if deps.clearAwaiting != nil {
 			deps.clearAwaiting(ctx, repo, loop.PRNumber, cwd)
 		}
 		delivered++
 	}
 	return delivered
+}
+
+func githubHITLDecisionPairKey(loop githubHITLAwaitingLoop) string {
+	repo := strings.TrimSpace(loop.Repo)
+	if repo == "" || loop.PRNumber == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s#%d", repo, loop.PRNumber)
 }
 
 // deliverHITLAnswerToLoop is the runtime-side equivalent of the api
