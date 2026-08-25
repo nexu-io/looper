@@ -10254,6 +10254,22 @@ func TestCommentOnlyNeedsHumanQuestionNamesAuthority(t *testing.T) {
 	}
 }
 
+func TestNativeMustFixReviewMarkerActionableRequiresInlineComments(t *testing.T) {
+	t.Parallel()
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventComment, Outcome: "actionable"}) {
+		t.Fatal("body-only COMMENT must not count as published must_fix")
+	}
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventRequestChanges, Outcome: "blocking"}) {
+		t.Fatal("body-only REQUEST_CHANGES must not count as published must_fix")
+	}
+	if !nativeMustFixReviewMarkerActionable(ReviewMarkerResult{Found: true, Event: ReviewEventComment, Outcome: "actionable", InlineCommentBodies: []string{"fix it"}}) {
+		t.Fatal("COMMENT with inline comments must count as published must_fix")
+	}
+	if nativeMustFixReviewMarkerActionable(ReviewMarkerResult{}) {
+		t.Fatal("missing marker must not count as published must_fix")
+	}
+}
+
 func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -10261,14 +10277,16 @@ func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 		markerMissing bool
 		markerEvent   ReviewEvent
 		markerOutcome string
+		inlineBodies  []string
 		wantHold      bool
 		wantRetryable bool
 		wantPublish   int
 		wantLastHead  string
 	}{
-		{name: "with_marker", markerMissing: false, markerEvent: ReviewEventComment, markerOutcome: "blocking", wantHold: true, wantPublish: 1, wantLastHead: "abc123"},
+		{name: "with_marker", markerMissing: false, markerEvent: ReviewEventComment, markerOutcome: "blocking", inlineBodies: []string{"fix it"}, wantHold: true, wantPublish: 1, wantLastHead: "abc123"},
 		{name: "without_marker", markerMissing: true, wantRetryable: true, wantPublish: 0},
 		{name: "clean_marker", markerMissing: false, markerEvent: ReviewEventApprove, markerOutcome: "clean", wantRetryable: true, wantPublish: 0},
+		{name: "body_only_comment", markerMissing: false, markerEvent: ReviewEventComment, markerOutcome: "actionable", wantRetryable: true, wantPublish: 0},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -10297,9 +10315,10 @@ func TestRunReviewStepNeedsHumanRecordsPublishedMarkerBeforePark(t *testing.T) {
 				Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
 			}}}
 			github := &fakeGitHubGateway{
-				reviewMarkerMissing: tc.markerMissing,
-				reviewMarkerEvent:   tc.markerEvent,
-				reviewMarkerOutcome: tc.markerOutcome,
+				reviewMarkerMissing:             tc.markerMissing,
+				reviewMarkerEvent:               tc.markerEvent,
+				reviewMarkerOutcome:             tc.markerOutcome,
+				reviewMarkerInlineCommentBodies: tc.inlineBodies,
 			}
 			runner := New(Options{
 				DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
@@ -10388,6 +10407,7 @@ func TestRunReviewStepMixedNativePersistsCompletionBeforePublishedHead(t *testin
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
 			reviewMarkerMissing: false, reviewMarkerEvent: ReviewEventComment, reviewMarkerOutcome: "blocking",
+			reviewMarkerInlineCommentBodies: []string{"fix it"},
 		}, Git: &fakeGitGateway{},
 		AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{
 			Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
@@ -10458,6 +10478,7 @@ func TestRunReviewStepNeedsHumanDoesNotRecountAlreadyPublishedHead(t *testing.T)
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{
 			reviewMarkerMissing: false, reviewMarkerEvent: ReviewEventComment, reviewMarkerOutcome: "blocking",
+			reviewMarkerInlineCommentBodies: []string{"fix it"},
 		}, Git: &fakeGitGateway{},
 		AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{
 			Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
@@ -10522,9 +10543,10 @@ func TestRunReviewStepNeedsHumanAtCapBudgetHoldOnlyNoStackedScope(t *testing.T) 
 		Status: "completed", Summary: "Mixed must_fix and needs_human", Stdout: stdout, ParseStatus: "parsed",
 	}}}
 	github := &fakeGitHubGateway{
-		reviewMarkerMissing: false,
-		reviewMarkerEvent:   ReviewEventComment,
-		reviewMarkerOutcome: "blocking",
+		reviewMarkerMissing:             false,
+		reviewMarkerEvent:               ReviewEventComment,
+		reviewMarkerOutcome:             "blocking",
+		reviewMarkerInlineCommentBodies: []string{"fix it"},
 	}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
@@ -10606,9 +10628,10 @@ func TestRunReviewStepNeedsHumanUnderCapScopeHoldOnly(t *testing.T) {
 		Status: "completed", Summary: "Mixed", Stdout: stdout, ParseStatus: "parsed",
 	}}}
 	github := &fakeGitHubGateway{
-		reviewMarkerMissing: false,
-		reviewMarkerEvent:   ReviewEventComment,
-		reviewMarkerOutcome: "blocking",
+		reviewMarkerMissing:             false,
+		reviewMarkerEvent:               ReviewEventComment,
+		reviewMarkerOutcome:             "blocking",
+		reviewMarkerInlineCommentBodies: []string{"fix it"},
 	}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},

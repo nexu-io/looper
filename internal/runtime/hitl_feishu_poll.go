@@ -172,7 +172,12 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 // an explicit budget Continue/Stop, invokes onAnswered so the live ask card is
 // marked resolved. Card-action delivery already does this; typed decisions must
 // too, or the cached loop-seq buttons can answer a later budget cycle.
-func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, text string, onAnswered func(context.Context, string, string)) error {
+// Typed Stop on a scope hold drains live pair agents before records terminalize,
+// matching card-action deliverAnswer.
+func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, db *sql.DB, cfg *config.Config, nowISO, loopID, text string, onAnswered func(context.Context, string, string), drain func(context.Context, storage.LoopRecord) error) error {
+	if err := drainScopeHoldOnStop(ctx, repos, loopID, text, drain); err != nil {
+		return err
+	}
 	shouldResolve := false
 	caps := reviewFixBudgetLiveCaps(cfg, "")
 	if repos != nil && repos.Loops != nil {
@@ -302,7 +307,7 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			return nil
 		},
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
-			return enqueueFeishuHITLMessage(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, text, input.OnHITLAnswerDelivered)
+			return enqueueFeishuHITLMessage(ctx, input.Repos, input.DB, input.Config, nowISO, loopID, text, input.OnHITLAnswerDelivered, input.DrainHITLPair)
 		},
 	}
 	if input.Logger != nil {

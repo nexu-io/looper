@@ -247,7 +247,7 @@ func TestFeishuHITLPollTypedBudgetMessageStaysParkedUntilContinue(t *testing.T) 
 		enqueueMessage: func(ctx contextType, loopID, text string) error {
 			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, func(_ contextType, answeredLoopID, answer string) {
 				resolved = append(resolved, answeredLoopID+"="+answer)
-			})
+			}, nil)
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
 			return deliverHITLAnswerToLoopWithCaps(ctx, repos, coordinator.DB(), nowISO, loopID, answer, reviewFixBudgetLiveCaps(nil, ""))
@@ -415,6 +415,95 @@ func TestGenericMessageDoesNotQueueNoAskBudgetHold(t *testing.T) {
 	}
 	if loops.ReviewerPublishCount(fresh.MetadataJSON) != 3 {
 		t.Fatalf("publish count = %d, want unchanged 3", loops.ReviewerPublishCount(fresh.MetadataJSON))
+	}
+}
+
+func TestFeishuHITLPollTypedScopeStopDrainsLiveSibling(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	const projectID = "project_scope_feishu_typed_stop"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	pr := int64(42)
+	target := "pr:acme/looper:42"
+	reviewer := storage.LoopRecord{
+		ID: "loop_feishu_typed_scope_reviewer", Seq: 91, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_feishu_typed_scope_fixer", Seq: 92, ProjectID: projectID, Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	parked, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+		Question: "Clarify AGENTS.md rule X before unpause",
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	reg := NewActiveExecutionRegistry()
+	var drained []string
+	drain := func(ctx context.Context, loop storage.LoopRecord) error {
+		if loop.Status == "terminated" || loop.Status == "stopped" {
+			t.Fatalf("drain after terminalize: status=%s", loop.Status)
+		}
+		drained = append(drained, loop.ID)
+		return drainReviewFixPairExecutions(ctx, repos, loop, reg)
+	}
+	deps := feishuHITLPollDeps{
+		loopByRoot: func(_ contextType, rootID string) string {
+			if rootID == "om_scope_root" {
+				return parked.ID
+			}
+			return ""
+		},
+		enqueueMessage: func(ctx contextType, loopID, text string) error {
+			return enqueueFeishuHITLMessage(ctx, repos, coordinator.DB(), nil, nowISO, loopID, text, nil, drain)
+		},
+	}
+	n, maxID := pollFeishuHITLInboxOnce(context.Background(), []feishuInboxEvent{{
+		ID: 40, Kind: "message", RootID: "om_scope_root", Text: "Stop",
+	}}, deps)
+	if n != 1 || maxID != 40 {
+		t.Fatalf("typed Stop poll = %d maxID=%d, want applied Stop", n, maxID)
+	}
+	if len(drained) != 1 || drained[0] != parked.ID {
+		t.Fatalf("typed Stop drained = %v, want [%s] before terminalize", drained, parked.ID)
+	}
+	fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+	if err != nil || fresh == nil || fresh.Status != "terminated" {
+		t.Fatalf("reviewer after typed Stop = (%#v, %v), want terminated", fresh, err)
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil || sibling.Status != "terminated" {
+		t.Fatalf("fixer after typed Stop = (%#v, %v), want terminated", sibling, err)
+	}
+	if !reg.LoopStopActive(reviewer.ID) || !reg.LoopStopActive(fixer.ID) {
+		t.Fatal("pair stop gates not closed after typed Feishu scope Stop")
 	}
 }
 

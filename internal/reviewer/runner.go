@@ -3602,21 +3602,14 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 }
 
 // nativeMustFixReviewMarkerActionable reports whether a verified marker can
-// stand in for published must_fix feedback. Clean/APPROVE markers and missing
-// markers are not actionable publication.
+// stand in for published must_fix feedback. Clean/APPROVE markers, missing
+// markers, and body-only COMMENT/REQUEST_CHANGES without inline comments are
+// not actionable publication.
 func nativeMustFixReviewMarkerActionable(found ReviewMarkerResult) bool {
 	if !found.Found {
 		return false
 	}
-	if len(found.InlineCommentBodies) > 0 {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(found.Outcome)) {
-	case "blocking", "non_blocking", "actionable":
-		return found.Event != ReviewEventApprove
-	default:
-		return false
-	}
+	return len(found.InlineCommentBodies) > 0
 }
 
 func sameReviewAuthorLogin(a string, b string) bool {
