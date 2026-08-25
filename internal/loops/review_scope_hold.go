@@ -253,6 +253,20 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 		if err := finishReviewScopeHumanPark(ctx, repos, held, input.Role, input.NowISO); err != nil {
 			return held, err
 		}
+		if sig := strings.TrimSpace(input.Signal); sig != "" && held.MetadataJSON != nil {
+			meta := parseMetadataObject(held.MetadataJSON)
+			meta["lastReviewedSignalFingerprint"] = sig
+			encoded, marshalErr := json.Marshal(meta)
+			if marshalErr != nil {
+				return held, marshalErr
+			}
+			text := string(encoded)
+			held.MetadataJSON = &text
+			held.UpdatedAt = input.NowISO
+			if err := repos.Loops.Upsert(ctx, held); err != nil {
+				return held, err
+			}
+		}
 		if err := ensureReviewScopeHumanHandoffEvent(ctx, repos, held, input); err != nil {
 			return held, err
 		}
@@ -307,6 +321,15 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 		}
 		metadata = string(encoded)
 		held.Status = "paused"
+	}
+	if sig := strings.TrimSpace(input.Signal); sig != "" {
+		meta := parseMetadataObject(&metadata)
+		meta["lastReviewedSignalFingerprint"] = sig
+		encoded, marshalErr := json.Marshal(meta)
+		if marshalErr != nil {
+			return input.Held, marshalErr
+		}
+		metadata = string(encoded)
 	}
 	held.MetadataJSON = &metadata
 	held.NextRunAt = nil

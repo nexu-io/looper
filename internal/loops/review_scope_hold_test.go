@@ -522,6 +522,33 @@ func TestScopeHandoffRecordsPendingSignalNotStaleMetadata(t *testing.T) {
 	}
 }
 
+func TestParkReviewScopeHumanPersistsSignalOnLoop(t *testing.T) {
+	t.Parallel()
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"loop":{"iterationCount":2}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_scope_park_sig", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("upsert reviewer: %v", err)
+	}
+	parked, err := ParkReviewScopeHuman(context.Background(), repos, ParkReviewScopeHumanInput{
+		Held: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42,
+		NowISO: nowISO, HITLEnabled: false,
+		Question: "Is this in PR scope?",
+		Signal:   "sig-live",
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewScopeHuman: %v", err)
+	}
+	if !IsReviewScopeHumanHold(parked) {
+		t.Fatalf("parked = %#v, want scope hold", parked)
+	}
+	meta := parseMetadataObject(parked.MetadataJSON)
+	if signal, _ := stringFromAny(meta["lastReviewedSignalFingerprint"]); signal != "sig-live" {
+		t.Fatalf("loop signal = %q, want sig-live committed with the hold", signal)
+	}
+}
+
 func derefMeta(m *string) string {
 	if m == nil {
 		return ""

@@ -3510,8 +3510,10 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			if err := r.parkDispositionNeedsHuman(ctx, input, thread.ID, decision.Evidence, reviewSignalFP); err != nil {
 				return checkpoint, err
 			}
-			if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP); err != nil {
-				return checkpoint, err
+			if loops.IsReviewFixBudgetHold(input.Loop) {
+				if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP); err != nil {
+					return checkpoint, err
+				}
 			}
 			var finErr error
 			checkpoint, finErr = r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
@@ -7284,12 +7286,14 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		if (existing.Status == "running" || existing.Status == "claimed") && strings.TrimSpace(input.ReviewSignalFingerprint) != "" {
 			updated := *existing
 			merged := parseJSONObject(existing.PayloadJSON)
+			keepPendingConvergence := pendingConvergencePassFromQueuePayload(existing.PayloadJSON) &&
+				samePendingConvergenceHeadSignal(input, merged)
 			merged["pendingReviewSignalFingerprint"] = input.ReviewSignalFingerprint
 			if strings.TrimSpace(input.HeadSHA) != "" {
 				merged["pendingHeadSha"] = input.HeadSHA
 			}
 			merged["pendingDispositionOnly"] = input.DispositionOnly
-			if input.ConvergencePass {
+			if input.ConvergencePass || keepPendingConvergence {
 				merged["pendingConvergencePass"] = true
 				merged["pendingDispositionOnly"] = false
 			} else {
@@ -7327,6 +7331,24 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 		r.wakeSchedulerAfterEnqueue()
 	}
 	return persisted, nil
+}
+
+// samePendingConvergenceHeadSignal is true when a later ordinary enqueue is the
+// same head and review signal already stashed or running. Delayed self-webhooks
+// from last-thread accept/resolve must not clear pendingConvergencePass.
+func samePendingConvergenceHeadSignal(input enqueueInput, existing map[string]any) bool {
+	pendingHead, _ := stringFromAny(existing["pendingHeadSha"])
+	head, _ := stringFromAny(existing["headSha"])
+	priorHead := firstNonEmpty(strings.TrimSpace(pendingHead), strings.TrimSpace(head))
+	inHead := strings.TrimSpace(input.HeadSHA)
+	if inHead != "" && priorHead != "" && inHead != priorHead {
+		return false
+	}
+	pendingSignal, _ := stringFromAny(existing["pendingReviewSignalFingerprint"])
+	signal, _ := stringFromAny(existing["reviewSignalFingerprint"])
+	priorSignal := firstNonEmpty(strings.TrimSpace(pendingSignal), strings.TrimSpace(signal))
+	inSignal := strings.TrimSpace(input.ReviewSignalFingerprint)
+	return inSignal != "" && priorSignal != "" && inSignal == priorSignal
 }
 
 func reviewerQueuePayloadJSON(headSHA, reviewSignal string, dispositionOnly bool) string {
