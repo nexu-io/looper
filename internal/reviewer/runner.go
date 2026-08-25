@@ -2142,6 +2142,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 
 // finalizeSuccessfulReviewerQueue completes the active item and schedules any
 // pending/partial-batch continuation fail-closed (live read required; schedule errors surface).
+// After Complete, any downstream failure restores the row unless a continuation is already active.
 func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint reviewerCheckpoint, status, summary string) (ProcessResult, error) {
 	// Capture pending coalesced signal before completing the active item.
 	// Prefer the live row: mid-run may have stashed pending* and/or written
@@ -2221,28 +2222,28 @@ func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project st
 		updated.NextRunAt = nil
 	})
 	if err != nil {
-		return ProcessResult{}, err
+		return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 	}
 	if parked, parkErr := r.parkReviewerBudgetAfterSuccessfulRun(ctx, project, updatedLoop); parkErr != nil {
-		return ProcessResult{}, parkErr
+		return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, parkErr)
 	} else if parked {
 		r.cleanupReviewerWorktreeIfTerminal(context.Background(), project, &checkpoint)
 		// Still schedule disposition / partial-batch continuation on budget hold.
 		// Convergence full-review (pendingDisp=false without partial cursor) waits.
 		if needsContinuation && hasPending && (pendingDisp || partialCont != nil) {
 			if err := r.schedulePendingReviewerContinuation(ctx, project, updatedLoop, priorForContinuation, pendingHead, pendingSignal, pendingDisp); err != nil {
-				return ProcessResult{}, err
+				return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 			}
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: runID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
 	if reason := terminalReviewerLoopReason(updatedLoop); reason != "" {
 		if _, err := r.repos.Queue.CancelByLoop(ctx, updatedLoop.ID, r.nowISO(), &reason); err != nil {
-			return ProcessResult{}, err
+			return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 		}
 	} else if needsContinuation && hasPending {
 		if err := r.schedulePendingReviewerContinuation(ctx, project, updatedLoop, priorForContinuation, pendingHead, pendingSignal, pendingDisp); err != nil {
-			return ProcessResult{}, err
+			return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 		}
 	}
 	r.cleanupReviewerWorktreeIfTerminal(context.Background(), project, &checkpoint)
@@ -2309,6 +2310,47 @@ func (r *Runner) schedulePendingReviewerContinuation(ctx context.Context, projec
 		}
 	}
 	return nil
+}
+
+// failReviewerFinalizeAfterComplete restores the completed row when no
+// continuation is active so a post-Complete updateLoop/schedule failure cannot
+// drop coalesced clean-convergence work after the live signal was promoted.
+func (r *Runner) failReviewerFinalizeAfterComplete(ctx context.Context, item storage.QueueItemRecord, cause error) (ProcessResult, error) {
+	if restoreErr := r.restoreReviewerQueueIfNoContinuation(ctx, item, cause); restoreErr != nil {
+		return ProcessResult{}, errors.Join(cause, restoreErr)
+	}
+	return ProcessResult{}, cause
+}
+
+func (r *Runner) restoreReviewerQueueIfNoContinuation(ctx context.Context, item storage.QueueItemRecord, cause error) error {
+	if r.repos == nil || r.repos.Queue == nil || strings.TrimSpace(item.ID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(item.DedupeKey) != "" {
+		active, err := r.repos.Queue.FindActiveByDedupe(ctx, item.DedupeKey)
+		if err != nil {
+			return err
+		}
+		if active != nil && active.ID != item.ID {
+			return nil
+		}
+		if active != nil && active.ID == item.ID && (active.Status == "queued" || active.Status == "running") {
+			return nil
+		}
+	}
+	nowISO := r.nowISO()
+	message := ""
+	if cause != nil {
+		message = cause.Error()
+	}
+	return r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{
+		ID:           item.ID,
+		AvailableAt:  nowISO,
+		Attempts:     item.Attempts,
+		ErrorMessage: optionalString(message),
+		ErrorKind:    string(FailureRetryableTransient),
+		UpdatedAt:    nowISO,
+	})
 }
 
 func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord) error {
@@ -3389,7 +3431,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		isDisposition := entry.disposition
 		decisionValue := strings.ToLower(strings.TrimSpace(decision.Decision))
 		// Narrow disposition path only terminates as accept/reject/needs_human.
-		if isDisposition || checkpoint.DispositionOnly || result.DispositionOnly {
+		if isDisposition {
 			switch decisionValue {
 			case "accept_wontfix", "reject_wontfix", "needs_human":
 			case "objectively_fixed", "not_fixed":
@@ -3408,11 +3450,10 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		commented := false
 		resolved := false
 		skippedReason := ""
-
 		// needs_human on the narrow disposition path: halt pair; no remote
 		// adjudication reply. Persist local signal identity so same-head polling
 		// does not re-enqueue unchanged input (§8.4). Legacy modes may still comment.
-		if decisionValue == "needs_human" && (isDisposition || checkpoint.DispositionOnly || result.DispositionOnly) {
+		if decisionValue == "needs_human" && isDisposition {
 			result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
 			result.ReviewSignalFingerprint = reviewSignalFP
 			result.ThreadFeedbackFingerprint = threadFeedbackFP

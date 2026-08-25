@@ -2024,4 +2024,223 @@ func TestAcceptReplyThenResolveFailureRetriesResolve(t *testing.T) {
 	}
 }
 
+func TestFinalizeRestoresQueueWhenPostCompleteLoopUpdateFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"same-head"}`
+	loop := storage.LoopRecord{
+		ID: "loop_restore_update", Seq: 1, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert loop: %v", err)
+	}
+	livePayload := `{"headSha":"same-head","reviewSignalFingerprint":"sig-disp","dispositionOnly":true,"pendingHeadSha":"same-head","pendingReviewSignalFingerprint":"sig-converge","pendingDispositionOnly":false}`
+	dedupe := buildReviewerDedupeKey("project_1", loop.ID, repo, prNumber)
+	item := storage.QueueItemRecord{
+		ID: "queue_restore_update", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: dedupe, Priority: storage.QueuePriorityReviewer, Status: "running",
+		AvailableAt: fixture.nowISO(), Attempts: 0, MaxAttempts: 5,
+		PayloadJSON: &livePayload, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Upsert queue: %v", err)
+	}
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER fail_loop_update BEFORE UPDATE ON loops
+		BEGIN
+			SELECT RAISE(ABORT, 'injected updateLoop failure');
+		END;
+	`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: config.ReviewerLoopConfig{QuietPeriodSeconds: 60},
+	})
+	ctx := context.Background()
+	_, err := runner.finalizeSuccessfulReviewerQueue(ctx,
+		storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp"}, loop, item, "run_restore_update",
+		reviewerCheckpoint{DispositionOnly: true}, "success", "disposition done")
+	if err == nil {
+		t.Fatal("expected post-complete updateLoop failure")
+	}
+	if !strings.Contains(err.Error(), "injected updateLoop failure") {
+		t.Fatalf("err = %v, want injected updateLoop failure", err)
+	}
+	got, getErr := fixture.repos.Queue.GetByID(ctx, item.ID)
+	if getErr != nil || got == nil {
+		t.Fatalf("GetByID = (%v, %v)", got, getErr)
+	}
+	if got.Status != "queued" {
+		t.Fatalf("status = %q, want queued restore after post-complete failure; err=%v", got.Status, err)
+	}
+	if got.PayloadJSON == nil || !strings.Contains(*got.PayloadJSON, "sig-converge") {
+		t.Fatalf("restored payload missing coalesced convergence signal: %v", got.PayloadJSON)
+	}
+	if got.PayloadJSON != nil && strings.Contains(*got.PayloadJSON, `"dispositionOnly":true`) {
+		t.Fatalf("restored payload must promote full-review continuation, got %s", *got.PayloadJSON)
+	}
+}
+
+func TestFinalizeRestoresQueueWhenContinuationEnqueueFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"same-head"}`
+	loop := storage.LoopRecord{
+		ID: "loop_restore_sched", Seq: 1, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert loop: %v", err)
+	}
+	livePayload := `{"headSha":"same-head","reviewSignalFingerprint":"sig-disp","dispositionOnly":true,"pendingHeadSha":"same-head","pendingReviewSignalFingerprint":"sig-converge","pendingDispositionOnly":false}`
+	dedupe := buildReviewerDedupeKey("project_1", loop.ID, repo, prNumber)
+	item := storage.QueueItemRecord{
+		ID: "queue_restore_sched", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: dedupe, Priority: storage.QueuePriorityReviewer, Status: "running",
+		AvailableAt: fixture.nowISO(), Attempts: 0, MaxAttempts: 5,
+		PayloadJSON: &livePayload, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Upsert queue: %v", err)
+	}
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER fail_continuation_insert BEFORE INSERT ON queue_items
+		WHEN NEW.id != 'queue_restore_sched'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected schedule failure');
+		END;
+	`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: config.ReviewerLoopConfig{QuietPeriodSeconds: 60},
+	})
+	ctx := context.Background()
+	_, err := runner.finalizeSuccessfulReviewerQueue(ctx,
+		storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp"}, loop, item, "run_restore_sched",
+		reviewerCheckpoint{DispositionOnly: true}, "success", "disposition done")
+	if err == nil {
+		t.Fatal("expected continuation enqueue failure")
+	}
+	if !strings.Contains(err.Error(), "injected schedule failure") {
+		t.Fatalf("err = %v, want injected schedule failure", err)
+	}
+	got, getErr := fixture.repos.Queue.GetByID(ctx, item.ID)
+	if getErr != nil || got == nil {
+		t.Fatalf("GetByID = (%v, %v)", got, getErr)
+	}
+	if got.Status != "queued" {
+		t.Fatalf("status = %q, want queued restore so polling can retry the coalesced pass", got.Status)
+	}
+	active, findErr := fixture.repos.Queue.FindActiveByDedupe(ctx, dedupe)
+	if findErr != nil || active == nil || active.ID != item.ID {
+		t.Fatalf("active continuation = (%v, %v), want restored original row", active, findErr)
+	}
+}
+
+func TestDispositionOnlyBatchDoesNotCoerceObjectiveDecisions(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeResolveObjective
+	policy.RequireCurrentReviewRequest = false
+	policy.RequireNewHeadSinceThread = true
+
+	threads := []ReviewThread{
+		{
+			ID: "thread_obj",
+			Comments: []ReviewThreadComment{
+				{ID: "c-obj", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"},
+			},
+		},
+		{
+			ID: "thread_disp",
+			Comments: []ReviewThreadComment{
+				{ID: "c-disp-1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "old-head"},
+				{ID: "c-disp-2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix out of scope", CreatedAt: "t2", UpdatedAt: "t2"},
+			},
+		},
+	}
+	github := &fakeGitHubGateway{
+		currentLogin:   "looper-bot",
+		reviewRequests: []string{"looper-bot"},
+		reviewThreads:  threads,
+		viewHeadSHA:    "abc123",
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed",
+		Stdout: `{"decisions":[{"threadId":"thread_obj","decision":"objectively_fixed","evidence":"nil check is present","confidence":"high"},{"threadId":"thread_disp","decision":"accept_wontfix","evidence":"outside PR scope","confidence":"high"}]}`,
+	}}}
+	fixture := newRunnerFixture(t)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123"}`
+	loop := storage.LoopRecord{
+		ID: "loop_mixed_disp", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert loop: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
+		ThreadResolution: policy,
+		LoopConfig:       testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Detail.ReviewRequests = []string{"looper-bot"}
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	held, holdErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if holdErr != nil || held == nil {
+		t.Fatalf("GetByID loop = (%v, %v)", held, holdErr)
+	}
+	if loops.IsReviewScopeHumanHold(*held) {
+		t.Fatal("objective candidate must not inherit disposition-only needs_human parking")
+	}
+	if len(github.addThreadReplyCalls) != 2 {
+		t.Fatalf("replies = %#v, want objectively_fixed then accept_wontfix", github.addThreadReplyCalls)
+	}
+	if !strings.Contains(github.addThreadReplyCalls[0].Body, "decision=objectively_fixed") {
+		t.Fatalf("first reply = %q, want objectively_fixed", github.addThreadReplyCalls[0].Body)
+	}
+	if github.addThreadReplyCalls[0].ThreadID != "thread_obj" {
+		t.Fatalf("first reply thread = %q, want thread_obj", github.addThreadReplyCalls[0].ThreadID)
+	}
+	if !strings.Contains(github.addThreadReplyCalls[1].Body, "decision=accept_wontfix") {
+		t.Fatalf("second reply = %q, want accept_wontfix", github.addThreadReplyCalls[1].Body)
+	}
+	if len(github.resolveThreadCalls) != 2 {
+		t.Fatalf("resolves = %#v, want both threads resolved", github.resolveThreadCalls)
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Commented != 2 || checkpoint.ThreadResolution.Resolved != 2 {
+		t.Fatalf("ThreadResolution = %#v, want two comments and two resolutions", checkpoint.ThreadResolution)
+	}
+}
+
 func int64Ptr(v int64) *int64 { return &v }
