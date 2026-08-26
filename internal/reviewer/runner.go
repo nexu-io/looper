@@ -70,6 +70,7 @@ var reviewerIssueClosingReferencePattern = regexp.MustCompile(`(?i)\b(?:close[sd
 const (
 	reviewerNativeResumeMetadataKey      = "reviewerNativeResume"
 	reviewerNativeResumeReasonHeadChange = "head_change"
+	metadataLastPublishedReviewIDKey     = "lastPublishedReviewId"
 )
 
 type ReviewerStep string
@@ -3975,6 +3976,11 @@ func appendUniqueString(values []string, value string) []string {
 	return append(values, value)
 }
 
+// parkDispositionScopePersistHook, when set (tests only), runs after the
+// budget-held loop is refreshed and before pending-scope persist so Continue
+// can interleave.
+var parkDispositionScopePersistHook func(loop storage.LoopRecord) error
+
 func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput, threadID, evidence, signal string) error {
 	if r.repos == nil {
 		return nil
@@ -4004,18 +4010,36 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 			}
 			loop = *fresh
 		}
-		encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
-			loop.MetadataJSON, question, message, r.reviewFixHITLEnabled(),
-		)
-		if err != nil {
-			return err
+		if !loops.IsReviewFixBudgetHold(loop) {
+			// Continue/unpause already released the pair; do not restore it.
+			return nil
 		}
-		loop.MetadataJSON = &encoded
-		loop.UpdatedAt = r.nowISO()
+		if parkDispositionScopePersistHook != nil {
+			if err := parkDispositionScopePersistHook(loop); err != nil {
+				return err
+			}
+		}
 		if r.repos.Loops == nil {
 			return fmt.Errorf("persist pending review scope requires loop storage")
 		}
-		return r.repos.Loops.Upsert(ctx, loop)
+		var persistErr error
+		_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+			if !loops.IsReviewFixBudgetHold(*updated) {
+				return
+			}
+			encoded, encErr := loops.PersistPendingReviewScopeHumanEvidence(
+				updated.MetadataJSON, question, message, r.reviewFixHITLEnabled(),
+			)
+			if encErr != nil {
+				persistErr = encErr
+				return
+			}
+			updated.MetadataJSON = &encoded
+		})
+		if err != nil {
+			return err
+		}
+		return persistErr
 	}
 	_, err := loops.ParkReviewScopeHuman(ctx, r.repos, loops.ParkReviewScopeHumanInput{
 		Held:        input.Loop,
@@ -6713,12 +6737,18 @@ func isValidBlockingReviewEvent(value string) bool {
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
 	updated, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		previous, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"])
-		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
+		meta := parseJSONObject(updated.MetadataJSON)
+		previous, _ := stringFromAny(meta["lastPublishedHeadSha"])
+		previousReviewID, _ := stringFromAny(meta[metadataLastPublishedReviewIDKey])
+		merge := map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()}
+		if reviewID := strings.TrimSpace(pending.IdempotencyKey); reviewID != "" {
+			merge[metadataLastPublishedReviewIDKey] = reviewID
+		}
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, merge)
 		if err != nil {
 			return
 		}
-		if strings.TrimSpace(previous) != strings.TrimSpace(pending.HeadSHA) {
+		if shouldCountPublishedReview(previous, previousReviewID, pending.HeadSHA, pending.IdempotencyKey) {
 			counted, _, countErr := loops.IncrementReviewerPublishCount(&metadataJSON)
 			if countErr != nil {
 				return
@@ -9561,6 +9591,17 @@ func reviewPublicationID(loopID string, checkpoint reviewerCheckpoint) string {
 
 func isConvergencePublication(checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint) bool {
 	return checkpoint.ConvergencePass || (checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.ScheduleConvergencePass) || isConvergenceReviewID(pending.IdempotencyKey)
+}
+
+// shouldCountPublishedReview reports whether a successful publish should
+// increment maxPublishesPerPR. Same-head retries reuse lastPublishedHeadSha;
+// same-head convergence uses the distinct publication identity instead.
+func shouldCountPublishedReview(previousHead, previousReviewID, headSHA, reviewID string) bool {
+	reviewID = strings.TrimSpace(reviewID)
+	if isConvergenceReviewID(reviewID) {
+		return reviewID != strings.TrimSpace(previousReviewID)
+	}
+	return strings.TrimSpace(previousHead) != strings.TrimSpace(headSHA)
 }
 
 func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey string) string {

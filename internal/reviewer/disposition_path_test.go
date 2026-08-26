@@ -3644,6 +3644,84 @@ func TestBudgetHeldDispositionNeedsHumanRefreshErrorDoesNotUpsertStale(t *testin
 	}
 }
 
+func TestBudgetHeldDispositionNeedsHumanContinueDoesNotRestoreHold(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	revMeta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_nh_budget_continue_race", Seq: 33, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &revMeta,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_nh_budget_continue_race_fix", Seq: 34, ProjectID: "project_1", Type: "fixer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: stringPtr(`{"followUpdates":true}`),
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(parked) {
+		t.Fatalf("fixture must be budget hold: %#v", parked)
+	}
+	parkDispositionScopePersistHook = func(held storage.LoopRecord) error {
+		result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
+		if contErr != nil {
+			return contErr
+		}
+		if !result.Applied {
+			return fmt.Errorf("continue not applied")
+		}
+		return nil
+	}
+	t.Cleanup(func() { parkDispositionScopePersistHook = nil })
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "looper-bot"},
+		Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = parked
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	if err := runner.parkDispositionNeedsHuman(context.Background(), input, "thread_1", "ambiguous", "sig-needs-human"); err != nil {
+		t.Fatalf("parkDispositionNeedsHuman: %v", err)
+	}
+	after, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || after == nil {
+		t.Fatalf("get reviewer: (%#v, %v)", after, getErr)
+	}
+	if loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("Continue must remain released, got hold status=%s meta=%s", after.Status, derefString(after.MetadataJSON))
+	}
+	if loops.IsReviewScopeHumanHold(*after) {
+		t.Fatalf("late persist must not park scope after Continue: status=%s meta=%s", after.Status, derefString(after.MetadataJSON))
+	}
+	sibling, sibErr := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
+	if sibErr != nil || sibling == nil {
+		t.Fatalf("get fixer: (%#v, %v)", sibling, sibErr)
+	}
+	if loops.IsReviewFixBudgetHold(*sibling) {
+		t.Fatalf("sibling Continue must remain released, got hold status=%s meta=%s", sibling.Status, derefString(sibling.MetadataJSON))
+	}
+}
+
 func int64Ptr(v int64) *int64 { return &v }
 
 func lastLoopEventSignal(t *testing.T, repos *storage.Repositories, loopID, eventType string) string {

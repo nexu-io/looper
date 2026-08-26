@@ -2529,6 +2529,72 @@ func TestRecordPublishedReviewProgressCountsBeforeClaimComplete(t *testing.T) {
 	}
 }
 
+func TestRecordPublishedReviewProgressCountsSameHeadConvergence(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	cfg := testReviewerLoopConfig()
+	cfg.MaxPublishesPerPR = 3
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"iterationCount":2}}`
+	loop := storage.LoopRecord{ID: "loop_conv_count", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	fixer := storage.LoopRecord{ID: "loop_conv_count_fix", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: stringPtr(`{"followUpdates":true}`), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA:        "abc123",
+		IdempotencyKey: agentNativeConvergenceReviewID(loop.ID, "abc123", "sig-1"),
+		Summary:        "same-head convergence",
+	}
+	input := stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1"},
+		Loop:     loop,
+		Run:      storage.RunRecord{ID: "run_conv_count"},
+		Repo:     repo,
+		PRNumber: prNumber,
+	}
+	if err := runner.recordPublishedReviewProgress(context.Background(), input, pending, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress() error = %v", err)
+	}
+	afterPublish, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || afterPublish == nil {
+		t.Fatalf("Loops.GetByID() after publish = (%#v, %v)", afterPublish, err)
+	}
+	if loops.ReviewerPublishCount(afterPublish.MetadataJSON) != 3 {
+		t.Fatalf("iterationCount after same-head convergence = %d, want 3", loops.ReviewerPublishCount(afterPublish.MetadataJSON))
+	}
+	if got, _ := stringFromAny(parseJSONObject(afterPublish.MetadataJSON)[metadataLastPublishedReviewIDKey]); got != pending.IdempotencyKey {
+		t.Fatalf("lastPublishedReviewId = %q, want %q", got, pending.IdempotencyKey)
+	}
+	if !loops.IsReviewFixBudgetHold(*afterPublish) {
+		t.Fatalf("same-head convergence at cap must park: status=%s meta=%s", afterPublish.Status, derefString(afterPublish.MetadataJSON))
+	}
+	input.Loop = *afterPublish
+	if err := runner.recordPublishedReviewProgress(context.Background(), input, pending, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress(retry) error = %v", err)
+	}
+	retried, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || retried == nil || loops.ReviewerPublishCount(retried.MetadataJSON) != 3 {
+		t.Fatalf("iterationCount after same-identity retry = (%#v, %v), want 3", retried, err)
+	}
+	next := pending
+	next.IdempotencyKey = agentNativeConvergenceReviewID(loop.ID, "abc123", "sig-2")
+	input.Loop = *retried
+	if err := runner.recordPublishedReviewProgress(context.Background(), input, next, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress(new signal) error = %v", err)
+	}
+	second, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || second == nil || loops.ReviewerPublishCount(second.MetadataJSON) != 4 {
+		t.Fatalf("iterationCount after new convergence identity = (%#v, %v), want 4", second, err)
+	}
+}
+
 func TestRecordLoopSuccessMetadataRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{LoopConfig: testReviewerLoopConfig()})
