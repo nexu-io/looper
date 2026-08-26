@@ -127,9 +127,10 @@ var feishuInboxCursor struct {
 var feishuInboxHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 type feishuHITLDeliveryDeps struct {
-	sendAsk func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error
-	nowISO  string
-	logWarn func(msg string, fields map[string]any)
+	sendAsk  func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error
+	closeAsk func(ctx contextType, loopID string)
+	nowISO   string
+	logWarn  func(msg string, fields map[string]any)
 }
 
 func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopRecord, repos *storage.Repositories, deps feishuHITLDeliveryDeps) int {
@@ -168,11 +169,34 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 			continue
 		}
 		if !persisted {
+			if deps.closeAsk != nil {
+				deps.closeAsk(ctx, loop.ID)
+			}
 			continue
 		}
+
 		delivered++
 	}
 	return delivered
+}
+
+// closeObsoleteFeishuPairAskCard resolves a card that SendHITLAsk already posted
+// when persistPairAskDelivery reports the ask is no longer current. Loop-seq
+// buttons on a leftover card can answer a later hold on the same loop.
+func closeObsoleteFeishuPairAskCard(ctx contextType, repos *storage.Repositories, loopID string, onAnswered func(context.Context, string, string)) {
+	if onAnswered == nil || strings.TrimSpace(loopID) == "" {
+		return
+	}
+	answer := loops.ReviewFixBudgetAnswerContinue
+	if repos != nil && repos.Loops != nil {
+		if fresh, err := repos.Loops.GetByID(ctx, loopID); err == nil && fresh != nil {
+			switch strings.TrimSpace(fresh.Status) {
+			case "terminated", "stopped":
+				answer = loops.ReviewFixBudgetAnswerStop
+			}
+		}
+	}
+	onAnswered(ctx, loopID, answer)
 }
 
 // enqueueFeishuHITLMessage applies a typed inbox reply and, when that reply is
@@ -425,8 +449,12 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			sendAsk: func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error {
 				return sendFeishuBudgetAsk(ctx, input, loop, ask)
 			},
+			closeAsk: func(ctx contextType, loopID string) {
+				closeObsoleteFeishuPairAskCard(ctx, input.Repos, loopID, input.OnHITLAnswerDelivered)
+			},
 			nowISO: nowISO,
 		}
+
 		if input.Logger != nil {
 			deliveryDeps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
 		}

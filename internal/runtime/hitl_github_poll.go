@@ -382,6 +382,11 @@ func githubHITLResidualOrdinaryAsk(ask loops.HITLAsk) bool {
 // the caller applies the answer, so tests can commit a racing Continue.
 var afterDrainScopeStopHook func()
 
+// afterAdvanceSiblingGitHubAskListHook is test-only: runs after the sibling List
+// snapshot and before per-sibling cursor writes, so tests can commit a racing
+// Continue/Stop from another transport.
+var afterAdvanceSiblingGitHubAskListHook func()
+
 func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) (bool, error) {
 	if drain == nil || repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
 		return false, nil
@@ -560,6 +565,9 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 	if err != nil {
 		return err
 	}
+	if afterAdvanceSiblingGitHubAskListHook != nil {
+		afterAdvanceSiblingGitHubAskListHook()
+	}
 	var except *storage.LoopRecord
 	for i := range all {
 		if strings.TrimSpace(all[i].ID) == exceptLoopID {
@@ -582,34 +590,61 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 		if derefLoopPRNumber(loop) != prNumber {
 			continue
 		}
-		if strings.TrimSpace(loop.Status) != "awaiting_human" {
-			continue
-		}
-		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
-			continue
-		}
-		if ask.PRNumber != 0 && ask.PRNumber != prNumber {
-			continue
-		}
-		if ask.AskCommentID >= commentID {
-			continue
-		}
-		if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID, answerAuthors) {
-			continue
-		}
-		ask.AskCommentID = commentID
-		meta, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if err != nil {
-			return err
-		}
-		updated := loop
-		updated.MetadataJSON = &meta
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		if err := advanceOneSiblingGitHubHITLAskPastComment(ctx, repos, loop.ID, prNumber, commentID, comments, answerAuthors); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// advanceOneSiblingGitHubHITLAskPastComment writes only AskCommentID onto a
+// freshly read sibling. A whole-record upsert of the preceding List snapshot
+// would restore awaiting_human and scope-hold metadata after a racing
+// Continue/Stop released the overlay.
+func advanceOneSiblingGitHubHITLAskPastComment(ctx context.Context, repos *storage.Repositories, loopID string, prNumber, commentID int64, comments []githubAnswerComment, answerAuthors []string) error {
+	loopID = strings.TrimSpace(loopID)
+	if repos == nil || repos.Loops == nil || loopID == "" || commentID == 0 {
+		return nil
+	}
+	unlock := LockLoopRequeue(loopID)
+	defer unlock()
+	fresh, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if fresh == nil {
+		return nil
+	}
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*fresh))
+	defer unlockTarget()
+	current, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if current == nil || strings.TrimSpace(current.Status) != "awaiting_human" {
+		return nil
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
+		return nil
+	}
+	if ask.PRNumber != 0 && ask.PRNumber != prNumber {
+		return nil
+	}
+	if ask.AskCommentID >= commentID {
+		return nil
+	}
+	if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID, answerAuthors) {
+		return nil
+	}
+	ask.AskCommentID = commentID
+	meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+	if err != nil {
+		return err
+	}
+	updated := *current
+	updated.MetadataJSON = &meta
+	return repos.Loops.Upsert(ctx, updated)
 }
 
 func githubHITLDecisionPairKey(loop githubHITLAwaitingLoop) string {

@@ -1377,6 +1377,7 @@ func TestFeishuScopeAskDeliveryDoesNotClobberContinueOrStop(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Loops.List() error = %v", err)
 			}
+			var closed []string
 			delivered := deliverUndeliveredFeishuBudgetAsks(context.Background(), all, repos, feishuHITLDeliveryDeps{
 				sendAsk: func(ctx contextType, loop storage.LoopRecord, _ loops.HITLAsk) error {
 					if tc.race != "" {
@@ -1390,6 +1391,12 @@ func TestFeishuScopeAskDeliveryDoesNotClobberContinueOrStop(t *testing.T) {
 					}
 					return nil
 				},
+				closeAsk: func(ctx contextType, loopID string) {
+					closeObsoleteFeishuPairAskCard(ctx, repos, loopID, func(_ context.Context, id, answer string) {
+						closed = append(closed, id+"="+answer)
+					})
+				},
+
 				nowISO: nowISO,
 			})
 			if delivered != tc.wantDelivered {
@@ -1410,11 +1417,18 @@ func TestFeishuScopeAskDeliveryDoesNotClobberContinueOrStop(t *testing.T) {
 				if !ok || !loops.IsReviewScopeHumanAsk(ask) || ask.Transport != "feishu" {
 					t.Fatalf("delivered scope ask = (%#v, %v), want feishu transport", ask, ok)
 				}
+				if len(closed) != 0 {
+					t.Fatalf("closed = %v, want empty when persist kept the ask", closed)
+				}
 				return
 			}
 			if ok && loops.IsReviewScopeHumanAsk(ask) {
 				t.Fatalf("stale persist restored scope ask after %s: %#v", tc.race, ask)
 			}
+			if len(closed) != 1 || closed[0] != reviewer.ID+"="+tc.race {
+				t.Fatalf("closed = %v, want posted card closed after %s", closed, tc.race)
+			}
+
 		})
 	}
 }
