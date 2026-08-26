@@ -145,30 +145,80 @@ func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, recor
 		if deps.addLabel != nil {
 			deps.addLabel(ctx, repo, prNumber, awaitingLabel, cwd)
 		}
-		ask.Transport = "github"
-		ask.PRNumber = prNumber
-		ask.AskCommentID = commentID
-		meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if werr != nil {
-			if deps.logWarn != nil {
-				deps.logWarn("hitl github: budget ask metadata write failed", map[string]any{"loopId": loop.ID, "error": werr.Error()})
-			}
-			continue
-		}
-		updated := loop
-		updated.MetadataJSON = &meta
-		if deps.nowISO != "" {
-			updated.UpdatedAt = deps.nowISO
-		}
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		posted := ask
+		persisted, err := persistPairAskDelivery(ctx, repos, loop.ID, deps.nowISO, posted, func(live *loops.HITLAsk) {
+			live.Transport = "github"
+			live.PRNumber = prNumber
+			live.AskCommentID = commentID
+		})
+		if err != nil {
 			if deps.logWarn != nil {
 				deps.logWarn("hitl github: budget ask persist failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 			}
 			continue
 		}
+		if !persisted {
+			continue
+		}
 		delivered++
 	}
 	return delivered
+}
+
+// persistPairAskDelivery writes ask-delivery fields onto the live loop when the
+// same awaiting pair ask is still current. A racing Continue/Stop can release
+// the hold while createComment/sendAsk is in flight; a whole-record upsert of
+// the pre-delivery snapshot would restore awaiting_human and scope metadata.
+func persistPairAskDelivery(ctx context.Context, repos *storage.Repositories, loopID, nowISO string, posted loops.HITLAsk, apply func(*loops.HITLAsk)) (bool, error) {
+	if repos == nil || repos.Loops == nil || strings.TrimSpace(loopID) == "" || apply == nil {
+		return false, nil
+	}
+	unlock := LockLoopRequeue(loopID)
+	defer unlock()
+	fresh, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if fresh == nil {
+		return false, nil
+	}
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*fresh))
+	defer unlockTarget()
+	current, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if current == nil || current.Status != "awaiting_human" {
+		return false, nil
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok {
+		return false, nil
+	}
+	if !loops.IsReviewFixBudgetAsk(ask) && !loops.IsReviewScopeHumanAsk(ask) {
+		return false, nil
+	}
+	if strings.TrimSpace(ask.Kind) != strings.TrimSpace(posted.Kind) || strings.TrimSpace(ask.AskedAt) != strings.TrimSpace(posted.AskedAt) {
+		return false, nil
+	}
+	status := strings.TrimSpace(ask.Status)
+	if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
+		return false, nil
+	}
+	apply(&ask)
+	meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+	if err != nil {
+		return false, err
+	}
+	updated := *current
+	updated.MetadataJSON = &meta
+	if strings.TrimSpace(nowISO) != "" {
+		updated.UpdatedAt = nowISO
+	}
+	if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func githubBudgetAskMarker(loopSeq int64, askedAt string) string {
@@ -331,6 +381,11 @@ func githubHITLResidualOrdinaryAsk(ask loops.HITLAsk) bool {
 // afterDrainScopeStopHook is test-only: runs after a scope Stop drain and before
 // the caller applies the answer, so tests can commit a racing Continue.
 var afterDrainScopeStopHook func()
+
+// afterAdvanceSiblingGitHubAskListHook is test-only: runs after the sibling List
+// snapshot and before per-sibling cursor writes, so tests can commit a racing
+// Continue/Stop from another transport.
+var afterAdvanceSiblingGitHubAskListHook func()
 
 func drainScopeHoldOnStop(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) (bool, error) {
 	if drain == nil || repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
@@ -510,6 +565,9 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 	if err != nil {
 		return err
 	}
+	if afterAdvanceSiblingGitHubAskListHook != nil {
+		afterAdvanceSiblingGitHubAskListHook()
+	}
 	var except *storage.LoopRecord
 	for i := range all {
 		if strings.TrimSpace(all[i].ID) == exceptLoopID {
@@ -532,34 +590,61 @@ func advanceSiblingGitHubHITLAsksPastComment(ctx context.Context, repos *storage
 		if derefLoopPRNumber(loop) != prNumber {
 			continue
 		}
-		if strings.TrimSpace(loop.Status) != "awaiting_human" {
-			continue
-		}
-		ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-		if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
-			continue
-		}
-		if ask.PRNumber != 0 && ask.PRNumber != prNumber {
-			continue
-		}
-		if ask.AskCommentID >= commentID {
-			continue
-		}
-		if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID, answerAuthors) {
-			continue
-		}
-		ask.AskCommentID = commentID
-		meta, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if err != nil {
-			return err
-		}
-		updated := loop
-		updated.MetadataJSON = &meta
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		if err := advanceOneSiblingGitHubHITLAskPastComment(ctx, repos, loop.ID, prNumber, commentID, comments, answerAuthors); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// advanceOneSiblingGitHubHITLAskPastComment writes only AskCommentID onto a
+// freshly read sibling. A whole-record upsert of the preceding List snapshot
+// would restore awaiting_human and scope-hold metadata after a racing
+// Continue/Stop released the overlay.
+func advanceOneSiblingGitHubHITLAskPastComment(ctx context.Context, repos *storage.Repositories, loopID string, prNumber, commentID int64, comments []githubAnswerComment, answerAuthors []string) error {
+	loopID = strings.TrimSpace(loopID)
+	if repos == nil || repos.Loops == nil || loopID == "" || commentID == 0 {
+		return nil
+	}
+	unlock := LockLoopRequeue(loopID)
+	defer unlock()
+	fresh, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if fresh == nil {
+		return nil
+	}
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*fresh))
+	defer unlockTarget()
+	current, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if current == nil || strings.TrimSpace(current.Status) != "awaiting_human" {
+		return nil
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok || !strings.EqualFold(strings.TrimSpace(ask.Transport), "github") {
+		return nil
+	}
+	if ask.PRNumber != 0 && ask.PRNumber != prNumber {
+		return nil
+	}
+	if ask.AskCommentID >= commentID {
+		return nil
+	}
+	if githubHITLResidualOrdinaryAsk(ask) && residualOrdinaryHasEarlierAnswer(comments, ask.AskCommentID, commentID, answerAuthors) {
+		return nil
+	}
+	ask.AskCommentID = commentID
+	meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+	if err != nil {
+		return err
+	}
+	updated := *current
+	updated.MetadataJSON = &meta
+	return repos.Loops.Upsert(ctx, updated)
 }
 
 func githubHITLDecisionPairKey(loop githubHITLAwaitingLoop) string {
@@ -669,6 +754,17 @@ func enqueueHumanMessageToLoopWithCaps(ctx context.Context, repos *storage.Repos
 	if loops.IsReviewScopeHumanHold(*loop) {
 		if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
 			return applyReviewScopeHumanAnswerAndReopen(ctx, db, repos, executions, *loop, text, nowISO)
+		}
+		if feishuOverlayResidualCardIsNotPairDecision(*loop, text) {
+			write := func(writeRepos *storage.Repositories) error {
+				return persistOverlayResidualAskAnswer(ctx, writeRepos, loopID, text, nowISO)
+			}
+			if db != nil {
+				return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+					return write(storage.NewRepositories(tx))
+				})
+			}
+			return write(repos)
 		}
 		return nil
 	}

@@ -127,9 +127,10 @@ var feishuInboxCursor struct {
 var feishuInboxHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 type feishuHITLDeliveryDeps struct {
-	sendAsk func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error
-	nowISO  string
-	logWarn func(msg string, fields map[string]any)
+	sendAsk  func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error
+	closeAsk func(ctx contextType, loopID string)
+	nowISO   string
+	logWarn  func(msg string, fields map[string]any)
 }
 
 func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopRecord, repos *storage.Repositories, deps feishuHITLDeliveryDeps) int {
@@ -157,28 +158,45 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 			}
 			continue
 		}
-		ask.Transport = "feishu"
-		meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if werr != nil {
-			if deps.logWarn != nil {
-				deps.logWarn("hitl feishu: budget ask metadata write failed", map[string]any{"loopId": loop.ID, "error": werr.Error()})
-			}
-			continue
-		}
-		updated := loop
-		updated.MetadataJSON = &meta
-		if deps.nowISO != "" {
-			updated.UpdatedAt = deps.nowISO
-		}
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		posted := ask
+		persisted, err := persistPairAskDelivery(ctx, repos, loop.ID, deps.nowISO, posted, func(live *loops.HITLAsk) {
+			live.Transport = "feishu"
+		})
+		if err != nil {
 			if deps.logWarn != nil {
 				deps.logWarn("hitl feishu: budget ask persist failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 			}
 			continue
 		}
+		if !persisted {
+			if deps.closeAsk != nil {
+				deps.closeAsk(ctx, loop.ID)
+			}
+			continue
+		}
+
 		delivered++
 	}
 	return delivered
+}
+
+// closeObsoleteFeishuPairAskCard resolves a card that SendHITLAsk already posted
+// when persistPairAskDelivery reports the ask is no longer current. Loop-seq
+// buttons on a leftover card can answer a later hold on the same loop.
+func closeObsoleteFeishuPairAskCard(ctx contextType, repos *storage.Repositories, loopID string, onAnswered func(context.Context, string, string)) {
+	if onAnswered == nil || strings.TrimSpace(loopID) == "" {
+		return
+	}
+	answer := loops.ReviewFixBudgetAnswerContinue
+	if repos != nil && repos.Loops != nil {
+		if fresh, err := repos.Loops.GetByID(ctx, loopID); err == nil && fresh != nil {
+			switch strings.TrimSpace(fresh.Status) {
+			case "terminated", "stopped":
+				answer = loops.ReviewFixBudgetAnswerStop
+			}
+		}
+	}
+	onAnswered(ctx, loopID, answer)
 }
 
 // enqueueFeishuHITLMessage applies a typed inbox reply and, when that reply is
@@ -204,6 +222,15 @@ func enqueueFeishuHITLMessage(ctx context.Context, repos *storage.Repositories, 
 		}
 		if loop != nil {
 			caps = reviewFixBudgetLiveCaps(cfg, loop.ProjectID)
+			if feishuOverlayResidualCardIsNotPairDecision(*loop, text) {
+				if err := preserveFeishuOverlayResidualCardAnswer(ctx, repos, db, loopID, text, nowISO); err != nil {
+					return err
+				}
+				if onAnswered != nil {
+					onAnswered(ctx, loopID, text)
+				}
+				return nil
+			}
 			if loops.IsReviewFixBudgetContinue(text) || loops.IsReviewFixBudgetStop(text) {
 				cardLoopID, err := feishuDecisionCardLoopID(ctx, repos, *loop)
 				if err != nil {
@@ -304,32 +331,7 @@ func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*fresh))
 	defer unlockTarget()
 	write := func(writeRepos *storage.Repositories) error {
-		current, err := writeRepos.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return err
-		}
-		if current == nil || !feishuOverlayResidualCardIsNotPairDecision(*current, answer) {
-			return nil
-		}
-		ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
-		if !ok {
-			return nil
-		}
-		status := strings.TrimSpace(ask.Status)
-		if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
-			return nil
-		}
-		ask.Answer = answer
-		ask.Status = "answered"
-		ask.AnsweredAt = nowISO
-		meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
-		if err != nil {
-			return err
-		}
-		updated := *current
-		updated.MetadataJSON = &meta
-		updated.UpdatedAt = nowISO
-		return writeRepos.Loops.Upsert(ctx, updated)
+		return persistOverlayResidualAskAnswer(ctx, writeRepos, loopID, answer, nowISO)
 	}
 	if db != nil {
 		return storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
@@ -337,6 +339,41 @@ func preserveFeishuOverlayResidualCardAnswer(ctx context.Context, repos *storage
 		})
 	}
 	return write(repos)
+}
+
+// persistOverlayResidualAskAnswer writes a residual ordinary ask answer without
+// taking pair locks. Callers must already hold requeue+target serialization or
+// be inside the preserve TX that re-reads under those locks.
+func persistOverlayResidualAskAnswer(ctx context.Context, writeRepos *storage.Repositories, loopID, answer, nowISO string) error {
+	if writeRepos == nil || writeRepos.Loops == nil {
+		return nil
+	}
+	current, err := writeRepos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return err
+	}
+	if current == nil || !feishuOverlayResidualCardIsNotPairDecision(*current, answer) {
+		return nil
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok {
+		return nil
+	}
+	status := strings.TrimSpace(ask.Status)
+	if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
+		return nil
+	}
+	ask.Answer = answer
+	ask.Status = "answered"
+	ask.AnsweredAt = nowISO
+	meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+	if err != nil {
+		return err
+	}
+	updated := *current
+	updated.MetadataJSON = &meta
+	updated.UpdatedAt = nowISO
+	return writeRepos.Loops.Upsert(ctx, updated)
 }
 
 // feishuDecisionCardLoopID returns the loop whose Continue/Stop Feishu card
@@ -412,8 +449,12 @@ func runFeishuHITLPoll(ctx context.Context, input defaultSchedulerTickInput) {
 			sendAsk: func(ctx contextType, loop storage.LoopRecord, ask loops.HITLAsk) error {
 				return sendFeishuBudgetAsk(ctx, input, loop, ask)
 			},
+			closeAsk: func(ctx contextType, loopID string) {
+				closeObsoleteFeishuPairAskCard(ctx, input.Repos, loopID, input.OnHITLAnswerDelivered)
+			},
 			nowISO: nowISO,
 		}
+
 		if input.Logger != nil {
 			deliveryDeps.logWarn = func(msg string, fields map[string]any) { input.Logger.Warn(msg, fields) }
 		}

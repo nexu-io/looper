@@ -8731,22 +8731,56 @@ func (r *Runner) parkOrDeferReviewerScopeHuman(ctx context.Context, loop storage
 }
 
 func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
-	encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
-		loop.MetadataJSON,
-		commentOnlyNeedsHumanQuestion(completion),
-		commentOnlyNeedsHumanEvidence(completion),
-		r.reviewFixHITLEnabled(),
-	)
-	if err != nil {
-		return err
-	}
-	updated := loop
-	updated.MetadataJSON = &encoded
-	updated.UpdatedAt = r.nowISO()
 	if r.repos == nil || r.repos.Loops == nil {
 		return fmt.Errorf("persist pending review scope requires loop storage")
 	}
-	return r.repos.Loops.Upsert(ctx, updated)
+	unlock := loops.LockLoopRequeue(loop.ID)
+	defer unlock()
+	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(loop))
+	defer unlockTarget()
+
+	parkLive := false
+	write := func(writeRepos *storage.Repositories) error {
+		fresh, err := writeRepos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return fmt.Errorf("refresh loop before pending review scope persist: %w", err)
+		}
+		if fresh == nil {
+			return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
+		}
+		if !loops.IsReviewFixBudgetHold(*fresh) {
+			// Continue already released the budget hold. Park scope on the live
+			// record instead of restoring the stale budget snapshot.
+			parkLive = true
+			return nil
+		}
+		encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
+			fresh.MetadataJSON,
+			commentOnlyNeedsHumanQuestion(completion),
+			commentOnlyNeedsHumanEvidence(completion),
+			r.reviewFixHITLEnabled(),
+		)
+		if err != nil {
+			return err
+		}
+		updated := *fresh
+		updated.MetadataJSON = &encoded
+		updated.UpdatedAt = r.nowISO()
+		return writeRepos.Loops.Upsert(ctx, updated)
+	}
+	if r.db != nil {
+		if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			return write(storage.NewRepositories(tx))
+		}); err != nil {
+			return err
+		}
+	} else if err := write(r.repos); err != nil {
+		return err
+	}
+	if parkLive {
+		return r.parkReviewerScopeHuman(ctx, loop, completion)
+	}
+	return nil
 }
 
 // afterCommentOnlyPublishMaybeParkScope runs after a successful comment-only

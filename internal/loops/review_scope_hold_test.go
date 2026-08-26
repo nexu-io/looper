@@ -550,7 +550,6 @@ func TestParkReviewScopeHumanPersistsSignalOnLoop(t *testing.T) {
 		t.Fatalf("loop signal = %q, want sig-live committed with the hold", signal)
 	}
 }
-
 func derefMeta(m *string) string {
 	if m == nil {
 		return ""
