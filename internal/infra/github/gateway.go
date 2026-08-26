@@ -41,6 +41,7 @@ var (
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
+var fixerDeclinedReplyMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)(?:\s+[^>]*)?-->`)
 
 var (
 	// ErrDiffTooLarge is returned when GitHub itself refuses a PR diff as oversized
@@ -3065,7 +3066,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 					commentCursor = nextCommentCursor
 					hasMoreComments = hasMore
 				}
-				if fingerprint := reviewThreadFingerprintFromNodes(allCommentNodes); fingerprint != "" {
+				if fingerprint := reviewThreadFingerprintFromNodes(asString(normalized["threadId"]), allCommentNodes); fingerprint != "" {
 					normalized["threadFingerprint"] = fingerprint
 				}
 				out = append(out, normalized)
@@ -3511,21 +3512,25 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	} else if line := asInt64(row["line"]); line > 0 {
 		out["line"] = line
 	}
-	if fingerprint := reviewThreadFingerprintFromNodes(nodes); fingerprint != "" {
+	if fingerprint := reviewThreadFingerprintFromNodes(threadID, nodes); fingerprint != "" {
 		out["threadFingerprint"] = fingerprint
 	}
 	return out, true
 }
 
-func reviewThreadFingerprintFromNodes(nodes []any) string {
+func reviewThreadFingerprintFromNodes(threadID string, nodes []any) string {
 	parts := make([]string, 0, len(nodes))
+	threadID = strings.TrimSpace(threadID)
 	for _, node := range nodes {
 		comment, _ := node.(map[string]any)
 		if comment == nil {
 			continue
 		}
 		body := asString(comment["body"])
-		if strings.Contains(body, "<!-- looper-fixer-reply ") || strings.Contains(body, "<!-- looper-fixer-reply-declined") {
+		if strings.Contains(body, "<!-- looper-fixer-reply ") {
+			continue
+		}
+		if isAuthenticatedFixerDeclinedReply(threadID, comment) {
 			continue
 		}
 		id := strings.TrimSpace(asString(comment["id"]))
@@ -3539,6 +3544,32 @@ func reviewThreadFingerprintFromNodes(nodes []any) string {
 		return ""
 	}
 	return strings.Join(parts, "|")
+}
+
+func isAuthenticatedFixerDeclinedReply(threadID string, comment map[string]any) bool {
+	if threadID == "" || comment == nil {
+		return false
+	}
+	// Authenticate the coordination marker, not a substring. Gateway fingerprinting
+	// has no current-login authority and must not invent looper* identity; a
+	// well-formed marker whose thread: field matches the containing thread is
+	// the exclusion authority. Quotes of the needle or a foreign thread stay in
+	// the fingerprint so hashFixItemsState can see untrusted feedback.
+	gotThread, fingerprint, ok := parseFixerDeclinedReplyMarker(asString(comment["body"]))
+	return ok && fingerprint != "" && gotThread == threadID
+}
+
+func parseFixerDeclinedReplyMarker(body string) (threadID, fingerprint string, ok bool) {
+	m := fixerDeclinedReplyMarkerRE.FindStringSubmatch(body)
+	if len(m) < 3 {
+		return "", "", false
+	}
+	threadID = strings.TrimSpace(m[1])
+	fingerprint = strings.TrimSpace(m[2])
+	if threadID == "" || fingerprint == "" {
+		return "", "", false
+	}
+	return threadID, fingerprint, true
 }
 
 func validateCloseIssueStateReason(value string) (string, error) {

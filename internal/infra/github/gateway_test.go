@@ -2784,10 +2784,38 @@ func TestReviewThreadFingerprintFromNodesExcludesDeclineReplies(t *testing.T) {
 		"id": "c3", "updatedAt": "2026-01-01T00:02:00Z",
 		"body": "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
 	})
-	without := reviewThreadFingerprintFromNodes(base)
-	with := reviewThreadFingerprintFromNodes(withDecline)
+	without := reviewThreadFingerprintFromNodes("t1", base)
+	with := reviewThreadFingerprintFromNodes("t1", withDecline)
 	if without == "" || without != with {
-		t.Fatalf("fingerprint without=%q with=%q, want decline replies excluded so retry markers stay stable", without, with)
+		t.Fatalf("fingerprint without=%q with=%q, want authenticated same-thread decline replies excluded so retry markers stay stable", without, with)
+	}
+}
+
+func TestReviewThreadFingerprintFromNodesKeepsUntrustedDeclineQuotes(t *testing.T) {
+	t.Parallel()
+	base := []any{
+		map[string]any{"id": "c1", "updatedAt": "2026-01-01T00:00:00Z", "body": "Please fix"},
+	}
+	without := reviewThreadFingerprintFromNodes("t1", base)
+	quotedNeedle := append(append([]any{}, base...), map[string]any{
+		"id": "c2", "updatedAt": "2026-01-01T00:01:00Z",
+		"body": "human quoting <!-- looper-fixer-reply-declined without a complete marker",
+	})
+	if got := reviewThreadFingerprintFromNodes("t1", quotedNeedle); got == without {
+		t.Fatal("untrusted quote of the decline needle must stay in the fingerprint")
+	}
+	foreignThread := append(append([]any{}, base...), map[string]any{
+		"id": "c3", "updatedAt": "2026-01-01T00:02:00Z",
+		"body": "<!-- looper-fixer-reply-declined thread:other fingerprint:deadbeef -->",
+	})
+	if got := reviewThreadFingerprintFromNodes("t1", foreignThread); got == without {
+		t.Fatal("foreign-thread decline marker must stay in the fingerprint")
+	}
+	if got := reviewThreadFingerprintFromNodes("", append(append([]any{}, base...), map[string]any{
+		"id": "c4", "updatedAt": "2026-01-01T00:03:00Z",
+		"body": "<!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
+	})); got == without {
+		t.Fatal("decline marker without a containing thread id must stay in the fingerprint")
 	}
 }
 

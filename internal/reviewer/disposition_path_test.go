@@ -3317,6 +3317,161 @@ func TestRunPublishStepPublishesSameHeadConvergenceDespiteLastPublishedHead(t *t
 	}
 }
 
+func TestRunPublishStepAbortsConvergenceWhenLiveThreadsReopen(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_pub_abort_conv", ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	completion := reviewerCommentOnlyCompletion{
+		Summary: "Convergence finding",
+		Outcome: "clean",
+	}
+	payload, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	github := &fakeGitHubGateway{
+		currentLogin: "looper-bot", viewHeadSHA: "abc123", reviewRequests: []string{"looper-bot"},
+		reviewThreads: []ReviewThread{{
+			ID: "thread_reopened",
+			Comments: []ReviewThreadComment{
+				{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+			},
+		}},
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project: (%#v, %v)", project, err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA: "abc123", IdempotencyKey: agentNativeConvergenceReviewID(loop.ID, "abc123", "sig"),
+		Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome,
+		ReviewerSummaryJSON: string(payload),
+	}
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_pub_abort_conv"},
+		Repo: repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			ConvergencePass: true,
+			Detail:          &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", State: "OPEN"},
+			Snapshot:        &checkpointSnapshot{HeadSHA: "abc123"},
+			PendingReview:   &pending,
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "disposition_only" {
+		t.Fatalf("SkipKind = %q, want disposition_only", checkpoint.SkipKind)
+	}
+	if checkpoint.PendingReview != nil {
+		t.Fatal("pending review must not survive live unresolved threads")
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want 0", github.issueCommentCalls)
+	}
+}
+
+func TestClaimToPublishAbortsConvergenceAfterLiveThreadAppears(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_claim_abort_conv", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"looper-bot"}, viewHeadSHA: "abc123"}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true,
+		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
+		ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents,
+	})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project: (%#v, %v)", project, err)
+	}
+	payload := `{"headSha":"abc123","reviewSignalFingerprint":"sig-converge","convergencePass":true}`
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{
+		Project:   *project,
+		Loop:      loop,
+		QueueItem: storage.QueueItemRecord{PayloadJSON: &payload},
+		Repo:      repo, PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "alice", ReviewRequests: []string{"looper-bot"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runFilterStep: %v", err)
+	}
+	if !checkpoint.ConvergencePass {
+		t.Fatalf("filter ConvergencePass = false, want claimed convergence while threads are clear")
+	}
+	github.reviewThreads = []ReviewThread{{
+		ID: "thread_new",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+		},
+	}}
+	completion := reviewerCommentOnlyCompletion{Summary: "stale convergence", Outcome: "clean"}
+	reviewJSON, err := json.Marshal(completion)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	checkpoint.Snapshot = &checkpointSnapshot{HeadSHA: "abc123"}
+	checkpoint.PendingReview = &pendingReviewCheckpoint{
+		HeadSHA: "abc123", IdempotencyKey: agentNativeConvergenceReviewID(loop.ID, "abc123", "sig-converge"),
+		Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome,
+		ReviewerSummaryJSON: string(reviewJSON),
+	}
+	checkpoint, err = runner.runPublishStep(context.Background(), stepInput{
+		Project: *project, Loop: loop, Run: storage.RunRecord{ID: "run_claim_abort_conv"},
+		Repo: repo, PRNumber: prNumber, Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runPublishStep() error = %v", err)
+	}
+	if checkpoint.ConvergencePass {
+		t.Fatal("publish still treated the pass as convergence after a live Looper thread appeared")
+	}
+	if checkpoint.SkipKind != "disposition_only" {
+		t.Fatalf("SkipKind = %q, want disposition_only", checkpoint.SkipKind)
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want 0", github.issueCommentCalls)
+	}
+}
+
 func TestQueuedSameHeadConvergencePassRequiresExplicitFlag(t *testing.T) {
 	t.Parallel()
 	signalOnly := `{"headSha":"abc123","reviewSignalFingerprint":"sig"}`

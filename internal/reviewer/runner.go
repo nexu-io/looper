@@ -2678,6 +2678,13 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ThreadResolutionFollowUpOnly = true
 		}
 	}
+	if checkpoint.ConvergencePass {
+		var revalidateErr error
+		checkpoint, revalidateErr = r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+		if revalidateErr != nil {
+			return checkpoint, revalidateErr
+		}
+	}
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Detail.HeadSHA)
 	if !isManualReviewerLoop(input.Loop) && networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
@@ -3236,6 +3243,10 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		}
 		checkpoint.SkipReason = ""
 		checkpoint.SkipKind = ""
+	}
+	checkpoint, err := r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+	if err != nil {
+		return checkpoint, err
 	}
 	narrowDisposition := r.shouldRunNarrowDispositionPath(input, checkpoint)
 	if !policy.Enabled && !narrowDisposition {
@@ -3821,6 +3832,52 @@ func (r *Runner) enqueueDispositionConvergence(ctx context.Context, input stepIn
 		AvailableAt:             availableAt,
 	})
 	return err
+}
+
+// revalidateSameHeadConvergence refreshes the live review signal and unresolved
+// Looper-authored thread set. Queue payload is a cursor; live threads are
+// authority. Unresolved disposition work demotes the pass to disposition-only.
+func (r *Runner) revalidateSameHeadConvergence(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (reviewerCheckpoint, error) {
+	if !checkpoint.ConvergencePass || checkpoint.SkipReason != "" {
+		return checkpoint, nil
+	}
+	if r.github == nil || !r.hasNativeThreadCapabilities(input.Project.ID) {
+		return checkpoint, nil
+	}
+	login, err := r.requireCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return checkpoint, err
+	}
+	threads, err := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
+	if err != nil {
+		return checkpoint, &loopError{message: "convergence revalidation listing failed: " + err.Error(), kind: FailureRetryableTransient}
+	}
+	head := ""
+	if checkpoint.Detail != nil {
+		head = strings.TrimSpace(checkpoint.Detail.HeadSHA)
+	}
+	if checkpoint.Snapshot != nil && strings.TrimSpace(checkpoint.Snapshot.HeadSHA) != "" {
+		head = strings.TrimSpace(checkpoint.Snapshot.HeadSHA)
+	}
+	if signal := ComputeReviewSignalFingerprintForLogin(head, threads, login); signal != "" {
+		checkpoint.ReviewSignalFingerprint = signal
+	}
+	if hasUnresolvedLooperAuthoredThreadsForLogin(threads, login) {
+		checkpoint.ConvergencePass = false
+		checkpoint.DispositionOnly = true
+		checkpoint.ThreadResolutionFollowUpOnly = true
+		if checkpoint.ThreadResolution != nil {
+			checkpoint.ThreadResolution.ScheduleConvergencePass = false
+		}
+	}
+	return checkpoint, nil
+}
+
+func (r *Runner) abortConvergenceForLiveDisposition(_ context.Context, _ stepInput, checkpoint reviewerCheckpoint) (reviewerCheckpoint, error) {
+	checkpoint.PendingReview = nil
+	checkpoint.SkipReason = "Same-head convergence aborted; unresolved Looper-authored threads require disposition"
+	checkpoint.SkipKind = "disposition_only"
+	return checkpoint, nil
 }
 
 func (r *Runner) commitPostMutationThreadResolution(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (reviewerCheckpoint, error) {
@@ -4566,6 +4623,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if checkpoint.PendingReview != nil {
 		return checkpoint, nil
 	}
+	beforeConvergence := checkpoint.ConvergencePass
+	checkpoint, err = r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	if beforeConvergence && !checkpoint.ConvergencePass && checkpoint.DispositionOnly {
+		return r.abortConvergenceForLiveDisposition(ctx, input, checkpoint)
+	}
 	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
 		return next, err
 	}
@@ -4827,6 +4892,15 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	checkpoint := input.Checkpoint
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
+	}
+	beforeConvergence := checkpoint.ConvergencePass
+	var revalidateErr error
+	checkpoint, revalidateErr = r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+	if revalidateErr != nil {
+		return checkpoint, revalidateErr
+	}
+	if beforeConvergence && !checkpoint.ConvergencePass && checkpoint.DispositionOnly {
+		return r.abortConvergenceForLiveDisposition(ctx, input, checkpoint)
 	}
 	if checkpoint.PendingReview == nil {
 		return checkpoint, &loopError{message: "Missing pending review checkpoint for publish step", kind: FailureRetryableAfterResume}
