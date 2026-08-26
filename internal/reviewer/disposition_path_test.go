@@ -1466,6 +1466,92 @@ func TestBudgetHeldDispositionOnlyDiscoveryEnqueues(t *testing.T) {
 	}
 }
 
+func TestBudgetHeldMissingSignalPersistsBaselineAndKeepsHold(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	// Upgrade path: budget-held continuous Reviewer with unresolved Looper
+	// threads, no lastReviewedSignalFingerprint, and no unaudited directive.
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"same-head","loop":{"enabled":true},"reviewFixBudget":{"exhaustedBy":"reviewer","pauseReason":"review_fix_budget_exhausted"}}`
+	loop := storage.LoopRecord{
+		ID: "loop_budget_upgrade_fp", Seq: 1, ProjectID: "project_1", Type: "reviewer", Status: "paused",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(loop) {
+		t.Fatal("fixture must be budget hold")
+	}
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "same-head"},
+		},
+	}}
+	github := &fakeGitHubGateway{
+		currentLogin: "looper-bot",
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"": {{Number: prNumber, Title: "PR", State: "OPEN", HeadSHA: "same-head", Author: "alice"}},
+		},
+		reviewThreads: threads,
+		viewHeadSHA:   "same-head",
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		DiscoveryPolicy:  DiscoveryPolicy{AutoDiscovery: true, RequireReviewRequest: false, EnableSelfReview: true},
+		LoopConfig:       testReviewerLoopConfig(),
+		ThreadResolution: config.ReviewerThreadResolutionConfig{Enabled: false, MaxThreadsPerRun: 10},
+	})
+	ctx := context.Background()
+	result, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want upgrade disposition-only enqueue", result.QueueItems)
+	}
+	if result.QueueItems[0].PayloadJSON == nil || !strings.Contains(*result.QueueItems[0].PayloadJSON, `"dispositionOnly":true`) {
+		t.Fatalf("payload = %v", result.QueueItems[0].PayloadJSON)
+	}
+
+	processed, err := runner.ProcessClaimedItem(ctx, result.QueueItems[0])
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem: %v", err)
+	}
+	if processed.Status != "skipped" || processed.Summary != "review-fix budget exhausted" {
+		t.Fatalf("processed = %#v, want skipped budget hold", processed)
+	}
+	if len(github.addThreadReplyCalls) != 0 || len(github.resolveThreadCalls) != 0 {
+		t.Fatalf("budget-held upgrade must not mutate threads: replies=%#v resolves=%#v", github.addThreadReplyCalls, github.resolveThreadCalls)
+	}
+
+	wantSignal := ComputeReviewSignalFingerprintForLogin("same-head", threads, "looper-bot")
+	after, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || after == nil {
+		t.Fatalf("GetByID: (%v, %v)", after, err)
+	}
+	if after.Status != "paused" || !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("hold not preserved: %#v", after)
+	}
+	gotSignal, _ := stringFromAny(parseJSONObject(after.MetadataJSON)[metadataLastReviewedSignalFingerprintKey])
+	if gotSignal != wantSignal {
+		t.Fatalf("lastReviewedSignalFingerprint = %q, want persisted live baseline %q", gotSignal, wantSignal)
+	}
+
+	decision, err := runner.sameHeadDiscoveryDecision(ctx, storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, repo, PullRequestSummary{Number: prNumber, HeadSHA: "same-head", Author: "alice"}, *after, parseJSONObject(after.MetadataJSON))
+	if err != nil {
+		t.Fatalf("sameHeadDiscoveryDecision: %v", err)
+	}
+	if decision.action != sameHeadDiscoverySkip {
+		t.Fatalf("rediscovery action = %v, want skip after baseline persist", decision.action)
+	}
+}
+
 func TestBudgetHeldHITLDispositionOnlyDiscoveryEnqueues(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

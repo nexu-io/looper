@@ -2842,6 +2842,9 @@ func threadResolutionBatchFullyComplete(tr *threadResolutionCheckpoint) bool {
 
 // dispositionOnlyStillActionable reports whether a budget-held disposition-only
 // claim still has a live changed disposition signal (payload is not authority).
+// Spec §8.7 admits only a new trusted directive or validated Fixer decline.
+// An absent lastReviewedSignalFingerprint with no such signal is upgrade
+// baseline work: persist the live fingerprint, keep the hold, and do not admit.
 func (r *Runner) dispositionOnlyStillActionable(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (bool, error) {
 	if r.github == nil || loop.Repo == nil || loop.PRNumber == nil {
 		return false, nil
@@ -2867,6 +2870,11 @@ func (r *Runner) dispositionOnlyStillActionable(ctx context.Context, project sto
 	last, _ := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey])
 	if strings.TrimSpace(last) != "" && last != live {
 		return true, nil
+	}
+	if strings.TrimSpace(last) == "" {
+		if err := r.persistLastReviewedSignalFingerprint(ctx, loop, live); err != nil {
+			return false, err
+		}
 	}
 	return false, nil
 }
