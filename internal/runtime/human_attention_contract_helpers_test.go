@@ -44,6 +44,30 @@ func assertHumanAttentionInAppCount(t *testing.T, repos *storage.Repositories, l
 	}
 }
 
+func assertHumanAttentionInAppBodyContains(t *testing.T, repos *storage.Repositories, loopID, want string) {
+	t.Helper()
+	notifications, err := repos.Notifications.List(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("Notifications.List() error = %v", err)
+	}
+	for _, n := range notifications {
+		if n.LoopID == nil || *n.LoopID != loopID {
+			continue
+		}
+		if n.Channel != "in_app" || n.Level != "action_required" {
+			continue
+		}
+		if n.DedupeKey == nil || !strings.HasPrefix(*n.DedupeKey, "human_attention:") {
+			continue
+		}
+		if strings.Contains(n.Body, want) {
+			return
+		}
+		t.Fatalf("human_attention in_app body for %s = %q, want substring %q", loopID, n.Body, want)
+	}
+	t.Fatalf("human_attention in_app row for %s not found", loopID)
+}
+
 func assertOsascriptContains(t *testing.T, path, want string) {
 	t.Helper()
 	body, err := os.ReadFile(path)

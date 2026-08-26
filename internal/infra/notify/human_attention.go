@@ -24,6 +24,9 @@ const (
 	// HumanAttentionReviewFixBudget is a no-HITL review-fix budget exhausted hold
 	// (paused + review_fix_budget_exhausted). Sibling-only pause does not notify.
 	HumanAttentionReviewFixBudget HumanAttentionReason = "review_fix_budget"
+	// HumanAttentionReviewScopeHuman is a no-HITL needs_human scope hold
+	// (paused + review_scope_human_required). Sibling-only pause does not notify.
+	HumanAttentionReviewScopeHuman HumanAttentionReason = "review_scope_human"
 )
 
 // HumanAttentionInput describes one durable entry into a state that requires an operator.
@@ -67,6 +70,8 @@ type HumanAttentionInput struct {
 	Reason     HumanAttentionReason
 	EntryKey   string
 	Subtitle   string
+	Question   string
+	Evidence   string
 	EntityType string
 	EntityID   string
 }
@@ -79,7 +84,7 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 		return nil
 	}
 	reason := HumanAttentionReason(strings.TrimSpace(string(input.Reason)))
-	if reason != HumanAttentionAwaitingHuman && reason != HumanAttentionManualIntervention && reason != HumanAttentionReviewFixBudget {
+	if reason != HumanAttentionAwaitingHuman && reason != HumanAttentionManualIntervention && reason != HumanAttentionReviewFixBudget && reason != HumanAttentionReviewScopeHuman {
 		return nil
 	}
 	entryKey := strings.TrimSpace(input.EntryKey)
@@ -92,6 +97,12 @@ func (g *Gateway) NotifyHumanAttention(ctx context.Context, input HumanAttention
 	body := fmt.Sprintf("%s requires operator attention (%s).", loopLabel, humanAttentionReasonLabel(reason))
 	if loopType := strings.TrimSpace(input.LoopType); loopType != "" {
 		body = fmt.Sprintf("%s (%s) requires operator attention (%s).", loopLabel, loopType, humanAttentionReasonLabel(reason))
+	}
+	if q := strings.TrimSpace(input.Question); q != "" {
+		body += " " + q
+	}
+	if e := strings.TrimSpace(input.Evidence); e != "" {
+		body += " " + e
 	}
 
 	entityType := strings.TrimSpace(input.EntityType)
@@ -296,6 +307,8 @@ func humanAttentionReasonLabel(reason HumanAttentionReason) string {
 		return "manual intervention"
 	case HumanAttentionReviewFixBudget:
 		return "review-fix budget exhausted"
+	case HumanAttentionReviewScopeHuman:
+		return "review scope requires human judgment"
 	default:
 		return string(reason)
 	}

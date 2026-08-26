@@ -145,6 +145,10 @@ type Context struct {
 	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
 	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
+	// NotifyHumanAttention observes a durable human-attention park after a
+	// non-claim path (budget Continue → scope promotion). Optional; Runtime
+	// NotifyHumanAttention is used when unset.
+	NotifyHumanAttention func(context.Context, string)
 }
 
 // TakeoverResult is what a takeover yields: the native session id + worktree +
@@ -5950,9 +5954,11 @@ func (h *Handler) reviewFixBudgetLiveCaps(projectID string) loops.ReviewFixBudge
 }
 
 // applyReviewFixBudgetContinueIfHeld delegates looper unpause /start on a
-// budget-held role to paired Continue. Returns nil response when not a hold.
+// budget-held or scope-held role to paired Continue. Scope-only holds release
+// without resetting meters; budget holds keep existing refill semantics.
+// Returns nil response when not a pair hold.
 func (h *Handler) applyReviewFixBudgetContinueIfHeld(ctx context.Context, loop storage.LoopRecord) (*loopResponse, error) {
-	if !loops.IsReviewFixBudgetHold(loop) {
+	if !loops.IsReviewFixPairHold(loop) {
 		return nil, nil
 	}
 	services := h.context.Runtime.Services()
@@ -5961,26 +5967,37 @@ func (h *Handler) applyReviewFixBudgetContinueIfHeld(ctx context.Context, loop s
 	}
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	caps := h.reviewFixBudgetLiveCaps(loop.ProjectID)
-	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (reviewFixContinueOutcome, error) {
 		repos := storage.NewRepositories(tx)
 		fresh, getErr := repos.Loops.GetByID(ctx, loop.ID)
 		if getErr != nil {
-			return storage.LoopRecord{}, getErr
+			return reviewFixContinueOutcome{}, getErr
 		}
 		if fresh == nil {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loop.ID)}
+			return reviewFixContinueOutcome{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loop.ID)}
 		}
-		if !loops.IsReviewFixBudgetHold(*fresh) {
-			return storage.LoopRecord{}, nil
+		// Budget hold (including combined with scope) uses meter-aware Continue.
+		if loops.IsReviewFixBudgetHold(*fresh) {
+			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerContinue, nowISO, caps)
+			if applyErr != nil {
+				return reviewFixContinueOutcome{}, applyErr
+			}
+			if !result.Applied {
+				return reviewFixContinueOutcome{}, nil
+			}
+			return reviewFixContinueOutcome{loop: result.Loop, fallbackID: promotedScopeHoldFallbackID(ctx, repos, result.Loop)}, nil
 		}
-		result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerContinue, nowISO, caps)
-		if applyErr != nil {
-			return storage.LoopRecord{}, applyErr
+		if loops.IsReviewScopeHumanHold(*fresh) {
+			result, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerContinue, nowISO)
+			if applyErr != nil {
+				return reviewFixContinueOutcome{}, applyErr
+			}
+			if !result.Applied {
+				return reviewFixContinueOutcome{}, nil
+			}
+			return reviewFixContinueOutcome{loop: result.Loop, fallbackID: promotedScopeHoldFallbackID(ctx, repos, result.Loop)}, nil
 		}
-		if !result.Applied {
-			return storage.LoopRecord{}, nil
-		}
-		return result.Loop, nil
+		return reviewFixContinueOutcome{}, nil
 	})
 	if err != nil {
 		var typed apiError
@@ -5989,17 +6006,103 @@ func (h *Handler) applyReviewFixBudgetContinueIfHeld(ctx context.Context, loop s
 		}
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
-	if updated.ID == "" {
+	if updated.loop.ID == "" {
 		return nil, nil
 	}
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
-	resp, serErr := h.serializeLoopWithDiagnostics(ctx, updated)
+	h.observePromotedScopeHolds(ctx, updated.loop, updated.fallbackID)
+	resp, serErr := h.serializeLoopWithDiagnostics(ctx, updated.loop)
 	if serErr != nil {
 		return nil, serErr
 	}
 	return &resp, nil
+}
+
+func (h *Handler) humanAttentionObserver() func(context.Context, string) {
+	if h.context.NotifyHumanAttention != nil {
+		return h.context.NotifyHumanAttention
+	}
+	if rt, ok := h.context.Runtime.(*looperdruntime.Runtime); ok {
+		return rt.NotifyHumanAttention
+	}
+	return nil
+}
+
+// observePromotedScopeHolds notifies after budget Continue may have created a
+// fresh no-HITL scope park. That path never finishes a claim, so the scheduler
+// observer would otherwise miss it until daemon restart.
+// fallbackID is the notification-owning primary captured inside the Continue
+// transaction. Durable attention ignores sibling-only pauses, so a later List
+// failure must not fall back to the answered sibling.
+func (h *Handler) observePromotedScopeHolds(ctx context.Context, loop storage.LoopRecord, fallbackID string) {
+	notify := h.humanAttentionObserver()
+	if notify == nil {
+		return
+	}
+	fallback := func() {
+		if id := strings.TrimSpace(fallbackID); id != "" {
+			notify(ctx, id)
+			return
+		}
+		if id := reviewScopeHumanNotifyLoopID(loop); id != "" {
+			notify(ctx, id)
+		}
+	}
+	if h.context.Runtime == nil {
+		fallback()
+		return
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Loops == nil {
+		fallback()
+		return
+	}
+	all, err := services.Repositories.Loops.List(ctx)
+	if err != nil {
+		fallback()
+		return
+	}
+	seen := make(map[string]struct{})
+	for _, member := range append(loops.FindSiblingReviewFixLoops(all, loop), loop) {
+		if _, ok := seen[member.ID]; ok {
+			continue
+		}
+		seen[member.ID] = struct{}{}
+		if loops.IsReviewScopeHumanHold(member) {
+			notify(ctx, member.ID)
+		}
+	}
+}
+
+type reviewFixContinueOutcome struct {
+	loop       storage.LoopRecord
+	fallbackID string
+}
+
+func promotedScopeHoldFallbackID(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) string {
+	if repos != nil && repos.Loops != nil {
+		if all, err := repos.Loops.List(ctx); err == nil {
+			for _, member := range append(loops.FindSiblingReviewFixLoops(all, loop), loop) {
+				if id := reviewScopeHumanNotifyLoopID(member); id != "" {
+					return id
+				}
+			}
+		}
+	}
+	return reviewScopeHumanNotifyLoopID(loop)
+}
+
+func reviewScopeHumanNotifyLoopID(loop storage.LoopRecord) string {
+	if loops.IsReviewScopeHumanRequiredPause(loop.MetadataJSON) && !loops.IsSiblingReviewScopeHumanPause(loop.MetadataJSON) {
+		return loop.ID
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if ok && loops.IsReviewScopeHumanAsk(ask) && strings.TrimSpace(loop.Status) == "awaiting_human" {
+		return loop.ID
+	}
+	return ""
 }
 
 // drainReviewFixBudgetPair stops live agents on both pair members before
@@ -6024,7 +6127,7 @@ func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.Loo
 			continue
 		}
 		seen[member.ID] = struct{}{}
-		if member.ID != loop.ID && !loops.IsReviewFixBudgetHold(member) {
+		if member.ID != loop.ID && !loops.IsReviewFixPairHold(member) {
 			continue
 		}
 		switch strings.TrimSpace(member.Status) {
@@ -6038,10 +6141,37 @@ func (h *Handler) drainReviewFixBudgetPair(ctx context.Context, loop storage.Loo
 	return nil
 }
 
-// applyReviewFixBudgetStopIfHeld delegates looper stop on a budget-held role to
-// paired Stop (terminate both). Returns nil when not a hold.
+// drainScopeHoldBeforeRespond looks up the loop before a HITL Stop mutation.
+// A lookup error must fail closed so ApplyReviewScopeHumanAnswer cannot
+// terminalize the pair without draining a live sibling.
+func drainScopeHoldBeforeRespond(ctx context.Context, repos *storage.Repositories, loopID, answer string, drain func(context.Context, storage.LoopRecord) error) (bool, error) {
+	if repos == nil || repos.Loops == nil || !loops.IsReviewFixBudgetStop(answer) {
+		return false, nil
+	}
+	peek, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if peek == nil {
+		return false, nil
+	}
+	ask, _ := loops.ReadHITLAsk(peek.MetadataJSON)
+	if !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*peek)) {
+		return false, nil
+	}
+	if drain == nil {
+		return false, nil
+	}
+	if err := drain(ctx, *peek); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// applyReviewFixBudgetStopIfHeld delegates looper stop on a budget-held or
+// scope-held role to paired Stop (terminate both). Returns nil when not a hold.
 func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop storage.LoopRecord) (any, error) {
-	if !loops.IsReviewFixBudgetHold(loop) {
+	if !loops.IsReviewFixPairHold(loop) {
 		return nil, nil
 	}
 	if err := h.drainReviewFixBudgetPair(ctx, loop); err != nil {
@@ -6062,17 +6192,27 @@ func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop stora
 		if fresh == nil {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loop.ID)}
 		}
-		if !loops.IsReviewFixBudgetHold(*fresh) {
-			return storage.LoopRecord{}, nil
+		if loops.IsReviewFixBudgetHold(*fresh) {
+			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerStop, nowISO, caps)
+			if applyErr != nil {
+				return storage.LoopRecord{}, applyErr
+			}
+			if !result.Applied {
+				return storage.LoopRecord{}, nil
+			}
+			return result.Loop, nil
 		}
-		result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerStop, nowISO, caps)
-		if applyErr != nil {
-			return storage.LoopRecord{}, applyErr
+		if loops.IsReviewScopeHumanHold(*fresh) {
+			result, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *fresh, loops.ReviewFixBudgetAnswerStop, nowISO)
+			if applyErr != nil {
+				return storage.LoopRecord{}, applyErr
+			}
+			if !result.Applied {
+				return storage.LoopRecord{}, nil
+			}
+			return result.Loop, nil
 		}
-		if !result.Applied {
-			return storage.LoopRecord{}, nil
-		}
-		return result.Loop, nil
+		return storage.LoopRecord{}, nil
 	})
 	if err != nil {
 		var typed apiError
@@ -6082,13 +6222,20 @@ func (h *Handler) applyReviewFixBudgetStopIfHeld(ctx context.Context, loop stora
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 	if updated.ID == "" {
+		// Continue already released the hold after drain. Reopen sibling
+		// gates before the route falls through to single-loop StopLoop.
+		looperdruntime.ReopenUnappliedScopeStopGates(ctx, services.Repositories, services.ActiveExecutions, loop.ID)
 		return nil, nil
+	}
+	outcome := "review_fix_budget_stop"
+	if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+		outcome = "review_scope_human_stop"
 	}
 	return map[string]any{
 		"stopped": true,
 		"loopId":  updated.ID,
 		"status":  updated.Status,
-		"outcome": "review_fix_budget_stop",
+		"outcome": outcome,
 	}, nil
 }
 
@@ -6104,6 +6251,15 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	drained, err := drainScopeHoldBeforeRespond(ctx, services.Repositories, loopID, answer, h.drainReviewFixBudgetPair)
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return loopResponse{}, typed
+		}
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -6113,14 +6269,36 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		if loop == nil {
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
-		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+			// Production StopLoop pauses awaiting_human during drain.
+			// Scope Stop must still terminalize a still-held paused record.
+			if loop.Status != string(domain.LoopStatusPaused) || !loops.IsReviewFixBudgetStop(answer) || !(loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*loop)) {
+				if drained && loops.IsReviewFixBudgetStop(answer) && !loops.IsReviewScopeHumanHold(*loop) && !loops.IsReviewFixBudgetHold(*loop) {
+					switch strings.TrimSpace(loop.Status) {
+					case "queued", "running":
+						return *loop, nil
+					}
+				}
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
+			}
+		}
 		if loops.IsReviewFixBudgetAsk(ask) {
 			result, applyErr := loops.ApplyReviewFixBudgetAnswer(ctx, repos, *loop, answer, nowISO, h.reviewFixBudgetLiveCaps(loop.ProjectID))
 			if applyErr != nil {
 				if errors.Is(applyErr, loops.ErrReviewFixBudgetInvalidAnswer) {
+					return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
+				}
+				return storage.LoopRecord{}, applyErr
+			}
+			if result.Applied {
+				return result.Loop, nil
+			}
+		}
+		if loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewScopeHumanHold(*loop) {
+			result, applyErr := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *loop, answer, nowISO)
+			if applyErr != nil {
+				if errors.Is(applyErr, loops.ErrReviewScopeHumanInvalidAnswer) {
 					return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: applyErr.Error()}
 				}
 				return storage.LoopRecord{}, applyErr
@@ -6144,6 +6322,9 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		}
 		return updated, nil
 	})
+	if drained {
+		looperdruntime.ReopenUnappliedScopeStopGates(ctx, services.Repositories, services.ActiveExecutions, loopID)
+	}
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {
@@ -6152,7 +6333,14 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 
-	if updated.Status != string(domain.LoopStatusAwaitingHuman) {
+	// Budget Continue may promote deferred needs_human into a fresh scope hold
+	// that is still awaiting_human. Overlay Continue can also release the pair
+	// hold while a residual ordinary agent ask remains awaiting. Return that
+	// park; do not treat it as the just-answered ask and implicitly Continue
+	// via mutateLoopStatus.
+	residualAsk, hasResidualAsk := loops.ReadHITLAsk(updated.MetadataJSON)
+	residualAwaiting := hasResidualAsk && strings.EqualFold(strings.TrimSpace(residualAsk.Status), "awaiting")
+	if updated.Status != string(domain.LoopStatusAwaitingHuman) || loops.IsReviewFixPairHold(updated) || residualAwaiting {
 		if h.context.TriggerSchedulerTick != nil {
 			h.context.TriggerSchedulerTick()
 		}
@@ -7191,12 +7379,16 @@ func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *stora
 			return err
 		}
 	}
-	// Budget holds require paired Continue (looper unpause) or Stop — not single-role retry.
-	if loops.IsReviewFixBudgetHold(loop) {
+	// Budget/scope pair holds require paired Continue (looper unpause) or Stop — not single-role retry.
+	if loops.IsReviewFixPairHold(loop) {
+		kind := "budget"
+		if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+			kind = "scope"
+		}
 		return apiError{
 			code:    pkgapi.ErrorCodeValidationFailed,
 			status:  http.StatusBadRequest,
-			message: fmt.Sprintf("Cannot retry review-fix budget hold on loop %s; use looper unpause (Continue) or looper stop", loop.ID),
+			message: fmt.Sprintf("Cannot retry review-fix %s hold on loop %s; use looper unpause (Continue) or looper stop", kind, loop.ID),
 		}
 	}
 	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {

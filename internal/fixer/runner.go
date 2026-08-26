@@ -1662,7 +1662,7 @@ func (r *Runner) shouldCreateFixerBudgetPark(loop storage.LoopRecord) bool {
 	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
 		return false
 	}
-	if loop.Status == "paused" && loops.IsReviewFixBudgetHold(loop) {
+	if loop.Status == "paused" && loops.IsReviewFixPairHold(loop) {
 		return false
 	}
 	if !loops.ParticipatesInReviewFixBudget(loop) {
@@ -1732,12 +1732,16 @@ func (r *Runner) parkFixerBudgetIfExhausted(ctx context.Context, loop storage.Lo
 	if loop.Status == "terminated" || loop.Status == "stopped" {
 		return false, nil
 	}
-	// Sibling pause is already a hold; do not treat "not self-exhausted" as proceed.
-	if loop.Status == "paused" && loops.IsSiblingReviewFixBudgetPause(loop.MetadataJSON) {
+	// Sibling pause / scope hold is already a hold; do not treat "not self-exhausted" as proceed.
+	if loop.Status == "paused" && (loops.IsSiblingReviewFixBudgetPause(loop.MetadataJSON) || loops.IsSiblingReviewScopeHumanPause(loop.MetadataJSON)) {
+		return true, nil
+	}
+	if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
 		return true, nil
 	}
 	if loop.Status == "awaiting_human" {
 		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			// Agent ask or scope ask: not a budget park target.
 			return true, nil
 		}
 	} else if loop.Status == "paused" && loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) {
@@ -1804,11 +1808,14 @@ func (r *Runner) refusePushIfBudgetExhausted(ctx context.Context, input stepInpu
 	if !loops.ParticipatesInReviewFixBudget(loop) {
 		return false, nil
 	}
-	if loops.IsReviewFixBudgetHold(loop) {
-		if _, err := r.parkFixerBudgetIfExhausted(ctx, loop); err != nil {
-			return true, err
+	if loops.IsReviewFixPairHold(loop) {
+		if loops.IsReviewFixBudgetHold(loop) {
+			if _, err := r.parkFixerBudgetIfExhausted(ctx, loop); err != nil {
+				return true, err
+			}
+			return true, &holdSkipError{summary: "Fixer stopped because review-fix budget is held"}
 		}
-		return true, &holdSkipError{summary: "Fixer stopped because review-fix budget is held"}
+		return true, &holdSkipError{summary: "Fixer stopped because review scope requires human judgment"}
 	}
 	cap := r.maxPushesPerPR(loop.ProjectID)
 	if !loops.BudgetExhausted(loops.FixerPushCount(loop.MetadataJSON), cap) {
@@ -2743,7 +2750,7 @@ func (r *Runner) finishHeldFixerQueueItem(ctx context.Context, loop storage.Loop
 	// step already persisted — only ordinary label/hold skips re-queue.
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
-		if loops.IsReviewFixBudgetHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
+		if loops.IsReviewFixPairHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
 			updated.NextRunAt = nil
 			return
 		}
@@ -5342,13 +5349,15 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if updatedLoop.Status == "awaiting_human" || updatedLoop.Status == "human_takeover" || updatedLoop.Status == "terminated" || updatedLoop.Status == "stopped" {
 			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
 		}
-		// Sibling pause / exhausted hold must not be revived by discovery enqueue.
+		// Sibling pause / exhausted / scope hold must not be revived by discovery enqueue.
 		// Notify only from discovery after a successful park (not from shared park).
-		if loops.IsReviewFixBudgetHold(updatedLoop) {
-			if parked, err := r.parkFixerBudgetIfExhausted(ctx, updatedLoop); err != nil {
-				return loopUpsertResult{}, err
-			} else if parked {
-				r.notifyHumanAttentionBestEffort(ctx, updatedLoop.ID)
+		if loops.IsReviewFixPairHold(updatedLoop) {
+			if loops.IsReviewFixBudgetHold(updatedLoop) {
+				if parked, err := r.parkFixerBudgetIfExhausted(ctx, updatedLoop); err != nil {
+					return loopUpsertResult{}, err
+				} else if parked {
+					r.notifyHumanAttentionBestEffort(ctx, updatedLoop.ID)
+				}
 			}
 			return loopUpsertResult{record: updatedLoop, created: false, skipped: true}, nil
 		}
