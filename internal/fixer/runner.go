@@ -3491,11 +3491,18 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	if withheld, err := r.skipPushIfDispositionWithheld(ctx, input, checkpoint); err != nil {
+	if withheld, admitted, err := r.skipPushIfDispositionWithheld(ctx, input, checkpoint); err != nil {
 		return checkpoint, err
 	} else if withheld {
 		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "pending_disposition"}})
 		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "Thread withheld pending Reviewer disposition adjudication", Evidence: resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, checkpoint.FixItemsHash)}
+		if admitted > 0 {
+			// Combined repair still contains withheld-thread edits. Do not push
+			// or resolve remaining items; rediscover so the next collect admits
+			// only the still-actionable set.
+			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			return checkpoint, &loopError{message: "Fixer push aborted because a repaired thread became withheld pending Reviewer disposition adjudication; will rediscover remaining items", kind: FailureRetryableAfterResume}
+		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
@@ -7513,17 +7520,19 @@ func (r *Runner) admitWithheldDispositionFixItems(ctx context.Context, input ste
 
 // skipPushIfDispositionWithheld rechecks live withhold immediately before the
 // remote push. A trusted /looper wontfix or /looper reconsider that arrived
-// after collect-fixes must not publish the repair. Failures are retryable
-// fail-closed. Non-comment runs skip the live read.
-func (r *Runner) skipPushIfDispositionWithheld(ctx context.Context, input stepInput, checkpoint fixerCheckpoint) (bool, error) {
+// after collect-fixes must not publish the repair, including when only some
+// collected items became withheld. Failures are retryable fail-closed.
+// Non-comment runs skip the live read. admitted is the still-actionable count
+// when withheld is true (0 = every collected item is withheld).
+func (r *Runner) skipPushIfDispositionWithheld(ctx context.Context, input stepInput, checkpoint fixerCheckpoint) (withheld bool, admitted int, err error) {
 	if !hasCommentFixItems(checkpoint.FixItems) {
-		return false, nil
+		return false, len(checkpoint.FixItems), nil
 	}
-	admitted, err := r.admitWithheldDispositionFixItems(ctx, input, checkpoint.FixItems)
+	remaining, err := r.admitWithheldDispositionFixItems(ctx, input, checkpoint.FixItems)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return len(admitted) == 0, nil
+	return len(remaining) < len(checkpoint.FixItems), len(remaining), nil
 }
 
 // suppressWithheldDispositionFixItems drops threads with unaudited trusted

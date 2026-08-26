@@ -8491,6 +8491,91 @@ func TestRunPushStepSkipsWhenWontfixArrivesAfterCollectFixes(t *testing.T) {
 	}
 }
 
+func TestCollectToPushAbortsWhenOneRepairedThreadBecomesWithheld(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopMetadata := `{}`
+	loopTarget := buildPullRequestTargetID("acme/looper", 42)
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_partial_withhold_push", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_partial_withhold_push", LoopID: "loop_partial_withhold_push", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{
+		currentUser: testLooperLogin,
+		viewResponses: []PullRequestDetail{{
+			Number: 42, State: "OPEN", HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head", Author: "alice",
+		}},
+		threads: []ReviewThread{
+			{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Author: testLooperLogin, Body: "Please fix t1 <!-- looper:stamp v=1 -->"}}},
+			{ID: "t2", Comments: []ReviewThreadComment{{ID: "c2", Author: testLooperLogin, Body: "Please fix t2 <!-- looper:stamp v=1 -->"}}},
+		},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, ValidationRunner: passValidation, AllowAutoPush: true, Now: fixture.now, Logger: fixture.logger})
+	collectCheckpoint := fixerCheckpoint{
+		Detail: &checkpointDetail{
+			State: "OPEN", HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main",
+			Comments: []map[string]any{
+				{"id": "c1", "threadId": "t1", "body": "Please fix t1 <!-- looper:stamp v=1 -->", "author": testLooperLogin},
+				{"id": "c2", "threadId": "t2", "body": "Please fix t2 <!-- looper:stamp v=1 -->", "author": testLooperLogin},
+			},
+		},
+	}
+	collected, err := runner.runCollectFixesStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{ID: "loop_partial_withhold_push", MetadataJSON: &loopMetadata},
+		Run:        run,
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: collectCheckpoint,
+	})
+	if err != nil {
+		t.Fatalf("runCollectFixesStep() error = %v", err)
+	}
+	if collected.SkipReason != "" || len(collected.FixItems) != 2 {
+		t.Fatalf("collect FixItems=%#v skip=%q, want both comment items admitted", collected.FixItems, collected.SkipReason)
+	}
+
+	github.threads[0].Comments = append(github.threads[0].Comments, ReviewThreadComment{
+		ID: "c1-wontfix", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix out of scope",
+	})
+
+	pushCheckpoint := collected
+	pushCheckpoint.Worktree = &checkpointWorktree{Path: t.TempDir(), Branch: "feature/fix-42", BaseHeadSHA: "base-head"}
+	pushCheckpoint.Repair = &checkpointRepair{Status: "completed"}
+	pushCheckpoint.Validation = &ValidationResult{Passed: true, HeadSHA: "fix-head"}
+	pushCheckpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "fix-head", NewCommitSHAs: []string{"fix-head"}, WorkingTreeClean: true}
+
+	updated, err := runner.runPushStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:       storage.LoopRecord{ID: "loop_partial_withhold_push", MetadataJSON: &loopMetadata},
+		Run:        run,
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: pushCheckpoint,
+	})
+	if err == nil || !strings.Contains(err.Error(), "will rediscover remaining items") {
+		t.Fatalf("runPushStep() error = %v, want rediscover after partial withhold", err)
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableAfterResume {
+		t.Fatalf("runPushStep() error = %v, want retryable-after-resume loopError", err)
+	}
+	if len(git.pushCalls) != 0 {
+		t.Fatalf("push calls = %d, want 0 when one repaired thread is withheld", len(git.pushCalls))
+	}
+	if updated.Push == nil || updated.Push.Pushed || !strings.Contains(updated.Push.SkippedReason, "withheld") {
+		t.Fatalf("updated.Push = %#v, want skipped withheld push", updated.Push)
+	}
+	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	}
+}
+
 func TestRunPushStepDoesNotAdoptAgentLifecyclePushEvidenceOnLiveHeadMismatch(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "other-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"}}}
