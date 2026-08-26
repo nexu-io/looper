@@ -3995,9 +3995,14 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 		}
 		loop := input.Loop
 		if r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
-			if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
-				loop = *fresh
+			fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+			if err != nil {
+				return fmt.Errorf("refresh loop before budget-held disposition park: %w", err)
 			}
+			if fresh == nil {
+				return fmt.Errorf("refresh loop before budget-held disposition park: loop %s not found", loop.ID)
+			}
+			loop = *fresh
 		}
 		encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
 			loop.MetadataJSON, question, message, r.reviewFixHITLEnabled(),

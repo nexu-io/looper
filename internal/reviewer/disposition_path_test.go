@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3549,6 +3550,97 @@ func TestNeedsHumanParkCommitsSignalWithoutLatePersist(t *testing.T) {
 	}
 	if result.Loop.MetadataJSON != nil && strings.Contains(*result.Loop.MetadataJSON, metadataLastReviewedSignalFingerprintKey) {
 		t.Fatalf("Continue left lastReviewedSignalFingerprint: %s", *result.Loop.MetadataJSON)
+	}
+}
+
+// failNthBudgetHeldLoopGet fails the Nth loops-by-id read. Used to model a
+// transient storage error after park/refresh and before pending-scope persist.
+type failNthBudgetHeldLoopGet struct {
+	db   *sql.DB
+	nth  int
+	seen int
+}
+
+func (q *failNthBudgetHeldLoopGet) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *failNthBudgetHeldLoopGet) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *failNthBudgetHeldLoopGet) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if strings.Contains(query, "SELECT * FROM loops WHERE id") {
+		q.seen++
+		if q.nth > 0 && q.seen == q.nth {
+			return q.db.QueryRowContext(ctx, `SELECT * FROM loops_refresh_probe_missing WHERE id = ?`, args...)
+		}
+	}
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+func TestBudgetHeldDispositionNeedsHumanRefreshErrorDoesNotUpsertStale(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	revMeta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_nh_budget_refresh_fail", Seq: 31, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &revMeta,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_nh_budget_refresh_fail_fix", Seq: 32, ProjectID: "project_1", Type: "fixer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: stringPtr(`{"followUpdates":true}`),
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(parked) {
+		t.Fatalf("fixture must be budget hold: %#v", parked)
+	}
+	querier := &failNthBudgetHeldLoopGet{db: fixture.coordinator.DB(), nth: 3}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: storage.NewRepositories(querier),
+		GitHub: &fakeGitHubGateway{currentLogin: "looper-bot"},
+		Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = parked
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	if err := runner.parkDispositionNeedsHuman(context.Background(), input, "thread_1", "ambiguous", "sig-needs-human"); err == nil {
+		t.Fatal("parkDispositionNeedsHuman error = nil, want refresh failure")
+	} else if !strings.Contains(err.Error(), "refresh loop before budget-held disposition park") {
+		t.Fatalf("parkDispositionNeedsHuman error = %v, want refresh loop before budget-held disposition park", err)
+	}
+	after, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || after == nil {
+		t.Fatalf("get loop: (%#v, %v)", after, getErr)
+	}
+	if !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("want durable budget hold: status=%s meta=%s", after.Status, derefString(after.MetadataJSON))
+	}
+	if loops.HasPendingReviewScopeHuman(*after) {
+		t.Fatalf("refresh failure must not persist pending scope from stale loop: meta=%s", derefString(after.MetadataJSON))
 	}
 }
 

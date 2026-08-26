@@ -16,7 +16,6 @@ const (
 
 	threadResolutionMarkerNeedle = "looper:thread-resolution"
 	fixerDeclinedMarkerNeedle    = "looper-fixer-reply-declined"
-	fixerFixedMarkerNeedle       = "looper-fixer-reply thread:"
 )
 
 var (
@@ -24,6 +23,8 @@ var (
 	threadResolutionMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper:thread-resolution\s+([^>]*?)-->`)
 	// Fixer decline marker. Optional trailing fields (e.g. attempt:post-reject) are ignored.
 	fixerDeclinedMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)(?:\s+[^>]*)?-->`)
+	// Fixer fixed-reply marker. Distinct from decline (`looper-fixer-reply-declined`).
+	fixerFixedMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply\s+thread:(\S+)\s+commit:(\S+)(?:\s+[^>]*)?-->`)
 )
 
 // threadResolutionMarkerFields holds parsed audit marker fields.
@@ -377,12 +378,27 @@ func isValidatedFixerDeclinedCommentFromAuthor(comment ReviewThreadComment, loop
 	return isLooperIdentityAuthor(comment.Author, looperLogin)
 }
 
-func isValidatedFixerFixedComment(body string) bool {
-	return strings.Contains(body, fixerFixedMarkerNeedle) && !isValidatedFixerDeclinedComment(body)
+func parseFixerFixedMarker(body string) (threadID, commitSHA string, ok bool) {
+	m := fixerFixedMarkerRE.FindStringSubmatch(body)
+	if len(m) < 3 {
+		return "", "", false
+	}
+	return strings.TrimSpace(m[1]), strings.TrimSpace(m[2]), true
 }
 
-func isValidatedFixerFixedCommentFromAuthor(comment ReviewThreadComment, looperLogin string) bool {
-	if !isValidatedFixerFixedComment(comment.Body) {
+func isValidatedFixerFixedComment(body string) bool {
+	threadID, commitSHA, ok := parseFixerFixedMarker(body)
+	return ok && threadID != "" && commitSHA != ""
+}
+
+// isValidatedFixerFixedCommentFromAuthor requires exact marker + Looper identity.
+// When containingThreadID is non-empty, the marker's thread field must match it exactly.
+func isValidatedFixerFixedCommentFromAuthor(comment ReviewThreadComment, looperLogin, containingThreadID string) bool {
+	threadID, commitSHA, ok := parseFixerFixedMarker(comment.Body)
+	if !ok || threadID == "" || commitSHA == "" {
+		return false
+	}
+	if want := strings.TrimSpace(containingThreadID); want != "" && threadID != want {
 		return false
 	}
 	return isLooperIdentityAuthor(comment.Author, looperLogin)

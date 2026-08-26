@@ -148,7 +148,7 @@ func LatestTrustedDispositionForLogin(thread ReviewThread, prAuthorLogin, looper
 		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
-		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin, thread.ID) || isValidatedFixerFixedCommentFromAuthor(comment, looperLogin) {
+		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin, thread.ID) || isValidatedFixerFixedCommentFromAuthor(comment, looperLogin, thread.ID) {
 			continue
 		}
 		directive, ok := ParseTrustedDispositionDirective(comment.Body)
@@ -309,7 +309,7 @@ func coordinationExcludedThreadFeedbackFingerprint(thread ReviewThread, looperLo
 		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
 			continue
 		}
-		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin, thread.ID) || isValidatedFixerFixedCommentFromAuthor(comment, looperLogin) {
+		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin, thread.ID) || isValidatedFixerFixedCommentFromAuthor(comment, looperLogin, thread.ID) {
 			continue
 		}
 		filtered.Comments = append(filtered.Comments, comment)

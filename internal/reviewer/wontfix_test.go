@@ -270,3 +270,46 @@ func TestForceNeedsHumanIgnoresQuotedForeignDecline(t *testing.T) {
 		t.Fatal("quoted foreign-thread decline must not force needs_human")
 	}
 }
+
+func TestForceNeedsHumanQuotedForeignFixedMarkerIsChangedInput(t *testing.T) {
+	t.Parallel()
+	baseComments := []ReviewThreadComment{
+		{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->"},
+		{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
+	}
+	base := ReviewThread{ID: "t1", Comments: append([]ReviewThreadComment{}, baseComments...)}
+	runner := &Runner{}
+	rejectBody := runner.buildThreadResolutionReplyWithFeedback(
+		"t1", "abc",
+		coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot"),
+		threadResolutionAgentDecision{Decision: "reject_wontfix", Evidence: "still needed", Confidence: "high"},
+		config.ReviewerThreadResolutionConfig{},
+	)
+	quoted := ReviewThread{ID: "t1", Comments: append(append([]ReviewThreadComment{}, baseComments...),
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
+		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "quoting <!-- looper-fixer-reply thread:other commit:abc123 -->", CreatedAt: "t4", UpdatedAt: "t4"},
+		ReviewThreadComment{ID: "c5", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:t1 fingerprint:x attempt:post-reject -->", CreatedAt: "t5", UpdatedAt: "t5"},
+	)}
+	if ForceNeedsHumanAfterSecondDecline(quoted, "abc", "looper-bot") {
+		t.Fatal("quoted foreign-thread fixed marker is new input and must not force needs_human")
+	}
+}
+
+func TestParseFixerFixedMarkerRequiresThreadAndCommit(t *testing.T) {
+	t.Parallel()
+	threadID, commit, ok := parseFixerFixedMarker("fixed <!-- looper-fixer-reply thread:t1 commit:abc123 -->")
+	if !ok || threadID != "t1" || commit != "abc123" {
+		t.Fatalf("got thread=%q commit=%q ok=%v, want t1/abc123/true", threadID, commit, ok)
+	}
+	if _, _, ok := parseFixerFixedMarker("quoting looper-fixer-reply thread:t1 without schema"); ok {
+		t.Fatal("substring without HTML comment must not parse")
+	}
+	if _, _, ok := parseFixerFixedMarker("<!-- looper-fixer-reply thread:t1 -->"); ok {
+		t.Fatal("marker missing commit must not parse")
+	}
+	if isValidatedFixerFixedCommentFromAuthor(ReviewThreadComment{
+		Author: "looper-bot", Body: "quoting <!-- looper-fixer-reply thread:other commit:abc123 -->",
+	}, "looper-bot", "t1") {
+		t.Fatal("foreign-thread fixed marker must not validate for containing thread")
+	}
+}

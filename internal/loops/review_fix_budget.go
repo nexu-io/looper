@@ -495,6 +495,10 @@ var reviewFixBudgetSiblingParkHook func(sibling storage.LoopRecord) error
 // release of one hold so Continue failure after partial release can be injected.
 var reviewFixBudgetReleaseHook func(loopID string) error
 
+// reviewFixBudgetHandoffPersistHook, when set (tests only), runs after the
+// handoff event is appended and before the loop upsert so Continue can interleave.
+var reviewFixBudgetHandoffPersistHook func(exhausted storage.LoopRecord) error
+
 func parkOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, sibling storage.LoopRecord, exhaustedBy, nowISO string) error {
 	if reviewFixBudgetSiblingParkHook != nil {
 		if err := reviewFixBudgetSiblingParkHook(sibling); err != nil {
@@ -559,6 +563,22 @@ func ensureReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repos
 	}
 	if err := appendReviewFixBudgetHandoffEvent(ctx, repos, exhausted, input, signal); err != nil {
 		return err
+	}
+	if reviewFixBudgetHandoffPersistHook != nil {
+		if err := reviewFixBudgetHandoffPersistHook(exhausted); err != nil {
+			return err
+		}
+	}
+	if repos.Loops != nil && strings.TrimSpace(exhausted.ID) != "" {
+		fresh, err := repos.Loops.GetByID(ctx, exhausted.ID)
+		if err != nil {
+			return err
+		}
+		if fresh == nil || !IsReviewFixBudgetHold(*fresh) {
+			// Continue/Stop won the race; do not resurrect the captured hold.
+			return nil
+		}
+		exhausted = *fresh
 	}
 	state = ReadReviewFixBudgetState(exhausted.MetadataJSON)
 	state.HandoffEventAt = input.NowISO
