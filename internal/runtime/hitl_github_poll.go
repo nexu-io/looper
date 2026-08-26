@@ -145,30 +145,80 @@ func deliverUndeliveredGitHubBudgetAsks(ctx contextType, projectID string, recor
 		if deps.addLabel != nil {
 			deps.addLabel(ctx, repo, prNumber, awaitingLabel, cwd)
 		}
-		ask.Transport = "github"
-		ask.PRNumber = prNumber
-		ask.AskCommentID = commentID
-		meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if werr != nil {
-			if deps.logWarn != nil {
-				deps.logWarn("hitl github: budget ask metadata write failed", map[string]any{"loopId": loop.ID, "error": werr.Error()})
-			}
-			continue
-		}
-		updated := loop
-		updated.MetadataJSON = &meta
-		if deps.nowISO != "" {
-			updated.UpdatedAt = deps.nowISO
-		}
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		posted := ask
+		persisted, err := persistPairAskDelivery(ctx, repos, loop.ID, deps.nowISO, posted, func(live *loops.HITLAsk) {
+			live.Transport = "github"
+			live.PRNumber = prNumber
+			live.AskCommentID = commentID
+		})
+		if err != nil {
 			if deps.logWarn != nil {
 				deps.logWarn("hitl github: budget ask persist failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 			}
 			continue
 		}
+		if !persisted {
+			continue
+		}
 		delivered++
 	}
 	return delivered
+}
+
+// persistPairAskDelivery writes ask-delivery fields onto the live loop when the
+// same awaiting pair ask is still current. A racing Continue/Stop can release
+// the hold while createComment/sendAsk is in flight; a whole-record upsert of
+// the pre-delivery snapshot would restore awaiting_human and scope metadata.
+func persistPairAskDelivery(ctx context.Context, repos *storage.Repositories, loopID, nowISO string, posted loops.HITLAsk, apply func(*loops.HITLAsk)) (bool, error) {
+	if repos == nil || repos.Loops == nil || strings.TrimSpace(loopID) == "" || apply == nil {
+		return false, nil
+	}
+	unlock := LockLoopRequeue(loopID)
+	defer unlock()
+	fresh, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if fresh == nil {
+		return false, nil
+	}
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*fresh))
+	defer unlockTarget()
+	current, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return false, err
+	}
+	if current == nil || current.Status != "awaiting_human" {
+		return false, nil
+	}
+	ask, ok := loops.ReadHITLAsk(current.MetadataJSON)
+	if !ok {
+		return false, nil
+	}
+	if !loops.IsReviewFixBudgetAsk(ask) && !loops.IsReviewScopeHumanAsk(ask) {
+		return false, nil
+	}
+	if strings.TrimSpace(ask.Kind) != strings.TrimSpace(posted.Kind) || strings.TrimSpace(ask.AskedAt) != strings.TrimSpace(posted.AskedAt) {
+		return false, nil
+	}
+	status := strings.TrimSpace(ask.Status)
+	if strings.EqualFold(status, "answered") || strings.EqualFold(status, "consumed") {
+		return false, nil
+	}
+	apply(&ask)
+	meta, err := loops.WriteHITLAsk(current.MetadataJSON, ask)
+	if err != nil {
+		return false, err
+	}
+	updated := *current
+	updated.MetadataJSON = &meta
+	if strings.TrimSpace(nowISO) != "" {
+		updated.UpdatedAt = nowISO
+	}
+	if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func githubBudgetAskMarker(loopSeq int64, askedAt string) string {

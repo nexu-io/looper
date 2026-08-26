@@ -1307,6 +1307,118 @@ func TestEnqueueFeishuHITLMessageFailsClosedWhenLookupErrors(t *testing.T) {
 	}
 }
 
+func TestFeishuScopeAskDeliveryDoesNotClobberContinueOrStop(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		race          string
+		wantDelivered int
+		wantStatus    string
+		wantHold      bool
+	}{
+		{name: "no_race", wantDelivered: 1, wantStatus: "awaiting_human", wantHold: true},
+		{name: "continue", race: loops.ReviewFixBudgetAnswerContinue, wantDelivered: 0, wantStatus: "queued", wantHold: false},
+		{name: "stop", race: loops.ReviewFixBudgetAnswerStop, wantDelivered: 0, wantStatus: "terminated", wantHold: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+			nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+			coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+				Now: func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+			}
+			t.Cleanup(func() { _ = coordinator.Close() })
+			if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+				t.Fatalf("RunPending() error = %v", err)
+			}
+			repos := storage.NewRepositories(coordinator.DB())
+			projectID := "project_scope_feishu_delivery_" + tc.name
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+				ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			repo := "acme/looper"
+			pr := int64(42)
+			target := "pr:acme/looper:42"
+			reviewer := storage.LoopRecord{
+				ID: "loop_scope_feishu_delivery_rev_" + tc.name, Seq: 401, ProjectID: projectID, Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			fixer := storage.LoopRecord{
+				ID: "loop_scope_feishu_delivery_fix_" + tc.name, Seq: 402, ProjectID: projectID, Type: "fixer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+			}
+			if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+			}
+			for _, item := range []storage.QueueItemRecord{
+				{ID: "queue_scope_feishu_rev_" + tc.name, ProjectID: stringPtr(projectID), LoopID: &reviewer.ID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Status: "queued", Priority: storage.QueuePriorityReviewer, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, DedupeKey: "reviewer:queue_scope_feishu_rev_" + tc.name},
+				{ID: "queue_scope_feishu_fix_" + tc.name, ProjectID: stringPtr(projectID), LoopID: &fixer.ID, Type: "fixer", TargetType: "pull_request", TargetID: target, Status: "queued", Priority: storage.QueuePriorityFixer, MaxAttempts: 3, AvailableAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, DedupeKey: "fixer:queue_scope_feishu_fix_" + tc.name},
+			} {
+				if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+					t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+				}
+			}
+			if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+				Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+				Question: "Clarify AGENTS.md rule X before unpause",
+			}); err != nil {
+				t.Fatalf("ParkReviewScopeHuman: %v", err)
+			}
+			all, err := repos.Loops.List(context.Background())
+			if err != nil {
+				t.Fatalf("Loops.List() error = %v", err)
+			}
+			delivered := deliverUndeliveredFeishuBudgetAsks(context.Background(), all, repos, feishuHITLDeliveryDeps{
+				sendAsk: func(ctx contextType, loop storage.LoopRecord, _ loops.HITLAsk) error {
+					if tc.race != "" {
+						fresh, err := repos.Loops.GetByID(ctx, loop.ID)
+						if err != nil || fresh == nil {
+							t.Fatalf("GetByID during sendAsk = (%#v, %v)", fresh, err)
+						}
+						if _, err := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *fresh, tc.race, nowISO); err != nil {
+							t.Fatalf("ApplyReviewScopeHumanAnswer(%s): %v", tc.race, err)
+						}
+					}
+					return nil
+				},
+				nowISO: nowISO,
+			})
+			if delivered != tc.wantDelivered {
+				t.Fatalf("deliverUndeliveredFeishuBudgetAsks() = %d, want %d", delivered, tc.wantDelivered)
+			}
+			fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+			if err != nil || fresh == nil {
+				t.Fatalf("Loops.GetByID(reviewer) = (%#v, %v)", fresh, err)
+			}
+			if fresh.Status != tc.wantStatus {
+				t.Fatalf("reviewer status = %s, want %s meta=%s", fresh.Status, tc.wantStatus, derefString(fresh.MetadataJSON))
+			}
+			if loops.IsReviewScopeHumanHold(*fresh) != tc.wantHold {
+				t.Fatalf("reviewer hold = %v, want %v meta=%s", loops.IsReviewScopeHumanHold(*fresh), tc.wantHold, derefString(fresh.MetadataJSON))
+			}
+			ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+			if tc.wantHold {
+				if !ok || !loops.IsReviewScopeHumanAsk(ask) || ask.Transport != "feishu" {
+					t.Fatalf("delivered scope ask = (%#v, %v), want feishu transport", ask, ok)
+				}
+				return
+			}
+			if ok && loops.IsReviewScopeHumanAsk(ask) {
+				t.Fatalf("stale persist restored scope ask after %s: %#v", tc.race, ask)
+			}
+		})
+	}
+}
+
 func mustCardAction(id int64, seq, answer string) feishuInboxEvent {
 	e := feishuInboxEvent{ID: id, Kind: "card_action"}
 	e.Value.LoopSeq = seq

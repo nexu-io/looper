@@ -157,23 +157,17 @@ func deliverUndeliveredFeishuBudgetAsks(ctx contextType, records []storage.LoopR
 			}
 			continue
 		}
-		ask.Transport = "feishu"
-		meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if werr != nil {
-			if deps.logWarn != nil {
-				deps.logWarn("hitl feishu: budget ask metadata write failed", map[string]any{"loopId": loop.ID, "error": werr.Error()})
-			}
-			continue
-		}
-		updated := loop
-		updated.MetadataJSON = &meta
-		if deps.nowISO != "" {
-			updated.UpdatedAt = deps.nowISO
-		}
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		posted := ask
+		persisted, err := persistPairAskDelivery(ctx, repos, loop.ID, deps.nowISO, posted, func(live *loops.HITLAsk) {
+			live.Transport = "feishu"
+		})
+		if err != nil {
 			if deps.logWarn != nil {
 				deps.logWarn("hitl feishu: budget ask persist failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 			}
+			continue
+		}
+		if !persisted {
 			continue
 		}
 		delivered++

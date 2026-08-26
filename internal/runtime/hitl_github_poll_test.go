@@ -1738,6 +1738,113 @@ func TestScopeStopReopensGatesWhenContinueWinsAfterDrain(t *testing.T) {
 	}
 }
 
+func TestGitHubScopeAskDeliveryDoesNotClobberContinueOrStop(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		race          string
+		wantDelivered int
+		wantStatus    string
+		wantHold      bool
+		wantCommentID int64
+	}{
+		{name: "no_race", wantDelivered: 1, wantStatus: "awaiting_human", wantHold: true, wantCommentID: 9201},
+		{name: "continue", race: loops.ReviewFixBudgetAnswerContinue, wantDelivered: 0, wantStatus: "queued", wantHold: false},
+		{name: "stop", race: loops.ReviewFixBudgetAnswerStop, wantDelivered: 0, wantStatus: "terminated", wantHold: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+			nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+			coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{
+				Now: func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+			}
+			t.Cleanup(func() { _ = coordinator.Close() })
+			if _, err := coordinator.MigrationRunner().RunPending(context.Background(), storage.RunPendingOptions{}); err != nil {
+				t.Fatalf("RunPending() error = %v", err)
+			}
+			repos := storage.NewRepositories(coordinator.DB())
+			projectID := "project_scope_github_delivery_" + tc.name
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+				ID: projectID, Name: "Scope", RepoPath: root, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			repo := "acme/looper"
+			pr := int64(42)
+			target := "pr:acme/looper:42"
+			reviewer := storage.LoopRecord{
+				ID: "loop_scope_gh_delivery_rev_" + tc.name, Seq: 301, ProjectID: projectID, Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			fixer := storage.LoopRecord{
+				ID: "loop_scope_gh_delivery_fix_" + tc.name, Seq: 302, ProjectID: projectID, Type: "fixer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &pr,
+				Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+				t.Fatalf("Loops.Upsert(reviewer) error = %v", err)
+			}
+			if err := repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+			}
+			seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_scope_gh_rev_"+tc.name, reviewer.ID, "reviewer", storage.QueuePriorityReviewer)
+			seedPollBudgetQueue(t, repos, nowISO, projectID, "queue_scope_gh_fix_"+tc.name, fixer.ID, "fixer", storage.QueuePriorityFixer)
+			if _, err := loops.ParkReviewScopeHuman(context.Background(), repos, loops.ParkReviewScopeHumanInput{
+				Held: reviewer, Role: "reviewer", Repo: repo, PRNumber: pr, NowISO: nowISO, HITLEnabled: true,
+				Question: "Clarify AGENTS.md rule X before unpause",
+			}); err != nil {
+				t.Fatalf("ParkReviewScopeHuman: %v", err)
+			}
+			all, err := repos.Loops.List(context.Background())
+			if err != nil {
+				t.Fatalf("Loops.List() error = %v", err)
+			}
+			delivered := deliverUndeliveredGitHubBudgetAsks(context.Background(), projectID, all, repos, githubHITLDeliveryDeps{
+				createComment: func(ctx contextType, _ string, _ int64, _ string, _ string) (int64, error) {
+					if tc.race != "" {
+						fresh, err := repos.Loops.GetByID(ctx, reviewer.ID)
+						if err != nil || fresh == nil {
+							t.Fatalf("GetByID during createComment = (%#v, %v)", fresh, err)
+						}
+						if _, err := loops.ApplyReviewScopeHumanAnswer(ctx, repos, *fresh, tc.race, nowISO); err != nil {
+							t.Fatalf("ApplyReviewScopeHumanAnswer(%s): %v", tc.race, err)
+						}
+					}
+					return 9201, nil
+				},
+				nowISO: nowISO,
+			})
+			if delivered != tc.wantDelivered {
+				t.Fatalf("deliverUndeliveredGitHubBudgetAsks() = %d, want %d", delivered, tc.wantDelivered)
+			}
+			fresh, err := repos.Loops.GetByID(context.Background(), reviewer.ID)
+			if err != nil || fresh == nil {
+				t.Fatalf("Loops.GetByID(reviewer) = (%#v, %v)", fresh, err)
+			}
+			if fresh.Status != tc.wantStatus {
+				t.Fatalf("reviewer status = %s, want %s meta=%s", fresh.Status, tc.wantStatus, derefString(fresh.MetadataJSON))
+			}
+			if loops.IsReviewScopeHumanHold(*fresh) != tc.wantHold {
+				t.Fatalf("reviewer hold = %v, want %v meta=%s", loops.IsReviewScopeHumanHold(*fresh), tc.wantHold, derefString(fresh.MetadataJSON))
+			}
+			ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
+			if tc.wantHold {
+				if !ok || !loops.IsReviewScopeHumanAsk(ask) || ask.Transport != "github" || ask.AskCommentID != tc.wantCommentID {
+					t.Fatalf("delivered scope ask = (%#v, %v), want github comment %d", ask, ok, tc.wantCommentID)
+				}
+				return
+			}
+			if ok && loops.IsReviewScopeHumanAsk(ask) {
+				t.Fatalf("stale persist restored scope ask after %s: %#v", tc.race, ask)
+			}
+		})
+	}
+}
+
 func seedPollBudgetQueue(t *testing.T, repos *storage.Repositories, nowISO, projectID, id, loopID, queueType string, priority int64) {
 	t.Helper()
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
