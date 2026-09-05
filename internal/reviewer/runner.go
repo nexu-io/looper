@@ -3312,6 +3312,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 
 	// Self-webhook / post-mutation admission: LIVE stored signal already matches.
 	meta := parseJSONObject(input.Loop.MetadataJSON)
+	lastReviewedSignal, _ := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey])
 	if last, ok := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey]); ok && last == reviewSignalFP && checkpoint.DispositionOnly {
 		var finErr error
 		checkpoint, finErr = r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
@@ -3483,7 +3484,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	decisionByID := map[string]threadResolutionAgentDecision{}
 	classifyThreads := make([]ReviewThread, 0, len(candidateThreads))
 	for _, thread := range candidateThreads {
-		if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin); ok {
+		if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin, lastReviewedSignal, threads); ok {
 			decisionByID[thread.ID] = decision
 			continue
 		}
@@ -4046,6 +4047,11 @@ func appendUniqueString(values []string, value string) []string {
 // can interleave.
 var parkDispositionScopePersistHook func(loop storage.LoopRecord) error
 
+// reviewScopeHumanPersistBeforeUpsertHook, when set (tests only), runs after a
+// hold-positive live read and immediately before pending-scope Upsert so
+// Continue can interleave in the remaining GetByID-then-Upsert window.
+var reviewScopeHumanPersistBeforeUpsertHook func(loop storage.LoopRecord) error
+
 func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput, threadID, evidence, signal string) error {
 	if r.repos == nil {
 		return nil
@@ -4065,15 +4071,23 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 			return err
 		}
 		loop := input.Loop
-		if r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		refreshHeld := func() (storage.LoopRecord, error) {
+			if r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+				return loop, nil
+			}
 			fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
 			if err != nil {
-				return fmt.Errorf("refresh loop before budget-held disposition park: %w", err)
+				return storage.LoopRecord{}, fmt.Errorf("refresh loop before budget-held disposition park: %w", err)
 			}
 			if fresh == nil {
-				return fmt.Errorf("refresh loop before budget-held disposition park: loop %s not found", loop.ID)
+				return storage.LoopRecord{}, fmt.Errorf("refresh loop before budget-held disposition park: loop %s not found", loop.ID)
 			}
-			loop = *fresh
+			return *fresh, nil
+		}
+		var err error
+		loop, err = refreshHeld()
+		if err != nil {
+			return err
 		}
 		if !loops.IsReviewFixBudgetHold(loop) {
 			// Continue/unpause already released the pair; do not restore it.
@@ -4087,24 +4101,34 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 		if r.repos.Loops == nil {
 			return fmt.Errorf("persist pending review scope requires loop storage")
 		}
-		var persistErr error
-		_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-			if !loops.IsReviewFixBudgetHold(*updated) {
-				return
-			}
-			encoded, encErr := loops.PersistPendingReviewScopeHumanEvidence(
-				updated.MetadataJSON, question, message, r.reviewFixHITLEnabled(),
-			)
-			if encErr != nil {
-				persistErr = encErr
-				return
-			}
-			updated.MetadataJSON = &encoded
-		})
+		loop, err = refreshHeld()
 		if err != nil {
 			return err
 		}
-		return persistErr
+		if !loops.IsReviewFixBudgetHold(loop) {
+			return nil
+		}
+		if reviewScopeHumanPersistBeforeUpsertHook != nil {
+			if err := reviewScopeHumanPersistBeforeUpsertHook(loop); err != nil {
+				return err
+			}
+		}
+		loop, err = refreshHeld()
+		if err != nil {
+			return err
+		}
+		if !loops.IsReviewFixBudgetHold(loop) {
+			return nil
+		}
+		encoded, encErr := loops.PersistPendingReviewScopeHumanEvidence(
+			loop.MetadataJSON, question, message, r.reviewFixHITLEnabled(),
+		)
+		if encErr != nil {
+			return encErr
+		}
+		loop.MetadataJSON = &encoded
+		loop.UpdatedAt = r.nowISO()
+		return r.repos.Loops.Upsert(ctx, loop)
 	}
 	_, err := loops.ParkReviewScopeHuman(ctx, r.repos, loops.ParkReviewScopeHumanInput{
 		Held:        input.Loop,
@@ -8821,23 +8845,65 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(loop))
 	defer unlockTarget()
 
-	parkLive := false
+	refreshLive := func() (*storage.LoopRecord, error) {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return nil, fmt.Errorf("refresh loop before pending review scope persist: %w", err)
+		}
+		if fresh == nil {
+			return nil, fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
+		}
+		return fresh, nil
+	}
+	fresh, err := refreshLive()
+	if err != nil {
+		return err
+	}
+	if !loops.IsReviewFixBudgetHold(*fresh) {
+		return r.parkReviewerScopeHuman(ctx, *fresh, completion)
+	}
+	if reviewScopeHumanPersistBeforeUpsertHook != nil {
+		if err := reviewScopeHumanPersistBeforeUpsertHook(*fresh); err != nil {
+			return err
+		}
+	}
+	live, err := refreshLive()
+	if err != nil {
+		return err
+	}
+	if !loops.IsReviewFixBudgetHold(*live) {
+		return r.parkReviewerScopeHuman(ctx, *live, completion)
+	}
 	write := func(writeRepos *storage.Repositories) error {
-		fresh, err := writeRepos.Loops.GetByID(ctx, loop.ID)
+		current, err := writeRepos.Loops.GetByID(ctx, loop.ID)
 		if err != nil {
 			return fmt.Errorf("refresh loop before pending review scope persist: %w", err)
 		}
-		if fresh == nil {
+		if current == nil {
 			return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
 		}
-		if !loops.IsReviewFixBudgetHold(*fresh) {
-			// Continue already released the budget hold. Park scope on the live
-			// record instead of restoring the stale budget snapshot.
-			parkLive = true
+		if !loops.IsReviewFixBudgetHold(*current) {
+			live = current
+			return nil
+		}
+		if reviewScopeHumanPersistBeforeUpsertHook != nil {
+			if err := reviewScopeHumanPersistBeforeUpsertHook(*current); err != nil {
+				return err
+			}
+		}
+		latest, err := writeRepos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return fmt.Errorf("refresh loop before pending review scope persist: %w", err)
+		}
+		if latest == nil {
+			return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
+		}
+		if !loops.IsReviewFixBudgetHold(*latest) {
+			live = latest
 			return nil
 		}
 		encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
-			fresh.MetadataJSON,
+			latest.MetadataJSON,
 			commentOnlyNeedsHumanQuestion(completion),
 			commentOnlyNeedsHumanEvidence(completion),
 			r.reviewFixHITLEnabled(),
@@ -8845,10 +8911,9 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 		if err != nil {
 			return err
 		}
-		updated := *fresh
-		updated.MetadataJSON = &encoded
-		updated.UpdatedAt = r.nowISO()
-		return writeRepos.Loops.Upsert(ctx, updated)
+		latest.MetadataJSON = &encoded
+		latest.UpdatedAt = r.nowISO()
+		return writeRepos.Loops.Upsert(ctx, *latest)
 	}
 	if r.db != nil {
 		if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
@@ -8859,8 +8924,8 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 	} else if err := write(r.repos); err != nil {
 		return err
 	}
-	if parkLive {
-		return r.parkReviewerScopeHuman(ctx, loop, completion)
+	if !loops.IsReviewFixBudgetHold(*live) {
+		return r.parkReviewerScopeHuman(ctx, *live, completion)
 	}
 	return nil
 }

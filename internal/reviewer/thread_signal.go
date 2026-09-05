@@ -77,7 +77,7 @@ func ComputeReviewSignalFingerprintForLogin(headSHA string, threads []ReviewThre
 func canonicalThreadFeedbackInput(threads []ReviewThread, looperLogin string) string {
 	looperThreads := make([]ReviewThread, 0, len(threads))
 	for _, thread := range threads {
-		if !isLooperAuthoredThreadForLogin(thread, looperLogin) {
+		if !isLooperAuthoredThreadForLogin(thread, looperLogin) && !HasUnauditedValidatedFixerDeclineForLogin(thread, looperLogin) {
 			continue
 		}
 		looperThreads = append(looperThreads, thread)
@@ -291,7 +291,12 @@ func hasThreadResolutionAuditForSignalForLogin(thread ReviewThread, threadID, he
 // feedback already exists. Spec §8.2: retry observes the remote audit marker
 // and must not reclassify after Reviewer's own mutation. A later validated
 // Fixer decline after reject_wontfix is new input (§8.4) and must not resume.
-func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, looperLogin string) (threadResolutionAgentDecision, bool) {
+// accept_wontfix is not resumed when lastReviewedSignalFingerprint equals the
+// current-head signal computed with this thread forced resolved (reopen: the
+// post-resolve fingerprint was stored, then the thread was reopened). last !=
+// current alone is not reopen — crash-after-accept (including a stale last)
+// must still resume. Empty last still resumes (in-run retry).
+func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, looperLogin, lastSignal string, allThreads []ReviewThread) (threadResolutionAgentDecision, bool) {
 	headSHA = strings.TrimSpace(headSHA)
 	if headSHA == "" || strings.TrimSpace(thread.ID) == "" {
 		return threadResolutionAgentDecision{}, false
@@ -301,6 +306,16 @@ func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, loop
 	}
 	candidateFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, looperLogin)
 	if candidateFP != "" && hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, headSHA, candidateFP, "accept_wontfix", looperLogin) {
+		last := strings.TrimSpace(lastSignal)
+		if last != "" {
+			live := allThreads
+			if len(live) == 0 {
+				live = []ReviewThread{thread}
+			}
+			if last == reviewSignalWithThreadForcedResolved(live, thread.ID, headSHA, looperLogin) {
+				return threadResolutionAgentDecision{}, false
+			}
+		}
 		return threadResolutionAgentDecision{
 			ThreadID: thread.ID, Decision: "accept_wontfix",
 			Evidence: "resume existing accept_wontfix audit", Confidence: "high",
@@ -316,6 +331,18 @@ func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, loop
 	return threadResolutionAgentDecision{}, false
 }
 
+func reviewSignalWithThreadForcedResolved(threads []ReviewThread, threadID, headSHA, looperLogin string) string {
+	copied := make([]ReviewThread, len(threads))
+	copy(copied, threads)
+	id := strings.TrimSpace(threadID)
+	for i := range copied {
+		if strings.TrimSpace(copied[i].ID) == id {
+			copied[i].IsResolved = true
+		}
+	}
+	return ComputeReviewSignalFingerprintForLogin(headSHA, copied, looperLogin)
+}
+
 // hasUnresolvedAcceptWontfixAudit is true when an unresolved Looper-authored
 // thread already carries a validated accept_wontfix audit.
 // Spec §8.2: a same-head remote audit is authority after a crash that lost the
@@ -328,7 +355,7 @@ func hasUnresolvedAcceptWontfixAudit(thread ReviewThread, headSHA, looperLogin s
 	if thread.IsResolved {
 		return false
 	}
-	if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, headSHA, looperLogin); ok && decision.Decision == "accept_wontfix" {
+	if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, headSHA, looperLogin, "", nil); ok && decision.Decision == "accept_wontfix" {
 		return true
 	}
 	return latestValidatedAuditDecision(thread, looperLogin) == "accept_wontfix"

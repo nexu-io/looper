@@ -2926,7 +2926,7 @@ func TestAcceptAuditHeadChangeIsReadmittedForReadjudication(t *testing.T) {
 	if ThreadHasChangedDispositionSignalForLogin(threads[0], "alice", "looper-bot") {
 		t.Fatal("H1 accept must keep the human directive audited")
 	}
-	if _, ok := resumeDispositionDecisionFromRemoteAudit(threads[0], "def456", "looper-bot"); ok {
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(threads[0], "def456", "looper-bot", "", nil); ok {
 		t.Fatal("H1 accept must not resume on H2")
 	}
 	if !hasUnresolvedAcceptWontfixAudit(threads[0], "def456", "looper-bot") {
@@ -3857,7 +3857,7 @@ func TestBudgetHeldDispositionNeedsHumanRefreshErrorDoesNotUpsertStale(t *testin
 	if !loops.IsReviewFixBudgetHold(parked) {
 		t.Fatalf("fixture must be budget hold: %#v", parked)
 	}
-	querier := &failNthBudgetHeldLoopGet{db: fixture.coordinator.DB(), nth: 3}
+	querier := &failNthBudgetHeldLoopGet{db: fixture.coordinator.DB(), nth: 4}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: storage.NewRepositories(querier),
 		GitHub: &fakeGitHubGateway{currentLogin: "looper-bot"},
@@ -3921,7 +3921,7 @@ func TestBudgetHeldDispositionNeedsHumanContinueDoesNotRestoreHold(t *testing.T)
 	if !loops.IsReviewFixBudgetHold(parked) {
 		t.Fatalf("fixture must be budget hold: %#v", parked)
 	}
-	parkDispositionScopePersistHook = func(held storage.LoopRecord) error {
+	continueHeld := func(held storage.LoopRecord) error {
 		result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
 		if contErr != nil {
 			return contErr
@@ -3931,7 +3931,12 @@ func TestBudgetHeldDispositionNeedsHumanContinueDoesNotRestoreHold(t *testing.T)
 		}
 		return nil
 	}
-	t.Cleanup(func() { parkDispositionScopePersistHook = nil })
+	parkDispositionScopePersistHook = continueHeld
+	reviewScopeHumanPersistBeforeUpsertHook = continueHeld
+	t.Cleanup(func() {
+		parkDispositionScopePersistHook = nil
+		reviewScopeHumanPersistBeforeUpsertHook = nil
+	})
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "looper-bot"},
 		Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(),

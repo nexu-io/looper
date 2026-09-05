@@ -687,9 +687,23 @@ Unlimited reviewer ⇄ fixer ping-pong is a cost and quality problem: each side 
 | `true` | `awaiting_human` with Continue/Stop | budget-paused | answer the ask |
 | `false` (default) | `paused`, reason `review_fix_budget_exhausted`, no ask | paired budget-paused | `looper unpause <seq>` or `looper stop <seq>` |
 
-Continue / no-HITL `unpause` refills only meters currently at/over their live cap and releases the pair. Stop / no-HITL `looper stop` terminates both roles. Product terminals (ready label, identical output, closed PR) still win and do not open a budget ask. Budget exhaustion never approves, resolves, or merges. Event: `loop.review_fix_budget.exhausted` (`level: action_required`).
+Continue / no-HITL `unpause` refills only meters currently at/over their live cap and releases the pair. Stop / no-HITL `looper stop` terminates both roles. Product terminals (ready label, identical output, closed PR) still win and do not open a budget ask. Budget exhaustion never approves, resolves, or merges. Event: `loop.review_fix_budget.exhausted` (`level: action_required`). A `needs_human` scope dispute with HITL off pauses the pair with reason `review_scope_human_required` and the same `unpause`/`stop` pair; `unpause` resumes against current evidence without refilling a meter unless one is also exhausted.
 
 **Failure prevented:** expanding-scope review/fix that never converges, including on default HITL-off installs. **Cost:** paired pause/unpause/stop plus an action-required event. **Why not reuse the old knobs:** those were reviewer-only infra counters that stranded long PRs and were explicitly demoted in #209.
+
+### Same-head disposition (always on for GitHub)
+
+Continuous GitHub Reviewer loops react to trusted `wontfix` / Fixer decline changes even when the PR head is unchanged. This path does **not** enable `roles.reviewer.behavior.threadResolution`; that setting still gates objective stale-thread reconciliation only and remains `enabled=false` by default.
+
+- Canonical command inside a Looper-authored thread: `/looper wontfix <reason>`. Compatibility aliases: a trusted human comment whose entire non-quoted body is `wontfix`, `won't fix`, or `won’t fix` (optionally `: <reason>`).
+- `/looper reconsider <reason>` cancels the latest accepted disposition on an unresolved/reopened thread.
+- Authority is the PR author or `OWNER` / `MEMBER` / `COLLABORATOR`. Arbitrary users and bots are not disposition authorities.
+- A Fixer `declined` reply is a dispute signal, not dismissal: Fixer replies with evidence and leaves the thread open; Reviewer adjudicates `accept_wontfix` (reply + resolve), `reject_wontfix` (reply, leave open), or `needs_human` (pair hold, no remote adjudication reply).
+- Unmarked third-party comments (human or Codex) stay Fixer-eligible. A validated Fixer decline on those threads still goes to Reviewer; trusted `/looper` directives stay Looper-authored-only.
+- GitHub webhooks accelerate the same path: `pull_request_review_comment` create/edit/delete and `pull_request_review_thread` `resolved` route both Reviewer and Fixer. Polling remains the correctness fallback. Forgejo is exempt from same-head disposition; its role budgets still apply.
+- A budget-held pair may run disposition-only reconciliation. That cannot publish a review, push code, refill a meter, or release the hold.
+
+Operator commands and HITL vs HITL-off resume are also in the [users guide](users-guide.md#same-head-wontfix-github-continuous-reviewer).
 
 ### Quiet-period debounce (shared + per-role)
 

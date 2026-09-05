@@ -67,6 +67,98 @@ func TestThreadWithheldFromFixerValidatedDecline(t *testing.T) {
 	}
 }
 
+func TestThreadWithheldFromFixerThirdPartyUnauditedDecline(t *testing.T) {
+	t.Parallel()
+	decline := ReviewThreadComment{
+		ID: "c2", Author: testLooperLogin,
+		Body: "out of scope <!-- looper-fixer-reply-declined thread:t1 fingerprint:x -->",
+	}
+
+	codexRoot := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "chatgpt-codex-connector[bot]", Body: "Please fix this race"},
+			decline,
+		},
+	}
+	if !ThreadWithheldFromFixer(codexRoot, "alice", testLooperLogin) {
+		t.Fatal("unresolved Codex root with validated Fixer decline must withhold")
+	}
+
+	humanRoot := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "alice", AuthorAssociation: "OWNER", Body: "Please fix this race"},
+			decline,
+		},
+	}
+	if !ThreadWithheldFromFixer(humanRoot, "alice", testLooperLogin) {
+		t.Fatal("unresolved human root with validated Fixer decline must withhold")
+	}
+
+	codexNoDecline := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "chatgpt-codex-connector[bot]", Body: "Please fix this race"},
+		},
+	}
+	if ThreadWithheldFromFixer(codexNoDecline, "alice", testLooperLogin) {
+		t.Fatal("unresolved Codex root without decline must not withhold")
+	}
+
+	humanNoDecline := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "alice", AuthorAssociation: "OWNER", Body: "Please fix this race"},
+		},
+	}
+	if ThreadWithheldFromFixer(humanNoDecline, "alice", testLooperLogin) {
+		t.Fatal("unresolved human root without decline must not withhold")
+	}
+
+	// Trusted human /looper wontfix stays Looper-authored-only.
+	thirdPartyWontfix := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "chatgpt-codex-connector[bot]", Body: "Please fix this race"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix out of scope"},
+		},
+	}
+	if ThreadWithheldFromFixer(thirdPartyWontfix, "alice", testLooperLogin) {
+		t.Fatal("trusted wontfix on third-party root must not withhold")
+	}
+	looperWontfix := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: testLooperLogin, Body: "Please fix <!-- looper:stamp v=1 -->"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix out of scope"},
+		},
+	}
+	if !ThreadWithheldFromFixer(looperWontfix, "alice", testLooperLogin) {
+		t.Fatal("trusted wontfix on Looper-authored thread must still withhold")
+	}
+
+	// Reviewer reject restores the existing third-party thread; Fixer may act.
+	rejected := humanRoot
+	rejected.Comments = append(append([]ReviewThreadComment{}, humanRoot.Comments...), ReviewThreadComment{
+		ID: "c3", Author: testLooperLogin,
+		Body: "<!-- looper:thread-resolution thread=t1 head=h feedback=f decision=reject_wontfix -->",
+	})
+	if ThreadWithheldFromFixer(rejected, "alice", testLooperLogin) {
+		t.Fatal("reject_wontfix after third-party decline must restore Fixer eligibility")
+	}
+
+	items := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}, {Type: "check", Name: "ci"}}
+	got := SuppressWithheldDispositionFixItems(items, []ReviewThread{codexRoot}, "alice", testLooperLogin)
+	if len(got) != 1 || got[0].Type != "check" {
+		t.Fatalf("got %#v, want only non-comment item after third-party decline withhold", got)
+	}
+	got = SuppressWithheldDispositionFixItems(items, []ReviewThread{codexNoDecline}, "alice", testLooperLogin)
+	if len(got) != 2 {
+		t.Fatalf("got %#v, want comment still admitted without decline", got)
+	}
+}
+
 func TestThreadWithheldFromFixerIgnoresUntrusted(t *testing.T) {
 	t.Parallel()
 	thread := ReviewThread{

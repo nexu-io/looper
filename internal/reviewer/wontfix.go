@@ -188,13 +188,15 @@ func HasUnauditedTrustedDispositionForLogin(thread ReviewThread, prAuthorLogin, 
 }
 
 // HasUnauditedValidatedFixerDecline reports a validated Fixer decline reply that
-// has not been followed by a Reviewer audit on the same thread.
+// has not been followed by a Reviewer audit on the same thread. Spec §5/§7.4:
+// Reviewer adjudicates validated Fixer declines on any unresolved thread, not
+// only Looper-authored roots. Trusted human directives stay Looper-authored-only.
 func HasUnauditedValidatedFixerDecline(thread ReviewThread) bool {
 	return HasUnauditedValidatedFixerDeclineForLogin(thread, "")
 }
 
 func HasUnauditedValidatedFixerDeclineForLogin(thread ReviewThread, looperLogin string) bool {
-	if thread.IsResolved || !isLooperAuthoredThreadForLogin(thread, looperLogin) {
+	if thread.IsResolved {
 		return false
 	}
 	lastAuditIdx := -1
@@ -210,14 +212,15 @@ func HasUnauditedValidatedFixerDeclineForLogin(thread ReviewThread, looperLogin 
 	return lastDeclineIdx >= 0 && lastDeclineIdx > lastAuditIdx
 }
 
-// ThreadHasChangedDispositionSignal is true when a Looper-authored unresolved
-// thread carries an unaudited trusted human disposition or validated Fixer decline.
+// ThreadHasChangedDispositionSignal is true when an unresolved thread carries
+// an unaudited trusted human disposition (Looper-authored roots only) or a
+// validated Fixer decline (any unresolved thread).
 func ThreadHasChangedDispositionSignal(thread ReviewThread, prAuthorLogin string) bool {
 	return ThreadHasChangedDispositionSignalForLogin(thread, prAuthorLogin, "")
 }
 
 func ThreadHasChangedDispositionSignalForLogin(thread ReviewThread, prAuthorLogin, looperLogin string) bool {
-	if thread.IsResolved || !isLooperAuthoredThreadForLogin(thread, looperLogin) {
+	if thread.IsResolved {
 		return false
 	}
 	return HasUnauditedTrustedDispositionForLogin(thread, prAuthorLogin, looperLogin) || HasUnauditedValidatedFixerDeclineForLogin(thread, looperLogin)

@@ -1076,6 +1076,52 @@ func TestRefreshHandoffDoesNotResurrectReleasedHold(t *testing.T) {
 	}
 }
 
+func TestRefreshHandoffDoesNotResurrectHoldReleasedAfterGetByID(t *testing.T) {
+	repos, nowISO := newBudgetFixture(t)
+	reviewerMeta := `{"lastPublishedHeadSha":"abc123def","lastReviewedSignalFingerprint":"sig-old","loop":{"iterationCount":3}}`
+	reviewer := seedBudgetLoop(t, repos, nowISO, "loop_refresh_after_get_rev", "reviewer", "running")
+	reviewer.MetadataJSON = &reviewerMeta
+	if err := repos.Loops.Upsert(context.Background(), reviewer); err != nil {
+		t.Fatalf("upsert reviewer: %v", err)
+	}
+	fixer := seedBudgetLoop(t, repos, nowISO, "loop_refresh_after_get_fix", "fixer", "queued")
+	parked, err := ParkReviewFixBudget(context.Background(), repos, ParkReviewFixBudgetInput{
+		Exhausted: reviewer, Role: "reviewer", Repo: "acme/looper", PRNumber: 42, Count: 3, Cap: 3,
+		NowISO: nowISO, HITLEnabled: false, LiveCaps: testBudgetCaps(3, 3),
+	})
+	if err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	reviewFixBudgetHandoffAfterRefreshHook = func(exhausted storage.LoopRecord) error {
+		result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, exhausted, "Continue", nowISO, testBudgetCaps(3, 3))
+		if err != nil {
+			return err
+		}
+		if !result.Applied {
+			return fmt.Errorf("continue not applied")
+		}
+		return nil
+	}
+	t.Cleanup(func() { reviewFixBudgetHandoffAfterRefreshHook = nil })
+	if err := RefreshReviewFixPairHandoff(context.Background(), repos, parked, "sig-new", nowISO); err != nil {
+		t.Fatalf("RefreshReviewFixPairHandoff: %v", err)
+	}
+	after, err := repos.Loops.GetByID(context.Background(), parked.ID)
+	if err != nil || after == nil {
+		t.Fatalf("get reviewer: (%#v, %v)", after, err)
+	}
+	if IsReviewFixBudgetHold(*after) {
+		t.Fatalf("Continue must remain released, got hold status=%s meta=%s", after.Status, derefLoopString(after.MetadataJSON))
+	}
+	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
+	if err != nil || sibling == nil {
+		t.Fatalf("get fixer: (%#v, %v)", sibling, err)
+	}
+	if IsReviewFixBudgetHold(*sibling) {
+		t.Fatalf("sibling Continue must remain released, got hold status=%s meta=%s", sibling.Status, derefLoopString(sibling.MetadataJSON))
+	}
+}
+
 func TestHandoffEventIncludesBothRoleMetersAndRetriesOnReentry(t *testing.T) {
 	t.Parallel()
 	repos, nowISO := newBudgetFixture(t)

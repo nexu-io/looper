@@ -496,8 +496,13 @@ var reviewFixBudgetSiblingParkHook func(sibling storage.LoopRecord) error
 var reviewFixBudgetReleaseHook func(loopID string) error
 
 // reviewFixBudgetHandoffPersistHook, when set (tests only), runs after the
-// handoff event is appended and before the loop upsert so Continue can interleave.
+// handoff event is appended and before the loop GetByID so Continue can interleave.
 var reviewFixBudgetHandoffPersistHook func(exhausted storage.LoopRecord) error
+
+// reviewFixBudgetHandoffAfterRefreshHook, when set (tests only), runs after a
+// hold-positive GetByID and before the live re-read/Upsert so Continue can
+// interleave in the remaining GetByID-then-Upsert window.
+var reviewFixBudgetHandoffAfterRefreshHook func(exhausted storage.LoopRecord) error
 
 func parkOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, sibling storage.LoopRecord, exhaustedBy, nowISO string) error {
 	if reviewFixBudgetSiblingParkHook != nil {
@@ -578,7 +583,21 @@ func ensureReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repos
 			// Continue/Stop won the race; do not resurrect the captured hold.
 			return nil
 		}
-		exhausted = *fresh
+		if reviewFixBudgetHandoffAfterRefreshHook != nil {
+			if err := reviewFixBudgetHandoffAfterRefreshHook(*fresh); err != nil {
+				return err
+			}
+		}
+		// Authority is the live row immediately before Upsert, not the
+		// hold-positive snapshot above. Continue/Stop may have released it.
+		latest, err := repos.Loops.GetByID(ctx, exhausted.ID)
+		if err != nil {
+			return err
+		}
+		if latest == nil || !IsReviewFixBudgetHold(*latest) {
+			return nil
+		}
+		exhausted = *latest
 	}
 	state = ReadReviewFixBudgetState(exhausted.MetadataJSON)
 	state.HandoffEventAt = input.NowISO

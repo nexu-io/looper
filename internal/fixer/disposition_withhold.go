@@ -24,30 +24,33 @@ var (
 	fixerDeclinedMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)(?:\s+[^>]*)?-->`)
 )
 
-// ThreadWithheldFromFixer reports whether an unresolved Looper-authored thread
-// must not receive further Fixer edits. Authority is Reviewer audit decisions
-// and trusted human / validated Fixer disposition signals — not "any audit
+// ThreadWithheldFromFixer reports whether an unresolved thread must not
+// receive further Fixer edits. Authority is Reviewer audit decisions and
+// trusted human / validated Fixer disposition signals — not "any audit
 // comment exists".
 //
 // Rules:
-//   - Unaudited trusted human wontfix/reconsider → withheld
-//   - Unaudited validated Fixer decline → withheld
+//   - Unaudited validated Fixer decline → withheld even on third-party
+//     (Human/Codex) roots; Reviewer adjudicates, Fixer must not re-decline
+//   - Unaudited trusted human wontfix/reconsider → withheld only on
+//     Looper-authored threads
 //   - Latest Reviewer decision accept_wontfix (or objectively_fixed) while still
-//     unresolved → withheld until the thread is actually resolved
+//     unresolved → withheld until the thread is actually resolved,
+//     Looper-authored only
 //   - Latest Reviewer decision reject_wontfix (or not_fixed) → actionable again
 //     on the existing thread (no new thread)
 func ThreadWithheldFromFixer(thread ReviewThread, prAuthorLogin, looperLogin string) bool {
 	if thread.IsResolved || len(thread.Comments) == 0 {
 		return false
 	}
+	lastDecision, lastDecisionIdx, hasDecision := lastReviewerAuditDecision(thread, looperLogin)
+	if hasUnauditedValidatedFixerDeclineAfter(thread, looperLogin, lastDecisionIdx) {
+		return true
+	}
 	if !isLooperAuthoredFixerThread(thread, looperLogin) {
 		return false
 	}
-	lastDecision, lastDecisionIdx, hasDecision := lastReviewerAuditDecision(thread, looperLogin)
 	if hasUnauditedTrustedDispositionAfter(thread, prAuthorLogin, lastDecisionIdx) {
-		return true
-	}
-	if hasUnauditedValidatedFixerDeclineAfter(thread, looperLogin, lastDecisionIdx) {
 		return true
 	}
 	if !hasDecision {

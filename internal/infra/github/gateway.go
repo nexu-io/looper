@@ -3040,6 +3040,10 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 	if err != nil {
 		return nil, err
 	}
+	looperLogin := ""
+	if login, err := g.GetCurrentUserLogin(ctx, cwd); err == nil {
+		looperLogin = strings.TrimSpace(login)
+	}
 	out := make([]map[string]any, 0, 100)
 	cursor := ""
 	for {
@@ -3048,7 +3052,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 			return nil, err
 		}
 		for _, node := range nodes {
-			normalized, ok := normalizeReviewThread(node)
+			normalized, ok := normalizeReviewThread(node, looperLogin)
 			if ok {
 				threadRow, _ := node.(map[string]any)
 				commentsRow, _ := threadRow["comments"].(map[string]any)
@@ -3066,7 +3070,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 					commentCursor = nextCommentCursor
 					hasMoreComments = hasMore
 				}
-				if fingerprint := reviewThreadFingerprintFromNodes(asString(normalized["threadId"]), allCommentNodes); fingerprint != "" {
+				if fingerprint := reviewThreadFingerprintFromNodes(asString(normalized["threadId"]), allCommentNodes, looperLogin); fingerprint != "" {
 					normalized["threadFingerprint"] = fingerprint
 				}
 				out = append(out, normalized)
@@ -3467,7 +3471,7 @@ func countUnresolvedThreads(comments []map[string]any) int {
 	return count
 }
 
-func normalizeReviewThread(value any) (map[string]any, bool) {
+func normalizeReviewThread(value any, looperLogin string) (map[string]any, bool) {
 	row, ok := value.(map[string]any)
 	if !ok {
 		return nil, false
@@ -3512,13 +3516,13 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	} else if line := asInt64(row["line"]); line > 0 {
 		out["line"] = line
 	}
-	if fingerprint := reviewThreadFingerprintFromNodes(threadID, nodes); fingerprint != "" {
+	if fingerprint := reviewThreadFingerprintFromNodes(threadID, nodes, looperLogin); fingerprint != "" {
 		out["threadFingerprint"] = fingerprint
 	}
 	return out, true
 }
 
-func reviewThreadFingerprintFromNodes(threadID string, nodes []any) string {
+func reviewThreadFingerprintFromNodes(threadID string, nodes []any, looperLogin string) string {
 	parts := make([]string, 0, len(nodes))
 	threadID = strings.TrimSpace(threadID)
 	for _, node := range nodes {
@@ -3530,7 +3534,7 @@ func reviewThreadFingerprintFromNodes(threadID string, nodes []any) string {
 		if strings.Contains(body, "<!-- looper-fixer-reply ") {
 			continue
 		}
-		if isAuthenticatedFixerDeclinedReply(threadID, comment) {
+		if isAuthenticatedFixerDeclinedReply(threadID, comment, looperLogin) {
 			continue
 		}
 		id := strings.TrimSpace(asString(comment["id"]))
@@ -3546,15 +3550,18 @@ func reviewThreadFingerprintFromNodes(threadID string, nodes []any) string {
 	return strings.Join(parts, "|")
 }
 
-func isAuthenticatedFixerDeclinedReply(threadID string, comment map[string]any) bool {
+func isAuthenticatedFixerDeclinedReply(threadID string, comment map[string]any, looperLogin string) bool {
 	if threadID == "" || comment == nil {
 		return false
 	}
-	// Authenticate the coordination marker, not a substring. Gateway fingerprinting
-	// has no current-login authority and must not invent looper* identity; a
-	// well-formed marker whose thread: field matches the containing thread is
-	// the exclusion authority. Quotes of the needle or a foreign thread stay in
-	// the fingerprint so hashFixItemsState can see untrusted feedback.
+	looperLogin = strings.TrimSpace(looperLogin)
+	if looperLogin == "" {
+		return false
+	}
+	author := strings.TrimSpace(extractAuthor(comment["author"]))
+	if author == "" || !strings.EqualFold(author, looperLogin) {
+		return false
+	}
 	gotThread, fingerprint, ok := parseFixerDeclinedReplyMarker(asString(comment["body"]))
 	return ok && fingerprint != "" && gotThread == threadID
 }

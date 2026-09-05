@@ -11518,7 +11518,6 @@ func TestProcessClaimedItemAtCapRecoversPendingScopeWithoutAgent(t *testing.T) {
 }
 
 func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing.T) {
-	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
 	prNumber := int64(42)
@@ -11557,10 +11556,17 @@ func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing
 		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
 		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
 	})
-	continued, err := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, parked, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 1, FixerMaxPushes: 8})
-	if err != nil || !continued.Applied {
-		t.Fatalf("ApplyReviewFixBudgetAnswer = (%#v, %v)", continued, err)
+	reviewScopeHumanPersistBeforeUpsertHook = func(held storage.LoopRecord) error {
+		result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 1, FixerMaxPushes: 8})
+		if contErr != nil {
+			return contErr
+		}
+		if !result.Applied {
+			return fmt.Errorf("continue not applied")
+		}
+		return nil
 	}
+	t.Cleanup(func() { reviewScopeHumanPersistBeforeUpsertHook = nil })
 	completion := reviewerCommentOnlyCompletion{
 		Summary: "Mixed must_fix and needs_human",
 		Outcome: "blocking",

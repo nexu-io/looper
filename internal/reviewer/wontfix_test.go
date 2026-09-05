@@ -313,3 +313,43 @@ func TestParseFixerFixedMarkerRequiresThreadAndCommit(t *testing.T) {
 		t.Fatal("foreign-thread fixed marker must not validate for containing thread")
 	}
 }
+
+func TestHasUnauditedValidatedFixerDeclineAdmitsNonLooperRoot(t *testing.T) {
+	t.Parallel()
+	codex := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "codex", Body: "Please fix this race"},
+			{ID: "c2", Author: "looper-bot", Body: "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:abc -->"},
+		},
+	}
+	if !HasUnauditedValidatedFixerDeclineForLogin(codex, "looper-bot") {
+		t.Fatal("validated Fixer decline on a Codex thread must be unaudited input")
+	}
+	if !ThreadHasChangedDispositionSignalForLogin(codex, "alice", "looper-bot") {
+		t.Fatal("Codex-root decline must be a changed disposition signal")
+	}
+	humanRoot := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "alice", AuthorAssociation: "OWNER", Body: "Please fix this race"},
+			{ID: "c2", Author: "looper-bot", Body: "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:abc -->"},
+		},
+	}
+	if !HasUnauditedValidatedFixerDeclineForLogin(humanRoot, "looper-bot") {
+		t.Fatal("validated Fixer decline on a human thread must be unaudited input")
+	}
+	if !ThreadHasChangedDispositionSignalForLogin(humanRoot, "alice", "looper-bot") {
+		t.Fatal("human-root decline must be a changed disposition signal")
+	}
+	wontfixOnly := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "alice", AuthorAssociation: "OWNER", Body: "Please fix this race"},
+			{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix out of scope"},
+		},
+	}
+	if ThreadHasChangedDispositionSignalForLogin(wontfixOnly, "alice", "looper-bot") {
+		t.Fatal("trusted /looper wontfix must still require a Looper-authored root")
+	}
+}
