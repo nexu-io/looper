@@ -106,7 +106,7 @@ If no project matches the current directory, or multiple projects match, pass `-
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | `looper plan --project <id> --issue <num>` |
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | `looper review <repo>#<pr> [--loop]` or `looper review <pr> [--loop]` from inside the repo |
-| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
+| `fixer` | Fixes PR issues based on review comments; declines leave threads open for Reviewer | `looper fix <repo>#<pr>` |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | `looper work --issue <num>` or `looper work --project <id> --issue <num>` |
 
 Forgejo MVP role support:
@@ -271,6 +271,35 @@ looper review owner/repo#42 --loop
 
 Use this when new commits are expected to keep landing on the PR.
 
+### Same-head `wontfix` (GitHub, continuous Reviewer)
+
+A continuous GitHub Reviewer loop (`looper review … --loop` or auto-discovery) reacts to trusted dispositions on an unchanged PR head. Reply **in a Looper-authored review thread**:
+
+```text
+/looper wontfix <reason>
+```
+
+Compatibility aliases: a trusted comment whose entire non-quoted body is `wontfix`, `won't fix`, or `won’t fix` (Unicode apostrophe), optionally followed by `: <reason>`. Incidental prose that merely contains those words is not a command.
+
+`/looper reconsider <reason>` cancels the latest accepted disposition on an unresolved or reopened thread.
+
+Authority is the PR author or a GitHub identity whose association is `OWNER`, `MEMBER`, or `COLLABORATOR`. Arbitrary users and bots are not disposition authorities.
+
+Reviewer then:
+
+- **accepts** (`accept_wontfix`): replies with scope evidence and resolves the thread
+- **rejects** (`reject_wontfix`): replies with concrete authority and leaves the thread open for Fixer
+- **needs human**: holds the Reviewer/Fixer pair; no remote adjudication reply
+
+This path does **not** enable `roles.reviewer.behavior.threadResolution.enabled`. That setting still gates objective stale-thread reconciliation only and stays `false` by default. Forgejo is exempt from same-head disposition; Reviewer and Fixer budgets still apply there.
+
+When either role budget trips, or Reviewer returns `needs_human`:
+
+- HITL on: Continue/Stop ask on the pair
+- HITL off (default): paused with no ask. Resume with `looper unpause <seq>` (Continue: refill only exhausted meters) or `looper stop <seq>` (terminate both). Either seq in the held pair works.
+
+Budget exhaustion is not approval. It never publishes a clean review, resolves a blocker, or enables auto-merge. Inspect a hold with `looper describe <seq>`.
+
 ### Reviewer auto-discovery rules
 
 Reviewer mainly watches two kinds of PRs:
@@ -344,6 +373,9 @@ Fixer will:
 - run validation
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
+- if a finding is out of documented PR scope, reply with a structured decline and **leave the thread unresolved** so Reviewer can accept, reject, or escalate (`needs_human`)
+
+Third-party review comments (a human or Codex, not Looper) stay Fixer-eligible. If Fixer declines one of those, it still replies with evidence and leaves the thread open; Reviewer adjudicates the decline. Trusted `/looper` directives apply only on Looper-authored threads.
 
 For Forgejo projects, automatic Fixer runs are summary-only because Forgejo's public REST API does not currently expose a native review-comment resolve mutation:
 
@@ -497,6 +529,7 @@ looper ps
 looper describe 12
 looper logs 12 --follow
 looper jump 12
+looper unpause 12
 looper stop 12
 looper run reconcile-stale
 ```
@@ -508,7 +541,8 @@ Typical usage:
 - `looper logs <id> --follow`: stream logs live
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
 - `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
-- `looper stop <id>`: stop an active loop
+- `looper unpause <id>`: on a review-fix budget or `needs_human` hold, Continue the pair (refill exhausted meters only); otherwise resume that one paused loop
+- `looper stop <id>`: stop an active loop; on a review-fix hold, terminate both roles in the lane
 - `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
 
 ## 15. Minimal end-to-end example

@@ -1977,7 +1977,6 @@ func TestAdvanceSiblingGitHubHITLAskDoesNotRestoreReleasedOverlay(t *testing.T) 
 		})
 	}
 }
-
 func seedPollBudgetQueue(t *testing.T, repos *storage.Repositories, nowISO, projectID, id, loopID, queueType string, priority int64) {
 	t.Helper()
 	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{

@@ -2529,6 +2529,72 @@ func TestRecordPublishedReviewProgressCountsBeforeClaimComplete(t *testing.T) {
 	}
 }
 
+func TestRecordPublishedReviewProgressCountsSameHeadConvergence(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	cfg := testReviewerLoopConfig()
+	cfg.MaxPublishesPerPR = 3
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"iterationCount":2}}`
+	loop := storage.LoopRecord{ID: "loop_conv_count", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	fixer := storage.LoopRecord{ID: "loop_conv_count_fix", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: stringPtr(`{"followUpdates":true}`), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
+	}
+	pending := pendingReviewCheckpoint{
+		HeadSHA:        "abc123",
+		IdempotencyKey: agentNativeConvergenceReviewID(loop.ID, "abc123", "sig-1"),
+		Summary:        "same-head convergence",
+	}
+	input := stepInput{
+		Project:  storage.ProjectRecord{ID: "project_1"},
+		Loop:     loop,
+		Run:      storage.RunRecord{ID: "run_conv_count"},
+		Repo:     repo,
+		PRNumber: prNumber,
+	}
+	if err := runner.recordPublishedReviewProgress(context.Background(), input, pending, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress() error = %v", err)
+	}
+	afterPublish, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || afterPublish == nil {
+		t.Fatalf("Loops.GetByID() after publish = (%#v, %v)", afterPublish, err)
+	}
+	if loops.ReviewerPublishCount(afterPublish.MetadataJSON) != 3 {
+		t.Fatalf("iterationCount after same-head convergence = %d, want 3", loops.ReviewerPublishCount(afterPublish.MetadataJSON))
+	}
+	if got, _ := stringFromAny(parseJSONObject(afterPublish.MetadataJSON)[metadataLastPublishedReviewIDKey]); got != pending.IdempotencyKey {
+		t.Fatalf("lastPublishedReviewId = %q, want %q", got, pending.IdempotencyKey)
+	}
+	if !loops.IsReviewFixBudgetHold(*afterPublish) {
+		t.Fatalf("same-head convergence at cap must park: status=%s meta=%s", afterPublish.Status, derefString(afterPublish.MetadataJSON))
+	}
+	input.Loop = *afterPublish
+	if err := runner.recordPublishedReviewProgress(context.Background(), input, pending, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress(retry) error = %v", err)
+	}
+	retried, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || retried == nil || loops.ReviewerPublishCount(retried.MetadataJSON) != 3 {
+		t.Fatalf("iterationCount after same-identity retry = (%#v, %v), want 3", retried, err)
+	}
+	next := pending
+	next.IdempotencyKey = agentNativeConvergenceReviewID(loop.ID, "abc123", "sig-2")
+	input.Loop = *retried
+	if err := runner.recordPublishedReviewProgress(context.Background(), input, next, ReviewEventComment); err != nil {
+		t.Fatalf("recordPublishedReviewProgress(new signal) error = %v", err)
+	}
+	second, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || second == nil || loops.ReviewerPublishCount(second.MetadataJSON) != 4 {
+		t.Fatalf("iterationCount after new convergence identity = (%#v, %v), want 4", second, err)
+	}
+}
+
 func TestRecordLoopSuccessMetadataRemovesDeprecatedBudgetMetadata(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{LoopConfig: testReviewerLoopConfig()})
@@ -8471,6 +8537,110 @@ func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPromptLaterPassUsesRepairFrontier(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "new-head"}}, "run_1", "reviewer:loop:new-head", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "old-head")
+	for _, want := range []string{
+		"Repair frontier contract (later pass)",
+		"Last reviewed head SHA: old-head",
+		"Current head SHA for this pass: new-head",
+		"every unresolved prior must_fix thread",
+		"diff from last reviewed head old-head to current head new-head",
+		"Do not rescan untouched original diff",
+		"late_discovery:",
+		"Ordinary P2/P3 robustness",
+		"disposition follow_up",
+		"disposition needs_human",
+		"Review pass contract (later pass / repair frontier)",
+		"Fixer decline adjudication",
+		"scope dispute, not dismissal authority",
+		"Do not open a duplicate thread",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("later-pass prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, forbidden := range []string{
+		"complete one full review pass before publishing",
+		"scan every changed file/range in scope",
+		"rather than deferring it to a later pass",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("later-pass prompt retains first-pass-only language %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
+func TestBuildReviewPromptFirstPassKeepsExhaustiveContract(t *testing.T) {
+	t.Parallel()
+
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
+	for _, want := range []string{
+		"Review pass contract: complete one full review pass before publishing",
+		"scan every changed file/range in scope",
+		"rather than deferring it to a later pass",
+		"Fixer decline adjudication",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("first-pass prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, forbidden := range []string{
+		"Repair frontier contract (later pass)",
+		"Do not rescan untouched original diff",
+		"late_discovery:",
+		"Review pass contract (later pass / repair frontier)",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("first-pass prompt contains later-pass-only language %q:\n%s", forbidden, prompt)
+		}
+	}
+}
+
+func TestNativeResumeReReviewPromptUsesRepairFrontierWhenLaterPass(t *testing.T) {
+	t.Parallel()
+
+	later := nativeResumeReReviewPrompt("acme/looper", 42, "sess-old", "interrupted", "new-head", "reviewer:loop:new-head", "published-old")
+	for _, want := range []string{
+		"repair-frontier re-review",
+		"not a full discard-and-rescan",
+		"last published/reviewed head SHA: published-old",
+		"diff from last published head published-old to current head new-head",
+		"every unresolved prior must_fix thread",
+		// Self-contained later-pass contracts (resume replaces the normal prompt).
+		"Repair frontier contract (later pass)",
+		"late_discovery:",
+		"disposition must_fix",
+		"Ordinary P2/P3 robustness",
+		"disposition follow_up",
+		"disposition needs_human",
+		"Fixer decline adjudication",
+		"Do not open a duplicate thread",
+		"Adjudicate on the existing thread only",
+	} {
+		if !strings.Contains(later, want) {
+			t.Fatalf("later-pass native resume prompt missing %q:\n%s", want, later)
+		}
+	}
+	first := nativeResumeReReviewPrompt("acme/looper", 42, "sess-old", "interrupted", "new-head", "reviewer:loop:new-head", "")
+	if strings.Contains(first, "repair-frontier re-review") {
+		t.Fatalf("first-pass native resume prompt unexpectedly uses frontier language:\n%s", first)
+	}
+	if !strings.Contains(first, "Discard findings, assumptions, anchors") {
+		t.Fatalf("first-pass native resume prompt missing full re-review language:\n%s", first)
+	}
+	for _, forbidden := range []string{
+		"Repair frontier contract (later pass)",
+		"late_discovery:",
+		"Fixer decline adjudication",
+	} {
+		if strings.Contains(first, forbidden) {
+			t.Fatalf("first-pass native resume prompt contains later-pass-only language %q:\n%s", forbidden, first)
+		}
+	}
+}
+
 func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	t.Parallel()
 
@@ -8606,7 +8776,7 @@ func TestBuildReviewPromptForgejoNativeKeepsMustFixInline(t *testing.T) {
 	}
 	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
 	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper"}}
-	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("project_1", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
 	if !strings.Contains(prompt, "every must_fix must remain an inline comment") {
 		t.Fatalf("forgejo prompt missing inline-only must_fix contract:\n%s", prompt)
 	}
@@ -8805,7 +8975,7 @@ func TestBuildReviewPromptFullPRScopeUsesAgentSideFetchContract(t *testing.T) {
 func TestBuildThreadResolutionPromptRequiresPreparedWorktreeReuse(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildThreadResolutionPrompt("acme/looper", 42, "abc123", nil)
+	prompt := buildThreadResolutionPrompt("acme/looper", 42, "abc123", nil, reviewerCheckpoint{})
 	for _, want := range []string{
 		"canonical local checkout",
 		"Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
@@ -9565,7 +9735,7 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
@@ -9578,7 +9748,7 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 func TestBuildReviewPromptBindsAutomaticReviewerRunID(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_auto", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_auto", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
 	if !strings.Contains(prompt, "--reviewer-run-id run_auto") {
 		t.Fatalf("automatic prompt missing --reviewer-run-id:\n%s", prompt)
 	}
@@ -9590,7 +9760,7 @@ func TestBuildReviewPromptBindsAutomaticReviewerRunID(t *testing.T) {
 func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false, "")
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail for follow-up bypass:\n%s", prompt)
@@ -9606,7 +9776,7 @@ func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 func TestBuildReviewPromptCommentOnlyOmitsGitHubPublishInstructions(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "")
 
 	for _, forbidden := range []string{"gh pr view", "gh pr diff", "gh api", "GitHub operation contract", "review request removed before publish", "trusted Looper CLI at", "review-thread resolution"} {
 		if strings.Contains(prompt, forbidden) {
@@ -9636,7 +9806,7 @@ func TestBuildReviewPromptCommentOnlyIncludesExistingReviewerSummaryAuthority(t 
 	if err != nil {
 		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
 	}
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true, "")
 
 	if !strings.Contains(prompt, "Existing Reviewer Summary authority") {
 		t.Fatalf("prompt missing reviewer summary authority:\n%s", prompt)
@@ -11348,7 +11518,6 @@ func TestProcessClaimedItemAtCapRecoversPendingScopeWithoutAgent(t *testing.T) {
 }
 
 func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing.T) {
-	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
 	prNumber := int64(42)
@@ -11387,10 +11556,17 @@ func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing
 		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
 		LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg,
 	})
-	continued, err := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, parked, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 1, FixerMaxPushes: 8})
-	if err != nil || !continued.Applied {
-		t.Fatalf("ApplyReviewFixBudgetAnswer = (%#v, %v)", continued, err)
+	reviewScopeHumanPersistBeforeUpsertHook = func(held storage.LoopRecord) error {
+		result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 1, FixerMaxPushes: 8})
+		if contErr != nil {
+			return contErr
+		}
+		if !result.Applied {
+			return fmt.Errorf("continue not applied")
+		}
+		return nil
 	}
+	t.Cleanup(func() { reviewScopeHumanPersistBeforeUpsertHook = nil })
 	completion := reviewerCommentOnlyCompletion{
 		Summary: "Mixed must_fix and needs_human",
 		Outcome: "blocking",
@@ -11409,6 +11585,9 @@ func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing
 	if loops.IsReviewFixBudgetHold(*fresh) {
 		t.Fatalf("stale persist restored budget hold after Continue: status=%s meta=%s", fresh.Status, derefString(fresh.MetadataJSON))
 	}
+	if loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("Continue meters must stay reset, got publish count %d meta=%s", loops.ReviewerPublishCount(fresh.MetadataJSON), derefString(fresh.MetadataJSON))
+	}
 	if !loops.IsReviewScopeHumanHold(*fresh) {
 		t.Fatalf("want scope hold after Continue-then-persist: status=%s meta=%s", fresh.Status, derefString(fresh.MetadataJSON))
 	}
@@ -11418,6 +11597,165 @@ func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing
 	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
 	if !ok || !loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewFixBudgetAsk(ask) {
 		t.Fatalf("ask = (%#v, %v), want scope ask without restored budget ask", ask, ok)
+	}
+
+}
+
+func TestPersistLastReviewedSignalDoesNotClobberBudgetContinue(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"iterationCount":3}}`
+	loop := storage.LoopRecord{
+		ID: "loop_signal_vs_continue", Seq: 112, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert loop: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_signal_vs_continue_fix", Seq: 113, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "queued", MetadataJSON: stringPtr(`{"followUpdates":true}`), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(parked) {
+		t.Fatalf("precondition: want budget hold, got status=%s meta=%s", parked.Status, derefString(parked.MetadataJSON))
+	}
+	continued := false
+	persistLastReviewedSignalBeforeCASHook = func(held storage.LoopRecord) error {
+		if continued {
+			return nil
+		}
+		continued = true
+		result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
+		if contErr != nil {
+			return contErr
+		}
+		if !result.Applied {
+			return fmt.Errorf("continue not applied")
+		}
+		return nil
+	}
+	t.Cleanup(func() { persistLastReviewedSignalBeforeCASHook = nil })
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{},
+		AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	if err := runner.persistLastReviewedSignalFingerprint(context.Background(), parked, "sig-after-continue", nil); err != nil {
+		t.Fatalf("persistLastReviewedSignalFingerprint: %v", err)
+	}
+	fresh, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("get loop: (%#v, %v)", fresh, err)
+	}
+	if loops.IsReviewFixBudgetHold(*fresh) {
+		t.Fatalf("fingerprint persist restored budget hold after Continue: status=%s meta=%s", fresh.Status, derefString(fresh.MetadataJSON))
+	}
+	if loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("Continue meters must stay reset, got publish count %d meta=%s", loops.ReviewerPublishCount(fresh.MetadataJSON), derefString(fresh.MetadataJSON))
+	}
+	gotSignal, _ := stringFromAny(parseJSONObject(fresh.MetadataJSON)[metadataLastReviewedSignalFingerprintKey])
+	if gotSignal != "sig-after-continue" {
+		t.Fatalf("lastReviewedSignalFingerprint = %q, want persisted on released row", gotSignal)
+	}
+}
+
+func TestBudgetHeldDispositionNeedsHumanCASMissWhileHeldRetriesOrErrors(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	revMeta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true,"iterationCount":3}}`
+	loop := storage.LoopRecord{
+		ID: "loop_nh_budget_cas_miss", Seq: 41, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &revMeta,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_nh_budget_cas_miss_fix", Seq: 42, ProjectID: "project_1", Type: "fixer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: stringPtr(`{"followUpdates":true}`),
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(parked) {
+		t.Fatalf("fixture must be budget hold: %#v", parked)
+	}
+	mutated := false
+	reviewScopeHumanPersistBeforeUpsertHook = func(held storage.LoopRecord) error {
+		if mutated {
+			return nil
+		}
+		mutated = true
+		live, getErr := fixture.repos.Loops.GetByID(context.Background(), held.ID)
+		if getErr != nil || live == nil {
+			return fmt.Errorf("get held loop: (%#v, %v)", live, getErr)
+		}
+		meta := parseJSONObject(live.MetadataJSON)
+		meta["casNoise"] = "competing-write"
+		encoded, marshalErr := json.Marshal(meta)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		text := string(encoded)
+		live.MetadataJSON = &text
+		live.UpdatedAt = nowISO
+		return fixture.repos.Loops.Upsert(context.Background(), *live)
+	}
+	t.Cleanup(func() { reviewScopeHumanPersistBeforeUpsertHook = nil })
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "looper-bot"},
+		Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = parked
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	parkErr := runner.parkDispositionNeedsHuman(context.Background(), input, "thread_1", "ambiguous", "sig-needs-human")
+	after, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || after == nil {
+		t.Fatalf("get reviewer: (%#v, %v)", after, getErr)
+	}
+	if !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("competing write must leave budget hold: status=%s meta=%s", after.Status, derefString(after.MetadataJSON))
+	}
+	if parkErr != nil {
+		return
+	}
+	if !loops.HasPendingReviewScopeHuman(*after) {
+		t.Fatalf("CAS miss while held must persist evidence or error, got nil with meta=%s", derefString(after.MetadataJSON))
 	}
 }
 
@@ -12851,6 +13189,8 @@ type fakeGitHubGateway struct {
 	updateIssueCommentErr           error
 	reviewThreads                   []ReviewThread
 	listReviewThreadsCalls          int
+	listReviewThreadsErr            error
+	listReviewThreadsErrAfter       int // fail on call N (1-based); 0 = always if err set
 	viewHeadSHA                     string
 	headSHACalls                    int
 	issueCommentCalls               []IssueCommentInput
@@ -12861,7 +13201,11 @@ type fakeGitHubGateway struct {
 	captureSnapshotErrs             []error
 	captureSnapshotCalls            int
 	addThreadReplyCalls             []AddReviewThreadReplyInput
+	addThreadReplyErr               error
 	resolveThreadCalls              []ResolveReviewThreadInput
+	resolveThreadErr                error
+	resolveThreadErrTimes           int // fail this many times then succeed; 0 with err = always
+	resolveThreadFailCount          int
 	addReactionCalls                []PullRequestReactionInput
 	removeReactionCalls             []PullRequestReactionInput
 	addLabelCalls                   []PullRequestLabelsInput
@@ -13243,6 +13587,11 @@ func (g *fakeGitHubGateway) RemoveIssueLabels(_ context.Context, input githubinf
 
 func (g *fakeGitHubGateway) ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error) {
 	g.listReviewThreadsCalls++
+	if g.listReviewThreadsErr != nil {
+		if g.listReviewThreadsErrAfter == 0 || g.listReviewThreadsCalls == g.listReviewThreadsErrAfter {
+			return nil, g.listReviewThreadsErr
+		}
+	}
 	out := make([]ReviewThread, len(g.reviewThreads))
 	copy(out, g.reviewThreads)
 	return out, nil
@@ -13250,11 +13599,33 @@ func (g *fakeGitHubGateway) ListReviewThreads(context.Context, ListReviewThreads
 
 func (g *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddReviewThreadReplyInput) error {
 	g.addThreadReplyCalls = append(g.addThreadReplyCalls, input)
+	if g.addThreadReplyErr != nil {
+		return g.addThreadReplyErr
+	}
+	// Persist reply onto the in-memory thread so retries see audit markers.
+	for i := range g.reviewThreads {
+		if g.reviewThreads[i].ID == input.ThreadID {
+			g.reviewThreads[i].Comments = append(g.reviewThreads[i].Comments, ReviewThreadComment{
+				ID:        fmt.Sprintf("reply-%d", len(g.addThreadReplyCalls)),
+				Author:    g.currentLogin,
+				Body:      input.Body,
+				CreatedAt: "t-reply",
+				UpdatedAt: "t-reply",
+			})
+			break
+		}
+	}
 	return nil
 }
 
 func (g *fakeGitHubGateway) ResolveReviewThread(_ context.Context, input ResolveReviewThreadInput) error {
 	g.resolveThreadCalls = append(g.resolveThreadCalls, input)
+	if g.resolveThreadErr != nil {
+		if g.resolveThreadErrTimes <= 0 || g.resolveThreadFailCount < g.resolveThreadErrTimes {
+			g.resolveThreadFailCount++
+			return g.resolveThreadErr
+		}
+	}
 	for i := range g.reviewThreads {
 		if g.reviewThreads[i].ID == input.ThreadID {
 			g.reviewThreads[i].IsResolved = true
@@ -13460,5 +13831,198 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	}
 	if persisted == nil || persisted.Status != "terminated" {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
+	}
+}
+
+func TestUpdateLoopDoesNotRestoreReleasedBudgetHold(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*storage.LoopRecord)
+	}{
+		{
+			name: "success-finalization",
+			mutate: func(updated *storage.LoopRecord) {
+				if loops.IsReviewFixPairHold(*updated) {
+					updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+					updated.NextRunAt = nil
+					return
+				}
+				updated.Status = "completed"
+				updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+				updated.NextRunAt = nil
+			},
+		},
+		{
+			name: "claim-start",
+			mutate: func(updated *storage.LoopRecord) {
+				if !loops.IsReviewFixBudgetHold(*updated) {
+					updated.Status = "running"
+				}
+				updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+				updated.NextRunAt = nil
+			},
+		},
+		{
+			name: "failure-finalization",
+			mutate: func(updated *storage.LoopRecord) {
+				updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+				if loops.IsReviewFixPairHold(*updated) {
+					updated.NextRunAt = nil
+					return
+				}
+				updated.Status = "paused"
+				updated.NextRunAt = nil
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			target := "pr:acme/looper:42"
+			metadata := `{"followUpdates":true,"loop":{"iterationCount":3}}`
+			loop := storage.LoopRecord{
+				ID: "loop_update_" + tc.name, Seq: 920, ProjectID: "project_1", Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("upsert loop: %v", err)
+			}
+			fixer := storage.LoopRecord{
+				ID: "loop_update_" + tc.name + "_fix", Seq: 921, ProjectID: "project_1", Type: "fixer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "queued", MetadataJSON: stringPtr(`{"followUpdates":true}`), CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("upsert fixer: %v", err)
+			}
+			parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+				Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+				Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+				LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+				DB:       fixture.coordinator.DB(),
+			})
+			if err != nil {
+				t.Fatalf("ParkReviewFixBudget: %v", err)
+			}
+			if !loops.IsReviewFixBudgetHold(parked) {
+				t.Fatalf("precondition: want budget hold, got status=%s", parked.Status)
+			}
+			continued := false
+			updateLoopBeforeWriteHook = func(held storage.LoopRecord) error {
+				if continued {
+					return nil
+				}
+				continued = true
+				result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
+				if contErr != nil {
+					return contErr
+				}
+				if !result.Applied {
+					return fmt.Errorf("continue not applied")
+				}
+				return nil
+			}
+			t.Cleanup(func() { updateLoopBeforeWriteHook = nil })
+			runner := &Runner{repos: fixture.repos, now: fixture.now}
+			if _, err := runner.updateLoop(context.Background(), parked, tc.mutate); err != nil {
+				t.Fatalf("updateLoop: %v", err)
+			}
+			fresh, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if err != nil || fresh == nil {
+				t.Fatalf("get loop: (%#v, %v)", fresh, err)
+			}
+			if loops.IsReviewFixBudgetHold(*fresh) {
+				t.Fatalf("%s restored budget hold after Continue: status=%s meta=%s", tc.name, fresh.Status, derefString(fresh.MetadataJSON))
+			}
+			if loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+				t.Fatalf("%s Continue meters must stay reset, got publish count %d meta=%s", tc.name, loops.ReviewerPublishCount(fresh.MetadataJSON), derefString(fresh.MetadataJSON))
+			}
+		})
+	}
+}
+
+func TestFinalizeSuccessfulReviewerQueueDoesNotClobberBudgetContinue(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true,"iterationCount":3}}`
+	loop := storage.LoopRecord{
+		ID: "loop_finalize_vs_continue", Seq: 930, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert loop: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_finalize_vs_continue_fix", Seq: 931, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "queued", MetadataJSON: stringPtr(`{"followUpdates":true}`), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	payload := reviewerQueuePayloadJSON("abc123", "sig-done", true)
+	item := storage.QueueItemRecord{
+		ID: "queue_finalize_vs_continue", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: buildReviewerDedupeKey("project_1", loop.ID, repo, prNumber),
+		Priority:  storage.QueuePriorityReviewer, Status: "running",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 5,
+		PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Upsert queue: %v", err)
+	}
+	continued := false
+	updateLoopBeforeWriteHook = func(held storage.LoopRecord) error {
+		if continued {
+			return nil
+		}
+		continued = true
+		result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
+		if contErr != nil {
+			return contErr
+		}
+		if !result.Applied {
+			return fmt.Errorf("continue not applied")
+		}
+		return nil
+	}
+	t.Cleanup(func() { updateLoopBeforeWriteHook = nil })
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	if _, err := runner.finalizeSuccessfulReviewerQueue(context.Background(),
+		storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp"}, parked, item, "run_finalize_continue",
+		reviewerCheckpoint{DispositionOnly: true}, "success", "disposition done"); err != nil {
+		t.Fatalf("finalizeSuccessfulReviewerQueue: %v", err)
+	}
+	fresh, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("get loop: (%#v, %v)", fresh, err)
+	}
+	if loops.IsReviewFixBudgetHold(*fresh) {
+		t.Fatalf("finalization restored budget hold after Continue: status=%s meta=%s", fresh.Status, derefString(fresh.MetadataJSON))
+	}
+	if loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("Continue meters must stay reset, got publish count %d meta=%s", loops.ReviewerPublishCount(fresh.MetadataJSON), derefString(fresh.MetadataJSON))
 	}
 }

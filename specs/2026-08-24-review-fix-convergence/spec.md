@@ -335,11 +335,13 @@ Include the original Looper review comment, trusted human edits/replies, and
 validated Fixer fixed/declined replies. Keep `isResolved` in the input because a
 human resolve/reopen is real state change.
 
-Store only `lastReviewedSignalFingerprint` in existing Reviewer loop metadata;
-do not persist comment bodies or a per-thread ledger. The queue dedupe key stays
-stable at the existing per-loop/PR identity and does **not** include the
-fingerprint. The signal fingerprint travels in queue payload/checkpoint data and
-in remote idempotency/audit markers.
+Store `lastReviewedSignalFingerprint` in existing Reviewer loop metadata, plus
+`lastResolvedReviewThreadIDs` as the set of thread IDs that were resolved in
+that same snapshot (reopen detection only). Do not persist comment bodies or a
+per-thread decision ledger. The queue dedupe key stays stable at the existing
+per-loop/PR identity and does **not** include the fingerprint. The signal
+fingerprint travels in queue payload/checkpoint data and in remote
+idempotency/audit markers.
 
 For a single-batch disposition, after Reviewer performs its own reply/resolve
 mutation, it must:

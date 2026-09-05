@@ -751,7 +751,7 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 			return routedDelivery{}, false, errors.New("issue_comment webhook missing repository or number")
 		}
 		return routedDelivery{}, false, nil
-	case "pull_request_review", "pull_request_review_comment":
+	case "pull_request_review":
 		var envelope pullRequestEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
 			return routedDelivery{}, false, fmt.Errorf("decode %s webhook: %w", eventType, err)
@@ -760,6 +760,27 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
 		}
 		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+	case "pull_request_review_comment":
+		var envelope pullRequestEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode %s webhook: %w", eventType, err)
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
+			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneReviewer: {}, LaneFixer: {}}}, true, nil
+	case "pull_request_review_thread":
+		var envelope pullRequestEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode %s webhook: %w", eventType, err)
+		}
+		if strings.TrimSpace(envelope.Action) != "resolved" {
+			return routedDelivery{}, false, nil
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
+			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneReviewer: {}, LaneFixer: {}}}, true, nil
 	case "push":
 		var envelope pushEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {

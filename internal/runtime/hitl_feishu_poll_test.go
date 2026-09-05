@@ -1124,7 +1124,6 @@ func TestFeishuHITLPollOverlayTypedReplyPreservedThroughScopeContinue(t *testing
 		t.Fatalf("fixer ask after Continue = (%#v, %v), want stored A applied without repeating typed input", answered, ok)
 	}
 }
-
 func TestFeishuResidualCardDoesNotClobberPairTransition(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -1432,7 +1431,6 @@ func TestFeishuScopeAskDeliveryDoesNotClobberContinueOrStop(t *testing.T) {
 		})
 	}
 }
-
 func mustCardAction(id int64, seq, answer string) feishuInboxEvent {
 	e := feishuInboxEvent{ID: id, Kind: "card_action"}
 	e.Value.LoopSeq = seq

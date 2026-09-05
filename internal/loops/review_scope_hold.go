@@ -219,7 +219,11 @@ type ParkReviewScopeHumanInput struct {
 	Question string
 	// Evidence is optional structured handoff text (authority conflict, etc.).
 	Evidence string
-	DB       *sql.DB
+	// Signal is the review-signal fingerprint being adjudicated. When set it
+	// wins over lastReviewedSignalFingerprint already stored on Held, so a
+	// needs_human park can record the current identity before persist.
+	Signal string
+	DB     *sql.DB
 }
 
 // ParkReviewScopeHuman parks the held role and pauses same-lane siblings for a
@@ -250,6 +254,20 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 	if isReviewScopeHumanPrimaryHold(held) {
 		if err := finishReviewScopeHumanPark(ctx, repos, held, input.Role, input.NowISO); err != nil {
 			return held, err
+		}
+		if sig := strings.TrimSpace(input.Signal); sig != "" && held.MetadataJSON != nil {
+			meta := parseMetadataObject(held.MetadataJSON)
+			meta["lastReviewedSignalFingerprint"] = sig
+			encoded, marshalErr := json.Marshal(meta)
+			if marshalErr != nil {
+				return held, marshalErr
+			}
+			text := string(encoded)
+			held.MetadataJSON = &text
+			held.UpdatedAt = input.NowISO
+			if err := repos.Loops.Upsert(ctx, held); err != nil {
+				return held, err
+			}
 		}
 		if err := ensureReviewScopeHumanHandoffEvent(ctx, repos, held, input); err != nil {
 			return held, err
@@ -305,6 +323,15 @@ func parkReviewScopeHumanBody(ctx context.Context, repos *storage.Repositories, 
 		}
 		metadata = string(encoded)
 		held.Status = "paused"
+	}
+	if sig := strings.TrimSpace(input.Signal); sig != "" {
+		meta := parseMetadataObject(&metadata)
+		meta["lastReviewedSignalFingerprint"] = sig
+		encoded, marshalErr := json.Marshal(meta)
+		if marshalErr != nil {
+			return input.Held, marshalErr
+		}
+		metadata = string(encoded)
 	}
 	held.MetadataJSON = &metadata
 	held.NextRunAt = nil
@@ -531,6 +558,9 @@ func appendReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repo
 	if head := reviewFixBudgetHandoffHead(held); head != "" {
 		payload["head"] = head
 	}
+	if signal := reviewScopeHandoffSignal(held, input.Signal); signal != "" {
+		payload["lastReviewedSignalFingerprint"] = signal
+	}
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType:  reviewScopeHumanHandoffEventType,
 		ProjectID:  optionalBudgetString(projectID),
@@ -541,6 +571,13 @@ func appendReviewScopeHumanHandoffEvent(ctx context.Context, repos *storage.Repo
 		ActorID:    optionalBudgetString("review-scope-human"),
 		Payload:    payload,
 	})
+}
+
+func reviewScopeHandoffSignal(held storage.LoopRecord, pending string) string {
+	if signal := strings.TrimSpace(pending); signal != "" {
+		return signal
+	}
+	return reviewFixHandoffSignal(held)
 }
 
 type ReviewScopeHumanAnswerResult struct {
@@ -695,9 +732,14 @@ func releaseOneReviewScopeHumanHold(ctx context.Context, repos *storage.Reposito
 		updated.NextRunAt = nil
 		return repos.Loops.Upsert(ctx, updated)
 	}
-
 	updated.Status = "queued"
 	updated.NextRunAt = &nowISO
+	meta = parseMetadataObject(updated.MetadataJSON)
+	delete(meta, "lastReviewedSignalFingerprint")
+	if encoded, encErr := json.Marshal(meta); encErr == nil {
+		text := string(encoded)
+		updated.MetadataJSON = &text
+	}
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return err
 	}

@@ -212,6 +212,10 @@ type ListReviewThreadsInput struct {
 	PRNumber int64
 	CWD      string
 	Limit    int
+	// AllPages requests full pagination for authority reads (withhold
+	// admission). When true, Limit is ignored as a stop condition.
+	// Existing Limit<=0 callers keep the historical default page cap.
+	AllPages bool
 }
 
 type ViewReviewThreadInput struct {
@@ -226,11 +230,12 @@ type ReviewThread struct {
 }
 
 type ReviewThreadComment struct {
-	ID        string
-	Body      string
-	Author    string
-	CreatedAt string
-	UpdatedAt string
+	ID                string
+	Body              string
+	Author            string
+	AuthorAssociation string
+	CreatedAt         string
+	UpdatedAt         string
 }
 
 type ResolveReviewThreadInput struct {
@@ -812,12 +817,13 @@ type checkpointRepair struct {
 }
 
 // replyExplanationEntry holds the agent's per-fix-item explanation for the
-// auto-reply posted before resolving the review thread. Stored on the repair
-// checkpoint so resume/retry reuses the same explanation if it still maps to
-// the current fix items snapshot. Fixed decisions must include
-// ThreadCommentsObserved so resolve-comments can verify the live thread still
-// contains exactly the same target review comment IDs before auto-resolving,
-// excluding only prior Looper fixer replies.
+// auto-reply Looper posts on the review thread. Stored on the repair checkpoint
+// so resume/retry reuses the same explanation if it still maps to the current
+// fix items snapshot. Fixed decisions must include ThreadCommentsObserved so
+// resolve-comments can verify the live thread still contains exactly the same
+// target review comment IDs before auto-resolving, excluding only prior Looper
+// fixer replies. Declined decisions reply and leave the thread unresolved for
+// Reviewer adjudication.
 type replyExplanationEntry struct {
 	FixItemID              string `json:"fixItemId"`
 	ThreadID               string `json:"threadId,omitempty"`
@@ -996,9 +1002,13 @@ const (
 	agentMissingThreadDecisionExplanation = "Agent did not provide a decision for this thread"
 	agentInvalidThreadDecisionExplanation = "Agent provided an unrecognized decision for this thread"
 	agentDeclinedThreadWithoutReason      = "Agent declined this thread without a substantive reason"
-	maxDeclinedThreadRecords              = 200
-	zeroProgressPauseReason               = "agent_zero_progress"
-	labelMismatchPauseReason              = "fixer_label_mismatch"
+	// declinePendingAdjudicationStatus marks a Fixer decline reply that left the
+	// review thread unresolved for Reviewer accept/reject/needs_human. It is not
+	// terminal same-head suppression and must not call ResolveReviewThread.
+	declinePendingAdjudicationStatus = "decline_pending_adjudication"
+	maxDeclinedThreadRecords         = 200
+	zeroProgressPauseReason          = "agent_zero_progress"
+	labelMismatchPauseReason         = "fixer_label_mismatch"
 )
 
 // parseReplyExplanations extracts the optional review_thread_replies array from
@@ -1945,6 +1955,10 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	}
 	allFixItemsStateHash := hashFixItemsState(allFixItems)
 	fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, repo, detail.Number), detail.HeadSHA, allFixItems)
+	fixItems, err = r.suppressWithheldDispositionFixItems(ctx, project, repo, detail, fixItems)
+	if err != nil {
+		return err
+	}
 	if len(fixItems) == 0 {
 		if err := r.resumePausedZeroProgressLoopIfStateChanged(ctx, project.ID, repo, detail.Number, detail.HeadSHA, allFixItemsStateHash); err != nil {
 			return err
@@ -2842,6 +2856,13 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
 	}
+	// Claim / pre-agent admission: re-evaluate disposition withhold before any
+	// worktree mutation or agent run so already-queued items that gained a
+	// trusted disposition after discovery are not edited or pushed.
+	fixItems, err = r.admitWithheldDispositionFixItems(ctx, input, fixItems)
+	if err != nil {
+		return checkpoint, err
+	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
 	if hasForgejoNativeReviewComments(fixItems) {
@@ -3470,6 +3491,21 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
+	if withheld, admitted, err := r.skipPushIfDispositionWithheld(ctx, input, checkpoint); err != nil {
+		return checkpoint, err
+	} else if withheld {
+		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "pending_disposition"}})
+		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "Thread withheld pending Reviewer disposition adjudication", Evidence: resolveFixEvidence(checkpoint, input.Loop.MetadataJSON, checkpoint.FixItemsHash)}
+		if admitted > 0 {
+			// Combined repair still contains withheld-thread edits. Do not push
+			// or resolve remaining items; rediscover so the next collect admits
+			// only the still-actionable set.
+			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+			return checkpoint, &loopError{message: "Fixer push aborted because a repaired thread became withheld pending Reviewer disposition adjudication; will rediscover remaining items", kind: FailureRetryableAfterResume}
+		}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
+	}
 	if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: branch, ExpectedRemoteHeadSHA: worktree.BaseHeadSHA}); err != nil {
 		message := err.Error()
 		eventType := "fixer.push.retryable"
@@ -3778,7 +3814,6 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	resolvedCount := 0
 	contractViolationCount := 0
-	declinedUpdates := map[string]declinedThreadRecord{}
 	commentItems := make([]FixItem, 0, len(fixItems))
 	nativeCommentItems := make([]FixItem, 0, len(fixItems))
 	for _, item := range fixItems {
@@ -3835,6 +3870,13 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	// successful "fixed" decision whenever a single new thread appeared,
 	// which on PRs receiving a steady stream of bot comments produced an
 	// unbreakable drift loop.
+	var looperLogin string
+	if len(commentItems) > 0 {
+		looperLogin, err = r.dispositionLooperLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
+		}
+	}
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
 			continue
@@ -3857,11 +3899,23 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 		if err != nil {
-			return checkpoint, err
+			// Fail-closed: do not mutate from stale "actionable" assumptions.
+			return checkpoint, &loopError{message: fmt.Sprintf("fixer disposition thread view failed: %v", err), kind: FailureRetryableTransient}
 		}
 		if thread.IsResolved {
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO()})
 			continue
+		}
+		// Last-line drift guard: withhold further edits while Reviewer
+		// adjudicates. Admission already suppressed withheld items before
+		// agent/worktree mutation; this catches races after the agent ran.
+		if ThreadWithheldFromFixer(thread, liveDetail.Author, looperLogin) {
+			allowDecline := normalizeReplyAction(decision.Action) == string(replyActionDeclined) &&
+				allowDeclineReplyWhileWithheld(thread, liveDetail.Author, looperLogin)
+			if !allowDecline {
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_pending_disposition", Message: "Thread withheld pending Reviewer disposition adjudication", UpdatedAt: r.nowISO()})
+				continue
+			}
 		}
 		if hasNonLooperCommentSince(thread, driftSince) {
 			driftCount++
@@ -3880,6 +3934,19 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 		switch normalizeReplyAction(decision.Action) {
 		case string(replyActionDeclined):
+			// Decline is a scope dispute for Reviewer adjudication: reply with
+			// evidence, leave the thread unresolved, and do not write terminal
+			// same-head declinedThreads suppression. Legacy remotely-resolved
+			// declines are handled above via thread.IsResolved.
+			repairCompletedAt := ""
+			if checkpoint.Repair != nil {
+				repairCompletedAt = checkpoint.Repair.CompletedAt
+			}
+			if stalePreRejectDeclineReplay(thread, looperLogin, repairCompletedAt) {
+				driftCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "skipped_thread_drift", Message: "Reviewer reject_wontfix arrived after the fixer decline decision; will rediscover for a fresh decision", UpdatedAt: r.nowISO()})
+				continue
+			}
 			decisionFingerprint := buildDeclinedThreadFingerprint(item, liveDetail.HeadSHA)
 			replyState, replyError := r.replyToDeclinedComment(ctx, input, item, decisionFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
 			if replyState == "failed" {
@@ -3890,24 +3957,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
 				return checkpoint, err
 			}
-			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath}); err != nil {
-				message := err.Error()
-				if strings.Contains(strings.ToLower(message), "already") {
-					if replyState == "sent" {
-						declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
-					}
-					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "already_resolved", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
-					continue
-				}
-				mutationFailureCount++
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "failed_mutation_retry", Message: message, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
-				continue
-			}
-			resolvedCount++
-			if replyState == "sent" {
-				declinedUpdates[decisionFingerprint] = declinedThreadRecord{RecordedAt: r.nowISO(), ThreadID: item.ThreadID, Reason: decision.Explanation}
-			}
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: "agent_declined", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeclined), Status: declinePendingAdjudicationStatus, Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 		default:
 			replyState, replyError := r.replyToFixedComment(ctx, input, item, commitSHA, decision.Explanation, checkpoint.ResolvedComments.Items)
 			if err := r.persistCheckpoint(ctx, input.Run.ID, stepResolveComments, checkpoint); err != nil {
@@ -3987,11 +4037,6 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	if contractViolationCount > 0 {
 		if _, err := r.incrementContractViolationCount(ctx, input.Loop, contractViolationCount); err != nil {
-			return checkpoint, err
-		}
-	}
-	if len(declinedUpdates) > 0 {
-		if _, err := r.persistDeclinedThreadRecords(ctx, input.Loop, declinedUpdates); err != nil {
 			return checkpoint, err
 		}
 	}
@@ -4257,28 +4302,76 @@ func (r *Runner) replyToFixedComment(ctx context.Context, input stepInput, item 
 	return "sent", ""
 }
 
+// stalePreRejectDeclineReplay is true when Reviewer reject_wontfix landed after
+// the checkpointed Fixer decline and no post-reject decline exists yet. Replay
+// must rediscover rather than promote that stale decision to a second decline.
+func stalePreRejectDeclineReplay(thread ReviewThread, looperLogin, repairCompletedAt string) bool {
+	lastReject := lastRejectWontfixIndex(thread, looperLogin)
+	if lastReject < 0 {
+		return false
+	}
+	for i := lastReject + 1; i < len(thread.Comments); i++ {
+		if isValidatedFixerDeclineComment(thread.Comments[i], looperLogin, thread.ID) {
+			return false
+		}
+	}
+	repairAt := parseRFC3339OrZero(repairCompletedAt)
+	rejectAt := commentLatestTime(thread.Comments[lastReject])
+	if repairAt.IsZero() || rejectAt.IsZero() {
+		return true
+	}
+	return !repairAt.After(rejectAt)
+}
+
+func commentLatestTime(comment ReviewThreadComment) time.Time {
+	created := parseRFC3339OrZero(comment.CreatedAt)
+	updated := parseRFC3339OrZero(comment.UpdatedAt)
+	if updated.After(created) {
+		return updated
+	}
+	return created
+}
+
 func (r *Runner) replyToDeclinedComment(ctx context.Context, input stepInput, item FixItem, decisionFingerprint, explanation string, existing []checkpointResolvedComment) (string, string) {
 	if item.ThreadID == "" {
 		return "skipped_no_thread", ""
 	}
-	for _, entry := range existing {
-		if entry.Action != string(replyActionDeclined) {
-			continue
-		}
-		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
-			if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
-				return entry.ReplyState, entry.ReplyError
-			}
-		}
-	}
-	body := buildFixerDeclinedReplyBody(item, explanation, decisionFingerprint)
-	existingRemoteReply, err := r.hasExistingFixerDeclinedReply(ctx, input, item, decisionFingerprint)
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 	if err != nil {
 		return "failed", err.Error()
 	}
-	if existingRemoteReply {
+	looperLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return "failed", err.Error()
+	}
+	looperLogin = strings.TrimSpace(looperLogin)
+	marker := declineMarkerForThread(thread, item.ThreadID, decisionFingerprint, looperLogin)
+	lastRejectIdx := lastRejectWontfixIndex(thread, looperLogin)
+	// Checkpoint idempotency only applies when we are not posting a fresh
+	// post-reject decline (new marker after Reviewer reject_wontfix).
+	if lastRejectIdx < 0 || hasValidatedDeclineWithMarkerAfter(thread, marker, looperLogin, lastRejectIdx) {
+		for _, entry := range existing {
+			if entry.Action != string(replyActionDeclined) {
+				continue
+			}
+			if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
+				if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
+					return entry.ReplyState, entry.ReplyError
+				}
+			}
+		}
+	}
+	if hasValidatedDeclineWithMarkerAfter(thread, marker, looperLogin, lastRejectIdx) {
 		return "sent", ""
 	}
+	// Before any reject, also treat the base same-fingerprint marker as sent.
+	if lastRejectIdx < 0 {
+		base := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint)
+		if hasValidatedDeclineWithMarkerAfter(thread, base, looperLogin, -1) {
+			return "sent", ""
+		}
+	}
+	body := buildFixerDeclinedReplyBodyWithMarker(item, explanation, marker)
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: item.ThreadID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 		return "failed", err.Error()
@@ -4304,20 +4397,21 @@ func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, ite
 }
 
 func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepInput, item FixItem, decisionFingerprint string) (bool, error) {
-	marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint)
-	if marker == "" {
-		return false, nil
-	}
 	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 	if err != nil {
 		return false, err
 	}
-	for _, comment := range thread.Comments {
-		if strings.Contains(comment.Body, marker) {
-			return true, nil
-		}
+	looperLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return false, err
 	}
-	return false, nil
+	looperLogin = strings.TrimSpace(looperLogin)
+	marker := declineMarkerForThread(thread, item.ThreadID, decisionFingerprint, looperLogin)
+	if marker == "" {
+		return false, nil
+	}
+	lastRejectIdx := lastRejectWontfixIndex(thread, looperLogin)
+	return hasValidatedDeclineWithMarkerAfter(thread, marker, looperLogin, lastRejectIdx), nil
 }
 
 func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, evidence threadFixEvidence, item FixItem) (string, PullRequestDetail, error) {
@@ -4573,6 +4667,10 @@ func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
 }
 
 func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint string) string {
+	return buildFixerDeclinedReplyBodyWithMarker(item, explanation, fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint))
+}
+
+func buildFixerDeclinedReplyBodyWithMarker(item FixItem, explanation, marker string) string {
 	var b strings.Builder
 	mention := strings.TrimSpace(item.Author)
 	if mention != "" {
@@ -4585,7 +4683,7 @@ func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint 
 		b.WriteString("\n\n")
 		b.WriteString(explanation)
 	}
-	if marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint); marker != "" {
+	if marker = strings.TrimSpace(marker); marker != "" {
 		b.WriteString("\n\n")
 		b.WriteString(marker)
 	}
@@ -4621,6 +4719,17 @@ func fixerDeclinedReplyMarker(threadID, decisionFingerprint string) string {
 		return ""
 	}
 	return fmt.Sprintf("<!-- looper-fixer-reply-declined thread:%s fingerprint:%s -->", threadID, decisionFingerprint)
+}
+
+// fixerDeclinedReplyMarkerPostReject is a distinct decline marker used once after
+// Reviewer reject_wontfix so the second same-fingerprint decline is visible.
+func fixerDeclinedReplyMarkerPostReject(threadID, decisionFingerprint string) string {
+	threadID = strings.TrimSpace(threadID)
+	decisionFingerprint = strings.TrimSpace(decisionFingerprint)
+	if threadID == "" || decisionFingerprint == "" {
+		return ""
+	}
+	return fmt.Sprintf("<!-- looper-fixer-reply-declined thread:%s fingerprint:%s attempt:post-reject -->", threadID, decisionFingerprint)
 }
 
 func summarizeFixItem(item FixItem) string {
@@ -4884,7 +4993,7 @@ func summaryStatusIcon(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "resolved", "already_resolved":
 		return "✅"
-	case "agent_declined":
+	case "agent_declined", declinePendingAdjudicationStatus:
 		return "⏸️"
 	case "failed":
 		return "⚠️"
@@ -6579,7 +6688,9 @@ func hasProgressed(checkpoint fixerCheckpoint) bool {
 		return false
 	}
 	for _, item := range checkpoint.ResolvedComments.Items {
-		if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" || item.Action == string(replyActionFixed) {
+		// decline_pending_adjudication counts as progress (reply posted) but is
+		// not terminal resolution — the thread stays open for Reviewer.
+		if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" || item.Status == declinePendingAdjudicationStatus || item.Action == string(replyActionFixed) {
 			return true
 		}
 	}
@@ -7391,6 +7502,104 @@ func buildDeclinedThreadFingerprint(item FixItem, headSHA string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// admitWithheldDispositionFixItems re-evaluates withhold at claim/collect-fixes
+// (before prepare-worktree and agent). Failures are retryable fail-closed.
+func (r *Runner) admitWithheldDispositionFixItems(ctx context.Context, input stepInput, fixItems []FixItem) ([]FixItem, error) {
+	if r.github == nil || len(fixItems) == 0 || !hasCommentFixItems(fixItems) {
+		return fixItems, nil
+	}
+	if r.isForgejoProject(input.Project.ID) {
+		return fixItems, nil
+	}
+	prAuthor, err := r.github.GetPullRequestAuthor(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("fixer disposition admission author lookup failed: %v", err), kind: FailureRetryableTransient}
+	}
+	return r.suppressWithheldDispositionFixItems(ctx, input.Project, input.Repo, PullRequestDetail{Number: input.PRNumber, Author: prAuthor}, fixItems)
+}
+
+// skipPushIfDispositionWithheld rechecks live withhold immediately before the
+// remote push. A trusted /looper wontfix or /looper reconsider that arrived
+// after collect-fixes must not publish the repair, including when only some
+// collected items became withheld. Failures are retryable fail-closed.
+// Non-comment runs skip the live read. admitted is the still-actionable count
+// when withheld is true (0 = every collected item is withheld).
+func (r *Runner) skipPushIfDispositionWithheld(ctx context.Context, input stepInput, checkpoint fixerCheckpoint) (withheld bool, admitted int, err error) {
+	if !hasCommentFixItems(checkpoint.FixItems) {
+		return false, len(checkpoint.FixItems), nil
+	}
+	remaining, err := r.admitWithheldDispositionFixItems(ctx, input, checkpoint.FixItems)
+	if err != nil {
+		return false, 0, err
+	}
+	return len(remaining) < len(checkpoint.FixItems), len(remaining), nil
+}
+
+// suppressWithheldDispositionFixItems drops threads with unaudited trusted
+// dispositions or validated Fixer declines until Reviewer adjudicates.
+// List/identity failures are retryable fail-closed (never treat items as
+// actionable from a stale empty withhold set).
+func (r *Runner) suppressWithheldDispositionFixItems(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail, fixItems []FixItem) ([]FixItem, error) {
+	if r.github == nil || len(fixItems) == 0 || !hasCommentFixItems(fixItems) {
+		return fixItems, nil
+	}
+	// Forgejo and other non-native providers have no same-head disposition path.
+	if r.isForgejoProject(project.ID) {
+		return fixItems, nil
+	}
+	looperLogin, err := r.dispositionLooperLogin(ctx, project.RepoPath)
+	if err != nil {
+		return nil, err
+	}
+	threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: repo, PRNumber: detail.Number, CWD: project.RepoPath, AllPages: true})
+	if err != nil {
+		return nil, &loopError{message: fmt.Sprintf("fixer withheld-disposition thread listing failed: %v", err), kind: FailureRetryableTransient}
+	}
+	return SuppressWithheldDispositionFixItems(fixItems, threads, detail.Author, looperLogin), nil
+}
+
+// dispositionLooperLogin returns the live Fixer GitHub login used for withhold
+// and mutation-guard identity checks. Empty login (e.g. integration tokens
+// that cannot resolve viewer login) is retryable fail-closed so withheld
+// dispositions are never treated as unowned/actionable.
+func (r *Runner) dispositionLooperLogin(ctx context.Context, repoPath string) (string, error) {
+	if r.github == nil {
+		return "", &loopError{message: "fixer disposition identity lookup failed: github gateway is nil", kind: FailureRetryableTransient}
+	}
+	looperLogin, err := r.github.GetCurrentUserLogin(ctx, repoPath)
+	if err != nil {
+		return "", &loopError{message: fmt.Sprintf("fixer disposition identity lookup failed: %v", err), kind: FailureRetryableTransient}
+	}
+	looperLogin = strings.TrimSpace(looperLogin)
+	if looperLogin == "" {
+		return "", &loopError{message: "fixer disposition identity is empty", kind: FailureRetryableTransient}
+	}
+	return looperLogin, nil
+}
+
+// allowDeclineReplyWhileWithheld is true only when the withhold is the Fixer's
+// own pending decline (idempotent re-reply) or a reject_wontfix path that still
+// has an open post-reject decline slot. accept_wontfix and trusted human
+// dispositions must not receive Fixer decline mutations.
+func allowDeclineReplyWhileWithheld(thread ReviewThread, prAuthorLogin, looperLogin string) bool {
+	lastDecision, lastIdx, hasDecision := lastReviewerAuditDecision(thread, looperLogin)
+	if hasUnauditedValidatedFixerDeclineAfter(thread, looperLogin, lastIdx) {
+		return true
+	}
+	if hasUnauditedTrustedDispositionAfter(thread, prAuthorLogin, lastIdx) {
+		return false
+	}
+	if !hasDecision {
+		return true
+	}
+	switch lastDecision {
+	case decisionRejectWontfix, decisionNotFixed:
+		return true
+	default:
+		return false
+	}
+}
+
 func suppressDeclinedFixItems(loopMetadataJSON *string, headSHA string, fixItems []FixItem) []FixItem {
 	records := parseDeclinedThreadRecords(parseJSONObject(loopMetadataJSON))
 	if len(records) == 0 {
@@ -7632,7 +7841,7 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 			`  - "fixItemId": the exact "id" of the fix item`,
 			`  - "threadId": the exact "threadId" of the same fix item`,
 			`  - "action": "fixed" or "declined"; a later HUMAN-IN-THE-LOOP instruction may additionally enable "needs_human"`,
-			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", respectfully explain why the suggestion was not adopted and cite the relevant scope, intent, repository rule, or concrete technical evidence. Make the explanation self-contained because Looper will post it as the thread reply before resolving the thread. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
+			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", respectfully explain why the suggestion was not adopted and cite the relevant scope, intent, repository rule, or concrete technical evidence. Make the explanation self-contained because Looper will post it as the thread reply and leave the thread unresolved for Reviewer adjudication. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
 			`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. The "id" MUST be the GraphQL PullRequestReviewComment node ID. If you fetched comments with REST pulls/{number}/comments, map REST "node_id" to "id" and REST "updated_at" to "updatedAt"; do not use the REST numeric "id". Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
 			"Before including an entry, re-read the relevant review thread/comment context.",
 			"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
@@ -7757,9 +7966,39 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 	if checkpoint.ReconcileCommits.FinalHeadSHA != "" && checkpoint.ReconcileCommits.BaseHeadSHA != "" && checkpoint.ReconcileCommits.FinalHeadSHA != checkpoint.ReconcileCommits.BaseHeadSHA {
 		return false
 	}
+	// Remaining open comment threads normally mean resolve was a no-op without a
+	// push. Decline-pending-adjudication threads are intentionally left open for
+	// Reviewer and must not trip this generic manual-intervention path. Do not
+	// fold them into terminal declinedThreads suppression.
 	for _, item := range fixItems {
-		if item.Type == "comment" {
+		if item.Type != "comment" {
+			continue
+		}
+		if commentExemptFromNoCommitResolveBlock(checkpoint, item) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// commentExemptFromNoCommitResolveBlock reports whether a still-open remaining
+// comment should not trigger the no-new-commits manual hold. Decline pending
+// Reviewer adjudication is the primary case; already-resolved statuses are
+// included defensively if they still appear in RemainingFixItems.
+func commentExemptFromNoCommitResolveBlock(checkpoint fixerCheckpoint, item FixItem) bool {
+	if checkpoint.ResolvedComments == nil {
+		return false
+	}
+	for _, entry := range checkpoint.ResolvedComments.Items {
+		if entry.FixItemID != item.ID && (entry.ThreadID == "" || entry.ThreadID != item.ThreadID) {
+			continue
+		}
+		switch entry.Status {
+		case declinePendingAdjudicationStatus, "already_resolved", "resolved", "agent_declined":
 			return true
+		default:
+			return false
 		}
 	}
 	return false

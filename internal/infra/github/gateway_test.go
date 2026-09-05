@@ -387,6 +387,9 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 		if strings.Contains(args, "reviewThreads") {
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}`}, nil
 		}
+		if strings.HasPrefix(args, "api user") {
+			return shell.Result{Stdout: "reviewer\n"}, nil
+		}
 		t.Fatalf("unexpected gh args: %q", args)
 		return shell.Result{}, nil
 	}
@@ -402,8 +405,8 @@ func TestGatewayViewPullRequestFallsBackWhenReviewRequestReviewerIsInaccessible(
 	if detail.ReviewRequests != nil || detail.ReviewRequestUsers != nil {
 		t.Fatalf("fallback review requests = %#v/%#v, want unknown metadata", detail.ReviewRequests, detail.ReviewRequestUsers)
 	}
-	if len(runner.calls) != 4 {
-		t.Fatalf("gh calls = %#v, want primary view, fallback view, review thread fetch, and issue comments fetch", runner.calls)
+	if len(runner.calls) != 5 {
+		t.Fatalf("gh calls = %#v, want primary view, fallback view, login lookup, review thread fetch, and issue comments fetch", runner.calls)
 	}
 }
 
@@ -443,6 +446,8 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 			return shell.Result{}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.HasPrefix(args, "api user"):
+			return shell.Result{Stdout: "reviewer\n"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -476,6 +481,8 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 			return shell.Result{Stdout: `{"number":42,"state":"OPEN","headRefOid":"head-42"}`}, nil
 		case strings.Contains(args, "reviewThreads"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.HasPrefix(args, "api user"):
+			return shell.Result{Stdout: "looper-bot\n"}, nil
 		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
 			if strings.Contains(args, "--slurp") {
 				t.Fatalf("comment command = %q, want page-wise projection without --slurp", args)
@@ -1323,6 +1330,8 @@ func TestGatewayViewPullRequestPaginatesReviewThreads(t *testing.T) {
 			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
 		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
 			return shell.Result{}, nil
+		case strings.HasPrefix(args, "api user"):
+			return shell.Result{Stdout: "looper-bot\n"}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && strings.Contains(args, "-F after=thread-cursor-1"):
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-2","isResolved":true,"comments":{"nodes":[{"id":"comment-2","body":"second page"}]}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.Contains(args, "reviewThreads(first: 100, after: $after)") && !strings.Contains(args, "-F after="):
@@ -2109,6 +2118,8 @@ func TestGatewayCapturePullRequestSnapshotPreservesFullDetails(t *testing.T) {
 			return shell.Result{}, nil
 		case strings.HasPrefix(args, "pr diff"):
 			return shell.Result{Stdout: "diff --git a/a.go b/a.go\n"}, nil
+		case strings.HasPrefix(args, "api user"):
+			return shell.Result{Stdout: "looper-bot\n"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -2164,6 +2175,8 @@ func TestGatewayCapturePullRequestSnapshotTruncatesTooLargeDiff(t *testing.T) {
 					return shell.Result{}, nil
 				case strings.HasPrefix(args, "pr diff"):
 					return tc.diffResult, tc.diffErr
+				case strings.HasPrefix(args, "api user"):
+					return shell.Result{Stdout: "looper-bot\n"}, nil
 				default:
 					t.Fatalf("unexpected gh args: %q", args)
 					return shell.Result{}, nil
@@ -2771,6 +2784,155 @@ func TestSubmitReviewLogsGhFailureDiagnostics(t *testing.T) {
 	normalization, _ := request["comment_processing"].(map[string]any)
 	if normalization["original_count"] != 1 || normalization["submitted_count"] != 1 {
 		t.Fatalf("comment_processing = %#v, want counts", normalization)
+	}
+}
+
+func TestReviewThreadFingerprintFromNodesExcludesDeclineReplies(t *testing.T) {
+	t.Parallel()
+	const looperLogin = "looper-bot"
+	base := []any{
+		map[string]any{"id": "c1", "updatedAt": "2026-01-01T00:00:00Z", "body": "Please fix <!-- looper:stamp v=1 -->"},
+		map[string]any{"id": "c2", "updatedAt": "2026-01-01T00:01:00Z", "body": "<!-- looper-fixer-reply thread:t1 sha:abc -->"},
+	}
+	withDecline := append(append([]any{}, base...), map[string]any{
+		"id": "c3", "updatedAt": "2026-01-01T00:02:00Z",
+		"author": map[string]any{"login": "Looper-Bot"},
+		"body":   "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
+	})
+	without := reviewThreadFingerprintFromNodes("t1", base, looperLogin)
+	with := reviewThreadFingerprintFromNodes("t1", withDecline, looperLogin)
+	if without == "" || without != with {
+		t.Fatalf("fingerprint without=%q with=%q, want authenticated same-thread decline replies excluded so retry markers stay stable", without, with)
+	}
+}
+
+func TestReviewThreadFingerprintFromNodesKeepsUntrustedDeclineQuotes(t *testing.T) {
+	t.Parallel()
+	const looperLogin = "looper-bot"
+	base := []any{
+		map[string]any{"id": "c1", "updatedAt": "2026-01-01T00:00:00Z", "body": "Please fix"},
+	}
+	without := reviewThreadFingerprintFromNodes("t1", base, looperLogin)
+	quotedNeedle := append(append([]any{}, base...), map[string]any{
+		"id": "c2", "updatedAt": "2026-01-01T00:01:00Z",
+		"body": "human quoting <!-- looper-fixer-reply-declined without a complete marker",
+	})
+	if got := reviewThreadFingerprintFromNodes("t1", quotedNeedle, looperLogin); got == without {
+		t.Fatal("untrusted quote of the decline needle must stay in the fingerprint")
+	}
+	foreignThread := append(append([]any{}, base...), map[string]any{
+		"id": "c3", "updatedAt": "2026-01-01T00:02:00Z",
+		"body": "<!-- looper-fixer-reply-declined thread:other fingerprint:deadbeef -->",
+	})
+	if got := reviewThreadFingerprintFromNodes("t1", foreignThread, looperLogin); got == without {
+		t.Fatal("foreign-thread decline marker must stay in the fingerprint")
+	}
+	if got := reviewThreadFingerprintFromNodes("", append(append([]any{}, base...), map[string]any{
+		"id": "c4", "updatedAt": "2026-01-01T00:03:00Z",
+		"body": "<!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
+	}), looperLogin); got == without {
+		t.Fatal("decline marker without a containing thread id must stay in the fingerprint")
+	}
+	humanQuote := append(append([]any{}, base...), map[string]any{
+		"id": "c5", "updatedAt": "2026-01-01T00:04:00Z",
+		"author": map[string]any{"login": "alice"},
+		"body":   "<!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
+	})
+	if got := reviewThreadFingerprintFromNodes("t1", humanQuote, looperLogin); got == without {
+		t.Fatal("complete same-thread decline marker from a non-looper author must stay in the fingerprint")
+	}
+	missingAuthor := append(append([]any{}, base...), map[string]any{
+		"id": "c6", "updatedAt": "2026-01-01T00:05:00Z",
+		"body": "<!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
+	})
+	if got := reviewThreadFingerprintFromNodes("t1", missingAuthor, looperLogin); got == without {
+		t.Fatal("complete same-thread decline marker with no author must stay in the fingerprint")
+	}
+	if got := reviewThreadFingerprintFromNodes("t1", append(append([]any{}, base...), map[string]any{
+		"id": "c7", "updatedAt": "2026-01-01T00:06:00Z",
+		"author": map[string]any{"login": "looper-bot"},
+		"body":   "<!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->",
+	}), ""); got == without {
+		t.Fatal("complete same-thread decline marker must stay in the fingerprint when looper login is empty")
+	}
+}
+
+func TestGatewayViewPullRequestExcludesDeclineFingerprintForIntegrationTokens(t *testing.T) {
+	t.Parallel()
+	const baseComments = `[{"id":"c1","updatedAt":"2026-01-01T00:00:00Z","body":"Please fix <!-- looper:stamp v=1 -->"},{"id":"c2","updatedAt":"2026-01-01T00:01:00Z","body":"<!-- looper-fixer-reply thread:t1 sha:abc -->"}]`
+	const declineComment = `{"id":"c3","updatedAt":"2026-01-01T00:02:00Z","author":{"login":"Looper-Bot"},"body":"declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->"}`
+	includeDecline := false
+	sawViewer := false
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{}, nil
+		case strings.HasPrefix(args, "api user"):
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case args == "api graphql -f query=query { viewer { login } }":
+			sawViewer = true
+			return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-bot"}}}`}, nil
+		case strings.Contains(args, "reviewThreads(first: 100, after: $after)"):
+			nodes := baseComments
+			if includeDecline {
+				nodes = strings.TrimSuffix(baseComments, "]") + "," + declineComment + "]"
+			}
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"t1","isResolved":false,"comments":{"nodes":` + nodes + `}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	viewFingerprint := func() string {
+		t.Helper()
+		detail, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+		if err != nil {
+			t.Fatalf("ViewPullRequest() error = %v", err)
+		}
+		if len(detail.Comments) != 1 {
+			t.Fatalf("len(detail.Comments) = %d, want 1", len(detail.Comments))
+		}
+		return asString(detail.Comments[0]["threadFingerprint"])
+	}
+	without := viewFingerprint()
+	includeDecline = true
+	with := viewFingerprint()
+	if !sawViewer {
+		t.Fatal("want graphql viewer { login } fallback after integration api user failure")
+	}
+	if without == "" || without != with {
+		t.Fatalf("fingerprint without=%q with=%q, want authenticated same-thread decline replies excluded via viewer login", without, with)
+	}
+}
+
+func TestGatewayGetCurrentUserIdentityFallsBackToViewerForIntegrationTokens(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq {login: .login, id: .id}":
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case "api graphql -f query=query { viewer { login } }":
+			return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-app[bot]"}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	ident, err := gateway.GetCurrentUserIdentity(context.Background(), "")
+	if err != nil {
+		t.Fatalf("GetCurrentUserIdentity() error = %v", err)
+	}
+	if ident.Login != "looper-app[bot]" {
+		t.Fatalf("GetCurrentUserIdentity() login = %q, want looper-app[bot]", ident.Login)
 	}
 }
 

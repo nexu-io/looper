@@ -191,7 +191,7 @@ func (r *commandRuntime) createWebhookHook(ctx context.Context, ghPath, repo, de
 	body := map[string]any{
 		"name":   "web",
 		"active": true,
-		"events": []string{"check_run", "issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment", "push"},
+		"events": append([]string{}, webhookHookEvents...),
 		"config": map[string]string{"url": deliveryURL, "content_type": "json", "insecure_ssl": "0", "secret": secret},
 	}
 	raw, _ := json.Marshal(body)
