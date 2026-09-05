@@ -610,6 +610,42 @@ func (r *LoopsRepository) UpdateMetadataIfMatch(ctx context.Context, id string, 
 	return rowsAffected > 0, nil
 }
 
+// UpdateIfMatch writes the full loop row only when the live status and
+// metadata_json still match the expected snapshot. applied is false on a CAS
+// miss or when id is empty. Does not insert.
+func (r *LoopsRepository) UpdateIfMatch(ctx context.Context, record LoopRecord, expectedStatus string, expectedMetadataJSON *string) (applied bool, err error) {
+	id := strings.TrimSpace(record.ID)
+	if id == "" {
+		return false, nil
+	}
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE loops SET
+			seq = ?,
+			project_id = ?,
+			type = ?,
+			target_type = ?,
+			target_id = ?,
+			repo = ?,
+			pr_number = ?,
+			status = ?,
+			config_json = ?,
+			metadata_json = ?,
+			last_run_at = ?,
+			next_run_at = ?,
+			created_at = ?,
+			updated_at = ?
+		WHERE id = ? AND status = ? AND ((? IS NULL AND metadata_json IS NULL) OR metadata_json = ?)
+	`, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt, id, expectedStatus, expectedMetadataJSON, expectedMetadataJSON)
+	if err != nil {
+		return false, fmt.Errorf("update loop if match: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("update loop if match rows affected: %w", err)
+	}
+	return rowsAffected > 0, nil
+}
+
 func (r *LoopsRepository) GetBySeq(ctx context.Context, seq int64) (*LoopRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM loops WHERE seq = ?`, seq)
 	record, err := scanLoop(row)

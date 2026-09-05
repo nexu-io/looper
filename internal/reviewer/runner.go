@@ -7803,24 +7803,57 @@ func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
 	return attempts
 }
 
+// updateLoopBeforeWriteHook, when set (tests only), runs after a live GetByID
+// and before mutate+CAS so Continue can interleave.
+var updateLoopBeforeWriteHook func(loop storage.LoopRecord) error
+
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
-	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil {
-		return storage.LoopRecord{}, err
+	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		return storage.LoopRecord{}, fmt.Errorf("update loop requires loop storage")
 	}
-	if current != nil && current.Status == "terminated" {
-		return *current, nil
+	for range reviewScopeHumanPersistCASAttempts {
+		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if current != nil && current.Status == "terminated" {
+			return *current, nil
+		}
+		if updateLoopBeforeWriteHook != nil {
+			snapshot := loop
+			if current != nil {
+				snapshot = *current
+			}
+			if err := updateLoopBeforeWriteHook(snapshot); err != nil {
+				return storage.LoopRecord{}, err
+			}
+		}
+		updated := loop
+		if current != nil {
+			updated = *current
+		}
+		expectedStatus := updated.Status
+		expectedMetadata := updated.MetadataJSON
+		mutate(&updated)
+		updated.UpdatedAt = r.nowISO()
+		if current == nil {
+			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+				return storage.LoopRecord{}, err
+			}
+			return updated, nil
+		}
+		applied, err := r.repos.Loops.UpdateIfMatch(ctx, updated, expectedStatus, expectedMetadata)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if applied {
+			return updated, nil
+		}
 	}
-	updated := loop
-	if current != nil {
-		updated = *current
+	return storage.LoopRecord{}, &loopError{
+		message: fmt.Sprintf("update loop lost CAS for loop %s", loop.ID),
+		kind:    FailureRetryableTransient,
 	}
-	mutate(&updated)
-	updated.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
-		return storage.LoopRecord{}, err
-	}
-	return updated, nil
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {

@@ -13833,3 +13833,196 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
 	}
 }
+
+func TestUpdateLoopDoesNotRestoreReleasedBudgetHold(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*storage.LoopRecord)
+	}{
+		{
+			name: "success-finalization",
+			mutate: func(updated *storage.LoopRecord) {
+				if loops.IsReviewFixPairHold(*updated) {
+					updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+					updated.NextRunAt = nil
+					return
+				}
+				updated.Status = "completed"
+				updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+				updated.NextRunAt = nil
+			},
+		},
+		{
+			name: "claim-start",
+			mutate: func(updated *storage.LoopRecord) {
+				if !loops.IsReviewFixBudgetHold(*updated) {
+					updated.Status = "running"
+				}
+				updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+				updated.NextRunAt = nil
+			},
+		},
+		{
+			name: "failure-finalization",
+			mutate: func(updated *storage.LoopRecord) {
+				updated.LastRunAt = stringPtr("2026-04-17T12:34:56.000Z")
+				if loops.IsReviewFixPairHold(*updated) {
+					updated.NextRunAt = nil
+					return
+				}
+				updated.Status = "paused"
+				updated.NextRunAt = nil
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			target := "pr:acme/looper:42"
+			metadata := `{"followUpdates":true,"loop":{"iterationCount":3}}`
+			loop := storage.LoopRecord{
+				ID: "loop_update_" + tc.name, Seq: 920, ProjectID: "project_1", Type: "reviewer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("upsert loop: %v", err)
+			}
+			fixer := storage.LoopRecord{
+				ID: "loop_update_" + tc.name + "_fix", Seq: 921, ProjectID: "project_1", Type: "fixer",
+				TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+				Status: "queued", MetadataJSON: stringPtr(`{"followUpdates":true}`), CreatedAt: nowISO, UpdatedAt: nowISO,
+			}
+			if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+				t.Fatalf("upsert fixer: %v", err)
+			}
+			parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+				Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+				Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+				LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+				DB:       fixture.coordinator.DB(),
+			})
+			if err != nil {
+				t.Fatalf("ParkReviewFixBudget: %v", err)
+			}
+			if !loops.IsReviewFixBudgetHold(parked) {
+				t.Fatalf("precondition: want budget hold, got status=%s", parked.Status)
+			}
+			continued := false
+			updateLoopBeforeWriteHook = func(held storage.LoopRecord) error {
+				if continued {
+					return nil
+				}
+				continued = true
+				result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
+				if contErr != nil {
+					return contErr
+				}
+				if !result.Applied {
+					return fmt.Errorf("continue not applied")
+				}
+				return nil
+			}
+			t.Cleanup(func() { updateLoopBeforeWriteHook = nil })
+			runner := &Runner{repos: fixture.repos, now: fixture.now}
+			if _, err := runner.updateLoop(context.Background(), parked, tc.mutate); err != nil {
+				t.Fatalf("updateLoop: %v", err)
+			}
+			fresh, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if err != nil || fresh == nil {
+				t.Fatalf("get loop: (%#v, %v)", fresh, err)
+			}
+			if loops.IsReviewFixBudgetHold(*fresh) {
+				t.Fatalf("%s restored budget hold after Continue: status=%s meta=%s", tc.name, fresh.Status, derefString(fresh.MetadataJSON))
+			}
+			if loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+				t.Fatalf("%s Continue meters must stay reset, got publish count %d meta=%s", tc.name, loops.ReviewerPublishCount(fresh.MetadataJSON), derefString(fresh.MetadataJSON))
+			}
+		})
+	}
+}
+
+func TestFinalizeSuccessfulReviewerQueueDoesNotClobberBudgetContinue(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	target := "pr:acme/looper:42"
+	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true,"iterationCount":3}}`
+	loop := storage.LoopRecord{
+		ID: "loop_finalize_vs_continue", Seq: 930, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "running", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("upsert loop: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_finalize_vs_continue_fix", Seq: 931, ProjectID: "project_1", Type: "fixer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "queued", MetadataJSON: stringPtr(`{"followUpdates":true}`), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	payload := reviewerQueuePayloadJSON("abc123", "sig-done", true)
+	item := storage.QueueItemRecord{
+		ID: "queue_finalize_vs_continue", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: buildReviewerDedupeKey("project_1", loop.ID, repo, prNumber),
+		Priority:  storage.QueuePriorityReviewer, Status: "running",
+		AvailableAt: nowISO, Attempts: 0, MaxAttempts: 5,
+		PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), item); err != nil {
+		t.Fatalf("Upsert queue: %v", err)
+	}
+	continued := false
+	updateLoopBeforeWriteHook = func(held storage.LoopRecord) error {
+		if continued {
+			return nil
+		}
+		continued = true
+		result, contErr := loops.ApplyReviewFixBudgetAnswer(context.Background(), fixture.repos, held, "Continue", nowISO, loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3})
+		if contErr != nil {
+			return contErr
+		}
+		if !result.Applied {
+			return fmt.Errorf("continue not applied")
+		}
+		return nil
+	}
+	t.Cleanup(func() { updateLoopBeforeWriteHook = nil })
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos,
+		Logger: fixture.logger, Now: fixture.now,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	if _, err := runner.finalizeSuccessfulReviewerQueue(context.Background(),
+		storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp"}, parked, item, "run_finalize_continue",
+		reviewerCheckpoint{DispositionOnly: true}, "success", "disposition done"); err != nil {
+		t.Fatalf("finalizeSuccessfulReviewerQueue: %v", err)
+	}
+	fresh, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("get loop: (%#v, %v)", fresh, err)
+	}
+	if loops.IsReviewFixBudgetHold(*fresh) {
+		t.Fatalf("finalization restored budget hold after Continue: status=%s meta=%s", fresh.Status, derefString(fresh.MetadataJSON))
+	}
+	if loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("Continue meters must stay reset, got publish count %d meta=%s", loops.ReviewerPublishCount(fresh.MetadataJSON), derefString(fresh.MetadataJSON))
+	}
+}
