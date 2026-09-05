@@ -3040,10 +3040,14 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 	if err != nil {
 		return nil, err
 	}
-	looperLogin := ""
-	if login, err := g.GetCurrentUserLogin(ctx, cwd); err == nil {
-		looperLogin = strings.TrimSpace(login)
+	login, err := g.GetCurrentUserLogin(ctx, cwd)
+	if err != nil || strings.TrimSpace(login) == "" {
+		login, err = g.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+		if err != nil {
+			return nil, err
+		}
 	}
+	looperLogin := strings.TrimSpace(login)
 	out := make([]map[string]any, 0, 100)
 	cursor := ""
 	for {

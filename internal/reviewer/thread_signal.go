@@ -13,6 +13,9 @@ import (
 const (
 	// metadataLastReviewedSignalFingerprintKey is stored on Reviewer loop metadata.
 	metadataLastReviewedSignalFingerprintKey = "lastReviewedSignalFingerprint"
+	// metadataLastResolvedReviewThreadIDsKey stores IDs of threads that were
+	// resolved in the last persisted review-signal snapshot.
+	metadataLastResolvedReviewThreadIDsKey = "lastResolvedReviewThreadIDs"
 
 	threadResolutionMarkerNeedle = "looper:thread-resolution"
 	fixerDeclinedMarkerNeedle    = "looper-fixer-reply-declined"
@@ -87,52 +90,68 @@ func canonicalThreadFeedbackInput(threads []ReviewThread, looperLogin string) st
 	})
 	var b strings.Builder
 	for _, thread := range looperThreads {
-		b.WriteString("thread\x1e")
-		b.WriteString(strings.TrimSpace(thread.ID))
-		b.WriteByte('\x1f')
-		if thread.IsResolved {
-			b.WriteString("resolved")
-		} else {
-			b.WriteString("unresolved")
-		}
-		b.WriteByte('\n')
-		if thread.IsResolved {
-			continue
-		}
-		comments := make([]ReviewThreadComment, 0, len(thread.Comments))
-		for _, comment := range thread.Comments {
-			if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
-				continue
-			}
-			comments = append(comments, comment)
-		}
-		sort.SliceStable(comments, func(i, j int) bool {
-			if comments[i].ID != comments[j].ID {
-				return comments[i].ID < comments[j].ID
-			}
-			return comments[i].CreatedAt < comments[j].CreatedAt
-		})
-		for _, comment := range comments {
-			b.WriteString("comment\x1e")
-			b.WriteString(strings.TrimSpace(comment.ID))
-			b.WriteByte('\x1f')
-			b.WriteString(normalizeLogin(comment.Author))
-			b.WriteByte('\x1f')
-			b.WriteString(strings.ToUpper(strings.TrimSpace(comment.AuthorAssociation)))
-			b.WriteByte('\x1f')
-			b.WriteString(strings.TrimSpace(comment.CreatedAt))
-			b.WriteByte('\x1f')
-			b.WriteString(strings.TrimSpace(comment.UpdatedAt))
-			b.WriteByte('\x1f')
-			b.WriteString(normalizedBodyHash(comment.Body))
-			b.WriteByte('\x1f')
-			b.WriteString(strings.TrimSpace(comment.OriginalCommitOID))
-			b.WriteByte('\x1f')
-			b.WriteString(strings.TrimSpace(comment.CommitOID))
-			b.WriteByte('\n')
-		}
+		appendCanonicalThreadFeedback(&b, thread, looperLogin)
 	}
 	return b.String()
+}
+
+// candidateThreadFeedbackFingerprintForLogin fingerprints one already-selected
+// disposition candidate. Unlike ThreadFeedbackFingerprintForLogin it always
+// includes the thread, so a Reviewer audit after a third-party Fixer decline
+// does not look like external feedback drift (HasUnauditedValidatedFixerDecline
+// is false post-accept).
+func candidateThreadFeedbackFingerprintForLogin(thread ReviewThread, looperLogin string) string {
+	var b strings.Builder
+	appendCanonicalThreadFeedback(&b, thread, looperLogin)
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func appendCanonicalThreadFeedback(b *strings.Builder, thread ReviewThread, looperLogin string) {
+	b.WriteString("thread\x1e")
+	b.WriteString(strings.TrimSpace(thread.ID))
+	b.WriteByte('\x1f')
+	if thread.IsResolved {
+		b.WriteString("resolved")
+	} else {
+		b.WriteString("unresolved")
+	}
+	b.WriteByte('\n')
+	if thread.IsResolved {
+		return
+	}
+	comments := make([]ReviewThreadComment, 0, len(thread.Comments))
+	for _, comment := range thread.Comments {
+		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
+			continue
+		}
+		comments = append(comments, comment)
+	}
+	sort.SliceStable(comments, func(i, j int) bool {
+		if comments[i].ID != comments[j].ID {
+			return comments[i].ID < comments[j].ID
+		}
+		return comments[i].CreatedAt < comments[j].CreatedAt
+	})
+	for _, comment := range comments {
+		b.WriteString("comment\x1e")
+		b.WriteString(strings.TrimSpace(comment.ID))
+		b.WriteByte('\x1f')
+		b.WriteString(normalizeLogin(comment.Author))
+		b.WriteByte('\x1f')
+		b.WriteString(strings.ToUpper(strings.TrimSpace(comment.AuthorAssociation)))
+		b.WriteByte('\x1f')
+		b.WriteString(strings.TrimSpace(comment.CreatedAt))
+		b.WriteByte('\x1f')
+		b.WriteString(strings.TrimSpace(comment.UpdatedAt))
+		b.WriteByte('\x1f')
+		b.WriteString(normalizedBodyHash(comment.Body))
+		b.WriteByte('\x1f')
+		b.WriteString(strings.TrimSpace(comment.OriginalCommitOID))
+		b.WriteByte('\x1f')
+		b.WriteString(strings.TrimSpace(comment.CommitOID))
+		b.WriteByte('\n')
+	}
 }
 
 func normalizedBodyHash(body string) string {
@@ -291,12 +310,15 @@ func hasThreadResolutionAuditForSignalForLogin(thread ReviewThread, threadID, he
 // feedback already exists. Spec §8.2: retry observes the remote audit marker
 // and must not reclassify after Reviewer's own mutation. A later validated
 // Fixer decline after reject_wontfix is new input (§8.4) and must not resume.
-// accept_wontfix is not resumed when lastReviewedSignalFingerprint equals the
-// current-head signal computed with this thread forced resolved (reopen: the
-// post-resolve fingerprint was stored, then the thread was reopened). last !=
-// current alone is not reopen — crash-after-accept (including a stale last)
-// must still resume. Empty last still resumes (in-run retry).
-func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, looperLogin, lastSignal string, allThreads []ReviewThread) (threadResolutionAgentDecision, bool) {
+// accept_wontfix is not resumed when this thread ID is in lastResolvedIDs
+// (already resolved in the last persisted snapshot) or when lastReviewedSignalFingerprint
+// equals the current-head signal computed with every currently-unresolved
+// thread that has a matching accept_wontfix audit forced resolved (two-thread
+// reopen even before IDs exist). last != current alone is not reopen —
+// crash-after-accept (including a stale last or last==current) must still
+// resume when the thread ID is not in lastResolvedIDs. Empty last still
+// resumes (in-run retry).
+func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, looperLogin, lastSignal string, allThreads []ReviewThread, lastResolvedIDs []string) (threadResolutionAgentDecision, bool) {
 	headSHA = strings.TrimSpace(headSHA)
 	if headSHA == "" || strings.TrimSpace(thread.ID) == "" {
 		return threadResolutionAgentDecision{}, false
@@ -306,13 +328,16 @@ func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, loop
 	}
 	candidateFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, looperLogin)
 	if candidateFP != "" && hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, headSHA, candidateFP, "accept_wontfix", looperLogin) {
+		if threadIDInLastResolved(thread.ID, lastResolvedIDs) {
+			return threadResolutionAgentDecision{}, false
+		}
 		last := strings.TrimSpace(lastSignal)
 		if last != "" {
 			live := allThreads
 			if len(live) == 0 {
 				live = []ReviewThread{thread}
 			}
-			if last == reviewSignalWithThreadForcedResolved(live, thread.ID, headSHA, looperLogin) {
+			if last == reviewSignalWithUnresolvedAcceptsForcedResolved(live, headSHA, looperLogin) {
 				return threadResolutionAgentDecision{}, false
 			}
 		}
@@ -331,16 +356,41 @@ func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, loop
 	return threadResolutionAgentDecision{}, false
 }
 
-func reviewSignalWithThreadForcedResolved(threads []ReviewThread, threadID, headSHA, looperLogin string) string {
+func threadIDInLastResolved(threadID string, lastResolvedIDs []string) bool {
+	want := strings.TrimSpace(threadID)
+	if want == "" {
+		return false
+	}
+	for _, id := range lastResolvedIDs {
+		if strings.TrimSpace(id) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewSignalWithUnresolvedAcceptsForcedResolved(threads []ReviewThread, headSHA, looperLogin string) string {
 	copied := make([]ReviewThread, len(threads))
 	copy(copied, threads)
-	id := strings.TrimSpace(threadID)
 	for i := range copied {
-		if strings.TrimSpace(copied[i].ID) == id {
+		if copied[i].IsResolved {
+			continue
+		}
+		candidateFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{copied[i]}, looperLogin)
+		if candidateFP != "" && hasThreadResolutionAuditForSignalForLogin(copied[i], copied[i].ID, headSHA, candidateFP, "accept_wontfix", looperLogin) {
 			copied[i].IsResolved = true
 		}
 	}
 	return ComputeReviewSignalFingerprintForLogin(headSHA, copied, looperLogin)
+}
+
+func threadHasValidatedFixerDeclineFromAuthor(thread ReviewThread, looperLogin string) bool {
+	for _, comment := range thread.Comments {
+		if isValidatedFixerDeclinedCommentFromAuthor(comment, looperLogin, thread.ID) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasUnresolvedAcceptWontfixAudit is true when an unresolved Looper-authored
@@ -355,7 +405,7 @@ func hasUnresolvedAcceptWontfixAudit(thread ReviewThread, headSHA, looperLogin s
 	if thread.IsResolved {
 		return false
 	}
-	if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, headSHA, looperLogin, "", nil); ok && decision.Decision == "accept_wontfix" {
+	if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, headSHA, looperLogin, "", nil, nil); ok && decision.Decision == "accept_wontfix" {
 		return true
 	}
 	return latestValidatedAuditDecision(thread, looperLogin) == "accept_wontfix"

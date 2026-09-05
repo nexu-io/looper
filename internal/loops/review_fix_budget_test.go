@@ -1092,8 +1092,11 @@ func TestRefreshHandoffDoesNotResurrectHoldReleasedAfterGetByID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("park: %v", err)
 	}
+	// Continue after the hold-positive GetByID and before the metadata write.
+	// A later clock changes updated_at so the CAS no-ops instead of colliding.
+	continueAt := time.Date(2026, time.April, 17, 12, 34, 57, 0, time.UTC).UTC().Format("2006-01-02T15:04:05.000Z")
 	reviewFixBudgetHandoffAfterRefreshHook = func(exhausted storage.LoopRecord) error {
-		result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, exhausted, "Continue", nowISO, testBudgetCaps(3, 3))
+		result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, exhausted, "Continue", continueAt, testBudgetCaps(3, 3))
 		if err != nil {
 			return err
 		}

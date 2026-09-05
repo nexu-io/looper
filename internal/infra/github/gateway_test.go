@@ -2857,6 +2857,60 @@ func TestReviewThreadFingerprintFromNodesKeepsUntrustedDeclineQuotes(t *testing.
 	}
 }
 
+func TestGatewayViewPullRequestExcludesDeclineFingerprintForIntegrationTokens(t *testing.T) {
+	t.Parallel()
+	const baseComments = `[{"id":"c1","updatedAt":"2026-01-01T00:00:00Z","body":"Please fix <!-- looper:stamp v=1 -->"},{"id":"c2","updatedAt":"2026-01-01T00:01:00Z","body":"<!-- looper-fixer-reply thread:t1 sha:abc -->"}]`
+	const declineComment = `{"id":"c3","updatedAt":"2026-01-01T00:02:00Z","author":{"login":"Looper-Bot"},"body":"declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:deadbeef -->"}`
+	includeDecline := false
+	sawViewer := false
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"title":"Review me","body":"Body","url":"https://example.test/pull/42","state":"OPEN","isDraft":false,"reviewDecision":"COMMENTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[],"comments":[],"reviews":[],"statusCheckRollup":[]}`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq "):
+			return shell.Result{}, nil
+		case strings.HasPrefix(args, "api user"):
+			result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+			return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+		case args == "api graphql -f query=query { viewer { login } }":
+			sawViewer = true
+			return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-bot"}}}`}, nil
+		case strings.Contains(args, "reviewThreads(first: 100, after: $after)"):
+			nodes := baseComments
+			if includeDecline {
+				nodes = strings.TrimSuffix(baseComments, "]") + "," + declineComment + "]"
+			}
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"t1","isResolved":false,"comments":{"nodes":` + nodes + `}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	viewFingerprint := func() string {
+		t.Helper()
+		detail, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+		if err != nil {
+			t.Fatalf("ViewPullRequest() error = %v", err)
+		}
+		if len(detail.Comments) != 1 {
+			t.Fatalf("len(detail.Comments) = %d, want 1", len(detail.Comments))
+		}
+		return asString(detail.Comments[0]["threadFingerprint"])
+	}
+	without := viewFingerprint()
+	includeDecline = true
+	with := viewFingerprint()
+	if !sawViewer {
+		t.Fatal("want graphql viewer { login } fallback after integration api user failure")
+	}
+	if without == "" || without != with {
+		t.Fatalf("fingerprint without=%q with=%q, want authenticated same-thread decline replies excluded via viewer login", without, with)
+	}
+}
+
 func TestGatewayGetCurrentUserIdentityFallsBackToViewerForIntegrationTokens(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

@@ -1298,7 +1298,7 @@ func (r *Runner) sameHeadDiscoveryDecision(ctx context.Context, project storage.
 		if hasUnresolvedLooperAuthoredThreadsForLogin(threads, looperLogin) {
 			return sameHeadDiscoveryResult{action: sameHeadDiscoveryEnqueueDisposition, signal: signal}, nil
 		}
-		if err := r.persistLastReviewedSignalFingerprint(ctx, loop, signal); err != nil {
+		if err := r.persistLastReviewedSignalFingerprint(ctx, loop, signal, threads); err != nil {
 			return sameHeadDiscoveryResult{}, err
 		}
 		return sameHeadDiscoveryResult{action: sameHeadDiscoveryBaselineOnly, signal: signal}, nil
@@ -1354,13 +1354,17 @@ func (r *Runner) listReviewThreadsForSignal(ctx context.Context, cwd, repo strin
 	return r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: repo, PRNumber: prNumber, CWD: cwd, AllPages: true})
 }
 
-func (r *Runner) persistLastReviewedSignalFingerprint(ctx context.Context, loop storage.LoopRecord, signal string) error {
+func (r *Runner) persistLastReviewedSignalFingerprint(ctx context.Context, loop storage.LoopRecord, signal string, threads []ReviewThread) error {
 	signal = strings.TrimSpace(signal)
 	if signal == "" || r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
 		return nil
 	}
+	updates := map[string]any{metadataLastReviewedSignalFingerprintKey: signal}
+	if threads != nil {
+		updates[metadataLastResolvedReviewThreadIDsKey] = resolvedReviewThreadIDs(threads)
+	}
 	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		metadataJSON, metaErr := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{metadataLastReviewedSignalFingerprintKey: signal})
+		metadataJSON, metaErr := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
 		}
@@ -1372,6 +1376,48 @@ func (r *Runner) persistLastReviewedSignalFingerprint(ctx context.Context, loop 
 		return nil
 	}
 	return loops.RefreshReviewFixPairHandoff(ctx, r.repos, updated, signal, r.nowISO())
+}
+
+func resolvedReviewThreadIDs(threads []ReviewThread) []string {
+	ids := make([]string, 0, len(threads))
+	for _, thread := range threads {
+		if !thread.IsResolved {
+			continue
+		}
+		if id := strings.TrimSpace(thread.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func lastResolvedReviewThreadIDsFromMeta(meta map[string]any) []string {
+	if meta == nil {
+		return nil
+	}
+	switch raw := meta[metadataLastResolvedReviewThreadIDsKey].(type) {
+	case []string:
+		out := make([]string, 0, len(raw))
+		for _, id := range raw {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(raw))
+		for _, item := range raw {
+			if s, ok := stringFromAny(item); ok {
+				if trimmed := strings.TrimSpace(s); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func (r *Runner) allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx context.Context, cwd, repo string, pr PullRequestSummary, currentLogin string, meta map[string]any, policy DiscoveryPolicy) (bool, error) {
@@ -2872,7 +2918,7 @@ func (r *Runner) dispositionOnlyStillActionable(ctx context.Context, project sto
 		return true, nil
 	}
 	if strings.TrimSpace(last) == "" {
-		if err := r.persistLastReviewedSignalFingerprint(ctx, loop, live); err != nil {
+		if err := r.persistLastReviewedSignalFingerprint(ctx, loop, live, threads); err != nil {
 			return false, err
 		}
 	}
@@ -2908,7 +2954,7 @@ func (r *Runner) admitSameHeadDisposition(ctx context.Context, input stepInput, 
 			return true, signal, nil
 		}
 		// Baseline without publishing.
-		if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, signal); err != nil {
+		if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, signal, threads); err != nil {
 			return false, "", err
 		}
 		return false, signal, nil
@@ -3261,7 +3307,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		// Still promote baseline signal on continuous loops with no work so
 		// discovery does not re-queue forever after upgrade.
 		if checkpoint.DispositionOnly && checkpoint.ReviewSignalFingerprint != "" {
-			_ = r.persistLastReviewedSignalFingerprint(ctx, input.Loop, checkpoint.ReviewSignalFingerprint)
+			_ = r.persistLastReviewedSignalFingerprint(ctx, input.Loop, checkpoint.ReviewSignalFingerprint, nil)
 		}
 		return checkpoint, nil
 	}
@@ -3313,6 +3359,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	// Self-webhook / post-mutation admission: LIVE stored signal already matches.
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	lastReviewedSignal, _ := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey])
+	lastResolvedIDs := lastResolvedReviewThreadIDsFromMeta(meta)
 	if last, ok := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey]); ok && last == reviewSignalFP && checkpoint.DispositionOnly {
 		var finErr error
 		checkpoint, finErr = r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
@@ -3453,7 +3500,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		// No remaining candidates: promote baseline / finish.
 		checkpoint.ThreadResolution = result
 		if checkpoint.DispositionOnly || result.DispositionOnly {
-			if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP); err != nil {
+			if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP, threads); err != nil {
 				return checkpoint, err
 			}
 			var finErr error
@@ -3484,7 +3531,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	decisionByID := map[string]threadResolutionAgentDecision{}
 	classifyThreads := make([]ReviewThread, 0, len(candidateThreads))
 	for _, thread := range candidateThreads {
-		if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin, lastReviewedSignal, threads); ok {
+		if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin, lastReviewedSignal, threads, lastResolvedIDs); ok {
 			decisionByID[thread.ID] = decision
 			continue
 		}
@@ -3544,7 +3591,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		// stale evidence. Persist local signal identity so same-head polling
 		// does not re-enqueue unchanged input (§8.4). Legacy modes may still comment.
 		if decisionValue == "needs_human" && isDisposition {
-			candidateFeedbackFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, currentLogin)
+			candidateFeedbackFP := candidateThreadFeedbackFingerprintForLogin(thread, currentLogin)
 			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP, decisionValue)
 			if err != nil {
 				checkpoint.ThreadResolution = result
@@ -3572,7 +3619,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				return checkpoint, err
 			}
 			if loops.IsReviewFixBudgetHold(input.Loop) {
-				if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP); err != nil {
+				if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP, threads); err != nil {
 					return checkpoint, err
 				}
 			}
@@ -3592,7 +3639,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		}
 
 		// Per-candidate feedback identity for mutation-staleness (full thread FP).
-		candidateFeedbackFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, currentLogin)
+		candidateFeedbackFP := candidateThreadFeedbackFingerprintForLogin(thread, currentLogin)
 		// reject_wontfix markers store coordination-excluded FP so §8.4 one-rejection
 		// quota can match later declines without Fixer-decline noise in the marker.
 		markerFeedbackFP := candidateFeedbackFP
@@ -3925,7 +3972,7 @@ func (r *Runner) commitPostMutationThreadResolution(ctx context.Context, input s
 			return checkpoint, err
 		}
 	}
-	if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, postSignal); err != nil {
+	if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, postSignal, refetched); err != nil {
 		return checkpoint, err
 	}
 	result.PostMutationCommitPending = false
@@ -4048,8 +4095,8 @@ func appendUniqueString(values []string, value string) []string {
 var parkDispositionScopePersistHook func(loop storage.LoopRecord) error
 
 // reviewScopeHumanPersistBeforeUpsertHook, when set (tests only), runs after a
-// hold-positive live read and immediately before pending-scope Upsert so
-// Continue can interleave in the remaining GetByID-then-Upsert window.
+// hold-positive live read and immediately before pending-scope metadata CAS so
+// Continue can interleave in the remaining GetByID-then-CAS window.
 var reviewScopeHumanPersistBeforeUpsertHook func(loop storage.LoopRecord) error
 
 func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput, threadID, evidence, signal string) error {
@@ -4101,24 +4148,10 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 		if r.repos.Loops == nil {
 			return fmt.Errorf("persist pending review scope requires loop storage")
 		}
-		loop, err = refreshHeld()
-		if err != nil {
-			return err
-		}
-		if !loops.IsReviewFixBudgetHold(loop) {
-			return nil
-		}
 		if reviewScopeHumanPersistBeforeUpsertHook != nil {
 			if err := reviewScopeHumanPersistBeforeUpsertHook(loop); err != nil {
 				return err
 			}
-		}
-		loop, err = refreshHeld()
-		if err != nil {
-			return err
-		}
-		if !loops.IsReviewFixBudgetHold(loop) {
-			return nil
 		}
 		encoded, encErr := loops.PersistPendingReviewScopeHumanEvidence(
 			loop.MetadataJSON, question, message, r.reviewFixHITLEnabled(),
@@ -4126,9 +4159,20 @@ func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput,
 		if encErr != nil {
 			return encErr
 		}
-		loop.MetadataJSON = &encoded
-		loop.UpdatedAt = r.nowISO()
-		return r.repos.Loops.Upsert(ctx, loop)
+		applied, casErr := r.repos.Loops.UpdateMetadataIfUpdatedAt(ctx, loop.ID, &encoded, r.nowISO(), loop.UpdatedAt)
+		if casErr != nil {
+			return casErr
+		}
+		if !applied {
+			live, liveErr := refreshHeld()
+			if liveErr != nil {
+				return liveErr
+			}
+			if !loops.IsReviewFixBudgetHold(live) {
+				return nil
+			}
+		}
+		return nil
 	}
 	_, err := loops.ParkReviewScopeHuman(ctx, r.repos, loops.ParkReviewScopeHumanInput{
 		Held:        input.Loop,
@@ -4176,12 +4220,14 @@ func (r *Runner) refreshThreadResolutionCandidateForPath(ctx context.Context, in
 				}
 				return nil, detail, nil
 			}
-			if !isLooperAuthoredThreadForLogin(latest[i], currentLogin) {
+			if !isLooperAuthoredThreadForLogin(latest[i], currentLogin) && !threadHasValidatedFixerDeclineFromAuthor(latest[i], currentLogin) {
 				return nil, detail, nil
 			}
 			// Stale mutation guard: feedback fingerprint must match classified input.
+			// Use the always-include candidate fingerprint so a third-party decline
+			// thread does not look drifted after Reviewer's own accept/reject audit.
 			if classifiedFeedbackFP != "" {
-				liveFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{latest[i]}, currentLogin)
+				liveFP := candidateThreadFeedbackFingerprintForLogin(latest[i], currentLogin)
 				if liveFP != classifiedFeedbackFP {
 					return nil, detail, &loopError{message: "thread feedback changed during thread reconciliation", kind: FailureRetryableAfterResume}
 				}
@@ -8845,35 +8891,7 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(loop))
 	defer unlockTarget()
 
-	refreshLive := func() (*storage.LoopRecord, error) {
-		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-		if err != nil {
-			return nil, fmt.Errorf("refresh loop before pending review scope persist: %w", err)
-		}
-		if fresh == nil {
-			return nil, fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
-		}
-		return fresh, nil
-	}
-	fresh, err := refreshLive()
-	if err != nil {
-		return err
-	}
-	if !loops.IsReviewFixBudgetHold(*fresh) {
-		return r.parkReviewerScopeHuman(ctx, *fresh, completion)
-	}
-	if reviewScopeHumanPersistBeforeUpsertHook != nil {
-		if err := reviewScopeHumanPersistBeforeUpsertHook(*fresh); err != nil {
-			return err
-		}
-	}
-	live, err := refreshLive()
-	if err != nil {
-		return err
-	}
-	if !loops.IsReviewFixBudgetHold(*live) {
-		return r.parkReviewerScopeHuman(ctx, *live, completion)
-	}
+	var live *storage.LoopRecord
 	write := func(writeRepos *storage.Repositories) error {
 		current, err := writeRepos.Loops.GetByID(ctx, loop.ID)
 		if err != nil {
@@ -8891,19 +8909,8 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 				return err
 			}
 		}
-		latest, err := writeRepos.Loops.GetByID(ctx, loop.ID)
-		if err != nil {
-			return fmt.Errorf("refresh loop before pending review scope persist: %w", err)
-		}
-		if latest == nil {
-			return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
-		}
-		if !loops.IsReviewFixBudgetHold(*latest) {
-			live = latest
-			return nil
-		}
 		encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
-			latest.MetadataJSON,
+			current.MetadataJSON,
 			commentOnlyNeedsHumanQuestion(completion),
 			commentOnlyNeedsHumanEvidence(completion),
 			r.reviewFixHITLEnabled(),
@@ -8911,19 +8918,30 @@ func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop stor
 		if err != nil {
 			return err
 		}
-		latest.MetadataJSON = &encoded
-		latest.UpdatedAt = r.nowISO()
-		return writeRepos.Loops.Upsert(ctx, *latest)
-	}
-	if r.db != nil {
-		if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
-			return write(storage.NewRepositories(tx))
-		}); err != nil {
+		newUpdatedAt := r.nowISO()
+		applied, err := writeRepos.Loops.UpdateMetadataIfUpdatedAt(ctx, current.ID, &encoded, newUpdatedAt, current.UpdatedAt)
+		if err != nil {
 			return err
 		}
-	} else if err := write(r.repos); err != nil {
+		if !applied {
+			return nil
+		}
+		current.MetadataJSON = &encoded
+		current.UpdatedAt = newUpdatedAt
+		live = current
+		return nil
+	}
+	if err := write(r.repos); err != nil {
 		return err
 	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return fmt.Errorf("refresh loop after pending review scope persist: %w", err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
+	}
+	live = fresh
 	if !loops.IsReviewFixBudgetHold(*live) {
 		return r.parkReviewerScopeHuman(ctx, *live, completion)
 	}

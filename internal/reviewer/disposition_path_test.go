@@ -87,6 +87,76 @@ func TestNarrowDispositionRunsWhenThreadResolutionDisabled(t *testing.T) {
 	}
 }
 
+func TestCodexRootValidatedDeclineAcceptWontfixMutates(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "codex", Body: "This is a bug", CreatedAt: "t1", UpdatedAt: "t1"},
+			{ID: "c2", Author: "looper-bot", Body: "declined <!-- looper-fixer-reply-declined thread:thread_1 fingerprint:abc -->", CreatedAt: "t2", UpdatedAt: "t2"},
+		},
+	}}
+	if isLooperAuthoredThreadForLogin(threads[0], "looper-bot") {
+		t.Fatal("fixture must be a Codex-root thread")
+	}
+	if !threadHasValidatedFixerDeclineFromAuthor(threads[0], "looper-bot") {
+		t.Fatal("fixture must carry a validated Looper Fixer decline")
+	}
+	github := &fakeGitHubGateway{
+		currentLogin:  "looper-bot",
+		reviewThreads: threads,
+		viewHeadSHA:   "abc123",
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed",
+		Stdout: `{"decisions":[{"threadId":"thread_1","decision":"accept_wontfix","evidence":"outside PR scope","confidence":"high"}]}`,
+	}}}
+	fixture := newRunnerFixture(t)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","lastReviewedSignalFingerprint":"stale-signal"}`
+	loop := storage.LoopRecord{
+		ID: "loop_codex_decline", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert loop: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now,
+		ThreadResolution: policy,
+		LoopConfig:       testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if len(github.addThreadReplyCalls) != 1 {
+		t.Fatalf("replies = %#v, want accept_wontfix audit on Codex-root decline", github.addThreadReplyCalls)
+	}
+	if !strings.Contains(github.addThreadReplyCalls[0].Body, "decision=accept_wontfix") {
+		t.Fatalf("body = %q", github.addThreadReplyCalls[0].Body)
+	}
+	if len(github.resolveThreadCalls) != 1 {
+		t.Fatalf("resolves = %#v, want accept_wontfix resolve after audit", github.resolveThreadCalls)
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Processed != 1 {
+		t.Fatalf("ThreadResolution = %#v", checkpoint.ThreadResolution)
+	}
+}
+
 func TestRequireNewHeadDoesNotBlockDisposition(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)
@@ -2926,7 +2996,7 @@ func TestAcceptAuditHeadChangeIsReadmittedForReadjudication(t *testing.T) {
 	if ThreadHasChangedDispositionSignalForLogin(threads[0], "alice", "looper-bot") {
 		t.Fatal("H1 accept must keep the human directive audited")
 	}
-	if _, ok := resumeDispositionDecisionFromRemoteAudit(threads[0], "def456", "looper-bot", "", nil); ok {
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(threads[0], "def456", "looper-bot", "", nil, nil); ok {
 		t.Fatal("H1 accept must not resume on H2")
 	}
 	if !hasUnresolvedAcceptWontfixAudit(threads[0], "def456", "looper-bot") {
@@ -3857,7 +3927,7 @@ func TestBudgetHeldDispositionNeedsHumanRefreshErrorDoesNotUpsertStale(t *testin
 	if !loops.IsReviewFixBudgetHold(parked) {
 		t.Fatalf("fixture must be budget hold: %#v", parked)
 	}
-	querier := &failNthBudgetHeldLoopGet{db: fixture.coordinator.DB(), nth: 4}
+	querier := &failNthBudgetHeldLoopGet{db: fixture.coordinator.DB(), nth: 3}
 	runner := New(Options{
 		DB: fixture.coordinator.DB(), Repos: storage.NewRepositories(querier),
 		GitHub: &fakeGitHubGateway{currentLogin: "looper-bot"},
@@ -3931,7 +4001,6 @@ func TestBudgetHeldDispositionNeedsHumanContinueDoesNotRestoreHold(t *testing.T)
 		}
 		return nil
 	}
-	parkDispositionScopePersistHook = continueHeld
 	reviewScopeHumanPersistBeforeUpsertHook = continueHeld
 	t.Cleanup(func() {
 		parkDispositionScopePersistHook = nil

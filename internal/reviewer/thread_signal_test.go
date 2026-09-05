@@ -189,11 +189,11 @@ func TestResumeDispositionDecisionFromRemoteAudit(t *testing.T) {
 		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
 		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: threadResolutionMarker("t1", "abc", fp, "accept_wontfix")},
 	)
-	decision, ok := resumeDispositionDecisionFromRemoteAudit(withAudit, "abc", "looper-bot", "", nil)
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(withAudit, "abc", "looper-bot", "", nil, nil)
 	if !ok || decision.Decision != "accept_wontfix" {
 		t.Fatalf("got %#v ok=%v, want accept resume", decision, ok)
 	}
-	if _, ok := resumeDispositionDecisionFromRemoteAudit(base, "abc", "looper-bot", "", nil); ok {
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(base, "abc", "looper-bot", "", nil, nil); ok {
 		t.Fatal("missing audit must not resume")
 	}
 	if !hasUnresolvedAcceptWontfixAudit(withAudit, "abc", "looper-bot") {
@@ -227,7 +227,7 @@ func TestUnresolvedAcceptAuditIsReadmittedAfterHeadChange(t *testing.T) {
 	if ThreadHasChangedDispositionSignalForLogin(withAudit, "alice", "looper-bot") {
 		t.Fatal("H1 accept must keep the human directive audited")
 	}
-	if _, ok := resumeDispositionDecisionFromRemoteAudit(withAudit, "def", "looper-bot", "", nil); ok {
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(withAudit, "def", "looper-bot", "", nil, nil); ok {
 		t.Fatal("H1 accept must not resume as current-head authority")
 	}
 	if !hasUnresolvedAcceptWontfixAudit(withAudit, "def", "looper-bot") {
@@ -250,7 +250,7 @@ func TestResumeRejectDoesNotSwallowPostRejectDecline(t *testing.T) {
 		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix no", CreatedAt: "t2", UpdatedAt: "t2"},
 		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
 	)
-	decision, ok := resumeDispositionDecisionFromRemoteAudit(afterReject, "abc", "looper-bot", "", nil)
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(afterReject, "abc", "looper-bot", "", nil, nil)
 	if !ok || decision.Decision != "reject_wontfix" {
 		t.Fatalf("got %#v ok=%v, want reject resume before second decline", decision, ok)
 	}
@@ -260,7 +260,7 @@ func TestResumeRejectDoesNotSwallowPostRejectDecline(t *testing.T) {
 		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
 		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:t1 fingerprint:x attempt:post-reject -->", CreatedAt: "t4", UpdatedAt: "t4"},
 	)
-	if _, ok := resumeDispositionDecisionFromRemoteAudit(second, "abc", "looper-bot", "", nil); ok {
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(second, "abc", "looper-bot", "", nil, nil); ok {
 		t.Fatal("post-reject decline must not resume reject_wontfix")
 	}
 	if !ForceNeedsHumanAfterSecondDecline(second, "abc", "looper-bot") {
@@ -299,19 +299,86 @@ func TestResumeAcceptWontfixDoesNotReuseReopenedThread(t *testing.T) {
 	}
 	resolvedSignal := ReviewSignalFingerprint("abc", resolvedFP)
 	openSignal := ReviewSignalFingerprint("abc", openFP)
-	if _, ok := resumeDispositionDecisionFromRemoteAudit(reopened, "abc", "looper-bot", resolvedSignal, []ReviewThread{reopened}); ok {
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(reopened, "abc", "looper-bot", resolvedSignal, []ReviewThread{reopened}, nil); ok {
 		t.Fatal("reopen must not resume accept_wontfix")
 	}
 	if !hasUnresolvedAcceptWontfixAudit(reopened, "abc", "looper-bot") {
 		t.Fatal("reopened accept must stay a classifier candidate")
 	}
-	decision, ok := resumeDispositionDecisionFromRemoteAudit(accepted, "abc", "looper-bot", openSignal, []ReviewThread{accepted})
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(accepted, "abc", "looper-bot", openSignal, []ReviewThread{accepted}, nil)
 	if !ok || decision.Decision != "accept_wontfix" {
 		t.Fatalf("crash-before-resolve got %#v ok=%v, want accept resume", decision, ok)
 	}
-	stale, ok := resumeDispositionDecisionFromRemoteAudit(accepted, "abc", "looper-bot", "stale-signal", []ReviewThread{accepted})
+	stale, ok := resumeDispositionDecisionFromRemoteAudit(accepted, "abc", "looper-bot", "stale-signal", []ReviewThread{accepted}, nil)
 	if !ok || stale.Decision != "accept_wontfix" {
 		t.Fatalf("stale last got %#v ok=%v, want accept resume", stale, ok)
+	}
+	same := ComputeReviewSignalFingerprintForLogin("abc", []ReviewThread{accepted}, "looper-bot")
+	lastEq, ok := resumeDispositionDecisionFromRemoteAudit(accepted, "abc", "looper-bot", same, []ReviewThread{accepted}, nil)
+	if !ok || lastEq.Decision != "accept_wontfix" {
+		t.Fatalf("last==current got %#v ok=%v, want accept resume", lastEq, ok)
+	}
+}
+
+func TestResumeAcceptWontfixDoesNotReuseTwoReopenedThreads(t *testing.T) {
+	t.Parallel()
+	accepted := func(id string, resolved bool) ReviewThread {
+		base := looperThread(id, false,
+			looperRoot("c1-"+id, "Please fix "+id),
+			ReviewThreadComment{ID: "c2-" + id, Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		)
+		fp := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+		return looperThread(id, resolved,
+			looperRoot("c1-"+id, "Please fix "+id),
+			ReviewThreadComment{ID: "c2-" + id, Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+			ReviewThreadComment{ID: "c3-" + id, Author: "looper-bot", Body: threadResolutionMarker(id, "abc", fp, "accept_wontfix")},
+		)
+	}
+	t1res := accepted("t1", true)
+	t2res := accepted("t2", true)
+	resolvedSignal := ComputeReviewSignalFingerprintForLogin("abc", []ReviewThread{t1res, t2res}, "looper-bot")
+	t1open := t1res
+	t1open.IsResolved = false
+	t2open := t2res
+	t2open.IsResolved = false
+	live := []ReviewThread{t1open, t2open}
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(t1open, "abc", "looper-bot", resolvedSignal, live, nil); ok {
+		t.Fatal("reopened t1 must not resume accept_wontfix")
+	}
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(t2open, "abc", "looper-bot", resolvedSignal, live, nil); ok {
+		t.Fatal("reopened t2 must not resume accept_wontfix")
+	}
+}
+
+func TestResumeAcceptWontfixSkipsReopenWhenSiblingCommentsChange(t *testing.T) {
+	t.Parallel()
+	accepted := func(id string, resolved bool) ReviewThread {
+		base := looperThread(id, false,
+			looperRoot("c1-"+id, "Please fix "+id),
+			ReviewThreadComment{ID: "c2-" + id, Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		)
+		fp := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+		return looperThread(id, resolved,
+			looperRoot("c1-"+id, "Please fix "+id),
+			ReviewThreadComment{ID: "c2-" + id, Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+			ReviewThreadComment{ID: "c3-" + id, Author: "looper-bot", Body: threadResolutionMarker(id, "abc", fp, "accept_wontfix")},
+		)
+	}
+	t1res := accepted("t1", true)
+	t2res := accepted("t2", true)
+	t3old := looperThread("t3", false, looperRoot("c1-t3", "Please look at this"))
+	lastSignal := ComputeReviewSignalFingerprintForLogin("abc", []ReviewThread{t1res, t2res, t3old}, "looper-bot")
+	t1open := t1res
+	t1open.IsResolved = false
+	t3new := looperThread("t3", false, looperRoot("c1-t3", "Please look at this carefully"))
+	live := []ReviewThread{t1open, t2res, t3new}
+	lastResolved := []string{"t1", "t2"}
+	if _, ok := resumeDispositionDecisionFromRemoteAudit(t1open, "abc", "looper-bot", lastSignal, live, lastResolved); ok {
+		t.Fatal("reopened t1 must not resume when lastResolvedIDs contains it")
+	}
+	crash := accepted("t1", false)
+	if decision, ok := resumeDispositionDecisionFromRemoteAudit(crash, "abc", "looper-bot", lastSignal, []ReviewThread{crash, t2res, t3new}, []string{"t2"}); !ok || decision.Decision != "accept_wontfix" {
+		t.Fatalf("crash-before-resolve got %#v ok=%v, want accept resume", decision, ok)
 	}
 }
 

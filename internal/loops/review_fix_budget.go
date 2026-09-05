@@ -500,8 +500,8 @@ var reviewFixBudgetReleaseHook func(loopID string) error
 var reviewFixBudgetHandoffPersistHook func(exhausted storage.LoopRecord) error
 
 // reviewFixBudgetHandoffAfterRefreshHook, when set (tests only), runs after a
-// hold-positive GetByID and before the live re-read/Upsert so Continue can
-// interleave in the remaining GetByID-then-Upsert window.
+// hold-positive GetByID and before the metadata CAS so Continue can
+// interleave in the remaining GetByID-then-write window.
 var reviewFixBudgetHandoffAfterRefreshHook func(exhausted storage.LoopRecord) error
 
 func parkOneSiblingReviewFixLoop(ctx context.Context, repos *storage.Repositories, sibling storage.LoopRecord, exhaustedBy, nowISO string) error {
@@ -588,27 +588,21 @@ func ensureReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repos
 				return err
 			}
 		}
-		// Authority is the live row immediately before Upsert, not the
-		// hold-positive snapshot above. Continue/Stop may have released it.
-		latest, err := repos.Loops.GetByID(ctx, exhausted.ID)
+		state = ReadReviewFixBudgetState(fresh.MetadataJSON)
+		state.HandoffEventAt = input.NowISO
+		encoded, err := WriteReviewFixBudgetState(fresh.MetadataJSON, state)
 		if err != nil {
 			return err
 		}
-		if latest == nil || !IsReviewFixBudgetHold(*latest) {
+		applied, err := repos.Loops.UpdateMetadataIfUpdatedAt(ctx, fresh.ID, &encoded, input.NowISO, fresh.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if !applied {
 			return nil
 		}
-		exhausted = *latest
 	}
-	state = ReadReviewFixBudgetState(exhausted.MetadataJSON)
-	state.HandoffEventAt = input.NowISO
-	encoded, err := WriteReviewFixBudgetState(exhausted.MetadataJSON, state)
-	if err != nil {
-		return err
-	}
-	updated := exhausted
-	updated.MetadataJSON = &encoded
-	updated.UpdatedAt = input.NowISO
-	return repos.Loops.Upsert(ctx, updated)
+	return nil
 }
 
 func appendReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repositories, exhausted storage.LoopRecord, input ParkReviewFixBudgetInput, signal string) error {
