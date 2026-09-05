@@ -243,10 +243,12 @@ func ThreadsHaveChangedDispositionSignalForLogin(threads []ReviewThread, prAutho
 // ForceNeedsHumanAfterSecondDecline reports §8.4 one-rejection quota: after
 // Reviewer reject_wontfix on an input, a later validated Fixer decline with
 // unchanged head + same canonical human/original-finding feedback forces
-// needs_human without another classifier argument. Changed head or changed
-// trusted human directive is new adjudicated input (quota resets).
+// needs_human without another classifier argument. Applies to Looper-authored
+// threads and to third-party (Human/Codex) threads that carry a validated
+// Fixer decline. Changed head or changed trusted human directive is new
+// adjudicated input (quota resets).
 func ForceNeedsHumanAfterSecondDecline(thread ReviewThread, headSHA, looperLogin string) bool {
-	if thread.IsResolved || !isLooperAuthoredThreadForLogin(thread, looperLogin) {
+	if thread.IsResolved {
 		return false
 	}
 	headSHA = strings.TrimSpace(headSHA)
@@ -301,12 +303,10 @@ func ForceNeedsHumanAfterSecondDecline(thread ReviewThread, headSHA, looperLogin
 }
 
 // coordinationExcludedThreadFeedbackFingerprint hashes human/original-finding
-// feedback on a Looper-authored thread after excluding validated Reviewer audits
-// and validated Fixer decline/fixed coordination replies.
+// feedback after excluding validated Reviewer audits and validated Fixer
+// decline/fixed coordination replies. Used on Looper-authored threads and on
+// third-party threads whose original finding must still match the reject marker.
 func coordinationExcludedThreadFeedbackFingerprint(thread ReviewThread, looperLogin string) string {
-	if !isLooperAuthoredThreadForLogin(thread, looperLogin) {
-		return ""
-	}
 	filtered := ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved}
 	for _, comment := range thread.Comments {
 		if isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
@@ -317,7 +317,7 @@ func coordinationExcludedThreadFeedbackFingerprint(thread ReviewThread, looperLo
 		}
 		filtered.Comments = append(filtered.Comments, comment)
 	}
-	return ThreadFeedbackFingerprintForLogin([]ReviewThread{filtered}, looperLogin)
+	return candidateThreadFeedbackFingerprintForLogin(filtered, looperLogin)
 }
 
 // LastReviewerDispositionDecision returns the latest validated Reviewer

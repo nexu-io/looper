@@ -353,3 +353,33 @@ func TestHasUnauditedValidatedFixerDeclineAdmitsNonLooperRoot(t *testing.T) {
 		t.Fatal("trusted /looper wontfix must still require a Looper-authored root")
 	}
 }
+
+func TestForceNeedsHumanAfterSecondDeclineOnCodexRoot(t *testing.T) {
+	t.Parallel()
+	base := ReviewThread{ID: "t1", Comments: []ReviewThreadComment{
+		{ID: "c1", Author: "codex", Body: "This is a bug", CreatedAt: "t1", UpdatedAt: "t1"},
+	}}
+	if isLooperAuthoredThreadForLogin(base, "looper-bot") {
+		t.Fatal("fixture must be a Codex-root thread")
+	}
+	excl := coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot")
+	if excl == "" {
+		t.Fatal("third-party original finding must still have a coordination-excluded fingerprint")
+	}
+	runner := &Runner{}
+	rejectBody := runner.buildThreadResolutionReplyWithFeedback(
+		"t1", "abc",
+		excl,
+		threadResolutionAgentDecision{Decision: "reject_wontfix", Evidence: "still in scope", Confidence: "high"},
+		config.ReviewerThreadResolutionConfig{},
+	)
+	thread := ReviewThread{ID: "t1", Comments: []ReviewThreadComment{
+		{ID: "c1", Author: "codex", Body: "This is a bug", CreatedAt: "t1", UpdatedAt: "t1"},
+		{ID: "c2", Author: "looper-bot", Body: "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:x -->", CreatedAt: "t2", UpdatedAt: "t2"},
+		{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
+		{ID: "c4", Author: "looper-bot", Body: "second <!-- looper-fixer-reply-declined thread:t1 fingerprint:y attempt:post-reject -->", CreatedAt: "t4", UpdatedAt: "t4"},
+	}}
+	if !ForceNeedsHumanAfterSecondDecline(thread, "abc", "looper-bot") {
+		t.Fatal("second unchanged-input decline after reject on a Codex-root thread must force needs_human")
+	}
+}

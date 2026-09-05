@@ -1013,6 +1013,82 @@ func TestPostRejectDeclineMarkerParksNeedsHumanWithoutClassifier(t *testing.T) {
 	}
 }
 
+func TestPostRejectDeclineOnCodexRootParksNeedsHumanWithoutClassifier(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	base := ReviewThread{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "codex", Body: "This is a bug", CreatedAt: "t1", UpdatedAt: "t1"},
+		},
+	}
+	if isLooperAuthoredThreadForLogin(base, "looper-bot") {
+		t.Fatal("fixture must be a Codex-root thread")
+	}
+	runnerForMarker := &Runner{}
+	rejectBody := runnerForMarker.buildThreadResolutionReplyWithFeedback(
+		"thread_1", "abc123",
+		coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot"),
+		threadResolutionAgentDecision{Decision: "reject_wontfix", Evidence: "still in scope", Confidence: "high"},
+		config.ReviewerThreadResolutionConfig{},
+	)
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "codex", Body: "This is a bug", CreatedAt: "t1", UpdatedAt: "t1"},
+			{ID: "c2", Author: "looper-bot", Body: "<!-- looper-fixer-reply-declined thread:thread_1 fingerprint:x -->", CreatedAt: "t2", UpdatedAt: "t2"},
+			{ID: "c3", Author: "looper-bot", Body: rejectBody, CreatedAt: "t3", UpdatedAt: "t3"},
+			{ID: "c4", Author: "looper-bot", Body: "second decline <!-- looper-fixer-reply-declined thread:thread_1 fingerprint:x attempt:post-reject -->", CreatedAt: "t4", UpdatedAt: "t4"},
+		},
+	}}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"}
+	agent := &fakeAgentExecutor{results: []AgentResult{{
+		Status: "completed",
+		Stdout: `{"decisions":[{"threadId":"thread_1","decision":"reject_wontfix","evidence":"flip","confidence":"high"}]}`,
+	}}}
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true}}`
+	loop := storage.LoopRecord{
+		ID: "loop_codex_post_reject", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+	if _, err := runner.runThreadResolutionStep(context.Background(), input); err != nil {
+		t.Fatalf("runThreadResolutionStep: %v", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("classifier starts = %d, want 0 for ForceNeedsHuman on Codex-root post-reject decline", len(agent.starts))
+	}
+	parked, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || parked == nil {
+		t.Fatalf("parked loop = (%#v, %v)", parked, err)
+	}
+	if !loops.IsReviewScopeHumanHold(*parked) {
+		t.Fatalf("loop metadata = %v, want review-scope human hold", parked.MetadataJSON)
+	}
+}
+
 func TestRejectWontfixMarkerUsesCoordinationExcludedFeedback(t *testing.T) {
 	t.Parallel()
 	policy := defaultThreadResolutionPolicy(t)

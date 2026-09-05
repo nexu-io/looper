@@ -1354,6 +1354,10 @@ func (r *Runner) listReviewThreadsForSignal(ctx context.Context, cwd, repo strin
 	return r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: repo, PRNumber: prNumber, CWD: cwd, AllPages: true})
 }
 
+// persistLastReviewedSignalBeforeCASHook, when set (tests only), runs after a
+// live GetByID and before the metadata CAS so Continue can interleave.
+var persistLastReviewedSignalBeforeCASHook func(loop storage.LoopRecord) error
+
 func (r *Runner) persistLastReviewedSignalFingerprint(ctx context.Context, loop storage.LoopRecord, signal string, threads []ReviewThread) error {
 	signal = strings.TrimSpace(signal)
 	if signal == "" || r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
@@ -1363,19 +1367,50 @@ func (r *Runner) persistLastReviewedSignalFingerprint(ctx context.Context, loop 
 	if threads != nil {
 		updates[metadataLastResolvedReviewThreadIDsKey] = resolvedReviewThreadIDs(threads)
 	}
-	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		metadataJSON, metaErr := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
-		if metaErr == nil {
-			updated.MetadataJSON = &metadataJSON
+	var live storage.LoopRecord
+	applied := false
+	for range reviewScopeHumanPersistCASAttempts {
+		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
 		}
-	})
-	if err != nil {
-		return err
+		if current == nil {
+			return fmt.Errorf("persist last reviewed signal lost loop %s", loop.ID)
+		}
+		if current.Status == "terminated" {
+			return nil
+		}
+		if persistLastReviewedSignalBeforeCASHook != nil {
+			if err := persistLastReviewedSignalBeforeCASHook(*current); err != nil {
+				return err
+			}
+		}
+		encoded, err := mergeLoopMetadataJSON(current.MetadataJSON, updates)
+		if err != nil {
+			return err
+		}
+		ok, err := r.repos.Loops.UpdateMetadataIfMatch(ctx, current.ID, &encoded, r.nowISO(), current.MetadataJSON)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		current.MetadataJSON = &encoded
+		live = *current
+		applied = true
+		break
 	}
-	if !loops.IsReviewFixBudgetHold(updated) {
+	if !applied {
+		return &loopError{
+			message: fmt.Sprintf("persist last reviewed signal lost CAS for loop %s", loop.ID),
+			kind:    FailureRetryableTransient,
+		}
+	}
+	if !loops.IsReviewFixBudgetHold(live) {
 		return nil
 	}
-	return loops.RefreshReviewFixPairHandoff(ctx, r.repos, updated, signal, r.nowISO())
+	return loops.RefreshReviewFixPairHandoff(ctx, r.repos, live, signal, r.nowISO())
 }
 
 func resolvedReviewThreadIDs(threads []ReviewThread) []string {
