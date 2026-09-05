@@ -656,6 +656,15 @@ counters/reason; CLI/dashboard may refresh thread links and PR state from the
 provider. This keeps historical evidence without another state copy to
 reconcile.
 
+Operator CLI and dashboard currently show the inspected loop's hold reason
+and exact unpause/stop commands only. The rest of this evidence list (PR,
+lane, current head, last reviewed signal, count/live cap meters, exhausted
+roles, unresolved `must_fix` links, pending `wontfix`/decline reasons,
+late-discovery blockers, last outcome/progress, provider-refreshed thread
+state) is deferred to a later bounded implementation: one backend-computed
+brief, CLI/dashboard display the same result, no TypeScript inference, no
+full-project polling, no persisted handoff record.
+
 ## 10. Module design
 
 ### 10.1 Reviewer convergence Module
@@ -943,8 +952,9 @@ go build ./...
 4. **Thread signal:** narrow feature gate, fingerprint, stable queue coalescing,
    same-head polling/webhook trigger, extended decisions, post-mutation signal
    commit, and stale-mutation guard tests.
-5. **Docs/observability:** configuration guide, user guide, dashboard/CLI handoff
-   detail, metrics/events for disposition and budget outcomes.
+5. **Docs/observability:** configuration guide, user guide, and the reduced
+   operator surface (docs plus inspected-loop hold reason and exact unpause/stop
+   commands). The full §9.5 handoff brief is not in this slice.
 
 Each slice must leave existing authority and lifecycle invariants intact. Do not
 merge a prompt-only partial that publishes new disposition words without the
