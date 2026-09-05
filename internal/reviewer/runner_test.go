@@ -11585,6 +11585,9 @@ func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing
 	if loops.IsReviewFixBudgetHold(*fresh) {
 		t.Fatalf("stale persist restored budget hold after Continue: status=%s meta=%s", fresh.Status, derefString(fresh.MetadataJSON))
 	}
+	if loops.ReviewerPublishCount(fresh.MetadataJSON) != 0 {
+		t.Fatalf("Continue meters must stay reset, got publish count %d meta=%s", loops.ReviewerPublishCount(fresh.MetadataJSON), derefString(fresh.MetadataJSON))
+	}
 	if !loops.IsReviewScopeHumanHold(*fresh) {
 		t.Fatalf("want scope hold after Continue-then-persist: status=%s meta=%s", fresh.Status, derefString(fresh.MetadataJSON))
 	}
@@ -11595,7 +11598,91 @@ func TestPersistPendingReviewerScopeHumanDoesNotClobberBudgetContinue(t *testing
 	if !ok || !loops.IsReviewScopeHumanAsk(ask) || loops.IsReviewFixBudgetAsk(ask) {
 		t.Fatalf("ask = (%#v, %v), want scope ask without restored budget ask", ask, ok)
 	}
+
 }
+func TestBudgetHeldDispositionNeedsHumanCASMissWhileHeldRetriesOrErrors(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	revMeta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","loop":{"enabled":true,"iterationCount":3}}`
+	loop := storage.LoopRecord{
+		ID: "loop_nh_budget_cas_miss", Seq: 41, ProjectID: "project_1", Type: "reviewer", Status: "running",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: &revMeta,
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert reviewer: %v", err)
+	}
+	fixer := storage.LoopRecord{
+		ID: "loop_nh_budget_cas_miss_fix", Seq: 42, ProjectID: "project_1", Type: "fixer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: &repo, PRNumber: &prNumber, MetadataJSON: stringPtr(`{"followUpdates":true}`),
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
+		t.Fatalf("Upsert fixer: %v", err)
+	}
+	parked, err := loops.ParkReviewFixBudget(context.Background(), fixture.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted: loop, Role: "reviewer", Repo: repo, PRNumber: prNumber,
+		Count: 3, Cap: 3, NowISO: nowISO, HITLEnabled: false,
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{ReviewerMaxPublishes: 3, FixerMaxPushes: 3},
+		DB:       fixture.coordinator.DB(),
+	})
+	if err != nil {
+		t.Fatalf("ParkReviewFixBudget: %v", err)
+	}
+	if !loops.IsReviewFixBudgetHold(parked) {
+		t.Fatalf("fixture must be budget hold: %#v", parked)
+	}
+	mutated := false
+	reviewScopeHumanPersistBeforeUpsertHook = func(held storage.LoopRecord) error {
+		if mutated {
+			return nil
+		}
+		mutated = true
+		live, getErr := fixture.repos.Loops.GetByID(context.Background(), held.ID)
+		if getErr != nil || live == nil {
+			return fmt.Errorf("get held loop: (%#v, %v)", live, getErr)
+		}
+		meta := parseJSONObject(live.MetadataJSON)
+		meta["casNoise"] = "competing-write"
+		encoded, marshalErr := json.Marshal(meta)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		text := string(encoded)
+		live.MetadataJSON = &text
+		live.UpdatedAt = nowISO
+		return fixture.repos.Loops.Upsert(context.Background(), *live)
+	}
+	t.Cleanup(func() { reviewScopeHumanPersistBeforeUpsertHook = nil })
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "looper-bot"},
+		Logger: fixture.logger, Now: fixture.now, LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = parked
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Repo = repo
+	input.PRNumber = prNumber
+	parkErr := runner.parkDispositionNeedsHuman(context.Background(), input, "thread_1", "ambiguous", "sig-needs-human")
+	after, getErr := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if getErr != nil || after == nil {
+		t.Fatalf("get reviewer: (%#v, %v)", after, getErr)
+	}
+	if !loops.IsReviewFixBudgetHold(*after) {
+		t.Fatalf("competing write must leave budget hold: status=%s meta=%s", after.Status, derefString(after.MetadataJSON))
+	}
+	if parkErr != nil {
+		return
+	}
+	if !loops.HasPendingReviewScopeHuman(*after) {
+		t.Fatalf("CAS miss while held must persist evidence or error, got nil with meta=%s", derefString(after.MetadataJSON))
+	}
+}
+
 func TestPublishAlreadyPublishedNeedsHumanSkipsScopeOnNewHead(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -399,11 +399,72 @@ func TestCanonicalFingerprintIncludesThirdPartyFixerDecline(t *testing.T) {
 	if ThreadFeedbackFingerprintForLogin([]ReviewThread{withDecline}, "looper-bot") == ThreadFeedbackFingerprintForLogin([]ReviewThread{withoutDecline}, "looper-bot") {
 		t.Fatal("unresolved Codex decline must change the review signal fingerprint")
 	}
+	openFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{withDecline}, "looper-bot")
+	if openFP == "" {
+		t.Fatal("expected third-party decline fingerprint")
+	}
+	accepted := ReviewThread{ID: "t1", Comments: []ReviewThreadComment{
+		codexRoot,
+		{ID: "c2", Author: "looper-bot", Body: "declined <!-- looper-fixer-reply-declined thread:t1 fingerprint:abc -->", CreatedAt: "t2", UpdatedAt: "t2"},
+		{ID: "c3", Author: "looper-bot", Body: threadResolutionMarker("t1", "abc", openFP, "accept_wontfix"), CreatedAt: "t3", UpdatedAt: "t3"},
+	}}
+	if ThreadFeedbackFingerprintForLogin([]ReviewThread{accepted}, "looper-bot") != openFP {
+		t.Fatal("third-party accept must stay in fingerprint until resolved")
+	}
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(accepted, "abc", "looper-bot", "", nil, nil)
+	if !ok || decision.Decision != "accept_wontfix" {
+		t.Fatalf("crash-after-accept got %#v ok=%v, want accept resume", decision, ok)
+	}
+	resolved := accepted
+	resolved.IsResolved = true
+	if ThreadFeedbackFingerprintForLogin([]ReviewThread{resolved}, "looper-bot") == openFP {
+		t.Fatal("resolved third-party thread must leave the open fingerprint")
+	}
 	humanWontfix := ReviewThread{ID: "t1", Comments: []ReviewThreadComment{
 		{ID: "c1", Author: "alice", AuthorAssociation: "OWNER", Body: "Please fix", CreatedAt: "t1", UpdatedAt: "t1"},
 		{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix out of scope", CreatedAt: "t2", UpdatedAt: "t2"},
 	}}
 	if ThreadHasChangedDispositionSignalForLogin(humanWontfix, "alice", "looper-bot") {
 		t.Fatal("trusted /looper wontfix must still require a Looper-authored root")
+	}
+}
+
+func TestResumeHonorsLatestRejectOverHistoricalAccept(t *testing.T) {
+	t.Parallel()
+	base := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+	)
+	openFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+	if openFP == "" {
+		t.Fatal("expected open fingerprint")
+	}
+	excl := coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot")
+	if excl == "" {
+		t.Fatal("expected coordination-excluded fingerprint")
+	}
+	afterReject := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: threadResolutionMarker("t1", "abc", openFP, "accept_wontfix"), CreatedAt: "t3", UpdatedAt: "t3"},
+		ReviewThreadComment{ID: "c4", Author: "looper-bot", Body: threadResolutionMarker("t1", "abc", excl, "reject_wontfix"), CreatedAt: "t4", UpdatedAt: "t4"},
+	)
+	if latestValidatedAuditDecision(afterReject, "looper-bot") != "reject_wontfix" {
+		t.Fatal("latest complete audit must be reject_wontfix")
+	}
+	decision, ok := resumeDispositionDecisionFromRemoteAudit(afterReject, "abc", "looper-bot", "", nil, nil)
+	if !ok || decision.Decision != "reject_wontfix" {
+		t.Fatalf("got %#v ok=%v, want reject resume", decision, ok)
+	}
+	if decision, ok := resumeDispositionDecisionFromRemoteAudit(afterReject, "abc", "looper-bot", "stale-signal", []ReviewThread{afterReject}, []string{"t1"}); !ok || decision.Decision != "reject_wontfix" {
+		t.Fatalf("lastResolvedIDs got %#v ok=%v, want reject resume not historical accept", decision, ok)
+	}
+	accepted := looperThread("t1", false,
+		looperRoot("c1", "Please fix"),
+		ReviewThreadComment{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+		ReviewThreadComment{ID: "c3", Author: "looper-bot", Body: threadResolutionMarker("t1", "abc", openFP, "accept_wontfix"), CreatedAt: "t3", UpdatedAt: "t3"},
+	)
+	if decision, ok := resumeDispositionDecisionFromRemoteAudit(accepted, "abc", "looper-bot", "", nil, nil); !ok || decision.Decision != "accept_wontfix" {
+		t.Fatalf("crash-before-resolve got %#v ok=%v, want accept resume", decision, ok)
 	}
 }

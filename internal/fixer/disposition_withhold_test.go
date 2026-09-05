@@ -53,6 +53,25 @@ func TestThreadWithheldFromFixerAcceptWontfixStaysWithheldUntilResolved(t *testi
 	}
 }
 
+func TestThreadWithheldFromFixerAcceptWontfixOnCodexRoot(t *testing.T) {
+	t.Parallel()
+	thread := ReviewThread{
+		ID: "t1",
+		Comments: []ReviewThreadComment{
+			{ID: "c1", Author: "chatgpt-codex-connector[bot]", Body: "Please fix this race"},
+			{ID: "c2", Author: testLooperLogin, Body: "out of scope <!-- looper-fixer-reply-declined thread:t1 fingerprint:x -->"},
+			{ID: "c3", Author: testLooperLogin, Body: "accepted <!-- looper:thread-resolution thread=t1 head=h feedback=f decision=accept_wontfix -->"},
+		},
+	}
+	if !ThreadWithheldFromFixer(thread, "alice", testLooperLogin) {
+		t.Fatal("unresolved Codex-root accept_wontfix must withhold")
+	}
+	thread.IsResolved = true
+	if ThreadWithheldFromFixer(thread, "alice", testLooperLogin) {
+		t.Fatal("resolved Codex-root accept_wontfix must not withhold")
+	}
+}
+
 func TestThreadWithheldFromFixerValidatedDecline(t *testing.T) {
 	t.Parallel()
 	thread := ReviewThread{

@@ -4037,6 +4037,171 @@ func TestBudgetHeldDispositionNeedsHumanContinueDoesNotRestoreHold(t *testing.T)
 	}
 }
 
+func TestCodexRootKillAfterAcceptResumesResolveWithoutReclassify(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	baseComments := []ReviewThreadComment{
+		{ID: "c1", Author: "codex", Body: "This is a bug", CreatedAt: "t1", UpdatedAt: "t1"},
+		{ID: "c2", Author: "looper-bot", Body: "declined <!-- looper-fixer-reply-declined thread:thread_1 fingerprint:abc -->", CreatedAt: "t2", UpdatedAt: "t2"},
+	}
+	base := ReviewThread{ID: "thread_1", Comments: baseComments}
+	if isLooperAuthoredThreadForLogin(base, "looper-bot") {
+		t.Fatal("fixture must be a Codex-root thread")
+	}
+	fp := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+	if fp == "" {
+		t.Fatal("expected feedback fingerprint")
+	}
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: append(append([]ReviewThreadComment{}, baseComments...), ReviewThreadComment{
+			ID: "c3", Author: "looper-bot", Body: "accepted " + threadResolutionMarker("thread_1", "abc123", fp, "accept_wontfix"),
+			CreatedAt: "t3", UpdatedAt: "t3",
+		}),
+	}}
+	if ThreadFeedbackFingerprintForLogin(threads, "looper-bot") != fp {
+		t.Fatal("posted accept audit must stay in the third-party fingerprint")
+	}
+	if !hasUnresolvedAcceptWontfixAudit(threads[0], "abc123", "looper-bot") {
+		t.Fatal("posted accept audit must remain a resolve candidate")
+	}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"}
+	agent := &fakeAgentExecutor{results: []AgentResult{
+		{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"reject_wontfix","evidence":"flip","confidence":"high"}]}`},
+	}}
+	fixture := newRunnerFixture(t)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","lastReviewedSignalFingerprint":"stale-signal"}`
+	loop := storage.LoopRecord{
+		ID: "loop_codex_kill_after_accept", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("classifier starts = %d, want 0 (resume remote accept without reclassify)", len(agent.starts))
+	}
+	if len(github.addThreadReplyCalls) != 0 {
+		t.Fatalf("replies = %d, want 0 (audit already posted)", len(github.addThreadReplyCalls))
+	}
+	if len(github.resolveThreadCalls) != 1 {
+		t.Fatalf("resolves = %d, want 1", len(github.resolveThreadCalls))
+	}
+	if !github.reviewThreads[0].IsResolved {
+		t.Fatal("unresolved third-party accept must resolve after kill-after-reply resume")
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Resolved < 1 {
+		t.Fatalf("ThreadResolution = %#v, want resolved", checkpoint.ThreadResolution)
+	}
+}
+
+func TestRejectAfterReopenDoesNotResumeHistoricalAccept(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = false
+	baseComments := []ReviewThreadComment{
+		{ID: "c1", Author: "looper-bot", Body: "Please fix <!-- looper:stamp v=1 -->", CommitOID: "abc123"},
+		{ID: "c2", Author: "alice", AuthorAssociation: "OWNER", Body: "/looper wontfix x", CreatedAt: "t2", UpdatedAt: "t2"},
+	}
+	base := ReviewThread{ID: "thread_1", Comments: baseComments}
+	fp := ThreadFeedbackFingerprintForLogin([]ReviewThread{base}, "looper-bot")
+	if fp == "" {
+		t.Fatal("expected feedback fingerprint")
+	}
+	excl := coordinationExcludedThreadFeedbackFingerprint(base, "looper-bot")
+	if excl == "" {
+		t.Fatal("expected coordination-excluded fingerprint")
+	}
+	threads := []ReviewThread{{
+		ID: "thread_1",
+		Comments: append(append([]ReviewThreadComment{}, baseComments...),
+			ReviewThreadComment{
+				ID: "c3", Author: "looper-bot", Body: "accepted " + threadResolutionMarker("thread_1", "abc123", fp, "accept_wontfix"),
+				CreatedAt: "t3", UpdatedAt: "t3",
+			},
+			ReviewThreadComment{
+				ID: "c4", Author: "looper-bot", Body: "rejected " + threadResolutionMarker("thread_1", "abc123", excl, "reject_wontfix"),
+				CreatedAt: "t4", UpdatedAt: "t4",
+			},
+		),
+	}}
+	if latestValidatedAuditDecision(threads[0], "looper-bot") != "reject_wontfix" {
+		t.Fatal("latest complete audit must be reject_wontfix")
+	}
+	if decision, ok := resumeDispositionDecisionFromRemoteAudit(threads[0], "abc123", "looper-bot", "stale-signal", threads, nil); !ok || decision.Decision != "reject_wontfix" {
+		t.Fatal("accept→reopen→reject must resume reject, not historical accept")
+	}
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewThreads: threads, viewHeadSHA: "abc123"}
+	agent := &fakeAgentExecutor{results: []AgentResult{
+		{Status: "completed", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"accept_wontfix","evidence":"flip back to accept","confidence":"high"}]}`},
+	}}
+	fixture := newRunnerFixture(t)
+	meta := `{"followUpdates":true,"lastPublishedHeadSha":"abc123","lastReviewedSignalFingerprint":"stale-signal"}`
+	loop := storage.LoopRecord{
+		ID: "loop_reject_after_reopen", ProjectID: "project_1", Type: "reviewer", Status: "queued",
+		TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"),
+		Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), MetadataJSON: &meta,
+		CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO(),
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{},
+		AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ThreadResolution: policy,
+		LoopConfig: testReviewerLoopConfig(),
+	})
+	input := threadResolutionStepInput()
+	input.Loop = loop
+	input.Project = storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}
+	input.Checkpoint.DispositionOnly = true
+	input.Checkpoint.Detail.Author = "alice"
+	input.Checkpoint.Detail.HeadSHA = "abc123"
+	input.Checkpoint.Snapshot.HeadSHA = "abc123"
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), input)
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("classifier starts = %d, want 0 (resume reject without reclassify)", len(agent.starts))
+	}
+	if len(github.resolveThreadCalls) != 0 {
+		t.Fatalf("resolves = %#v, want 0 (reject must not restore accept)", github.resolveThreadCalls)
+	}
+	if github.reviewThreads[0].IsResolved {
+		t.Fatal("reject after reopen must not resolve the thread")
+	}
+	for _, reply := range github.addThreadReplyCalls {
+		if strings.Contains(reply.Body, "decision=accept_wontfix") {
+			t.Fatalf("replies = %#v, historical accept must not be republished", github.addThreadReplyCalls)
+		}
+	}
+	if checkpoint.ThreadResolution == nil {
+		t.Fatal("expected thread resolution checkpoint")
+	}
+}
+
 func int64Ptr(v int64) *int64 { return &v }
 
 func lastLoopEventSignal(t *testing.T, repos *storage.Repositories, loopID, eventType string) string {

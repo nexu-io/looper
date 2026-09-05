@@ -80,7 +80,8 @@ func ComputeReviewSignalFingerprintForLogin(headSHA string, threads []ReviewThre
 func canonicalThreadFeedbackInput(threads []ReviewThread, looperLogin string) string {
 	looperThreads := make([]ReviewThread, 0, len(threads))
 	for _, thread := range threads {
-		if !isLooperAuthoredThreadForLogin(thread, looperLogin) && !HasUnauditedValidatedFixerDeclineForLogin(thread, looperLogin) {
+		if !isLooperAuthoredThreadForLogin(thread, looperLogin) &&
+			(thread.IsResolved || !threadHasValidatedFixerDeclineFromAuthor(thread, looperLogin)) {
 			continue
 		}
 		looperThreads = append(looperThreads, thread)
@@ -310,14 +311,16 @@ func hasThreadResolutionAuditForSignalForLogin(thread ReviewThread, threadID, he
 // feedback already exists. Spec §8.2: retry observes the remote audit marker
 // and must not reclassify after Reviewer's own mutation. A later validated
 // Fixer decline after reject_wontfix is new input (§8.4) and must not resume.
-// accept_wontfix is not resumed when this thread ID is in lastResolvedIDs
-// (already resolved in the last persisted snapshot) or when lastReviewedSignalFingerprint
-// equals the current-head signal computed with every currently-unresolved
-// thread that has a matching accept_wontfix audit forced resolved (two-thread
-// reopen even before IDs exist). last != current alone is not reopen —
-// crash-after-accept (including a stale last or last==current) must still
-// resume when the thread ID is not in lastResolvedIDs. Empty last still
-// resumes (in-run retry).
+// latestValidatedAuditDecision is authority: if the newest complete audit is
+// reject_wontfix, a historical accept_wontfix is never resumed (accept→resolve→
+// reopen→reject must resume or classify reject). accept_wontfix is not resumed
+// when this thread ID is in lastResolvedIDs (already resolved in the last
+// persisted snapshot) or when lastReviewedSignalFingerprint equals the
+// current-head signal computed with every currently-unresolved thread that has
+// a matching accept_wontfix audit forced resolved (two-thread reopen even
+// before IDs exist). last != current alone is not reopen — crash-after-accept
+// (including a stale last or last==current) must still resume when the thread
+// ID is not in lastResolvedIDs. Empty last still resumes (in-run retry).
 func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, looperLogin, lastSignal string, allThreads []ReviewThread, lastResolvedIDs []string) (threadResolutionAgentDecision, bool) {
 	headSHA = strings.TrimSpace(headSHA)
 	if headSHA == "" || strings.TrimSpace(thread.ID) == "" {
@@ -326,25 +329,27 @@ func resumeDispositionDecisionFromRemoteAudit(thread ReviewThread, headSHA, loop
 	if ForceNeedsHumanAfterSecondDecline(thread, headSHA, looperLogin) {
 		return threadResolutionAgentDecision{}, false
 	}
-	candidateFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, looperLogin)
-	if candidateFP != "" && hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, headSHA, candidateFP, "accept_wontfix", looperLogin) {
-		if threadIDInLastResolved(thread.ID, lastResolvedIDs) {
-			return threadResolutionAgentDecision{}, false
-		}
-		last := strings.TrimSpace(lastSignal)
-		if last != "" {
-			live := allThreads
-			if len(live) == 0 {
-				live = []ReviewThread{thread}
-			}
-			if last == reviewSignalWithUnresolvedAcceptsForcedResolved(live, headSHA, looperLogin) {
+	if latestValidatedAuditDecision(thread, looperLogin) != "reject_wontfix" {
+		candidateFP := ThreadFeedbackFingerprintForLogin([]ReviewThread{thread}, looperLogin)
+		if candidateFP != "" && hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, headSHA, candidateFP, "accept_wontfix", looperLogin) {
+			if threadIDInLastResolved(thread.ID, lastResolvedIDs) {
 				return threadResolutionAgentDecision{}, false
 			}
+			last := strings.TrimSpace(lastSignal)
+			if last != "" {
+				live := allThreads
+				if len(live) == 0 {
+					live = []ReviewThread{thread}
+				}
+				if last == reviewSignalWithUnresolvedAcceptsForcedResolved(live, headSHA, looperLogin) {
+					return threadResolutionAgentDecision{}, false
+				}
+			}
+			return threadResolutionAgentDecision{
+				ThreadID: thread.ID, Decision: "accept_wontfix",
+				Evidence: "resume existing accept_wontfix audit", Confidence: "high",
+			}, true
 		}
-		return threadResolutionAgentDecision{
-			ThreadID: thread.ID, Decision: "accept_wontfix",
-			Evidence: "resume existing accept_wontfix audit", Confidence: "high",
-		}, true
 	}
 	excl := coordinationExcludedThreadFeedbackFingerprint(thread, looperLogin)
 	if excl != "" && hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, headSHA, excl, "reject_wontfix", looperLogin) {

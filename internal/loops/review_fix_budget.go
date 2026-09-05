@@ -594,7 +594,7 @@ func ensureReviewFixBudgetHandoffEvent(ctx context.Context, repos *storage.Repos
 		if err != nil {
 			return err
 		}
-		applied, err := repos.Loops.UpdateMetadataIfUpdatedAt(ctx, fresh.ID, &encoded, input.NowISO, fresh.UpdatedAt)
+		applied, err := repos.Loops.UpdateMetadataIfMatch(ctx, fresh.ID, &encoded, input.NowISO, fresh.MetadataJSON)
 		if err != nil {
 			return err
 		}

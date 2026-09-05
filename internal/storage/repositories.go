@@ -591,22 +591,21 @@ func (r *LoopsRepository) GetByID(ctx context.Context, id string) (*LoopRecord, 
 	return &record, nil
 }
 
-// UpdateMetadataIfUpdatedAt writes metadata_json and updated_at only when the
-// current row still has expectedUpdatedAt. applied is false on a CAS miss or
-// when id or expectedUpdatedAt is empty.
-func (r *LoopsRepository) UpdateMetadataIfUpdatedAt(ctx context.Context, id string, metadataJSON *string, newUpdatedAt, expectedUpdatedAt string) (applied bool, err error) {
+// UpdateMetadataIfMatch writes metadata_json and updated_at only when the
+// current row's metadata_json still matches expectedMetadataJSON. applied is
+// false on a CAS miss or when id is empty.
+func (r *LoopsRepository) UpdateMetadataIfMatch(ctx context.Context, id string, metadataJSON *string, newUpdatedAt string, expectedMetadataJSON *string) (applied bool, err error) {
 	id = strings.TrimSpace(id)
-	expectedUpdatedAt = strings.TrimSpace(expectedUpdatedAt)
-	if id == "" || expectedUpdatedAt == "" {
+	if id == "" {
 		return false, nil
 	}
-	result, err := r.q.ExecContext(ctx, `UPDATE loops SET metadata_json = ?, updated_at = ? WHERE id = ? AND updated_at = ?`, metadataJSON, newUpdatedAt, id, expectedUpdatedAt)
+	result, err := r.q.ExecContext(ctx, `UPDATE loops SET metadata_json = ?, updated_at = ? WHERE id = ? AND ((? IS NULL AND metadata_json IS NULL) OR metadata_json = ?)`, metadataJSON, newUpdatedAt, id, expectedMetadataJSON, expectedMetadataJSON)
 	if err != nil {
-		return false, fmt.Errorf("update loop metadata if updated_at: %w", err)
+		return false, fmt.Errorf("update loop metadata if match: %w", err)
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("update loop metadata if updated_at rows affected: %w", err)
+		return false, fmt.Errorf("update loop metadata if match rows affected: %w", err)
 	}
 	return rowsAffected > 0, nil
 }

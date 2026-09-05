@@ -1092,11 +1092,10 @@ func TestRefreshHandoffDoesNotResurrectHoldReleasedAfterGetByID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("park: %v", err)
 	}
-	// Continue after the hold-positive GetByID and before the metadata write.
-	// A later clock changes updated_at so the CAS no-ops instead of colliding.
-	continueAt := time.Date(2026, time.April, 17, 12, 34, 57, 0, time.UTC).UTC().Format("2006-01-02T15:04:05.000Z")
+	// Continue reuses the held row's UpdatedAt (same millisecond). Metadata CAS
+	// must refuse to restore publication counters / hold metadata.
 	reviewFixBudgetHandoffAfterRefreshHook = func(exhausted storage.LoopRecord) error {
-		result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, exhausted, "Continue", continueAt, testBudgetCaps(3, 3))
+		result, err := ApplyReviewFixBudgetAnswer(context.Background(), repos, exhausted, "Continue", nowISO, testBudgetCaps(3, 3))
 		if err != nil {
 			return err
 		}
@@ -1115,6 +1114,9 @@ func TestRefreshHandoffDoesNotResurrectHoldReleasedAfterGetByID(t *testing.T) {
 	}
 	if IsReviewFixBudgetHold(*after) {
 		t.Fatalf("Continue must remain released, got hold status=%s meta=%s", after.Status, derefLoopString(after.MetadataJSON))
+	}
+	if ReviewerPublishCount(after.MetadataJSON) != 0 {
+		t.Fatalf("Continue meters must stay reset, got publish count %d meta=%s", ReviewerPublishCount(after.MetadataJSON), derefLoopString(after.MetadataJSON))
 	}
 	sibling, err := repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil {

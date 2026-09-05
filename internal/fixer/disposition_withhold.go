@@ -34,9 +34,9 @@ var (
 //     (Human/Codex) roots; Reviewer adjudicates, Fixer must not re-decline
 //   - Unaudited trusted human wontfix/reconsider → withheld only on
 //     Looper-authored threads
-//   - Latest Reviewer decision accept_wontfix (or objectively_fixed) while still
-//     unresolved → withheld until the thread is actually resolved,
-//     Looper-authored only
+//   - Latest Reviewer decision accept_wontfix (or objectively_fixed / needs_human)
+//     while still unresolved → withheld until the thread is actually resolved,
+//     on any thread (including Human/Codex roots)
 //   - Latest Reviewer decision reject_wontfix (or not_fixed) → actionable again
 //     on the existing thread (no new thread)
 func ThreadWithheldFromFixer(thread ReviewThread, prAuthorLogin, looperLogin string) bool {
@@ -47,10 +47,8 @@ func ThreadWithheldFromFixer(thread ReviewThread, prAuthorLogin, looperLogin str
 	if hasUnauditedValidatedFixerDeclineAfter(thread, looperLogin, lastDecisionIdx) {
 		return true
 	}
-	if !isLooperAuthoredFixerThread(thread, looperLogin) {
-		return false
-	}
-	if hasUnauditedTrustedDispositionAfter(thread, prAuthorLogin, lastDecisionIdx) {
+	if isLooperAuthoredFixerThread(thread, looperLogin) &&
+		hasUnauditedTrustedDispositionAfter(thread, prAuthorLogin, lastDecisionIdx) {
 		return true
 	}
 	if !hasDecision {
