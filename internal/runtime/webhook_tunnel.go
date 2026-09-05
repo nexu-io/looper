@@ -39,6 +39,7 @@ type webhookTunnelGitHubHook struct {
 		URL         string `json:"url"`
 		ContentType string `json:"content_type"`
 		InsecureSSL string `json:"insecure_ssl"`
+		Secret      string `json:"secret"`
 	} `json:"config"`
 	LastResponse *struct {
 		Code int `json:"code"`
@@ -308,7 +309,7 @@ func (w *webhookRuntime) reconcileTunnelHook(ctx context.Context, store *storage
 	if record.ConsecutiveDisables >= webhookTunnelDisableLatchThreshold && !hook.Active {
 		return tunnelStateLatched(record, "remote hook disabled repeatedly; not re-enabling")
 	}
-	needPatch := !hook.Active || strings.TrimSpace(hook.Config.URL) != url || !sameWebhookEvents(hook.Events, webhookForwardEvents) || !strings.EqualFold(strings.TrimSpace(hook.Config.ContentType), "json") || strings.TrimSpace(hook.Config.InsecureSSL) != "0"
+	needPatch := !hook.Active || strings.TrimSpace(hook.Config.URL) != url || !sameWebhookEvents(hook.Events, webhookForwardEvents) || !strings.EqualFold(strings.TrimSpace(hook.Config.ContentType), "json") || strings.TrimSpace(hook.Config.InsecureSSL) != "0" || strings.TrimSpace(hook.Config.Secret) == ""
 	if needPatch {
 		if !hook.Active {
 			record.ConsecutiveDisables++
