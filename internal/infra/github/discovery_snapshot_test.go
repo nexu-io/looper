@@ -151,6 +151,10 @@ func TestDiscoverySnapshotDoesNotCacheFailedPullRequestDetailFetch(t *testing.T)
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.HasPrefix(cmd, "api --paginate repos/acme/looper/issues/7/comments --jq "):
 			return shell.Result{}, nil
+		case strings.Contains(cmd, "api user --jq .login"):
+			return shell.Result{Stdout: "octo\n"}, nil
+		case strings.Contains(cmd, "query { viewer { login } }"):
+			return shell.Result{Stdout: `{"data":{"viewer":{"login":"octo"}}}`}, nil
 		default:
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
 		}
@@ -188,6 +192,10 @@ func TestDiscoverySnapshotPreservesPendingWorkSignalsInPullRequestDetail(t *test
 		case strings.HasPrefix(cmd, "api --paginate repos/acme/looper/issues/9/comments --jq "):
 			counts["issue_comments"]++
 			return shell.Result{}, nil
+		case strings.Contains(cmd, "api user --jq .login"):
+			return shell.Result{Stdout: "octo\n"}, nil
+		case strings.Contains(cmd, "query { viewer { login } }"):
+			return shell.Result{Stdout: `{"data":{"viewer":{"login":"octo"}}}`}, nil
 		default:
 			return shell.Result{}, errors.New("unexpected command: " + cmd)
 		}

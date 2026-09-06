@@ -156,13 +156,25 @@ type loopRetryWorktreeDiscardOutput struct {
 	Reason       string  `json:"reason"`
 }
 
+type loopRetryWorktreeClearUnusableOutput struct {
+	WorktreePath *string `json:"worktreePath"`
+	Cleared      bool    `json:"cleared"`
+	NoOp         bool    `json:"noOp"`
+	Reason       string  `json:"reason"`
+}
+
 type loopRetryOutput struct {
-	Loop                   loopOutput                      `json:"loop"`
-	QueueItemID            *string                         `json:"queueItemId"`
-	Mode                   string                          `json:"mode"`
-	ResetAttempts          bool                            `json:"resetAttempts"`
-	DiscardWorktreeChanges bool                            `json:"discardWorktreeChanges"`
-	WorktreeDiscard        *loopRetryWorktreeDiscardOutput `json:"worktreeDiscard"`
+	Loop                   loopOutput `json:"loop"`
+	QueueItemID            *string    `json:"queueItemId"`
+	Mode                   string     `json:"mode"`
+	ResetAttempts          bool       `json:"resetAttempts"`
+	DiscardWorktreeChanges bool       `json:"discardWorktreeChanges"`
+	// ClearUnusableWorktreePath is a pointer so field presence is preserved.
+	// Older daemons omit the key (nil); true is the only acknowledgement that
+	// clear-unusable was understood by the daemon.
+	ClearUnusableWorktreePath *bool                                 `json:"clearUnusableWorktreePath"`
+	WorktreeDiscard           *loopRetryWorktreeDiscardOutput       `json:"worktreeDiscard"`
+	WorktreeClearUnusable     *loopRetryWorktreeClearUnusableOutput `json:"worktreeClearUnusable"`
 }
 
 type reviewRepairOutput struct {
@@ -532,6 +544,16 @@ func writeHumanLoopRetried(w io.Writer, payload json.RawMessage) error {
 				[2]any{"worktreePath", formatScalar(data.WorktreeDiscard.WorktreePath)},
 				[2]any{"worktreeDiscardNoOp", data.WorktreeDiscard.NoOp},
 				[2]any{"worktreeDiscardReason", data.WorktreeDiscard.Reason},
+			)
+		}
+	}
+	if data.ClearUnusableWorktreePath != nil && *data.ClearUnusableWorktreePath {
+		fields = append(fields, [2]any{"clearUnusableWorktreePath", true})
+		if data.WorktreeClearUnusable != nil {
+			fields = append(fields,
+				[2]any{"worktreePath", formatScalar(data.WorktreeClearUnusable.WorktreePath)},
+				[2]any{"worktreeClearNoOp", data.WorktreeClearUnusable.NoOp},
+				[2]any{"worktreeClearReason", data.WorktreeClearUnusable.Reason},
 			)
 		}
 	}

@@ -13,6 +13,21 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// reviewSubmitMustFixComment returns a contract-test comment with required
+// Looper disposition fields. Provider payloads must strip these before GitHub.
+func reviewSubmitMustFixComment(body, path string, line int64, side string) map[string]any {
+	return map[string]any{
+		"body":          body,
+		"path":          path,
+		"line":          line,
+		"side":          side,
+		"disposition":   "must_fix",
+		"severity":      "blocking",
+		"scopeBasis":    "introduced_regression",
+		"scopeEvidence": "contract test finding in PR scope",
+	}
+}
+
 func newReviewSubmitTestCommand(stdout, stderr *bytes.Buffer) *cobra.Command {
 	cmd := &cobra.Command{Use: "submit"}
 	cmd.SetOut(stdout)

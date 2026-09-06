@@ -23,7 +23,61 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		return Config{}, err
 	}
 
+	applyQuietPeriodInheritance(&config, partials...)
+
 	return config, nil
+}
+
+// applyQuietPeriodInheritance resolves role quiet-period values when the role
+// field is unset but defaults.loop.quietPeriodSeconds was set in a partial:
+//
+//	role override ?? defaults.loop ?? role-specific DefaultConfig value
+//
+// Reviewer keeps 60 and fixer keeps 0 when neither defaults.loop nor the role
+// field is present in any partial (DefaultConfig values).
+func applyQuietPeriodInheritance(cfg *Config, partials ...PartialConfig) {
+	defaultsExplicit := false
+	reviewerExplicit := false
+	fixerExplicit := false
+	for _, partial := range partials {
+		if partial.Defaults != nil && partial.Defaults.Loop != nil && partial.Defaults.Loop.QuietPeriodSeconds != nil {
+			defaultsExplicit = true
+		}
+		if quietPeriodExplicitInReviewerPartial(partial) {
+			reviewerExplicit = true
+		}
+		if quietPeriodExplicitInFixerPartial(partial) {
+			fixerExplicit = true
+		}
+	}
+	if !defaultsExplicit {
+		return
+	}
+	if !reviewerExplicit {
+		cfg.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds = cfg.Defaults.Loop.QuietPeriodSeconds
+	}
+	if !fixerExplicit {
+		cfg.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds = cfg.Defaults.Loop.QuietPeriodSeconds
+	}
+}
+
+func quietPeriodExplicitInReviewerPartial(partial PartialConfig) bool {
+	if partial.LegacyReviewer != nil && partial.LegacyReviewer.Loop != nil && partial.LegacyReviewer.Loop.QuietPeriodSeconds != nil {
+		return true
+	}
+	if partial.Roles == nil || partial.Roles.Reviewer == nil || partial.Roles.Reviewer.Behavior == nil {
+		return false
+	}
+	loop := partial.Roles.Reviewer.Behavior.Loop
+	return loop != nil && loop.QuietPeriodSeconds != nil
+}
+
+func quietPeriodExplicitInFixerPartial(partial PartialConfig) bool {
+	if partial.Roles == nil || partial.Roles.Fixer == nil || partial.Roles.Fixer.Behavior == nil {
+		return false
+	}
+	loop := partial.Roles.Fixer.Behavior.Loop
+	return loop != nil && loop.QuietPeriodSeconds != nil
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
@@ -1091,6 +1145,16 @@ func mergeDefaultsConfig(config *DefaultsConfig, partial PartialDefaultsConfig) 
 	if partial.AddSnapshotMode != nil {
 		config.AddSnapshotMode = *partial.AddSnapshotMode
 	}
+
+	if partial.Loop != nil {
+		mergeDefaultsLoopConfig(&config.Loop, *partial.Loop)
+	}
+}
+
+func mergeDefaultsLoopConfig(config *DefaultsLoopConfig, partial PartialDefaultsLoopConfig) {
+	if partial.QuietPeriodSeconds != nil {
+		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
+	}
 }
 
 func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) {
@@ -1219,6 +1283,9 @@ func mergeReviewerLoopConfig(config *ReviewerLoopConfig, partial PartialReviewer
 	}
 	if partial.StopOnIdenticalOutput != nil {
 		config.StopOnIdenticalOutput = *partial.StopOnIdenticalOutput
+	}
+	if partial.MaxPublishesPerPR != nil {
+		config.MaxPublishesPerPR = *partial.MaxPublishesPerPR
 	}
 }
 
@@ -1443,11 +1510,29 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	if partial.Triggers != nil {
 		mergeFixerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
+	if partial.Behavior != nil {
+		mergeFixerBehaviorConfig(&config.Behavior, *partial.Behavior)
+	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
+	}
+}
+
+func mergeFixerBehaviorConfig(config *FixerBehaviorConfig, partial PartialFixerBehaviorConfig) {
+	if partial.Loop != nil {
+		mergeFixerLoopConfig(&config.Loop, *partial.Loop)
+	}
+}
+
+func mergeFixerLoopConfig(config *FixerLoopConfig, partial PartialFixerLoopConfig) {
+	if partial.QuietPeriodSeconds != nil {
+		config.QuietPeriodSeconds = *partial.QuietPeriodSeconds
+	}
+	if partial.MaxPushesPerPR != nil {
+		config.MaxPushesPerPR = *partial.MaxPushesPerPR
 	}
 }
 

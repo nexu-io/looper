@@ -70,6 +70,7 @@ var reviewerIssueClosingReferencePattern = regexp.MustCompile(`(?i)\b(?:close[sd
 const (
 	reviewerNativeResumeMetadataKey      = "reviewerNativeResume"
 	reviewerNativeResumeReasonHeadChange = "head_change"
+	metadataLastPublishedReviewIDKey     = "lastPublishedReviewId"
 )
 
 type ReviewerStep string
@@ -327,6 +328,10 @@ type ListReviewThreadsInput struct {
 	PRNumber int64
 	CWD      string
 	Limit    int
+	// AllPages requests full pagination for authority reads (fingerprints,
+	// post-mutation refetch). When true, Limit is ignored as a stop condition.
+	// Existing Limit<=0 callers keep the historical default page cap.
+	AllPages bool
 }
 
 type ReviewThread struct {
@@ -342,6 +347,7 @@ type ReviewThreadComment struct {
 	ID                string
 	Body              string
 	Author            string
+	AuthorAssociation string
 	CreatedAt         string
 	UpdatedAt         string
 	Path              string
@@ -487,6 +493,9 @@ type Options struct {
 	CommentOnlyPublish      bool
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
+	// NotifyHumanAttention, when set, observes durable loop state after a new
+	// review-fix budget park (including discovery-time parks before claim).
+	NotifyHumanAttention func(context.Context, string)
 }
 
 type DiscoveryPolicy struct {
@@ -537,6 +546,7 @@ type Runner struct {
 	commentOnlyPublish      bool
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
+	notifyHumanAttention    func(context.Context, string)
 }
 
 type DiscoveryInput struct {
@@ -578,10 +588,18 @@ type reviewerCheckpoint struct {
 	Worktree                     *checkpointWorktree         `json:"worktree,omitempty"`
 	ThreadResolution             *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
 	ThreadResolutionFollowUpOnly bool                        `json:"threadResolutionFollowUpOnly,omitempty"`
-	PendingReview                *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
-	SkipReason                   string                      `json:"skipReason,omitempty"`
-	SkipKind                     string                      `json:"skipKind,omitempty"`
-	SkipReviewerLogin            string                      `json:"skipReviewerLogin,omitempty"`
+	// DispositionOnly marks a same-head thread-disposition pass that must not
+	// publish a new PR review or apply minPublishIntervalSeconds.
+	DispositionOnly bool `json:"dispositionOnly,omitempty"`
+	// ConvergencePass is an explicitly admitted same-head full review after
+	// disposition cleared Looper blockers. It must not reuse head-only
+	// publication identity or the lastPublishedHeadSha already-published skip.
+	ConvergencePass         bool                     `json:"convergencePass,omitempty"`
+	ReviewSignalFingerprint string                   `json:"reviewSignalFingerprint,omitempty"`
+	PendingReview           *pendingReviewCheckpoint `json:"pendingReview,omitempty"`
+	SkipReason              string                   `json:"skipReason,omitempty"`
+	SkipKind                string                   `json:"skipKind,omitempty"`
+	SkipReviewerLogin       string                   `json:"skipReviewerLogin,omitempty"`
 }
 
 type checkpointDetail struct {
@@ -644,19 +662,58 @@ type reviewerCommentOnlyCompletion struct {
 }
 
 type reviewerCommentOnlyFindingResult struct {
-	ReviewItemID string   `json:"review_item_id,omitempty"`
-	Title        string   `json:"title"`
-	Body         string   `json:"body"`
-	Files        []string `json:"files,omitempty"`
-	Supersedes   []string `json:"supersedes,omitempty"`
+	ReviewItemID  string   `json:"review_item_id,omitempty"`
+	Title         string   `json:"title"`
+	Body          string   `json:"body"`
+	Files         []string `json:"files,omitempty"`
+	Path          string   `json:"path,omitempty"`
+	Line          int      `json:"line,omitempty"`
+	Supersedes    []string `json:"supersedes,omitempty"`
+	Disposition   string   `json:"disposition,omitempty"`
+	Severity      string   `json:"severity,omitempty"`
+	ScopeBasis    string   `json:"scopeBasis,omitempty"`
+	ScopeEvidence string   `json:"scopeEvidence,omitempty"`
 }
 
+const (
+	reviewFindingDispositionMustFix    = "must_fix"
+	reviewFindingDispositionFollowUp   = "follow_up"
+	reviewFindingDispositionNeedsHuman = "needs_human"
+)
+
+const (
+	reviewFindingSeverityBlocking    = "blocking"
+	reviewFindingSeverityNonBlocking = "non_blocking"
+	reviewFindingSeverityNit         = "nit"
+
+	reviewFindingScopeStatedIntent           = "stated_intent"
+	reviewFindingScopeIntroducedRegression   = "introduced_regression"
+	reviewFindingScopeRequiredInvariant      = "required_invariant"
+	reviewFindingScopeIndependentImprovement = "independent_improvement"
+	reviewFindingScopeAmbiguousIntent        = "ambiguous_intent"
+)
+
 type threadResolutionCheckpoint struct {
-	HeadSHA   string `json:"headSha,omitempty"`
-	Processed int    `json:"processed,omitempty"`
-	Commented int    `json:"commented,omitempty"`
-	Resolved  int    `json:"resolved,omitempty"`
-	Reported  int    `json:"reported,omitempty"`
+	HeadSHA                   string `json:"headSha,omitempty"`
+	ThreadFeedbackFingerprint string `json:"threadFeedbackFingerprint,omitempty"`
+	ReviewSignalFingerprint   string `json:"reviewSignalFingerprint,omitempty"`
+	// CapturedSignalFingerprint is the complete live signal at candidate capture;
+	// used to detect inter-batch drift before the next MaxThreadsPerRun batch.
+	CapturedSignalFingerprint string   `json:"capturedSignalFingerprint,omitempty"`
+	CompletedThreadIDs        []string `json:"completedThreadIds,omitempty"`
+	CapturedCandidateIDs      []string `json:"capturedCandidateIds,omitempty"`
+	PartialBatch              bool     `json:"partialBatch,omitempty"`
+	// PostMutationCommitPending is true when remote mutations succeeded but the
+	// authoritative post-mutation fingerprint promote has not yet committed.
+	PostMutationCommitPending bool `json:"postMutationCommitPending,omitempty"`
+	DispositionOnly           bool `json:"dispositionOnly,omitempty"`
+	// ScheduleConvergencePass requests a same-head full-review admission after
+	// disposition cleared blockers on a non-budget-held loop.
+	ScheduleConvergencePass bool `json:"scheduleConvergencePass,omitempty"`
+	Processed               int  `json:"processed,omitempty"`
+	Commented               int  `json:"commented,omitempty"`
+	Resolved                int  `json:"resolved,omitempty"`
+	Reported                int  `json:"reported,omitempty"`
 }
 
 type resumedRunContext struct {
@@ -718,7 +775,7 @@ func New(options Options) *Runner {
 	}
 	loopConfig := options.LoopConfig
 	if loopConfig == (config.ReviewerLoopConfig{}) {
-		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true}
+		loopConfig = config.ReviewerLoopConfig{EnabledByDefault: false, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 0, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true, StopOnIdenticalOutput: true, MaxPublishesPerPR: config.DefaultReviewFixBudgetCap}
 	}
 	scope := options.Scope
 	if scope == "" {
@@ -777,6 +834,7 @@ func New(options Options) *Runner {
 		commentOnlyPublish:      options.CommentOnlyPublish,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
+		notifyHumanAttention:    options.NotifyHumanAttention,
 	}
 }
 
@@ -1040,9 +1098,14 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 			loopResult.record = *recovered
 		}
 	}
-	if terminalReviewerLoopReason(loopResult.record) != "" {
-		result.Skipped++
-		return nil
+	// Budget-held paused / awaiting_human (HITL) loops must reach the
+	// disposition-only exception below (§8.7). Other terminal statuses stay skipped.
+	if reason := terminalReviewerLoopReason(loopResult.record); reason != "" {
+		budgetHold := loops.IsReviewFixBudgetHold(loopResult.record)
+		if !(budgetHold && (reason == "paused" || reason == "awaiting_human")) {
+			result.Skipped++
+			return nil
+		}
 	}
 	if loopResult.created {
 		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
@@ -1060,22 +1123,129 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		}
 		*currentLogin = normalizeLogin(lookupLogin)
 	}
-	if reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp && !r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy) {
-		result.Skipped++
-		return nil
-	}
+	samePublishedHead := false
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pr.HeadSHA && pr.HeadSHA != "" {
+		samePublishedHead = true
+	}
+	dispositionOnly := false
+	reviewSignal := ""
+	// For continuous native-thread loops, evaluate same-head signal before
+	// head-based lastFilterSkip suppression so a changed disposition is not
+	// blocked forever by already_published_head / not_requested history.
+	if samePublishedHead {
+		// lastPublishedHeadSha is publication metadata only; discovery identity is
+		// the review signal (head + Looper-authored thread feedback).
+		decision, err := r.sameHeadDiscoveryDecision(ctx, project, repo, pr, loopResult.record, meta)
+		if err != nil {
+			return err
+		}
+		switch decision.action {
+		case sameHeadDiscoverySkip:
+			result.Skipped++
+			return nil
+		case sameHeadDiscoveryBaselineOnly:
+			result.Skipped++
+			return nil
+		case sameHeadDiscoveryEnqueueDisposition:
+			dispositionOnly = true
+			reviewSignal = decision.signal
+		case sameHeadDiscoveryEnqueueFull:
+			reviewSignal = decision.signal
+		}
+	}
+	if !dispositionOnly && reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp {
+		allowFollowUp, followErr := r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy)
+		if followErr != nil {
+			return followErr
+		}
+		if !allowFollowUp {
+			result.Skipped++
+			return nil
+		}
+	}
+	if loopResult.record.Status == "human_takeover" {
 		result.Skipped++
 		return nil
 	}
-	availableAt := r.nextReviewAvailableAt(meta)
+	// Scope holds / non-budget awaiting_human: still skip.
+	// Budget holds: allow disposition-only enqueue without releasing the hold.
+	if loops.IsReviewFixPairHold(loopResult.record) {
+		if dispositionOnly && loops.IsReviewFixBudgetHold(loopResult.record) {
+			availableAt := r.nextReviewAvailableAt(meta, true)
+			queueItem, queueErr := r.enqueue(ctx, enqueueInput{
+				ProjectID:               project.ID,
+				LoopID:                  loopResult.record.ID,
+				Repo:                    repo,
+				PRNumber:                pr.Number,
+				HeadSHA:                 pr.HeadSHA,
+				ReviewSignalFingerprint: reviewSignal,
+				DispositionOnly:         true,
+				AvailableAt:             availableAt,
+			})
+			if queueErr != nil {
+				return queueErr
+			}
+			// markLoopQueuedForReview no-ops on pair holds — status/counters stay.
+			if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
+				return err
+			}
+			result.QueueItems = append(result.QueueItems, queueItem)
+			return nil
+		}
+		if loops.IsReviewFixBudgetHold(loopResult.record) {
+			if parked, err := r.parkReviewerBudgetIfExhausted(ctx, loopResult.record); err != nil {
+				return err
+			} else if parked {
+				r.notifyHumanAttentionBestEffort(ctx, loopResult.record.ID)
+			}
+		}
+		result.Skipped++
+		return nil
+	}
+	if loopResult.record.Status == "awaiting_human" {
+		result.Skipped++
+		return nil
+	}
+	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, loopResult.record); err != nil {
+		return err
+	} else if parked {
+		// Just parked for budget: still allow disposition-only on the new hold.
+		if dispositionOnly {
+			availableAt := r.nextReviewAvailableAt(meta, true)
+			queueItem, queueErr := r.enqueue(ctx, enqueueInput{
+				ProjectID:               project.ID,
+				LoopID:                  loopResult.record.ID,
+				Repo:                    repo,
+				PRNumber:                pr.Number,
+				HeadSHA:                 pr.HeadSHA,
+				ReviewSignalFingerprint: reviewSignal,
+				DispositionOnly:         true,
+				AvailableAt:             availableAt,
+			})
+			if queueErr != nil {
+				return queueErr
+			}
+			if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
+				return err
+			}
+			result.QueueItems = append(result.QueueItems, queueItem)
+			r.notifyHumanAttentionBestEffort(ctx, loopResult.record.ID)
+			return nil
+		}
+		r.notifyHumanAttentionBestEffort(ctx, loopResult.record.ID)
+		result.Skipped++
+		return nil
+	}
+	availableAt := r.nextReviewAvailableAt(meta, dispositionOnly)
 	queueItem, queueErr := r.enqueue(ctx, enqueueInput{
-		ProjectID:   project.ID,
-		LoopID:      loopResult.record.ID,
-		Repo:        repo,
-		PRNumber:    pr.Number,
-		HeadSHA:     pr.HeadSHA,
-		AvailableAt: availableAt,
+		ProjectID:               project.ID,
+		LoopID:                  loopResult.record.ID,
+		Repo:                    repo,
+		PRNumber:                pr.Number,
+		HeadSHA:                 pr.HeadSHA,
+		ReviewSignalFingerprint: reviewSignal,
+		DispositionOnly:         dispositionOnly,
+		AvailableAt:             availableAt,
 	})
 	if queueErr != nil {
 		return queueErr
@@ -1087,23 +1257,225 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 	return nil
 }
 
-func (r *Runner) allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx context.Context, cwd, repo string, pr PullRequestSummary, currentLogin string, meta map[string]any, policy DiscoveryPolicy) bool {
+type sameHeadDiscoveryAction int
+
+const (
+	sameHeadDiscoverySkip sameHeadDiscoveryAction = iota
+	sameHeadDiscoveryBaselineOnly
+	sameHeadDiscoveryEnqueueDisposition
+	sameHeadDiscoveryEnqueueFull
+)
+
+type sameHeadDiscoveryResult struct {
+	action sameHeadDiscoveryAction
+	signal string
+}
+
+// sameHeadDiscoveryDecision decides whether a continuous same-head loop should
+// skip, store a baseline fingerprint, or enqueue disposition/full work.
+func (r *Runner) sameHeadDiscoveryDecision(ctx context.Context, project storage.ProjectRecord, repo string, pr PullRequestSummary, loop storage.LoopRecord, meta map[string]any) (sameHeadDiscoveryResult, error) {
+	if !r.hasNativeThreadCapabilities(project.ID) {
+		// Forgejo / providers without native threads: head-only identity remains.
+		return sameHeadDiscoveryResult{action: sameHeadDiscoverySkip}, nil
+	}
+	if !isContinuousReviewerLoop(loop, meta) {
+		return sameHeadDiscoveryResult{action: sameHeadDiscoverySkip}, nil
+	}
+	looperLogin, err := r.requireCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return sameHeadDiscoveryResult{}, err
+	}
+	threads, err := r.listReviewThreadsForSignal(ctx, project.RepoPath, repo, pr.Number)
+	if err != nil {
+		// Fail closed on listing errors: retryable, do not advance or invent a signal.
+		r.logWarn("reviewer same-head signal listing failed", map[string]any{"repo": repo, "prNumber": pr.Number, "error": err.Error()})
+		return sameHeadDiscoveryResult{}, &loopError{message: "same-head signal listing failed: " + err.Error(), kind: FailureRetryableTransient}
+	}
+	signal := ComputeReviewSignalFingerprintForLogin(pr.HeadSHA, threads, looperLogin)
+	lastSignal, _ := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey])
+	if strings.TrimSpace(lastSignal) == "" {
+		// Upgrade path: missing fingerprint.
+		if hasUnresolvedLooperAuthoredThreadsForLogin(threads, looperLogin) {
+			return sameHeadDiscoveryResult{action: sameHeadDiscoveryEnqueueDisposition, signal: signal}, nil
+		}
+		if err := r.persistLastReviewedSignalFingerprint(ctx, loop, signal, threads); err != nil {
+			return sameHeadDiscoveryResult{}, err
+		}
+		return sameHeadDiscoveryResult{action: sameHeadDiscoveryBaselineOnly, signal: signal}, nil
+	}
+	if lastSignal == signal {
+		return sameHeadDiscoveryResult{action: sameHeadDiscoverySkip, signal: signal}, nil
+	}
+	// Signal changed on unchanged head → disposition (or clean convergence) pass.
+	return sameHeadDiscoveryResult{action: sameHeadDiscoveryEnqueueDisposition, signal: signal}, nil
+}
+
+// requireCurrentUserLogin resolves live GitHub identity. Empty login and lookup
+// failures are retryable — production paths must not invent looper* identity.
+func (r *Runner) requireCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
+	if r.github == nil {
+		return "", &loopError{message: "github gateway is not configured", kind: FailureRetryableTransient}
+	}
+	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	login = normalizeLogin(login)
+	if login == "" {
+		return "", &loopError{message: "current user login is empty", kind: FailureRetryableTransient}
+	}
+	return login, nil
+}
+
+func (r *Runner) hasNativeThreadCapabilities(projectID string) bool {
+	return !r.forgejoProject(projectID)
+}
+
+func isContinuousReviewerLoop(loop storage.LoopRecord, meta map[string]any) bool {
+	if meta == nil {
+		meta = parseJSONObject(loop.MetadataJSON)
+	}
+	if enabled, ok := meta["followUpdates"].(bool); ok {
+		return enabled
+	}
+	if loopMeta, ok := meta["loop"].(map[string]any); ok {
+		if enabled, ok := loopMeta["enabled"].(bool); ok {
+			return enabled
+		}
+	}
+	return false
+}
+
+func (r *Runner) listReviewThreadsForSignal(ctx context.Context, cwd, repo string, prNumber int64) ([]ReviewThread, error) {
+	if r.github == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
+	// Authority reads must page fully; MaxThreadsPerRun only limits classifier batches.
+	return r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: repo, PRNumber: prNumber, CWD: cwd, AllPages: true})
+}
+
+// persistLastReviewedSignalBeforeCASHook, when set (tests only), runs after a
+// live GetByID and before the metadata CAS so Continue can interleave.
+var persistLastReviewedSignalBeforeCASHook func(loop storage.LoopRecord) error
+
+func (r *Runner) persistLastReviewedSignalFingerprint(ctx context.Context, loop storage.LoopRecord, signal string, threads []ReviewThread) error {
+	signal = strings.TrimSpace(signal)
+	if signal == "" || r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		return nil
+	}
+	updates := map[string]any{metadataLastReviewedSignalFingerprintKey: signal}
+	if threads != nil {
+		updates[metadataLastResolvedReviewThreadIDsKey] = resolvedReviewThreadIDs(threads)
+	}
+	var live storage.LoopRecord
+	applied := false
+	for range reviewScopeHumanPersistCASAttempts {
+		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("persist last reviewed signal lost loop %s", loop.ID)
+		}
+		if current.Status == "terminated" {
+			return nil
+		}
+		if persistLastReviewedSignalBeforeCASHook != nil {
+			if err := persistLastReviewedSignalBeforeCASHook(*current); err != nil {
+				return err
+			}
+		}
+		encoded, err := mergeLoopMetadataJSON(current.MetadataJSON, updates)
+		if err != nil {
+			return err
+		}
+		ok, err := r.repos.Loops.UpdateMetadataIfMatch(ctx, current.ID, &encoded, r.nowISO(), current.MetadataJSON)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		current.MetadataJSON = &encoded
+		live = *current
+		applied = true
+		break
+	}
+	if !applied {
+		return &loopError{
+			message: fmt.Sprintf("persist last reviewed signal lost CAS for loop %s", loop.ID),
+			kind:    FailureRetryableTransient,
+		}
+	}
+	if !loops.IsReviewFixBudgetHold(live) {
+		return nil
+	}
+	return loops.RefreshReviewFixPairHandoff(ctx, r.repos, live, signal, r.nowISO())
+}
+
+func resolvedReviewThreadIDs(threads []ReviewThread) []string {
+	ids := make([]string, 0, len(threads))
+	for _, thread := range threads {
+		if !thread.IsResolved {
+			continue
+		}
+		if id := strings.TrimSpace(thread.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func lastResolvedReviewThreadIDsFromMeta(meta map[string]any) []string {
+	if meta == nil {
+		return nil
+	}
+	switch raw := meta[metadataLastResolvedReviewThreadIDsKey].(type) {
+	case []string:
+		out := make([]string, 0, len(raw))
+		for _, id := range raw {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(raw))
+		for _, item := range raw {
+			if s, ok := stringFromAny(item); ok {
+				if trimmed := strings.TrimSpace(s); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func (r *Runner) allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx context.Context, cwd, repo string, pr PullRequestSummary, currentLogin string, meta map[string]any, policy DiscoveryPolicy) (bool, error) {
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) || !policy.RequireReviewRequest {
-		return false
+		return false, nil
 	}
 	raw, _ := meta["lastFilterSkip"].(map[string]any)
 	if raw == nil {
-		return false
+		return false, nil
 	}
 	kind, _ := stringFromAny(raw["kind"])
 	if kind != "not_requested" || !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
-		return false
+		return false, nil
 	}
 	reviewerLogin, _ := stringFromAny(raw["reviewerLogin"])
 	if normalizeLogin(reviewerLogin) == "" || normalizeLogin(currentLogin) == "" || normalizeLogin(reviewerLogin) != normalizeLogin(currentLogin) {
-		return false
+		return false, nil
 	}
-	return r.hasThreadResolutionFollowUpCandidate(ctx, cwd, repo, pr.Number, pr.HeadSHA, currentLogin)
+	if r.hasThreadResolutionFollowUpCandidate(ctx, cwd, repo, pr.Number, pr.HeadSHA, currentLogin) {
+		return true, nil
+	}
+	// Narrow disposition is independent of ThreadResolution.Enabled.
+	return r.hasNarrowDispositionCandidate(ctx, cwd, repo, pr.Number, pr.HeadSHA, pr.Author, currentLogin)
 }
 
 func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project storage.ProjectRecord, repo string, policy DiscoveryPolicy, currentLogin *string, loop storage.LoopRecord, detail PullRequestDetail, result *DiscoveryResult) error {
@@ -1131,6 +1503,14 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 	allowThreadResolutionFollowUp := false
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) {
 		allowThreadResolutionFollowUp = r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, *currentLogin)
+		if !allowThreadResolutionFollowUp {
+			// Narrow disposition candidate still allows discovery when Enabled=false.
+			var narrowErr error
+			allowThreadResolutionFollowUp, narrowErr = r.hasNarrowDispositionCandidate(ctx, project.RepoPath, repo, detail.Number, detail.HeadSHA, detail.Author, *currentLogin)
+			if narrowErr != nil {
+				return narrowErr
+			}
+		}
 		if !allowThreadResolutionFollowUp {
 			result.Skipped++
 			return nil
@@ -1763,6 +2143,16 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.LastRunAt = stringPtr(r.nowISO())
+		// Budget/scope pair holds must keep awaiting_human/paused presentation.
+		// Still attach NextRunAt when the queue item is retryable.
+		if loops.IsReviewFixPairHold(*updated) {
+			if failedQueue != nil && failedQueue.Status == "queued" {
+				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+			} else {
+				updated.NextRunAt = nil
+			}
+			return
+		}
 		if updated.Status == "paused" {
 			updated.NextRunAt = nil
 		} else if failedQueue != nil && failedQueue.Status == "queued" {
@@ -1791,12 +2181,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
 	if reason := terminalReviewerLoopReason(*loop); reason != "" {
-		cancelReason := "loop_" + reason
-		if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &cancelReason); err != nil {
-			return ProcessResult{}, err
+		// Budget holds stay non-terminal for claim preflight so at-cap recovery can
+		// still persist deferred needs_human scope before the budget skip return.
+		if !loops.IsReviewFixBudgetHold(*loop) {
+			cancelReason := "loop_" + reason
+			if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &cancelReason); err != nil {
+				return ProcessResult{}, err
+			}
+			summary := fmt.Sprintf("Skipped terminal reviewer loop %s: %s", loop.ID, reason)
+			return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
 		}
-		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: %s", loop.ID, reason)
-		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
 	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
@@ -1805,12 +2199,43 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
+	if r.shouldCreateReviewerBudgetPark(*loop) && r.livePullRequestClosed(ctx, *project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, *loop, "pr_closed_or_merged"); err != nil {
+			return ProcessResult{}, err
+		}
+		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: pr_closed_or_merged", loop.ID)
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
+	}
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
 		var holdErr *holdSkipError
 		if errors.As(err, &holdErr) {
 			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
 		}
 		return ProcessResult{}, err
+	}
+	dispositionOnlyClaim := payloadDispositionOnly(queueItem.PayloadJSON)
+	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, *loop); err != nil {
+		return ProcessResult{}, err
+	} else if parked {
+		// Budget-held disposition-only with a live changed signal still runs the
+		// narrow path (handoff refresh only; never publish / meter).
+		allowDisposition := false
+		if dispositionOnlyClaim && loop.Repo != nil && loop.PRNumber != nil {
+			if live, liveErr := r.dispositionOnlyStillActionable(ctx, *project, *loop, queueItem); liveErr != nil {
+				return ProcessResult{}, liveErr
+			} else {
+				allowDisposition = live
+			}
+		}
+		if !allowDisposition {
+			// Crash gap: publish + budget park may have landed without scope
+			// park/defer. Recover pending/scope from the latest checkpoint before
+			// skipping — never start the agent or re-publish on this path.
+			if err := r.recoverPublishedNeedsHumanScopeFromLatestRun(ctx, *project, *loop); err != nil {
+				return ProcessResult{}, err
+			}
+			return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "review-fix budget exhausted"}, nil
+		}
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -1867,7 +2292,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 	}
 	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.Status = "running"
+		// Disposition-only on a budget hold must not flip hold status to running.
+		if !(dispositionOnlyClaim && loops.IsReviewFixBudgetHold(*updated)) {
+			updated.Status = "running"
+		}
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
 		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON, project.ID)
@@ -1959,6 +2387,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				} else if failure.interrupted && terminalReviewerLoopReason(*updated) == "failed" {
 					updated.Status = "paused"
 					updated.NextRunAt = nil
+				} else if loops.IsReviewFixPairHold(*updated) {
+					// Keep awaiting_human/paused hold presentation; still schedule retry.
+					if failedQueue != nil && failedQueue.Status == "queued" {
+						updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+					} else {
+						updated.NextRunAt = nil
+					}
 				} else if updated.Status == "paused" {
 					updated.NextRunAt = nil
 				} else if failedQueue != nil && failedQueue.Status == "queued" {
@@ -2010,31 +2445,228 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
 	}
+	return r.finalizeSuccessfulReviewerQueue(ctx, *project, *loop, queueItem, run.ID, checkpoint, status, summary)
+}
+
+// finalizeSuccessfulReviewerQueue completes the active item and schedules any
+// pending/partial-batch continuation fail-closed (live read required; schedule errors surface).
+// After Complete, any downstream failure restores the row unless a continuation is already active.
+func (r *Runner) finalizeSuccessfulReviewerQueue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint reviewerCheckpoint, status, summary string) (ProcessResult, error) {
+	// Capture pending coalesced signal before completing the active item.
+	// Prefer the live row: mid-run may have stashed pending* and/or written
+	// partialBatchContinuation onto the running payload after claim.
+	// Fail closed on live read — do not Complete against a blind/stale snapshot.
+	liveItem, liveErr := r.repos.Queue.GetByID(ctx, queueItem.ID)
+	if liveErr != nil {
+		return ProcessResult{}, &loopError{message: "live queue read before complete failed: " + liveErr.Error(), kind: FailureRetryableTransient}
+	}
+	priorForContinuation := queueItem
+	if liveItem != nil {
+		priorForContinuation = *liveItem
+	}
+	pendingHead, pendingSignal, pendingDisp, hasPending := pendingReviewSignalFromQueuePayload(priorForContinuation.PayloadJSON)
+	partialCont := partialBatchContinuationFromPayload(priorForContinuation.PayloadJSON)
+	// Cursor-only resume: running enqueue may have written partialBatchContinuation
+	// without a distinct pending* signal (or pending was cleared). Still continue.
+	if !hasPending && partialCont != nil {
+		pendingSignal = strings.TrimSpace(partialCont.ReviewSignalFingerprint)
+		if pendingSignal == "" {
+			pendingSignal = strings.TrimSpace(partialCont.CapturedSignalFingerprint)
+		}
+		if pendingSignal == "" {
+			pendingSignal = reviewSignalFromQueuePayload(priorForContinuation.PayloadJSON)
+		}
+		pendingHead = strings.TrimSpace(partialCont.HeadSHA)
+		if pendingHead == "" {
+			pendingHead = headSHAFromQueuePayload(priorForContinuation.PayloadJSON)
+		}
+		pendingDisp = partialCont.DispositionOnly || payloadDispositionOnly(priorForContinuation.PayloadJSON)
+		hasPending = strings.TrimSpace(pendingSignal) != ""
+	}
+	needsContinuation := hasPending || partialCont != nil
+	if needsContinuation && strings.TrimSpace(pendingSignal) == "" {
+		pendingSignal = reviewSignalFromQueuePayload(priorForContinuation.PayloadJSON)
+		hasPending = strings.TrimSpace(pendingSignal) != ""
+		needsContinuation = hasPending || partialCont != nil
+	}
+	// Promote pending*/cursor onto primary payload before Complete so a failed
+	// post-Complete schedule can MarkRetry-resurrect with usable continuation state.
+	if needsContinuation && hasPending {
+		if promoted, promoErr := promoteReviewerContinuationPayload(priorForContinuation.PayloadJSON, pendingHead, pendingSignal, pendingDisp); promoErr != nil {
+			return ProcessResult{}, promoErr
+		} else if promoted != "" {
+			payload := promoted
+			priorForContinuation.PayloadJSON = &payload
+			priorForContinuation.UpdatedAt = r.nowISO()
+			if _, _, upsertErr := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, priorForContinuation); upsertErr != nil {
+				return ProcessResult{}, upsertErr
+			}
+		}
+	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+			return ProcessResult{LoopID: loop.ID, RunID: runID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 		}
 		return ProcessResult{}, err
 	}
-	updatedLoop, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+	updatedLoop, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
+		}
+		// Preserve budget/scope pair hold status after disposition-only work.
+		if loops.IsReviewFixPairHold(*updated) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+			return
+		}
+		if r.shouldParkReviewerBudget(*updated, checkpoint) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+			return
 		}
 		updated.Status = r.loopSuccessStatus(updated.Status, updated.MetadataJSON, checkpoint.SkipReason)
 		updated.LastRunAt = stringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	})
 	if err != nil {
-		return ProcessResult{}, err
+		return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
+	}
+	if parked, parkErr := r.parkReviewerBudgetAfterSuccessfulRun(ctx, project, updatedLoop); parkErr != nil {
+		return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, parkErr)
+	} else if parked {
+		r.cleanupReviewerWorktreeIfTerminal(context.Background(), project, &checkpoint)
+		// Still schedule disposition / partial-batch continuation on budget hold.
+		// Convergence full-review (pendingDisp=false without partial cursor) waits.
+		if needsContinuation && hasPending && (pendingDisp || partialCont != nil) {
+			if err := r.schedulePendingReviewerContinuation(ctx, project, updatedLoop, priorForContinuation, pendingHead, pendingSignal, pendingDisp); err != nil {
+				return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
+			}
+		}
+		return ProcessResult{LoopID: loop.ID, RunID: runID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
 	if reason := terminalReviewerLoopReason(updatedLoop); reason != "" {
 		if _, err := r.repos.Queue.CancelByLoop(ctx, updatedLoop.ID, r.nowISO(), &reason); err != nil {
-			return ProcessResult{}, err
+			return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
+		}
+	} else if needsContinuation && hasPending && !alreadyPublishedSameHeadConvergence(checkpoint) {
+		if err := r.schedulePendingReviewerContinuation(ctx, project, updatedLoop, priorForContinuation, pendingHead, pendingSignal, pendingDisp); err != nil {
+			return r.failReviewerFinalizeAfterComplete(ctx, priorForContinuation, err)
 		}
 	}
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
-	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+	r.cleanupReviewerWorktreeIfTerminal(context.Background(), project, &checkpoint)
+	return ProcessResult{LoopID: loop.ID, RunID: runID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+}
+
+// promoteReviewerContinuationPayload lifts pending* (or explicit head/signal) onto
+// primary payload fields and drops pending* keys. partialBatchContinuation is kept.
+func promoteReviewerContinuationPayload(payloadJSON *string, head, signal string, dispositionOnly bool) (string, error) {
+	if strings.TrimSpace(signal) == "" {
+		return "", nil
+	}
+	merged := parseJSONObject(payloadJSON)
+	convergencePass := pendingConvergencePassFromQueuePayload(payloadJSON)
+	delete(merged, "pendingReviewSignalFingerprint")
+	delete(merged, "pendingHeadSha")
+	delete(merged, "pendingDispositionOnly")
+	delete(merged, "pendingConvergencePass")
+	merged["reviewSignalFingerprint"] = signal
+	if strings.TrimSpace(head) != "" {
+		merged["headSha"] = head
+	}
+	if convergencePass {
+		merged["convergencePass"] = true
+		merged["dispositionOnly"] = false
+	} else {
+		merged["dispositionOnly"] = dispositionOnly
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func (r *Runner) schedulePendingReviewerContinuation(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, prior storage.QueueItemRecord, head, signal string, dispositionOnly bool) error {
+	if strings.TrimSpace(signal) == "" || prior.Repo == nil || prior.PRNumber == nil {
+		return nil
+	}
+	if head == "" {
+		head = headSHAFromQueuePayload(prior.PayloadJSON)
+	}
+	meta := parseJSONObject(loop.MetadataJSON)
+	availableAt := r.nextReviewAvailableAt(meta, dispositionOnly)
+	item, err := r.enqueue(ctx, enqueueInput{
+		ProjectID:               project.ID,
+		LoopID:                  loop.ID,
+		Repo:                    *prior.Repo,
+		PRNumber:                *prior.PRNumber,
+		HeadSHA:                 head,
+		ReviewSignalFingerprint: signal,
+		DispositionOnly:         dispositionOnly && !queuedSameHeadConvergencePass(prior.PayloadJSON),
+		ConvergencePass:         queuedSameHeadConvergencePass(prior.PayloadJSON),
+		AvailableAt:             availableAt,
+	})
+	if err != nil {
+		return err
+	}
+	// Preserve partial-batch cursor from the completed run onto the new item.
+	if contRaw, ok := parseJSONObject(prior.PayloadJSON)["partialBatchContinuation"]; ok && contRaw != nil {
+		merged := parseJSONObject(item.PayloadJSON)
+		merged["partialBatchContinuation"] = contRaw
+		encoded, encErr := json.Marshal(merged)
+		if encErr != nil {
+			return encErr
+		}
+		payload := string(encoded)
+		item.PayloadJSON = &payload
+		item.UpdatedAt = r.nowISO()
+		if _, _, upsertErr := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, item); upsertErr != nil {
+			return upsertErr
+		}
+	}
+	return nil
+}
+
+// failReviewerFinalizeAfterComplete restores the completed row when no
+// continuation is active so a post-Complete updateLoop/schedule failure cannot
+// drop coalesced clean-convergence work after the live signal was promoted.
+func (r *Runner) failReviewerFinalizeAfterComplete(ctx context.Context, item storage.QueueItemRecord, cause error) (ProcessResult, error) {
+	if restoreErr := r.restoreReviewerQueueIfNoContinuation(ctx, item, cause); restoreErr != nil {
+		return ProcessResult{}, errors.Join(cause, restoreErr)
+	}
+	return ProcessResult{}, cause
+}
+
+func (r *Runner) restoreReviewerQueueIfNoContinuation(ctx context.Context, item storage.QueueItemRecord, cause error) error {
+	if r.repos == nil || r.repos.Queue == nil || strings.TrimSpace(item.ID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(item.DedupeKey) != "" {
+		active, err := r.repos.Queue.FindActiveByDedupe(ctx, item.DedupeKey)
+		if err != nil {
+			return err
+		}
+		if active != nil && active.ID != item.ID {
+			return nil
+		}
+		if active != nil && active.ID == item.ID && (active.Status == "queued" || active.Status == "running") {
+			return nil
+		}
+	}
+	nowISO := r.nowISO()
+	message := ""
+	if cause != nil {
+		message = cause.Error()
+	}
+	return r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{
+		ID:           item.ID,
+		AvailableAt:  nowISO,
+		Attempts:     item.Attempts,
+		ErrorMessage: optionalString(message),
+		ErrorKind:    string(FailureRetryableTransient),
+		UpdatedAt:    nowISO,
+	})
 }
 
 func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord) error {
@@ -2257,22 +2889,86 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, nil
 		}
 	}
+	meta := parseJSONObject(input.Loop.MetadataJSON)
+	samePublishedHead := false
+	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
+		samePublishedHead = true
+	}
+	alreadyReviewedHead := false
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
 		if err := ensureCurrentLogin(); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
 		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
+			alreadyReviewedHead = true
+		}
+	}
+	if samePublishedHead || alreadyReviewedHead {
+		// Explicit same-head full-review continuation after disposition cleared
+		// blockers. Do not force disposition-only or head-only skip.
+		if queuedSameHeadConvergencePass(input.QueueItem.PayloadJSON) {
+			checkpoint.ConvergencePass = true
+			checkpoint.DispositionOnly = false
+			checkpoint.ThreadResolutionFollowUpOnly = false
+			if signal := reviewSignalFromQueuePayload(input.QueueItem.PayloadJSON); signal != "" {
+				checkpoint.ReviewSignalFingerprint = signal
+			}
+		} else if admitted, signal, err := r.admitSameHeadDisposition(ctx, input, checkpoint, meta); err != nil {
+			return checkpoint, err
+		} else if admitted {
+			checkpoint.DispositionOnly = true
+			checkpoint.ThreadResolutionFollowUpOnly = true
+			checkpoint.ReviewSignalFingerprint = signal
+			return checkpoint, nil
+		} else if alreadyReviewedHead && !samePublishedHead {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
 			checkpoint.SkipKind = "already_reviewed_by_current_user"
 			checkpoint.SkipReviewerLogin = currentLogin
 			return checkpoint, nil
+		} else if samePublishedHead {
+			checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
+			checkpoint.SkipKind = "already_published_head"
+			return checkpoint, nil
 		}
 	}
-	meta := parseJSONObject(input.Loop.MetadataJSON)
-	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
-		checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
-		checkpoint.SkipKind = "already_published_head"
-		return checkpoint, nil
+	// Queue payload is a cursor, not authority. Compare to live head/signal.
+	payloadHead := headSHAFromQueuePayload(input.QueueItem.PayloadJSON)
+	payloadSignal := reviewSignalFromQueuePayload(input.QueueItem.PayloadJSON)
+	payloadDispOnly := payloadDispositionOnly(input.QueueItem.PayloadJSON)
+	if payloadDispOnly {
+		liveHead := ""
+		if checkpoint.Detail != nil {
+			liveHead = strings.TrimSpace(checkpoint.Detail.HeadSHA)
+		}
+		if payloadHead != "" && liveHead != "" && payloadHead != liveHead {
+			// Head drifted after disposition-only enqueue → full new-head review.
+			checkpoint.DispositionOnly = false
+			checkpoint.ThreadResolutionFollowUpOnly = false
+			checkpoint.ReviewSignalFingerprint = ""
+		} else {
+			checkpoint.DispositionOnly = true
+			checkpoint.ThreadResolutionFollowUpOnly = true
+			if payloadSignal != "" {
+				checkpoint.ReviewSignalFingerprint = payloadSignal
+			}
+		}
+	} else if payloadSignal != "" {
+		checkpoint.ReviewSignalFingerprint = payloadSignal
+	}
+	// Restore partial-batch continuation cursor from payload when present.
+	if cont := partialBatchContinuationFromPayload(input.QueueItem.PayloadJSON); cont != nil {
+		checkpoint.ThreadResolution = cont
+		checkpoint.DispositionOnly = checkpoint.DispositionOnly || cont.DispositionOnly
+		if cont.DispositionOnly {
+			checkpoint.ThreadResolutionFollowUpOnly = true
+		}
+	}
+	if checkpoint.ConvergencePass {
+		var revalidateErr error
+		checkpoint, revalidateErr = r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+		if revalidateErr != nil {
+			return checkpoint, revalidateErr
+		}
 	}
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Detail.HeadSHA)
 	if !isManualReviewerLoop(input.Loop) && networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
@@ -2294,7 +2990,22 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
 		if reviewRequestsKnownAbsent(checkpoint.Detail.ReviewRequests, currentLogin) {
+			// Disposition-only work is targeted intent and may proceed without a
+			// fresh review request (RequireCurrentReviewRequest does not apply).
+			if checkpoint.DispositionOnly {
+				checkpoint.ThreadResolutionFollowUpOnly = true
+				return checkpoint, nil
+			}
 			if r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {
+				checkpoint.ThreadResolutionFollowUpOnly = true
+				return checkpoint, nil
+			}
+			narrowOK, narrowErr := r.hasNarrowDispositionCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, checkpoint.Detail.Author, currentLogin)
+			if narrowErr != nil {
+				return checkpoint, narrowErr
+			}
+			if narrowOK {
+				checkpoint.DispositionOnly = true
 				checkpoint.ThreadResolutionFollowUpOnly = true
 				return checkpoint, nil
 			}
@@ -2304,6 +3015,218 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 	}
 	return checkpoint, nil
+}
+
+func reviewSignalFromQueuePayload(payloadJSON *string) string {
+	payload := parseJSONObject(payloadJSON)
+	signal, _ := stringFromAny(payload["reviewSignalFingerprint"])
+	return strings.TrimSpace(signal)
+}
+
+func headSHAFromQueuePayload(payloadJSON *string) string {
+	payload := parseJSONObject(payloadJSON)
+	head, _ := stringFromAny(payload["headSha"])
+	return strings.TrimSpace(head)
+}
+
+func pendingReviewSignalFromQueuePayload(payloadJSON *string) (head, signal string, dispositionOnly bool, ok bool) {
+	payload := parseJSONObject(payloadJSON)
+	signal, _ = stringFromAny(payload["pendingReviewSignalFingerprint"])
+	signal = strings.TrimSpace(signal)
+	if signal == "" {
+		return "", "", false, false
+	}
+	head, _ = stringFromAny(payload["pendingHeadSha"])
+	head = strings.TrimSpace(head)
+	if v, isBool := payload["pendingDispositionOnly"].(bool); isBool {
+		dispositionOnly = v
+	}
+	return head, signal, dispositionOnly, true
+}
+
+func pendingConvergencePassFromQueuePayload(payloadJSON *string) bool {
+	payload := parseJSONObject(payloadJSON)
+	v, ok := payload["pendingConvergencePass"].(bool)
+	return ok && v
+}
+
+func payloadDispositionOnly(payloadJSON *string) bool {
+	payload := parseJSONObject(payloadJSON)
+	if v, ok := payload["dispositionOnly"].(bool); ok {
+		return v
+	}
+	return false
+}
+
+// queuedSameHeadConvergencePass reports an explicit full-review continuation
+// scheduled after last-thread accept. Signal-bearing payloads are not enough:
+// MaxThreadsPerRun partial continuations also carry reviewSignalFingerprint.
+func queuedSameHeadConvergencePass(payloadJSON *string) bool {
+	payload := parseJSONObject(payloadJSON)
+	v, ok := payload["convergencePass"].(bool)
+	return ok && v
+}
+
+func alreadyPublishedSameHeadConvergence(checkpoint reviewerCheckpoint) bool {
+	return checkpoint.ConvergencePass && checkpoint.PendingReview != nil && checkpoint.SkipReason == ""
+}
+
+func partialBatchContinuationFromPayload(payloadJSON *string) *threadResolutionCheckpoint {
+	payload := parseJSONObject(payloadJSON)
+	raw, ok := payload["partialBatchContinuation"].(map[string]any)
+	if !ok || raw == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var cont threadResolutionCheckpoint
+	if err := json.Unmarshal(encoded, &cont); err != nil {
+		return nil
+	}
+	if !cont.PartialBatch && !cont.PostMutationCommitPending {
+		return nil
+	}
+	return &cont
+}
+
+// threadResolutionBatchFullyComplete reports whether a prior thread-resolution
+// checkpoint finished every captured candidate for this head. Used to avoid
+// treating a mid-batch mutation failure (PartialBatch=false but incomplete
+// CompletedThreadIDs) as a finished batch on retry.
+func threadResolutionBatchFullyComplete(tr *threadResolutionCheckpoint) bool {
+	if tr == nil || tr.PartialBatch || tr.PostMutationCommitPending {
+		return false
+	}
+	if len(tr.CapturedCandidateIDs) == 0 || len(tr.CompletedThreadIDs) == 0 {
+		return false
+	}
+	completed := make(map[string]struct{}, len(tr.CompletedThreadIDs))
+	for _, id := range tr.CompletedThreadIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		completed[id] = struct{}{}
+	}
+	if len(completed) == 0 {
+		return false
+	}
+	for _, id := range tr.CapturedCandidateIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := completed[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// dispositionOnlyStillActionable reports whether a budget-held disposition-only
+// claim still has a live changed disposition signal (payload is not authority).
+// Spec §8.7 admits only a new trusted directive or validated Fixer decline.
+// An absent lastReviewedSignalFingerprint with no such signal is upgrade
+// baseline work: persist the live fingerprint, keep the hold, and do not admit.
+func (r *Runner) dispositionOnlyStillActionable(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (bool, error) {
+	if r.github == nil || loop.Repo == nil || loop.PRNumber == nil {
+		return false, nil
+	}
+	looperLogin, err := r.requireCurrentUserLogin(ctx, project.RepoPath)
+	if err != nil {
+		return false, err
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: *loop.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	threads, err := r.listReviewThreadsForSignal(ctx, project.RepoPath, *loop.Repo, *loop.PRNumber)
+	if err != nil {
+		return false, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	if ThreadsHaveChangedDispositionSignalForLogin(threads, detail.Author, looperLogin) {
+		return true, nil
+	}
+	// Also admit when live signal differs from stored fingerprint (upgrade / edit).
+	meta := parseJSONObject(loop.MetadataJSON)
+	live := ComputeReviewSignalFingerprintForLogin(detail.HeadSHA, threads, looperLogin)
+	last, _ := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey])
+	if strings.TrimSpace(last) != "" && last != live {
+		return true, nil
+	}
+	if strings.TrimSpace(last) == "" {
+		if err := r.persistLastReviewedSignalFingerprint(ctx, loop, live, threads); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// admitSameHeadDisposition returns true when a continuous native-thread loop has
+// a review signal that differs from lastReviewedSignalFingerprint (or needs the
+// upgrade reconciliation pass). Live listing is authority; payload is a cursor.
+func (r *Runner) admitSameHeadDisposition(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, meta map[string]any) (bool, string, error) {
+	if checkpoint.Detail == nil || !r.hasNativeThreadCapabilities(input.Project.ID) {
+		return false, "", nil
+	}
+	if !isContinuousReviewerLoop(input.Loop, meta) {
+		return false, "", nil
+	}
+	looperLogin, err := r.requireCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return false, "", err
+	}
+	threads, err := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
+	if err != nil {
+		return false, "", &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	signal := ComputeReviewSignalFingerprintForLogin(checkpoint.Detail.HeadSHA, threads, looperLogin)
+	lastSignal, _ := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey])
+	// Self-webhook / already-reviewed exit only when LIVE signal equals stored.
+	if strings.TrimSpace(lastSignal) != "" && lastSignal == signal {
+		return false, signal, nil
+	}
+	if strings.TrimSpace(lastSignal) == "" {
+		if hasUnresolvedLooperAuthoredThreadsForLogin(threads, looperLogin) {
+			return true, signal, nil
+		}
+		// Baseline without publishing.
+		if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, signal, threads); err != nil {
+			return false, "", err
+		}
+		return false, signal, nil
+	}
+	return true, signal, nil
+}
+
+func (r *Runner) hasNarrowDispositionCandidate(ctx context.Context, cwd, repo string, prNumber int64, headSHA, prAuthor, looperLogin string) (bool, error) {
+	if r.github == nil || strings.TrimSpace(headSHA) == "" {
+		return false, nil
+	}
+	looperLogin = normalizeLogin(looperLogin)
+	if looperLogin == "" {
+		var err error
+		looperLogin, err = r.requireCurrentUserLogin(ctx, cwd)
+		if err != nil {
+			return false, err
+		}
+	}
+	threads, err := r.listReviewThreadsForSignal(ctx, cwd, repo, prNumber)
+	if err != nil {
+		r.logWarn("reviewer disposition candidate lookup failed", map[string]any{"repo": repo, "prNumber": prNumber, "error": err.Error()})
+		return false, &loopError{message: "disposition candidate listing failed: " + err.Error(), kind: FailureRetryableTransient}
+	}
+	for _, thread := range threads {
+		if ThreadHasChangedDispositionSignalForLogin(thread, prAuthor, looperLogin) {
+			return true, nil
+		}
+		if hasUnresolvedAcceptWontfixAudit(thread, headSHA, looperLogin) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 const conflictedPRNotificationChannel = "github_pr_comment"
@@ -2604,10 +3527,40 @@ type threadResolutionAgentOutput struct {
 func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	policy := r.threadResolution
-	if checkpoint.SkipReason != "" || !policy.Enabled {
+	// Partial-batch continuations set SkipReason so the rest of the pipeline
+	// short-circuits, but the next runThreadResolutionStep must still process
+	// remaining candidates from the captured cursor.
+	if checkpoint.SkipReason != "" {
+		if checkpoint.ThreadResolution == nil || !checkpoint.ThreadResolution.PartialBatch {
+			return checkpoint, nil
+		}
+		checkpoint.SkipReason = ""
+		checkpoint.SkipKind = ""
+	}
+	checkpoint, err := r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	narrowDisposition := r.shouldRunNarrowDispositionPath(input, checkpoint)
+	if !policy.Enabled && !narrowDisposition {
+		// Still promote baseline signal on continuous loops with no work so
+		// discovery does not re-queue forever after upgrade.
+		if checkpoint.DispositionOnly && checkpoint.ReviewSignalFingerprint != "" {
+			_ = r.persistLastReviewedSignalFingerprint(ctx, input.Loop, checkpoint.ReviewSignalFingerprint, nil)
+		}
 		return checkpoint, nil
 	}
-	if checkpoint.ThreadResolution != nil && checkpoint.Snapshot != nil && checkpoint.ThreadResolution.HeadSHA == checkpoint.Snapshot.HeadSHA {
+	// Retry path: mutations done, promote pending — do not re-classify.
+	if checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.PostMutationCommitPending {
+		return r.commitPostMutationThreadResolution(ctx, input, checkpoint)
+	}
+	if checkpoint.ThreadResolution != nil && checkpoint.Snapshot != nil && checkpoint.ThreadResolution.HeadSHA == checkpoint.Snapshot.HeadSHA && threadResolutionBatchFullyComplete(checkpoint.ThreadResolution) {
+		// Completed single-batch (or final batch) for this head — every captured
+		// candidate must be in CompletedThreadIDs. A mid-batch mutation error
+		// (e.g. reply ok, resolve failed) must not short-circuit as finished.
+		if checkpoint.DispositionOnly {
+			return r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
+		}
 		return checkpoint, nil
 	}
 	if checkpoint.Detail == nil || checkpoint.Snapshot == nil {
@@ -2619,101 +3572,400 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		return checkpoint, nil
 	}
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	if !r.hasNativeThreadCapabilities(input.Project.ID) {
+		// Providers without native threads never claim same-head disposition.
+		if checkpoint.DispositionOnly {
+			return r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
+		}
+		return checkpoint, nil
 	}
-	currentLogin = normalizeLogin(currentLogin)
+	currentLogin, err := r.requireCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return checkpoint, err
+	}
 	limit := policy.MaxThreadsPerRun
 	if limit <= 0 {
 		limit = 10
 	}
-	fetchLimit := limit * 5
-	if fetchLimit < 100 {
-		fetchLimit = 100
-	}
-	threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: fetchLimit})
+	threads, err := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
-	candidates := make([]ReviewThread, 0, len(threads))
-	for _, thread := range threads {
-		if len(candidates) >= limit {
-			break
+	threadFeedbackFP := ThreadFeedbackFingerprintForLogin(threads, currentLogin)
+	reviewSignalFP := ReviewSignalFingerprint(checkpoint.Snapshot.HeadSHA, threadFeedbackFP)
+	checkpoint.ReviewSignalFingerprint = reviewSignalFP
+
+	// Self-webhook / post-mutation admission: LIVE stored signal already matches.
+	meta := parseJSONObject(input.Loop.MetadataJSON)
+	lastReviewedSignal, _ := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey])
+	lastResolvedIDs := lastResolvedReviewThreadIDsFromMeta(meta)
+	if last, ok := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey]); ok && last == reviewSignalFP && checkpoint.DispositionOnly {
+		var finErr error
+		checkpoint, finErr = r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
+		if finErr != nil {
+			return checkpoint, finErr
 		}
-		if r.threadResolutionCandidate(thread, checkpoint.Snapshot.HeadSHA, currentLogin, policy) {
-			candidates = append(candidates, thread)
-		}
-	}
-	result := &threadResolutionCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Reported: len(candidates)}
-	if len(candidates) == 0 {
+		result := &threadResolutionCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, ReviewSignalFingerprint: reviewSignalFP, ThreadFeedbackFingerprint: threadFeedbackFP, DispositionOnly: true}
 		checkpoint.ThreadResolution = result
 		return checkpoint, nil
 	}
-	decisions, err := r.classifyReviewThreads(ctx, input, checkpoint, candidates)
-	if err != nil {
-		return checkpoint, err
+
+	// Inter-batch drift: live complete signal diverged from captured signal.
+	// CapturedSignalFingerprint is refreshed after each partial batch to the
+	// post-mutation live signal so our own accept/resolve/audit does not look
+	// like external drift and wipe the continuation cursor.
+	if checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.PartialBatch {
+		captured := strings.TrimSpace(checkpoint.ThreadResolution.CapturedSignalFingerprint)
+		if captured != "" && captured != reviewSignalFP {
+			checkpoint.ThreadResolution = nil
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: "review signal drifted between thread-resolution batches", kind: FailureRetryableAfterResume}
+		}
 	}
+
+	completedSet := map[string]struct{}{}
+	var priorCompleted []string
+	if checkpoint.ThreadResolution != nil {
+		priorCompleted = append(priorCompleted, checkpoint.ThreadResolution.CompletedThreadIDs...)
+		for _, id := range checkpoint.ThreadResolution.CompletedThreadIDs {
+			completedSet[id] = struct{}{}
+		}
+	}
+
+	type candidateEntry struct {
+		thread      ReviewThread
+		disposition bool // narrow disposition path
+		objective   bool // legacy ThreadResolution.Enabled path
+	}
+	// Capture full candidate set once for partial-batch continuation.
+	var capturedIDs []string
+	capturedSignal := reviewSignalFP
+	if checkpoint.ThreadResolution != nil && len(checkpoint.ThreadResolution.CapturedCandidateIDs) > 0 {
+		capturedIDs = append(capturedIDs, checkpoint.ThreadResolution.CapturedCandidateIDs...)
+		if s := strings.TrimSpace(checkpoint.ThreadResolution.CapturedSignalFingerprint); s != "" {
+			capturedSignal = s
+		}
+	}
+	allCandidates := make([]candidateEntry, 0)
+	threadByID := make(map[string]ReviewThread, len(threads))
+	for _, thread := range threads {
+		threadByID[thread.ID] = thread
+		if _, done := completedSet[thread.ID]; done {
+			continue
+		}
+		isDisposition := narrowDisposition && (ThreadHasChangedDispositionSignalForLogin(thread, checkpoint.Detail.Author, currentLogin) || hasUnresolvedAcceptWontfixAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin))
+		isObjective := policy.Enabled && r.threadResolutionCandidate(thread, checkpoint.Snapshot.HeadSHA, currentLogin, policy)
+		if !isDisposition && !isObjective {
+			continue
+		}
+		allCandidates = append(allCandidates, candidateEntry{thread: thread, disposition: isDisposition, objective: isObjective})
+	}
+	if len(capturedIDs) == 0 {
+		for _, c := range allCandidates {
+			capturedIDs = append(capturedIDs, c.thread.ID)
+		}
+		slices.Sort(capturedIDs)
+	} else {
+		// Restrict to the originally captured set (stable batches).
+		allowed := map[string]struct{}{}
+		for _, id := range capturedIDs {
+			allowed[id] = struct{}{}
+		}
+		filtered := allCandidates[:0]
+		seen := map[string]struct{}{}
+		for _, c := range allCandidates {
+			if _, ok := allowed[c.thread.ID]; ok {
+				filtered = append(filtered, c)
+				seen[c.thread.ID] = struct{}{}
+			}
+		}
+		// Resume captured-but-incomplete threads that no longer surface as live
+		// disposition candidates (e.g. accept audit posted, resolve failed — the
+		// unaudited signal is gone but resolve must still run).
+		for _, id := range capturedIDs {
+			if _, done := completedSet[id]; done {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			thread, ok := threadByID[id]
+			if !ok {
+				// Gone from provider listing — treat as terminated for the cursor.
+				priorCompleted = appendUniqueString(priorCompleted, id)
+				completedSet[id] = struct{}{}
+				continue
+			}
+			if thread.IsResolved {
+				priorCompleted = appendUniqueString(priorCompleted, id)
+				completedSet[id] = struct{}{}
+				continue
+			}
+			// Prefer disposition resume when narrow path is active; else objective.
+			filtered = append(filtered, candidateEntry{
+				thread:      thread,
+				disposition: narrowDisposition || checkpoint.DispositionOnly,
+				objective:   policy.Enabled && !narrowDisposition && !checkpoint.DispositionOnly,
+			})
+			seen[id] = struct{}{}
+		}
+		allCandidates = filtered
+	}
+
+	result := &threadResolutionCheckpoint{
+		HeadSHA:                   checkpoint.Snapshot.HeadSHA,
+		ThreadFeedbackFingerprint: threadFeedbackFP,
+		ReviewSignalFingerprint:   reviewSignalFP,
+		CapturedSignalFingerprint: capturedSignal,
+		CompletedThreadIDs:        append([]string{}, priorCompleted...),
+		CapturedCandidateIDs:      capturedIDs,
+		DispositionOnly:           checkpoint.DispositionOnly || (narrowDisposition && !policy.Enabled),
+		Reported:                  len(allCandidates) + len(priorCompleted),
+		Processed:                 len(priorCompleted),
+		Commented: func() int {
+			if checkpoint.ThreadResolution != nil {
+				return checkpoint.ThreadResolution.Commented
+			}
+			return 0
+		}(),
+		Resolved: func() int {
+			if checkpoint.ThreadResolution != nil {
+				return checkpoint.ThreadResolution.Resolved
+			}
+			return 0
+		}(),
+	}
+	if len(allCandidates) == 0 {
+		// No remaining candidates: promote baseline / finish.
+		checkpoint.ThreadResolution = result
+		if checkpoint.DispositionOnly || result.DispositionOnly {
+			if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP, threads); err != nil {
+				return checkpoint, err
+			}
+			var finErr error
+			checkpoint, finErr = r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
+			if finErr != nil {
+				return checkpoint, finErr
+			}
+		}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
+	}
+
+	// One MaxThreadsPerRun batch per run. Do not promote fingerprint until all
+	// captured candidates terminate and post-mutation refetch succeeds.
+	batch := allCandidates
+	if len(batch) > limit {
+		batch = batch[:limit]
+	}
+	remainingAfter := len(allCandidates) - len(batch)
+	result.PartialBatch = remainingAfter > 0
+
+	candidateThreads := make([]ReviewThread, 0, len(batch))
+	for _, c := range batch {
+		candidateThreads = append(candidateThreads, c.thread)
+	}
+	// Pre-classify one-rejection quota without another classifier call.
+	// Existing remote audits are decision authority on retry (spec §8.2).
 	decisionByID := map[string]threadResolutionAgentDecision{}
-	for _, decision := range decisions {
-		decisionByID[decision.ThreadID] = decision
+	classifyThreads := make([]ReviewThread, 0, len(candidateThreads))
+	for _, thread := range candidateThreads {
+		if decision, ok := resumeDispositionDecisionFromRemoteAudit(thread, checkpoint.Snapshot.HeadSHA, currentLogin, lastReviewedSignal, threads, lastResolvedIDs); ok {
+			decisionByID[thread.ID] = decision
+			continue
+		}
+		if ForceNeedsHumanAfterSecondDecline(thread, checkpoint.Snapshot.HeadSHA, currentLogin) {
+			decisionByID[thread.ID] = threadResolutionAgentDecision{
+				ThreadID: thread.ID, Decision: "needs_human",
+				Evidence: "second unchanged-input Fixer decline after reject_wontfix", Confidence: "high",
+			}
+			continue
+		}
+		classifyThreads = append(classifyThreads, thread)
 	}
-	for _, thread := range candidates {
+	if len(classifyThreads) > 0 {
+		decisions, err := r.classifyReviewThreads(ctx, input, checkpoint, classifyThreads, threadFeedbackFP)
+		if err != nil {
+			checkpoint.ThreadResolution = result
+			return checkpoint, err
+		}
+		for _, decision := range decisions {
+			decisionByID[decision.ThreadID] = decision
+		}
+	}
+
+	mutated := false
+	for _, entry := range batch {
+		thread := entry.thread
 		decision, ok := decisionByID[thread.ID]
 		if !ok {
 			decision = threadResolutionAgentDecision{ThreadID: thread.ID, Decision: "needs_human", Evidence: "no classifier decision returned", Confidence: "low"}
 		}
+		decision = normalizeThreadResolutionDecision(decision)
+		isDisposition := entry.disposition
+		decisionValue := strings.ToLower(strings.TrimSpace(decision.Decision))
+		// Narrow disposition path only terminates as accept/reject/needs_human.
+		if isDisposition {
+			switch decisionValue {
+			case "accept_wontfix", "reject_wontfix", "needs_human":
+			case "objectively_fixed", "not_fixed":
+				prior := decisionValue
+				decision.Decision = "needs_human"
+				decisionValue = "needs_human"
+				if strings.TrimSpace(decision.Evidence) == "" {
+					decision.Evidence = "disposition candidate cannot terminate as " + prior
+				}
+			default:
+				decision.Decision = "needs_human"
+				decisionValue = "needs_human"
+			}
+		}
 		result.Processed++
-		auditedForHead := hasSufficientThreadResolutionAuditForDecision(policy, thread, checkpoint.Snapshot.HeadSHA, decision)
 		commented := false
 		resolved := false
 		skippedReason := ""
-		if !auditedForHead && r.threadResolutionShouldComment(policy, decision) {
-			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
+		// needs_human on the narrow disposition path: halt pair; no remote
+		// adjudication reply. Recheck live head and per-thread fingerprint
+		// first (§8.5) so a push during classify cannot park the pair on
+		// stale evidence. Persist local signal identity so same-head polling
+		// does not re-enqueue unchanged input (§8.4). Legacy modes may still comment.
+		if decisionValue == "needs_human" && isDisposition {
+			candidateFeedbackFP := candidateThreadFeedbackFingerprintForLogin(thread, currentLogin)
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP, decisionValue)
 			if err != nil {
+				checkpoint.ThreadResolution = result
 				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
 				return checkpoint, err
 			}
 			if latestThread == nil {
 				skippedReason = "candidate_no_longer_eligible"
-				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
+				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, decisionValue, strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
+				result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
 				continue
 			}
 			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				checkpoint.ThreadResolution = result
 				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
-			body := r.buildThreadResolutionReply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
+			result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
+			result.ReviewSignalFingerprint = reviewSignalFP
+			result.ThreadFeedbackFingerprint = threadFeedbackFP
+			checkpoint.ReviewSignalFingerprint = reviewSignalFP
+			checkpoint.ThreadResolution = result
+			r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, decisionValue, strings.TrimSpace(decision.Evidence), thread.ID, "needs_human", "")
+			if err := r.parkDispositionNeedsHuman(ctx, input, thread.ID, decision.Evidence, reviewSignalFP); err != nil {
+				return checkpoint, err
+			}
+			if loops.IsReviewFixBudgetHold(input.Loop) {
+				if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, reviewSignalFP, threads); err != nil {
+					return checkpoint, err
+				}
+			}
+			var finErr error
+			checkpoint, finErr = r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
+			if finErr != nil {
+				return checkpoint, finErr
+			}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
+		}
+
+		// Objective decisions stay behind ThreadResolution.Enabled.
+		if !isDispositionDecision(decisionValue) && isObjectiveThreadResolutionDecision(decision) && !policy.Enabled {
+			decision.Decision = "not_fixed"
+			decisionValue = "not_fixed"
+		}
+
+		// Per-candidate feedback identity for mutation-staleness (full thread FP).
+		candidateFeedbackFP := candidateThreadFeedbackFingerprintForLogin(thread, currentLogin)
+		// reject_wontfix markers store coordination-excluded FP so §8.4 one-rejection
+		// quota can match later declines without Fixer-decline noise in the marker.
+		markerFeedbackFP := candidateFeedbackFP
+		if decisionValue == "reject_wontfix" {
+			markerFeedbackFP = coordinationExcludedThreadFeedbackFingerprint(thread, currentLogin)
+		}
+
+		audited := false
+		if isDispositionDecision(decisionValue) {
+			audited = hasThreadResolutionAuditForSignalForLogin(thread, thread.ID, checkpoint.Snapshot.HeadSHA, markerFeedbackFP, decisionValue, currentLogin)
+		} else {
+			audited = hasSufficientThreadResolutionAuditForDecision(policy, thread, checkpoint.Snapshot.HeadSHA, decision, currentLogin)
+		}
+
+		shouldComment := false
+		shouldResolve := false
+		if isDispositionDecision(decisionValue) {
+			shouldComment = !audited && (decisionValue == "accept_wontfix" || decisionValue == "reject_wontfix")
+			shouldResolve = decisionValue == "accept_wontfix"
+		} else if policy.Enabled {
+			shouldComment = !audited && r.threadResolutionShouldComment(policy, decision)
+			shouldResolve = r.threadResolutionShouldResolve(policy, decision)
+		}
+
+		if shouldComment {
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP, decisionValue)
+			if err != nil {
+				checkpoint.ThreadResolution = result
+				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
+				return checkpoint, err
+			}
+			if latestThread == nil {
+				skippedReason = "candidate_no_longer_eligible"
+				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, decisionValue, strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
+				result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
+				continue
+			}
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				checkpoint.ThreadResolution = result
+				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+			}
+			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
+			body := r.buildThreadResolutionReplyWithFeedback(thread.ID, checkpoint.Snapshot.HeadSHA, markerFeedbackFP, decision, policy)
 			disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
+				checkpoint.ThreadResolution = result
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 			}
 			result.Commented++
 			commented = true
+			mutated = true
 		}
-		if r.threadResolutionShouldResolve(policy, decision) {
-			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
+		if shouldResolve {
+			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidateForPath(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, isDisposition, candidateFeedbackFP, decisionValue)
 			if err != nil {
+				checkpoint.ThreadResolution = result
 				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
 				return checkpoint, err
 			}
 			if latestThread == nil {
 				skippedReason = "candidate_no_longer_eligible"
+				result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
 				continue
 			}
 			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+				checkpoint.ThreadResolution = result
 				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
-			if !hasObjectiveThreadResolutionAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
+			if isDispositionDecision(decisionValue) {
+				if !hasThreadResolutionAuditForSignalForLogin(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA, candidateFeedbackFP, decisionValue, currentLogin) && !commented {
+					skippedReason = "missing_disposition_audit_comment"
+					result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
+					continue
+				}
+			} else if !hasObjectiveThreadResolutionAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA, currentLogin) && !commented {
 				skippedReason = "missing_objective_audit_comment"
+				result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
 				continue
 			}
 			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: thread.ID, CWD: input.Project.RepoPath}); err != nil {
+				checkpoint.ThreadResolution = result
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 			}
 			result.Resolved++
 			resolved = true
+			mutated = true
 		}
 		action := "reported"
 		if resolved {
@@ -2723,17 +3975,523 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		} else if skippedReason != "" {
 			action = "skipped"
 		}
-		r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, action, skippedReason)
+		r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, decisionValue, strings.TrimSpace(decision.Evidence), thread.ID, action, skippedReason)
+		result.CompletedThreadIDs = appendUniqueString(result.CompletedThreadIDs, thread.ID)
 	}
+
 	checkpoint.ThreadResolution = result
+	if input.Run.ID != "" && r.repos != nil && r.repos.Runs != nil {
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepThreadResolution, checkpoint); err != nil {
+			return checkpoint, err
+		}
+	}
+
+	// Partial batch: requeue continuation; do not promote fingerprint.
+	if result.PartialBatch {
+		// Anchor the continuation cursor to the post-mutation live signal so the
+		// next batch does not treat our own resolve/audit as inter-batch drift.
+		// Fail closed on listing errors — do not continue with a stale cursor.
+		liveThreads, listErr := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
+		if listErr != nil {
+			checkpoint.ThreadResolution = result
+			return checkpoint, &loopError{message: "partial-batch signal refetch failed: " + listErr.Error(), kind: FailureRetryableTransient}
+		}
+		liveFP := ThreadFeedbackFingerprintForLogin(liveThreads, currentLogin)
+		liveSignal := ReviewSignalFingerprint(checkpoint.Snapshot.HeadSHA, liveFP)
+		result.ThreadFeedbackFingerprint = liveFP
+		result.ReviewSignalFingerprint = liveSignal
+		result.CapturedSignalFingerprint = liveSignal
+		checkpoint.ReviewSignalFingerprint = liveSignal
+		checkpoint.ThreadResolution = result
+		if err := r.enqueueThreadResolutionContinuation(ctx, input, checkpoint, result); err != nil {
+			return checkpoint, err
+		}
+		if checkpoint.DispositionOnly || result.DispositionOnly {
+			checkpoint.SkipReason = "Partial thread disposition batch; continuation queued"
+			checkpoint.SkipKind = "disposition_partial_batch"
+			checkpoint.PendingReview = nil
+		}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
+	}
+
+	// Mark commit pending before refetch so a refetch failure retries promote only.
+	if mutated {
+		result.PostMutationCommitPending = true
+		checkpoint.ThreadResolution = result
+		if input.Run.ID != "" && r.repos != nil && r.repos.Runs != nil {
+			if err := r.persistCheckpoint(ctx, input.Run.ID, stepThreadResolution, checkpoint); err != nil {
+				return checkpoint, err
+			}
+		}
+	}
+	return r.commitPostMutationThreadResolution(ctx, input, checkpoint)
+}
+
+func (r *Runner) shouldRunNarrowDispositionPath(input stepInput, checkpoint reviewerCheckpoint) bool {
+	if !r.hasNativeThreadCapabilities(input.Project.ID) {
+		return false
+	}
+	meta := parseJSONObject(input.Loop.MetadataJSON)
+	if !isContinuousReviewerLoop(input.Loop, meta) {
+		return false
+	}
+	if checkpoint.DispositionOnly {
+		return true
+	}
+	// Also run when ThreadResolutionFollowUpOnly was set for disposition.
+	return checkpoint.ThreadResolutionFollowUpOnly && !r.threadResolution.Enabled
+}
+
+func (r *Runner) finishDispositionOnlyCheckpoint(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (reviewerCheckpoint, error) {
+	checkpoint.DispositionOnly = true
+	checkpoint.ThreadResolutionFollowUpOnly = true
+	// Same-head clean convergence: when disposition cleared blockers and the pair
+	// is not budget-held, schedule a distinct full-review admission (not head-only skip).
+	shouldConverge, err := r.shouldScheduleDispositionConvergence(ctx, input, checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	if shouldConverge {
+		checkpoint.SkipReason = ""
+		checkpoint.SkipKind = ""
+		if checkpoint.ThreadResolution != nil {
+			checkpoint.ThreadResolution.ScheduleConvergencePass = true
+		}
+		// Clear disposition-only so skipThreadResolutionFollowUpReview does not block review.
+		checkpoint.DispositionOnly = false
+		checkpoint.ThreadResolutionFollowUpOnly = false
+		checkpoint.ConvergencePass = true
+		if err := r.enqueueDispositionConvergence(ctx, input, checkpoint); err != nil {
+			return checkpoint, err
+		}
+		checkpoint.PendingReview = nil
+		return checkpoint, nil
+	}
+	if checkpoint.SkipReason == "" {
+		checkpoint.SkipReason = "Completed same-head thread disposition pass"
+		checkpoint.SkipKind = "disposition_only"
+	}
+	checkpoint.PendingReview = nil
+	// Budget-held: refresh handoff only (park re-entry), never publish.
+	if loops.IsReviewFixBudgetHold(input.Loop) {
+		if _, err := r.parkReviewerBudgetIfExhausted(ctx, input.Loop); err != nil {
+			return checkpoint, err
+		}
+	}
+	return checkpoint, nil
+}
+
+func (r *Runner) shouldScheduleDispositionConvergence(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (bool, error) {
+	if !r.hasNativeThreadCapabilities(input.Project.ID) {
+		return false, nil
+	}
+	if loops.IsReviewFixBudgetHold(input.Loop) || loops.IsReviewFixPairHold(input.Loop) {
+		return false, nil
+	}
+	if checkpoint.Snapshot == nil {
+		return false, nil
+	}
+	login, err := r.requireCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		// Identity failures are retryable — do not silently skip convergence after
+		// a fingerprint was already persisted (polling would see no change).
+		return false, err
+	}
+	threads, err := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
+	if err != nil {
+		return false, &loopError{message: "disposition convergence listing failed: " + err.Error(), kind: FailureRetryableTransient}
+	}
+	return !hasUnresolvedLooperAuthoredThreadsForLogin(threads, login), nil
+}
+
+func (r *Runner) enqueueDispositionConvergence(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) error {
+	if r.repos == nil || r.repos.Queue == nil {
+		return nil
+	}
+	head := ""
+	if checkpoint.Snapshot != nil {
+		head = checkpoint.Snapshot.HeadSHA
+	}
+	signal := strings.TrimSpace(checkpoint.ReviewSignalFingerprint)
+	availableAt := r.nextReviewAvailableAt(parseJSONObject(input.Loop.MetadataJSON), false)
+	_, err := r.enqueue(ctx, enqueueInput{
+		ProjectID:               input.Project.ID,
+		LoopID:                  input.Loop.ID,
+		Repo:                    input.Repo,
+		PRNumber:                input.PRNumber,
+		HeadSHA:                 head,
+		ReviewSignalFingerprint: signal,
+		DispositionOnly:         false,
+		ConvergencePass:         true,
+		AvailableAt:             availableAt,
+	})
+	return err
+}
+
+// revalidateSameHeadConvergence refreshes the live review signal and unresolved
+// Looper-authored thread set. Queue payload is a cursor; live threads are
+// authority. Unresolved disposition work demotes the pass to disposition-only.
+func (r *Runner) revalidateSameHeadConvergence(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (reviewerCheckpoint, error) {
+	if !checkpoint.ConvergencePass || checkpoint.SkipReason != "" {
+		return checkpoint, nil
+	}
+	if r.github == nil || !r.hasNativeThreadCapabilities(input.Project.ID) {
+		return checkpoint, nil
+	}
+	login, err := r.requireCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return checkpoint, err
+	}
+	threads, err := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
+	if err != nil {
+		return checkpoint, &loopError{message: "convergence revalidation listing failed: " + err.Error(), kind: FailureRetryableTransient}
+	}
+	head := ""
+	if checkpoint.Detail != nil {
+		head = strings.TrimSpace(checkpoint.Detail.HeadSHA)
+	}
+	if checkpoint.Snapshot != nil && strings.TrimSpace(checkpoint.Snapshot.HeadSHA) != "" {
+		head = strings.TrimSpace(checkpoint.Snapshot.HeadSHA)
+	}
+	if signal := ComputeReviewSignalFingerprintForLogin(head, threads, login); signal != "" {
+		checkpoint.ReviewSignalFingerprint = signal
+	}
+	if hasUnresolvedLooperAuthoredThreadsForLogin(threads, login) {
+		checkpoint.ConvergencePass = false
+		checkpoint.DispositionOnly = true
+		checkpoint.ThreadResolutionFollowUpOnly = true
+		if checkpoint.ThreadResolution != nil {
+			checkpoint.ThreadResolution.ScheduleConvergencePass = false
+		}
+	}
+	return checkpoint, nil
+}
+
+func (r *Runner) abortConvergenceForLiveDisposition(_ context.Context, _ stepInput, checkpoint reviewerCheckpoint) (reviewerCheckpoint, error) {
+	checkpoint.PendingReview = nil
+	checkpoint.SkipReason = "Same-head convergence aborted; unresolved Looper-authored threads require disposition"
+	checkpoint.SkipKind = "disposition_only"
+	return checkpoint, nil
+}
+
+func (r *Runner) commitPostMutationThreadResolution(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (reviewerCheckpoint, error) {
+	result := checkpoint.ThreadResolution
+	if result == nil {
+		return checkpoint, nil
+	}
+	currentLogin, err := r.requireCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		result.PostMutationCommitPending = true
+		checkpoint.ThreadResolution = result
+		return checkpoint, err
+	}
+	refetched, err := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
+	if err != nil {
+		result.PostMutationCommitPending = true
+		result.PartialBatch = false
+		checkpoint.ThreadResolution = result
+		return checkpoint, &loopError{message: "post-mutation thread refetch failed: " + err.Error(), kind: FailureRetryableTransient}
+	}
+	postFeedback := ThreadFeedbackFingerprintForLogin(refetched, currentLogin)
+	head := result.HeadSHA
+	if checkpoint.Snapshot != nil && checkpoint.Snapshot.HeadSHA != "" {
+		head = checkpoint.Snapshot.HeadSHA
+	}
+	postSignal := ReviewSignalFingerprint(head, postFeedback)
+	result.ThreadFeedbackFingerprint = postFeedback
+	result.ReviewSignalFingerprint = postSignal
+	result.PartialBatch = false
+	// Do not clear PostMutationCommitPending until fingerprint write succeeds.
+	result.PostMutationCommitPending = true
+	checkpoint.ReviewSignalFingerprint = postSignal
+	checkpoint.ThreadResolution = result
+	if input.Run.ID != "" && r.repos != nil && r.repos.Runs != nil {
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepThreadResolution, checkpoint); err != nil {
+			return checkpoint, err
+		}
+	}
+	if err := r.persistLastReviewedSignalFingerprint(ctx, input.Loop, postSignal, refetched); err != nil {
+		return checkpoint, err
+	}
+	result.PostMutationCommitPending = false
+	checkpoint.ThreadResolution = result
+	if input.Run.ID != "" && r.repos != nil && r.repos.Runs != nil {
+		_ = r.persistCheckpoint(ctx, input.Run.ID, stepThreadResolution, checkpoint)
+	}
+	if checkpoint.DispositionOnly || result.DispositionOnly {
+		var finErr error
+		checkpoint, finErr = r.finishDispositionOnlyCheckpoint(ctx, input, checkpoint)
+		if finErr != nil {
+			return checkpoint, finErr
+		}
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
 
+func (r *Runner) enqueueThreadResolutionContinuation(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, result *threadResolutionCheckpoint) error {
+	if result == nil {
+		return nil
+	}
+	head := ""
+	if checkpoint.Snapshot != nil {
+		head = checkpoint.Snapshot.HeadSHA
+	}
+	partialCont := map[string]any{
+		"headSha":                   result.HeadSHA,
+		"threadFeedbackFingerprint": result.ThreadFeedbackFingerprint,
+		"reviewSignalFingerprint":   result.ReviewSignalFingerprint,
+		"capturedSignalFingerprint": result.CapturedSignalFingerprint,
+		"completedThreadIds":        result.CompletedThreadIDs,
+		"capturedCandidateIds":      result.CapturedCandidateIDs,
+		"partialBatch":              true,
+		"dispositionOnly":           result.DispositionOnly,
+		"processed":                 result.Processed,
+		"commented":                 result.Commented,
+		"resolved":                  result.Resolved,
+		"reported":                  result.Reported,
+	}
+	availableAt := r.nextReviewAvailableAt(parseJSONObject(input.Loop.MetadataJSON), result.DispositionOnly || checkpoint.DispositionOnly)
+	// Enqueue via stable dedupe; if active item is this run's item (running),
+	// stash as pending signal for post-completion continuation.
+	item, err := r.enqueue(ctx, enqueueInput{
+		ProjectID:               input.Project.ID,
+		LoopID:                  input.Loop.ID,
+		Repo:                    input.Repo,
+		PRNumber:                input.PRNumber,
+		HeadSHA:                 head,
+		ReviewSignalFingerprint: result.CapturedSignalFingerprint,
+		DispositionOnly:         result.DispositionOnly || checkpoint.DispositionOnly,
+		AvailableAt:             availableAt,
+	})
+	if err != nil {
+		return err
+	}
+	// Merge full partial-batch cursor onto the active item. Running/claimed
+	// enqueue only stashes pending* fields; completed/captured IDs must survive.
+	merged := parseJSONObject(item.PayloadJSON)
+	if strings.TrimSpace(head) != "" {
+		merged["headSha"] = head
+	}
+	if strings.TrimSpace(result.CapturedSignalFingerprint) != "" {
+		merged["reviewSignalFingerprint"] = result.CapturedSignalFingerprint
+	}
+	merged["dispositionOnly"] = result.DispositionOnly || checkpoint.DispositionOnly
+	merged["partialBatchContinuation"] = partialCont
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return err
+	}
+	payloadStr := string(encoded)
+	item.PayloadJSON = &payloadStr
+	item.UpdatedAt = r.nowISO()
+	if _, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, item); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isDispositionDecision(decision string) bool {
+	switch strings.ToLower(strings.TrimSpace(decision)) {
+	case "accept_wontfix", "reject_wontfix":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeThreadResolutionDecision(decision threadResolutionAgentDecision) threadResolutionAgentDecision {
+	decision.Decision = strings.ToLower(strings.TrimSpace(decision.Decision))
+	decision.Confidence = strings.ToLower(strings.TrimSpace(decision.Confidence))
+	switch decision.Decision {
+	case "objectively_fixed", "accept_wontfix", "reject_wontfix", "needs_human", "not_fixed":
+	default:
+		decision.Decision = "needs_human"
+		if strings.TrimSpace(decision.Evidence) == "" {
+			decision.Evidence = "unrecognized classifier decision"
+		}
+	}
+	return decision
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+// parkDispositionScopePersistHook, when set (tests only), runs after the
+// budget-held loop is refreshed and before pending-scope persist so Continue
+// can interleave.
+var parkDispositionScopePersistHook func(loop storage.LoopRecord) error
+
+// reviewScopeHumanPersistBeforeUpsertHook, when set (tests only), runs after a
+// hold-positive live read and immediately before pending-scope metadata CAS so
+// Continue can interleave in the remaining GetByID-then-CAS window.
+var reviewScopeHumanPersistBeforeUpsertHook func(loop storage.LoopRecord) error
+
+const reviewScopeHumanPersistCASAttempts = 3
+
+func (r *Runner) parkDispositionNeedsHuman(ctx context.Context, input stepInput, threadID, evidence, signal string) error {
+	if r.repos == nil {
+		return nil
+	}
+	message := strings.TrimSpace(evidence)
+	if message == "" {
+		message = "Thread disposition requires human judgment"
+	}
+	question := fmt.Sprintf("Review thread %s needs human disposition judgment", strings.TrimSpace(threadID))
+	// Do not stack a scope hold over an existing budget hold. Persist pending
+	// evidence so budget Continue can promote it, then refresh the handoff.
+	if loops.IsReviewFixBudgetHold(input.Loop) {
+		if _, err := r.parkReviewerBudgetIfExhausted(ctx, input.Loop); err != nil {
+			return err
+		}
+		if err := loops.RefreshReviewFixPairHandoff(ctx, r.repos, input.Loop, signal, r.nowISO()); err != nil {
+			return err
+		}
+		loop := input.Loop
+		refreshHeld := func() (storage.LoopRecord, error) {
+			if r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+				return loop, nil
+			}
+			fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+			if err != nil {
+				return storage.LoopRecord{}, fmt.Errorf("refresh loop before budget-held disposition park: %w", err)
+			}
+			if fresh == nil {
+				return storage.LoopRecord{}, fmt.Errorf("refresh loop before budget-held disposition park: loop %s not found", loop.ID)
+			}
+			return *fresh, nil
+		}
+		if r.repos.Loops == nil {
+			return fmt.Errorf("persist pending review scope requires loop storage")
+		}
+		var err error
+		for range reviewScopeHumanPersistCASAttempts {
+			loop, err = refreshHeld()
+			if err != nil {
+				return err
+			}
+			if !loops.IsReviewFixBudgetHold(loop) {
+				// Continue/unpause already released the pair; do not restore it.
+				return nil
+			}
+			if parkDispositionScopePersistHook != nil {
+				if err := parkDispositionScopePersistHook(loop); err != nil {
+					return err
+				}
+			}
+			if reviewScopeHumanPersistBeforeUpsertHook != nil {
+				if err := reviewScopeHumanPersistBeforeUpsertHook(loop); err != nil {
+					return err
+				}
+			}
+			encoded, encErr := loops.PersistPendingReviewScopeHumanEvidence(
+				loop.MetadataJSON, question, message, r.reviewFixHITLEnabled(),
+			)
+			if encErr != nil {
+				return encErr
+			}
+			applied, casErr := r.repos.Loops.UpdateMetadataIfMatch(ctx, loop.ID, &encoded, r.nowISO(), loop.MetadataJSON)
+			if casErr != nil {
+				return casErr
+			}
+			if applied {
+				return nil
+			}
+		}
+		live, liveErr := refreshHeld()
+		if liveErr != nil {
+			return liveErr
+		}
+		if !loops.IsReviewFixBudgetHold(live) {
+			return nil
+		}
+		return &loopError{
+			message: fmt.Sprintf("persist pending review scope lost CAS while budget hold remains for loop %s", loop.ID),
+			kind:    FailureRetryableTransient,
+		}
+	}
+	_, err := loops.ParkReviewScopeHuman(ctx, r.repos, loops.ParkReviewScopeHumanInput{
+		Held:        input.Loop,
+		Role:        "reviewer",
+		Repo:        input.Repo,
+		PRNumber:    input.PRNumber,
+		NowISO:      r.nowISO(),
+		HITLEnabled: r.reviewFixHITLEnabled(),
+		Question:    question,
+		Evidence:    message,
+		Signal:      signal,
+		DB:          r.db,
+	})
+	if err != nil {
+		return err
+	}
+	r.notifyHumanAttentionBestEffort(ctx, input.Loop.ID)
+	return nil
+}
+
+func (r *Runner) refreshThreadResolutionCandidateForPath(ctx context.Context, input stepInput, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig, threadID string, dispositionPath bool, classifiedFeedbackFP, decision string) (*ReviewThread, PullRequestDetail, error) {
+	if dispositionPath {
+		// Bypass RequireCurrentReviewRequest and RequireNewHeadSinceThread.
+		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+		if err != nil {
+			return nil, PullRequestDetail{}, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		if normalizePRState(detail.State) != "open" || detail.HeadSHA != headSHA {
+			return nil, PullRequestDetail{}, &loopError{message: "PR changed during thread reconciliation", kind: FailureRetryableAfterResume}
+		}
+		latest, err := r.listReviewThreadsForSignal(ctx, input.Project.RepoPath, input.Repo, input.PRNumber)
+		if err != nil {
+			return nil, detail, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		}
+		for i := range latest {
+			if latest[i].ID != threadID {
+				continue
+			}
+			if latest[i].IsResolved {
+				// Human resolve during classify is terminal. Only accept_wontfix
+				// may treat it as idempotent success; reject/needs_human must not
+				// mutate or park on the stale classified snapshot.
+				if strings.EqualFold(strings.TrimSpace(decision), "accept_wontfix") {
+					return &latest[i], detail, nil
+				}
+				return nil, detail, nil
+			}
+			if !isLooperAuthoredThreadForLogin(latest[i], currentLogin) && !threadHasValidatedFixerDeclineFromAuthor(latest[i], currentLogin) {
+				return nil, detail, nil
+			}
+			// Stale mutation guard: feedback fingerprint must match classified input.
+			// Use the always-include candidate fingerprint so a third-party decline
+			// thread does not look drifted after Reviewer's own accept/reject audit.
+			if classifiedFeedbackFP != "" {
+				liveFP := candidateThreadFeedbackFingerprintForLogin(latest[i], currentLogin)
+				if liveFP != classifiedFeedbackFP {
+					return nil, detail, &loopError{message: "thread feedback changed during thread reconciliation", kind: FailureRetryableAfterResume}
+				}
+			}
+			return &latest[i], detail, nil
+		}
+		return nil, detail, nil
+	}
+	return r.refreshThreadResolutionCandidate(ctx, input, headSHA, currentLogin, policy, threadID, 100)
+}
+
 func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint, err error) reviewerCheckpoint {
 	var typed *loopError
-	if errors.As(err, &typed) && typed.kind == FailureRetryableAfterResume && strings.Contains(typed.message, "PR changed during thread reconciliation") {
-		checkpoint.ResumePolicy = "restart_from_discover"
+	if errors.As(err, &typed) && typed.kind == FailureRetryableAfterResume {
+		if strings.Contains(typed.message, "PR changed during thread reconciliation") || strings.Contains(typed.message, "thread feedback changed") {
+			checkpoint.ResumePolicy = "restart_from_discover"
+		}
 	}
 	return checkpoint
 }
@@ -2772,7 +4530,10 @@ func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, current
 	if policy.Scope == config.ReviewerThreadResolutionScopeLooperAuthoredOnly && normalizeLogin(first.Author) != currentLogin {
 		return false
 	}
-	if policy.Scope == config.ReviewerThreadResolutionScopeLooperAuthoredOnly && !isLooperAuthoredThread(thread) {
+	// Use the live reviewer login so non-looper* identities (e.g. "bob") that
+	// authored stamped roots still count; empty-login isLooperAuthoredThread
+	// only accepts looper* bot names and would drop legitimate follow-ups.
+	if policy.Scope == config.ReviewerThreadResolutionScopeLooperAuthoredOnly && !isLooperAuthoredThreadForLogin(thread, currentLogin) {
 		return false
 	}
 	if policy.RequireNewHeadSinceThread && headSHA != "" {
@@ -2781,7 +4542,7 @@ func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, current
 			return false
 		}
 	}
-	if policy.Mode != config.ReviewerThreadResolutionModeResolveObjective && hasThreadResolutionAuditForHead(thread, headSHA) {
+	if policy.Mode != config.ReviewerThreadResolutionModeResolveObjective && hasValidatedThreadResolutionAuditForHead(thread, headSHA, currentLogin) {
 		return false
 	}
 	return true
@@ -2813,7 +4574,7 @@ func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input ste
 	return nil, detail, nil
 }
 
-func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, threads []ReviewThread) ([]threadResolutionAgentDecision, error) {
+func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, threads []ReviewThread, feedbackFingerprint string) ([]threadResolutionAgentDecision, error) {
 	if r.agentExecutor == nil {
 		return nil, &loopError{message: "reviewer agent executor is not configured", kind: FailureRetryableTransient}
 	}
@@ -2827,8 +4588,17 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		candidateIDs = append(candidateIDs, thread.ID)
 	}
 	slices.Sort(candidateIDs)
-	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
-	prompt := buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads)
+	feedbackFingerprint = strings.TrimSpace(feedbackFingerprint)
+	if feedbackFingerprint == "" {
+		login := ""
+		if checkpoint.Detail != nil {
+			login = normalizeLogin(checkpoint.Detail.CurrentLogin)
+		}
+		feedbackFingerprint = ThreadFeedbackFingerprintForLogin(threads, login)
+	}
+	// Include classified feedback identity so edits invalidate idempotency.
+	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, feedbackFingerprint, strings.Join(candidateIDs, ","))
+	prompt := buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads, checkpoint)
 	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
 		prompt = nativeResumeContinuationPrompt("thread-resolution", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	}
@@ -2863,7 +4633,7 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &loopError{message: message, kind: FailureRetryableTransient}
 	}
-	parsed, err := parseThreadResolutionOutput(result.Stdout)
+	parsed, err := parseThreadResolutionOutput(result.Stdout, candidateIDs)
 	if err == nil {
 		return parsed.Decisions, nil
 	}
@@ -2874,27 +4644,54 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
 }
 
-func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, threads []ReviewThread) string {
-	payload, _ := json.MarshalIndent(map[string]any{"repo": repo, "prNumber": prNumber, "headSHA": headSHA, "threads": threads}, "", "  ")
+func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, threads []ReviewThread, checkpoint reviewerCheckpoint) string {
+	payload := map[string]any{"repo": repo, "prNumber": prNumber, "headSHA": headSHA, "threads": threads}
+	if checkpoint.Detail != nil {
+		payload["prTitle"] = checkpoint.Detail.Title
+		if checkpoint.Snapshot != nil {
+			payload["prBody"] = checkpoint.Snapshot.Body
+			if checkpoint.Snapshot.Title != "" {
+				payload["prTitle"] = checkpoint.Snapshot.Title
+			}
+		}
+	} else if checkpoint.Snapshot != nil {
+		payload["prTitle"] = checkpoint.Snapshot.Title
+		payload["prBody"] = checkpoint.Snapshot.Body
+	}
+	if checkpoint.Snapshot != nil && checkpoint.Snapshot.PayloadJSON != "" {
+		// Linked-intent / instructions already captured on the snapshot when present.
+		payload["snapshotContext"] = checkpoint.Snapshot.PayloadJSON
+	}
+	encoded, _ := json.MarshalIndent(payload, "", "  ")
 	return strings.TrimSpace(`You are running Looper's reviewer thread reconciliation phase.
 
-Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify whether each requested change is objectively addressed at the current head.
+Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify each thread. Use PR title/body and any snapshotContext (repository instructions / linked intent) as scope authority.
+
+Decisions:
+- objectively_fixed: requested behavior is verifiably present at the current head
+- accept_wontfix: finding is outside documented PR scope, optional, incorrect, or superseded by a trusted human wontfix / validated Fixer decline
+- reject_wontfix: finding is required by repository rule/PR intent or is a directly introduced correctness/safety regression; keep unresolved
+- needs_human: authority conflicts, reason missing, or evidence ambiguous
+- not_fixed: no disposition applies and requested behavior is still absent
 
 Safety rules:
 - The current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout. Reuse it for git fetch, git checkout, diff inspection, and local verification. Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.
 - Return objectively_fixed only for concrete, verifiable code or documentation changes that are present in the worktree.
-- Return needs_human for subjective, product, design, security-sensitive, ambiguous, or partially addressed feedback.
+- An explicit trusted human "/looper wontfix" (or alias) is a request for scope adjudication, not automatic acceptance.
+- "/looper reconsider" is a new disposition signal requiring accept_wontfix, reject_wontfix, or needs_human — never silent not_fixed.
+- A validated Fixer decline marker is a dispute signal for accept/reject, not human authority by itself.
 - Do not treat an author reply like "fixed" as evidence by itself.
+- Every decision MUST include non-empty evidence.
 - Do not call GitHub APIs and do not post comments.
 
 Output only valid JSON in this exact shape:
-{"decisions":[{"threadId":"<id>","decision":"objectively_fixed|needs_human|not_fixed","evidence":"brief concrete evidence","confidence":"high|medium|low"}]}
+{"decisions":[{"threadId":"<id>","decision":"objectively_fixed|accept_wontfix|reject_wontfix|needs_human|not_fixed","evidence":"brief concrete evidence","confidence":"high|medium|low"}]}
 
 Payload:
-` + string(payload))
+` + string(encoded))
 }
 
-func parseThreadResolutionOutput(stdout string) (threadResolutionAgentOutput, error) {
+func parseThreadResolutionOutput(stdout string, requiredThreadIDs []string) (threadResolutionAgentOutput, error) {
 	trimmed := strings.TrimSpace(stdout)
 	start := strings.Index(trimmed, "{")
 	end := strings.LastIndex(trimmed, "}")
@@ -2904,6 +4701,22 @@ func parseThreadResolutionOutput(stdout string) (threadResolutionAgentOutput, er
 	var parsed threadResolutionAgentOutput
 	if err := json.Unmarshal([]byte(trimmed[start:end+1]), &parsed); err != nil {
 		return threadResolutionAgentOutput{}, fmt.Errorf("parse thread resolution classifier output: %w", err)
+	}
+	byID := map[string]threadResolutionAgentDecision{}
+	for _, d := range parsed.Decisions {
+		id := strings.TrimSpace(d.ThreadID)
+		if id == "" {
+			continue
+		}
+		if strings.TrimSpace(d.Evidence) == "" {
+			return threadResolutionAgentOutput{}, fmt.Errorf("thread resolution classifier returned empty evidence for thread %s", id)
+		}
+		byID[id] = d
+	}
+	for _, id := range requiredThreadIDs {
+		if _, ok := byID[id]; !ok {
+			return threadResolutionAgentOutput{}, fmt.Errorf("thread resolution classifier missing decision for thread %s", id)
+		}
 	}
 	return parsed, nil
 }
@@ -2928,6 +4741,10 @@ func isObjectiveThreadResolutionDecision(decision threadResolutionAgentDecision)
 }
 
 func (r *Runner) buildThreadResolutionReply(threadID, headSHA string, decision threadResolutionAgentDecision, policy config.ReviewerThreadResolutionConfig) string {
+	return r.buildThreadResolutionReplyWithFeedback(threadID, headSHA, "", decision, policy)
+}
+
+func (r *Runner) buildThreadResolutionReplyWithFeedback(threadID, headSHA, feedbackFingerprint string, decision threadResolutionAgentDecision, policy config.ReviewerThreadResolutionConfig) string {
 	evidence := strings.TrimSpace(decision.Evidence)
 	if evidence == "" {
 		evidence = "the current head"
@@ -2936,7 +4753,13 @@ func (r *Runner) buildThreadResolutionReply(threadID, headSHA string, decision t
 	if decisionValue == "" {
 		decisionValue = "needs_human"
 	}
-	marker := fmt.Sprintf("<!-- looper:thread-resolution thread=%s head=%s decision=%s -->", threadID, headSHA, decisionValue)
+	marker := threadResolutionMarker(threadID, headSHA, feedbackFingerprint, decisionValue)
+	switch decisionValue {
+	case "accept_wontfix":
+		return fmt.Sprintf("Looper accepts the scope disposition on head `%s`: %s. Resolving this thread.\n%s", headSHA, evidence, marker)
+	case "reject_wontfix":
+		return fmt.Sprintf("Looper rejects the scope disposition on head `%s`: %s. Keeping this thread unresolved so Fixer can address it.\n%s", headSHA, evidence, marker)
+	}
 	if isObjectiveThreadResolutionDecision(decision) {
 		if policy.Mode == config.ReviewerThreadResolutionModeSuggestResolution {
 			return fmt.Sprintf("Looper checked this thread against head `%s`. The requested change appears objectively addressed by %s. Please resolve this thread if you agree.\n%s", headSHA, evidence, marker)
@@ -2949,6 +4772,8 @@ func (r *Runner) buildThreadResolutionReply(threadID, headSHA string, decision t
 	return fmt.Sprintf("Looper checked this thread against head `%s`. I could not verify that this thread is objectively resolved: %s.\n%s", headSHA, evidence, marker)
 }
 
+// hasThreadResolutionAuditForHead is a substring helper retained for unit tests.
+// Production mutation/idempotency paths must use hasValidatedThreadResolutionAuditForHead.
 func hasThreadResolutionAuditForHead(thread ReviewThread, headSHA string) bool {
 	needle := "looper:thread-resolution"
 	headNeedle := "head=" + headSHA
@@ -2960,17 +4785,42 @@ func hasThreadResolutionAuditForHead(thread ReviewThread, headSHA string) bool {
 	return false
 }
 
-func hasSufficientThreadResolutionAuditForDecision(policy config.ReviewerThreadResolutionConfig, thread ReviewThread, headSHA string, decision threadResolutionAgentDecision) bool {
-	if policy.Mode == config.ReviewerThreadResolutionModeResolveObjective && isObjectiveThreadResolutionDecision(decision) {
-		return hasObjectiveThreadResolutionAuditForHead(thread, thread.ID, headSHA)
+// hasValidatedThreadResolutionAuditForHead requires a well-formed marker and
+// Looper identity — not a substring spoof.
+func hasValidatedThreadResolutionAuditForHead(thread ReviewThread, headSHA, looperLogin string) bool {
+	headSHA = strings.TrimSpace(headSHA)
+	for _, comment := range thread.Comments {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
+			continue
+		}
+		fields, ok := parseThreadResolutionMarker(comment.Body)
+		if !ok {
+			continue
+		}
+		if headSHA == "" || fields.HeadSHA == headSHA {
+			return true
+		}
 	}
-	return hasThreadResolutionAuditForHead(thread, headSHA)
+	return false
 }
 
-func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, headSHA string) bool {
+func hasSufficientThreadResolutionAuditForDecision(policy config.ReviewerThreadResolutionConfig, thread ReviewThread, headSHA string, decision threadResolutionAgentDecision, looperLogin string) bool {
+	if policy.Mode == config.ReviewerThreadResolutionModeResolveObjective && isObjectiveThreadResolutionDecision(decision) {
+		return hasObjectiveThreadResolutionAuditForHead(thread, thread.ID, headSHA, looperLogin)
+	}
+	return hasValidatedThreadResolutionAuditForHead(thread, headSHA, looperLogin)
+}
+
+func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, headSHA, looperLogin string) bool {
 	for _, comment := range thread.Comments {
-		body := comment.Body
-		if strings.Contains(body, "looper:thread-resolution") && strings.Contains(body, "thread="+threadID) && strings.Contains(body, "head="+headSHA) && strings.Contains(body, "decision=objectively_fixed") {
+		if !isValidatedThreadResolutionAudit(comment, looperLogin, thread.ID) {
+			continue
+		}
+		fields, ok := parseThreadResolutionMarker(comment.Body)
+		if !ok {
+			continue
+		}
+		if fields.ThreadID == threadID && fields.HeadSHA == headSHA && fields.Decision == "objectively_fixed" {
 			return true
 		}
 	}
@@ -2978,11 +4828,22 @@ func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, hea
 }
 
 func isLooperAuthoredThread(thread ReviewThread) bool {
+	return isLooperAuthoredThreadForLogin(thread, "")
+}
+
+// isLooperAuthoredThreadForLogin requires the root comment to carry a Looper
+// stamp/review marker and, when looperLogin is known, to be authored by that
+// identity. Spoofed stamps from untrusted authors are not Looper-authored.
+func isLooperAuthoredThreadForLogin(thread ReviewThread, looperLogin string) bool {
 	if len(thread.Comments) == 0 {
 		return false
 	}
-	body := thread.Comments[0].Body
-	return strings.Contains(body, "looper:stamp") || strings.Contains(body, "looper:review")
+	root := thread.Comments[0]
+	body := root.Body
+	if !strings.Contains(body, "looper:stamp") && !strings.Contains(body, "looper:review") {
+		return false
+	}
+	return isLooperIdentityAuthor(root.Author, looperLogin)
 }
 
 func latestThreadFeedbackCommitOID(thread ReviewThread) string {
@@ -3069,7 +4930,16 @@ func (r *Runner) startReviewerHeadChangeMonitor(ctx context.Context, input stepI
 }
 
 func (r *Runner) appendThreadResolutionEvent(ctx context.Context, input stepInput, headSHA, decision, evidence, threadID, action, skippedReason string) {
-	r.appendEvent(ctx, eventInput{eventType: "reviewer.thread_resolution", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "threadId": threadID, "headSha": headSHA, "decision": decision, "evidence": evidence, "action": action, "skippedReason": skippedReason}})
+	payload := map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "threadId": threadID, "headSha": headSHA, "decision": decision, "evidence": evidence, "action": action, "skippedReason": skippedReason}
+	if isDispositionDecision(decision) {
+		payload["disposition"] = true
+	}
+	if meta := parseJSONObject(input.Loop.MetadataJSON); meta != nil {
+		if signal, ok := stringFromAny(meta[metadataLastReviewedSignalFingerprintKey]); ok && strings.TrimSpace(signal) != "" {
+			payload["lastReviewedSignalFingerprint"] = strings.TrimSpace(signal)
+		}
+	}
+	r.appendEvent(ctx, eventInput{eventType: "reviewer.thread_resolution", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: payload})
 }
 
 func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
@@ -3077,6 +4947,14 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	var err error
 	if checkpoint.PendingReview != nil {
 		return checkpoint, nil
+	}
+	beforeConvergence := checkpoint.ConvergencePass
+	checkpoint, err = r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	if beforeConvergence && !checkpoint.ConvergencePass && checkpoint.DispositionOnly {
+		return r.abortConvergenceForLiveDisposition(ctx, input, checkpoint)
 	}
 	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
 		return next, err
@@ -3111,7 +4989,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
+	idempotencyKey := reviewPublicationID(input.Loop.ID, checkpoint)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Snapshot.HeadSHA)
 	reviewRequestBypassReason := ""
@@ -3124,8 +5002,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
-	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
+	lastPublishedHeadSHA, _ := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"])
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion, lastPublishedHeadSHA)
+	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, lastPublishedHeadSHA)
 	metadata := map[string]any{
 		"loopType":            "reviewer",
 		"phase":               "review",
@@ -3191,6 +5070,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
+		if !commentOnlyCompletion {
+			if nativeCompletion, parseErr := parseReviewerNativeCompletion(result); parseErr == nil && commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
+				return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
+			}
+		}
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		} else if found.Found {
@@ -3235,22 +5119,67 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
-	if cleanReviewNoopSummary(result.Summary) {
-		if commentOnlyCompletion {
-			completion, err := parseReviewerCommentOnlyCompletion(result)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	if commentOnlyCompletion {
+		completion, err := parseReviewerCommentOnlyCompletion(result)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		if commentOnlyCompletionHasNeedsHuman(completion) {
+			// Pure needs_human: park without publishing/counting.
+			if len(publishableCommentOnlyFindings(completion.Findings)) == 0 {
+				checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
+				if freshErr != nil || blocked {
+					return checkpoint, freshErr
+				}
+				if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
+					return checkpoint, err
+				}
+				return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
 			}
-			payload, err := json.Marshal(completion)
-			if err != nil {
-				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
+			// Mixed must_fix + needs_human: publish must_fix first (publish step),
+			// then apply the one-hold rule after recordPublishedReviewProgress.
+			payload, marshalErr := json.Marshal(completion)
+			if marshalErr != nil {
+				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", marshalErr), kind: FailureRetryableAfterResume}
 			}
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: completion.Outcome == "clean"}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{
+				HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative,
+				Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload),
+			}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
+		payload, err := json.Marshal(completion)
+		if err != nil {
+			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
+		}
+		cleanNoop := cleanReviewNoopSummary(result.Summary) && completion.Outcome == "clean"
+		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: cleanNoop}
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		return checkpoint, nil
+	}
+
+	// Native path: parse __LOOPER_RESULT__ findings (same disposition contract).
+	// Summary-only markers without findings stay valid; remote marker is publish authority.
+	nativeCompletion, err := parseReviewerNativeCompletion(result)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if commentOnlyCompletionHasNeedsHuman(nativeCompletion) {
+		return r.finishNativeNeedsHumanCompletion(ctx, input, checkpoint, result, nativeCompletion, idempotencyKey)
+	}
+	nativeFindingsJSON := ""
+	if len(nativeCompletion.Findings) > 0 {
+		payload, marshalErr := json.Marshal(nativeCompletion)
+		if marshalErr != nil {
+			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
+		}
+		nativeFindingsJSON = string(payload)
+	}
+
+	if cleanReviewNoopSummary(result.Summary) {
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ReviewerSummaryJSON: nativeFindingsJSON, CleanNoop: true}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
@@ -3261,30 +5190,25 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 				if err := validateCleanApprovedReviewMarkerBody(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
-				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ContentFingerprint: reviewMarkerFingerprint(found), CleanNoop: true}
+				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ContentFingerprint: reviewMarkerFingerprint(found), ReviewerSummaryJSON: nativeFindingsJSON, CleanNoop: true}
 				checkpoint.ResumePolicy = "advance_from_checkpoint"
 				return checkpoint, nil
 			}
 			return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 		}
-		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
+		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ReviewerSummaryJSON: nativeFindingsJSON, CleanNoop: true}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
-	if commentOnlyCompletion {
-		completion, err := parseReviewerCommentOnlyCompletion(result)
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-		payload, err := json.Marshal(completion)
-		if err != nil {
-			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
-		}
-		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload)}
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
-		return checkpoint, nil
+	outcome := normalizeCommentOnlyOutcome(reviewCompletionOutcome(result))
+	if nativeCompletion.Outcome != "" {
+		outcome = nativeCompletion.Outcome
 	}
-	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(reviewCompletionOutcome(result))}
+	summary := result.Summary
+	if strings.TrimSpace(nativeCompletion.Summary) != "" {
+		summary = nativeCompletion.Summary
+	}
+	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: summary, Outcome: outcome, ReviewerSummaryJSON: nativeFindingsJSON}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -3294,14 +5218,43 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	beforeConvergence := checkpoint.ConvergencePass
+	var revalidateErr error
+	checkpoint, revalidateErr = r.revalidateSameHeadConvergence(ctx, input, checkpoint)
+	if revalidateErr != nil {
+		return checkpoint, revalidateErr
+	}
+	if beforeConvergence && !checkpoint.ConvergencePass && checkpoint.DispositionOnly {
+		return r.abortConvergenceForLiveDisposition(ctx, input, checkpoint)
+	}
 	if checkpoint.PendingReview == nil {
 		return checkpoint, &loopError{message: "Missing pending review checkpoint for publish step", kind: FailureRetryableAfterResume}
 	}
 	pending := *checkpoint.PendingReview
 	meta := parseJSONObject(input.Loop.MetadataJSON)
-	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
+	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA && !isConvergencePublication(checkpoint, pending) {
+		// Crash/retry gap: recordPublishedReviewProgress may have written
+		// lastPublishedHeadSha (and budget park) before
+		// afterCommentOnlyPublishMaybeParkScope ran. Recover park/defer
+		// without re-publishing. Freshness gates refuse stale/closed PRs.
+		// No-ops when pending has no needs_human.
+		// Same-head convergence publications must not take this path: the
+		// prior review already recorded this head.
+		next, err := r.recoverAlreadyPublishedScopePark(ctx, input, checkpoint, pending)
+		if err != nil {
+			return next, err
+		}
+		if next.SkipReason != "" || next.SkipKind != "" {
+			return next, nil
+		}
+		checkpoint = next
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-published review for head %s", pending.HeadSHA)
 		return checkpoint, nil
+	}
+	// Admission at the mutation seam: refuse a counted publish when already at
+	// the live cap (observe mid-run cap lowers). PR-closed still wins later.
+	if refused, err := r.refusePublishIfBudgetExhausted(ctx, input); refused || err != nil {
+		return checkpoint, err
 	}
 	if pending.CleanNoop {
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
@@ -3351,7 +5304,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
 				return checkpoint, err
 			}
-			return checkpoint, nil
+			return r.afterCommentOnlyPublishMaybeParkScope(ctx, input, checkpoint, pending)
 		}
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
@@ -3434,7 +5387,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
 			return checkpoint, err
 		}
-		return checkpoint, nil
+		return r.afterCommentOnlyPublishMaybeParkScope(ctx, input, checkpoint, pending)
 	}
 	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
@@ -3496,6 +5449,18 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		checkpoint.ResumePolicy = "rerun_review"
 		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
 	}
+	if pendingNativeMustFixRequiresActionableMarker(pending) && !nativeMustFixReviewMarkerActionable(markerResult, pendingNativeMustFixCount(pending)) {
+		message := missingReviewMarkerMessage(input, pending) + "; must_fix publication requires an actionable review marker with inline comments for every finding"
+		if pending.MarkerVerificationMisses == 0 {
+			pending.MarkerVerificationMisses = 1
+			checkpoint.PendingReview = pending.clone()
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, &loopError{message: message + "; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
+		}
+		checkpoint.PendingReview = nil
+		checkpoint.ResumePolicy = "rerun_review"
+		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
+	}
 	reviewPolicy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if cleanReviewNoopSummary(pending.Summary) && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
 		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
@@ -3531,9 +5496,15 @@ func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.L
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
 		return ProcessResult{}, err
 	}
+	// Do not revive a review-fix pair hold (or other terminal park) that the
+	// step already persisted — only ordinary label/hold skips re-queue.
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		updated.Status = "queued"
 		updated.LastRunAt = stringPtr(r.nowISO())
+		if loops.IsReviewFixPairHold(*updated) || updated.Status == "terminated" || updated.Status == "stopped" || updated.Status == "awaiting_human" || updated.Status == "human_takeover" {
+			updated.NextRunAt = nil
+			return
+		}
+		updated.Status = "queued"
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
@@ -3546,6 +5517,15 @@ func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.L
 }
 
 func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (bool, reviewerCheckpoint, error) {
+	// Disposition-only passes never run a full code review/publish.
+	if checkpoint.DispositionOnly || checkpoint.SkipKind == "disposition_only" {
+		if checkpoint.SkipReason == "" {
+			checkpoint.SkipReason = "Completed same-head thread disposition pass"
+			checkpoint.SkipKind = "disposition_only"
+		}
+		checkpoint.PendingReview = nil
+		return true, checkpoint, nil
+	}
 	if !checkpoint.ThreadResolutionFollowUpOnly {
 		return false, checkpoint, nil
 	}
@@ -3599,6 +5579,10 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	if err != nil || found.Found {
 		return found, err
 	}
+	if isConvergenceReviewID(idempotencyKey) {
+		// Same-head convergence must not reuse a prior head-only marker.
+		return found, nil
+	}
 	bareLoopMarker := agentNativeBareLoopReviewMarker(input.Loop.ID, headSHA)
 	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: bareLoopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
@@ -3610,6 +5594,104 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return found, err
 	}
 	return found, nil
+}
+
+// finishNativeNeedsHumanCompletion parks a valid needs_human native completion,
+// counting an already-submitted must_fix marker when present. Shared by the
+// completed parse path and failed-run recovery so a later nonzero exit cannot
+// drop ReviewerSummaryJSON and skip the scope hold.
+func (r *Runner) finishNativeNeedsHumanCompletion(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, result AgentResult, nativeCompletion reviewerCommentOnlyCompletion, idempotencyKey string) (reviewerCheckpoint, error) {
+	checkpoint, blocked, freshErr := r.applyScopeParkFreshness(ctx, input, checkpoint, checkpoint.Snapshot.HeadSHA)
+	if freshErr != nil || blocked {
+		return checkpoint, freshErr
+	}
+	found, markerErr := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{}))
+	if markerErr != nil {
+		return checkpoint, &loopError{message: markerErr.Error(), kind: FailureRetryableAfterResume}
+	}
+	mustFixCount := len(publishableCommentOnlyFindings(nativeCompletion.Findings))
+	if mustFixCount > 0 && !nativeMustFixReviewMarkerActionable(found, mustFixCount) {
+		return checkpoint, &loopError{
+			message: missingReviewMarkerMessage(input, pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey}) + "; mixed must_fix+needs_human requires an actionable review marker before parking scope",
+			kind:    FailureRetryableAfterResume,
+		}
+	}
+	payload, marshalErr := json.Marshal(nativeCompletion)
+	if marshalErr != nil {
+		return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer native completion: %v", marshalErr), kind: FailureRetryableAfterResume}
+	}
+	if nativeMustFixReviewMarkerActionable(found, mustFixCount) {
+		summary := result.Summary
+		if strings.TrimSpace(nativeCompletion.Summary) != "" {
+			summary = nativeCompletion.Summary
+		}
+		outcome := normalizeCommentOnlyOutcome(found.Outcome)
+		if outcome == "" {
+			outcome = normalizeCommentOnlyOutcome(nativeCompletion.Outcome)
+		}
+		pending := pendingReviewCheckpoint{
+			HeadSHA:             checkpoint.Snapshot.HeadSHA,
+			IdempotencyKey:      idempotencyKey,
+			Event:               found.Event,
+			Summary:             summary,
+			Outcome:             outcome,
+			ContentFingerprint:  reviewMarkerFingerprint(found),
+			ReviewerSummaryJSON: string(payload),
+		}
+		checkpoint.PendingReview = &pending
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepReview, checkpoint); err != nil {
+			return checkpoint, err
+		}
+		alreadyPublished := false
+		if last, ok := stringFromAny(parseJSONObject(input.Loop.MetadataJSON)["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
+			alreadyPublished = true
+		}
+		if !alreadyPublished {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+				return checkpoint, err
+			}
+		}
+	}
+	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, nativeCompletion); err != nil {
+		return checkpoint, err
+	}
+	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
+}
+
+// nativeMustFixReviewMarkerActionable reports whether a verified marker can
+// stand in for published must_fix feedback. Clean/APPROVE markers, missing
+// markers, body-only COMMENT/REQUEST_CHANGES, and markers with fewer non-empty
+// inline comments than structured must_fix findings are not actionable
+// publication: leftover must_fix never becomes remote feedback or Fixer input.
+func nativeMustFixReviewMarkerActionable(found ReviewMarkerResult, mustFixCount int) bool {
+	if !found.Found {
+		return false
+	}
+	n := 0
+	for _, body := range found.InlineCommentBodies {
+		if strings.TrimSpace(body) != "" {
+			n++
+		}
+	}
+	if mustFixCount < 1 {
+		return n > 0
+	}
+	return n >= mustFixCount
+}
+
+func pendingNativeMustFixCount(pending pendingReviewCheckpoint) int {
+	if strings.TrimSpace(pending.ReviewerSummaryJSON) == "" {
+		return 0
+	}
+	var completion reviewerCommentOnlyCompletion
+	if err := json.Unmarshal([]byte(pending.ReviewerSummaryJSON), &completion); err != nil {
+		return 0
+	}
+	return len(publishableCommentOnlyFindings(completion.Findings))
+}
+
+func pendingNativeMustFixRequiresActionableMarker(pending pendingReviewCheckpoint) bool {
+	return pendingNativeMustFixCount(pending) > 0
 }
 
 func sameReviewAuthorLogin(a string, b string) bool {
@@ -4128,6 +6210,14 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	if err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	// Pure needs_human: park without publishing. Mixed must_fix+needs_human
+	// publishes must_fix only; caller parks/defers scope after recordPublished.
+	if commentOnlyCompletionHasNeedsHuman(completion) && len(publishableCommentOnlyFindings(completion.Findings)) == 0 {
+		if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
+			return err
+		}
+		return reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
+	}
 	comments, err := r.github.ListIssueComments(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -4144,7 +6234,7 @@ func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, 
 	if err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	body, err := renderReviewerSummaryComment(summary, completion.Summary)
+	body, err := renderReviewerSummaryComment(summary, commentOnlyPublishVisibleSummary(completion))
 	if err != nil {
 		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -4418,6 +6508,35 @@ func reviewCompletionOutcome(result AgentResult) string {
 }
 
 func parseReviewerCommentOnlyCompletion(result AgentResult) (reviewerCommentOnlyCompletion, error) {
+	completion, err := unmarshalReviewerCompletionMarker(result)
+	if err != nil {
+		return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse reviewer comment-only completion: %w", err)
+	}
+	return validateReviewerCommentOnlyCompletion(completion)
+}
+
+// parseReviewerNativeCompletion parses __LOOPER_RESULT__ after a native review step.
+// Summary-only markers without findings remain valid (remote review marker is publish
+// authority). When findings are present, validation is fail-closed.
+func parseReviewerNativeCompletion(result AgentResult) (reviewerCommentOnlyCompletion, error) {
+	completion, err := unmarshalReviewerCompletionMarker(result)
+	if err != nil {
+		// Native agents historically emit a parsed completion without a strict
+		// findings payload; treat missing marker payload as empty findings.
+		if strings.Contains(err.Error(), "completion marker is required") {
+			return reviewerCommentOnlyCompletion{Summary: strings.TrimSpace(result.Summary)}, nil
+		}
+		return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse reviewer native completion: %w", err)
+	}
+	if len(completion.Findings) == 0 {
+		completion.Summary = strings.TrimSpace(completion.Summary)
+		completion.Outcome = normalizeCommentOnlyOutcome(completion.Outcome)
+		return completion, nil
+	}
+	return validateReviewerCommentOnlyCompletion(completion)
+}
+
+func unmarshalReviewerCompletionMarker(result AgentResult) (reviewerCommentOnlyCompletion, error) {
 	var completion reviewerCommentOnlyCompletion
 	raw := result.Stdout
 	if strings.TrimSpace(result.Stderr) != "" {
@@ -4431,11 +6550,11 @@ func parseReviewerCommentOnlyCompletion(result AgentResult) (reviewerCommentOnly
 		}
 		payload := strings.TrimPrefix(line, agent.CompletionMarkerPrefix)
 		if err := json.Unmarshal([]byte(payload), &completion); err != nil {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse reviewer comment-only completion: %w", err)
+			return reviewerCommentOnlyCompletion{}, err
 		}
-		return validateReviewerCommentOnlyCompletion(completion)
+		return completion, nil
 	}
-	return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion marker is required")
+	return reviewerCommentOnlyCompletion{}, fmt.Errorf("completion marker is required")
 }
 
 func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) (reviewerCommentOnlyCompletion, error) {
@@ -4447,26 +6566,50 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 	if completion.Outcome == "" {
 		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome must be clean, non_blocking, or blocking")
 	}
-	if completion.Outcome == "clean" {
-		if len(completion.Findings) != 0 {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion must not include findings")
-		}
-		if !cleanReviewNoopSummary(completion.Summary) {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion summary must start with \"No actionable findings\"")
-		}
-		return completion, nil
-	}
-	if len(completion.Findings) == 0 {
-		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one finding")
-	}
 	seenFindingIDs := map[string]struct{}{}
+	mustFixCount := 0
 	for i := range completion.Findings {
 		finding := &completion.Findings[i]
 		finding.ReviewItemID = strings.TrimSpace(finding.ReviewItemID)
 		finding.Title = strings.TrimSpace(finding.Title)
 		finding.Body = strings.TrimSpace(finding.Body)
+		finding.Path = strings.TrimSpace(finding.Path)
+		finding.Disposition = strings.TrimSpace(finding.Disposition)
+		finding.Severity = strings.TrimSpace(finding.Severity)
+		finding.ScopeBasis = strings.TrimSpace(finding.ScopeBasis)
+		finding.ScopeEvidence = strings.TrimSpace(finding.ScopeEvidence)
 		if finding.Title == "" || finding.Body == "" {
 			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires title and body", i)
+		}
+		if finding.Disposition == "" {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires disposition", i)
+		}
+		if finding.ScopeBasis == "" {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires scopeBasis", i)
+		}
+		if finding.ScopeEvidence == "" {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires scopeEvidence", i)
+		}
+		switch finding.Disposition {
+		case reviewFindingDispositionMustFix, reviewFindingDispositionFollowUp, reviewFindingDispositionNeedsHuman:
+		default:
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid disposition %q", i, finding.Disposition)
+		}
+		if finding.Severity == "" {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires severity", i)
+		}
+		switch finding.Severity {
+		case reviewFindingSeverityBlocking, reviewFindingSeverityNonBlocking, reviewFindingSeverityNit:
+		default:
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid severity %q", i, finding.Severity)
+		}
+		switch finding.ScopeBasis {
+		case reviewFindingScopeStatedIntent, reviewFindingScopeIntroducedRegression, reviewFindingScopeRequiredInvariant, reviewFindingScopeIndependentImprovement, reviewFindingScopeAmbiguousIntent:
+		default:
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d has invalid scopeBasis %q", i, finding.ScopeBasis)
+		}
+		if finding.Disposition == reviewFindingDispositionMustFix {
+			mustFixCount++
 		}
 		if finding.ReviewItemID != "" {
 			if _, exists := seenFindingIDs[finding.ReviewItemID]; exists {
@@ -4497,7 +6640,176 @@ func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyComplet
 		}
 		finding.Supersedes = supersedes
 	}
+	if completion.Outcome == "clean" {
+		if mustFixCount != 0 {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion must not include must_fix findings")
+		}
+		if !cleanReviewNoopSummary(completion.Summary) {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion summary must start with \"No actionable findings\"")
+		}
+		return completion, nil
+	}
+	if mustFixCount == 0 && !commentOnlyCompletionHasNeedsHuman(completion) {
+		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one must_fix finding")
+	}
+	if mustFixCount > 0 {
+		required := requiredOutcomeForMustFixFindings(completion.Findings)
+		if required != "" && completion.Outcome != required {
+			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome %q does not match highest must_fix severity (want %s)", completion.Outcome, required)
+		}
+	}
 	return completion, nil
+}
+
+func commentOnlyCompletionHasNeedsHuman(completion reviewerCommentOnlyCompletion) bool {
+	for _, finding := range completion.Findings {
+		if strings.TrimSpace(finding.Disposition) == reviewFindingDispositionNeedsHuman {
+			return true
+		}
+	}
+	return false
+}
+
+// requiredOutcomeForMustFixFindings maps the highest published must_fix severity
+// onto the completion outcome contract: blocking findings require outcome=blocking;
+// non_blocking/nit must_fix findings require outcome=non_blocking. Empty means no
+// must_fix findings were present.
+func requiredOutcomeForMustFixFindings(findings []reviewerCommentOnlyFindingResult) string {
+	required := ""
+	for _, finding := range findings {
+		if strings.TrimSpace(finding.Disposition) != reviewFindingDispositionMustFix {
+			continue
+		}
+		switch strings.TrimSpace(finding.Severity) {
+		case reviewFindingSeverityBlocking:
+			return "blocking"
+		case reviewFindingSeverityNonBlocking, reviewFindingSeverityNit:
+			required = "non_blocking"
+		}
+	}
+	return required
+}
+
+// publishableCommentOnlyFindings returns only must_fix findings for remote summary items.
+func publishableCommentOnlyFindings(findings []reviewerCommentOnlyFindingResult) []reviewerCommentOnlyFindingResult {
+	out := make([]reviewerCommentOnlyFindingResult, 0, len(findings))
+	for _, finding := range findings {
+		if strings.TrimSpace(finding.Disposition) == reviewFindingDispositionMustFix {
+			out = append(out, finding)
+		}
+	}
+	return out
+}
+
+// commentOnlyPublishVisibleSummary is the remote-visible prose for comment-only
+// publish. It must not smuggle follow_up/needs_human content into the PR comment;
+// those stay in the structured local completion/event only.
+func commentOnlyPublishVisibleSummary(completion reviewerCommentOnlyCompletion) string {
+	mustFix := publishableCommentOnlyFindings(completion.Findings)
+	hasSuppressed := false
+	for _, finding := range completion.Findings {
+		switch strings.TrimSpace(finding.Disposition) {
+		case reviewFindingDispositionFollowUp, reviewFindingDispositionNeedsHuman:
+			hasSuppressed = true
+		}
+	}
+	if !hasSuppressed {
+		return strings.TrimSpace(completion.Summary)
+	}
+	if len(mustFix) == 0 {
+		return "No actionable findings"
+	}
+	parts := make([]string, 0, len(mustFix))
+	for _, finding := range mustFix {
+		title := strings.TrimSpace(finding.Title)
+		body := strings.TrimSpace(finding.Body)
+		switch {
+		case title != "" && body != "":
+			parts = append(parts, title+": "+body)
+		case title != "":
+			parts = append(parts, title)
+		case body != "":
+			parts = append(parts, body)
+		}
+	}
+	if len(parts) == 0 {
+		return "Must-fix findings require attention."
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func commentOnlyNeedsHumanQuestion(completion reviewerCommentOnlyCompletion) string {
+	var parts []string
+	for _, finding := range completion.Findings {
+		if strings.TrimSpace(finding.Disposition) != reviewFindingDispositionNeedsHuman {
+			continue
+		}
+		title := strings.TrimSpace(finding.Title)
+		body := strings.TrimSpace(finding.Body)
+		basis := strings.TrimSpace(finding.ScopeBasis)
+		evidence := strings.TrimSpace(finding.ScopeEvidence)
+		if title == "" && body == "" {
+			continue
+		}
+		authority := authorityInputChangeHint(basis, evidence)
+		findingText := title
+		if findingText == "" {
+			findingText = body
+		} else if body != "" {
+			findingText = title + ": " + body
+		}
+		parts = append(parts, fmt.Sprintf("%s before unpause; finding: %s", authority, findingText))
+	}
+	if len(parts) == 0 {
+		return "Clarify the repository rule, PR goal/non-goal, or linked spec that governs this scope before unpause. Continue resumes against current evidence, or stop the pair?"
+	}
+	return strings.Join(parts, " ") + " Continue resumes against current evidence, or stop the pair?"
+}
+
+// authorityInputChangeHint names which authority input must change before unpause.
+func authorityInputChangeHint(scopeBasis, scopeEvidence string) string {
+	basis := strings.TrimSpace(scopeBasis)
+	evidence := strings.TrimSpace(scopeEvidence)
+	switch basis {
+	case "stated_intent":
+		if evidence != "" {
+			return "Clarify PR goal/non-goal or stated intent (" + evidence + ")"
+		}
+		return "Clarify PR goal/non-goal or stated intent"
+	case "required_invariant":
+		if evidence != "" {
+			return "Clarify repository rule / required invariant (" + evidence + ")"
+		}
+		return "Clarify repository rule or required invariant"
+	case "introduced_regression":
+		if evidence != "" {
+			return "Clarify regression evidence or acceptance boundary (" + evidence + ")"
+		}
+		return "Clarify regression evidence or acceptance boundary"
+	case "independent_improvement":
+		if evidence != "" {
+			return "Clarify whether this independent improvement is in PR scope (" + evidence + ")"
+		}
+		return "Clarify whether this independent improvement is in PR scope"
+	case "ambiguous_intent":
+		if evidence != "" {
+			return "Clarify ambiguous PR intent / non-goals or AGENTS.md rule (" + evidence + ")"
+		}
+		return "Clarify ambiguous PR intent, non-goals, or AGENTS.md rule"
+	default:
+		if evidence != "" {
+			return "Clarify authority input (" + evidence + ")"
+		}
+		return "Clarify repository rule, PR goal/non-goal, or linked spec"
+	}
+}
+
+func commentOnlyNeedsHumanEvidence(completion reviewerCommentOnlyCompletion) string {
+	payload, err := json.Marshal(completion.Findings)
+	if err != nil {
+		return ""
+	}
+	return string(payload)
 }
 
 func pendingReviewerCommentOnlyCompletion(pending pendingReviewCheckpoint) (reviewerCommentOnlyCompletion, error) {
@@ -4529,6 +6841,20 @@ func reviewerSummaryPromptContext(issueComments []map[string]any) string {
 }
 
 func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completion reviewerCommentOnlyCompletion) (forge.ReviewerSummary, error) {
+	// Remote Reviewer Summary authority is must_fix only; follow_up/needs_human
+	// stay in the structured completion and must not become new open remote items.
+	// Existing open items referenced by needs_human stay open until the human
+	// decision is applied so Forgejo Fixer still sees them after a scope Continue.
+	publishFindings := publishableCommentOnlyFindings(completion.Findings)
+	needsHumanReferencedIDs := map[string]struct{}{}
+	for _, finding := range completion.Findings {
+		if strings.TrimSpace(finding.Disposition) != reviewFindingDispositionNeedsHuman {
+			continue
+		}
+		if id := strings.TrimSpace(finding.ReviewItemID); id != "" {
+			needsHumanReferencedIDs[id] = struct{}{}
+		}
+	}
 	reviewRoundID := 1
 	if existing.ReviewRoundID > 0 {
 		reviewRoundID = existing.ReviewRoundID + 1
@@ -4542,15 +6868,15 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 		}
 	}
 	updatedExistingIDs := map[string]struct{}{}
-	for _, finding := range completion.Findings {
+	for _, finding := range publishFindings {
 		if finding.ReviewItemID != "" {
 			updatedExistingIDs[finding.ReviewItemID] = struct{}{}
 		}
 	}
 	assigned := map[string]struct{}{}
 	supersededTargets := map[string]string{}
-	updated := make([]forge.ReviewItem, 0, len(existing.Items)+len(completion.Findings))
-	for _, finding := range completion.Findings {
+	updated := make([]forge.ReviewItem, 0, len(existing.Items)+len(publishFindings))
+	for _, finding := range publishFindings {
 		id := finding.ReviewItemID
 		if id != "" {
 			if _, ok := itemsByID[id]; !ok {
@@ -4601,6 +6927,11 @@ func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completi
 			continue
 		}
 		if item.Status == forge.ReviewItemStatusOpen {
+			if _, keepOpen := needsHumanReferencedIDs[item.ReviewItemID]; keepOpen {
+				item.LastSeenRoundID = reviewRoundID
+				finalItems = append(finalItems, item)
+				continue
+			}
 			item.Status = forge.ReviewItemStatusResolved
 			item.SupersededBy = ""
 			item.LastSeenRoundID = reviewRoundID
@@ -4808,16 +7139,83 @@ func isValidBlockingReviewEvent(value string) bool {
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
-		if err == nil {
-			updated.MetadataJSON = stringPtr(metadataJSON)
+	updated, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		meta := parseJSONObject(updated.MetadataJSON)
+		previous, _ := stringFromAny(meta["lastPublishedHeadSha"])
+		previousReviewID, _ := stringFromAny(meta[metadataLastPublishedReviewIDKey])
+		merge := map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()}
+		if reviewID := strings.TrimSpace(pending.IdempotencyKey); reviewID != "" {
+			merge[metadataLastPublishedReviewIDKey] = reviewID
 		}
-	}); err != nil {
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, merge)
+		if err != nil {
+			return
+		}
+		if shouldCountPublishedReview(previous, previousReviewID, pending.HeadSHA, pending.IdempotencyKey) {
+			counted, _, countErr := loops.IncrementReviewerPublishCount(&metadataJSON)
+			if countErr != nil {
+				return
+			}
+			metadataJSON = counted
+		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
+	})
+	if err != nil {
 		return err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
+	// After a successful counted increment, park immediately when now exhausted.
+	if r.shouldCreateReviewerBudgetPark(updated) {
+		if r.livePullRequestClosed(ctx, input.Project, input.Repo, input.PRNumber) {
+			return nil
+		}
+		if _, parkErr := r.parkReviewerBudgetIfExhausted(ctx, updated); parkErr != nil {
+			return parkErr
+		}
+	}
 	return nil
+}
+
+// refusePublishIfBudgetExhausted parks and skips when the loop already sits at
+// the live publish cap before a counted mutation. Returns refused=true when the
+// publish must not proceed.
+func (r *Runner) refusePublishIfBudgetExhausted(ctx context.Context, input stepInput) (bool, error) {
+	loop := input.Loop
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return true, err
+		}
+		if fresh != nil {
+			loop = *fresh
+		}
+	}
+	if !loops.ParticipatesInReviewFixBudget(loop) {
+		return false, nil
+	}
+	if loops.IsReviewFixPairHold(loop) {
+		if loops.IsReviewFixBudgetHold(loop) {
+			if _, err := r.parkReviewerBudgetIfExhausted(ctx, loop); err != nil {
+				return true, err
+			}
+			return true, &holdSkipError{summary: "Reviewer stopped because review-fix budget is held"}
+		}
+		return true, &holdSkipError{summary: "Reviewer stopped because review scope requires human judgment"}
+	}
+	cap := r.maxPublishesPerPR(loop.ProjectID)
+	if !loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), cap) {
+		return false, nil
+	}
+	if r.livePullRequestClosed(ctx, input.Project, input.Repo, input.PRNumber) {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return true, err
+		}
+		return true, &holdSkipError{summary: "Reviewer stopped because pull request is closed"}
+	}
+	if _, err := r.parkReviewerBudgetIfExhausted(ctx, loop); err != nil {
+		return true, err
+	}
+	return true, &holdSkipError{summary: "Reviewer stopped because review-fix publish budget is exhausted"}
 }
 
 type eventInput struct {
@@ -4841,6 +7239,15 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
 		return resumedRunContext{}, err
+	}
+	if latestRun != nil && latestRun.Status == "running" {
+		// Another processor already owns the running slot for this loop. Do not
+		// insert a second running run; map to retryable_transient (issue #634).
+		// Stale orphans are ReconcileStaleRuns' job — this path only refuses the race.
+		return resumedRunContext{}, &loopError{
+			message: fmt.Sprintf("loop %s already has a running reviewer run %s", loop.ID, latestRun.ID),
+			kind:    FailureRetryableTransient,
+		}
 	}
 	checkpoint := parseCheckpoint(nil)
 	lastCompleted := ReviewerStep("")
@@ -4908,6 +7315,18 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
+		if hasRunning, checkErr := r.repos.Runs.HasRunningByLoopID(ctx, loop.ID); checkErr == nil && hasRunning {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running reviewer run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
+		if failureclass.IsOneRunningRunPerLoopViolation(err) {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running reviewer run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil
@@ -5268,6 +7687,10 @@ func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopR
 		return nil
 	}
 	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		// Never flip a budget/scope pair hold back to queued.
+		if loops.IsReviewFixPairHold(*updated) {
+			return
+		}
 		if active, activeErr := r.hasActiveRunningRun(ctx, updated.ID); activeErr == nil && active {
 			updated.Status = "running"
 			updated.NextRunAt = nil
@@ -5293,13 +7716,23 @@ func (r *Runner) hasActiveRunningRun(ctx context.Context, loopID string) (bool, 
 }
 
 func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) ([]storage.LoopRecord, error) {
-	loops, err := r.repos.Loops.List(ctx)
+	all, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]storage.LoopRecord, 0)
-	for _, loop := range loops {
-		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil || loop.Status == "paused" || loop.Status == "failed" || terminalReviewerLoopReason(loop) != "" {
+	for _, loop := range all {
+		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || loop.PRNumber == nil || loop.Status == "failed" {
+			continue
+		}
+		// Budget-held paused / awaiting_human (HITL) loops stay visible so
+		// discovery can enqueue disposition-only work (§8.7) without releasing
+		// the hold. Other paused / terminal statuses remain excluded.
+		if loop.Status == "paused" || loop.Status == "awaiting_human" {
+			if !loops.IsReviewFixBudgetHold(loop) {
+				continue
+			}
+		} else if terminalReviewerLoopReason(loop) != "" {
 			continue
 		}
 		meta := parseJSONObject(loop.MetadataJSON)
@@ -5350,12 +7783,15 @@ func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startSte
 }
 
 type enqueueInput struct {
-	ProjectID   string
-	LoopID      string
-	Repo        string
-	PRNumber    int64
-	HeadSHA     string
-	AvailableAt time.Time
+	ProjectID               string
+	LoopID                  string
+	Repo                    string
+	PRNumber                int64
+	HeadSHA                 string
+	ReviewSignalFingerprint string
+	DispositionOnly         bool
+	ConvergencePass         bool
+	AvailableAt             time.Time
 }
 
 func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
@@ -5368,23 +7804,49 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if !input.AvailableAt.IsZero() {
 		availableAt = eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
 	}
-	payloadJSON := ""
-	if strings.TrimSpace(input.HeadSHA) != "" {
-		payload, err := json.Marshal(map[string]any{"headSha": input.HeadSHA})
-		if err != nil {
-			return storage.QueueItemRecord{}, err
+	payloadJSON := reviewerQueuePayloadJSON(input.HeadSHA, input.ReviewSignalFingerprint, input.DispositionOnly)
+	if input.ConvergencePass {
+		merged := parseJSONObject(&payloadJSON)
+		merged["convergencePass"] = true
+		if encoded, err := json.Marshal(merged); err == nil {
+			payloadJSON = string(encoded)
 		}
-		payloadJSON = string(payload)
 	}
 	if existing != nil {
-		if existing.Status == "queued" && strings.TrimSpace(input.HeadSHA) != "" {
+		// Coalesce queued/retry-wait items in place to the latest head+signal.
+		// Retry-wait items remain status "queued" with a future AvailableAt.
+		if existing.Status == "queued" && (strings.TrimSpace(input.HeadSHA) != "" || strings.TrimSpace(input.ReviewSignalFingerprint) != "") {
 			existingPayload := parseJSONObject(existing.PayloadJSON)
 			existingHeadSHA, _ := stringFromAny(existingPayload["headSha"])
-			if existingHeadSHA != input.HeadSHA && isoTimeAfter(availableAt, existing.AvailableAt) {
+			existingSignal, _ := stringFromAny(existingPayload["reviewSignalFingerprint"])
+			headChanged := strings.TrimSpace(input.HeadSHA) != "" && existingHeadSHA != input.HeadSHA
+			signalChanged := strings.TrimSpace(input.ReviewSignalFingerprint) != "" && existingSignal != input.ReviewSignalFingerprint
+			if headChanged || signalChanged || payloadJSON != derefString(existing.PayloadJSON) {
+				existingAvailableAt := parseRFC3339OrZero(existing.AvailableAt)
+				debounced := loops.DebounceSchedule(r.now(), r.loopConfig.QuietPeriodSeconds, existingAvailableAt)
+				if !input.AvailableAt.IsZero() && input.AvailableAt.After(debounced) {
+					debounced = input.AvailableAt
+				}
+				updatedAvailableAt := eventlog.FormatJavaScriptISOString(debounced.UTC())
 				updated := *existing
-				updated.AvailableAt = availableAt
+				updated.AvailableAt = updatedAvailableAt
 				updated.UpdatedAt = r.nowISO()
-				updated.PayloadJSON = &payloadJSON
+				if payloadJSON != "" {
+					nextPayload := payloadJSON
+					if !headChanged && !signalChanged {
+						merged := parseJSONObject(&nextPayload)
+						if cont, ok := existingPayload["partialBatchContinuation"]; ok && cont != nil {
+							merged["partialBatchContinuation"] = cont
+						}
+						if conv, ok := existingPayload["convergencePass"].(bool); ok && conv {
+							merged["convergencePass"] = true
+						}
+						if encoded, encErr := json.Marshal(merged); encErr == nil {
+							nextPayload = string(encoded)
+						}
+					}
+					updated.PayloadJSON = &nextPayload
+				}
 				persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
 				if err != nil {
 					return storage.QueueItemRecord{}, err
@@ -5393,6 +7855,37 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				r.wakeSchedulerAfterEnqueue()
 				return updated, nil
 			}
+		}
+		// Running/claimed: stash latest pending signal on the active item; do not
+		// create a second active item. Continuation is scheduled after the run.
+		if (existing.Status == "running" || existing.Status == "claimed") && strings.TrimSpace(input.ReviewSignalFingerprint) != "" {
+			updated := *existing
+			merged := parseJSONObject(existing.PayloadJSON)
+			keepPendingConvergence := pendingConvergencePassFromQueuePayload(existing.PayloadJSON) &&
+				samePendingConvergenceHeadSignal(input, merged)
+			merged["pendingReviewSignalFingerprint"] = input.ReviewSignalFingerprint
+			if strings.TrimSpace(input.HeadSHA) != "" {
+				merged["pendingHeadSha"] = input.HeadSHA
+			}
+			merged["pendingDispositionOnly"] = input.DispositionOnly
+			if input.ConvergencePass || keepPendingConvergence {
+				merged["pendingConvergencePass"] = true
+				merged["pendingDispositionOnly"] = false
+			} else {
+				delete(merged, "pendingConvergencePass")
+			}
+			encoded, err := json.Marshal(merged)
+			if err != nil {
+				return storage.QueueItemRecord{}, err
+			}
+			payload := string(encoded)
+			updated.PayloadJSON = &payload
+			updated.UpdatedAt = r.nowISO()
+			persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+			if err != nil {
+				return storage.QueueItemRecord{}, err
+			}
+			return persisted, nil
 		}
 		return *existing, nil
 	}
@@ -5415,10 +7908,63 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	return persisted, nil
 }
 
+// samePendingConvergenceHeadSignal is true when a later ordinary enqueue is the
+// same head and review signal already stashed or running. Delayed self-webhooks
+// from last-thread accept/resolve must not clear pendingConvergencePass.
+func samePendingConvergenceHeadSignal(input enqueueInput, existing map[string]any) bool {
+	pendingHead, _ := stringFromAny(existing["pendingHeadSha"])
+	head, _ := stringFromAny(existing["headSha"])
+	priorHead := firstNonEmpty(strings.TrimSpace(pendingHead), strings.TrimSpace(head))
+	inHead := strings.TrimSpace(input.HeadSHA)
+	if inHead != "" && priorHead != "" && inHead != priorHead {
+		return false
+	}
+	pendingSignal, _ := stringFromAny(existing["pendingReviewSignalFingerprint"])
+	signal, _ := stringFromAny(existing["reviewSignalFingerprint"])
+	priorSignal := firstNonEmpty(strings.TrimSpace(pendingSignal), strings.TrimSpace(signal))
+	inSignal := strings.TrimSpace(input.ReviewSignalFingerprint)
+	return inSignal != "" && priorSignal != "" && inSignal == priorSignal
+}
+
+func reviewerQueuePayloadJSON(headSHA, reviewSignal string, dispositionOnly bool) string {
+	payload := map[string]any{}
+	if strings.TrimSpace(headSHA) != "" {
+		payload["headSha"] = headSHA
+	}
+	if strings.TrimSpace(reviewSignal) != "" {
+		payload["reviewSignalFingerprint"] = reviewSignal
+	}
+	if dispositionOnly {
+		payload["dispositionOnly"] = true
+	}
+	if len(payload) == 0 {
+		return ""
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
 func (r *Runner) wakeSchedulerAfterEnqueue() {
 	if r.onQueueItemEnqueued != nil {
 		r.onQueueItemEnqueued()
 	}
+}
+
+func parseRFC3339OrZero(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed
+	}
+	return time.Time{}
 }
 
 func isoTimeAfter(candidate, current string) bool {
@@ -5465,24 +8011,57 @@ func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
 	return attempts
 }
 
+// updateLoopBeforeWriteHook, when set (tests only), runs after a live GetByID
+// and before mutate+CAS so Continue can interleave.
+var updateLoopBeforeWriteHook func(loop storage.LoopRecord) error
+
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
-	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil {
-		return storage.LoopRecord{}, err
+	if r.repos == nil || r.repos.Loops == nil || strings.TrimSpace(loop.ID) == "" {
+		return storage.LoopRecord{}, fmt.Errorf("update loop requires loop storage")
 	}
-	if current != nil && current.Status == "terminated" {
-		return *current, nil
+	for range reviewScopeHumanPersistCASAttempts {
+		current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if current != nil && current.Status == "terminated" {
+			return *current, nil
+		}
+		if updateLoopBeforeWriteHook != nil {
+			snapshot := loop
+			if current != nil {
+				snapshot = *current
+			}
+			if err := updateLoopBeforeWriteHook(snapshot); err != nil {
+				return storage.LoopRecord{}, err
+			}
+		}
+		updated := loop
+		if current != nil {
+			updated = *current
+		}
+		expectedStatus := updated.Status
+		expectedMetadata := updated.MetadataJSON
+		mutate(&updated)
+		updated.UpdatedAt = r.nowISO()
+		if current == nil {
+			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
+				return storage.LoopRecord{}, err
+			}
+			return updated, nil
+		}
+		applied, err := r.repos.Loops.UpdateIfMatch(ctx, updated, expectedStatus, expectedMetadata)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if applied {
+			return updated, nil
+		}
 	}
-	updated := loop
-	if current != nil {
-		updated = *current
+	return storage.LoopRecord{}, &loopError{
+		message: fmt.Sprintf("update loop lost CAS for loop %s", loop.ID),
+		kind:    FailureRetryableTransient,
 	}
-	mutate(&updated)
-	updated.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
-		return storage.LoopRecord{}, err
-	}
-	return updated, nil
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {
@@ -5693,14 +8272,16 @@ func (r *Runner) hasPendingHeadChangeNativeResume(ctx context.Context, loopID st
 	return ok
 }
 
-func (r *Runner) nativeResumePromptForReview(ctx context.Context, input stepInput, currentHeadSHA string, idempotencyKey string) string {
+func (r *Runner) nativeResumePromptForReview(ctx context.Context, input stepInput, currentHeadSHA string, idempotencyKey string, lastPublishedHeadSHA string) string {
 	record := r.pendingNativeResume(ctx, input.Loop.ID)
 	if record == nil {
 		return ""
 	}
 	if r.nativeResume.ReReviewPromptOnHeadChange {
 		if headChange, ok := reviewerNativeResumeHeadChange(record); ok && headChange.matches(input.Repo, input.PRNumber) {
-			return nativeResumeReReviewPrompt(input.Repo, input.PRNumber, headChange.OldHeadSHA, headChange.NewHeadSHA, currentHeadSHA, idempotencyKey)
+			// Only use repair-frontier language when a prior Looper review was
+			// published; otherwise keep the full re-review resume prompt.
+			return nativeResumeReReviewPrompt(input.Repo, input.PRNumber, headChange.OldHeadSHA, headChange.NewHeadSHA, currentHeadSHA, idempotencyKey, lastPublishedHeadSHA)
 		}
 	}
 	return nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, currentHeadSHA, idempotencyKey)
@@ -5828,7 +8409,37 @@ Before any GitHub side effect, re-check the current PR/head/idempotency guards f
 If the review or thread-resolution result was already posted, report the existing completion marker instead of posting a duplicate.`, strings.TrimSpace(phase), repo, prNumber, headSHA, idempotencyKey)
 }
 
-func nativeResumeReReviewPrompt(repo string, prNumber int64, oldHeadSHA string, interruptedHeadSHA string, currentHeadSHA string, idempotencyKey string) string {
+func nativeResumeReReviewPrompt(repo string, prNumber int64, oldHeadSHA string, interruptedHeadSHA string, currentHeadSHA string, idempotencyKey string, lastPublishedHeadSHA string) string {
+	if isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA) {
+		// Resume replaces the normal review prompt, so later-pass native resume
+		// must carry the same late-discovery dispositions and Fixer-decline
+		// adjudication contract as buildReviewPromptWithInstructions.
+		return strings.Join([]string{
+			fmt.Sprintf(`Continue the existing Looper reviewer review task in this resumed native session as a repair-frontier re-review (not a full discard-and-rescan of the original PR diff).
+
+The pull request changed while the prior review was running:
+- PR: %s#%d
+- last published/reviewed head SHA: %s
+- previous session head SHA: %s
+- head SHA observed at interruption: %s
+- current expected head SHA for this run: %s
+- idempotency key for this run: %s
+
+Use prior session context only as background. Inspect only:
+1. every unresolved prior must_fix thread;
+2. the diff from last published head %s to current head %s;
+3. directly affected call sites, contracts, tests, and lifecycle invariants;
+4. evidence that Fixer addressed each prior finding.
+
+Do not rescan untouched original diff merely to invent ordinary P2/P3 hardening. Discard findings, assumptions, anchors, or conclusions that only apply to a previous head and are no longer valid. Keep only findings that are still concrete, actionable, and valid against the current head.
+
+Before any GitHub side effect, re-check that the PR is open, the current head SHA still matches the current expected head SHA, and the current-user review-request/idempotency guards from the existing instructions still pass.
+
+If a matching review for the current expected head and idempotency key was already posted, report the existing completion marker instead of posting a duplicate.`, repo, prNumber, lastPublishedHeadSHA, oldHeadSHA, interruptedHeadSHA, currentHeadSHA, idempotencyKey, lastPublishedHeadSHA, currentHeadSHA),
+			repairFrontierPassContract(lastPublishedHeadSHA, currentHeadSHA, false),
+			fixerDeclineAdjudicationContract(),
+		}, "\n\n")
+	}
 	return fmt.Sprintf(`Continue the existing Looper reviewer review task in this resumed native session, but treat it as a PR update re-review.
 
 The pull request changed while the prior review was running:
@@ -6226,12 +8837,14 @@ func (r *Runner) loopEnabled(meta map[string]any) bool {
 	return false
 }
 
-func (r *Runner) nextReviewAvailableAt(meta map[string]any) time.Time {
+func (r *Runner) nextReviewAvailableAt(meta map[string]any, dispositionOnly bool) time.Time {
 	availableAt := r.now()
 	if _, reviewed := stringFromAny(meta["lastPublishedHeadSha"]); reviewed && r.loopConfig.QuietPeriodSeconds > 0 {
 		availableAt = availableAt.Add(time.Duration(r.loopConfig.QuietPeriodSeconds) * time.Second)
 	}
-	if r.loopConfig.MinPublishIntervalSeconds > 0 {
+	// minPublishIntervalSeconds applies to new PR review publication only, not
+	// disposition-only classifier runs.
+	if !dispositionOnly && r.loopConfig.MinPublishIntervalSeconds > 0 {
 		if lastPublishedAt, ok := stringFromAny(meta["lastPublishedAt"]); ok {
 			if parsed, err := time.Parse(time.RFC3339Nano, lastPublishedAt); err == nil {
 				minimum := parsed.Add(time.Duration(r.loopConfig.MinPublishIntervalSeconds) * time.Second)
@@ -6380,11 +8993,391 @@ func (r *Runner) loopSuccessStatus(currentStatus string, metadataJSON *string, s
 
 func isTerminalReviewerLoopStatus(status string) bool {
 	switch status {
-	case "terminated", "failed", "paused", "stopped":
+	case "terminated", "failed", "paused", "stopped", "awaiting_human", "human_takeover":
 		return true
 	default:
 		return false
 	}
+}
+
+func (r *Runner) maxPublishesPerPR(projectID string) int {
+	if r.projectRoleConfig != nil {
+		return config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Reviewer.Behavior.Loop.MaxPublishesPerPR
+	}
+	return r.loopConfig.MaxPublishesPerPR
+}
+
+func (r *Runner) reviewFixHITLEnabled() bool {
+	return r.projectRoleConfig != nil && r.projectRoleConfig.HITL.Enabled
+}
+
+func (r *Runner) shouldParkReviewerBudget(loop storage.LoopRecord, checkpoint reviewerCheckpoint) bool {
+	if !loops.ParticipatesInReviewFixBudget(loop) || checkpoint.SkipReason != "" || checkpoint.PendingReview == nil {
+		return false
+	}
+	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+		return false
+	}
+	return loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), r.maxPublishesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) livePullRequestClosed(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) bool {
+	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
+		return false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false
+	}
+	return normalizePRState(detail.State) != "open"
+}
+
+func (r *Runner) shouldCreateReviewerBudgetPark(loop storage.LoopRecord) bool {
+	if loop.Status == "terminated" || loop.Status == "stopped" || loop.Status == "awaiting_human" {
+		return false
+	}
+	if loop.Status == "paused" && loops.IsReviewFixPairHold(loop) {
+		return false
+	}
+	if !loops.ParticipatesInReviewFixBudget(loop) {
+		return false
+	}
+	if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+		return false
+	}
+	return loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), r.maxPublishesPerPR(loop.ProjectID))
+}
+
+func (r *Runner) parkReviewerBudgetAfterSuccessfulRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord) (bool, error) {
+	if r.shouldCreateReviewerBudgetPark(loop) && r.livePullRequestClosed(ctx, project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, loop, "pr_closed_or_merged"); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return r.parkReviewerBudgetIfExhausted(ctx, loop)
+}
+
+func (r *Runner) parkReviewerBudgetIfExhausted(ctx context.Context, loop storage.LoopRecord) (bool, error) {
+	if loop.Status == "terminated" || loop.Status == "stopped" {
+		return false, nil
+	}
+	// Sibling pause / scope hold is already a hold; finish cancel/sibling work on
+	// re-entry but do not treat "not self-exhausted" as permission to proceed.
+	if loop.Status == "paused" && (loops.IsSiblingReviewFixBudgetPause(loop.MetadataJSON) || loops.IsSiblingReviewScopeHumanPause(loop.MetadataJSON)) {
+		return true, nil
+	}
+	if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+		return true, nil
+	}
+	if loop.Status == "awaiting_human" {
+		if ask, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok || !loops.IsReviewFixBudgetAsk(ask) {
+			// Agent ask or scope ask: not a budget park target.
+			return true, nil
+		}
+	} else if loop.Status == "paused" && loops.IsReviewFixBudgetExhaustedPause(loop.MetadataJSON) {
+		// Re-enter no-ask hold to finish cancel/sibling park / handoff event.
+	} else {
+		if !loops.ParticipatesInReviewFixBudget(loop) {
+			return false, nil
+		}
+		if reason, _ := stringFromAny(reviewerLoopMetadata(parseJSONObject(loop.MetadataJSON))["terminationReason"]); reason != "" && !isDeprecatedReviewerLoopBudgetReason(reason) {
+			return false, nil
+		}
+		cap := r.maxPublishesPerPR(loop.ProjectID)
+		if !loops.BudgetExhausted(loops.ReviewerPublishCount(loop.MetadataJSON), cap) {
+			return false, nil
+		}
+	}
+	cap := r.maxPublishesPerPR(loop.ProjectID)
+	count := loops.ReviewerPublishCount(loop.MetadataJSON)
+	fixerCap := 0
+	if r.projectRoleConfig != nil {
+		fixerCap = config.ProjectRoleConfigs(*r.projectRoleConfig, loop.ProjectID).Fixer.Behavior.Loop.MaxPushesPerPR
+	}
+	_, err := loops.ParkReviewFixBudget(ctx, r.repos, loops.ParkReviewFixBudgetInput{
+		Exhausted:   loop,
+		Role:        "reviewer",
+		Repo:        derefString(loop.Repo),
+		PRNumber:    derefInt64(loop.PRNumber),
+		Count:       count,
+		Cap:         cap,
+		NowISO:      r.nowISO(),
+		HITLEnabled: r.reviewFixHITLEnabled(),
+		LiveCaps: loops.ReviewFixBudgetLiveCaps{
+			ReviewerMaxPublishes: cap,
+			FixerMaxPushes:       fixerCap,
+		},
+		DB: r.db,
+	})
+	if err != nil {
+		return false, err
+	}
+	// Notify is owned by discovery call sites (and scheduler post-claim), not
+	// shared park — in-run parks must not notify before queue finalization.
+	return true, nil
+}
+
+func (r *Runner) notifyHumanAttentionBestEffort(ctx context.Context, loopID string) {
+	if r.notifyHumanAttention == nil || strings.TrimSpace(loopID) == "" {
+		return
+	}
+	r.notifyHumanAttention(ctx, loopID)
+}
+
+// parkReviewerScopeHuman parks the review-fix pair for needs_human findings.
+// Does not use budget Continue/Stop refill; notify is best-effort at this site
+// because park can happen outside a claim finalization path.
+func (r *Runner) parkReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+			loop = *fresh
+		}
+	}
+	_, err := loops.ParkReviewScopeHuman(ctx, r.repos, loops.ParkReviewScopeHumanInput{
+		Held: loop, Role: "reviewer", Repo: derefString(loop.Repo), PRNumber: derefInt64(loop.PRNumber),
+		NowISO: r.nowISO(), HITLEnabled: r.reviewFixHITLEnabled(),
+		Question: commentOnlyNeedsHumanQuestion(completion), Evidence: commentOnlyNeedsHumanEvidence(completion),
+		DB: r.db,
+	})
+	if err != nil {
+		return err
+	}
+	r.notifyHumanAttentionBestEffort(ctx, loop.ID)
+	return nil
+}
+
+// parkOrDeferReviewerScopeHuman applies the one-hold rule after a counted publish
+// or pure needs_human: if the loop is already budget-held, persist scope evidence
+// without stacking a second HITL ask/primary pause reason; otherwise park scope.
+func (r *Runner) parkOrDeferReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
+	if r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return fmt.Errorf("refresh loop before review scope park: %w", err)
+		}
+		if fresh != nil {
+			loop = *fresh
+		}
+	}
+	if loops.IsReviewFixBudgetHold(loop) {
+		return r.persistPendingReviewerScopeHuman(ctx, loop, completion)
+	}
+	return r.parkReviewerScopeHuman(ctx, loop, completion)
+}
+
+func (r *Runner) persistPendingReviewerScopeHuman(ctx context.Context, loop storage.LoopRecord, completion reviewerCommentOnlyCompletion) error {
+	if r.repos == nil || r.repos.Loops == nil {
+		return fmt.Errorf("persist pending review scope requires loop storage")
+	}
+	unlock := loops.LockLoopRequeue(loop.ID)
+	defer unlock()
+	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(loop))
+	defer unlockTarget()
+
+	var live *storage.LoopRecord
+	write := func(writeRepos *storage.Repositories) error {
+		for range reviewScopeHumanPersistCASAttempts {
+			current, err := writeRepos.Loops.GetByID(ctx, loop.ID)
+			if err != nil {
+				return fmt.Errorf("refresh loop before pending review scope persist: %w", err)
+			}
+			if current == nil {
+				return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
+			}
+			if !loops.IsReviewFixBudgetHold(*current) {
+				live = current
+				return nil
+			}
+			if reviewScopeHumanPersistBeforeUpsertHook != nil {
+				if err := reviewScopeHumanPersistBeforeUpsertHook(*current); err != nil {
+					return err
+				}
+			}
+			encoded, err := loops.PersistPendingReviewScopeHumanEvidence(
+				current.MetadataJSON,
+				commentOnlyNeedsHumanQuestion(completion),
+				commentOnlyNeedsHumanEvidence(completion),
+				r.reviewFixHITLEnabled(),
+			)
+			if err != nil {
+				return err
+			}
+			newUpdatedAt := r.nowISO()
+			applied, err := writeRepos.Loops.UpdateMetadataIfMatch(ctx, current.ID, &encoded, newUpdatedAt, current.MetadataJSON)
+			if err != nil {
+				return err
+			}
+			if applied {
+				current.MetadataJSON = &encoded
+				current.UpdatedAt = newUpdatedAt
+				live = current
+				return nil
+			}
+		}
+		current, err := writeRepos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return fmt.Errorf("refresh loop before pending review scope persist: %w", err)
+		}
+		if current == nil {
+			return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
+		}
+		if !loops.IsReviewFixBudgetHold(*current) {
+			live = current
+			return nil
+		}
+		return fmt.Errorf("persist pending review scope lost CAS while budget hold remains for loop %s", loop.ID)
+	}
+	if err := write(r.repos); err != nil {
+		return err
+	}
+	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil {
+		return fmt.Errorf("refresh loop after pending review scope persist: %w", err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("persist pending review scope lost loop %s", loop.ID)
+	}
+	live = fresh
+	if !loops.IsReviewFixBudgetHold(*live) {
+		return r.parkReviewerScopeHuman(ctx, *live, completion)
+	}
+	return nil
+}
+
+// afterCommentOnlyPublishMaybeParkScope runs after a successful comment-only
+// publish + counted progress. Mixed must_fix+needs_human parks/defers scope
+// under the one-hold rule; pure must_fix returns nil.
+func (r *Runner) afterCommentOnlyPublishMaybeParkScope(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint) (reviewerCheckpoint, error) {
+	completion, err := pendingReviewerCommentOnlyCompletion(pending)
+	if err != nil || !commentOnlyCompletionHasNeedsHuman(completion) {
+		return checkpoint, nil
+	}
+	if err := r.parkOrDeferReviewerScopeHuman(ctx, input.Loop, completion); err != nil {
+		return checkpoint, err
+	}
+	return checkpoint, reviewerScopeOrBudgetHoldSkip(ctx, r, input.Loop)
+}
+
+// recoverAlreadyPublishedScopePark recovers needs_human scope park/defer after a
+// crash between recordPublishedReviewProgress and afterCommentOnlyPublishMaybeParkScope.
+// Applies live PR freshness gates so closed/new-head retries do not pause on
+// obsolete findings. Returns a stale/skip checkpoint without parking when drift
+// is detected; retryable GitHub view failures surface as errors.
+func (r *Runner) recoverAlreadyPublishedScopePark(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint) (reviewerCheckpoint, error) {
+	completion, err := pendingReviewerCommentOnlyCompletion(pending)
+	if err != nil || !commentOnlyCompletionHasNeedsHuman(completion) {
+		return checkpoint, nil
+	}
+	staleReason, err := r.scopeParkRecoveryFreshnessBlockReason(ctx, input.Project, input.Repo, input.PRNumber, pending, checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	if staleReason != "" {
+		return markReviewerRunStale(checkpoint, staleReason), nil
+	}
+	return r.afterCommentOnlyPublishMaybeParkScope(ctx, input, checkpoint, pending)
+}
+
+// recoverPublishedNeedsHumanScopeFromLatestRun is the ProcessClaimedItem preflight
+// counterpart: when budget already parks/skips the claim, still recover deferred
+// scope from the latest run checkpoint if publish landed with needs_human.
+// Does not start the agent or re-publish.
+func (r *Runner) recoverPublishedNeedsHumanScopeFromLatestRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord) error {
+	if r.repos == nil || r.repos.Runs == nil {
+		return nil
+	}
+	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if latestRun == nil {
+		return nil
+	}
+	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
+	if checkpoint.PendingReview == nil {
+		return nil
+	}
+	pending := *checkpoint.PendingReview
+	meta := parseJSONObject(loop.MetadataJSON)
+	last, ok := stringFromAny(meta["lastPublishedHeadSha"])
+	if !ok || last == "" || last != pending.HeadSHA {
+		return nil
+	}
+	completion, err := pendingReviewerCommentOnlyCompletion(pending)
+	if err != nil || !commentOnlyCompletionHasNeedsHuman(completion) {
+		return nil
+	}
+	repo := derefString(loop.Repo)
+	prNumber := derefInt64(loop.PRNumber)
+	staleReason, err := r.scopeParkRecoveryFreshnessBlockReason(ctx, project, repo, prNumber, pending, checkpoint)
+	if err != nil {
+		return err
+	}
+	if staleReason != "" {
+		// Closed PR or new head: do not park/defer obsolete scope evidence.
+		return nil
+	}
+	return r.parkOrDeferReviewerScopeHuman(ctx, loop, completion)
+}
+
+// scopeParkRecoveryFreshnessBlockReason views the live PR and returns a non-empty
+// stale/closed reason when scope park/defer must not run. Empty reason means OK
+// to park or recover. Retryable view failures return an error (fail closed — do
+// not park on unknown state). Missing PRs are treated as non-open drift.
+func (r *Runner) scopeParkRecoveryFreshnessBlockReason(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, pending pendingReviewCheckpoint, checkpoint reviewerCheckpoint) (string, error) {
+	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
+		return "", nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		if githubinfra.IsPullRequestNotFoundError(err) {
+			return fmt.Sprintf("PR drift detected before publish: expected PR state OPEN, observed missing for %s#%d", repo, prNumber), nil
+		}
+		return "", &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
+	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
+		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), nil
+	}
+	if reason := reviewerPublishDriftReason(stepInput{Repo: repo, PRNumber: prNumber}, checkpoint, detail); reason != "" {
+		return reason, nil
+	}
+	if normalizePRState(detail.State) != "open" {
+		observed := strings.ToUpper(strings.TrimSpace(detail.State))
+		if observed == "" {
+			observed = "NON_OPEN"
+		}
+		return fmt.Sprintf("PR drift detected before publish: expected PR state OPEN, observed %s for %s#%d", observed, repo, prNumber), nil
+	}
+	return "", nil
+}
+
+// applyScopeParkFreshness rechecks live PR state/head before a direct needs_human
+// park. blocked=true means the run is stale/closed and must not hold the pair.
+func (r *Runner) applyScopeParkFreshness(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, headSHA string) (reviewerCheckpoint, bool, error) {
+	staleReason, err := r.scopeParkRecoveryFreshnessBlockReason(ctx, input.Project, input.Repo, input.PRNumber, pendingReviewCheckpoint{HeadSHA: headSHA}, checkpoint)
+	if err != nil {
+		return checkpoint, false, err
+	}
+	if staleReason != "" {
+		return markReviewerRunStale(checkpoint, staleReason), true, nil
+	}
+	return checkpoint, false, nil
+}
+
+func reviewerScopeOrBudgetHoldSkip(ctx context.Context, r *Runner, loop storage.LoopRecord) error {
+	if r != nil && r.repos != nil && r.repos.Loops != nil && strings.TrimSpace(loop.ID) != "" {
+		if fresh, err := r.repos.Loops.GetByID(ctx, loop.ID); err == nil && fresh != nil {
+			loop = *fresh
+		}
+	}
+	if loops.IsReviewFixBudgetHold(loop) {
+		return &holdSkipError{summary: "Reviewer stopped because review-fix budget is exhausted"}
+	}
+	if loops.IsReviewScopeHumanHold(loop) || loops.HasPendingReviewScopeHuman(loop) {
+		return &holdSkipError{summary: "Reviewer stopped because review scope requires human judgment"}
+	}
+	return &holdSkipError{summary: "Reviewer stopped because review scope requires human judgment"}
 }
 
 func terminalReviewerLoopReason(loop storage.LoopRecord) string {
@@ -6435,7 +9428,9 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	loopMeta["lastStatus"] = "success"
 	loopMeta["consecutiveFailures"] = 0
 	reviewCompleted := checkpoint.SkipReason == "" && checkpoint.PendingReview != nil
-	if reviewCompleted {
+	publishedHead, _ := stringFromAny(meta["lastPublishedHeadSha"])
+	alreadyCounted := publishedHead != "" && (head == "" || publishedHead == head)
+	if reviewCompleted && !alreadyCounted {
 		loopMeta["iterationCount"] = iterations + 1
 	}
 	if reviewCompleted && head != "" {
@@ -6690,8 +9685,39 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false, "")
 	return prompt
+}
+
+// isRepairFrontierPass is true when a prior Looper review was published for this
+// lane and the PR head has since changed. Budget Continue must not clear
+// lastPublishedHeadSha; that field is the durable frontier base.
+func isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA string) bool {
+	last := strings.TrimSpace(lastPublishedHeadSHA)
+	current := strings.TrimSpace(currentHeadSHA)
+	return last != "" && current != "" && last != current
+}
+
+func repairFrontierPassContract(lastPublishedHeadSHA, currentHeadSHA string, commentOnly bool) string {
+	scanVerb := "publishing"
+	if commentOnly {
+		scanVerb = "finalizing"
+	}
+	return fmt.Sprintf(`Repair frontier contract (later pass): a prior Looper review was published for head %s and the current head is %s. This is not a first full-pass rescan. Before %s, inspect only:
+1. every unresolved prior must_fix thread;
+2. the diff from last reviewed head %s to current head %s;
+3. directly affected call sites, contracts, tests, and lifecycle invariants;
+4. evidence that Fixer actually addressed each prior finding.
+Do not rescan untouched original diff merely to invent ordinary new P2/P3 hardening, cleanup, style, or independent-improvement work.
+Late findings discovered in untouched old diff:
+- Clear security, data corruption/loss, broken public contract, or P0/P1 correctness blocker → disposition must_fix; mark late discovery in scopeEvidence (for example prefix with "late_discovery: …") and include it in convergence evidence.
+- Ordinary P2/P3 robustness, cleanup, style, or independent improvement → disposition follow_up; do not feed the current Fixer loop.
+- Scope or severity genuinely ambiguous → disposition needs_human.
+Budget Continue does not reset this repair frontier; lastPublishedHeadSha remains the base until a new head is published.`, lastPublishedHeadSHA, currentHeadSHA, scanVerb, lastPublishedHeadSHA, currentHeadSHA)
+}
+
+func fixerDeclineAdjudicationContract() string {
+	return `Fixer decline adjudication: a validated Fixer declined reply on an existing Looper-authored review thread is a scope dispute, not dismissal authority. Do not open a duplicate thread for the same finding. Adjudicate on the existing thread only: (1) accept the decline when the item is out of scope (leave the thread for later resolution ownership — do not invent a new thread), (2) reject the decline with new concrete authority evidence and keep the thread unresolved so Fixer remains eligible, or (3) disposition needs_human when judgment is required. A second attempted fix to the same subsystem, or a repeated reviewer–fixer scope conflict without new evidence, must be needs_human — not another automatic argument round.`
 }
 
 func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewerCheckpoint, scope config.ReviewerScope) string {
@@ -6772,7 +9798,7 @@ func reviewerProjectProviderKind(cfg config.Config, projectID string) config.Pro
 	return config.ProviderKindGitHub
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool, lastPublishedHeadSHA string) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -6785,15 +9811,18 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if forgejoNative {
 		forgeName = "Forgejo"
 	}
-	publishInstruction := fmt.Sprintf("For actionable findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, follow the clean-result publishing instructions for this run. Do not return review JSON for looper to parse; looper will not parse review content or post forge comments for you after the agent exits.", forgeName)
+	currentHeadSHA := snapshotHeadSHA(checkpoint)
+	lastPublishedHeadSHA = strings.TrimSpace(lastPublishedHeadSHA)
+	laterPass := isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA)
+	publishInstruction := fmt.Sprintf("For actionable must_fix findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell (inline comments only for must_fix). For no-actionable-finding results, follow the clean-result publishing instructions for this run. After the agent step, finish with `__LOOPER_RESULT__` JSON that includes `summary`, optional `outcome`, and `findings` using the same disposition fields as comment-only (`disposition`, `severity`, `scopeBasis`, `scopeEvidence`, `title`, `body`, optional `path`/`line`). Looper **does** parse this findings list: `follow_up` is retained locally only and must not be submitted; `needs_human` parks the pair and must not be submitted as change-request comments. Do not smuggle follow_up/needs_human into unstructured top-level review body prose as the only carrier of a blocking finding.", forgeName)
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
-	outcomeInstruction := "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
-	cleanResultCompletionInstruction := "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback."
+	outcomeInstruction := "Use outcome=clean only when there are no must_fix findings, outcome=non_blocking for must_fix feedback that should not block merge, and outcome=blocking for must_fix findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
+	cleanResultCompletionInstruction := "Group findings only when they share the same root cause; keep unrelated concerns as separate findings. Accumulate every independent in-scope must_fix before publishing — do not intentionally defer an already observed in-scope issue. The publication budget limits review publications, not findings per publication. If there is no concrete must_fix feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback."
 	if looperCLIPath == "" {
-		outcomeInstruction = "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
-		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`. Do not invent feedback."
+		outcomeInstruction = "Use outcome=clean only when there are no must_fix findings, outcome=non_blocking for must_fix feedback that should not block merge, and outcome=blocking for must_fix findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
+		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns as separate findings. Accumulate every independent in-scope must_fix before publishing — do not intentionally defer an already observed in-scope issue. The publication budget limits review publications, not findings per publication. If there is no concrete must_fix feedback, do not finish successfully or add a clean signal because the trusted wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`. Do not invent feedback."
 	}
 	fetchContract := reviewerAgentSideGitHubFetchContract()
 	if forgejoNative {
@@ -6801,11 +9830,15 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	}
 	if commentOnlyPublish {
 		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata and diff in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
-		outcomeInstruction = "If there are actionable findings, finish successfully with a concise markdown summary and set the final `__LOOPER_RESULT__` JSON fields to include: `summary` (same human summary), `outcome` (`non_blocking` or `blocking`), and `findings` (an array of actionable issues only). Each finding object MUST contain `title`, `body`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no actionable findings, set `outcome` to `clean`, keep `findings` empty, and start `summary` with `No actionable findings`. Do not include terminal logs, extra JSON payloads, or publishing commands."
-		cleanResultCompletionInstruction = "Prefer a concise, specific final summary over many shallow notes. If there is no concrete actionable feedback, start the final summary with `No actionable findings`. Do not invent feedback."
+		outcomeInstruction = "Classify every candidate finding with disposition `must_fix` | `follow_up` | `needs_human`, plus `severity`, `scopeBasis`, and `scopeEvidence`. Include all candidates in `__LOOPER_RESULT__.findings`. Looper publishes only `must_fix` findings into the remote Reviewer Summary; `follow_up` stays in the structured result only; `needs_human` parks the pair and is never posted as a change request. If there are must_fix findings, finish successfully with a concise markdown summary and set `summary`, `outcome` (`non_blocking` or `blocking`), and `findings`. Each finding object MUST contain `title`, `body`, `disposition`, `severity`, `scopeBasis`, `scopeEvidence`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no must_fix findings and no needs_human, set `outcome` to `clean` (follow_up-only findings may remain in `findings`), and start `summary` with `No actionable findings` when there are no must_fix items. Do not include terminal logs, extra JSON payloads, or publishing commands."
+		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns separate. Accumulate every independent in-scope must_fix before finalizing. If there is no concrete must_fix feedback, start the final summary with `No actionable findings`. Do not invent feedback."
 		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata and diff before invoking you. Use the prepared local worktree plus the supplied metadata/diff as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	if laterPass {
+		parts = append(parts, fmt.Sprintf("Last reviewed head SHA: %s", lastPublishedHeadSHA), fmt.Sprintf("Current head SHA for this pass: %s", currentHeadSHA), repairFrontierPassContract(lastPublishedHeadSHA, currentHeadSHA, commentOnlyPublish))
+	}
+	parts = append(parts, fixerDeclineAdjudicationContract())
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
 	}
@@ -6843,8 +9876,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	specLabelInstruction := "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after it validates a matching APPROVED clean review marker for the current head."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
 	reviewerModeFlag := ""
+	if strings.TrimSpace(runID) != "" {
+		reviewerModeFlag = fmt.Sprintf(" --reviewer-run-id %s", runID)
+	}
 	if manual {
-		reviewerModeFlag = fmt.Sprintf(" --reviewer-manual --reviewer-run-id %s", runID)
+		reviewerModeFlag = " --reviewer-manual" + reviewerModeFlag
 	}
 	actionableReviewSubmitCommand := fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s`", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	if reviewEvents.Clean == config.ReviewerReviewEventApprove && looperCLIPath != "" && !(autoMergeEnabled && phase != "spec") {
@@ -6865,42 +9901,52 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
 	if commentOnlyPublish {
+		reviewPassContract := "Review pass contract: complete one full review pass before finalizing. Use the supplied PR metadata, supplied diff, and local worktree to inspect every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass."
+		if laterPass {
+			reviewPassContract = "Review pass contract (later pass / repair frontier): complete the repair-frontier inspection before finalizing. Do not perform a full first-pass rescan of untouched original diff. Focus on unresolved prior must_fix threads, the last-reviewed-head→current-head delta, directly affected contracts/tests/lifecycle invariants, and Fixer evidence. Do not stop after the first issue within that frontier."
+		}
 		parts = append(parts,
-			"Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself.",
-			"Review pass contract: complete one full review pass before finalizing. Use the supplied PR metadata, supplied diff, and local worktree to inspect every changed file/range in scope. Do not stop after the first issue. If a blocking issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass.",
-			"Finding accumulator contract: accumulate candidate findings internally before finalizing. For each candidate, track location, severity, evidence, why it matters, and a suggested fix. Deduplicate, merge same-root-cause findings, and prefer fewer deep comments over many shallow ones.",
+			"Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself. Only must_fix findings become remote Reviewer Summary items; follow_up and needs_human remain in structured completion only.",
+			reviewPassContract,
+			"Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), plus title/body/location. must_fix becomes remote feedback; follow_up is retained only in structured completion; needs_human must not be published as a change request and parks the pair for human judgment.",
+			"Finding accumulator contract: accumulate candidate findings internally before finalizing. For each candidate, track disposition, severity, scopeBasis, scopeEvidence, location, problem, why it matters, and a suggested fix. Deduplicate only the same root cause or a genuinely repeated pattern; keep unrelated concerns separate. Grouping is valid only for a shared root cause with representative locations.",
 			"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
-			"Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed blocking findings are included, repeated patterns are consolidated, non-blocking/nit feedback is not escalated, every finding has concrete evidence and a suggested fix, and the summary outcome matches the highest severity.",
+			"Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included, repeated patterns are consolidated only when they share a root cause, non-blocking/nit feedback is not escalated, every finding has disposition/scope evidence and a suggested fix, and the summary outcome matches the highest must_fix severity.",
 			cleanResultCompletionInstruction,
-			"Every finding MUST include: (1) an exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
+			"Every finding MUST include: (1) disposition/severity/scopeBasis/scopeEvidence, (2) an exact file/section/symbol reference, (3) the concrete problem, (4) why it matters, (5) evidence from the changed lines or spec section, and (6) a specific suggested change.",
 			"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
 		)
 		return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
-	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
+	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries. Each actionable comment MUST include GitHub fields `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body`, plus Looper-only fields `disposition` (must be `must_fix`), `scopeBasis`, and `scopeEvidence` (and preferably `severity`). The trusted wrapper rejects missing disposition/scope fields and rejects `follow_up`/`needs_human` in actionable comments or the visible review body; those dispositions stay out of the submit payload. Looper strips Looper-only fields before calling GitHub/Forgejo.", looperCLICommand)
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
 	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
-	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor."
+	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If a must_fix location is outside the live diff's exact line, attach it to the nearest anchorable changed-file location instead of submitting an invalid inline anchor. Do not move must_fix findings into the top-level review body; the trusted wrapper rejects actionable body-only reviews, and body-only markers are not published must_fix."
 	if forgejoNative {
 		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
-		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), and `body`; the wrapper maps validated anchors to Forgejo positions.", looperCLICommand)
+		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), `body`, plus Looper-only `disposition=must_fix`, `scopeBasis`, and `scopeEvidence`; the wrapper validates those fields, rejects `follow_up`/`needs_human` in comments or the visible review body, then maps anchors to Forgejo and strips Looper-only fields before the provider call.", looperCLICommand)
 		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
 		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
-		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors; downgrade unanchorable feedback to a top-level review-body item with an exact file/section/symbol reference."
+		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors. If a must_fix location is not exactly on the supplied diff, attach it to the nearest anchorable changed-file location. Do not downgrade must_fix findings to a top-level review-body item; every must_fix must remain an inline comment."
 	}
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 		submitPayloadInstruction = ""
 	}
+	reviewPassContract := "Review pass contract: complete one full review pass before publishing. Collect PR metadata, changed-file list, live diffs, prior unresolved feedback, and necessary surrounding context; then scan every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass."
+	if laterPass {
+		reviewPassContract = "Review pass contract (later pass / repair frontier): complete the repair-frontier inspection before publishing. Do not perform a full first-pass rescan of untouched original diff merely to invent ordinary P2/P3 work. Collect unresolved prior must_fix threads, the last-reviewed-head→current-head delta, directly affected call sites/contracts/tests/lifecycle invariants, and Fixer evidence for each prior finding. Do not stop after the first issue within that frontier."
+	}
 	parts = append(parts,
 		idempotencyInstruction,
 		existingMarkerEventInstruction,
 		githubOperationContract,
-		"Review pass contract: complete one full review pass before publishing. Collect PR metadata, changed-file list, live diffs, prior unresolved feedback, and necessary surrounding context; then scan every changed file/range in scope. Do not stop after the first issue. If a blocking issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass.",
-		"Finding accumulator contract: accumulate candidate findings internally before publishing. For each candidate, track location, severity, evidence, why it matters, and a suggested fix. Before submitting, deduplicate, merge same-root-cause findings, group repeated patterns into systemic comments with representative examples, and prefer fewer deep comments over many shallow ones. If there are more than 15 blocking findings or more than 25 total comments, avoid comment flooding by publishing grouped systemic blockers instead of many repetitive inline comments.",
+		reviewPassContract,
+		"Finding disposition contract: every candidate uses disposition must_fix|follow_up|needs_human, severity blocking|non_blocking|nit, scopeBasis (stated_intent|introduced_regression|required_invariant|independent_improvement|ambiguous_intent), scopeEvidence (specific repository rule, PR goal/non-goal, linked spec section, or regression evidence), path/line, problem, why, and suggestedChange. Emit the full candidate list in `__LOOPER_RESULT__.findings` — Looper parses this JSON. Only must_fix may be submitted through `looper review submit` as remote actionable feedback. Retain follow_up in structured completion only — do not submit follow_up as review comments. For needs_human, do not submit change-request comments; include them in `__LOOPER_RESULT__.findings` so Looper can park the pair for human judgment. Actionable/blocking reviews must carry must_fix as inline comments, not body-only prose.",
+		"Finding accumulator contract: accumulate candidate findings internally before publishing. For each candidate, track disposition, severity, scopeBasis, scopeEvidence, location, problem, why it matters, and a suggested fix. Before submitting, deduplicate only the same root cause or a genuinely repeated pattern; group repeated patterns into systemic comments with representative examples only when they share a root cause. Keep unrelated concerns as separate comments. The publication budget limits review publications, not findings per publication.",
 		"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
-		"Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed blocking findings are included, repeated patterns are consolidated, non-blocking/nit feedback is not escalated, every published finding has concrete evidence and a suggested fix, and the review outcome matches the highest published severity.",
+		"Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included in this publication, repeated patterns are consolidated only for a shared root cause, non-blocking/nit feedback is not escalated, every published comment has disposition=must_fix with scopeBasis/scopeEvidence plus concrete evidence and a suggested fix, and the review outcome matches the highest published severity.",
 		freshnessInstruction,
 		reviewRequestInstruction,
 		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you have actionable findings but do not have concrete actionable prose yet, exit non-zero instead of posting logs. For a clean APPROVE review, write the required author mention, change/verification summary, and warm acknowledgement; never use an LGTM, empty, or disclosure-only clean body as a fallback.",
@@ -6919,12 +9965,12 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"For complex linting/parsing logic, prefer recommending fixture-matrix tests over isolated one-regression tests. For CSS linting specifically, consider coverage for multiple style blocks, inline styles, comments, at-rules, cascade order, custom properties, var() fallbacks, theme scopes, and px/em/rem unit handling.",
 		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
-		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback; top-level comment bodies must still name the exact file, section, symbol, or behavior they refer to.",
-		"Flag any top-level actionable comment that lacks exact file, section, symbol, or behavior context as a follow-up quality-gating failure; do not publish vague unlocated feedback.",
+		"Cross-cutting or otherwise unanchorable must_fix findings still require an inline comment on a representative changed-file location; do not submit them as body-only top-level feedback.",
+		"Flag vague unlocated must_fix feedback as a follow-up quality-gating failure; every must_fix must be an inline comment with an exact file, section, symbol, or behavior reference.",
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
 		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
-		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use them only for clean summaries or genuinely cross-cutting/unanchorable feedback.",
-		"For non-blocking or blocking finding reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
+		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use the review body only for clean summaries or a short overview of already-submitted inline must_fix findings.",
+		"For non-blocking or blocking must_fix reviews, the review body should be a short overview plus markers/disclosure; every must_fix finding must live in inline `comments` so maintainers can resolve them individually.",
 		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",
@@ -7013,6 +10059,45 @@ func snapshotHeadSHA(checkpoint reviewerCheckpoint) string {
 
 func agentNativeReviewID(loopID string, headSHA string) string {
 	return fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
+}
+
+func agentNativeConvergenceReviewID(loopID, headSHA, signal string) string {
+	id := fmt.Sprintf("reviewer:%s:%s:convergence", loopID, headSHA)
+	signal = strings.TrimSpace(signal)
+	if signal == "" {
+		return id
+	}
+	return id + ":" + signal
+}
+
+func isConvergenceReviewID(id string) bool {
+	return strings.Contains(id, ":convergence:") || strings.HasSuffix(id, ":convergence")
+}
+
+func reviewPublicationID(loopID string, checkpoint reviewerCheckpoint) string {
+	headSHA := ""
+	if checkpoint.Snapshot != nil {
+		headSHA = checkpoint.Snapshot.HeadSHA
+	}
+	if checkpoint.ConvergencePass || (checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.ScheduleConvergencePass) {
+		return agentNativeConvergenceReviewID(loopID, headSHA, checkpoint.ReviewSignalFingerprint)
+	}
+	return agentNativeReviewID(loopID, headSHA)
+}
+
+func isConvergencePublication(checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint) bool {
+	return checkpoint.ConvergencePass || (checkpoint.ThreadResolution != nil && checkpoint.ThreadResolution.ScheduleConvergencePass) || isConvergenceReviewID(pending.IdempotencyKey)
+}
+
+// shouldCountPublishedReview reports whether a successful publish should
+// increment maxPublishesPerPR. Same-head retries reuse lastPublishedHeadSha;
+// same-head convergence uses the distinct publication identity instead.
+func shouldCountPublishedReview(previousHead, previousReviewID, headSHA, reviewID string) bool {
+	reviewID = strings.TrimSpace(reviewID)
+	if isConvergenceReviewID(reviewID) {
+		return reviewID != strings.TrimSpace(previousReviewID)
+	}
+	return strings.TrimSpace(previousHead) != strings.TrimSpace(headSHA)
 }
 
 func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey string) string {

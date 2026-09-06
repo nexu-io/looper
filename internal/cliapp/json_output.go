@@ -308,17 +308,26 @@ func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
 			return nil, fmt.Errorf("loop retry requires <seq|loopId>")
 		}
 		discard := getBoolFlag(cmd, "discard-worktree-changes")
+		clearUnusable := getBoolFlag(cmd, "clear-unusable-worktree")
+		if discard && clearUnusable {
+			return nil, fmt.Errorf("--discard-worktree-changes and --clear-unusable-worktree are mutually exclusive")
+		}
 		if discard && !getBoolFlag(cmd, "confirm") {
 			return nil, fmt.Errorf("--discard-worktree-changes requires --confirm")
+		}
+		if clearUnusable && !getBoolFlag(cmd, "confirm") {
+			return nil, fmt.Errorf("--clear-unusable-worktree requires --confirm")
 		}
 		mode := strings.TrimSpace(getStringFlag(cmd, "mode"))
 		if mode == "" {
 			mode = "auto"
 		}
 
-		// When discard is not already opted in, preflight dirty worktree and
-		// either prompt (human) or refuse with jump guidance (scripts/json).
-		if !discard {
+		var worktreeStatus *loopWorktreeStatusOutput
+
+		// When neither destructive flag is opted in, preflight worktree and
+		// either prompt (human) or refuse with jump/clear guidance (scripts/json).
+		if !discard && !clearUnusable {
 			status, statusErr := r.fetchLoopWorktreeStatus(ctx, selector)
 			if statusErr != nil {
 				// Preflight is best-effort: daemon older than worktree route
@@ -326,22 +335,37 @@ func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
 				if !isAPINotFoundError(statusErr) {
 					return nil, statusErr
 				}
-			} else if decision := classifyRetryWorktreePreflight(status); decision != retryWorktreeOK {
-				switch decision {
-				case retryWorktreeOfferDiscard:
-					if getBoolFlag(cmd, "json") {
+			} else {
+				worktreeStatus = status
+				if decision := classifyRetryWorktreePreflight(status); decision != retryWorktreeOK {
+					switch decision {
+					case retryWorktreeOfferDiscard:
+						if getBoolFlag(cmd, "json") {
+							return nil, dirtyWorktreeRetryGuidanceError(selector, status)
+						}
+						discardConfirmed, promptErr := promptDiscardDirtyWorktree(cmd, selector, status)
+						if promptErr != nil {
+							return nil, promptErr
+						}
+						if !discardConfirmed {
+							return nil, dirtyWorktreeRetryGuidanceError(selector, status)
+						}
+						discard = true
+					case retryWorktreeOfferClear:
+						if getBoolFlag(cmd, "json") {
+							return nil, unusableWorktreeRetryGuidanceError(selector, status)
+						}
+						clearConfirmed, promptErr := promptClearUnusableWorktree(cmd, selector, status)
+						if promptErr != nil {
+							return nil, promptErr
+						}
+						if !clearConfirmed {
+							return nil, unusableWorktreeRetryGuidanceError(selector, status)
+						}
+						clearUnusable = true
+					case retryWorktreeInspectOnly:
 						return nil, dirtyWorktreeRetryGuidanceError(selector, status)
 					}
-					discardConfirmed, promptErr := promptDiscardDirtyWorktree(cmd, selector, status)
-					if promptErr != nil {
-						return nil, promptErr
-					}
-					if !discardConfirmed {
-						return nil, dirtyWorktreeRetryGuidanceError(selector, status)
-					}
-					discard = true
-				case retryWorktreeInspectOnly:
-					return nil, dirtyWorktreeRetryGuidanceError(selector, status)
 				}
 			}
 		}
@@ -350,8 +374,78 @@ func (r *commandRuntime) loopRetry(cmd *cobra.Command, args []string) error {
 		if discard {
 			body["discardWorktreeChanges"] = true
 		}
-		return r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
+		if clearUnusable {
+			// Negotiate clear support and bind the confirmed path BEFORE POST
+			// /retry. Pre-change daemons ignore clearUnusableWorktreePath and
+			// would otherwise queue a plain retry before ack can fail closed.
+			if worktreeStatus == nil {
+				status, statusErr := r.fetchLoopWorktreeStatus(ctx, selector)
+				if statusErr != nil {
+					if isAPINotFoundError(statusErr) {
+						return nil, fmt.Errorf("daemon does not support clear-unusable-worktree (GET /worktree missing); upgrade looperd or clear the path manually then retry without --clear-unusable-worktree")
+					}
+					return nil, statusErr
+				}
+				worktreeStatus = status
+			}
+			if err := requireClearUnusableWorktreeCapability(worktreeStatus); err != nil {
+				return nil, err
+			}
+			expectedPath := ""
+			if worktreeStatus.WorktreePath != nil {
+				expectedPath = strings.TrimSpace(*worktreeStatus.WorktreePath)
+			}
+			if expectedPath == "" {
+				return nil, fmt.Errorf("clear-unusable-worktree requires a resolved worktreePath from GET /worktree; inspect with looper jump %s or upgrade looperd", selector)
+			}
+			body["clearUnusableWorktreePath"] = true
+			body["expectedWorktreePath"] = expectedPath
+		}
+		payload, err := r.postJSON(ctx, "/api/v1/loops/"+url.PathEscape(selector)+"/retry", body)
+		if err != nil {
+			return nil, err
+		}
+		// Defense in depth: still require an explicit true echo after a
+		// capability-gated POST so a mixed-version edge cannot report success
+		// without clearing.
+		if clearUnusable {
+			if err := requireClearUnusableWorktreeAck(payload); err != nil {
+				return nil, err
+			}
+		}
+		return payload, nil
 	}, writeHumanLoopRetried)
+}
+
+// requireClearUnusableWorktreeCapability fails before POST /retry when the
+// daemon's GET /worktree response does not advertise clear support. Omitted or
+// false means a pre-change daemon that would ignore clearUnusableWorktreePath
+// and queue a plain retry.
+func requireClearUnusableWorktreeCapability(status *loopWorktreeStatusOutput) error {
+	if status == nil {
+		return fmt.Errorf("daemon did not advertise supportsClearUnusablePath; upgrade looperd or clear the path manually then retry without --clear-unusable-worktree")
+	}
+	if status.SupportsClearUnusablePath == nil || !*status.SupportsClearUnusablePath {
+		return fmt.Errorf("daemon did not advertise supportsClearUnusablePath; upgrade looperd or clear the path manually then retry without --clear-unusable-worktree")
+	}
+	return nil
+}
+
+// requireClearUnusableWorktreeAck fails when the daemon did not acknowledge
+// clearUnusableWorktreePath=true. Omitted or false means an older daemon that
+// silently ignored the request body field.
+func requireClearUnusableWorktreeAck(payload json.RawMessage) error {
+	var data loopRetryOutput
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("decode loop retry response: %w", err)
+	}
+	if data.ClearUnusableWorktreePath == nil {
+		return fmt.Errorf("daemon did not acknowledge clearUnusableWorktreePath (field omitted); upgrade looperd or clear the path manually then retry without --clear-unusable-worktree")
+	}
+	if !*data.ClearUnusableWorktreePath {
+		return fmt.Errorf("daemon did not acknowledge clearUnusableWorktreePath (got false); upgrade looperd or clear the path manually then retry without --clear-unusable-worktree")
+	}
+	return nil
 }
 
 type loopWorktreeStatusOutput struct {
@@ -364,6 +458,9 @@ type loopWorktreeStatusOutput struct {
 	Clean        *bool   `json:"clean"`
 	Dirty        *bool   `json:"dirty"`
 	Reason       string  `json:"reason"`
+	// SupportsClearUnusablePath uses a pointer so omitted JSON (pre-change
+	// daemons) stays nil and fails capability negotiation closed.
+	SupportsClearUnusablePath *bool `json:"supportsClearUnusablePath"`
 }
 
 func (r *commandRuntime) fetchLoopWorktreeStatus(ctx context.Context, selector string) (*loopWorktreeStatusOutput, error) {
@@ -403,19 +500,46 @@ func promptDiscardDirtyWorktree(cmd *cobra.Command, selector string, status *loo
 	)
 }
 
+func promptClearUnusableWorktree(cmd *cobra.Command, selector string, status *loopWorktreeStatusOutput) (bool, error) {
+	path := ""
+	if status != nil && status.WorktreePath != nil {
+		path = strings.TrimSpace(*status.WorktreePath)
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Looper could not verify a usable checkout for loop %s\n", strings.TrimSpace(selector))
+	if path != "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  path: %s\n", path)
+	}
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  Confirming deletes the entire managed path, including uncommitted or leftover files.")
+	_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  Inspect first if unsure.")
+	return promptBootstrapBool(
+		bufio.NewReader(cmd.InOrStdin()),
+		cmd.ErrOrStderr(),
+		"Remove managed path and retry",
+		false,
+	)
+}
+
 type retryWorktreeDecision int
 
 const (
 	retryWorktreeOK retryWorktreeDecision = iota
 	retryWorktreeOfferDiscard
+	retryWorktreeOfferClear
 	retryWorktreeInspectOnly
 )
 
 // classifyRetryWorktreePreflight decides whether plain retry may proceed.
 // Discard is offered only for present + managed + dirty worktrees.
+// Clear is offered for present + managed + reason unusable_path.
 func classifyRetryWorktreePreflight(status *loopWorktreeStatusOutput) retryWorktreeDecision {
 	if status == nil || !status.Present {
 		return retryWorktreeOK
+	}
+	if strings.TrimSpace(status.Reason) == "unusable_path" {
+		if status.Managed {
+			return retryWorktreeOfferClear
+		}
+		return retryWorktreeInspectOnly
 	}
 	if status.Dirty == nil || !*status.Dirty {
 		// status_unavailable leaves dirty nil — allow plain retry (fail later if needed).
@@ -464,6 +588,29 @@ func dirtyWorktreeRetryGuidanceError(selector string, status *loopWorktreeStatus
 	// Document discard for managed dirty trees so operators can re-run non-interactively.
 	if managedDirty {
 		fmt.Fprintf(&b, "\n  discard: looper retry %s --discard-worktree-changes --confirm", quoteShellArg(sel))
+	}
+	return fmt.Errorf("%s", b.String())
+}
+
+func unusableWorktreeRetryGuidanceError(selector string, status *loopWorktreeStatusOutput) error {
+	path := ""
+	if status != nil && status.WorktreePath != nil {
+		path = strings.TrimSpace(*status.WorktreePath)
+	}
+	sel := strings.TrimSpace(selector)
+	var b strings.Builder
+	b.WriteString("retry cancelled: worktree path is unusable (not a git checkout)")
+	if path != "" {
+		fmt.Fprintf(&b, "\n  path: %s", path)
+	}
+	if status != nil && status.Present {
+		fmt.Fprintf(&b, "\n  inspect: looper jump %s", quoteShellArg(sel))
+		if path != "" {
+			fmt.Fprintf(&b, "\n  or:     cd -- %s", quoteShellArg(path))
+		}
+	}
+	if status != nil && status.Managed {
+		fmt.Fprintf(&b, "\n  clear:   looper retry %s --clear-unusable-worktree --confirm", quoteShellArg(sel))
 	}
 	return fmt.Errorf("%s", b.String())
 }

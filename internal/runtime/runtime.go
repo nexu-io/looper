@@ -196,15 +196,18 @@ type Runtime struct {
 	humanAttentionNotifyWG     sync.WaitGroup
 	humanAttentionNotifyDone   chan struct{}
 	activeExecutions           *ActiveExecutionRegistry
-	projectCatalog             *projects.Catalog
-	githubGateway              *githubinfra.Gateway
-	webhook                    *webhookRuntime
-	webhookDaemonLock          *daemonLock
-	webhookForwarder           WebhookForwarder
-	networkManager             runtimeNetworkManager
-	schedulerDisabled          bool
-	startupReadyOnce           sync.Once
-	startupReadyErr            error
+	// beginShutdownHooks run during BeginShutdown after admission flips to
+	// stopping and before non-agent drain waits (cancel producers first).
+	beginShutdownHooks []func()
+	projectCatalog     *projects.Catalog
+	githubGateway      *githubinfra.Gateway
+	webhook            *webhookRuntime
+	webhookDaemonLock  *daemonLock
+	webhookForwarder   WebhookForwarder
+	networkManager     runtimeNetworkManager
+	schedulerDisabled  bool
+	startupReadyOnce   sync.Once
+	startupReadyErr    error
 	// ownershipAcquired remains true after CompleteStartup succeeds so stop
 	// still writes looperd.stopped. Admission is the sole ready Authority;
 	// this flag is not a mutation/claim gate.
@@ -477,7 +480,15 @@ func (r *Runtime) BeginShutdown(reason string) {
 	// cancels under admission.mu. Do not take r.mu while holding admission.mu
 	// (other paths lock r.mu then read admission — that order would deadlock).
 	cancels := r.snapshotWorkProducerCancels()
-	_ = r.admission.BeginShutdownThen(reason, cancels.invokeForShutdown)
+	hooks := r.snapshotBeginShutdownHooks()
+	_ = r.admission.BeginShutdownThen(reason, func() {
+		cancels.invokeForShutdown()
+		for _, hook := range hooks {
+			if hook != nil {
+				hook()
+			}
+		}
+	})
 	// Close agent spawn admission and confirmed-drain live handles — agents and
 	// tracked Supervisor-owned non-agents (#576/#577). Agent leases cancel via
 	// registry; non-agent owners were canceled above.
@@ -488,6 +499,34 @@ func (r *Runtime) BeginShutdown(reason string) {
 			r.mu.Unlock()
 		}
 	}
+}
+
+// OnBeginShutdown registers a hook invoked during BeginShutdown after admission
+// flips to stopping and work-producer cancels run, but before the registry
+// waits on tracked non-agent handles. Used for Supervisor-owned non-agent
+// work that is not scheduler/recovery (e.g. model catalog shared probes).
+// Hooks must be safe to call more than once (idempotent cancel).
+func (r *Runtime) OnBeginShutdown(hook func()) {
+	if r == nil || hook == nil {
+		return
+	}
+	r.mu.Lock()
+	r.beginShutdownHooks = append(r.beginShutdownHooks, hook)
+	r.mu.Unlock()
+}
+
+func (r *Runtime) snapshotBeginShutdownHooks() []func() {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.beginShutdownHooks) == 0 {
+		return nil
+	}
+	out := make([]func(), len(r.beginShutdownHooks))
+	copy(out, r.beginShutdownHooks)
+	return out
 }
 
 // workProducerCancels is a lock-free snapshot of cancel targets so

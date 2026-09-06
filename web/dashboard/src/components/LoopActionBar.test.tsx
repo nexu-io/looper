@@ -99,6 +99,26 @@ describe("classifyRetryWorktree", () => {
         // dirty unknown → fail closed (shared with recovery card)
       }),
     ).toBe("inspect-only");
+    expect(
+      classifyRetryWorktree({
+        loopId: "l",
+        seq: 1,
+        present: true,
+        managed: true,
+        reason: "unusable_path",
+        supportsClearUnusablePath: true,
+      }),
+    ).toBe("offer-clear");
+    expect(
+      classifyRetryWorktree({
+        loopId: "l",
+        seq: 1,
+        present: true,
+        managed: true,
+        reason: "unusable_path",
+        // older daemon omits capability → do not offer clear
+      }),
+    ).toBe("inspect-only");
   });
 });
 
@@ -187,6 +207,34 @@ describe("LoopActionBar retry dirty UX", () => {
     await waitFor(() => {
       expect(retryLoop).toHaveBeenCalledWith("3491", {
         discardWorktreeChanges: true,
+      });
+    });
+  });
+
+  it("confirms clear for managed unusable_path and posts clearUnusableWorktreePath", async () => {
+    fetchLoopWorktree.mockResolvedValue({
+      loopId: "loop_1",
+      seq: 3491,
+      present: true,
+      managed: true,
+      reason: "unusable_path",
+      worktreePath: "/tmp/hollow-wt",
+      supportsClearUnusablePath: true,
+    });
+    renderBar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await screen.findByText(/Unusable worktree path — clear and retry/i);
+    expect(retryLoop).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear path & retry" }));
+
+    await waitFor(() => {
+      expect(retryLoop).toHaveBeenCalledWith("3491", {
+        discardWorktreeChanges: false,
+        clearUnusableWorktreePath: true,
+        expectedWorktreePath: "/tmp/hollow-wt",
       });
     });
   });

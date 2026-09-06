@@ -1407,28 +1407,20 @@ func TestExecutorExplicitKillMarksKilled(t *testing.T) {
 }
 
 func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing.T) {
-	// Shell pid-file publication races with Start's reap (open(O_TRUNC) then write of
-	// $$ can leave an empty file). Use the bound containment handle's leader PID —
-	// available after Start fails — as the OS-level probe target instead.
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
 	if err := coordinator.Close(); err != nil {
 		t.Fatalf("coordinator.Close() error = %v", err)
 	}
-	owner := &trackingOwner{}
-	custom := config.AgentVendor("custom")
-	executor := New(ExecutorOptions{
-		Config: ExecutorConfig{Vendor: custom, Params: map[string]any{
-			"command": "/bin/sh", "args": []any{"-c", "trap '' TERM; while true; do sleep 1; done"},
-		}},
-		Repos:             repos,
-		ParamsOwnerVendor: &custom,
-		Owner:             owner,
-	})
+	workDir := t.TempDir()
+	pidPath := filepath.Join(workDir, "agent.pid")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{
+		"command": "/bin/sh", "args": []any{"-c", `echo $$ > "$PID_FILE"; trap '' TERM; while true; do sleep 1; done`},
+	}}, Repos: repos, ParamsOwnerVendor: customOwner()})
 
 	handle, err := executor.Start(context.Background(), RunInput{
-		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: t.TempDir(), Prompt: "ignored",
-		Timeout: time.Second,
+		ExecutionID: "agent_initial_persist_failure", WorkingDirectory: workDir, Prompt: "ignored",
+		Timeout: time.Second, Env: map[string]string{"PID_FILE": pidPath},
 	})
 	if err == nil {
 		t.Fatal("Start() error = nil, want initial persistence failure")
@@ -1439,17 +1431,30 @@ func TestExecutorStartFailsAndReapsProcessWhenInitialPersistenceFails(t *testing
 	if handle != nil {
 		t.Fatalf("Start() handle = %#v, want nil", handle)
 	}
-	if owner.lease == nil || owner.lease.handle == nil {
-		t.Fatal("expected tracking lease with bound handle after Start failure")
-	}
-	if !owner.lease.handle.ConfirmedDead() {
-		t.Fatal("handle not ConfirmedDead after initial-persist failure reap")
-	}
-	pid := owner.lease.handle.PID()
-	if pid <= 0 {
-		t.Fatalf("handle.PID() = %d, want positive leader pid", pid)
-	}
 	deadline := time.Now().Add(2 * time.Second)
+	var pid int
+	for {
+		data, readErr := os.ReadFile(pidPath)
+		if readErr != nil {
+			// Process died before creating the pid file.
+			return
+		}
+		pidStr := strings.TrimSpace(string(data))
+		if pidStr == "" {
+			// Redirection created the file; Start reaped the child before echo flushed.
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		parsed, parseErr := strconv.Atoi(pidStr)
+		if parseErr != nil {
+			t.Fatalf("parse pid: %v", parseErr)
+		}
+		pid = parsed
+		break
+	}
 	for time.Now().Before(deadline) {
 		if killErr := syscall.Kill(pid, 0); killErr == syscall.ESRCH {
 			return

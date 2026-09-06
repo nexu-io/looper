@@ -312,6 +312,35 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Reviewer.Behavior.Loop.MaxWallClockSeconds; got != 0 {
 		t.Fatalf("reviewer loop max wall clock default = %d, want 0", got)
 	}
+	if got := cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR; got != DefaultReviewFixBudgetCap {
+		t.Fatalf("reviewer maxPublishesPerPR default = %d, want %d", got, DefaultReviewFixBudgetCap)
+	}
+	if got := cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR; got != DefaultReviewFixBudgetCap {
+		t.Fatalf("fixer maxPushesPerPR default = %d, want %d", got, DefaultReviewFixBudgetCap)
+	}
+	if cfg.HITL.Enabled {
+		t.Fatal("HITL default must remain false; caps enforce with a no-ask paired hold when HITL is off")
+	}
+}
+
+func TestValidateReviewFixBudgetCaps(t *testing.T) {
+	t.Parallel()
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = -1
+	cfg.Roles.Fixer.Behavior.Loop.MaxPushesPerPR = -2
+	err = Validate(cfg)
+	if err == nil {
+		t.Fatal("Validate() = nil, want budget cap errors")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "roles.reviewer.behavior.loop.maxPublishesPerPR", "must be an integer >= 0")
+	assertValidationIssue(t, validationErr, "roles.fixer.behavior.loop.maxPushesPerPR", "must be an integer >= 0")
 }
 
 func TestMinimalForgejoProviderConfigAppliesSafeProjectProfile(t *testing.T) {

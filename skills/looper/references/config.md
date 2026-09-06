@@ -73,7 +73,7 @@ Hot-safe fields are deliberately curated:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and an explicit `agent.model` is changed or unset in the same edit instead of being silently carried across vendors. Clearing a configured vendor uses the same guard, preventing a retained profile from passing through an intermediate `null`. Configuring the first vendor may use an already prepared model/params profile. Cross-vendor continuations keep their checkpoint, worktree, HITL answer, and human instructions but start a fresh native session.
 
-Everything else is restart-bound. Important exclusions are `agent.nativeResume.*`, arbitrary `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `notifications.webhook.*` (including its Feishu transport), all `hitl.*`, `instructions.maxBytes`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*`. The Planner Plane-assignee field is file-only; Worker `roles.worker.triggers.planeAssigneeId` remains a supported hot-safe control. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget. The Reviewer-specific `roles.reviewer.behavior.nativeResume.*` fields are part of the curated Reviewer behavior surface; the global `agent.nativeResume.*` field is not. Listener/storage/runtime ownership, polling/cache topology, logger ownership, providers, projects, `tools.gitPath`, and `tools.ghPath` also require restart. New fields default to restart-bound until explicitly classified. Mixed hot-safe and restart-bound edits are rejected as one candidate; Looper never applies only the convenient half.
+Everything else is restart-bound. Important exclusions are `agent.nativeResume.*`, arbitrary `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `notifications.webhook.*` (including its Feishu transport), all `hitl.*`, `instructions.maxBytes`, `roles.reviewer.autoMerge.*`, `defaults.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.fixer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*`. The Planner Plane-assignee field is file-only; Worker `roles.worker.triggers.planeAssigneeId` remains a supported hot-safe control. The scheduler retry budget/base delay and quiet-period / Reviewer timing fields are durable queue-scheduling inputs (`AvailableAt` / `NextRunAt`); Coordinator transient retries are persisted as a remaining budget. The Reviewer-specific `roles.reviewer.behavior.nativeResume.*` fields are part of the curated Reviewer behavior surface; the global `agent.nativeResume.*` field is not. Listener/storage/runtime ownership, polling/cache topology, logger ownership, providers, projects, `tools.gitPath`, and `tools.ghPath` also require restart. New fields default to restart-bound until explicitly classified. Mixed hot-safe and restart-bound edits are rejected as one candidate; Looper never applies only the convenient half.
 
 Deprecated file-only aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are watcher-hot compatibility representations of canonical fields. They are never dashboard controls. A canonical dashboard edit retires the matching alias leaf so unsetting the canonical value later cannot reveal stale compatibility policy.
 
@@ -344,6 +344,9 @@ baseBranch = "main"
 openPrStrategy = "all_done"
 addSnapshotMode = "async"
 
+[defaults.loop]
+quietPeriodSeconds = 60
+
 [roles.planner.discovery]
 autoDiscovery = true
 
@@ -367,9 +370,16 @@ reviewingLabel = "looper:spec-reviewing"
 scope = "changed_ranges"
 publishMode = "single_review"
 
+[roles.reviewer.behavior.loop]
+maxPublishesPerPR = 3
+
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
 blocking = "REQUEST_CHANGES"
+
+[roles.fixer.behavior.loop]
+quietPeriodSeconds = 0
+maxPushesPerPR = 3
 
 [roles.fixer.discovery]
 autoDiscovery = true

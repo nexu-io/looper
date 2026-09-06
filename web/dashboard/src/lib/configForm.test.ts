@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import { ApiError, type ConfigData } from "./api";
 import {
   AGENT_VENDOR_OPTIONS,
+  agentModelScope,
   buildConfigPatch,
   CONFIG_GROUPS,
   configFieldErrors,
   configFieldPaths,
   configSelectOptions,
   draftStagesConfigChange,
+  effectiveAgentVendor,
   highImpactChanges,
   profileLeafUnsetWouldEmpty,
   roleAgentPath,
@@ -170,14 +172,24 @@ describe("config form contract", () => {
       roleAgentPath("fixer", "profile"),
     );
     expect(configFieldPaths(data, roles)).not.toContain("roles.worker.agent");
-    expect(configSelectOptions("agent.vendor")).toEqual([
-      ...AGENT_VENDOR_OPTIONS,
-    ]);
+    // Independent expected list so omissions in AGENT_VENDOR_OPTIONS fail this
+    // test instead of comparing the constant to itself.
+    const supportedVendors = [
+      "claude-code",
+      "codex",
+      "opencode",
+      "cursor-cli",
+      "grok-build",
+      "pi",
+      "omp",
+    ] as const;
+    expect([...AGENT_VENDOR_OPTIONS]).toEqual([...supportedVendors]);
+    expect(configSelectOptions("agent.vendor")).toEqual([...supportedVendors]);
     expect(configSelectOptions(roleAgentPath("worker", "vendor"))).toEqual([
-      ...AGENT_VENDOR_OPTIONS,
+      ...supportedVendors,
     ]);
     expect(configSelectOptions("agent.profiles.fast.vendor")).toEqual([
-      ...AGENT_VENDOR_OPTIONS,
+      ...supportedVendors,
     ]);
   });
 
@@ -327,6 +339,31 @@ describe("config form contract", () => {
       "roles.worker.agent.model": "",
     });
     expect(result.body.unset).toEqual([]);
+  });
+
+  it("stages a suppress binding for absent global agent.model when the draft is blank", () => {
+    const data = fixture();
+    // Fixture has no agent.model published — absent. Selecting "Vendor
+    // default" from the combobox drafts "" and must persist as an explicit
+    // suppress binding rather than a silent no-op.
+    expect((data.agent as { model?: unknown }).model).toBeUndefined();
+    const result = buildConfigPatch(data, { "agent.model": "" }, []);
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({ "agent.model": "" });
+    expect(result.body.unset).toEqual([]);
+    // draftStagesConfigChange must observe the same staging so the Config
+    // form does not immediately drop the draft.
+    expect(draftStagesConfigChange(data, "agent.model", "")).toBe(true);
+  });
+
+  it("does not restage suppress when agent.model is already explicit \"\"", () => {
+    const data = fixture();
+    (data.agent as { model?: unknown }).model = "";
+    const result = buildConfigPatch(data, { "agent.model": "" }, []);
+    expect(result.errors).toEqual({});
+    expect(result.body.set).toEqual({});
+    expect(result.body.unset).toEqual([]);
+    expect(draftStagesConfigChange(data, "agent.model", "")).toBe(false);
   });
 
   it("stages blank profile/role model drafts as suppress when the leaf is absent", () => {
@@ -707,5 +744,144 @@ describe("config form contract", () => {
     expect(configFieldErrors(error)).toEqual({
       "scheduler.maxConcurrentRuns": "must be greater than zero",
     });
+  });
+});
+
+describe("agentModelScope", () => {
+  it("classifies model paths", () => {
+    expect(agentModelScope("agent.model")).toEqual({ kind: "global" });
+    expect(agentModelScope("agent.profiles.fast.model")).toEqual({
+      kind: "profile",
+      id: "fast",
+    });
+    expect(agentModelScope("roles.worker.agent.model")).toEqual({
+      kind: "role",
+      role: "worker",
+    });
+    expect(agentModelScope("agent.vendor")).toBeNull();
+    expect(agentModelScope("roles.worker.agent.vendor")).toBeNull();
+    expect(agentModelScope("agent.profiles.fast.vendor")).toBeNull();
+  });
+});
+
+describe("effectiveAgentVendor", () => {
+  it("returns the global vendor for the global scope", () => {
+    const data = fixture();
+    expect(
+      effectiveAgentVendor(data, {}, [], { kind: "global" }),
+    ).toBe("codex");
+  });
+
+  it("returns null when the global vendor is unset", () => {
+    const data = fixture();
+    expect(
+      effectiveAgentVendor(data, {}, ["agent.vendor"], { kind: "global" }),
+    ).toBeNull();
+  });
+
+  it("prefers a draft vendor over the published value", () => {
+    const data = fixture();
+    expect(
+      effectiveAgentVendor(
+        data,
+        { "agent.vendor": "claude-code" },
+        [],
+        { kind: "global" },
+      ),
+    ).toBe("claude-code");
+  });
+
+  it("resolves profile scope via own vendor, then global", () => {
+    const data = fixture();
+    // Published fast profile has vendor=codex; global also codex.
+    expect(
+      effectiveAgentVendor(data, {}, [], { kind: "profile", id: "fast" }),
+    ).toBe("codex");
+
+    // Unset the profile vendor → falls back to global.
+    expect(
+      effectiveAgentVendor(
+        data,
+        {},
+        ["agent.profiles.fast.vendor"],
+        { kind: "profile", id: "fast" },
+      ),
+    ).toBe("codex");
+
+    // Global vendor draft overrides.
+    expect(
+      effectiveAgentVendor(
+        data,
+        { "agent.vendor": "opencode" },
+        ["agent.profiles.fast.vendor"],
+        { kind: "profile", id: "fast" },
+      ),
+    ).toBe("opencode");
+  });
+
+  it("treats whole-profile unset as no profile vendor", () => {
+    const data = fixture();
+    expect(
+      effectiveAgentVendor(
+        data,
+        {},
+        ["agent.profiles.fast"],
+        { kind: "profile", id: "fast" },
+      ),
+    ).toBe("codex");
+  });
+
+  it("resolves role scope inline vendor first, then profile, then global", () => {
+    const data = fixture();
+    // Fixture role worker: profile=fast, vendor=claude-code → inline wins.
+    expect(
+      effectiveAgentVendor(data, {}, [], { kind: "role", role: "worker" }),
+    ).toBe("claude-code");
+
+    // Unset role vendor → profile "fast" (vendor=codex) resolves.
+    expect(
+      effectiveAgentVendor(
+        data,
+        {},
+        ["roles.worker.agent.vendor"],
+        { kind: "role", role: "worker" },
+      ),
+    ).toBe("codex");
+
+    // Unset role profile too → falls back to global.
+    expect(
+      effectiveAgentVendor(
+        data,
+        {},
+        ["roles.worker.agent.vendor", "roles.worker.agent.profile"],
+        { kind: "role", role: "worker" },
+      ),
+    ).toBe("codex");
+
+    // Global draft override wins once role/profile vendors are gone.
+    expect(
+      effectiveAgentVendor(
+        data,
+        { "agent.vendor": "opencode" },
+        [
+          "roles.worker.agent.vendor",
+          "roles.worker.agent.profile",
+          "agent.profiles.fast.vendor",
+        ],
+        { kind: "role", role: "worker" },
+      ),
+    ).toBe("opencode");
+  });
+
+  it("empty-string draft vendor counts as absent for overlay", () => {
+    const data = fixture();
+    expect(
+      effectiveAgentVendor(
+        data,
+        { "roles.worker.agent.vendor": "" },
+        [],
+        { kind: "role", role: "worker" },
+      ),
+    ).toBe("codex"); // profile fast still resolves
   });
 });

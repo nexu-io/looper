@@ -2,13 +2,18 @@ package forge
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
 func TestValidateTrustedReviewProxyArgv(t *testing.T) {
@@ -92,6 +97,13 @@ func TestApplyTrustedReviewProxyPolicyRewritesAgentFlags(t *testing.T) {
 	want = []string{"review", "submit", "acme/looper#1", "--clean-review-event", "COMMENT", "--blocking-review-event", "COMMENT", "--commit-id", "automatic-head"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("applyTrustedReviewProxyPolicy(automatic) = %#v, want %#v", got, want)
+	}
+	// Daemon-authored automatic run identity is still bound.
+	automaticBound := TrustedReviewProxyPolicy{Clean: "COMMENT", Blocking: "COMMENT", ExpectedCommitID: "automatic-head", ReviewerRunID: "run_auto"}
+	got = applyTrustedReviewProxyPolicy([]string{"review", "submit", "acme/looper#1", "--reviewer-run-id=run_agent"}, automaticBound)
+	want = []string{"review", "submit", "acme/looper#1", "--clean-review-event", "COMMENT", "--blocking-review-event", "COMMENT", "--commit-id", "automatic-head", "--reviewer-run-id", "run_auto"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("applyTrustedReviewProxyPolicy(automatic bound) = %#v, want %#v", got, want)
 	}
 }
 
@@ -537,3 +549,152 @@ func TestTrustedReviewProxyKeepsRunConfigWhenLiveFileChanges(t *testing.T) {
 		t.Fatalf("trusted child retained named config path %q; want descriptor-only snapshot", strings.TrimSpace(string(childConfigPath)))
 	}
 }
+
+// Contract (PR #630 review): on Bind failure after Start, emergency kill/reap
+// must finish before endTrack so BeginShutdown cannot observe a closed
+// BeginTrack reservation while cleanup is still running.
+func TestTrustedReviewBindFailureEndsTrackAfterEmergencyKill(t *testing.T) {
+	dir := t.TempDir()
+	realLooper := filepath.Join(dir, "real-looper")
+	// Long sleep so a reordered endTrack-before-kill would leave a live child
+	// and reverse the recorded event order under the delayed-kill hook.
+	script := trustedReviewProxyStubScript("sleep 60\n")
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+
+	oldBind := bindTrustedReviewCmd
+	bindTrustedReviewCmd = func(cmd *exec.Cmd, opts processcontainment.Options) (*processcontainment.Handle, error) {
+		return nil, errors.New("forced bind failure")
+	}
+	t.Cleanup(func() { bindTrustedReviewCmd = oldBind })
+
+	var mu sync.Mutex
+	var events []string
+	record := func(e string) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	// Hold kill completion so concurrent BeginShutdown-style observers would
+	// race if endTrack ran first; release only after recording kill_done.
+	killHold := make(chan struct{})
+	oldAfter := afterTrustedReviewEmergencyKill
+	afterTrustedReviewEmergencyKill = func(*exec.Cmd) {
+		record("kill_done")
+		<-killHold
+	}
+	t.Cleanup(func() { afterTrustedReviewEmergencyKill = oldAfter })
+
+	tracker := &orderRecordingTracker{onEnd: func() { record("endTrack") }}
+
+	sockPath, cleanup, err := StartTrustedReviewProxy(realLooper, nil, "acme/looper#1", dir, config.Config{}, testTrustedReviewPolicy(), tracker)
+	if err != nil {
+		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	t.Setenv(TrustedReviewSockEnv, sockPath)
+	t.Setenv(trustedReviewProxySkipEnv, "")
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- ProxyReviewSubmit([]string{"review", "submit", "acme/looper#1", "--event", "COMMENT"}, []byte(`{"body":"x"}`), dir)
+	}()
+
+	// Wait until emergency kill finished (still holding so endTrack cannot race
+	// ahead without being recorded after kill_done).
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		n := len(events)
+		snapshot := append([]string(nil), events...)
+		mu.Unlock()
+		if n > 0 {
+			if snapshot[0] != "kill_done" {
+				close(killHold)
+				t.Fatalf("first event = %v, want kill_done before endTrack", snapshot)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			close(killHold)
+			t.Fatalf("timed out waiting for emergency kill; events=%v", snapshot)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// While kill holds, endTrack must not have run yet.
+	mu.Lock()
+	if len(events) != 1 || events[0] != "kill_done" {
+		snapshot := append([]string(nil), events...)
+		mu.Unlock()
+		close(killHold)
+		t.Fatalf("events while kill held = %v, want only [kill_done]", snapshot)
+	}
+	mu.Unlock()
+
+	close(killHold)
+
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("ProxyReviewSubmit() error = nil, want bind failure")
+		}
+		if !strings.Contains(err.Error(), "forced bind failure") && !strings.Contains(err.Error(), "bind trusted review") {
+			t.Fatalf("ProxyReviewSubmit() error = %v, want bind failure", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ProxyReviewSubmit hung after bind failure")
+	}
+
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	want := []string{"kill_done", "endTrack"}
+	if len(got) != len(want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+	if tracker.begins != 1 {
+		t.Fatalf("BeginTrack calls = %d, want 1", tracker.begins)
+	}
+	if tracker.tracks != 0 {
+		t.Fatalf("Track calls = %d, want 0 on Bind failure", tracker.tracks)
+	}
+}
+
+type orderRecordingTracker struct {
+	mu     sync.Mutex
+	begins int
+	tracks int
+	onEnd  func()
+}
+
+func (t *orderRecordingTracker) BeginTrack() (end func(), err error) {
+	t.mu.Lock()
+	t.begins++
+	t.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if t.onEnd != nil {
+				t.onEnd()
+			}
+		})
+	}, nil
+}
+
+func (t *orderRecordingTracker) Track(*processcontainment.Handle) (release func()) {
+	t.mu.Lock()
+	t.tracks++
+	t.mu.Unlock()
+	return func() {}
+}
+
+func (t *orderRecordingTracker) ReportDrainFailure(error) {}

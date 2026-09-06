@@ -313,6 +313,7 @@ func TestReconcileTunnelHookTreatsDesiredURLAsManagedInsteadOfOrphaning(t *testi
 	hook.Config.URL = desiredURL
 	hook.Config.ContentType = "json"
 	hook.Config.InsecureSSL = "0"
+	hook.Config.Secret = "********"
 	client := &fakeWebhookTunnelGitHubClient{getHook: hook, getFound: true}
 	rt := newWebhookRuntime(cfg, &testLogger{}, func() time.Time { return time.Unix(10, 0) })
 	rt.tunnelClient = client

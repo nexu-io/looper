@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { Link, useParams } from "react-router-dom";
+import { CopyButton } from "@/components/CopyButton";
 import { LoopActionBar } from "@/components/LoopActionBar";
 import { LoopTypeBadge } from "@/components/LoopTypeBadge";
 import { PanelError } from "@/components/PanelError";
@@ -43,6 +44,7 @@ import {
   resolveLogsStreamStatus,
   stderrGapFromSecondarySnapshot,
 } from "@/lib/logsStream";
+import { readReviewFixHandoff } from "@/lib/reviewFixHandoff";
 import { consumeSSE } from "@/lib/sse";
 import { usePolling } from "@/lib/usePolling";
 
@@ -260,6 +262,31 @@ function HITLDecisionCard({
         </Button>
       </form>
       {error ? <p className="mb-0 text-[12px] text-red-500">{error}</p> : null}
+    </Card>
+  );
+}
+
+function ReviewFixHandoffCard({ loop }: { loop: Loop }) {
+  const handoff = readReviewFixHandoff(loop);
+  if (!handoff) return null;
+  return (
+    <Card title={handoff.title}>
+      <p className="mt-0 text-[13px]">{handoff.lead}</p>
+      {handoff.pauseReason ? (
+        <dl className="m-0">
+          <Kv label="Pause reason" value={handoff.pauseReason} />
+        </dl>
+      ) : null}
+      <div className="mt-2 flex flex-wrap gap-2">
+        <code className="mono rounded border border-[var(--border)] px-2 py-1 text-[12px]">
+          {handoff.unpauseCommand}
+        </code>
+        <CopyButton text={handoff.unpauseCommand} label="Copy unpause" />
+        <code className="mono rounded border border-[var(--border)] px-2 py-1 text-[12px]">
+          {handoff.stopCommand}
+        </code>
+        <CopyButton text={handoff.stopCommand} label="Copy stop" />
+      </div>
     </Card>
   );
 }
@@ -819,6 +846,7 @@ export function LoopDetailPage() {
       ) : null}
 
       {data ? <HITLDecisionCard loop={data} onMutated={onMutated} /> : null}
+      {data ? <ReviewFixHandoffCard loop={data} /> : null}
 
       {data ? (
         <Card title="Actions">

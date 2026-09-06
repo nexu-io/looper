@@ -17,9 +17,11 @@ import { actionsForLoopStatus } from "@/lib/actions";
 import { isWorktreeRouteUnavailable } from "@/components/LoopActionBar";
 import {
   classifyRetryWorktree,
+  recoveryClearCliHint,
   recoveryDiscardCliHint,
   recoveryGuidance,
   recoveryJumpCommand,
+  recoveryOffersClear,
   recoveryOffersDiscard,
   recoveryRecommendsRetry,
   recoveryWorktreeDecision,
@@ -42,6 +44,7 @@ function ownershipLabel(worktree: LoopWorktreeStatus | null): string {
 
 function dirtyLabel(worktree: LoopWorktreeStatus | null): string {
   if (!worktree?.present) return "—";
+  if (worktree.reason === "unusable_path") return "unusable";
   if (worktree.dirty === true) return "dirty";
   if (worktree.dirty === false || worktree.clean === true) return "clean";
   return "unknown";
@@ -63,9 +66,10 @@ export function RecoveryCard({
   const [fetchFailed, setFetchFailed] = useState(false);
   const [loadingWt, setLoadingWt] = useState(false);
   const [pending, setPending] = useState<
-    "retry" | "discard-retry" | "takeover" | "stop" | null
+    "retry" | "discard-retry" | "clear-retry" | "takeover" | "stop" | null
   >(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
   const [confirmTakeover, setConfirmTakeover] = useState(false);
   const [inspectOpen, setInspectOpen] = useState(false);
@@ -85,6 +89,7 @@ export function RecoveryCard({
     setLoadingWt(false);
     setPending(null);
     setConfirmDiscard(false);
+    setConfirmClear(false);
     setConfirmStop(false);
     setConfirmTakeover(false);
     setInspectOpen(false);
@@ -102,6 +107,7 @@ export function RecoveryCard({
     setLoadingWt(false);
     setPending(null);
     setConfirmDiscard(false);
+    setConfirmClear(false);
     setConfirmStop(false);
     setConfirmTakeover(false);
     setInspectOpen(false);
@@ -171,16 +177,35 @@ export function RecoveryCard({
     "(no failure reason recorded)";
   const jumpCmd = recoveryJumpCommand(selector);
   const discardCli = recoveryDiscardCliHint(selector);
+  const clearCli = recoveryClearCliHint(selector);
   const offersDiscard = recoveryOffersDiscard(worktree, { fetchFailed });
+  const offersClear = recoveryOffersClear(worktree, { fetchFailed });
   const recommendsRetry = recoveryRecommendsRetry(worktree, { fetchFailed });
 
   const finishRetry = useCallback(
-    async (discardWorktreeChanges: boolean) => {
-      await retryLoop(selector, { discardWorktreeChanges });
+    async (opts?: {
+      discardWorktreeChanges?: boolean;
+      clearUnusableWorktreePath?: boolean;
+      expectedWorktreePath?: string;
+    }) => {
+      const discardWorktreeChanges = opts?.discardWorktreeChanges === true;
+      const clearUnusableWorktreePath = opts?.clearUnusableWorktreePath === true;
+      const expectedWorktreePath = opts?.expectedWorktreePath?.trim() ?? "";
+      await retryLoop(selector, {
+        discardWorktreeChanges,
+        ...(clearUnusableWorktreePath
+          ? {
+              clearUnusableWorktreePath: true,
+              expectedWorktreePath,
+            }
+          : {}),
+      });
       toast.success(
-        discardWorktreeChanges
-          ? "Retry queued (worktree discarded)"
-          : "Retry queued",
+        clearUnusableWorktreePath
+          ? "Retry queued (unusable path cleared)"
+          : discardWorktreeChanges
+            ? "Retry queued (worktree discarded)"
+            : "Retry queued",
       );
       await onMutated?.();
     },
@@ -189,7 +214,7 @@ export function RecoveryCard({
 
   // Plain retry must re-fetch /worktree at click time (same authority as
   // LoopActionBar): a stale "ok" preflight or "Retry without discard" on a
-  // dirty/unmanaged tree must not requeue until classification is freshly ok.
+  // dirty/unmanaged/unusable tree must not requeue until classification is freshly ok.
   const onRetry = useCallback(async () => {
     if (busy || !actions.retry) return;
     setPending("retry");
@@ -201,7 +226,7 @@ export function RecoveryCard({
       } catch (err) {
         if (isWorktreeRouteUnavailable(err)) {
           // Older daemon without /worktree — match LoopActionBar plain retry.
-          await finishRetry(false);
+          await finishRetry();
           return;
         }
         setWorktree(null);
@@ -224,6 +249,12 @@ export function RecoveryCard({
         );
         return;
       }
+      if (decision === "offer-clear") {
+        toast.error(
+          "Worktree path is unusable; clear leftovers or inspect before plain retry",
+        );
+        return;
+      }
       if (decision === "inspect-only") {
         toast.error(
           fresh.managed
@@ -233,7 +264,7 @@ export function RecoveryCard({
         return;
       }
 
-      await finishRetry(false);
+      await finishRetry();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setInlineError(message);
@@ -248,7 +279,7 @@ export function RecoveryCard({
     setPending("discard-retry");
     setInlineError(null);
     try {
-      await finishRetry(true);
+      await finishRetry({ discardWorktreeChanges: true });
       setConfirmDiscard(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -258,6 +289,31 @@ export function RecoveryCard({
       setPending(null);
     }
   }, [busy, offersDiscard, actions.retry, finishRetry, toast]);
+
+  const onClearRetry = useCallback(async () => {
+    if (busy || !offersClear || !actions.retry) return;
+    setPending("clear-retry");
+    setInlineError(null);
+    try {
+      const expectedWorktreePath = worktree?.worktreePath?.trim() ?? "";
+      if (!expectedWorktreePath) {
+        throw new Error(
+          "Confirmed worktree path is missing; refresh worktree status before clear",
+        );
+      }
+      await finishRetry({
+        clearUnusableWorktreePath: true,
+        expectedWorktreePath,
+      });
+      setConfirmClear(false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setInlineError(message);
+      toast.error(message);
+    } finally {
+      setPending(null);
+    }
+  }, [busy, offersClear, actions.retry, finishRetry, toast, worktree]);
 
   const onTakeover = useCallback(async () => {
     if (busy || !actions.takeover) return;
@@ -449,6 +505,31 @@ export function RecoveryCard({
                   </>
                 ) : null}
 
+                {decision === "offer-clear" ? (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => setInspectOpen(true)}
+                    >
+                      Inspect / Jump
+                    </Button>
+                    {actions.retry ? (
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => setConfirmClear(true)}
+                      >
+                        {pending === "clear-retry"
+                          ? "…"
+                          : "Clear unusable path & Retry"}
+                      </Button>
+                    ) : null}
+                  </>
+                ) : null}
+
                 {decision === "inspect-only" ? (
                   <Button
                     variant="ghost"
@@ -496,14 +577,16 @@ export function RecoveryCard({
                   </>
                 ) : null}
 
-                {/* Allow plain retry on dirty/inspect paths when operator has fixed the tree */}
-                {(decision === "offer-discard" || decision === "inspect-only") &&
+                {/* Allow plain retry on dirty/clear/inspect paths when operator has fixed the tree */}
+                {(decision === "offer-discard" ||
+                  decision === "offer-clear" ||
+                  decision === "inspect-only") &&
                 actions.retry ? (
                   <Button
                     variant="ghost"
                     size="sm"
                     disabled={busy}
-                    title="Retry without discarding (use after cleaning the tree yourself)"
+                    title="Retry without discarding or clearing (use after fixing the path yourself)"
                     onClick={() => void onRetry()}
                   >
                     {pending === "retry" ? "…" : "Retry without discard"}
@@ -538,6 +621,39 @@ export function RecoveryCard({
                   <div className="mb-1 flex items-center justify-between gap-2">
                     <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
                       Worktree
+                    </span>
+                    <CopyButton text={worktree.worktreePath} />
+                  </div>
+                  <p className="m-0 break-all mono text-[11px]">
+                    {worktree.worktreePath}
+                  </p>
+                </div>
+              ) : null}
+            </ConfirmDialog>
+          ) : null}
+
+          {confirmClear ? (
+            <ConfirmDialog
+              open
+              title="Clear unusable worktree path and retry?"
+              confirmLabel="Clear path & retry"
+              danger
+              busy={busy}
+              onCancel={() => {
+                if (!busy) setConfirmClear(false);
+              }}
+              onConfirm={() => void onClearRetry()}
+            >
+              <p className="m-0 text-[var(--text-muted)]">
+                Looper could not verify this as a usable checkout. Confirming will
+                delete the entire managed path, including uncommitted or leftover
+                files, then re-queue the loop. Inspect first if you are unsure.
+              </p>
+              {worktree?.worktreePath ? (
+                <div className="mt-2 rounded border border-[var(--border)] bg-[var(--bg)] p-2">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">
+                      Path to remove
                     </span>
                     <CopyButton text={worktree.worktreePath} />
                   </div>
@@ -594,7 +710,9 @@ export function RecoveryCard({
               title={
                 decision === "offer-discard"
                   ? "Inspect dirty worktree"
-                  : "Inspect worktree"
+                  : decision === "offer-clear"
+                    ? "Inspect unusable worktree path"
+                    : "Inspect worktree"
               }
               confirmLabel="Close"
               showCancel={false}
@@ -634,6 +752,11 @@ export function RecoveryCard({
                     After fixing or deciding to drop changes: use Discard &amp;
                     Retry, or run{" "}
                     <span className="mono">{discardCli}</span>
+                  </p>
+                ) : offersClear ? (
+                  <p className="m-0 text-[11px] text-[var(--text-muted)]">
+                    After inspecting leftovers: use Clear unusable path &amp; Retry,
+                    or run <span className="mono">{clearCli}</span>
                   </p>
                 ) : (
                   <p className="m-0 text-[11px] text-[var(--text-muted)]">

@@ -41,6 +41,7 @@ var (
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
+var fixerDeclinedReplyMarkerRE = regexp.MustCompile(`(?is)<!--\s*looper-fixer-reply-declined\s+thread:(\S+)\s+fingerprint:(\S+)(?:\s+[^>]*)?-->`)
 
 var (
 	// ErrDiffTooLarge is returned when GitHub itself refuses a PR diff as oversized
@@ -576,6 +577,10 @@ type ListReviewThreadsInput struct {
 	PRNumber int64
 	CWD      string
 	Limit    int
+	// AllPages fetches every review-thread page for authority reads. When true,
+	// Limit is not used as a stop condition. Limit<=0 without AllPages still
+	// defaults to 100 so existing callers are unchanged.
+	AllPages bool
 }
 
 type ViewReviewThreadInput struct {
@@ -1770,18 +1775,31 @@ func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadIn
 }
 
 func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
+	unlimited := input.AllPages
 	limit := input.Limit
-	if limit <= 0 {
-		limit = 100
+	if !unlimited {
+		if limit <= 0 {
+			limit = 100
+		}
 	}
 	owner, name, err := parseRepo(input.Repo)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ReviewThread, 0, min(limit, 100))
+	capHint := 100
+	if !unlimited && limit > 0 {
+		capHint = min(limit, 100)
+	}
+	out := make([]ReviewThread, 0, capHint)
 	threadsCursor := ""
-	for len(out) < limit {
-		pageSize := min(100, limit-len(out))
+	for unlimited || len(out) < limit {
+		pageSize := 100
+		if !unlimited {
+			pageSize = min(100, limit-len(out))
+			if pageSize <= 0 {
+				break
+			}
+		}
 		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadPage(ctx, input.CWD, owner, name, input.PRNumber, pageSize, threadsCursor)
 		if err != nil {
 			return nil, err
@@ -1811,7 +1829,7 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 				thread.URL = thread.Comments[0].URL
 			}
 			out = append(out, thread)
-			if len(out) == limit {
+			if !unlimited && len(out) == limit {
 				break
 			}
 		}
@@ -3041,6 +3059,14 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 	if err != nil {
 		return nil, err
 	}
+	login, err := g.GetCurrentUserLogin(ctx, cwd)
+	if err != nil || strings.TrimSpace(login) == "" {
+		login, err = g.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+		if err != nil {
+			return nil, err
+		}
+	}
+	looperLogin := strings.TrimSpace(login)
 	out := make([]map[string]any, 0, 100)
 	cursor := ""
 	for {
@@ -3049,7 +3075,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 			return nil, err
 		}
 		for _, node := range nodes {
-			normalized, ok := normalizeReviewThread(node)
+			normalized, ok := normalizeReviewThread(node, looperLogin)
 			if ok {
 				threadRow, _ := node.(map[string]any)
 				commentsRow, _ := threadRow["comments"].(map[string]any)
@@ -3067,7 +3093,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 					commentCursor = nextCommentCursor
 					hasMoreComments = hasMore
 				}
-				if fingerprint := reviewThreadFingerprintFromNodes(allCommentNodes); fingerprint != "" {
+				if fingerprint := reviewThreadFingerprintFromNodes(asString(normalized["threadId"]), allCommentNodes, looperLogin); fingerprint != "" {
 					normalized["threadFingerprint"] = fingerprint
 				}
 				out = append(out, normalized)
@@ -3468,7 +3494,7 @@ func countUnresolvedThreads(comments []map[string]any) int {
 	return count
 }
 
-func normalizeReviewThread(value any) (map[string]any, bool) {
+func normalizeReviewThread(value any, looperLogin string) (map[string]any, bool) {
 	row, ok := value.(map[string]any)
 	if !ok {
 		return nil, false
@@ -3513,20 +3539,25 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	} else if line := asInt64(row["line"]); line > 0 {
 		out["line"] = line
 	}
-	if fingerprint := reviewThreadFingerprintFromNodes(nodes); fingerprint != "" {
+	if fingerprint := reviewThreadFingerprintFromNodes(threadID, nodes, looperLogin); fingerprint != "" {
 		out["threadFingerprint"] = fingerprint
 	}
 	return out, true
 }
 
-func reviewThreadFingerprintFromNodes(nodes []any) string {
+func reviewThreadFingerprintFromNodes(threadID string, nodes []any, looperLogin string) string {
 	parts := make([]string, 0, len(nodes))
+	threadID = strings.TrimSpace(threadID)
 	for _, node := range nodes {
 		comment, _ := node.(map[string]any)
 		if comment == nil {
 			continue
 		}
-		if strings.Contains(asString(comment["body"]), "<!-- looper-fixer-reply ") {
+		body := asString(comment["body"])
+		if strings.Contains(body, "<!-- looper-fixer-reply ") {
+			continue
+		}
+		if isAuthenticatedFixerDeclinedReply(threadID, comment, looperLogin) {
 			continue
 		}
 		id := strings.TrimSpace(asString(comment["id"]))
@@ -3540,6 +3571,35 @@ func reviewThreadFingerprintFromNodes(nodes []any) string {
 		return ""
 	}
 	return strings.Join(parts, "|")
+}
+
+func isAuthenticatedFixerDeclinedReply(threadID string, comment map[string]any, looperLogin string) bool {
+	if threadID == "" || comment == nil {
+		return false
+	}
+	looperLogin = strings.TrimSpace(looperLogin)
+	if looperLogin == "" {
+		return false
+	}
+	author := strings.TrimSpace(extractAuthor(comment["author"]))
+	if author == "" || !strings.EqualFold(author, looperLogin) {
+		return false
+	}
+	gotThread, fingerprint, ok := parseFixerDeclinedReplyMarker(asString(comment["body"]))
+	return ok && fingerprint != "" && gotThread == threadID
+}
+
+func parseFixerDeclinedReplyMarker(body string) (threadID, fingerprint string, ok bool) {
+	m := fixerDeclinedReplyMarkerRE.FindStringSubmatch(body)
+	if len(m) < 3 {
+		return "", "", false
+	}
+	threadID = strings.TrimSpace(m[1])
+	fingerprint = strings.TrimSpace(m[2])
+	if threadID == "" || fingerprint == "" {
+		return "", "", false
+	}
+	return threadID, fingerprint, true
 }
 
 func validateCloseIssueStateReason(value string) (string, error) {

@@ -344,7 +344,10 @@
             "allowRiskyFixes": false,
             "fixAllPullRequests": false,
             "openPrStrategy": "all_done",
-            "addSnapshotMode": "async"
+            "addSnapshotMode": "async",
+            "loop": {
+              "quietPeriodSeconds": 60
+            }
           },
           "instructions": {
             "enabled": true,
@@ -417,6 +420,7 @@
                   "minPublishIntervalSeconds": 300,
                   "maxIterationsPerPR": 20,
                   "maxIterationsPerHead": 1,
+                  "maxPublishesPerPR": 3,
                   "maxWallClockSeconds": 0,
                   "maxConsecutiveFailures": 3,
                   "maxAgentExecutionsPerPR": 25,
@@ -474,6 +478,12 @@
                 "labels": [],
                 "labelMode": "all",
                 "authorFilter": "current_user"
+              },
+              "behavior": {
+                "loop": {
+                  "quietPeriodSeconds": 0,
+                  "maxPushesPerPR": 3
+                }
               }
             },
             "worker": {
@@ -900,7 +910,8 @@
           "queueItemId": "<uuid>",
           "mode": "auto",
           "resetAttempts": true,
-          "discardWorktreeChanges": false
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
         },
         "requestId": "fixture-request-id"
       }
@@ -947,7 +958,8 @@
           "queueItemId": "<uuid>",
           "mode": "auto",
           "resetAttempts": true,
-          "discardWorktreeChanges": false
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
         },
         "requestId": "fixture-request-id"
       }

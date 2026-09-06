@@ -111,7 +111,7 @@ Profile and role agent vendor/model fields are hot-safe curated identity fields:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `defaults.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.fixer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and quiet-period / Reviewer timing fields are durable queue-scheduling inputs (`AvailableAt` / `NextRunAt`); Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -276,6 +276,16 @@ A role is runnable only when the overlay leaves a non-empty vendor. Missing glob
 
 After the full overlay, an empty-string model is kept as an explicit empty binding (not the same as unset): the vendor CLI uses its own default, and any global `agent.params` `--model`/`-m` flags are stripped so they cannot override the suppression.
 
+### Model suggestions
+
+Dashboard Config model fields offer searchable suggestions drawn from a built-in static list per vendor, optionally merged with a best-effort probe of the local vendor CLI. The same list is available via `GET /api/v1/agent/models?vendor=...`.
+
+The catalog is **advisory only** — not an allowlist. Arbitrary model IDs remain valid config values; save and claim never require membership in the catalog. See [ADR-0016](adr/0016-agent-model-catalog-is-advisory.md).
+
+Claude Code is static-only (no non-interactive list command). Other vendors may probe the same resolved local CLI binary used for spawn when available; probe failure falls back to the built-in list and does not block config load or save.
+
+Empty-string vs unset model semantics are unchanged (see [Model semantics](#model-semantics) above).
+
 ### Coordinator triage
 
 Coordinator triage LLM uses the **global** agent only (`agent.vendor` / `agent.model`, plus global params/env/timeouts). It does not read `roles.coordinator.agent` or coding-role profile bindings. If global `agent.vendor` is unset, triage LLM is skipped; coding roles that resolve via profile or role bindings can still run.
@@ -358,6 +368,36 @@ Authenticate the daemon safely with `grok login --device-auth`, or make `XAI_API
 For fresh unattended runs, Looper supplies `--always-approve` and `--sandbox off` so Grok can update Git metadata outside a linked worktree. Configured agent arguments override these defaults; in particular, operators can select a stricter `--sandbox` when the repository layout permits it, `--permission-mode` may prompt or fail unattended runs, non-`plain` `--output-format` can prevent direct `__LOOPER_RESULT__=` completion-marker parsing, and configured `-p` or `--single` replaces Looper's generated task prompt.
 
 Grok Build support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt, and Looper never uses Grok Build's ambient `--continue`.
+
+## Pi
+
+Use `pi` as the `agent.vendor` identifier. Looper invokes the [Pi](https://pi.dev) coding agent executable as `pi`:
+
+```toml
+[agent]
+vendor = "pi"
+```
+
+Authenticate via Pi's own login/config (project-local `.pi` and vendor credentials). Prefer vendor authentication over storing secrets in Looper configuration.
+
+For fresh unattended runs, Looper supplies `-p` with the generated task prompt and `--approve` (trusts project-local `.pi` for the run). Configured `agent.params.args` override these defaults: if `-p`/`--print` is already present, Looper does not append its prompt (operator owns print/prompt); if any of `-a`/`--approve`/`-na`/`--no-approve` is present, Looper does not add `--approve`. There is no `--cwd` flag—Looper sets the process working directory to the worktree.
+
+Pi support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt.
+
+## Oh My Pi (omp)
+
+Use `omp` as the `agent.vendor` identifier (not `oh-my-pi`). Looper invokes the [Oh My Pi](https://omp.sh) executable as `omp`:
+
+```toml
+[agent]
+vendor = "omp"
+```
+
+Authenticate via omp's own login/config. Prefer vendor authentication over storing secrets in Looper configuration.
+
+For fresh unattended runs, Looper supplies `-p` with the generated task prompt, `--cwd <worktree>` when the workdir is non-empty, and `--auto-approve`. Configured arguments override defaults: if `-p`/`--print` is already present, Looper does not append its prompt; if `--cwd` is present, Looper does not add workdir; if `--auto-approve` or `--approval-mode` (including `--approval-mode=...`) is present, Looper does not add `--auto-approve`.
+
+Oh My Pi support is fresh-run only. Daemon native resume and interactive takeover through `looper resume` are unsupported. A retry uses a fresh checkpoint prompt.
 
 ## Provider support
 
@@ -613,8 +653,12 @@ publishMode = "single_review"
 
 [roles.reviewer.behavior.loop]
 enabledByDefault = true
+# Continuous follow-up debounce after a published review. Inherits defaults.loop when unset.
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
+# Successful reviewer publishes per PR. 0 disables. Exhaustion always
+# holds the pair; HITL only chooses ask vs no-ask presentation.
+maxPublishesPerPR = 3
 
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
@@ -626,6 +670,74 @@ reReviewPromptOnHeadChange = false
 ```
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
+
+### Review-fix budget
+
+Unlimited reviewer ⇄ fixer ping-pong is a cost and quality problem: each side can keep inventing new work. The old `maxIterationsPerPR` / `maxIterationsPerHead` knobs are still accepted but **ignored**. The live caps are separate per role:
+
+| Path | Counts | Default |
+| --- | --- | --- |
+| `roles.reviewer.behavior.loop.maxPublishesPerPR` | Successful published reviews on one PR | `3` |
+| `roles.fixer.behavior.loop.maxPushesPerPR` | Successful fixer pushes on one PR | `3` |
+
+`0` disables that role's cap. Authority is live config plus a durable counter (`iterationCount` for reviewer, `reviewFixBudget.pushCount` for fixer). Caps enforce whether or not HITL is enabled. Automatic and takeover (`manual` + `followUpdates`) loops participate; one-shot manual loops do not. Either exhausted role holds the same-lane pair:
+
+| `hitl.enabled` | Exhausted role | Sibling | Resume |
+| --- | --- | --- | --- |
+| `true` | `awaiting_human` with Continue/Stop | budget-paused | answer the ask |
+| `false` (default) | `paused`, reason `review_fix_budget_exhausted`, no ask | paired budget-paused | `looper unpause <seq>` or `looper stop <seq>` |
+
+Continue / no-HITL `unpause` refills only meters currently at/over their live cap and releases the pair. Stop / no-HITL `looper stop` terminates both roles. Product terminals (ready label, identical output, closed PR) still win and do not open a budget ask. Budget exhaustion never approves, resolves, or merges. Event: `loop.review_fix_budget.exhausted` (`level: action_required`). A `needs_human` scope dispute with HITL off pauses the pair with reason `review_scope_human_required` and the same `unpause`/`stop` pair; `unpause` resumes against current evidence without refilling a meter unless one is also exhausted.
+
+`looper describe <seq>` / `looper loop inspect <seq>` and the dashboard loop page show the current hold reason and the exact `looper unpause <seq>` / `looper stop <seq>` commands. Live caps, current head, last reviewed signal, exhausted-role meters, unresolved findings, pending decisions, late blockers, and outcome/progress are not rebuilt on those surfaces (park-time `loop.review_fix_budget.exhausted` / `loop.review_scope_human.required` events still snapshot decision-time evidence).
+
+**Failure prevented:** expanding-scope review/fix that never converges, including on default HITL-off installs. **Cost:** paired pause/unpause/stop plus an action-required event. **Why not reuse the old knobs:** those were reviewer-only infra counters that stranded long PRs and were explicitly demoted in #209.
+
+### Same-head disposition (always on for GitHub)
+
+Continuous GitHub Reviewer loops react to trusted `wontfix` / Fixer decline changes even when the PR head is unchanged. This path does **not** enable `roles.reviewer.behavior.threadResolution`; that setting still gates objective stale-thread reconciliation only and remains `enabled=false` by default.
+
+- Canonical command inside a Looper-authored thread: `/looper wontfix <reason>`. Compatibility aliases: a trusted human comment whose entire non-quoted body is `wontfix`, `won't fix`, or `won’t fix` (optionally `: <reason>`).
+- `/looper reconsider <reason>` cancels the latest accepted disposition on an unresolved/reopened thread.
+- Authority is the PR author or `OWNER` / `MEMBER` / `COLLABORATOR`. Arbitrary users and bots are not disposition authorities.
+- A Fixer `declined` reply is a dispute signal, not dismissal: Fixer replies with evidence and leaves the thread open; Reviewer adjudicates `accept_wontfix` (reply + resolve), `reject_wontfix` (reply, leave open), or `needs_human` (pair hold, no remote adjudication reply).
+- Unmarked third-party comments (human or Codex) stay Fixer-eligible. A validated Fixer decline on those threads still goes to Reviewer; trusted `/looper` directives stay Looper-authored-only.
+- GitHub webhooks accelerate the same path: `pull_request_review_comment` create/edit/delete and `pull_request_review_thread` `resolved` route both Reviewer and Fixer. Polling remains the correctness fallback. Forgejo is exempt from same-head disposition; its role budgets still apply.
+- A budget-held pair may run disposition-only reconciliation. That cannot publish a review, push code, refill a meter, or release the hold.
+
+Operator commands and HITL vs HITL-off resume are also in the [users guide](users-guide.md#same-head-wontfix-github-continuous-reviewer).
+
+### Quiet-period debounce (shared + per-role)
+
+Quiet period **settles new actionable signals** before starting work: wait N seconds after a signal change, and **reset the wait** if another signal arrives in the window. It is **not** retry backoff, fixer no-op follow-up backoff, coordinator dispatch delay, or reviewer `minPublishIntervalSeconds`.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `defaults.loop.quietPeriodSeconds` | Shared default when a role field is unset | `60` |
+| `roles.reviewer.behavior.loop.quietPeriodSeconds` | Reviewer continuous follow-up debounce | `60` |
+| `roles.fixer.behavior.loop.quietPeriodSeconds` | Fixer new/changed fixable-set settle window | `0` (opt-in) |
+
+Effective resolution: `projects[].roles.<role>.behavior.loop.quietPeriodSeconds` → role global → `defaults.loop` → role-specific hardcoded default. Fields are restart-bound because they feed durable queue `AvailableAt` / loop `NextRunAt`. Env examples: `LOOPER_DEFAULTS_LOOP_QUIET_PERIOD_SECONDS`, `LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS`; existing reviewer quiet env/flag paths remain valid.
+
+When quiet and a separate backoff both apply, eligible time is the **max** of the constraints. Recommended fixer starters are `60`–`120` seconds once you want burst protection; leave `0` for historical immediate enqueue.
+
+#### Concept trade-off
+
+**Failure prevented:** Bursty review/CI signals (multiple threads, check re-runs, rapid head updates) cause role loops to start work mid-storm. That produces thrash: duplicate agent runs, wasted budget, and fix sets that go stale before the agent finishes. Quiet period delays eligibility until the discovery signal has stopped changing.
+
+**What it costs:**
+
+- **New config surface:** `defaults.loop` plus per-role `behavior.loop.quietPeriodSeconds`, inheritance when a role field is unset, project overlays, env/CLI, API contract, and restart-bound classification all stay in sync.
+- **Persisted signal identity:** Fixer discovery keys settle windows on `fixItemsStateHash` (and related queue metadata). Wrong or unstable hashing over-delays, under-delays, or restarts the window on noise.
+- **Queue coalesce / gating:** Mid-delay hash changes update the active loop-scoped queue item in place so a new `fixItemsHash` cannot bypass the delay via a second enqueue. That path must not drop work, lose backoff composition, or extend forever on unchanged polls.
+- **Edge cases to keep correct:** `quiet=0` remains immediate (migration-safe); quiet never shortens an existing later `AvailableAt`; quiet composes with no-op/retry backoff via `max`; first discovery vs rediscovery vs post-run re-queue all apply the same helper.
+- **Failure modes:** Overflowing seconds→`time.Duration` would schedule in the past (rejected at validation); daemon restart mid-window re-reads durable `AvailableAt` / `NextRunAt` (authority stays on those fields, not the agent).
+
+**Why simpler alternatives are insufficient:**
+
+- **Delete the layer / no debounce:** Reintroduces mid-storm starts—the failure this feature exists to stop.
+- **Trust agent structured output** ("wait until settled"): The agent cannot observe future GitHub review bursts; settlement is an infra timing concern. Queue `AvailableAt` / loop `NextRunAt` remain scheduler authority; quiet period only delays eligibility after discovery signal changes.
+- **Fail loud on burst:** Bursty GitHub events are normal, not errors; failing would thrash operators without improving fix quality.
 
 ### Reviewer auto-merge settings
 
@@ -806,6 +918,12 @@ allowRiskyFixes = false
 openPrStrategy = "all_done"
 addSnapshotMode = "async"
 
+[defaults.loop]
+# Shared quiet-period default for role signal-settling debounce.
+# Role overrides: roles.<role>.behavior.loop.quietPeriodSeconds
+# 0 = off. Restart-bound (feeds durable queue AvailableAt / NextRunAt).
+quietPeriodSeconds = 60
+
 # `allowAutoApprove` is a legacy compatibility alias.
 # Prefer `roles.reviewer.behavior.reviewEvents.clean = "APPROVE"` in new config.
 
@@ -868,6 +986,7 @@ publishMode = "single_review"
 enabledByDefault = true
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
+maxPublishesPerPR = 3
 
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
@@ -883,6 +1002,13 @@ strategy = "squash"
 requireBranchProtection = true
 transientRetries = 3
 scope = "looper-only"
+
+[roles.fixer.behavior.loop]
+# Opt-in quiet period (default 0 = immediate enqueue). Recommended starter: 60–120.
+quietPeriodSeconds = 0
+# Successful fixer pushes per PR. 0 disables. Exhaustion always holds
+# the pair; HITL only chooses ask vs no-ask presentation.
+maxPushesPerPR = 3
 
 [roles.fixer.discovery]
 autoDiscovery = true

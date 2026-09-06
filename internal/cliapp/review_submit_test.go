@@ -459,6 +459,333 @@ func TestTrustedFollowUpNewHeadReviewRequestBypass(t *testing.T) {
 	}
 }
 
+func TestRefuseReviewSubmitBudgetAgainstRepos(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+
+	seedSubmittingRun := func(loopID, runID string) {
+		t.Helper()
+		if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+			ID: runID, LoopID: loopID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", runID, err)
+		}
+	}
+
+	// Exhausted submitting loop blocks submit.
+	exhaustedMeta := `{"loop":{"iterationCount":3}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_exhausted", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &exhaustedMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(exhausted) error = %v", err)
+	}
+	seedSubmittingRun("loop_exhausted", "run_exhausted")
+	err = refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_exhausted")
+	if err == nil || !strings.Contains(err.Error(), "publish budget exhausted") {
+		t.Fatalf("exhausted count error = %v, want publish budget exhausted", err)
+	}
+	// Same via current running run (no --reviewer-run-id).
+	err = refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "")
+	if err == nil || !strings.Contains(err.Error(), "publish budget exhausted") {
+		t.Fatalf("exhausted via current run error = %v, want publish budget exhausted", err)
+	}
+
+	// Held loop without a resolvable submitting run skips (optional authority).
+	holdMeta := `{"loop":{"iterationCount":0},"reviewFixBudget":{"siblingOf":"fixer","pauseReason":"sibling_review_fix_budget"},"pauseReason":"sibling_review_fix_budget"}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_exhausted", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &holdMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(hold) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_exhausted", LoopID: "loop_exhausted", Status: "completed", StartedAt: now, EndedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(complete exhausted) error = %v", err)
+	}
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, ""); err != nil {
+		t.Fatalf("held without submitting run error = %v, want nil (skip)", err)
+	}
+
+	// Under-cap participating submitting loop allows submit (no error).
+	underMeta := `{"loop":{"iterationCount":1}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_under", Seq: 10, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &underMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(under) error = %v", err)
+	}
+	seedSubmittingRun("loop_under", "run_under")
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_under"); err != nil {
+		t.Fatalf("under-cap error = %v, want nil", err)
+	}
+
+	// One-shot manual submitting loop is exempt even when count is at cap.
+	manualMeta := `{"manual":true,"loop":{"iterationCount":9}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_manual_cap", Seq: 11, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &manualMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(manual) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_under", LoopID: "loop_under", Status: "completed", StartedAt: now, EndedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(complete under) error = %v", err)
+	}
+	seedSubmittingRun("loop_manual_cap", "run_manual")
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_manual"); err != nil {
+		t.Fatalf("one-shot manual error = %v, want nil", err)
+	}
+
+	// Exhausted automatic must not block a one-shot manual submitting loop.
+	autoExhausted := `{"loop":{"iterationCount":3}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_auto_exhausted", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &autoExhausted, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(auto exhausted) error = %v", err)
+	}
+	oneShotMeta := `{"manual":true,"loop":{"iterationCount":0}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_oneshot_submit", Seq: 3, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &oneShotMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(oneshot) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_manual", LoopID: "loop_manual_cap", Status: "completed", StartedAt: now, EndedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(complete manual) error = %v", err)
+	}
+	seedSubmittingRun("loop_oneshot_submit", "run_oneshot")
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_oneshot"); err != nil {
+		t.Fatalf("oneshot with exhausted automatic error = %v, want nil", err)
+	}
+
+	// Held automatic must not block a different-lane continuous_manual under-cap submit.
+	holdAutoMeta := `{"loop":{"iterationCount":0},"reviewFixBudget":{"siblingOf":"fixer","pauseReason":"sibling_review_fix_budget"},"pauseReason":"sibling_review_fix_budget"}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_auto_held", Seq: 4, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &holdAutoMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(auto held) error = %v", err)
+	}
+	cmMeta := `{"manual":true,"followUpdates":true,"loop":{"iterationCount":1}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_cm_submit", Seq: 5, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &cmMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(continuous manual) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_oneshot", LoopID: "loop_oneshot_submit", Status: "completed", StartedAt: now, EndedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(complete oneshot) error = %v", err)
+	}
+	seedSubmittingRun("loop_cm_submit", "run_cm")
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_cm"); err != nil {
+		t.Fatalf("continuous_manual under-cap with held automatic error = %v, want nil", err)
+	}
+
+	// Exhausted continuous_manual submitting loop still blocks.
+	cmExhausted := `{"manual":true,"followUpdates":true,"loop":{"iterationCount":3}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_cm_submit", Seq: 5, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &cmExhausted, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(cm exhausted) error = %v", err)
+	}
+	err = refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_cm")
+	if err == nil || !strings.Contains(err.Error(), "publish budget exhausted") {
+		t.Fatalf("exhausted continuous_manual error = %v, want publish budget exhausted", err)
+	}
+}
+
+func TestRefuseReviewSubmitBudgetAgainstReposPausedSubmittingRun(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+
+	holdMeta := `{"loop":{"iterationCount":0},"reviewFixBudget":{"siblingOf":"fixer","pauseReason":"sibling_review_fix_budget"},"pauseReason":"sibling_review_fix_budget"}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_submit", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &holdMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(paused) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_paused_submit", LoopID: "loop_paused_submit", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(paused submit) error = %v", err)
+	}
+
+	err = refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_paused_submit")
+	if err == nil || !strings.Contains(err.Error(), "review-fix budget is held") {
+		t.Fatalf("paused submitting run via run id error = %v, want held", err)
+	}
+	err = refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "")
+	if err == nil || !strings.Contains(err.Error(), "review-fix budget is held") {
+		t.Fatalf("paused submitting run via current run error = %v, want held", err)
+	}
+}
+
+func TestRefuseReviewSubmitBudgetFailsClosedOnMultipleRunningRuns(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+
+	heldMeta := `{"loop":{"iterationCount":3},"reviewFixBudget":{"exhaustedBy":"reviewer","pauseReason":"review_fix_budget_exhausted"},"pauseReason":"review_fix_budget_exhausted"}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_auto_held", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &heldMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(auto held) error = %v", err)
+	}
+	cmMeta := `{"manual":true,"followUpdates":true,"loop":{"iterationCount":1}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_cm_live", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &cmMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(continuous manual) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_auto_held", LoopID: "loop_auto_held", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(auto) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_cm_live", LoopID: "loop_cm_live", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(cm) error = %v", err)
+	}
+
+	err = refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "")
+	if err == nil || !strings.Contains(err.Error(), "pass --reviewer-run-id") {
+		t.Fatalf("multiple running runs without run id error = %v, want fail-closed", err)
+	}
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_auto_held"); err == nil || !strings.Contains(err.Error(), "review-fix budget is held") {
+		t.Fatalf("held automatic via run id error = %v, want held", err)
+	}
+	if err := refuseReviewSubmitBudgetAgainstRepos(context.Background(), repos, cfg, repo, prNumber, "run_cm_live"); err != nil {
+		t.Fatalf("continuous_manual via run id error = %v, want nil", err)
+	}
+}
+
+func TestSubmitReviewWithoutAnchorValidationRefusesBudgetBeforeSubmit(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "looper.sqlite")
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert error = %v", err)
+	}
+	exhaustedMeta := `{"loop":{"iterationCount":3}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_budget", Seq: 7, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &exhaustedMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run_budget", LoopID: "loop_budget", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR = 3
+
+	var submitCalls int
+	gateway := &budgetGateSubmitGateway{onSubmit: func() { submitCalls++ }}
+	var stdout, stderr bytes.Buffer
+	cmd := newReviewSubmitTestCommand(&stdout, &stderr)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Set("reviewer-run-id", "run_budget"); err != nil {
+		t.Fatalf("set reviewer-run-id: %v", err)
+	}
+	runtime := &commandRuntime{}
+	payload := reviewSubmitPayload{Body: "ok\n<!-- looper:review id=a head=head outcome=clean -->"}
+	err = submitReviewWithoutAnchorValidation(cmd, runtime, cfg, gateway, repo, prNumber, "COMMENT", payload, "head", root, cfg.Disclosure)
+	if err == nil || !strings.Contains(err.Error(), "publish budget exhausted") {
+		t.Fatalf("submitReviewWithoutAnchorValidation() error = %v, want budget exhausted", err)
+	}
+	if submitCalls != 0 {
+		t.Fatalf("SubmitReview calls = %d, want 0 (refused before mutation)", submitCalls)
+	}
+
+	// Under-cap still reaches mock gateway.
+	underMeta := `{"loop":{"iterationCount":1}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_budget", Seq: 7, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &underMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(under) error = %v", err)
+	}
+	err = submitReviewWithoutAnchorValidation(cmd, runtime, cfg, gateway, repo, prNumber, "COMMENT", payload, "head", root, cfg.Disclosure)
+	if err != nil {
+		t.Fatalf("under-cap submit error = %v", err)
+	}
+	if submitCalls != 1 {
+		t.Fatalf("SubmitReview calls = %d, want 1", submitCalls)
+	}
+}
+
+type budgetGateSubmitGateway struct {
+	onSubmit func()
+}
+
+func (g *budgetGateSubmitGateway) ViewPullRequest(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	return githubinfra.PullRequestDetail{}, nil
+}
+func (g *budgetGateSubmitGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+	return "reviewer", nil
+}
+func (g *budgetGateSubmitGateway) GetPullRequestDiff(context.Context, githubinfra.GetPullRequestDiffInput) (string, error) {
+	return "", nil
+}
+func (g *budgetGateSubmitGateway) SubmitReview(context.Context, githubinfra.SubmitReviewInput) error {
+	if g.onSubmit != nil {
+		g.onSubmit()
+	}
+	return nil
+}
+
 func TestValidateReviewSubmitEventAcceptsRequestChanges(t *testing.T) {
 	t.Parallel()
 
@@ -476,7 +803,8 @@ func TestValidateReviewSubmitEventAcceptsRequestChanges(t *testing.T) {
 func TestValidateReviewSubmitBodyRequiresSingleMatchingMarker(t *testing.T) {
 	t.Parallel()
 	body := "Review body\n<!-- looper:review id=abc head=def outcome=actionable -->"
-	if err := validateReviewSubmitBody(body, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+	// Actionable COMMENT requires inline comments (no body-only smuggling).
+	if err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "fix", Path: "main.go", Line: 1, Side: "RIGHT"}}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
 		t.Fatalf("validateReviewSubmitBody() error = %v", err)
 	}
 	for _, tc := range []struct {
@@ -522,12 +850,82 @@ func TestValidateReviewSubmitBodyAllowsRequestChangesOnlyForBlocking(t *testing.
 	}
 }
 
+func TestValidateReviewSubmitBodyRejectsActionableBodyOnly(t *testing.T) {
+	t.Parallel()
+	blocking := "<!-- looper:review id=abc head=def outcome=blocking -->"
+	if err := validateReviewSubmitBody(blocking, nil, "def", "REQUEST_CHANGES", decisionReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "at least one inline comment") {
+		t.Fatalf("REQUEST_CHANGES body-only error = %v, want inline comment requirement", err)
+	}
+	actionable := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	if err := validateReviewSubmitBody(actionable, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "at least one inline comment") {
+		t.Fatalf("actionable COMMENT body-only error = %v, want inline comment requirement", err)
+	}
+	// Clean body-only COMMENT remains allowed.
+	clean := "<!-- looper:review id=abc head=def outcome=clean -->"
+	if err := validateReviewSubmitBody(clean, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("clean COMMENT body-only error = %v", err)
+	}
+}
+
 func TestValidateReviewSubmitBodyRejectsCleanApproveWithInlineComments(t *testing.T) {
 	t.Parallel()
 	body := "<!-- looper:review id=abc head=def outcome=clean -->"
 	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "inline", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "APPROVE", decisionReviewPolicy, "octocat")
 	if err == nil || !strings.Contains(err.Error(), "without inline comments") {
 		t.Fatalf("validateReviewSubmitBody(APPROVE with comments) error = %v, want inline rejection", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsCleanCommentWithInlineComments(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=clean -->"
+	// Clean COMMENT must reject any inline comments (same as APPROVE).
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{{
+		Body: "must_fix smuggled", Path: "main.go", Line: 10, Side: "RIGHT",
+		Disposition: "must_fix", ScopeBasis: "required_invariant", ScopeEvidence: "rule",
+	}}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "without inline comments") {
+		t.Fatalf("validateReviewSubmitBody(clean COMMENT with comments) error = %v, want inline rejection", err)
+	}
+	// Clean body-only COMMENT remains allowed.
+	if err := validateReviewSubmitBody(body, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("validateReviewSubmitBody(clean COMMENT body-only) error = %v", err)
+	}
+	// Actionable COMMENT still requires ≥1 inline comment (must_fix enforced separately).
+	actionable := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	if err := validateReviewSubmitBody(actionable, nil, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "at least one inline comment") {
+		t.Fatalf("actionable COMMENT body-only error = %v, want inline comment requirement", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsSuppressedFindings(t *testing.T) {
+	t.Parallel()
+
+	comments := []reviewSubmitComment{{
+		Body: "must_fix", Path: "main.go", Line: 1, Side: "RIGHT",
+		Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "nil deref",
+	}}
+	ok := "Must-fix only: guard the nil pointer.\n<!-- looper:review id=abc head=def outcome=actionable -->"
+	if err := validateReviewSubmitBody(ok, comments, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("must_fix summary body error = %v", err)
+	}
+	hidden := "<!-- follow_up: rename helper -->\nMust-fix only.\n<!-- looper:review id=abc head=def outcome=actionable -->"
+	if err := validateReviewSubmitBody(hidden, comments, "def", "COMMENT", commentOnlyReviewPolicy, "octocat"); err != nil {
+		t.Fatalf("suppressed token only in HTML comment error = %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "follow_up prose", body: "Also a follow_up rename later.\n<!-- looper:review id=abc head=def outcome=actionable -->"},
+		{name: "needs_human prose", body: "This needs_human because scope is unclear.\n<!-- looper:review id=abc head=def outcome=actionable -->"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateReviewSubmitBody(tc.body, comments, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+			if err == nil || !strings.Contains(err.Error(), "follow_up or needs_human") {
+				t.Fatalf("error = %v, want suppressed-finding rejection", err)
+			}
+		})
 	}
 }
 
@@ -1161,5 +1559,118 @@ func TestReviewSubmitGatewayUsesStorageProjectRoles(t *testing.T) {
 	}
 	if got := strings.Join(forgeGateway.labels, ","); got != "looper:review" {
 		t.Fatalf("labels = %q, want looper:review from storage project roles", got)
+	}
+}
+
+func TestValidateReviewSubmitCommentDispositionsRequiresMustFixEvidence(t *testing.T) {
+	t.Parallel()
+
+	mustFix := []reviewSubmitComment{{
+		Body: "Null check missing", Path: "app.go", Line: 10, Side: "RIGHT",
+		Disposition: "must_fix", ScopeBasis: "introduced_regression", ScopeEvidence: "PR adds nil deref on happy path",
+	}}
+	if err := validateReviewSubmitCommentDispositions(mustFix); err != nil {
+		t.Fatalf("must_fix+evidence error = %v", err)
+	}
+	if err := validateReviewSubmitCommentDispositions(nil); err != nil {
+		t.Fatalf("empty comments error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		comments []reviewSubmitComment
+		want     string
+	}{
+		{
+			name: "missing fields",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+			}},
+			want: "requires disposition=must_fix",
+		},
+		{
+			name: "follow_up rejected",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+				Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "nice to have",
+			}},
+			want: "follow_up",
+		},
+		{
+			name: "needs_human rejected",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+				Disposition: "needs_human", ScopeBasis: "ambiguous_intent", ScopeEvidence: "unclear",
+			}},
+			want: "needs_human",
+		},
+		{
+			name: "invalid scopeBasis rejected",
+			comments: []reviewSubmitComment{{
+				Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+				Disposition: "must_fix", ScopeBasis: "whatever", ScopeEvidence: "nil deref",
+			}},
+			want: "invalid scopeBasis",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateReviewSubmitCommentDispositions(tc.comments)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestReviewSubmitStripsLooperOnlyFieldsAndRejectsBeforeSubmit(t *testing.T) {
+	t.Parallel()
+
+	// Unknown extra JSON keys are ignored by encoding/json into the struct.
+	raw := []byte(`{
+		"body": "Blocking\n\n<!-- looper:review id=abc head=deadbeef outcome=blocking -->",
+		"comments": [{
+			"body": "fix it",
+			"path": "app.go",
+			"line": 10,
+			"side": "RIGHT",
+			"disposition": "must_fix",
+			"severity": "blocking",
+			"scopeBasis": "introduced_regression",
+			"scopeEvidence": "nil deref",
+			"unknownExtra": true
+		}]
+	}`)
+	var payload reviewSubmitPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if err := validateReviewSubmitCommentDispositions(payload.Comments); err != nil {
+		t.Fatalf("validate dispositions: %v", err)
+	}
+	if payload.Comments[0].Disposition != "must_fix" || payload.Comments[0].ScopeBasis == "" {
+		t.Fatalf("payload comments = %#v", payload.Comments[0])
+	}
+	// Provider mapping strips Looper-only fields (same as reviewSubmit path).
+	mapped := githubinfra.ReviewComment{
+		Body: payload.Comments[0].Body, Path: payload.Comments[0].Path,
+		Line: payload.Comments[0].Line, Side: payload.Comments[0].Side,
+	}
+	if mapped.Body != "fix it" || mapped.Path != "app.go" {
+		t.Fatalf("mapped = %#v", mapped)
+	}
+
+	// Reject path: follow_up never reaches SubmitReview.
+	submitCalls := 0
+	gateway := &budgetGateSubmitGateway{onSubmit: func() { submitCalls++ }}
+	_ = gateway
+	bad := []reviewSubmitComment{{
+		Body: "x", Path: "app.go", Line: 1, Side: "RIGHT",
+		Disposition: "follow_up", ScopeBasis: "independent_improvement", ScopeEvidence: "later",
+	}}
+	if err := validateReviewSubmitCommentDispositions(bad); err == nil {
+		t.Fatal("expected follow_up rejection")
+	}
+	if submitCalls != 0 {
+		t.Fatalf("SubmitReview calls = %d, want 0", submitCalls)
 	}
 }

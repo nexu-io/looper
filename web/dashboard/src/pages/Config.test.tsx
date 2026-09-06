@@ -1246,9 +1246,12 @@ describe("ConfigPage", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderPage();
 
-    fireEvent.change(await screen.findByLabelText("agent.profiles.fast.model"), {
+    const modelInput = await screen.findByLabelText("agent.profiles.fast.model");
+    fireEvent.change(modelInput, {
       target: { value: "gpt-5" },
     });
+    // ModelCombobox keeps keystrokes local until commit (blur / Enter / pick).
+    fireEvent.blur(modelInput);
     clickSaveChanges();
     fireEvent.click(
       await screen.findByRole("button", {
@@ -1385,9 +1388,11 @@ describe("ConfigPage", () => {
     expect(screen.queryByLabelText(/params/i)).toBeNull();
     expect(screen.queryByText(/params map/i)).toBeNull();
 
-    fireEvent.change(screen.getByLabelText("agent.profiles.fast.model"), {
+    const profileModel = screen.getByLabelText("agent.profiles.fast.model");
+    fireEvent.change(profileModel, {
       target: { value: "gpt-5" },
     });
+    fireEvent.blur(profileModel);
     fireEvent.change(screen.getByLabelText("New profile id"), {
       target: { value: "cheap" },
     });
@@ -1545,6 +1550,7 @@ describe("ConfigPage", () => {
     ) as HTMLInputElement;
     expect(modelInput.disabled).toBe(false);
     fireEvent.change(modelInput, { target: { value: "gpt-5" } });
+    fireEvent.blur(modelInput);
 
     fireEvent.change(screen.getByLabelText("New profile id"), {
       target: { value: "cheap" },
@@ -1568,5 +1574,134 @@ describe("ConfigPage", () => {
     const body = JSON.parse(String(patchCall?.[1]?.body));
     expect(body.set["agent.profiles.fast.model"]).toBe("gpt-5");
     expect(body.set["agent.profiles.cheap.vendor"]).toBe("opencode");
+  });
+
+  it("restores absent global agent.model via Unbound without Discard", async () => {
+    // Published agent.model is absent (default-sourced): Unset is hidden and
+    // Inherit is not offered. After drafting a concrete id, Unbound must clear
+    // the draft back to null so Save does not set agent.model.
+    const { model: _drop, ...agentWithoutModel } = configFixture().agent!;
+    void _drop;
+    const initial = configFixture({
+      agent: {
+        ...agentWithoutModel,
+        vendor: "codex",
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.model": {
+            source: "default",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.startsWith("/api/v1/agent/models")) {
+        return response({
+          vendor: "codex",
+          models: [{ id: "gpt-5", label: "GPT-5", source: "static" }],
+          sources: { static: true, probe: "skipped" },
+          probedAt: null,
+        });
+      }
+      if (path !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${path}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    const modelInput = (await screen.findByLabelText(
+      "agent.model",
+    )) as HTMLInputElement;
+    // Absent → closed placeholder is Unbound, not Vendor default.
+    expect(modelInput.placeholder).toBe("Unbound");
+    expect(modelInput.value).toBe("");
+
+    fireEvent.focus(modelInput);
+    fireEvent.change(modelInput, { target: { value: "gpt-5" } });
+    fireEvent.blur(modelInput);
+    expect(modelInput.value).toBe("gpt-5");
+    expect(screen.getAllByText(/1\s*unsaved/i).length).toBeGreaterThan(0);
+
+    // Field-local restore: Unbound clears the draft (no full Discard).
+    fireEvent.focus(modelInput);
+    fireEvent.mouseDown(await screen.findByText("Unbound"));
+    expect(modelInput.value).toBe("");
+    expect(modelInput.placeholder).toBe("Unbound");
+    // No remaining dirty state for this field alone — dock may disappear.
+    expect(screen.queryByText(/unsaved/i)).toBeNull();
+
+    // Open placeholder documents empty = vendor default suppress, not inherit.
+    fireEvent.focus(modelInput);
+    expect(modelInput.placeholder).toMatch(/vendor default/i);
+    expect(modelInput.placeholder).not.toMatch(/inherit CLI/i);
+  });
+
+  it("stages explicit vendor-default suppress for empty global agent.model clear", async () => {
+    const { model: _drop, ...agentWithoutModel } = configFixture().agent!;
+    void _drop;
+    const initial = configFixture({
+      agent: {
+        ...agentWithoutModel,
+        vendor: "codex",
+        envKeys: ["OPENAI_API_KEY"],
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "agent.model": {
+            source: "default",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path.startsWith("/api/v1/agent/models")) {
+        return response({
+          vendor: "codex",
+          models: [{ id: "gpt-5", label: "GPT-5", source: "static" }],
+          sources: { static: true, probe: "skipped" },
+          probedAt: null,
+        });
+      }
+      if (path !== "/api/v1/config") {
+        throw new Error(`unexpected request: ${path}`);
+      }
+      if (init?.method === "PATCH") return response(initial);
+      return response(initial);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPage();
+
+    const modelInput = (await screen.findByLabelText(
+      "agent.model",
+    )) as HTMLInputElement;
+    fireEvent.focus(modelInput);
+    fireEvent.mouseDown(await screen.findByText("Vendor default"));
+    expect(modelInput.placeholder).toBe("Vendor default");
+    clickSaveChanges();
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
+        true,
+      );
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patchCall?.[1]?.body));
+    expect(body.set["agent.model"]).toBe("");
+    expect(body.unset).toEqual([]);
   });
 });

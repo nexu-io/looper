@@ -231,7 +231,10 @@
         "allowRiskyFixes": true,
         "fixAllPullRequests": false,
         "openPrStrategy": "first_commit",
-        "addSnapshotMode": "async"
+        "addSnapshotMode": "async",
+        "loop": {
+          "quietPeriodSeconds": 60
+        }
       },
       "roles": {
         "coordinator": {
@@ -297,6 +300,7 @@
               "minPublishIntervalSeconds": 300,
               "maxIterationsPerPR": 20,
               "maxIterationsPerHead": 1,
+              "maxPublishesPerPR": 3,
               "maxWallClockSeconds": 0,
               "maxConsecutiveFailures": 3,
               "maxAgentExecutionsPerPR": 25,
@@ -354,6 +358,12 @@
             "labels": [],
             "labelMode": "all",
             "authorFilter": "current_user"
+          },
+          "behavior": {
+            "loop": {
+              "quietPeriodSeconds": 0,
+              "maxPushesPerPR": 3
+            }
           }
         },
         "worker": {

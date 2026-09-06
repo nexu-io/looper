@@ -45,6 +45,14 @@ For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `gr
 
 Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive `looper resume` takeover. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
 
+### Pi
+
+For Pi ([pi.dev](https://pi.dev)), configure `agent.vendor = "pi"`; Looper runs the `pi` executable. Authenticate with Pi's own login/config (project-local `.pi`). Looper defaults to `-p <prompt> --approve` for unattended fresh runs. Configured `-p`/`--print` means you own the prompt; any of `-a`/`--approve`/`-na`/`--no-approve` skips the default approve flag. Pi has no daemon native resume or interactive `looper resume` takeover.
+
+### Oh My Pi (omp)
+
+For Oh My Pi ([omp.sh](https://omp.sh)), configure `agent.vendor = "omp"` (not `oh-my-pi`); Looper runs the `omp` executable. Authenticate with omp's own login/config. Looper defaults to `-p <prompt> --cwd <worktree> --auto-approve`. Configured print, cwd, or approval flags (`--auto-approve` / `--approval-mode`) override those defaults. Oh My Pi has no daemon native resume or interactive `looper resume` takeover.
+
 ## 1a. Local-only vs Routed projects
 
 Looper supports two project modes:
@@ -98,7 +106,7 @@ If no project matches the current directory, or multiple projects match, pass `-
 | `coordinator` | Proactively triages fresh issues and commits a Disposition with durable labels | runs automatically inside `looperd` |
 | `planner` | Generates a spec from an issue and opens a spec PR | `looper plan --project <id> --issue <num>` |
 | `reviewer` | Reviews a PR or spec PR and publishes GitHub reviews | `looper review <repo>#<pr> [--loop]` or `looper review <pr> [--loop]` from inside the repo |
-| `fixer` | Fixes PR issues based on review comments and tries to resolve threads | `looper fix <repo>#<pr>` |
+| `fixer` | Fixes PR issues based on review comments; declines leave threads open for Reviewer | `looper fix <repo>#<pr>` |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | `looper work --issue <num>` or `looper work --project <id> --issue <num>` |
 
 Forgejo MVP role support:
@@ -263,6 +271,35 @@ looper review owner/repo#42 --loop
 
 Use this when new commits are expected to keep landing on the PR.
 
+### Same-head `wontfix` (GitHub, continuous Reviewer)
+
+A continuous GitHub Reviewer loop (`looper review … --loop` or auto-discovery) reacts to trusted dispositions on an unchanged PR head. Reply **in a Looper-authored review thread**:
+
+```text
+/looper wontfix <reason>
+```
+
+Compatibility aliases: a trusted comment whose entire non-quoted body is `wontfix`, `won't fix`, or `won’t fix` (Unicode apostrophe), optionally followed by `: <reason>`. Incidental prose that merely contains those words is not a command.
+
+`/looper reconsider <reason>` cancels the latest accepted disposition on an unresolved or reopened thread.
+
+Authority is the PR author or a GitHub identity whose association is `OWNER`, `MEMBER`, or `COLLABORATOR`. Arbitrary users and bots are not disposition authorities.
+
+Reviewer then:
+
+- **accepts** (`accept_wontfix`): replies with scope evidence and resolves the thread
+- **rejects** (`reject_wontfix`): replies with concrete authority and leaves the thread open for Fixer
+- **needs human**: holds the Reviewer/Fixer pair; no remote adjudication reply
+
+This path does **not** enable `roles.reviewer.behavior.threadResolution.enabled`. That setting still gates objective stale-thread reconciliation only and stays `false` by default. Forgejo is exempt from same-head disposition; Reviewer and Fixer budgets still apply there.
+
+When either role budget trips, or Reviewer returns `needs_human`:
+
+- HITL on: Continue/Stop ask on the pair
+- HITL off (default): paused with no ask. Resume with `looper unpause <seq>` (Continue: refill only exhausted meters) or `looper stop <seq>` (terminate both). Either seq in the held pair works.
+
+Budget exhaustion is not approval. It never publishes a clean review, resolves a blocker, or enables auto-merge. Inspect a hold with `looper describe <seq>`.
+
 ### Reviewer auto-discovery rules
 
 Reviewer mainly watches two kinds of PRs:
@@ -336,6 +373,9 @@ Fixer will:
 - run validation
 - push back to the same PR branch
 - after validation and push succeed, try to resolve only the review threads that were both verified by Looper and explicitly confirmed by the fixer agent
+- if a finding is out of documented PR scope, reply with a structured decline and **leave the thread unresolved** so Reviewer can accept, reject, or escalate (`needs_human`)
+
+Third-party review comments (a human or Codex, not Looper) stay Fixer-eligible. If Fixer declines one of those, it still replies with evidence and leaves the thread open; Reviewer adjudicates the decline. Trusted `/looper` directives apply only on Looper-authored threads.
 
 For Forgejo projects, automatic Fixer runs are summary-only because Forgejo's public REST API does not currently expose a native review-comment resolve mutation:
 
@@ -489,6 +529,7 @@ looper ps
 looper describe 12
 looper logs 12 --follow
 looper jump 12
+looper unpause 12
 looper stop 12
 looper run reconcile-stale
 ```
@@ -496,11 +537,12 @@ looper run reconcile-stale
 Typical usage:
 
 - `looper ps`: see which loops are currently running (includes a truncated failure reason when present)
-- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`
+- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`. For a review-fix budget or scope hold, also names the hold reason and the next command (`looper unpause <seq>` / `looper stop <seq>`).
 - `looper logs <id> --follow`: stream logs live
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
 - `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
-- `looper stop <id>`: stop an active loop
+- `looper unpause <id>`: on a review-fix budget hold, Continue the pair (refill exhausted meters only); on a `needs_human` scope hold, release only the overlay and leave independent blockers; otherwise resume that one paused loop
+- `looper stop <id>`: stop an active loop, or terminate a budget/scope-held pair
 - `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
 
 ## 15. Minimal end-to-end example
@@ -562,7 +604,7 @@ looper takeover owner/repo#42 --merge   # also auto-merge once approved + green
 3. starts a continuous reviewer loop and fixer loop on the target PR (skip the fixer with `--no-fix`);
 4. with `--merge`, sets `roles.reviewer.autoMerge.enabled` for the project so the reviewer enables GitHub auto-merge once the PR is approved and checks are green.
 
-Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `grok` / `opencode` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
+Agent selection: `takeover` reuses the vendor already in your config; otherwise it auto-detects an installed `claude` / `codex` / `grok` / `opencode` / `pi` / `omp` CLI, prompts when the choice is ambiguous, and accepts `--agent-vendor` plus `--yes` for non-interactive runs. Auto-merge still depends on the repository allowing it (and, by default, on branch protection with required checks); when GitHub refuses, the reviewer keeps reviewing and reports why instead.
 
 Manage and stop takeovers:
 

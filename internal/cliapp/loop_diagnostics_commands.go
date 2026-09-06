@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -22,10 +23,17 @@ type loopInspectOutput struct {
 	SelectorKind    string                  `json:"selectorKind"`
 	Loop            loopDiagnosticLoop      `json:"loop"`
 	Metadata        loopDiagnosticMetadata  `json:"metadata"`
+	Handoff         *loopInspectHandoff     `json:"handoff,omitempty"`
 	Run             *loopDiagnosticRun      `json:"run,omitempty"`
 	LatestQueueItem *queueItemCommandOutput `json:"latestQueueItem,omitempty"`
 	Agent           *loopDiagnosticAgent    `json:"agent,omitempty"`
 	Diagnosis       loopDiagnosis           `json:"diagnosis"`
+}
+
+type loopInspectHandoff struct {
+	Kind        string  `json:"kind"`
+	PauseReason *string `json:"pauseReason,omitempty"`
+	Resume      string  `json:"resume"`
 }
 
 type loopFailuresOutput struct {
@@ -79,6 +87,7 @@ type loopDiagnosticMetadata struct {
 	LastPublishedHeadSHA *string                     `json:"lastPublishedHeadSha,omitempty"`
 	LastReviewEvent      *string                     `json:"lastReviewEvent,omitempty"`
 	LastReviewSummary    *string                     `json:"lastReviewSummary,omitempty"`
+	PauseReason          *string                     `json:"pauseReason,omitempty"`
 	LastFilterSkip       map[string]any              `json:"lastFilterSkip,omitempty"`
 	Loop                 *loopDiagnosticLoopMetadata `json:"loop,omitempty"`
 }
@@ -388,6 +397,9 @@ func buildLoopInspectOutput(ctx context.Context, repos *storage.Repositories, se
 		agentOutput := diagnosticAgentOutput(*agent, now)
 		output.Agent = &agentOutput
 	}
+	if handoff := reviewFixInspectHandoff(resolved.Loop, metadata); handoff != nil {
+		output.Handoff = handoff
+	}
 	return output, nil
 }
 
@@ -433,6 +445,7 @@ func parseLoopDiagnosticMetadata(raw *string) loopDiagnosticMetadata {
 		LastPublishedHeadSHA: stringPtrFromMap(doc, "lastPublishedHeadSha"),
 		LastReviewEvent:      stringPtrFromMap(doc, "lastReviewEvent"),
 		LastReviewSummary:    stringPtrFromMap(doc, "lastReviewSummary"),
+		PauseReason:          stringPtrFromMap(doc, "pauseReason"),
 	}
 	if skip, ok := doc["lastFilterSkip"].(map[string]any); ok {
 		output.LastFilterSkip = skip
@@ -583,6 +596,14 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 	}
 	if diagnosis.RecommendedAction == "" {
 		diagnosis.RecommendedAction = recommendedActionForState(state)
+	}
+	if associateQueue && loops.IsReviewFixPairHold(loop) {
+		release := reviewFixInspectResume(loop)
+		if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+			diagnosis.RecommendedAction = release + "; unpause releases only the scope hold; then " + diagnosis.RecommendedAction
+		} else {
+			diagnosis.RecommendedAction = release
+		}
 	}
 	// Expand <seq> before emitting JSON/human output so operators and scripts
 	// never see the literal placeholder outside writeHumanLoopInspect.
@@ -773,6 +794,9 @@ func recommendedActionForManualIntervention(message string) string {
 	if strings.Contains(lower, "dirty worktree") || strings.Contains(lower, "worktree is dirty") || strings.Contains(lower, "uncommitted changes") {
 		return "inspect with looper jump <seq>, or discard via looper retry <seq> --discard-worktree-changes --confirm"
 	}
+	if strings.Contains(lower, "unusable and not empty") || strings.Contains(lower, "unusable worktree path preserved") {
+		return "inspect with looper jump <seq>, or clear leftovers via looper retry <seq> --clear-unusable-worktree --confirm"
+	}
 	if strings.Contains(lower, "worktree is locked") {
 		return "unlock or remove the locked worktree, then looper retry <seq>"
 	}
@@ -801,6 +825,65 @@ func recommendedActionForState(state string) string {
 
 func formatActionWithSeq(action string, seq int64) string {
 	return strings.ReplaceAll(action, "<seq>", strconv.FormatInt(seq, 10))
+}
+
+func reviewFixInspectHandoff(loop storage.LoopRecord, metadata loopDiagnosticMetadata) *loopInspectHandoff {
+	if !loops.IsReviewFixPairHold(loop) {
+		return nil
+	}
+	kind := loops.HITLKindReviewFixBudget
+	if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+		kind = loops.HITLKindReviewScopeHuman
+	}
+	return &loopInspectHandoff{
+		Kind:        kind,
+		PauseReason: reviewFixInspectPauseReason(metadata, loop, kind),
+		Resume:      reviewFixInspectResume(loop),
+	}
+}
+
+func reviewFixInspectResume(loop storage.LoopRecord) string {
+	selector := strings.TrimSpace(loop.ID)
+	if loop.Seq > 0 {
+		selector = strconv.FormatInt(loop.Seq, 10)
+	}
+	cli := fmt.Sprintf("looper unpause %s / looper stop %s", selector, selector)
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if ok && strings.EqualFold(strings.TrimSpace(ask.Status), "awaiting") &&
+		(loops.IsReviewFixBudgetAsk(ask) || loops.IsReviewScopeHumanAsk(ask)) {
+		return "Continue / Stop; " + cli
+	}
+	return cli
+}
+
+func reviewFixInspectPauseReason(metadata loopDiagnosticMetadata, loop storage.LoopRecord, kind string) *string {
+	if metadata.PauseReason != nil {
+		if reason := strings.TrimSpace(*metadata.PauseReason); reason != "" {
+			return &reason
+		}
+	}
+	nested := ""
+	if kind == loops.HITLKindReviewScopeHuman {
+		nested = strings.TrimSpace(loops.ReadReviewScopeHumanState(loop.MetadataJSON).PauseReason)
+	} else {
+		nested = strings.TrimSpace(loops.ReadReviewFixBudgetState(loop.MetadataJSON).PauseReason)
+	}
+	if nested == "" {
+		return nil
+	}
+	return &nested
+}
+
+func humanInspectHoldReason(output loopInspectOutput) string {
+	if output.Metadata.PauseReason != nil {
+		if reason := strings.TrimSpace(*output.Metadata.PauseReason); reason != "" {
+			return reason
+		}
+	}
+	if output.Handoff != nil && output.Handoff.PauseReason != nil {
+		return strings.TrimSpace(*output.Handoff.PauseReason)
+	}
+	return ""
 }
 
 func requiresOperatorHold(output loopInspectOutput) bool {
@@ -911,12 +994,32 @@ func writeHumanLoopInspect(w io.Writer, output loopInspectOutput) error {
 			}
 		}
 	}
+	if reason := humanInspectHoldReason(output); reason != "" {
+		if _, err := fmt.Fprintf(w, "Hold: %s\n", reason); err != nil {
+			return err
+		}
+	}
+	if output.Handoff != nil {
+		if _, err := fmt.Fprintf(w, "Release: %s\n", output.Handoff.Resume); err != nil {
+			return err
+		}
+		if output.Handoff.Kind == loops.HITLKindReviewFixBudget {
+			if _, err := fmt.Fprintln(w, "unpause releases the budget hold and refills only exhausted meters; other holds, including scope holds, may still prevent the pair from running."); err != nil {
+				return err
+			}
+		}
+		if output.Handoff.Kind == loops.HITLKindReviewScopeHuman {
+			if _, err := fmt.Fprintln(w, "unpause releases the scope hold; other blockers remain, such as unanswered agent/HITL asks, failed or interrupted runs, human takeover, or a manual pause."); err != nil {
+				return err
+			}
+		}
+	}
 	if output.Diagnosis.RecommendedAction != "" {
 		if _, err := fmt.Fprintf(w, "Action: %s\n", formatActionWithSeq(output.Diagnosis.RecommendedAction, output.Loop.Seq)); err != nil {
 			return err
 		}
 	}
-	if requiresOperatorHold(output) {
+	if requiresOperatorHold(output) && output.Handoff == nil {
 		if _, err := fmt.Fprintf(w, "Next: after resolving the blocker, looper retry %d (see also looper logs %d)\n", output.Loop.Seq, output.Loop.Seq); err != nil {
 			return err
 		}

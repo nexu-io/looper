@@ -1066,6 +1066,66 @@ func TestFixerGitHubAdapterBoundaryContracts(t *testing.T) {
 	})
 }
 
+func TestFixerGitHubAdapterResolvesIntegrationTokenIdentity(t *testing.T) {
+	t.Parallel()
+	integrationErr := func() (shell.Result, error) {
+		result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+		return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+	}
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		CWD:    t.TempDir(),
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			switch strings.Join(options.Args, " ") {
+			case "api user --jq .login", "api user --jq {login: .login, id: .id}":
+				return integrationErr()
+			case "api graphql -f query=query { viewer { login } }":
+				return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-app[bot]"}}}`}, nil
+			default:
+				t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+				return shell.Result{}, nil
+			}
+		},
+	})
+	login, err := fixerGitHubAdapter{gateway: gateway}.GetCurrentUserLogin(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("GetCurrentUserLogin() error = %v", err)
+	}
+	if login != "looper-app[bot]" {
+		t.Fatalf("GetCurrentUserLogin() = %q, want looper-app[bot]", login)
+	}
+}
+
+func TestReviewerGitHubAdapterResolvesIntegrationTokenIdentity(t *testing.T) {
+	t.Parallel()
+	integrationErr := func() (shell.Result, error) {
+		result := shell.Result{ExitCode: 1, Stderr: "HTTP 403: Resource not accessible by integration"}
+		return result, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: result}
+	}
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		CWD:    t.TempDir(),
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			switch strings.Join(options.Args, " ") {
+			case "api user --jq .login", "api user --jq {login: .login, id: .id}":
+				return integrationErr()
+			case "api graphql -f query=query { viewer { login } }":
+				return shell.Result{Stdout: `{"data":{"viewer":{"login":"looper-app[bot]"}}}`}, nil
+			default:
+				t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+				return shell.Result{}, nil
+			}
+		},
+	})
+	login, err := reviewerGitHubAdapter{gateway: gateway}.GetCurrentUserLogin(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("GetCurrentUserLogin() error = %v", err)
+	}
+	if login != "looper-app[bot]" {
+		t.Fatalf("GetCurrentUserLogin() = %q, want looper-app[bot]", login)
+	}
+}
+
 func TestFixerGitHubAdapterForgejoResolveNativeReviewComment(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	var calledPath string
