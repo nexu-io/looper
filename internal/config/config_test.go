@@ -564,6 +564,40 @@ func TestForgejoProjectAllowsExplicitAutoMergeOptIn(t *testing.T) {
 	}
 }
 
+func TestForgejoProjectRejectsAutoMergeWithSummaryComment(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"notifications": {"osascript": {"enabled": false}},
+		"providers": [{"id":"fj","kind":"forgejo","baseUrl":"https://forgejo.example.test","tokenEnv":"FORGEJO_TOKEN"}],
+		"projects": [{
+			"id":"demo",
+			"name":"Demo",
+			"provider":"fj",
+			"repo":"owner/repo",
+			"repoPath":"/tmp/repo",
+			"roles": {
+				"reviewer": {
+					"autoMerge": {"enabled": true},
+					"behavior": {"publishMode": "summary_comment"}
+				}
+			}
+		}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+	_, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want summary_comment auto-merge validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.autoMerge.enabled", "must be false when publishMode is summary_comment")
+}
+
 func TestForgejoProviderAuthTeaAllowsMissingTokenEnv(t *testing.T) {
 	auth := ProviderAuthTea
 	cfg, err := Normalize(t.TempDir(), PartialConfig{

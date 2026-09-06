@@ -28,6 +28,9 @@ func (s *Service) validateReviewerAutoMergeForProject(ctx context.Context, proje
 		if project.ID != projectID || config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
 			continue
 		}
+		if roles.Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment {
+			return reviewerAutoMergeValidationError(projectRepoLabel(repo, projectID), `publishMode "summary_comment" cannot submit the native APPROVE review auto-merge requires`)
+		}
 		for _, provider := range cfg.Providers {
 			if provider.ID != project.Provider {
 				continue

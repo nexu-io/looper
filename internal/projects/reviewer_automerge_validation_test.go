@@ -134,6 +134,25 @@ func TestValidateReviewerAutoMergeForProjectFailureModes(t *testing.T) {
 	}
 }
 
+func TestValidateReviewerAutoMergeRejectsForgejoSummaryComment(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "FORGEJO_TOKEN"
+	cfg.Roles.Reviewer.AutoMerge.Enabled = true
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
+	cfg.Providers = []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: &tokenEnv}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", Provider: "fj", Repo: "acme/looper", RepoPath: t.TempDir()}}
+	repo := "acme/looper"
+	err = (&Service{}).validateReviewerAutoMergeForProject(context.Background(), "project_1", &repo, "main", cfg)
+	if err == nil || !strings.Contains(err.Error(), `publishMode "summary_comment"`) {
+		t.Fatalf("validateReviewerAutoMergeForProject() error = %v, want summary_comment rejection", err)
+	}
+}
+
 func TestServiceAddProjectValidatesReviewerAutoMerge(t *testing.T) {
 	t.Parallel()
 

@@ -5888,7 +5888,11 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 	if resolvePullRequestPhase(detail.Labels) == "spec" {
 		return nil, nil
 	}
-	if r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
+	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
+	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
+		return nil, nil
+	}
+	if reviewEvents.Clean != config.ReviewerReviewEventApprove {
 		return nil, nil
 	}
 	autoMergeCfg := r.reviewerAutoMergeConfigForProject(input.Project.ID)
