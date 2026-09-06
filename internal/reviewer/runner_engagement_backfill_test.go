@@ -273,12 +273,6 @@ func TestLooperReviewEngagementHeadMatchesPublishVerifierGates(t *testing.T) {
 		t.Fatalf("COMMENT policy clean = %q, want old-head", got)
 	}
 
-	if !isRecognizedReviewOutcome("blocking") || isRecognizedReviewOutcome("BLOCKING") {
-		t.Fatal("isRecognizedReviewOutcome must match exact lowercase publish-verification tokens")
-	}
-	if reviewMarkerOutcomeEventAllowed("BLOCKING", ReviewEventRequestChanges, allowedRC, false) {
-		t.Fatal("reviewMarkerOutcomeEventAllowed(BLOCKING) = true, want false")
-	}
 }
 
 func TestReviewsForEngagementBackfillTreatsEmptyPresentListAsAuthoritative(t *testing.T) {
@@ -335,5 +329,152 @@ func TestReviewsForEngagementBackfillTreatsEmptyPresentListAsAuthoritative(t *te
 	}
 	if github.loadReviewsCalls != 1 {
 		t.Fatalf("LoadPullRequestReviews calls = %d, want 1 when reviews field is omitted", github.loadReviewsCalls)
+	}
+}
+
+// Bypass discovery entirely: a persisted queue/checkpoint must be sufficient to
+// reach a full review or finish its pending publication after a daemon restart.
+func TestQueuedAndResumedReviewerRecoverEngagementWithoutDiscovery(t *testing.T) {
+	for _, mode := range []string{"queued", "review", "publish", "legacy-thread-only", "disposition-new-head", "request-consumed"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			ctx := context.Background()
+			repo, loopID := "acme/looper", "loop_recover_"+mode
+			prNumber := int64(42)
+			reviews := []map[string]any{{"author": map[string]any{"login": "bob"}, "commit": map[string]any{"oid": "old-head"}, "state": "CHANGES_REQUESTED", "body": "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=blocking -->"}}
+			github := &fakeGitHubGateway{currentLogin: "bob", author: "alice", reviewRequests: []string{}, viewHeadSHA: "new-head", reviews: reviews}
+			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Follow-up review", Stdout: `__LOOPER_RESULT__={"summary":"posted follow-up review"}`, ParseStatus: "parsed"}}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, CommentOnlyPublish: mode == "publish", Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{RequireReviewRequest: true}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}, LoopConfig: testReviewerLoopConfig()})
+			if mode == "request-consumed" {
+				github.reviewRequests = []string{"bob"}
+				github.removeReviewRequestOnSecondView = true
+			}
+			agent.onStart = func(input AgentRunInput) {
+				stored, err := fixture.repos.Loops.GetByID(ctx, loopID)
+				if err != nil || stored == nil {
+					t.Fatalf("load at agent start: %#v, %v", stored, err)
+				}
+				if got, _ := stringFromAny(parseJSONObject(stored.MetadataJSON)["lastPublishedHeadSha"]); got != "old-head" {
+					t.Fatalf("agent started before recovering prior publication: %q", got)
+				}
+				if !strings.Contains(input.Prompt, "a fresh current-user review request is not required") {
+					t.Fatal("agent prompt still requires a fresh request")
+				}
+			}
+			now := fixture.nowISO()
+			meta := `{"followUpdates":true,"loop":{"enabled":true}}`
+			loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &meta, CreatedAt: now, UpdatedAt: now}
+			if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "review" || mode == "publish" || mode == "legacy-thread-only" {
+				checkpoint := reviewerCheckpoint{
+					ResumePolicy: "advance_from_checkpoint",
+					Detail:       &checkpointDetail{Title: "Review", State: "OPEN", HeadSHA: "new-head", BaseSHA: "base", HeadRefName: "feature/review-me", BaseRefName: "main", Author: "alice", CurrentLogin: "bob", Reviews: reviews},
+					Snapshot:     &checkpointSnapshot{HeadSHA: "new-head"},
+					Worktree:     &checkpointWorktree{Path: t.TempDir(), Branch: "pr-42", BaseBranch: "main", PreparedAt: now},
+					// Pending review lets a resumed review/publish retain its checkpoint even
+					// though the consumed request is omitted by JSON's empty-list encoding.
+					PendingReview: &pendingReviewCheckpoint{HeadSHA: "new-head", IdempotencyKey: agentNativeReviewID(loopID, "new-head"), Event: reviewEventAgentNative, Summary: "No actionable findings remain", Outcome: "clean"},
+				}
+				if mode == "review" || mode == "legacy-thread-only" {
+					checkpoint.PendingReview = nil
+					checkpoint.Detail.ReviewRequests = []string{"someone-else"}
+					checkpoint.ThreadResolutionFollowUpOnly = mode == "legacy-thread-only"
+				}
+				lastStep := stepThreadResolution
+				if mode == "publish" {
+					lastStep = stepReview
+					checkpoint.PendingReview.ReviewerSummaryJSON = `{"summary":"No actionable findings remain","outcome":"clean","findings":[]}`
+				}
+				run := storage.RunRecord{ID: "run_previous", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("review"), LastCompletedStep: stringPtr(string(lastStep)), CheckpointJSON: stringPtr(mustMarshalJSON(checkpoint)), StartedAt: now, EndedAt: &now, CreatedAt: now, UpdatedAt: now}
+				if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+					t.Fatal(err)
+				}
+			}
+			queuedHead := "new-head"
+			if mode == "disposition-new-head" {
+				queuedHead = "old-head"
+			}
+			if _, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loopID, Repo: repo, PRNumber: prNumber, HeadSHA: queuedHead, DispositionOnly: mode == "disposition-new-head"}); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, now, "worker", "reviewer")
+			if err != nil || claimed == nil {
+				t.Fatalf("claim = %#v, %v", claimed, err)
+			}
+			result, err := runner.ProcessClaimedItem(ctx, *claimed)
+			if err != nil || result.Status != "success" {
+				t.Fatalf("process = %#v, %v", result, err)
+			}
+			wantStarts := 1
+			if mode == "publish" {
+				wantStarts = 0
+				if len(github.issueCommentCalls) != 1 {
+					t.Fatalf("publication calls = %d, want 1", len(github.issueCommentCalls))
+				}
+			}
+			if len(agent.starts) != wantStarts {
+				t.Fatalf("agent starts = %d, want %d", len(agent.starts), wantStarts)
+			}
+			updated, err := fixture.repos.Loops.GetByID(ctx, loopID)
+			if err != nil || updated == nil {
+				t.Fatalf("loop = %#v, %v", updated, err)
+			}
+			if got, _ := stringFromAny(parseJSONObject(updated.MetadataJSON)["lastPublishedHeadSha"]); got != "new-head" {
+				t.Fatalf("published head = %q", got)
+			}
+		})
+	}
+}
+
+func TestEngagementBackfillDoesNotOverwriteConcurrentPublication(t *testing.T) {
+	// Deliberately sequential: updateLoopBeforeWriteHook is the existing CAS race
+	// affordance. Interleave publication after recovery's read and before its CAS.
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	repo, loopID := "acme/looper", "loop_racing_recovery"
+	pr := int64(42)
+	meta := `{"followUpdates":true,"loop":{"enabled":true}}`
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "running", MetadataJSON: &meta, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}})
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("project = %#v, %v", project, err)
+	}
+	published := false
+	oldHook := updateLoopBeforeWriteHook
+	defer func() { updateLoopBeforeWriteHook = oldHook }()
+	updateLoopBeforeWriteHook = func(current storage.LoopRecord) error {
+		if published {
+			return nil
+		}
+		published = true
+		raw := `{"followUpdates":true,"lastPublishedHeadSha":"new-head","loop":{"enabled":true,"iterationCount":2}}`
+		current.MetadataJSON = &raw
+		return fixture.repos.Loops.Upsert(ctx, current)
+	}
+	reviews := []map[string]any{{"author": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "commit": map[string]any{"oid": "old-head"}, "body": "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=blocking -->"}}
+	got, err := runner.backfillPublishedHeadFromLooperReview(ctx, *project, loop, PullRequestDetail{HeadSHA: "new-head", Reviews: reviews}, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !published {
+		t.Fatal("publication interleave did not run")
+	}
+	stored, err := fixture.repos.Loops.GetByID(ctx, loopID)
+	if err != nil || stored == nil {
+		t.Fatalf("stored = %#v, %v", stored, err)
+	}
+	for _, record := range []storage.LoopRecord{got, *stored} {
+		parsed := parseJSONObject(record.MetadataJSON)
+		if parsed["lastPublishedHeadSha"] != "new-head" || intFromAny(reviewerLoopMetadata(parsed)["iterationCount"]) != 2 {
+			t.Fatalf("recovery overwrote publication: %s", *record.MetadataJSON)
+		}
 	}
 }

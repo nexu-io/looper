@@ -2479,25 +2479,50 @@ type reviewIdempotencyMarker struct {
 	Outcome string
 }
 
-// ParsedReviewMarker is the canonical Looper review marker shape shared by
-// publish verification and reviewer engagement recovery.
-type ParsedReviewMarker struct {
-	ID      string
-	Head    string
-	Outcome string
-}
-
 var reviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
 
-// ParseReviewMarkers returns only markers accepted by publish verification's
-// case-sensitive grammar and required field validation.
-func ParseReviewMarkers(body string) []ParsedReviewMarker {
-	parsed := parseReviewIdempotencyMarkers(body)
-	markers := make([]ParsedReviewMarker, 0, len(parsed))
-	for _, marker := range parsed {
-		markers = append(markers, ParsedReviewMarker{ID: marker.ID, Head: marker.Head, Outcome: marker.Outcome})
+// ReviewEngagementHead recovers a loop's previous publication using the same
+// marker grammar and event policy as publish verification. Both GitHub GraphQL
+// and native review payloads are accepted. A valid review of the current head
+// prevents an older review from authorizing another full pass on that head.
+func ReviewEngagementHead(reviews []map[string]any, loopID, headSHA, login string, allowed []string, allowCleanComment bool) string {
+	login = normalizeReviewMarkerLogin(strings.TrimPrefix(strings.TrimSpace(login), "@"))
+	if login == "" || strings.TrimSpace(loopID) == "" || strings.TrimSpace(headSHA) == "" {
+		return ""
 	}
-	return markers
+	wantID := "reviewer:" + strings.TrimSpace(loopID)
+	previous := ""
+	for _, review := range reviews {
+		author, _ := review["author"].(map[string]any)
+		if author == nil {
+			author, _ = review["user"].(map[string]any)
+		}
+		if normalizeReviewMarkerLogin(asString(author["login"])) != login {
+			continue
+		}
+		event := reviewEventFromState(asString(review["state"]))
+		commit, _ := review["commit"].(map[string]any)
+		sha := strings.TrimSpace(asString(commit["oid"]))
+		if sha == "" {
+			sha = strings.TrimSpace(asString(review["commit_id"]))
+		}
+		if sha == "" {
+			continue
+		}
+		for _, marker := range parseReviewIdempotencyMarkers(asString(review["body"])) {
+			if marker.ID != wantID && !strings.HasPrefix(marker.ID, wantID+":") {
+				continue
+			}
+			if marker.Head != sha || !reviewMarkerEventAllowedForOutcome(marker.Outcome, event, allowed, allowCleanComment) {
+				continue
+			}
+			if sha == strings.TrimSpace(headSHA) {
+				return ""
+			}
+			previous = sha
+		}
+	}
+	return previous
 }
 
 func findReviewIdempotencyMarker(body string, marker string) (reviewIdempotencyMarker, bool) {

@@ -33,6 +33,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/reviewengagement"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
@@ -1524,26 +1525,25 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 }
 
 func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, detail PullRequestDetail, currentLogin string) (storage.LoopRecord, error) {
-	meta := parseJSONObject(loop.MetadataJSON)
-	if lastPublished, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && strings.TrimSpace(lastPublished) != "" {
+	if reviewengagement.PublishedHead(loop.MetadataJSON) != "" {
 		return loop, nil
 	}
-	reviews, err := r.reviewsForEngagementBackfill(ctx, project, loop, detail)
-	if err != nil {
+	engagedHead, err := reviewengagement.Resolve(loop.MetadataJSON, detail.HeadSHA, func() (string, error) {
+		reviews, err := r.reviewsForEngagementBackfill(ctx, project, loop, detail)
+		if err != nil {
+			return "", err
+		}
+		policy := r.effectiveReviewEvents(project.ID, loop.MetadataJSON)
+		return looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, r.allowedReviewEventsForPolicy(policy), sameReviewAuthorLogin(currentLogin, detail.Author)), nil
+	})
+	if err != nil || engagedHead == "" {
 		return loop, err
 	}
-	// Match publish verification: only promote ownership from markers that the
-	// effective clean/blocking policy would have accepted as a published review.
-	// A COMMENTED review with outcome=clean|blocking is rejected when policy
-	// requires APPROVE|REQUEST_CHANGES, so it must not backfill lastPublishedHeadSha.
-	policy := r.effectiveReviewEvents(project.ID, loop.MetadataJSON)
-	allowedEvents := r.allowedReviewEventsForPolicy(policy)
-	allowCleanComment := sameReviewAuthorLogin(currentLogin, detail.Author)
-	engagedHead := looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, allowedEvents, allowCleanComment)
-	if engagedHead == "" {
-		return loop, nil
-	}
 	return r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		// A concurrent publication wins over historical recovery.
+		if reviewengagement.PublishedHead(updated.MetadataJSON) != "" || !reviewengagement.Enabled(updated.MetadataJSON) {
+			return
+		}
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": engagedHead})
 		if err == nil {
 			updated.MetadataJSON = stringPtr(metadataJSON)
@@ -1583,143 +1583,12 @@ func (r *Runner) reviewsForEngagementBackfill(ctx context.Context, project stora
 	return refreshed.Reviews, nil
 }
 
-func looperReviewEngagementHead(reviews []map[string]any, login string, loopID string, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment bool) string {
-	login = normalizeLogin(login)
-	loopID = strings.TrimSpace(loopID)
-	currentHeadSHA = strings.TrimSpace(currentHeadSHA)
-	if login == "" || loopID == "" {
-		return ""
+func looperReviewEngagementHead(reviews []map[string]any, login, loopID, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment bool) string {
+	events := make([]string, len(allowedEvents))
+	for i, event := range allowedEvents {
+		events[i] = string(event)
 	}
-	wantID := "reviewer:" + loopID
-	engagedHead := ""
-	for _, review := range reviews {
-		author, _ := review["author"].(map[string]any)
-		if author == nil {
-			author, _ = review["user"].(map[string]any)
-		}
-		authorLogin, _ := stringFromAny(author["login"])
-		if normalizeLogin(authorLogin) != login {
-			continue
-		}
-		state, _ := stringFromAny(review["state"])
-		if !isSubmittedReviewState(state) {
-			continue
-		}
-		event := reviewEventFromSubmittedState(state)
-		if event == "" {
-			continue
-		}
-		commitSHA := ""
-		if commit, ok := review["commit"].(map[string]any); ok {
-			commitSHA, _ = stringFromAny(commit["oid"])
-		}
-		if commitSHA == "" {
-			commitSHA, _ = stringFromAny(review["commit_id"])
-		}
-		commitSHA = strings.TrimSpace(commitSHA)
-		if commitSHA == "" || commitSHA == currentHeadSHA {
-			continue
-		}
-		body, _ := stringFromAny(review["body"])
-		for _, marker := range githubinfra.ParseReviewMarkers(body) {
-			id := marker.ID
-			head := marker.Head
-			outcome := marker.Outcome
-			if id != wantID && !strings.HasPrefix(id, wantID+":") {
-				continue
-			}
-			if head != commitSHA {
-				continue
-			}
-			// Reuse the publish verifier's outcome/event/policy rules so a marker
-			// that verification would reject cannot authorize follow-up ownership.
-			if !reviewMarkerOutcomeEventAllowed(outcome, event, allowedEvents, allowCleanComment) {
-				continue
-			}
-			engagedHead = commitSHA
-		}
-	}
-	return engagedHead
-}
-
-// reviewEventFromSubmittedState maps a submitted GitHub/Forgejo review state to
-// the review-submit event token used by publish verification.
-func reviewEventFromSubmittedState(state string) ReviewEvent {
-	switch strings.ToUpper(strings.TrimSpace(state)) {
-	case "APPROVED":
-		return ReviewEventApprove
-	case "CHANGES_REQUESTED":
-		return ReviewEventRequestChanges
-	case "COMMENTED":
-		return ReviewEventComment
-	default:
-		return ""
-	}
-}
-
-// reviewMarkerOutcomeEventAllowed mirrors github.reviewMarkerEventAllowedForOutcome
-// (and forgejoNativeReviewMarkerEventAllowed): outcome=clean requires APPROVE when
-// that event is allowed, outcome=blocking requires REQUEST_CHANGES when allowed,
-// and COMMENT only matches non_blocking/actionable (or the explicit clean-comment
-// self-approval fallback).
-//
-// Outcome matching is exact (no case folding), matching github.isValidReviewMarkerOutcome
-// and runtimeValidReviewMarkerOutcome. Publish verification rejects outcome=BLOCKING
-// and similar variants; engagement recovery must not accept them either.
-func reviewMarkerOutcomeEventAllowed(outcome string, event ReviewEvent, allowed []ReviewEvent, allowCleanComment bool) bool {
-	if event == "" {
-		return false
-	}
-	// Same gate as the canonical marker parsers: only exact lowercase outcomes
-	// that publish verification would accept can authorize ownership backfill.
-	if !isRecognizedReviewOutcome(outcome) {
-		return false
-	}
-	if len(allowed) == 0 {
-		return true
-	}
-	if !reviewEventInAllowed(event, allowed) {
-		return false
-	}
-	switch outcome {
-	case "clean":
-		if allowCleanComment && event == ReviewEventComment {
-			return true
-		}
-		if reviewEventInAllowed(ReviewEventApprove, allowed) {
-			return event == ReviewEventApprove
-		}
-		return event == ReviewEventComment
-	case "blocking":
-		if reviewEventInAllowed(ReviewEventRequestChanges, allowed) {
-			return event == ReviewEventRequestChanges
-		}
-		return event == ReviewEventComment
-	case "non_blocking", "actionable":
-		return event == ReviewEventComment
-	default:
-		return false
-	}
-}
-
-// isRecognizedReviewOutcome mirrors github.isValidReviewMarkerOutcome and
-// runtimeValidReviewMarkerOutcome: exact lowercase tokens only.
-func isRecognizedReviewOutcome(outcome string) bool {
-	switch outcome {
-	case "clean", "non_blocking", "blocking", "actionable":
-		return true
-	default:
-		return false
-	}
-}
-
-func reviewEventInAllowed(event ReviewEvent, allowed []ReviewEvent) bool {
-	for _, candidate := range allowed {
-		if candidate == event {
-			return true
-		}
-	}
-	return false
+	return githubinfra.ReviewEngagementHead(reviews, loopID, currentHeadSHA, login, events, allowCleanComment)
 }
 
 func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
@@ -2313,6 +2182,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(startStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(startStep)}})
 	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(startStep), "resumed": resumedRun.Resumed})
+	engagementResolved := false
 	for _, step := range stepsFrom(startStep) {
 		stepStartedAt := r.now()
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
@@ -2320,7 +2190,26 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
-		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
+		// Resolve before the first eligibility/action step, including resumes that
+		// start after filter. Reuse discovered review data instead of a second PR read.
+		if !engagementResolved && step != stepDiscover && checkpoint.Detail != nil {
+			engagementResolved = true
+			if reviewengagement.Enabled(loop.MetadataJSON) && reviewengagement.PublishedHead(loop.MetadataJSON) == "" {
+				login, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+				err = lookupErr
+				if err == nil {
+					detail := PullRequestDetail{HeadSHA: checkpoint.Detail.HeadSHA, Author: checkpoint.Detail.Author, Reviews: checkpoint.Detail.Reviews}
+					recovered, recoverErr := r.backfillPublishedHeadFromLooperReview(ctx, *project, *loop, detail, login)
+					err = recoverErr
+					if err == nil {
+						loop = &recovered
+					}
+				}
+			}
+		}
+		if err == nil {
+			checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
+		}
 		if err != nil {
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
@@ -5530,7 +5419,7 @@ func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input s
 		return false, checkpoint, nil
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if isManualReviewerLoop(input.Loop) || !policy.RequireReviewRequest || checkpoint.Detail == nil {
+	if checkpoint.Detail == nil || !requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Detail.HeadSHA) {
 		return false, checkpoint, nil
 	}
 	currentLogin := strings.TrimSpace(checkpoint.Detail.CurrentLogin)
@@ -7072,12 +6961,10 @@ func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
 }
 
 func (r *Runner) allowedReviewEventsForPolicy(policy config.ReviewerReviewEventsConfig) []ReviewEvent {
-	events := []ReviewEvent{ReviewEventComment}
-	if policy.Clean == config.ReviewerReviewEventApprove {
-		events = append(events, ReviewEventApprove)
-	}
-	if policy.Blocking == config.ReviewerReviewEventRequestChanges {
-		events = append(events, ReviewEventRequestChanges)
+	allowed := reviewengagement.AllowedEvents(policy)
+	events := make([]ReviewEvent, len(allowed))
+	for i, event := range allowed {
+		events[i] = ReviewEvent(event)
 	}
 	return events
 }
@@ -7101,23 +6988,7 @@ func (r *Runner) reviewEventsForProject(projectID string) config.ReviewerReviewE
 }
 
 func (r *Runner) effectiveReviewEvents(projectID string, metadataJSON *string) config.ReviewerReviewEventsConfig {
-	// Prefer snapshotted loop metadata when present; otherwise use the live
-	// per-project policy so newly auto-discovered loops honor project overrides.
-	policy := r.reviewEventsForProject(projectID)
-	meta := parseJSONObject(metadataJSON)
-	if reviewEvents, ok := meta["reviewEvents"].(map[string]any); ok {
-		if clean, ok := stringFromAny(reviewEvents["clean"]); ok && strings.TrimSpace(clean) != "" {
-			if isValidCleanReviewEvent(clean) {
-				policy.Clean = config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(clean)))
-			}
-		}
-		if blocking, ok := stringFromAny(reviewEvents["blocking"]); ok && strings.TrimSpace(blocking) != "" {
-			if isValidBlockingReviewEvent(blocking) {
-				policy.Blocking = config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(blocking)))
-			}
-		}
-	}
-	return policy
+	return reviewengagement.Policy(metadataJSON, r.reviewEventsForProject(projectID))
 }
 
 func isValidCleanReviewEvent(value string) bool {
@@ -7760,19 +7631,7 @@ func requireReviewRequestForLoop(loop storage.LoopRecord, requireReviewRequest b
 }
 
 func reviewerFollowUpHasNewHead(loop storage.LoopRecord, headSHA string) bool {
-	if strings.TrimSpace(headSHA) == "" {
-		return false
-	}
-	meta := parseJSONObject(loop.MetadataJSON)
-	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
-		return false
-	}
-	loopMeta := reviewerLoopMetadata(meta)
-	if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
-		return false
-	}
-	lastPublishedHeadSHA, ok := stringFromAny(meta["lastPublishedHeadSha"])
-	return ok && lastPublishedHeadSHA != "" && lastPublishedHeadSHA != headSHA
+	return reviewengagement.HasNewHead(loop.MetadataJSON, headSHA)
 }
 
 func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startStep ReviewerStep) bool {

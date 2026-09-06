@@ -3474,6 +3474,9 @@ func TestVerifyAgentNativeReviewMarkerDoesNotReuseLoopPrefixForConvergence(t *te
 	if found.Found {
 		t.Fatalf("found = %#v, want miss so a new clean/blocking review can publish", found)
 	}
+	if len(github.reviewMarkerInputs) != 1 {
+		t.Fatalf("convergence must only look up its own identity, got %#v", github.reviewMarkerInputs)
+	}
 	for _, in := range github.reviewMarkerInputs {
 		if strings.Contains(in.Marker, "id_prefix=") {
 			t.Fatalf("convergence verification reused loop-prefix marker %q", in.Marker)

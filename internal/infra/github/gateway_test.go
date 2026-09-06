@@ -2964,3 +2964,14 @@ type reviewSubmitDiagnosticEvent struct {
 	Name   string
 	Fields map[string]any
 }
+
+func TestReviewEngagementDoesNotRecoverOldHeadWhenCurrentHeadAlreadyReviewed(t *testing.T) {
+	t.Parallel()
+	old := map[string]any{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "commit_id": "old", "body": "<!-- looper:review id=reviewer:loop head=old outcome=blocking -->"}
+	current := map[string]any{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "commit_id": "new", "body": "<!-- looper:review id=reviewer:loop head=new outcome=blocking -->"}
+	for _, reviews := range [][]map[string]any{{old, current}, {current, old}} {
+		if got := ReviewEngagementHead(reviews, "loop", "new", "bob", []string{"COMMENT", "REQUEST_CHANGES"}, false); got != "" {
+			t.Fatalf("current head granted full follow-up via %q", got)
+		}
+	}
+}

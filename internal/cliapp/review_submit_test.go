@@ -20,6 +20,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/outboundguard"
+	"github.com/nexu-io/looper/internal/reviewengagement"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -425,26 +426,36 @@ func TestTrustedFollowUpNewHeadReviewRequestBypass(t *testing.T) {
 		t.Fatalf("Runs.Upsert(run_followup) error = %v", err)
 	}
 
+	requestedHead := "new-head"
+	resolve := func(loop storage.LoopRecord) (bool, error) {
+		previous, err := reviewengagement.Resolve(loop.MetadataJSON, requestedHead, func() (string, error) { t.Fatal("stored publication must avoid recovery"); return "", nil })
+		return previous != "" && previous != requestedHead, err
+	}
 	// Automatic follow-up prompts do not pass --reviewer-run-id; resolve via current run.
-	bypass, err := trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, "new-head")
+	requestedHead = "new-head"
+	bypass, err := trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, resolve)
 	if err != nil || !bypass {
 		t.Fatalf("trustedCurrentFollowUpNewHeadReviewerBypass(new head) = %v, %v; want true, nil", bypass, err)
 	}
-	bypass, err = trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, "old-head")
+	requestedHead = "old-head"
+	bypass, err = trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, resolve)
 	if err != nil || bypass {
 		t.Fatalf("trustedCurrentFollowUpNewHeadReviewerBypass(same head) = %v, %v; want false, nil", bypass, err)
 	}
 
 	// Explicit run-id path must also honor follow-up new-head.
-	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "run_followup", "new-head")
+	requestedHead = "new-head"
+	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "run_followup", resolve)
 	if err != nil || !bypass {
 		t.Fatalf("trustedFollowUpNewHeadReviewerRun(new head) = %v, %v; want true, nil", bypass, err)
 	}
-	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "run_followup", "old-head")
+	requestedHead = "old-head"
+	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "run_followup", resolve)
 	if err != nil || bypass {
 		t.Fatalf("trustedFollowUpNewHeadReviewerRun(same head) = %v, %v; want false, nil", bypass, err)
 	}
-	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "missing_run", "new-head")
+	requestedHead = "new-head"
+	bypass, err = trustedFollowUpNewHeadReviewerRun(context.Background(), repos, repo, prNumber, "missing_run", resolve)
 	if err != nil || bypass {
 		t.Fatalf("trustedFollowUpNewHeadReviewerRun(missing run) = %v, %v; want false, nil", bypass, err)
 	}
@@ -453,7 +464,8 @@ func TestTrustedFollowUpNewHeadReviewRequestBypass(t *testing.T) {
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_followup", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &sameHeadMeta, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Loops.Upsert(same head) error = %v", err)
 	}
-	bypass, err = trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, "new-head")
+	requestedHead = "new-head"
+	bypass, err = trustedCurrentFollowUpNewHeadReviewerBypass(context.Background(), repos, repo, prNumber, resolve)
 	if err != nil || bypass {
 		t.Fatalf("trustedCurrentFollowUpNewHeadReviewerBypass(same published head) = %v, %v; want false, nil", bypass, err)
 	}
