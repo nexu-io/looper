@@ -444,8 +444,8 @@ func TestDiagnoseLoopBudgetHoldRecommendsUnpauseStop(t *testing.T) {
 	if !strings.Contains(got, "Hold: review_fix_budget_exhausted") {
 		t.Fatalf("human inspect = %q, want Hold reason", got)
 	}
-	if !strings.Contains(got, "Resume: looper unpause 12 / looper stop 12") {
-		t.Fatalf("human inspect = %q, want Resume commands", got)
+	if !strings.Contains(got, "Release: looper unpause 12 / looper stop 12") {
+		t.Fatalf("human inspect = %q, want Release commands", got)
 	}
 	if strings.Contains(got, "looper retry 12") {
 		t.Fatalf("human inspect = %q, must not suggest retry", got)

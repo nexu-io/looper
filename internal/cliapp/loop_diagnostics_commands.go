@@ -598,7 +598,12 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 		diagnosis.RecommendedAction = recommendedActionForState(state)
 	}
 	if associateQueue && loops.IsReviewFixPairHold(loop) {
-		diagnosis.RecommendedAction = reviewFixInspectResume(loop)
+		release := reviewFixInspectResume(loop)
+		if loops.IsReviewScopeHumanHold(loop) && !loops.IsReviewFixBudgetHold(loop) {
+			diagnosis.RecommendedAction = release + "; unpause releases only the scope hold; then " + diagnosis.RecommendedAction
+		} else {
+			diagnosis.RecommendedAction = release
+		}
 	}
 	// Expand <seq> before emitting JSON/human output so operators and scripts
 	// never see the literal placeholder outside writeHumanLoopInspect.
@@ -995,12 +1000,13 @@ func writeHumanLoopInspect(w io.Writer, output loopInspectOutput) error {
 		}
 	}
 	if output.Handoff != nil {
-		label := "Resume"
-		if output.Handoff.Kind == loops.HITLKindReviewScopeHuman {
-			label = "Release"
-		}
-		if _, err := fmt.Fprintf(w, "%s: %s\n", label, output.Handoff.Resume); err != nil {
+		if _, err := fmt.Fprintf(w, "Release: %s\n", output.Handoff.Resume); err != nil {
 			return err
+		}
+		if output.Handoff.Kind == loops.HITLKindReviewFixBudget {
+			if _, err := fmt.Fprintln(w, "unpause releases the budget hold and refills only exhausted meters; other holds, including scope holds, may still prevent the pair from running."); err != nil {
+				return err
+			}
 		}
 		if output.Handoff.Kind == loops.HITLKindReviewScopeHuman {
 			if _, err := fmt.Fprintln(w, "unpause releases the scope hold; failed, interrupted, human takeover, or a manual pause remain."); err != nil {

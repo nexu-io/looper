@@ -34,7 +34,7 @@ const SCOPE_REASONS: Record<string, true> = {
 };
 
 const BUDGET_LEAD =
-  "Continue/Unpause refills only exhausted meters and resumes the pair; Stop terminates both; exhaustion is not approval.";
+  "Continue/Unpause releases the budget hold and refills only exhausted meters; other holds, including scope holds, may still prevent the pair from running. Stop terminates both; exhaustion is not approval.";
 
 const SCOPE_LEAD =
   "Continue/Unpause releases the scope hold; independent blockers (failed, interrupted, human takeover, or a manual pause) remain; Stop terminates both.";

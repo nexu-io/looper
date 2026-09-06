@@ -65,6 +65,24 @@ describe("readReviewFixHandoff", () => {
     });
   });
 
+  it("does not promise resume when budget and scope holds coexist", () => {
+    const handoff = readReviewFixHandoff({
+      seq: 12,
+      status: "paused",
+      metadataJson: JSON.stringify({
+        pauseReason: "sibling_review_fix_budget",
+        reviewFixBudget: { pauseReason: "sibling_review_fix_budget" },
+        reviewScopeHuman: {
+          heldBy: "reviewer",
+          pauseReason: "sibling_review_scope_human",
+        },
+      }),
+    });
+    expect(handoff?.lead).toContain("releases the budget hold");
+    expect(handoff?.lead).toContain("other holds, including scope holds");
+    expect(handoff?.lead).not.toContain("resumes the pair");
+  });
+
   it("ignores ordinary paused loops", () => {
     expect(
       readReviewFixHandoff({
@@ -101,7 +119,8 @@ describe("readReviewFixHandoff", () => {
       }),
     });
     expect(budget?.lead).toContain("refills only exhausted meters");
-    expect(budget?.lead).toContain("resumes the pair");
+    expect(budget?.lead).toContain("other holds, including scope holds");
+    expect(budget?.lead).not.toContain("resumes the pair");
     expect(budget?.lead).toContain("exhaustion is not approval");
     expect(budget?.lead).not.toContain("releases the scope hold");
 
