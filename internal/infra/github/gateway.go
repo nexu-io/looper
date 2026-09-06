@@ -2485,7 +2485,9 @@ var reviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
 // marker grammar and event policy as publish verification. Both GitHub GraphQL
 // and native review payloads are accepted. A valid review of the current head
 // prevents an older review from authorizing another full pass on that head.
-func ReviewEngagementHead(reviews []map[string]any, loopID, headSHA, login string, allowed []string, allowCleanComment bool) string {
+// allowBlockingComment is exclusively the Forgejo self-review transport fallback;
+// GitHub callers leave it false and retain their existing outcome/event policy.
+func ReviewEngagementHead(reviews []map[string]any, loopID, headSHA, login string, allowed []string, allowCleanComment, allowBlockingComment bool) string {
 	login = normalizeReviewMarkerLogin(strings.TrimPrefix(strings.TrimSpace(login), "@"))
 	if login == "" || strings.TrimSpace(loopID) == "" || strings.TrimSpace(headSHA) == "" {
 		return ""
@@ -2513,7 +2515,11 @@ func ReviewEngagementHead(reviews []map[string]any, loopID, headSHA, login strin
 			if marker.ID != wantID && !strings.HasPrefix(marker.ID, wantID+":") {
 				continue
 			}
-			if marker.Head != sha || !reviewMarkerEventAllowedForOutcome(marker.Outcome, event, allowed, allowCleanComment) {
+			eventAllowed := reviewMarkerEventAllowedForOutcome(marker.Outcome, event, allowed, allowCleanComment)
+			if allowBlockingComment && marker.Outcome == "blocking" && event == "COMMENT" && reviewEventAllowed(event, allowed) {
+				eventAllowed = true
+			}
+			if marker.Head != sha || !eventAllowed {
 				continue
 			}
 			if sha == strings.TrimSpace(headSHA) {

@@ -1114,6 +1114,100 @@ func TestEffectiveReviewSubmitEventDoesNotFetchUserForComment(t *testing.T) {
 	}
 }
 
+func TestForgejoSelfReviewTransportPreservesOutcomeAndDisclosure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, event, outcome, author, wantEvent string
+	}{
+		{name: "self blocking", event: "REQUEST_CHANGES", outcome: "blocking", author: "Reviewer", wantEvent: "COMMENT"},
+		{name: "self clean", event: "APPROVE", outcome: "clean", author: "reviewer", wantEvent: "COMMENT"},
+		{name: "other author blocking", event: "REQUEST_CHANGES", outcome: "blocking", author: "alice", wantEvent: "REQUEST_CHANGES"},
+		{name: "other author clean", event: "APPROVE", outcome: "clean", author: "alice", wantEvent: "APPROVED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var published map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/swagger.v1.json":
+					_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
+					_, _ = w.Write([]byte(`{"id":7,"login":"reviewer"}`))
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+					_, _ = w.Write([]byte(`[]`))
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v1/repos/acme/looper/pulls/42/reviews":
+					if err := json.NewDecoder(r.Body).Decode(&published); err != nil {
+						t.Error(err)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 9, "state": published["event"], "body": published["body"], "commit_id": "head", "user": map[string]any{"login": "reviewer"}})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			vendor := config.AgentVendorCodex
+			cfg.Agent.Vendor = &vendor
+			cfg.Disclosure.Enabled = true
+			cfg.Disclosure.IncludeAgent = true
+			cfg.Disclosure.IncludeOS = false
+			cfg.Disclosure.Channels.ReviewComment = true
+			cfg.Disclosure.Channels.InlineCommentVisible = false
+			stamper := disclosure.FromConfig(cfg)
+			gateway := forgejoReviewSubmitGateway{client: client, stamper: stamper}
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			stderr := &bytes.Buffer{}
+			cmd.SetErr(stderr)
+			event, err := (&commandRuntime{}).effectiveReviewSubmitEvent(cmd, gateway, "acme/looper", 42, tc.event, tc.author, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := "@" + tc.author + " Thanks for the implementation; I checked the changed behavior.\n\n<!-- looper:review id=reviewer:loop:head head=head outcome=" + tc.outcome + " -->"
+			input := githubinfra.SubmitReviewInput{PRNumber: 42, Event: event, Body: body, CommitID: "head"}
+			if tc.outcome == "blocking" {
+				input.Comments = []githubinfra.ReviewComment{{Body: "Return the discounted total.", Path: "app.go", Line: 1, Side: "RIGHT"}}
+			}
+			if err := gateway.SubmitReview(context.Background(), input); err != nil {
+				t.Fatal(err)
+			}
+			if published["event"] != tc.wantEvent || published["commit_id"] != "head" {
+				t.Fatalf("published transport = %#v; want %s at head", published, tc.wantEvent)
+			}
+			wantBody := stamper.Markdown(body, "reviewer", disclosure.ChannelReviewComment)
+			if published["body"] != wantBody {
+				t.Fatalf("Forgejo body differs from the shared GitHub template:\n%v\nwant:\n%s", published["body"], wantBody)
+			}
+			for _, want := range []string{"🔁 Powered by ", "runner=reviewer · agent=codex · " + disclosure.Slogan, "outcome=" + tc.outcome} {
+				if !strings.Contains(wantBody, want) {
+					t.Fatalf("body %q missing %q", wantBody, want)
+				}
+			}
+			if tc.outcome == "blocking" {
+				comments, _ := published["comments"].([]any)
+				if len(comments) != 1 {
+					t.Fatalf("published comments = %#v, want preserved blocking inline", comments)
+				}
+				comment, _ := comments[0].(map[string]any)
+				if comment["body"] != stamper.ReviewComment(input.Comments[0].Body, "reviewer") {
+					t.Fatalf("inline disclosure differs from GitHub: %#v", comment)
+				}
+			}
+			if strings.EqualFold(tc.author, "reviewer") && !strings.Contains(stderr.String(), "authenticated Forgejo user") {
+				t.Fatalf("self-review downgrade diagnostic = %q", stderr.String())
+			}
+		})
+	}
+}
+
 func TestWrapReviewSubmitErrorSurfacesContentSafetyRecoveryGuidance(t *testing.T) {
 	t.Parallel()
 	cmd := &cobra.Command{}

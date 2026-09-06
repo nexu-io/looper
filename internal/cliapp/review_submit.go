@@ -689,18 +689,31 @@ func wrapReviewSubmitError(cmd *cobra.Command, repo string, prNumber int64, even
 	return fmt.Errorf("%s: %w", prefix, err)
 }
 
-func (r *commandRuntime) effectiveReviewSubmitEvent(cmd *cobra.Command, gh reviewSubmitGateway, repo string, prNumber int64, event string, authorLogin string, cwd string) (string, error) {
-	if !strings.EqualFold(strings.TrimSpace(event), "APPROVE") || strings.TrimSpace(authorLogin) == "" {
+func (r *commandRuntime) effectiveReviewSubmitEvent(cmd *cobra.Command, gateway reviewSubmitGateway, repo string, prNumber int64, event string, authorLogin string, cwd string) (string, error) {
+	_, isForgejo := gateway.(forgejoReviewSubmitGateway)
+	isApproval := strings.EqualFold(strings.TrimSpace(event), "APPROVE")
+	isForgejoChangeRequest := isForgejo && strings.EqualFold(strings.TrimSpace(event), "REQUEST_CHANGES")
+	if (!isApproval && !isForgejoChangeRequest) || strings.TrimSpace(authorLogin) == "" {
 		return event, nil
 	}
-	currentLogin, err := gh.GetCurrentUserLogin(cmd.Context(), cwd)
+	providerName := "GitHub"
+	if isForgejo {
+		providerName = "Forgejo"
+	}
+	currentLogin, err := gateway.GetCurrentUserLogin(cmd.Context(), cwd)
 	if err != nil {
-		return "", fmt.Errorf("determine authenticated GitHub user for self-approval check: %w", err)
+		return "", fmt.Errorf("determine authenticated %s user for self-review check: %w", providerName, err)
 	}
 	if !sameGitHubLogin(currentLogin, authorLogin) {
 		return event, nil
 	}
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "looper: downgrading APPROVE review to COMMENT for %s#%d because authenticated GitHub user %q authored the pull request and GitHub does not allow self-approval\n", repo, prNumber, strings.TrimSpace(currentLogin))
+	restriction := providerName + " does not allow self-approval"
+	if isForgejoChangeRequest {
+		restriction = "Forgejo does not allow authors to request changes on their own pull requests"
+	}
+	// This only adapts native transport. The validated outcome marker and inline
+	// findings remain unchanged, including a blocking outcome on a COMMENT review.
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "looper: downgrading %s review to COMMENT for %s#%d because authenticated %s user %q authored the pull request and %s\n", event, repo, prNumber, providerName, strings.TrimSpace(currentLogin), restriction)
 	return "COMMENT", nil
 }
 
@@ -1140,7 +1153,9 @@ func recoverReviewSubmitEngagement(ctx context.Context, gateway reviewSubmitGate
 	}
 	policyCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
 	policy := reviewengagement.Policy(loop.MetadataJSON, config.ProjectRoleConfigs(policyCfg, loop.ProjectID).Reviewer.Behavior.ReviewEvents)
-	return githubinfra.ReviewEngagementHead(detail.Reviews, loop.ID, headSHA, login, reviewengagement.AllowedEvents(policy), sameGitHubLogin(login, detail.Author)), nil
+	selfAuthored := sameGitHubLogin(login, detail.Author)
+	_, isForgejo := gateway.(forgejoReviewSubmitGateway)
+	return githubinfra.ReviewEngagementHead(detail.Reviews, loop.ID, headSHA, login, reviewengagement.AllowedEvents(policy), selfAuthored, selfAuthored && isForgejo), nil
 }
 
 func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {

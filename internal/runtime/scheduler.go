@@ -702,9 +702,15 @@ func forgeLabelNames(labels []forge.Label) []string {
 	return names
 }
 
-func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
+func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool, includeComments bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
 	requested := pr.Reviewers
-	reviews, err := client.ListPullRequestReviews(ctx, pr.Number)
+	var reviews []forge.PullRequestReview
+	var err error
+	if includeComments {
+		reviews, err = client.ListPullRequestReviews(ctx, pr.Number)
+	} else {
+		reviews, err = client.ListPullRequestReviewSummaries(ctx, pr.Number)
+	}
 	if err != nil {
 		var capabilityErr *forge.UnsupportedCapabilityError
 		if !compatibilityFallback || !errors.As(err, &capabilityErr) {
@@ -712,31 +718,73 @@ func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr for
 		}
 	}
 	objects := make([]map[string]any, 0, len(reviews))
-	latestStates := map[string]string{}
+	latestVotes := map[string]forge.PullRequestReview{}
 	for _, review := range reviews {
 		objects = append(objects, map[string]any{
-			"id":     review.ID,
-			"author": map[string]any{"login": review.User.Login},
-			"body":   review.Body,
-			"state":  review.State,
-			"commit": map[string]any{"oid": review.CommitID},
-			"url":    review.HTMLURL,
+			"id":        review.ID,
+			"author":    map[string]any{"login": review.User.Login},
+			"body":      review.Body,
+			"state":     review.State,
+			"commit":    map[string]any{"oid": review.CommitID},
+			"url":       review.HTMLURL,
+			"comments":  forgeReviewCommentsToObjects(review.Comments),
+			"dismissed": review.Dismissed,
+			"stale":     review.Stale,
 		})
-		if login := strings.ToLower(strings.TrimSpace(review.User.Login)); login != "" {
-			latestStates[login] = review.State
+		if login := strings.ToLower(strings.TrimSpace(review.User.Login)); login != "" && (review.State == "CHANGES_REQUESTED" || review.State == "APPROVED") && !review.Dismissed {
+			if prior, found := latestVotes[login]; !found || review.ID > prior.ID {
+				latestVotes[login] = review
+			}
 		}
 	}
 	decision := ""
-	for _, state := range latestStates {
-		if state == "CHANGES_REQUESTED" {
+	for _, review := range latestVotes {
+		if review.State == "CHANGES_REQUESTED" {
 			decision = "CHANGES_REQUESTED"
 			break
 		}
-		if state == "APPROVED" {
+		if review.State == "APPROVED" {
 			decision = "APPROVED"
 		}
 	}
 	return forgeIdentityLogins(requested), forgeNetworkPolicyUsers(requested), objects, decision, nil
+}
+
+func forgeReviewCommentsToObjects(comments []forge.PullRequestReviewComment) []map[string]any {
+	objects := make([]map[string]any, 0, len(comments))
+	for _, comment := range comments {
+		objects = append(objects, map[string]any{
+			"id": comment.ID, "body": comment.Body, "author": map[string]any{"login": comment.User.Login},
+			"url": comment.HTMLURL, "path": comment.Path, "diffHunk": comment.DiffHunk,
+			"isResolved": comment.Resolver.Value != nil, "updatedAt": comment.UpdatedAt,
+		})
+	}
+	return objects
+}
+
+func forgeReviewContextComments(reviews []map[string]any) []map[string]any {
+	var comments []map[string]any
+	for _, review := range reviews {
+		state, _ := review["state"].(string)
+		if state == "PENDING" || state == "DISMISSED" {
+			continue
+		}
+		inline, _ := review["comments"].([]map[string]any)
+		comments = append(comments, inline...)
+	}
+	return comments
+}
+
+func forgeChecksToObjects(checks []forge.CommitCheck) []map[string]any {
+	objects := make([]map[string]any, 0, len(checks))
+	for _, check := range checks {
+		objects = append(objects, map[string]any{
+			"id": check.ID, "name": check.Name, "state": check.State,
+			"description": check.Description, "url": check.URL, "detailsUrl": check.URL,
+			"actionRunId": check.ActionRunID,
+		})
+	}
+	return objects
 }
 
 func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
@@ -1138,11 +1186,15 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), false)
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HasConflicts: conflicted, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -1171,11 +1223,15 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), false)
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HasConflicts: conflicted, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -1236,11 +1292,19 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), true)
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
+		checks, err := client.ListCommitChecks(ctx, pr.Head.SHA)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		return reviewer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, HasConflicts: conflicted, ChecksSummary: summarizeCheckStates(forgeChecksToObjects(checks)), Comments: forgeReviewContextComments(reviews), Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1410,12 +1474,15 @@ func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input revi
 		if !ok {
 			continue
 		}
+		if review.CommitID != "" && !strings.EqualFold(strings.TrimSpace(review.CommitID), marker.Head) {
+			continue
+		}
 		author := strings.TrimSpace(review.User.Login)
 		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
 			continue
 		}
 		event := forgejoReviewEventFromState(review.State)
-		if !forgejoNativeReviewMarkerEventAllowed(marker.Outcome, event, input.AllowedReviewEvents, input.AllowCleanComment) {
+		if !forgejoNativeReviewMarkerEventAllowed(marker.Outcome, event, input.AllowedReviewEvents, input.AllowCleanComment, input.AllowBlockingComment) {
 			continue
 		}
 		inlineBodies := make([]string, 0, len(review.Comments))
@@ -1445,8 +1512,8 @@ func forgejoReviewEventFromState(state string) reviewer.ReviewEvent {
 // forgejoNativeReviewMarkerEventAllowed mirrors github.reviewMarkerEventAllowedForOutcome so
 // outcome=clean requires APPROVE when that event is allowed, outcome=blocking requires
 // REQUEST_CHANGES when allowed, and COMMENT only matches non-blocking/actionable (or the
-// explicit clean-comment self-approval fallback).
-func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent, allowCleanComment bool) bool {
+// explicit self-authored COMMENT transport fallbacks).
+func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent, allowCleanComment, allowBlockingComment bool) bool {
 	if event == "" {
 		return false
 	}
@@ -1466,6 +1533,9 @@ func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.Review
 		}
 		return event == reviewer.ReviewEventComment
 	case "blocking":
+		if allowBlockingComment && event == reviewer.ReviewEventComment {
+			return true
+		}
 		if forgejoReviewEventAllowed(reviewer.ReviewEventRequestChanges, allowed) {
 			return event == reviewer.ReviewEventRequestChanges
 		}
@@ -2183,7 +2253,15 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 		if err != nil {
 			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
-		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
+		checks, err := client.ListCommitChecks(ctx, pr.Head.SHA)
+		if err != nil {
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+		if err != nil {
+			return fixer.PullRequestDetail{}, err
+		}
+		return fixer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Checks: forgeChecksToObjects(checks), HasConflicts: conflicted, Author: pr.User.Login}, nil
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
@@ -2374,6 +2452,10 @@ func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input 
 				IsResolved:          comment.Resolver.Value != nil,
 				Author:              comment.User.Login,
 				UpdatedAt:           comment.UpdatedAt,
+				ReviewBody:          comment.ReviewBody,
+				ReviewState:         comment.ReviewState,
+				ReviewCommitID:      comment.ReviewCommitID,
+				ReviewAuthor:        comment.ReviewAuthor,
 			})
 		}
 		return out, nil
@@ -2489,10 +2571,30 @@ func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input f
 }
 
 func (a fixerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input fixer.PullRequestReviewersInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
+	}
 	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) ListPullRequestReviews(ctx context.Context, input fixer.ViewPullRequestInput) ([]fixer.ReviewSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		reviews, err := client.ListPullRequestReviewSummaries(ctx, input.PRNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]fixer.ReviewSummary, 0, len(reviews))
+		for _, review := range reviews {
+			out = append(out, fixer.ReviewSummary{ID: review.ID, State: review.State, Author: review.User.Login, Body: review.Body})
+		}
+		return out, nil
+	}
 	reviews, err := a.gateway.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return nil, err
@@ -2505,6 +2607,12 @@ func (a fixerGitHubAdapter) ListPullRequestReviews(ctx context.Context, input fi
 }
 
 func (a fixerGitHubAdapter) DismissReview(ctx context.Context, input fixer.DismissReviewInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.DismissPullRequestReview(ctx, input.PRNumber, input.ReviewID, input.Message)
+	}
 	return a.gateway.DismissReview(ctx, githubinfra.DismissReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, ReviewID: input.ReviewID, Message: input.Message, CWD: input.CWD})
 }
 

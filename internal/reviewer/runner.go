@@ -164,6 +164,7 @@ type PullRequestSummary struct {
 
 type PullRequestDetail struct {
 	Number             int64
+	URL                string
 	Title              string
 	Body               string
 	State              string
@@ -270,7 +271,10 @@ type VerifyReviewMarkerInput struct {
 	AllowedReviewEvents []ReviewEvent
 	AuthorLogin         string
 	AllowCleanComment   bool
-	CWD                 string
+	// Forgejo rejects self-authored change requests; the trusted wrapper keeps
+	// outcome=blocking and publishes COMMENT for this transport fallback only.
+	AllowBlockingComment bool
+	CWD                  string
 }
 
 type ReviewMarkerResult struct {
@@ -1534,7 +1538,8 @@ func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, proj
 			return "", err
 		}
 		policy := r.effectiveReviewEvents(project.ID, loop.MetadataJSON)
-		return looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, r.allowedReviewEventsForPolicy(policy), sameReviewAuthorLogin(currentLogin, detail.Author)), nil
+		selfAuthored := sameReviewAuthorLogin(currentLogin, detail.Author)
+		return looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, r.allowedReviewEventsForPolicy(policy), selfAuthored, selfAuthored && r.forgejoProject(project.ID)), nil
 	})
 	if err != nil || engagedHead == "" {
 		return loop, err
@@ -1583,12 +1588,12 @@ func (r *Runner) reviewsForEngagementBackfill(ctx context.Context, project stora
 	return refreshed.Reviews, nil
 }
 
-func looperReviewEngagementHead(reviews []map[string]any, login, loopID, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment bool) string {
+func looperReviewEngagementHead(reviews []map[string]any, login, loopID, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment, allowBlockingComment bool) string {
 	events := make([]string, len(allowedEvents))
 	for i, event := range allowedEvents {
 		events[i] = string(event)
 	}
-	return githubinfra.ReviewEngagementHead(reviews, loopID, currentHeadSHA, login, events, allowCleanComment)
+	return githubinfra.ReviewEngagementHead(reviews, loopID, currentHeadSHA, login, events, allowCleanComment, allowBlockingComment)
 }
 
 func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
@@ -5464,7 +5469,8 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
 	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON))
 	allowCleanComment := sameReviewAuthorLogin(currentLogin, prAuthorLogin)
-	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	allowBlockingComment := allowCleanComment && r.forgejoProject(input.Project.ID)
+	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, AllowBlockingComment: allowBlockingComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}
@@ -5473,12 +5479,12 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return found, nil
 	}
 	bareLoopMarker := agentNativeBareLoopReviewMarker(input.Loop.ID, headSHA)
-	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: bareLoopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: bareLoopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, AllowBlockingComment: allowBlockingComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}
 	loopMarker := agentNativeLoopReviewMarker(input.Loop.ID, headSHA)
-	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: loopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: loopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, AllowBlockingComment: allowBlockingComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}

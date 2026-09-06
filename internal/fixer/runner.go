@@ -160,6 +160,7 @@ type PullRequestSummary struct {
 
 type PullRequestDetail struct {
 	Number         int64
+	URL            string
 	State          string
 	IsDraft        bool
 	Labels         []string
@@ -270,6 +271,10 @@ type NativeReviewComment struct {
 	IsResolved          bool
 	Author              string
 	UpdatedAt           string
+	ReviewBody          string
+	ReviewState         string
+	ReviewCommitID      string
+	ReviewAuthor        string
 }
 
 func NativeReviewCommentFingerprint(commentID int64, updatedAt string) string {

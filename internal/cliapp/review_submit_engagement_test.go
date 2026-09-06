@@ -106,37 +106,50 @@ esac
 
 func TestForgejoReviewSubmitRecoversNativeEngagement(t *testing.T) {
 	t.Parallel()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/swagger.v1.json":
-			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
-		case "/api/v1/user":
-			_, _ = w.Write([]byte(`{"login":"bob"}`))
-		case "/api/v1/repos/acme/looper/pulls/42":
-			_, _ = w.Write([]byte(`{"number":42,"state":"open","user":{"login":"alice"},"head":{"sha":"new"}}`))
-		case "/api/v1/repos/acme/looper/pulls/42/reviews/1/comments":
-			_, _ = w.Write([]byte(`[]`))
-		case "/api/v1/repos/acme/looper/pulls/42/reviews":
-			_, _ = w.Write([]byte(`[{"id":1,"user":{"login":"bob"},"state":"REQUEST_CHANGES","commit_id":"old","body":"<!-- looper:review id=reviewer:loop head=old outcome=blocking -->"}]`))
-		default:
-			t.Errorf("unexpected request: %s", r.URL.Path)
-			w.WriteHeader(404)
-		}
-	}))
-	defer server.Close()
-	client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Storage.DBPath = filepath.Join(t.TempDir(), "absent.sqlite")
-	meta := `{"followUpdates":true,"loop":{"enabled":true},"reviewEvents":{"blocking":"REQUEST_CHANGES"}}`
-	loop := storage.LoopRecord{ID: "loop", ProjectID: "project", MetadataJSON: &meta}
-	got, err := recoverReviewSubmitEngagement(context.Background(), forgejoReviewSubmitGateway{client: client}, cfg, loop, "acme/looper", 42, "new", t.TempDir())
-	if err != nil || got != "old" {
-		t.Fatalf("recovery = %q, %v", got, err)
+	for _, tc := range []struct {
+		name, author, reviewAuthor, state, markerHead, want string
+	}{
+		{name: "native change request", author: "alice", reviewAuthor: "bob", state: "REQUEST_CHANGES", markerHead: "old", want: "old"},
+		{name: "self blocking fallback", author: "bob", reviewAuthor: "bob", state: "COMMENT", markerHead: "old", want: "old"},
+		{name: "other author comment is not a fallback", author: "alice", reviewAuthor: "bob", state: "COMMENT", markerHead: "old"},
+		{name: "self fallback still requires review author", author: "bob", reviewAuthor: "alice", state: "COMMENT", markerHead: "old"},
+		{name: "self fallback still requires matching commit", author: "bob", reviewAuthor: "bob", state: "COMMENT", markerHead: "different"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/swagger.v1.json":
+					_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
+				case "/api/v1/user":
+					_, _ = w.Write([]byte(`{"login":"bob"}`))
+				case "/api/v1/repos/acme/looper/pulls/42":
+					_ = json.NewEncoder(w).Encode(map[string]any{"number": 42, "state": "open", "user": map[string]any{"login": tc.author}, "head": map[string]any{"sha": "new"}})
+				case "/api/v1/repos/acme/looper/pulls/42/reviews/1/comments":
+					_, _ = w.Write([]byte(`[]`))
+				case "/api/v1/repos/acme/looper/pulls/42/reviews":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1, "user": map[string]any{"login": tc.reviewAuthor}, "state": tc.state, "commit_id": "old", "body": "<!-- looper:review id=reviewer:loop head=" + tc.markerHead + " outcome=blocking -->"}})
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+					w.WriteHeader(404)
+				}
+			}))
+			defer server.Close()
+			client, err := forge.NewForgejoClient(forge.RepositoryRef{ProviderID: "forgejo", Kind: forge.ProviderKindForgejo, BaseURL: server.URL, Repo: "acme/looper"}, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Storage.DBPath = filepath.Join(t.TempDir(), "absent.sqlite")
+			meta := `{"followUpdates":true,"loop":{"enabled":true},"reviewEvents":{"blocking":"REQUEST_CHANGES"}}`
+			loop := storage.LoopRecord{ID: "loop", ProjectID: "project", MetadataJSON: &meta}
+			got, err := recoverReviewSubmitEngagement(context.Background(), forgejoReviewSubmitGateway{client: client}, cfg, loop, "acme/looper", 42, "new", t.TempDir())
+			if err != nil || got != tc.want {
+				t.Fatalf("recovery = %q, %v; want %q", got, err, tc.want)
+			}
+		})
 	}
 }

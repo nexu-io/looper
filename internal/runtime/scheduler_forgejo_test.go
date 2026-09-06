@@ -382,6 +382,10 @@ func TestReviewerGitHubAdapterForgejoCommentOnlyFlow(t *testing.T) {
 	var comparePath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/statuses/"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []any{}})
 		case r.Method == http.MethodGet && r.URL.Path == "/swagger.v1.json":
 			_, _ = w.Write([]byte(`{"paths":{}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
@@ -581,6 +585,10 @@ func TestFixerGitHubAdapterForgejoSummaryCommentNoResolveFlow(t *testing.T) {
 	var removedLabelPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/statuses/"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []any{}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "login": "fixer-bot"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":

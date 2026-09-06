@@ -252,13 +252,13 @@ func TestLooperReviewEngagementHeadMatchesPublishVerifierGates(t *testing.T) {
 	canonicalClean := "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=clean -->"
 
 	// Policy: COMMENTED+blocking is only valid when REQUEST_CHANGES is not required.
-	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalBlocking), "bob", loopID, "new-head", allowedRC, false); got != "" {
+	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalBlocking), "bob", loopID, "new-head", allowedRC, false, false); got != "" {
 		t.Fatalf("COMMENTED+blocking under REQUEST_CHANGES policy = %q, want empty", got)
 	}
-	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalBlocking), "bob", loopID, "new-head", allowedComment, false); got != "old-head" {
+	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalBlocking), "bob", loopID, "new-head", allowedComment, false, false); got != "old-head" {
 		t.Fatalf("COMMENTED+blocking under COMMENT policy = %q, want old-head", got)
 	}
-	if got := looperReviewEngagementHead(marker(canonicalBlocking), "bob", loopID, "new-head", allowedRC, false); got != "old-head" {
+	if got := looperReviewEngagementHead(marker(canonicalBlocking), "bob", loopID, "new-head", allowedRC, false, false); got != "old-head" {
 		t.Fatalf("CHANGES_REQUESTED+blocking = %q, want old-head", got)
 	}
 
@@ -268,21 +268,21 @@ func TestLooperReviewEngagementHeadMatchesPublishVerifierGates(t *testing.T) {
 		"<!-- looper:review-extra id=reviewer:" + loopID + " head=old-head outcome=blocking -->",
 		"<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=BLOCKING -->",
 	} {
-		if got := looperReviewEngagementHead(marker(body), "bob", loopID, "new-head", allowedRC, false); got != "" {
+		if got := looperReviewEngagementHead(marker(body), "bob", loopID, "new-head", allowedRC, false, false); got != "" {
 			t.Fatalf("noncanonical body %q engagement head = %q, want empty", body, got)
 		}
 	}
 
 	// Human-body quality belongs to publish validation, not engagement authority.
-	if got := looperReviewEngagementHead(withState("APPROVED", canonicalClean), "bob", loopID, "new-head", allowedApprove, false); got != "old-head" {
+	if got := looperReviewEngagementHead(withState("APPROVED", canonicalClean), "bob", loopID, "new-head", allowedApprove, false, false); got != "old-head" {
 		t.Fatalf("APPROVED clean marker-only = %q, want old-head engagement", got)
 	}
 
-	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalClean), "bob", loopID, "new-head", allowedApprove, true); got != "old-head" {
+	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalClean), "bob", loopID, "new-head", allowedApprove, true, false); got != "old-head" {
 		t.Fatalf("self-approval clean marker-only = %q, want old-head engagement", got)
 	}
 	// COMMENT clean policy does not require body validation.
-	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalClean), "bob", loopID, "new-head", allowedComment, false); got != "old-head" {
+	if got := looperReviewEngagementHead(withState("COMMENTED", canonicalClean), "bob", loopID, "new-head", allowedComment, false, false); got != "old-head" {
 		t.Fatalf("COMMENT policy clean = %q, want old-head", got)
 	}
 

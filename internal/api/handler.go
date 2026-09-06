@@ -4913,36 +4913,62 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if err != nil {
 		return err
 	}
-	// Hold preflight is best-effort at create time: when we cannot reliably talk to
-	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
-	// skip validation rather than blocking manual creation for unrelated local setup.
-	if strings.TrimSpace(project.RepoPath) == "" {
+	if target.TargetType != domain.LoopTargetTypeIssue && target.TargetType != domain.LoopTargetTypePullRequest {
 		return nil
 	}
-	if _, err := os.Stat(project.RepoPath); err != nil {
-		return nil
+	cfg := h.effectiveConfig()
+	provider, ok := resolveProjectProviderConfig(cfg, projectID, parseJSONObject(project.MetadataJSON))
+	if !ok {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: provider for project %q is not configured", projectID)}
 	}
-	ghPath := strings.TrimSpace(derefString(h.context.Config.Tools.GHPath))
-	if ghPath == "" {
-		return nil
-	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
 	labels := []string(nil)
-	switch target.TargetType {
-	case domain.LoopTargetTypeIssue:
-		detail, err := gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+	if provider.Kind == config.ProviderKindForgejo {
+		client, clientErr := forge.NewForgejoClientFromConfig(provider, target.Repo)
+		err = clientErr
+		if err == nil {
+			switch target.TargetType {
+			case domain.LoopTargetTypeIssue:
+				var detail forge.Issue
+				detail, err = client.ViewIssue(ctx, target.IssueNumber)
+				for _, label := range detail.Labels {
+					labels = append(labels, label.Name)
+				}
+			case domain.LoopTargetTypePullRequest:
+				var detail forge.PullRequest
+				detail, err = client.ViewPullRequest(ctx, target.PRNumber)
+				for _, label := range detail.Labels {
+					labels = append(labels, label.Name)
+				}
+			}
 		}
-		labels = detail.Labels
-	case domain.LoopTargetTypePullRequest:
-		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
-		if err != nil {
-			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+	} else {
+		// Preserve the GitHub preflight's best-effort local setup behavior.
+		// Forgejo authenticates directly through its provider and does not need gh
+		// or a local checkout to read the target's current hold labels.
+		if strings.TrimSpace(project.RepoPath) == "" {
+			return nil
 		}
-		labels = detail.Labels
-	default:
-		return nil
+		if _, err := os.Stat(project.RepoPath); err != nil {
+			return nil
+		}
+		ghPath := strings.TrimSpace(derefString(cfg.Tools.GHPath))
+		if ghPath == "" {
+			return nil
+		}
+		gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
+		switch target.TargetType {
+		case domain.LoopTargetTypeIssue:
+			var detail githubinfra.IssueDetail
+			detail, err = gh.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
+			labels = detail.Labels
+		case domain.LoopTargetTypePullRequest:
+			var detail githubinfra.PullRequestDetail
+			detail, err = gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
+			labels = detail.Labels
+		}
+	}
+	if err != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
 	}
 	if !domain.IsAutoLaneHeld(loopType, labels) {
 		return nil
@@ -8109,41 +8135,45 @@ func resolveProjectProviderKind(cfg config.Config, projectID string, metadata ma
 // metadata provider id. Base URL is empty for unknown providers; GitHub defaults
 // to https://github.com when kind is github and base is unset.
 func resolveProjectProvider(cfg config.Config, projectID string, metadata map[string]any) (kind config.ProviderKind, baseURL string, ok bool) {
-	providerID := ""
+	provider, ok := resolveProjectProviderConfig(cfg, projectID, metadata)
+	if !ok {
+		return "", "", false
+	}
+	if provider.Kind == config.ProviderKindPlane {
+		// Plane remains the reported task-source provider; code hosting is GitHub.
+		return config.ProviderKindPlane, "https://github.com", true
+	}
+	kind = provider.Kind
+	if kind == "" {
+		kind = config.ProviderKindGitHub
+	}
+	base := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+	if kind == config.ProviderKindGitHub && base == "" {
+		base = "https://github.com"
+	}
+	return kind, base, true
+}
+
+// The request's runtime config includes the live project catalog. Fall back to
+// record metadata for API-registered projects absent from a caller's snapshot.
+func resolveProjectProviderConfig(cfg config.Config, projectID string, metadata map[string]any) (config.ProviderConfig, bool) {
+	providerID := strings.TrimSpace(stringMetadataValue(metadata, "provider"))
 	for _, configured := range cfg.Projects {
 		if configured.ID != projectID {
 			continue
 		}
 		providerID = strings.TrimSpace(configured.Provider)
-		if providerID == "" {
-			return config.ProviderKindGitHub, "https://github.com", true
-		}
 		break
 	}
 	if providerID == "" {
-		providerID = strings.TrimSpace(stringMetadataValue(metadata, "provider"))
-	}
-	if providerID == "" {
-		return config.ProviderKindGitHub, "https://github.com", true
+		return config.ProviderConfig{Kind: config.ProviderKindGitHub, BaseURL: "https://github.com"}, true
 	}
 	for _, provider := range cfg.Providers {
-		if provider.ID != providerID {
-			continue
+		if provider.ID == providerID {
+			return provider, true
 		}
-		if provider.Kind == config.ProviderKindPlane {
-			// Plane remains the reported task-source provider; code hosting is GitHub.
-			return config.ProviderKindPlane, "https://github.com", true
-		}
-		base := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
-		if provider.Kind == config.ProviderKindGitHub && base == "" {
-			base = "https://github.com"
-		}
-		if provider.Kind == "" {
-			return config.ProviderKindGitHub, base, true
-		}
-		return provider.Kind, base, true
 	}
-	return "", "", false
+	return config.ProviderConfig{}, false
 }
 
 // resolveProjectRepoURL builds the forge HTML URL for owner/repo using the
