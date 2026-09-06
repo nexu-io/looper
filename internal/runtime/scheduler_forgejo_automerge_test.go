@@ -182,3 +182,66 @@ func TestForgejoMergeAdapterDoesNotScheduleAndRejectsChangedHead(t *testing.T) {
 		t.Fatalf("new-head merge: queued=%d merged=%d", scheduled, merged)
 	}
 }
+
+func TestForgejoViewIssueRoutesCrossRepoLookupAwayFromCWD(t *testing.T) {
+	t.Setenv("FORGEJO_ISSUE_TOKEN", "test")
+	var requested []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.Path)
+		switch r.URL.Path {
+		case "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{}}`))
+		case "/api/v1/repos/other/repo/issues/123":
+			_, _ = w.Write([]byte(`{"number":123,"title":"linked","state":"open","body":"Acceptance criteria","html_url":"https://code.example/other/repo/issues/123","labels":[{"name":"looper:worker-ready"}]}`))
+		case "/api/v1/repos/core/looper/issues/123":
+			t.Errorf("used CWD repo for cross-repo issue lookup")
+			_, _ = w.Write([]byte(`{"number":123,"title":"wrong-repo","state":"open"}`))
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cwd := t.TempDir()
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forge", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_ISSUE_TOKEN")}},
+		Projects: []config.ProjectRefConfig{
+			{ID: "pr-project", Provider: "forge", Repo: "core/looper", RepoPath: cwd},
+			{ID: "issue-project", Provider: "forge", Repo: "other/repo", RepoPath: t.TempDir()},
+		},
+	}
+	adapter := reviewerGitHubAdapter{config: &cfg}
+	issue, err := adapter.ViewIssue(context.Background(), githubinfra.ViewIssueInput{Repo: "other/repo", IssueNumber: 123, CWD: cwd})
+	if err != nil {
+		t.Fatalf("ViewIssue() error = %v", err)
+	}
+	if issue.Number != 123 || issue.Title != "linked" || issue.URL != "https://code.example/other/repo/issues/123" {
+		t.Fatalf("ViewIssue() = %#v, want other/repo#123", issue)
+	}
+	for _, path := range requested {
+		if path == "/api/v1/repos/core/looper/issues/123" {
+			t.Fatalf("requested = %#v, CWD repo must not supply merge-authority issue", requested)
+		}
+	}
+}
+
+func TestForgejoViewIssueRejectsUnboundCrossRepoLookup(t *testing.T) {
+	t.Setenv("FORGEJO_ISSUE_TOKEN", "test")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"number":123,"title":"wrong-repo","state":"open"}`))
+	}))
+	defer server.Close()
+	cwd := t.TempDir()
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forge", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_ISSUE_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "pr-project", Provider: "forge", Repo: "core/looper", RepoPath: cwd}},
+	}
+	adapter := reviewerGitHubAdapter{config: &cfg}
+	_, err := adapter.ViewIssue(context.Background(), githubinfra.ViewIssueInput{Repo: "other/repo", IssueNumber: 123, CWD: cwd})
+	var httpErr *forge.ForgejoHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("ViewIssue() error = %v, want HTTP 404 for unbound cross-repo lookup", err)
+	}
+}

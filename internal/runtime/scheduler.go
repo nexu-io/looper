@@ -863,6 +863,41 @@ func forgeClientForLocation[T any](cfg *config.Config, repo string, cwd []string
 	return byRepo(cfg, repo)
 }
 
+// forgejoClientForIssueLookup binds ViewIssue to the referenced repository.
+// CWD still disambiguates same-slug projects, but a closing reference such as
+// Fixes other/repo#123 must not reuse the PR project's client.
+func forgejoClientForIssueLookup(cfg *config.Config, repo, cwd string) (*forge.ForgejoClient, bool, error) {
+	repo = strings.TrimSpace(repo)
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			projectRepo := strings.TrimSpace(project.Repo)
+			if repo == "" || strings.EqualFold(projectRepo, repo) {
+				client, err := forge.NewForgejoClientFromConfig(provider, projectRepo)
+				if err != nil {
+					return nil, true, err
+				}
+				return client, true, nil
+			}
+			client, ok, err := forgejoClientForRepo(cfg, repo)
+			if ok || err != nil {
+				return client, ok, err
+			}
+			return nil, true, &forge.ForgejoHTTPError{
+				Method:     http.MethodGet,
+				Path:       "issues",
+				StatusCode: http.StatusNotFound,
+				Message:    fmt.Sprintf("cross-repository issue %s is not bound to a configured Forgejo project", repo),
+			}
+		}
+	}
+	return forgeClientForLocation(cfg, repo, []string{cwd}, forgejoClientForCWD, forgejoClientForRepo)
+}
+
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
 	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
@@ -1331,7 +1366,7 @@ func (a reviewerGitHubAdapter) LoadPullRequestReviews(ctx context.Context, input
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := forgejoClientForIssueLookup(a.config, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return githubinfra.IssueDetail{}, err
 		}

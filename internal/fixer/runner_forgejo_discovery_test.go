@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -238,6 +239,80 @@ func TestForgejoAutoDiscoveryIgnoresUntrustedSummaryMarker(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 {
 		t.Fatalf("QueueItems = %#v, label and untrusted summary must not invent repair authority", result.QueueItems)
+	}
+}
+
+func TestForgejoSummaryCommentDiscoveryIgnoresUnsupportedNativeReviews(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	detail := forgejoDiscoveryDetail(t, "head-1", 1)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper",
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
+		viewResponses: []PullRequestDetail{detail},
+		listNativeErr: &forge.ForgejoHTTPError{StatusCode: http.StatusNotFound, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
+	}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || len(result.CreatedLoopIDs) != 1 {
+		t.Fatalf("result = %#v, want summary_comment fixer loop from Reviewer Summary", result)
+	}
+	if github.listNativeCalls != 0 {
+		t.Fatalf("listNativeCalls = %d, summary_comment discovery must not require native review APIs", github.listNativeCalls)
+	}
+}
+
+func TestForgejoNativeDiscoveryRequiresNativeReviewAPI(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	detail := forgejoDiscoveryDetail(t, "head-1", 1)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper",
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
+		viewResponses: []PullRequestDetail{detail},
+		listNativeErr: &forge.ForgejoHTTPError{StatusCode: http.StatusNotFound, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
+	}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
+
+	_, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err == nil || !strings.Contains(err.Error(), "discovery is unsupported") {
+		t.Fatalf("DiscoverPullRequests() error = %v, want native discovery manual intervention", err)
+	}
+}
+
+func TestRunCollectFixesStepSummaryCommentSkipsUnsupportedNativeDiscovery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	detail := forgejoDiscoveryDetail(t, "head-1", 1)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper",
+		listNativeErr: &forge.ForgejoHTTPError{StatusCode: http.StatusNotFound, Method: "GET", Path: "/pulls/42/reviews", Message: "missing endpoint"},
+	}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
+
+	checkpoint, err := runner.runCollectFixesStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: fixtureProjectPath(t, fixture)},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)},
+	})
+	if err != nil {
+		t.Fatalf("runCollectFixesStep() error = %v", err)
+	}
+	if github.listNativeCalls != 0 {
+		t.Fatalf("listNativeCalls = %d, summary_comment collect-fixes must not require native review APIs", github.listNativeCalls)
+	}
+	if len(checkpoint.FixItems) == 0 {
+		t.Fatalf("FixItems = %#v, want Reviewer Summary items", checkpoint.FixItems)
 	}
 }
 

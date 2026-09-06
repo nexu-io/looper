@@ -1861,6 +1861,13 @@ func (r *Runner) isForgejoProject(projectID string) bool {
 	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
 }
 
+func (r *Runner) forgejoSummaryCommentMode(projectID string) bool {
+	if r.projectRoleConfig == nil {
+		return false
+	}
+	return r.isForgejoProject(projectID) && config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
+}
+
 func defaultDiscoveryLimit(limit int) int {
 	if limit <= 0 {
 		return 30
@@ -2047,11 +2054,13 @@ func (r *Runner) prepareForgejoDiscoveryDetail(ctx context.Context, project stor
 		return detail, err
 	}
 	sanitizeForgejoSummaryAuthority(&detail, currentUser)
-	native, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: repo, PRNumber: detail.Number, CWD: project.RepoPath})
-	if err != nil {
-		return detail, classifyForgejoNativeDiscoveryError(err)
+	if !r.forgejoSummaryCommentMode(project.ID) {
+		native, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: repo, PRNumber: detail.Number, CWD: project.RepoPath})
+		if err != nil {
+			return detail, classifyForgejoNativeDiscoveryError(err)
+		}
+		detail.Comments = append(nativeReviewCommentsToMaps(actionableNativeReviewComments(native, currentUser)), nonNativeComments(detail.Comments)...)
 	}
-	detail.Comments = append(nativeReviewCommentsToMaps(actionableNativeReviewComments(native, currentUser)), nonNativeComments(detail.Comments)...)
 	checkpoint := fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)}
 	if _, _, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
 		return detail, err
@@ -2873,7 +2882,7 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
-	if r.isForgejoProject(input.Project.ID) || isManualFixerLoop(input.Loop) {
+	if !r.forgejoSummaryCommentMode(input.Project.ID) && (r.isForgejoProject(input.Project.ID) || isManualFixerLoop(input.Loop)) {
 		if err := r.attachForgejoNativeComments(ctx, input, &checkpoint); err != nil {
 			return checkpoint, err
 		}
@@ -3815,7 +3824,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	var liveNativeComments []NativeReviewComment
-	if hasNativeForgejoItems || r.isForgejoProject(input.Project.ID) || isManualFixerLoop(input.Loop) {
+	if hasNativeForgejoItems || (!r.forgejoSummaryCommentMode(input.Project.ID) && (r.isForgejoProject(input.Project.ID) || isManualFixerLoop(input.Loop))) {
 		liveNativeComments, err = r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 		if err != nil {
 			return checkpoint, classifyForgejoNativeResolveError(err)
