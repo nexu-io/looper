@@ -683,9 +683,9 @@ func TestFixerGitHubAdapterForgejoSummaryCommentNoResolveFlow(t *testing.T) {
 	if err := adapter.RemovePullRequestLabels(ctx, fixer.PullRequestLabelsInput{Repo: "acme/looper", PRNumber: 42, Labels: []string{"looper:fix"}, CWD: repoPath}); err != nil {
 		t.Fatalf("RemovePullRequestLabels() error = %v", err)
 	}
-	compare, err := adapter.CompareCommits(ctx, fixer.CompareCommitsInput{Repo: "acme/looper", Base: "base123", Head: "abc123", CWD: repoPath})
-	if err != nil || compare.Status != "ahead" {
-		t.Fatalf("CompareCommits() = %#v, %v; want ahead", compare, err)
+	compare, err := adapter.CompareCommits(ctx, fixer.CompareCommitsInput{Repo: "acme/looper", Base: "abc123", Head: "abc123", CWD: repoPath})
+	if err != nil || compare.Status != "identical" {
+		t.Fatalf("CompareCommits() = %#v, %v; want identical", compare, err)
 	}
 	if _, err := adapter.ListReviewThreads(ctx, fixer.ListReviewThreadsInput{Repo: "acme/looper", PRNumber: 42, CWD: repoPath}); err == nil || !strings.Contains(err.Error(), "does not support native review threads") {
 		t.Fatalf("ListReviewThreads() error = %v, want Forgejo unsupported native review threads", err)

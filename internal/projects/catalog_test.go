@@ -312,9 +312,9 @@ func TestMaterializeCatalogAppliesAndValidatesForgejoRoleProfile(t *testing.T) {
 		t.Fatalf("materialized coordinator = %#v, want Forgejo coordinator and dependency gates disabled", coordinator)
 	}
 
-	incompatibleMetadata := `{"provider":"forgejo-main","repo":"core/odcrew","roles":{"reviewer":{"autoMerge":{"enabled":true}}},"source":"api"}`
+	incompatibleMetadata := `{"provider":"forgejo-main","repo":"core/odcrew","roles":{"reviewer":{"behavior":{"threadResolution":{"enabled":true}}}},"source":"api"}`
 	_, err = MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &incompatibleMetadata}})
-	if err == nil || !strings.Contains(err.Error(), "autoMerge.enabled") {
+	if err == nil || !strings.Contains(err.Error(), "threadResolution.enabled") {
 		t.Fatalf("MaterializeCatalog() error = %v, want incompatible Forgejo role rejection", err)
 	}
 }

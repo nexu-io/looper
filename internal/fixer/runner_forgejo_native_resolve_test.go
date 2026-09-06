@@ -13,7 +13,13 @@ import (
 )
 
 func nativeReply(fixItemID, action string) replyExplanationEntry {
-	return replyExplanationEntry{FixItemID: fixItemID, Action: action, Explanation: "Reviewed the Forgejo native comment."}
+	updated := "u1"
+	for id, value := range map[int64]string{102: "u2", 103: "u3", 104: "u4"} {
+		if fixItemID == NativeReviewCommentFixItemID(id) {
+			updated = value
+		}
+	}
+	return replyExplanationEntry{FixItemID: fixItemID, Action: action, Explanation: "Reviewed the Forgejo native comment.", ObservedFingerprint: fixItemID + ":" + updated}
 }
 
 func nativeFixItem(commentID int64, updatedAt string) FixItem {
@@ -28,14 +34,14 @@ func nativeFixItem(commentID int64, updatedAt string) FixItem {
 	}
 }
 
-func TestRunResolveCommentsStepForgejoNativeRequiresActualPush(t *testing.T) {
+func TestRunResolveCommentsStepForgejoNativeAllowsAlreadyFixedWithoutNewPush(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"}}}}
 	runner := New(Options{GitHub: github})
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: false}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-	if err == nil || !strings.Contains(err.Error(), "actual push") {
-		t.Fatalf("runResolveCommentsStep() error = %v, want actual push requirement", err)
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, already-fixed decisions do not require a fake commit", err)
 	}
 }
 
@@ -206,7 +212,7 @@ func TestRunResolveCommentsStepForgejoNativeClassifiesHTTPAndTimeoutErrors(t *te
 	}
 }
 
-func TestRunResolveCommentsStepForgejoNativeUnsupportedResolveRequiresManualIntervention(t *testing.T) {
+func TestRunResolveCommentsStepForgejoNativeUnsupportedResolutionRetainsFixedDecision(t *testing.T) {
 	t.Parallel()
 	for _, errValue := range []error{
 		&forge.ForgejoHTTPError{StatusCode: 404, Method: "POST", Path: "/resolve", Message: "missing"},
@@ -216,12 +222,11 @@ func TestRunResolveCommentsStepForgejoNativeUnsupportedResolveRequiresManualInte
 		runner := New(Options{GitHub: github})
 		checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 		updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
-		var loopErr *loopError
-		if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention || !strings.Contains(loopErr.Error(), "requires manual intervention") {
-			t.Fatalf("runResolveCommentsStep() error = %#v, want manual intervention", err)
+		if err != nil {
+			t.Fatalf("runResolveCommentsStep() error = %v", err)
 		}
-		if updated.ResolvedComments == nil || len(updated.ResolvedComments.Items) != 1 || updated.ResolvedComments.Items[0].Status != "unsupported_remote_resolution" {
-			t.Fatalf("resolved comments = %#v, want unsupported_remote_resolution", updated.ResolvedComments)
+		if updated.ResolvedComments == nil || len(updated.ResolvedComments.Items) != 1 || updated.ResolvedComments.Items[0].Status != forgejoFixedUnresolvedStatus {
+			t.Fatalf("resolved comments = %#v, want code fixed with remote comment still open", updated.ResolvedComments)
 		}
 	}
 }

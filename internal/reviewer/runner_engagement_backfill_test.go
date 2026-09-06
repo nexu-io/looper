@@ -15,12 +15,17 @@ import (
 )
 
 func TestDiscoverPullRequestsRequeuesLooperEngagedFollowUpAfterCurrentHeadSkip(t *testing.T) {
-	for _, recovered := range []bool{false, true} {
-		name := "missing publication"
-		if recovered {
-			name = "already recovered publication"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		recovered, forgejo, self bool
+	}{
+		{"missing publication", false, false, false},
+		{"already recovered publication", true, false, false},
+		{"Forgejo missing publication", false, true, false},
+		{"Forgejo already recovered publication", true, true, false},
+		{"Forgejo self blocking COMMENT", false, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			fixture := newRunnerFixture(t)
 			const loopID = "loop_follow_engaged_without_metadata"
@@ -36,12 +41,33 @@ func TestDiscoverPullRequestsRequeuesLooperEngagedFollowUpAfterCurrentHeadSkip(t
 				}},
 			}
 			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"posted clean follow-up review"}`, ParseStatus: "parsed"}}}
-			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}, LoopConfig: testReviewerLoopConfig()})
+			options := Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}, LoopConfig: testReviewerLoopConfig()}
+			if tc.forgejo {
+				cfg, err := config.DefaultConfig(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				cfg.Providers = []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+				cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "fj", Repo: "acme/looper"}}
+				cfg.Roles.Reviewer.Discovery.AutoDiscovery = true
+				cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = true
+				cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{}
+				cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview = tc.self
+				cfg.Roles.Reviewer.Behavior.ReviewEvents = options.ReviewEvents
+				cfg.Roles.Reviewer.Behavior.Loop = testReviewerLoopConfig()
+				options.CustomInstructions = &cfg
+				github.comments = []map[string]any{{"body": "Old finding, explicitly fixed by the fixer", "isResolved": false}}
+				if tc.self {
+					github.author = "bob"
+					github.reviews[0]["state"] = "COMMENTED"
+				}
+			}
+			runner := New(options)
 			nowISO := fixture.nowISO()
 			repo := "acme/looper"
 			prNumber := int64(42)
 			metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
-			if recovered {
+			if tc.recovered {
 				metadata = strings.Replace(metadata, `"followUpdates":true`, `"followUpdates":true,"lastPublishedHeadSha":"old-head"`, 1)
 			}
 			loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -74,6 +100,15 @@ func TestDiscoverPullRequestsRequeuesLooperEngagedFollowUpAfterCurrentHeadSkip(t
 			}
 			if processed.Status != "success" || len(agent.starts) != 1 {
 				t.Fatalf("ProcessClaimedItem() = %#v, agent starts = %d; want full follow-up review", processed, len(agent.starts))
+			}
+			if tc.forgejo && (github.listReviewThreadsCalls != 0 || len(github.resolveThreadCalls) != 0) {
+				t.Fatal("Forgejo follow-up attempted unsupported thread resolution")
+			}
+			if tc.forgejo {
+				repeated, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+				if err != nil || len(repeated.QueueItems) != 0 {
+					t.Fatalf("same-head rediscovery = %#v, %v; want no duplicate review", repeated, err)
+				}
 			}
 
 		})

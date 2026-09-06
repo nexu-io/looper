@@ -294,15 +294,16 @@ type UpdateCommentInput struct {
 }
 
 type Issue struct {
-	Number    int64
-	Title     string
-	Body      string
-	State     string
-	HTMLURL   string
-	UpdatedAt string
-	User      Identity
-	Labels    []Label
-	Assignees []Identity
+	Number        int64
+	IsPullRequest bool
+	Title         string
+	Body          string
+	State         string
+	HTMLURL       string
+	UpdatedAt     string
+	User          Identity
+	Labels        []Label
+	Assignees     []Identity
 }
 
 type PullRequest struct {
@@ -985,15 +986,16 @@ type forgejoLabel struct {
 }
 
 type forgejoIssue struct {
-	Number    int64          `json:"number"`
-	Title     string         `json:"title"`
-	Body      string         `json:"body"`
-	State     string         `json:"state"`
-	HTMLURL   string         `json:"html_url"`
-	UpdatedAt string         `json:"updated_at"`
-	User      forgejoUser    `json:"user"`
-	Labels    []forgejoLabel `json:"labels"`
-	Assignees []forgejoUser  `json:"assignees"`
+	Number      int64          `json:"number"`
+	PullRequest *struct{}      `json:"pull_request"`
+	Title       string         `json:"title"`
+	Body        string         `json:"body"`
+	State       string         `json:"state"`
+	HTMLURL     string         `json:"html_url"`
+	UpdatedAt   string         `json:"updated_at"`
+	User        forgejoUser    `json:"user"`
+	Labels      []forgejoLabel `json:"labels"`
+	Assignees   []forgejoUser  `json:"assignees"`
 }
 
 type forgejoPullRequest struct {
@@ -1083,7 +1085,7 @@ type forgejoPullRequestReview struct {
 }
 
 func convertIssue(input forgejoIssue) Issue {
-	return Issue{Number: input.Number, Title: input.Title, Body: input.Body, State: input.State, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
+	return Issue{Number: input.Number, IsPullRequest: input.PullRequest != nil, Title: input.Title, Body: input.Body, State: input.State, HTMLURL: input.HTMLURL, UpdatedAt: input.UpdatedAt, User: convertUser(input.User), Labels: convertLabels(input.Labels), Assignees: convertUsers(input.Assignees)}
 }
 
 func convertPullRequest(input forgejoPullRequest) PullRequest {

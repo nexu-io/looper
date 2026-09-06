@@ -20,26 +20,9 @@ func forgejoPullRequestHasConflicts(ctx context.Context, cfg *config.Config, rep
 	// Forgejo's mergeable=false also includes CHECKING, server-side ERROR and
 	// WIP. Only an actual merge of the exact base/head commits can establish a
 	// conflict; the check never checks out or merges into the caller's worktree.
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" && cfg != nil {
-		for _, project := range cfg.Projects {
-			if strings.EqualFold(strings.TrimSpace(project.Repo), strings.TrimSpace(repo)) {
-				if cwd != "" {
-					return false, failureclass.WithBoundary(fmt.Errorf("merge conflict check for %s requires an unambiguous project path", repo), failureclass.BoundaryGitLocal)
-				}
-				cwd = strings.TrimSpace(project.RepoPath)
-			}
-		}
-	}
-	if cwd == "" {
-		return false, failureclass.WithBoundary(fmt.Errorf("merge conflict check for %s requires project repo path", repo), failureclass.BoundaryGitLocal)
-	}
-	gitPath := ""
-	if cfg != nil {
-		gitPath = derefString(cfg.Tools.GitPath)
-	}
-	if strings.TrimSpace(gitPath) == "" {
-		gitPath = "git"
+	gitPath, cwd, err := forgejoGitLocation(cfg, repo, cwd)
+	if err != nil {
+		return false, err
 	}
 	conflicted, err := forgejoHasMergeConflicts(ctx, gitPath, cwd, pr.Base.SHA, pr.Head.SHA)
 	// Preserve remote fetch failures and keep transient local launch pressure retryable.
@@ -60,35 +43,8 @@ func withForgejoConflictBoundary(err error) error {
 // It requires Git's merge-tree --write-tree support (Git 2.38 or later).
 func forgejoHasMergeConflicts(ctx context.Context, gitPath, repoPath, baseSHA, headSHA string) (bool, error) {
 	commits := []string{strings.TrimSpace(baseSHA), strings.TrimSpace(headSHA)}
-	for _, sha := range commits {
-		if len(sha) != 40 && len(sha) != 64 {
-			return false, fmt.Errorf("merge conflict check requires full base and head commit IDs")
-		}
-		if _, err := hex.DecodeString(sha); err != nil {
-			return false, fmt.Errorf("merge conflict check requires hexadecimal commit IDs: %w", err)
-		}
-	}
-	missing, err := missingForgejoMergeCommits(ctx, gitPath, repoPath, commits)
-	if err != nil {
+	if err := ensureForgejoCommits(ctx, gitPath, repoPath, commits); err != nil {
 		return false, err
-	}
-	if len(missing) > 0 {
-		// Empty refmap and no FETCH_HEAD write keep the caller's refs unchanged.
-		args := append([]string{"fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin"}, missing...)
-		if _, err := shell.Run(ctx, shell.Options{Command: gitPath, CWD: repoPath, Args: args}); err != nil {
-			boundary := failureclass.BoundaryGitRemote
-			if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
-				boundary = failureclass.BoundaryGitLocal
-			}
-			return false, failureclass.WithBoundary(fmt.Errorf("fetch commits for merge conflict check: %w", err), boundary)
-		}
-		missing, err = missingForgejoMergeCommits(ctx, gitPath, repoPath, commits)
-		if err != nil {
-			return false, err
-		}
-		if len(missing) > 0 {
-			return false, fmt.Errorf("merge conflict check commits still unavailable after fetch: %s", strings.Join(missing, ", "))
-		}
 	}
 	result, err := shell.Run(ctx, shell.Options{Command: gitPath, CWD: repoPath, Args: []string{"merge-tree", "--write-tree", commits[0], commits[1]}})
 	if err == nil {
@@ -104,7 +60,41 @@ func forgejoHasMergeConflicts(ctx context.Context, gitPath, repoPath, baseSHA, h
 	return false, fmt.Errorf("check merge conflicts: %w", err)
 }
 
-func missingForgejoMergeCommits(ctx context.Context, gitPath, repoPath string, commits []string) ([]string, error) {
+func ensureForgejoCommits(ctx context.Context, gitPath, repoPath string, commits []string) error {
+	for _, sha := range commits {
+		if len(sha) != 40 && len(sha) != 64 {
+			return fmt.Errorf("Forgejo commit inspection requires full base and head commit IDs")
+		}
+		if _, err := hex.DecodeString(sha); err != nil {
+			return fmt.Errorf("Forgejo commit inspection requires hexadecimal commit IDs: %w", err)
+		}
+	}
+	missing, err := missingForgejoCommits(ctx, gitPath, repoPath, commits)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		// Empty refmap and no FETCH_HEAD write keep the caller's refs unchanged.
+		args := append([]string{"fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin"}, missing...)
+		if _, err := shell.Run(ctx, shell.Options{Command: gitPath, CWD: repoPath, Args: args}); err != nil {
+			boundary := failureclass.BoundaryGitRemote
+			if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
+				boundary = failureclass.BoundaryGitLocal
+			}
+			return failureclass.WithBoundary(fmt.Errorf("fetch commits for Forgejo commit inspection: %w", err), boundary)
+		}
+		missing, err = missingForgejoCommits(ctx, gitPath, repoPath, commits)
+		if err != nil {
+			return err
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("Forgejo commit inspection commits still unavailable after fetch: %s", strings.Join(missing, ", "))
+		}
+	}
+	return nil
+}
+
+func missingForgejoCommits(ctx context.Context, gitPath, repoPath string, commits []string) ([]string, error) {
 	// Batch-check reports a missing object on stdout with exit zero. Ordinary
 	// git failures (bad CWD, permissions, unavailable binary) remain errors and
 	// do not incorrectly trigger a fetch or become a conflict verdict.
@@ -138,4 +128,29 @@ func missingForgejoMergeCommits(ctx context.Context, gitPath, repoPath string, c
 		}
 	}
 	return missing, nil
+}
+
+func forgejoGitLocation(cfg *config.Config, repo, cwd string) (gitPath, location string, err error) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" && cfg != nil {
+		for _, project := range cfg.Projects {
+			if strings.EqualFold(strings.TrimSpace(project.Repo), strings.TrimSpace(repo)) {
+				if cwd != "" {
+					return "", "", failureclass.WithBoundary(fmt.Errorf("merge conflict check for %s requires an unambiguous project path", repo), failureclass.BoundaryGitLocal)
+				}
+				cwd = strings.TrimSpace(project.RepoPath)
+			}
+		}
+	}
+	if cwd == "" {
+		return "", "", failureclass.WithBoundary(fmt.Errorf("merge conflict check for %s requires project repo path", repo), failureclass.BoundaryGitLocal)
+	}
+	gitPath = ""
+	if cfg != nil {
+		gitPath = derefString(cfg.Tools.GitPath)
+	}
+	if strings.TrimSpace(gitPath) == "" {
+		gitPath = "git"
+	}
+	return gitPath, cwd, nil
 }

@@ -1339,7 +1339,7 @@ func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.
 		if err != nil {
 			return githubinfra.IssueDetail{}, err
 		}
-		return githubinfra.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: forgeLabelNames(issue.Labels), Assignees: forgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
+		return githubinfra.IssueDetail{IsPullRequest: issue.IsPullRequest, Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: forgeLabelNames(issue.Labels), Assignees: forgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
 	}
 	if a.gateway == nil {
 		return githubinfra.IssueDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1348,10 +1348,24 @@ func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.
 }
 
 func (a reviewerGitHubAdapter) GetRepositorySettings(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.RepositorySettings{}, err
+		}
+		settings, err := client.GetRepositoryMergeSettings(ctx)
+		return githubinfra.RepositorySettings{AllowSquashMerge: settings.AllowSquashMerge, AllowMergeCommit: settings.AllowMergeCommit, AllowRebaseMerge: settings.AllowRebaseMerge, AllowAutoMerge: true}, err
+	}
 	return a.gateway.GetRepositorySettings(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) GetBranchProtection(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.BranchProtection{}, err
+		}
+		branch, err := client.GetBranchProtection(ctx, input.Branch)
+		return githubinfra.BranchProtection{Enabled: branch.Protected, HasRequiredChecks: branch.Protected && branch.EnableStatusCheck && len(branch.StatusCheckContexts) > 0, RequiredChecks: branch.StatusCheckContexts}, err
+	}
 	return a.gateway.GetBranchProtection(ctx, input)
 }
 
@@ -1746,11 +1760,11 @@ func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinf
 }
 
 func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("forgejo provider capability autoMerge is unsupported")
+		return client.EnableAutoMerge(ctx, input.PRNumber, string(input.Strategy), input.HeadSHA)
 	}
 	return a.gateway.EnableAutoMerge(ctx, input)
 }
@@ -2496,15 +2510,12 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.CompareCommitsResult{}, err
 		}
-		out, err := client.CompareBranches(ctx, forge.CompareBranchesInput{Base: input.Base, Head: input.Head})
-		if err != nil {
-			return fixer.CompareCommitsResult{}, err
-		}
-		return fixer.CompareCommitsResult{Status: out.Status}, nil
+		status, err := forgejoCompareCommits(ctx, a.config, input.Repo, input.CWD, input.Base, input.Head)
+		return fixer.CompareCommitsResult{Status: status}, err
 	}
 	out, err := a.gateway.CompareCommits(ctx, githubinfra.CompareCommitsInput{Repo: input.Repo, Base: input.Base, Head: input.Head, CWD: input.CWD})
 	if err != nil {

@@ -2,7 +2,6 @@ package fixer
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 
@@ -11,7 +10,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestForgejoAutoDiscoveryUsesReviewerSummaryWithoutReadingNativeComments(t *testing.T) {
+func TestForgejoAutoDiscoveryUsesReviewerSummaryAndNativeComments(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	detail := forgejoDiscoveryDetail(t, "head-1", 1)
@@ -20,7 +19,6 @@ func TestForgejoAutoDiscoveryUsesReviewerSummaryWithoutReadingNativeComments(t *
 		listOpen:       []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
 		viewResponses:  []PullRequestDetail{detail},
 		nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Rename this helper", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}},
-		listNativeErr:  errors.New("native API must not be called during automatic discovery"),
 	}
 	cfg := forgejoFixerDiscoveryConfig(t, fixture)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
@@ -92,7 +90,7 @@ func TestForgejoAutoDiscoverySuppressesConsumedReviewerRoundUntilHeadChanges(t *
 	}
 }
 
-func TestForgejoAutoDiscoveryIgnoresNativeCommentsRegardlessOfResolverField(t *testing.T) {
+func TestForgejoAutoDiscoveryAcceptsOpenNativeCommentsRegardlessOfResolverField(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name            string
@@ -111,7 +109,6 @@ func TestForgejoAutoDiscoveryIgnoresNativeCommentsRegardlessOfResolverField(t *t
 				listOpen:       []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
 				viewResponses:  []PullRequestDetail{detail},
 				nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: tc.resolverPresent, IsResolved: tc.resolved}},
-				listNativeErr:  errors.New("resolver response fields are not API capability authority"),
 			}
 			cfg := forgejoFixerDiscoveryConfig(t, fixture)
 			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
@@ -120,14 +117,18 @@ func TestForgejoAutoDiscoveryIgnoresNativeCommentsRegardlessOfResolverField(t *t
 			if err != nil {
 				t.Fatalf("DiscoverPullRequests() error = %v", err)
 			}
-			if len(result.QueueItems) != 0 {
-				t.Fatalf("QueueItems = %#v, native comments must not authorize automatic Forgejo fixer work", result.QueueItems)
+			want := 1
+			if tc.resolved {
+				want = 0
+			}
+			if len(result.QueueItems) != want {
+				t.Fatalf("QueueItems = %#v, want %d for open native feedback", result.QueueItems, want)
 			}
 		})
 	}
 }
 
-func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
+func TestForgejoAutomaticCollectAttachesNativeComments(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	cfg := forgejoFixerDiscoveryConfig(t, fixture)
@@ -139,7 +140,7 @@ func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
 	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{
 		{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true},
 		{ProviderCommentID: 102, Body: "Unsupported", Author: "bob", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: false},
-	}, listNativeErr: errors.New("automatic collect must not read native comments")}
+	}}
 	runner := New(Options{GitHub: github, CustomInstructions: cfg})
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	if err != nil || project == nil {
@@ -149,8 +150,8 @@ func TestForgejoAutomaticCollectDoesNotAttachNativeComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runCollectFixesStep() error = %v", err)
 	}
-	if len(checkpoint.FixItems) != 1 || checkpoint.FixItems[0].ID != "R-001" {
-		t.Fatalf("FixItems = %#v, want only the trusted reviewer summary item", checkpoint.FixItems)
+	if len(checkpoint.FixItems) != 3 {
+		t.Fatalf("FixItems = %#v, want two native items and the trusted summary item", checkpoint.FixItems)
 	}
 }
 

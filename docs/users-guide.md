@@ -1,6 +1,6 @@
 # Looper Quick User Guide
 
-This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer requests/reviews, summary-comment compatibility, and the manual/direct native-review-comment fixer path.
+This guide is for everyday users. It focuses on how `coordinator`, `planner`, `reviewer`, `fixer`, and `worker` interact with forge issues and PRs. GitHub is fully supported; Forgejo support includes planner, worker, native reviewer/fixer loops, summary-comment compatibility, and opt-in reviewer auto-merge.
 
 ## 1. Prerequisites
 
@@ -109,12 +109,13 @@ If no project matches the current directory, or multiple projects match, pass `-
 | `fixer` | Fixes PR issues based on review comments; declines leave threads open for Reviewer | `looper fix <repo>#<pr>` |
 | `worker` | Implements the actual work from a spec or issue, and can reuse an existing PR | `looper work --issue <num>` or `looper work --project <id> --issue <num>` |
 
-Forgejo MVP role support:
+Forgejo role support:
 
 - Planner and Worker are supported over the Forgejo REST API.
-- Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level Reviewer Summary compatibility protocol.
-- Fixer is supported through two Forgejo-specific paths: Reviewer Summary items still flow through the top-level Fixer Summary PR comment, and manual/direct `looper fix` runs also read unresolved native Forgejo PR review comments and can resolve those native comments after validation, push, and post-push verification.
-- Coordinator, auto-merge, routed network mode, and webhook modes remain unsupported for Forgejo.
+- Reviewer supports native review requests and native `APPROVE`, `REQUEST_CHANGES`, and `COMMENT` reviews. A configured `summary_comment` publish mode retains the top-level comment protocol. Both modes use the same visible templates and disclosure as GitHub.
+- Fixer automatically consumes native inline findings and legacy summary items, repairs the code, validates, and pushes. Without a remote resolve API, it reports the fix in a PR comment and leaves the native comment open. Local acknowledgements prevent unchanged findings from repeating after a restart.
+- Reviewer auto-merge is available when explicitly enabled, subject to the existing review, scope, and branch policies. It defaults to disabled.
+- Coordinator, native thread resolution, routed network mode, and webhook modes remain unsupported for Forgejo.
 - A Forgejo-only daemon can start without `gh`; mixed or GitHub projects still require `gh`.
 
 ## 4. Recommended flow
@@ -311,7 +312,7 @@ For the default review-requested path, Looper asks GitHub for PRs requested from
 
 For spec PRs, `looper:spec-reviewing` marks the review phase, but it does not by itself authorize other users' Looper instances to run. Request review from the intended GitHub user to trigger that user's automatic reviewer.
 
-For Forgejo projects, reviewer auto-discovery defaults to review requests. Configured labels can be used independently or combined with review requests; combined results are deduplicated deterministically. Reviewer publishes native `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews according to configuration and preserves Looper disclosure/idempotency markers. Self-authored PRs are skipped by default; when self-review is enabled, an attempted clean approval is explicitly downgraded to `COMMENT`. Set reviewer `publishMode` to `summary_comment` to keep the legacy Reviewer Summary/Fixer Summary workflow.
+For Forgejo projects, reviewer auto-discovery defaults to review requests. Configured labels can be used independently or combined with review requests; combined results are deduplicated deterministically. Reviewer publishes native `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` reviews according to configuration and preserves Looper disclosure/idempotency markers. Self-authored PRs are skipped by default; an authorized self-review uses `COMMENT` for both clean and blocking outcomes when Forgejo rejects the configured event. A clean self-comment does not authorize auto-merge. Set reviewer `publishMode` to `summary_comment` to keep the legacy comment workflow with common message templates.
 
 ### What happens after reviewer finishes
 
@@ -377,12 +378,15 @@ Fixer will:
 
 Third-party review comments (a human or Codex, not Looper) stay Fixer-eligible. If Fixer declines one of those, it still replies with evidence and leaves the thread open; Reviewer adjudicates the decline. Trusted `/looper` directives apply only on Looper-authored threads.
 
-For Forgejo projects, automatic Fixer runs are summary-only because Forgejo's public REST API does not currently expose a native review-comment resolve mutation:
+For Forgejo projects, automatic and manual Fixer runs consume native findings without requiring a review-comment resolve mutation:
 
-- reviewer-summary items still come from the top-level Reviewer Summary comment
-- native Forgejo PR review comments do not trigger automatic Fixer runs, even when their response includes a `resolver` field
-- the `resolver` response field describes state; it is not treated as proof that a resolve mutation exists
-- explicit manual Fixer runs may inspect native comments, but stop with a manual-intervention error when the provider cannot resolve them
+- native findings from other reviewers and the current account's Looper Reviewer can trigger repairs; ordinary self-comments and Fixer chatter are ignored
+- a matching structured `fixed` decision, successful validation, and current input/head checks acknowledge the code repair; the remote comment stays open and the PR receives a common Fixer message
+- unchanged acknowledged findings are suppressed across polling and restarts while the current head contains the repair; edited comments, new findings, and removal of the repair commit re-arm them
+- deferred and declined findings remain open; existing manual holds and role budgets apply, and explicit `needs_human` results suspend for intervention
+- legacy reviewer-summary items remain supported, with protocol metadata hidden from the visible message
+
+After a repair changes the head, Reviewer can review the new code. GitHub's same-head decline adjudication is not available on Forgejo. See [Forgejo configuration](configuration.md#provider-support) for opt-in auto-merge and the remaining provider limits.
 
 If the PR is still in the spec review phase and the review becomes clean, fixer can also move the labels from:
 

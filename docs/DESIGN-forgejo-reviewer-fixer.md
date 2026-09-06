@@ -34,9 +34,31 @@ Forgejo 拒绝在自己创建的 PR 上提交 REQUEST_CHANGES；已获准的自�
 
 `mergeable=false` 不能直接表示冲突：Forgejo 还用它表示计算中、计算失败及 WIP。provider 保留原始三态；运行时只在明确为 false 时，使用 `git merge-tree --write-tree` 检查准确的 base/head commit。代价是一次本地 Git 计算以及必要时获取缺失对象，不新增持久化状态，不变更分支、index、工作区或 FETCH_HEAD；简单映射布尔值会把正常 PR 错判为冲突，因此不足以满足 F2。该路径要求 Git 支持 `merge-tree --write-tree`（2.38+）。依据：[Forgejo 16.0.3 Mergeable 实现](https://codeberg.org/forgejo/forgejo/src/tag/v16.0.3/models/issues/pull.go#L881)。
 
-优先删除“无法 resolve 就不允许修复”的能力门槛。已有 checkpoint 与 fixer evidence 可承载本地处理结果，不引入第二套 receipt / ledger 或数据库迁移。新增本地处理结果如果需要状态值，必须明确表示“代码已处理、远端仍未关闭”，并在发现、重试与展示路径保持同一含义；这是避免无 resolve 平台重复修复的必要成本。不能仅忽略远端未解决评论，否则新评论、修改后的评论和 deferred 结果会丢失。
+优先删除“无法 resolve 就不允许修复”的能力门槛。复用已有 fixer evidence 的 `ResolveState=fixed_unresolved`，明确表示“代码已处理、远端仍未关闭”，不引入第二套 receipt / ledger 或数据库迁移。repair checkpoint 增加 agent 当时看到的评论指纹，防止 resolve 重试时把旧决定套给已编辑评论；缺少指纹的旧 checkpoint 重新采集，不从新快照补猜。成本是保留新状态值与旧 checkpoint 的兼容路径，并让发现、重试与展示保持同一含义。仅忽略所有远端未解决评论会丢失新评论、编辑和 deferred 结果；仅删除能力门槛则会在重启后重复修复。
+
+原生评论没有远端 resolve/reply 结果时，公共修复说明是该轮唯一的远端处理反馈，不能沿用 GitHub 补充总结的 best-effort 语义。先在已有 run checkpoint 保存 agent 决定，说明发布成功或按同一 marker 查回后，再写入用于 discovery 去重的 evidence；发布失败仅重放已有步骤，不重复 agent 或推送。这个顺序避免增加“等待消息”的队列状态和额外 discovery 门禁。HTTP 结果只表示消息是否送达，不改变 agent 对代码是否 fixed 的决定。
+
+混合旧 summary 与原生评论时，同一条公共回评先保存本轮成功结果，再重新采集新增或编辑的反馈。复用 checkpoint 中 agent 已观察的旧 reviewer round，避免新 round 借用旧决定；发布时仍刷新 fixer 评论以恢复响应丢失后的同一条消息。发现与 recheck 直接读取最新 reviewer round，因此手动循环关闭 autoDiscovery 后也能看到新反馈。没有增加快照字段或消息层；旧协议仍以 round 版本为边界，不扩展支持人工在同一 round 内改写隐藏协议内容。
+
+Forgejo Compare API 只返回 commits/files/total_commits，没有 GitHub 的 status/ahead_by/behind_by。已处理 finding 是否仍包含在当前 head，使用准确 commit 的 Git ancestry 判断，复用冲突检查的对象获取逻辑。代价是本地 Git 查询和必要的对象获取；不能从比较结果的 commit 数量推断祖先关系。浅克隆中如果两个方向都查不到祖先，明确报错，避免把截断历史误判为分叉；先补全本地历史后可继续。
+
+自动合并复用现有策略和 provider dispatch，不新增授权状态或重试账本。授权来自既有 clean review 结果、显式配置及 Looper 范围策略，提交 SHA 仅约束该决定不能作用于漂移后的代码。独立审查发现 Forgejo 16.0.3 的 scheduled merge 会在 `head_commit_id` 校验前返回，后台任务也不保存该 SHA，因此不能靠携带这个字段声称排队合并受保护。删除对服务器合并队列的依赖，使用 `merge_when_checks_succeed=false` 的即时合并与既有 Reviewer publish checkpoint 重试；CI 拒绝后复用已完成的评审，不重新调用 agent。成本是维护 settings / protection 的字段映射，并保留 review request 被审批消费后的同一 checkpoint 恢复路径。默认关闭，不 force merge、不自动删分支，不放宽标签、linked issue / criteria 或自审 COMMENT 限制。依据：[API 的排队与即时分支](https://codeberg.org/forgejo/forgejo/src/tag/v16.0.3/routers/api/v1/repo/pull.go#L1004)、[后台合并执行](https://codeberg.org/forgejo/forgejo/src/tag/v16.0.3/services/automerge/automerge.go#L231)。
 
 ## 验收命令
+
+在本次实现分支的工作区构建可执行文件：
+
+```sh
+mkdir -p dist
+go build -o dist/looper ./cmd/looper
+go build -o dist/looperd ./cmd/looperd
+```
+
+既有 Forgejo 项目不需要迁移数据库。原生流程使用 `roles.reviewer.behavior.publishMode=single_review`，并启用 reviewer/fixer 的 autoDiscovery。同一账号同时创建和评审 PR 时，需要显式允许 self-review；可以使用配置的 reviewer label 触发，不依赖自请求评审。保留 `threadResolution.enabled=false`。这些设置均可放在目标项目的 `projects[].roles` 下；具体结构见 [配置说明](configuration.md#provider-support)。兼容 `summary_comment` 的旧项目可以继续运行，也使用相同的可见模板。
+
+自动合并单独显式开启，仍要求既有 Looper scope / linked issue / acceptance criteria / 分支保护。等待 CI 使用现有有界重试，达到队列重试或连续失败上限后，需要在 CI 就绪后继续或重新检查；不是无限期后台排队。自审降级为 COMMENT 不授予合并权限。
+
+完整源码检查：
 
 ```sh
 gofmt -l .
@@ -48,3 +70,14 @@ go build ./...
 Sandbox 使用 `core/looper-sandbox`、独立配置 / 数据库 / worktree / 端口及专属分支和标签。测试结束关闭本轮 PR 并删除本轮测试分支、标签；不合并到 sandbox 默认分支，不操作现有 looperd。远端请求同时校验 HTTP 状态，不能只依赖 tea 退出码。
 
 实际验证结果与最终配置步骤在验收阶段补齐。
+
+已有 `tea` 登录和 Codex 登录时，可执行隔离的真实 agent 验收：
+
+```sh
+python3 scripts/forgejo-review-fix-smoke.py \
+  --base-url https://code.powerformer.net \
+  --repo core/looper-sandbox \
+  --tea-login powerformer-code
+```
+
+脚本从当前源码构建二进制，手动发起第一轮原生 reviewer（不使用 force），随后自动执行 fixer 与新 head 的 reviewer，并重启同一隔离数据库验证不会重复推送或发布 review。最后运行远端修复 commit 的 fixture 测试、检查公共署名与可见消息格式，并关闭自身 PR、删除自身分支和标签。真实 Codex 调用使用当前账号，会消耗模型额度。证据保存在 `dist/looper-smoke-<run>/`，包括远端快照、run/checkpoint、fixture 测试结果与 cleanup 结果。

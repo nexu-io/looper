@@ -363,6 +363,9 @@ func TestMinimalForgejoProviderConfigAppliesSafeProjectProfile(t *testing.T) {
 		t.Fatalf("provider baseUrl = %q, want normalized host without trailing slash", got)
 	}
 	roles := ProjectRoleConfigs(loaded.Config, "demo")
+	if roles.Reviewer.AutoMerge.Enabled {
+		t.Fatal("Forgejo auto-merge must remain disabled by default")
+	}
 	if !roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
 		t.Fatalf("forgejo reviewer requireReviewRequest = false, want true")
 	}
@@ -534,8 +537,31 @@ func TestForgejoProjectRejectsUnsupportedRoleCapabilityOptIns(t *testing.T) {
 	if !errors.As(err, &validationErr) {
 		t.Fatalf("LoadFile() error = %T, want *ConfigValidationError", err)
 	}
-	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.autoMerge.enabled", "must be false for forgejo projects")
 	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.threadResolution.enabled", "must be false for forgejo projects")
+}
+
+func TestForgejoProjectAllowsExplicitAutoMergeOptIn(t *testing.T) {
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.json")
+	contents := `{
+		"notifications":{"osascript":{"enabled":false}},
+		"providers":[{"id":"fj","kind":"forgejo","baseUrl":"https://forgejo.example.test","tokenEnv":"FORGEJO_TOKEN"}],
+		"projects":[{"id":"demo","name":"Demo","provider":"fj","repo":"owner/repo","repoPath":"/tmp/repo","roles":{"reviewer":{"autoMerge":{"enabled":true,"strategy":"rebase"}}}}]
+	}`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	autoMerge := ProjectRoleConfigs(loaded.Config, "demo").Reviewer.AutoMerge
+	if !autoMerge.Enabled || autoMerge.Strategy != ReviewerAutoMergeStrategyRebase || autoMerge.Scope != ReviewerAutoMergeScopeLooperOnly || !autoMerge.RequireBranchProtection {
+		t.Fatalf("auto-merge opt-in changed policy = %#v", autoMerge)
+	}
+	if loaded.Config.Roles.Reviewer.AutoMerge.Enabled {
+		t.Fatal("project opt-in changed the global default")
+	}
 }
 
 func TestForgejoProviderAuthTeaAllowsMissingTokenEnv(t *testing.T) {
