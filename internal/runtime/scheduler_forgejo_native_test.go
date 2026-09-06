@@ -72,6 +72,40 @@ func TestFindForgejoNativeReviewMarkerEnforcesOutcomeSpecificEvents(t *testing.T
 	}
 }
 
+func TestFindForgejoNativeReviewMarkerAcceptsOnlyExplicitSelfBlockingFallback(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, reviewAuthor, markerHead, commitHead string
+		allow, wantFound                           bool
+	}{
+		{name: "self transport fallback", reviewAuthor: "reviewer", markerHead: "head", commitHead: "head", allow: true, wantFound: true},
+		{name: "no self transport allowance", reviewAuthor: "reviewer", markerHead: "head", commitHead: "head"},
+		{name: "wrong review author", reviewAuthor: "other", markerHead: "head", commitHead: "head", allow: true},
+		{name: "wrong marker head", reviewAuthor: "reviewer", markerHead: "old", commitHead: "old", allow: true},
+		{name: "review commit differs from marker", reviewAuthor: "reviewer", markerHead: "head", commitHead: "old", allow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviews := []forge.PullRequestReview{{
+				ID: 1, State: "COMMENTED", CommitID: tc.commitHead,
+				Body:     "Blocking finding\n<!-- looper:review id=reviewer:loop:head head=" + tc.markerHead + " outcome=blocking -->",
+				User:     forge.Identity{Login: tc.reviewAuthor},
+				Comments: []forge.PullRequestReviewComment{{Body: "Return the discounted total."}},
+			}}
+			found := findForgejoNativeReviewMarker(reviews, reviewer.VerifyReviewMarkerInput{
+				Marker: "looper:review id=reviewer:loop:head head=head", AuthorLogin: "reviewer",
+				AllowedReviewEvents:  []reviewer.ReviewEvent{reviewer.ReviewEventComment, reviewer.ReviewEventRequestChanges},
+				AllowBlockingComment: tc.allow,
+			})
+			if found.Found != tc.wantFound {
+				t.Fatalf("marker = %#v, want Found=%t", found, tc.wantFound)
+			}
+			if tc.wantFound && (found.Event != reviewer.ReviewEventComment || found.Outcome != "blocking" || len(found.InlineCommentBodies) != 1) {
+				t.Fatalf("self review lost its blocking finding: %#v", found)
+			}
+		})
+	}
+}
+
 func TestReviewerForgejoAdapterNativeDiscoveryContextPublishAndRetry(t *testing.T) {
 	t.Setenv("FORGEJO_TOKEN", "secret")
 	marker := "<!-- looper:review id=reviewer:loop:head-42 head=head-42 outcome=blocking -->"
@@ -79,6 +113,10 @@ func TestReviewerForgejoAdapterNativeDiscoveryContextPublishAndRetry(t *testing.
 	publishCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/statuses/"):
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/actions/runs"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []any{}})
 		case r.URL.Path == "/swagger.v1.json":
 			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{},"post":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}}}}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/user":

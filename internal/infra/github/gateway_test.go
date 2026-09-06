@@ -2970,8 +2970,30 @@ func TestReviewEngagementDoesNotRecoverOldHeadWhenCurrentHeadAlreadyReviewed(t *
 	old := map[string]any{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "commit_id": "old", "body": "<!-- looper:review id=reviewer:loop head=old outcome=blocking -->"}
 	current := map[string]any{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "commit_id": "new", "body": "<!-- looper:review id=reviewer:loop head=new outcome=blocking -->"}
 	for _, reviews := range [][]map[string]any{{old, current}, {current, old}} {
-		if got := ReviewEngagementHead(reviews, "loop", "new", "bob", []string{"COMMENT", "REQUEST_CHANGES"}, false); got != "" {
+		if got := ReviewEngagementHead(reviews, "loop", "new", "bob", []string{"COMMENT", "REQUEST_CHANGES"}, false, false); got != "" {
 			t.Fatalf("current head granted full follow-up via %q", got)
 		}
+	}
+}
+
+func TestReviewEngagementSelfBlockingFallbackStillMatchesAuthorAndHead(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, author, commit, markerHead string
+		allow                            bool
+		want                             string
+	}{
+		{name: "explicit Forgejo fallback", author: "bob", commit: "old", markerHead: "old", allow: true, want: "old"},
+		{name: "GitHub policy unchanged", author: "bob", commit: "old", markerHead: "old"},
+		{name: "wrong review author", author: "alice", commit: "old", markerHead: "old", allow: true},
+		{name: "marker does not match reviewed commit", author: "bob", commit: "old", markerHead: "other", allow: true},
+		{name: "current head already reviewed", author: "bob", commit: "new", markerHead: "new", allow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviews := []map[string]any{{"user": map[string]any{"login": tc.author}, "state": "COMMENTED", "commit_id": tc.commit, "body": "<!-- looper:review id=reviewer:loop head=" + tc.markerHead + " outcome=blocking -->"}}
+			if got := ReviewEngagementHead(reviews, "loop", "new", "bob", []string{"COMMENT", "REQUEST_CHANGES"}, true, tc.allow); got != tc.want {
+				t.Fatalf("engagement = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

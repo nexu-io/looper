@@ -227,16 +227,16 @@ func TestFixerHITLParksResumesAndConsumesAnswer(t *testing.T) {
 	}
 }
 
-func TestFixerHITLPromptIsLimitedToNonNativeReviewThreads(t *testing.T) {
+func TestFixerHITLPromptIncludesExplicitNativeDecisionContract(t *testing.T) {
 	t.Parallel()
 	native := []FixItem{{Type: "comment", ID: "native-1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101}}
-	if instruction := fixerHITLPromptFor(native); instruction != "" {
-		t.Fatalf("native-only HITL instruction = %q, want empty", instruction)
+	if instruction := fixerHITLPromptFor(native); !strings.Contains(instruction, "repair_results") {
+		t.Fatalf("native HITL instruction = %q, want structured native contract", instruction)
 	}
 	regular := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}
 	instruction := fixerHITLPromptFor(regular)
-	if !strings.Contains(instruction, "only to non-native comment fix items") ||
-		!strings.Contains(instruction, "Never use \"needs_human\" in Forgejo repair_results") ||
+	if !strings.Contains(instruction, "including Forgejo native comments") ||
+		!strings.Contains(instruction, "For Forgejo native comments") ||
 		!strings.Contains(instruction, "Classify every listed item before editing") ||
 		!strings.Contains(instruction, "the same behavior needs a second repair") ||
 		!strings.Contains(instruction, "STOP THE ENTIRE TURN BEFORE MAKING EDITS") ||

@@ -521,14 +521,14 @@ func isAbsoluteHTTPURL(value string) bool {
 }
 
 func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if roles.Reviewer.AutoMerge.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false for forgejo projects"})
-	}
 	if roles.Reviewer.Behavior.ThreadResolution.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.threadResolution.enabled", Message: "must be false for forgejo projects"})
 	}
 	if roles.Coordinator.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for forgejo projects"})
+	}
+	if roles.Reviewer.AutoMerge.Enabled && roles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false when publishMode is summary_comment"})
 	}
 }
 

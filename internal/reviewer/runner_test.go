@@ -8789,7 +8789,7 @@ func TestBuildReviewPromptForgejoNativeKeepsMustFixInline(t *testing.T) {
 func TestBuildReviewerMinimalPRSeedUsesEnterpriseHost(t *testing.T) {
 	t.Parallel()
 
-	seed := buildReviewerMinimalPRSeed("ghe.example.com/acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, config.ReviewerScopeFullPR)
+	seed := buildReviewerMinimalPRSeed("ghe.example.com/acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, config.ReviewerScopeFullPR, "")
 	if !strings.Contains(seed, "\"url\": \"https://ghe.example.com/acme/looper/pull/42\"") {
 		t.Fatalf("seed = %q, want enterprise host PR URL", seed)
 	}
@@ -8831,31 +8831,49 @@ func TestBuildReviewPromptRequiresHumanCleanApproveBodyMentioningAuthor(t *testi
 
 func TestBuildReviewPromptOmitsSubmitPathInstructionWhenTrustedWrapperUnavailable(t *testing.T) {
 	t.Parallel()
+	for _, provider := range []string{"GitHub", "Forgejo"} {
+		t.Run(provider, func(t *testing.T) {
+			cfg, err := config.DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if provider == "Forgejo" {
+				cfg.Providers = []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
+				cfg.Projects = []config.ProjectRefConfig{{ID: "p", Provider: "fj", Repo: "acme/looper"}}
+			}
+			prompt, _ := buildReviewPromptWithInstructions("p", cfg, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, true, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "", false, false, "")
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "")
-
-	if !strings.Contains(prompt, "trusted looper review submit wrapper unavailable") {
-		t.Fatalf("prompt missing trusted wrapper unavailable failure instruction:\n%s", prompt)
-	}
-	for _, want := range []string{
-		"do not publish any GitHub review",
-		"do not add or remove any GitHub reaction",
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing wrapper-unavailable failure guard %q:\n%s", want, prompt)
-		}
-	}
-	for _, forbidden := range []string{
-		"When submitting through",
-		"'' review submit",
-		" review submit acme/looper#42",
-		"You must publish the GitHub review yourself by calling looper's enforced review-submit wrapper",
-		"finish successfully with the `No actionable findings` summary only",
-		"finish successfully with a summary beginning `No actionable findings`",
-	} {
-		if strings.Contains(prompt, forbidden) {
-			t.Fatalf("prompt contains unavailable submit-path instruction %q:\n%s", forbidden, prompt)
-		}
+			if !strings.Contains(prompt, "trusted looper review submit wrapper unavailable") {
+				t.Fatalf("prompt missing trusted wrapper unavailable failure instruction:\n%s", prompt)
+			}
+			for _, want := range []string{
+				"do not publish any " + provider + " review",
+				"do not add or remove any " + provider + " reaction",
+			} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt missing wrapper-unavailable failure guard %q:\n%s", want, prompt)
+				}
+			}
+			for _, forbidden := range []string{
+				"When submitting through",
+				"'' review submit",
+				" review submit acme/looper#42",
+				"You must publish the GitHub review yourself by calling looper's enforced review-submit wrapper",
+				"finish successfully with the `No actionable findings` summary only",
+				"finish successfully with a summary beginning `No actionable findings`",
+			} {
+				if strings.Contains(prompt, forbidden) {
+					t.Fatalf("prompt contains unavailable submit-path instruction %q:\n%s", forbidden, prompt)
+				}
+			}
+			if provider == "Forgejo" {
+				for _, forbidden := range []string{"GitHub operation contract", "gh api", "gh pr"} {
+					if strings.Contains(prompt, forbidden) {
+						t.Fatalf("Forgejo wrapper-unavailable prompt contains %q", forbidden)
+					}
+				}
+			}
+		})
 	}
 }
 

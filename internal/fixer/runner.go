@@ -146,6 +146,7 @@ type FixItem struct {
 	URL                 string   `json:"url,omitempty"`
 	Path                string   `json:"path,omitempty"`
 	Line                int64    `json:"line,omitempty"`
+	ActionRunID         int64    `json:"actionRunId,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -160,6 +161,7 @@ type PullRequestSummary struct {
 
 type PullRequestDetail struct {
 	Number         int64
+	URL            string
 	State          string
 	IsDraft        bool
 	Labels         []string
@@ -270,10 +272,18 @@ type NativeReviewComment struct {
 	IsResolved          bool
 	Author              string
 	UpdatedAt           string
+	ReviewBody          string
+	ReviewState         string
+	ReviewCommitID      string
+	ReviewAuthor        string
 }
 
-func NativeReviewCommentFingerprint(commentID int64, updatedAt string) string {
-	return fmt.Sprintf("%s:%d:%s", NativeReviewCommentSource, commentID, strings.TrimSpace(updatedAt))
+// NativeReviewCommentFingerprint binds an observed decision to the comment's
+// identity and exact feedback. Forgejo may change updated_at after a push even
+// when the feedback is unchanged, so timestamps are not content revisions.
+func NativeReviewCommentFingerprint(commentID int64, body string) string {
+	digest := sha256.Sum256([]byte(body))
+	return fmt.Sprintf("%s:%d:sha256:%x", NativeReviewCommentSource, commentID, digest)
 }
 
 func NativeReviewCommentFixItemID(commentID int64) string {
@@ -763,6 +773,7 @@ const (
 )
 
 type checkpointDetail struct {
+	URL            string           `json:"url,omitempty"`
 	State          string           `json:"state,omitempty"`
 	IsDraft        bool             `json:"isDraft,omitempty"`
 	Labels         []string         `json:"labels,omitempty"`
@@ -830,6 +841,7 @@ type replyExplanationEntry struct {
 	Action                 string `json:"action,omitempty"`
 	Explanation            string `json:"explanation"`
 	ThreadCommentsObserved string `json:"threadCommentsObserved,omitempty"`
+	ObservedFingerprint    string `json:"observedFingerprint,omitempty"`
 }
 
 type nativeRepairResultEntry struct {
@@ -1137,6 +1149,8 @@ func normalizeNativeRepairAction(raw string) string {
 		return "declined"
 	case "deferred":
 		return "deferred"
+	case "needs_human":
+		return "needs_human"
 	default:
 		return ""
 	}
@@ -1207,7 +1221,7 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 	out := make([]replyExplanationEntry, 0, len(results))
 	for _, result := range results {
 		item := itemsByProviderID[result.ProviderCommentID]
-		out = append(out, replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: result.Action, Explanation: result.Explanation})
+		out = append(out, replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: result.Action, Explanation: result.Explanation, ObservedFingerprint: result.ObservedFingerprint})
 	}
 	return out
 }
@@ -1847,6 +1861,13 @@ func (r *Runner) isForgejoProject(projectID string) bool {
 	return r.projectRoleConfig != nil && config.ProjectProviderKind(*r.projectRoleConfig, projectID) == config.ProviderKindForgejo
 }
 
+func (r *Runner) forgejoSummaryCommentMode(projectID string) bool {
+	if r.projectRoleConfig == nil {
+		return false
+	}
+	return r.isForgejoProject(projectID) && config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
+}
+
 func defaultDiscoveryLimit(limit int) int {
 	if limit <= 0 {
 		return 30
@@ -1925,7 +1946,7 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
-	detail, err = r.prepareForgejoDiscoveryDetail(ctx, project, detail)
+	detail, err = r.prepareForgejoDiscoveryDetail(ctx, project, repo, detail)
 	if err != nil {
 		return err
 	}
@@ -1953,8 +1974,19 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
-	allFixItemsStateHash := hashFixItemsState(allFixItems)
-	fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, repo, detail.Number), detail.HeadSHA, allFixItems)
+	actionableFixItems, err = r.suppressFixedForgejoNativeItems(ctx, project, repo, detail.Number, detail.HeadSHA, loop, actionableFixItems)
+	if err != nil {
+		return err
+	}
+	if len(actionableFixItems) == 0 {
+		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
+			return err
+		}
+		result.Skipped++
+		return nil
+	}
+	allFixItemsStateHash := hashFixItemsState(actionableFixItems)
+	fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, repo, detail.Number), detail.HeadSHA, actionableFixItems)
 	fixItems, err = r.suppressWithheldDispositionFixItems(ctx, project, repo, detail, fixItems)
 	if err != nil {
 		return err
@@ -2010,10 +2042,10 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 }
 
 func pullRequestCheckpointDetail(detail PullRequestDetail) *checkpointDetail {
-	return &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
+	return &checkpointDetail{URL: detail.URL, State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
 }
 
-func (r *Runner) prepareForgejoDiscoveryDetail(ctx context.Context, project storage.ProjectRecord, detail PullRequestDetail) (PullRequestDetail, error) {
+func (r *Runner) prepareForgejoDiscoveryDetail(ctx context.Context, project storage.ProjectRecord, repo string, detail PullRequestDetail) (PullRequestDetail, error) {
 	if !r.isForgejoProject(project.ID) {
 		return detail, nil
 	}
@@ -2022,6 +2054,13 @@ func (r *Runner) prepareForgejoDiscoveryDetail(ctx context.Context, project stor
 		return detail, err
 	}
 	sanitizeForgejoSummaryAuthority(&detail, currentUser)
+	if !r.forgejoSummaryCommentMode(project.ID) {
+		native, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: repo, PRNumber: detail.Number, CWD: project.RepoPath})
+		if err != nil {
+			return detail, classifyForgejoNativeDiscoveryError(err)
+		}
+		detail.Comments = append(nativeReviewCommentsToMaps(actionableNativeReviewComments(native, currentUser)), nonNativeComments(detail.Comments)...)
+	}
 	checkpoint := fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)}
 	if _, _, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
 		return detail, err
@@ -2679,7 +2718,7 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 	if !isManualFixerLoop(input.Loop) && len(prQueryLabels(policy.Labels)) > 0 && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		return checkpoint, &labelMismatchSkipError{summary: fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", input.Repo, input.PRNumber)}
 	}
-	checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
+	checkpoint.Detail = &checkpointDetail{URL: detail.URL, State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
 }
@@ -2843,8 +2882,8 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
-	if isManualFixerLoop(input.Loop) {
-		if err := r.attachManualForgejoNativeComments(ctx, input, &checkpoint); err != nil {
+	if !r.forgejoSummaryCommentMode(input.Project.ID) && (r.isForgejoProject(input.Project.ID) || isManualFixerLoop(input.Loop)) {
+		if err := r.attachForgejoNativeComments(ctx, input, &checkpoint); err != nil {
 			return checkpoint, err
 		}
 	}
@@ -2863,19 +2902,12 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	if err != nil {
 		return checkpoint, err
 	}
+	fixItems, err = r.suppressFixedForgejoNativeItems(ctx, input.Project, input.Repo, input.PRNumber, detailHeadSHA(checkpoint.Detail), &input.Loop, fixItems)
+	if err != nil {
+		return checkpoint, err
+	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
-	if hasForgejoNativeReviewComments(fixItems) {
-		state, probeErr := r.github.ProbeNativeReviewCommentResolution(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
-		if probeErr != nil || state != forge.ProbeStateSupported {
-			return checkpoint, &loopError{message: fmt.Sprintf("Forgejo native review comment resolution is %s; manual intervention required", firstNonEmpty(string(state), "unknown")), kind: FailureManualIntervention}
-		}
-	}
-	for _, item := range fixItems {
-		if item.Type == "comment" && item.Source == NativeReviewCommentSource && !item.ResolverPresent {
-			return checkpoint, &loopError{message: fmt.Sprintf("Forgejo native review comment resolution is unsupported for comment %d; manual intervention required", item.ProviderCommentID), kind: FailureManualIntervention}
-		}
-	}
 	if len(fixItems) == 0 {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped %s#%d because no fix items remain", input.Repo, input.PRNumber)
 		return checkpoint, nil
@@ -2894,7 +2926,7 @@ func hasForgejoNativeReviewComments(items []FixItem) bool {
 	return false
 }
 
-func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint) error {
+func (r *Runner) attachForgejoNativeComments(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint) error {
 	if checkpoint == nil || checkpoint.Detail == nil {
 		return nil
 	}
@@ -2908,9 +2940,6 @@ func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input st
 	nativeComments, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return classifyForgejoNativeDiscoveryError(err)
-	}
-	if len(nativeComments) == 0 {
-		return nil
 	}
 	nativeComments = actionableNativeReviewComments(nativeComments, currentUser)
 	comments := make([]map[string]any, 0, len(nativeComments)+len(checkpoint.Detail.Comments))
@@ -3333,6 +3362,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, &holdSkipError{summary: summary}
 	}
 	replies := normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
+	replies = append(replies, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
 	if err := validateNeedsHumanReplies(result.Stdout, result.Stderr, checkpoint.FixItems, replies); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureManualIntervention}
 	}
@@ -3344,7 +3374,6 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	}
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.Repair.ReplyExplanations = replies
-	checkpoint.Repair.ReplyExplanations = append(checkpoint.Repair.ReplyExplanations, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -3734,8 +3763,13 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	hasReviewerSummary := false
 	if _, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
-	} else {
-		hasReviewerSummary = ok
+	} else if ok {
+		for _, item := range checkpoint.FixItems {
+			if item.Source == "forgejo-reviewer-summary" {
+				hasReviewerSummary = true
+				break
+			}
+		}
 	}
 	if checkpoint.Validation == nil || !checkpoint.Validation.Passed {
 		return checkpoint, &loopError{message: "resolve-comments requires successful validation", kind: FailureRetryableAfterResume}
@@ -3743,16 +3777,17 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.Push == nil {
 		return checkpoint, &loopError{message: "resolve-comments requires push step to complete", kind: FailureRetryableAfterResume}
 	}
+	if hasForgejoNativeReviewComments(checkpoint.FixItems) {
+		// Persisted agent decisions can replay publication after interruption;
+		// live head and comment checks below still restart on actual drift.
+		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
+	}
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
 		return checkpoint, err
 	}
 	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, liveDetail.Labels) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
-	}
-	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
-	if err != nil {
-		return checkpoint, err
 	}
 	// Ancestor guard: if we previously pushed a fix commit, make sure the
 	// live PR head still descends from it. If a collaborator force-pushed or
@@ -3781,32 +3816,57 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	priorNativeCommentItems := make([]FixItem, 0)
-	priorNativeCommentItemsByProviderID := map[int64]FixItem{}
 	hasNativeForgejoItems := false
 	for _, item := range checkpoint.FixItems {
 		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
 			hasNativeForgejoItems = true
 			priorNativeCommentItems = append(priorNativeCommentItems, item)
-			priorNativeCommentItemsByProviderID[item.ProviderCommentID] = item
 		}
 	}
 	var liveNativeComments []NativeReviewComment
-	if hasNativeForgejoItems || isManualFixerLoop(input.Loop) {
+	if hasNativeForgejoItems || (!r.forgejoSummaryCommentMode(input.Project.ID) && (r.isForgejoProject(input.Project.ID) || isManualFixerLoop(input.Loop))) {
 		liveNativeComments, err = r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 		if err != nil {
 			return checkpoint, classifyForgejoNativeResolveError(err)
 		}
-		if len(liveNativeComments) > 0 {
-			currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-			if err != nil {
-				return checkpoint, err
-			}
-			liveNativeComments = nonSelfNativeReviewComments(liveNativeComments, currentUser)
-			liveDetail.Comments = append(nativeReviewCommentsToMaps(liveNativeComments), nonNativeComments(liveDetail.Comments)...)
+		currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return checkpoint, err
 		}
+		sanitizeForgejoSummaryAuthority(&liveDetail, currentUser)
+		liveNativeComments = eligibleNativeReviewComments(liveNativeComments, currentUser)
+		liveDetail.Comments = append(nativeReviewCommentsToMaps(liveNativeComments), nonNativeComments(liveDetail.Comments)...)
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
-	fixItems := collectFixItems(liveDetail)
+	fixItems, err := collectFixItemsFromCheckpointForStep(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	fixItems, err = r.unsatisfiedForgejoSummaryItems(input.Project.ID, checkpoint.Detail, fixItems)
+	if err != nil {
+		return checkpoint, err
+	}
+	fixItems, err = r.suppressFixedForgejoNativeItems(ctx, input.Project, input.Repo, input.PRNumber, liveDetail.HeadSHA, &input.Loop, fixItems)
+	if err != nil {
+		return checkpoint, err
+	}
+	// Retain the round's original items for truthful reporting and retry. Newly
+	// arrived comments are still checked below and cannot borrow old decisions.
+	for _, prior := range checkpoint.FixItems {
+		if prior.Source != NativeReviewCommentSource && prior.Source != "forgejo-reviewer-summary" {
+			continue
+		}
+		found := false
+		for _, item := range fixItems {
+			if item.ID == prior.ID && item.Type == prior.Type && item.Name == prior.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			fixItems = append(fixItems, prior)
+		}
+	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
 	if checkpoint.ResolvedComments == nil {
@@ -3848,7 +3908,6 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	driftCount := 0
 	mutationFailureCount := 0
-	nativeMutationFailureCount := 0
 	var nativeMutationErr error
 	// Drift detection must be anchored to when the agent recorded the
 	// reply explanations, not when the current (possibly retried) run
@@ -3978,62 +4037,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	if len(nativeCommentItems) > 0 {
-		repliesByFixItemID := agentResolveRepliesByFixItemID(checkpoint)
-		liveByProviderID := map[int64]NativeReviewComment{}
-		for _, live := range liveNativeComments {
-			liveByProviderID[live.ProviderCommentID] = live
-		}
-		for _, item := range nativeCommentItems {
-			if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
-				continue
-			}
-			decision, hasDecision := repliesByFixItemID[item.ID]
-			live, liveOK := liveByProviderID[item.ProviderCommentID]
-			if !liveOK {
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "deleted", UpdatedAt: r.nowISO()})
-				continue
-			}
-			if live.IsResolved {
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "already_resolved", UpdatedAt: r.nowISO()})
-				continue
-			}
-			if !hasDecision {
-				contractViolationCount++
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_missing_agent_decision", Message: agentMissingThreadDecisionExplanation, UpdatedAt: r.nowISO()})
-				continue
-			}
-			if strings.TrimSpace(decision.Action) != "fixed" {
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_noop", UpdatedAt: r.nowISO()})
-				continue
-			}
-			if !checkpoint.Push.Pushed {
-				return checkpoint, &loopError{message: "resolve-comments requires an actual push before resolving fixed Forgejo native review comments", kind: FailureManualIntervention}
-			}
-			priorItem := priorNativeCommentItemsByProviderID[item.ProviderCommentID]
-			if strings.TrimSpace(priorItem.ObservedFingerprint) == "" || priorItem.ObservedFingerprint != strings.TrimSpace(live.ObservedFingerprint) {
-				driftCount++
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_thread_drift", Message: "Forgejo native review comment changed since the fixer inspected it", UpdatedAt: r.nowISO()})
-				continue
-			}
-			if err := r.github.ResolveNativeReviewComment(ctx, ResolveNativeReviewCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, ProviderCommentID: item.ProviderCommentID, CWD: input.Project.RepoPath}); err != nil {
-				if isForgejoNativeResolveUnsupported(err) {
-					nativeMutationFailureCount++
-					if nativeMutationErr == nil {
-						nativeMutationErr = err
-					}
-					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "unsupported_remote_resolution", Message: err.Error(), UpdatedAt: r.nowISO()})
-					continue
-				}
-				nativeMutationFailureCount++
-				if nativeMutationErr == nil {
-					nativeMutationErr = err
-				}
-				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "failed_mutation_retry", Message: err.Error(), UpdatedAt: r.nowISO()})
-				continue
-			}
-			resolvedCount++
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "resolved", UpdatedAt: r.nowISO()})
-		}
+		finished, missing, drift, finishErr := r.finishForgejoNativeComments(ctx, input, &checkpoint, nativeCommentItems, liveNativeComments)
+		resolvedCount += finished
+		contractViolationCount += missing
+		driftCount += drift
+		nativeMutationErr = finishErr
 	}
 	if contractViolationCount > 0 {
 		if _, err := r.incrementContractViolationCount(ctx, input.Loop, contractViolationCount); err != nil {
@@ -4041,8 +4049,25 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.comments.resolved", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"items": checkpoint.ResolvedComments.Items}})
-	if resolvedCount > 0 {
-		r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, lookupReplyExplanations(checkpoint))
+	// Publish this round's confirmed results before rediscovering any newer
+	// feedback. Mixed native/legacy rounds use the same comment and checkpoint
+	// as legacy-only rounds; publication must succeed before local suppression.
+	if hasReviewerSummary {
+		checkpoint, err = r.runForgejoFixerSummaryStep(ctx, stepInput{Project: input.Project, Loop: input.Loop, Run: input.Run, QueueItem: input.QueueItem, Repo: input.Repo, PRNumber: input.PRNumber, Checkpoint: checkpoint})
+		if err != nil {
+			return checkpoint, err
+		}
+		if err := r.recordPublishedForgejoNativeResults(ctx, input, checkpoint); err != nil {
+			return checkpoint, err
+		}
+	} else if resolvedCount > 0 || len(nativeCommentItems) > 0 || (r.isForgejoProject(input.Project.ID) && roundProducedNewCommits(&checkpoint)) {
+		if err := r.publishRoundSummaryComment(ctx, input, &checkpoint, fixItems, commitSHA, lookupReplyExplanations(checkpoint)); err != nil && len(nativeCommentItems) > 0 {
+			checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
+			return checkpoint, &loopError{message: fmt.Sprintf("Failed to publish Forgejo fixer acknowledgement; will retry: %v", err), kind: FailureRetryableAfterResume}
+		}
+		if err := r.recordPublishedForgejoNativeResults(ctx, input, checkpoint); err != nil {
+			return checkpoint, err
+		}
 	}
 	if driftCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
@@ -4056,15 +4081,12 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: FailureRetryableAfterResume}
 	}
-	if nativeMutationFailureCount > 0 {
+	if nativeMutationErr != nil {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 		return checkpoint, classifyForgejoNativeResolveError(nativeMutationErr)
 	}
 	if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
 		return checkpoint, err
-	}
-	if hasReviewerSummary {
-		return r.runForgejoFixerSummaryStep(ctx, stepInput{Project: input.Project, Loop: input.Loop, Run: input.Run, QueueItem: input.QueueItem, Repo: input.Repo, PRNumber: input.PRNumber, Checkpoint: checkpoint})
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
@@ -4147,18 +4169,11 @@ func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, input.Repo, liveDetail)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
-	reviewerSummary, ok, err = reviewerSummaryFromCheckpointDetail(checkpoint.Detail)
-	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
-	}
-	if !ok {
-		return checkpoint, &loopError{message: "forgejo fixer requires reviewer summary comment", kind: FailureNonRetryable}
-	}
 	summary, err := buildForgejoFixerSummary(checkpoint, reviewerSummary, lookupReplyExplanations(checkpoint))
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -4166,7 +4181,7 @@ func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput
 	if err := forge.ValidateFixerResultsForReviewerSummary(reviewerSummary, summary); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	body, err := renderForgejoFixerSummaryComment(summary)
+	body, err := renderForgejoFixerRoundComment(summary, input.Repo, input.PRNumber, checkpoint)
 	if err != nil {
 		return checkpoint, err
 	}
@@ -4256,19 +4271,39 @@ func nextForgejoFixRoundID(detail *checkpointDetail) int {
 }
 
 func renderForgejoFixerSummaryComment(summary forge.FixerSummary) (string, error) {
+	checkpoint := fixerCheckpoint{}
+	for _, result := range summary.Results {
+		checkpoint.FixItems = append(checkpoint.FixItems, FixItem{Type: "comment", Source: "forgejo-reviewer-summary", ID: result.ReviewItemID})
+	}
+	return renderForgejoFixerRoundComment(summary, "", 0, checkpoint)
+}
+
+func renderForgejoFixerRoundComment(summary forge.FixerSummary, repo string, prNumber int64, checkpoint fixerCheckpoint) (string, error) {
 	marker, err := forge.RenderFixerSummary(summary)
 	if err != nil {
 		return "", err
 	}
-	var b strings.Builder
-	b.WriteString("**Looper Forgejo Fixer Summary**\n\n")
-	b.WriteString(fmt.Sprintf("Consumed Reviewer Summary round `%d`; Fixer Summary round `%d`.\n\n", summary.ConsumedReviewRoundID, summary.FixRoundID))
-	for _, result := range summary.Results {
-		b.WriteString(fmt.Sprintf("- `%s`: `%s` — %s\n", result.ReviewItemID, result.Result, strings.ReplaceAll(strings.TrimSpace(result.Explanation), "\n", " ")))
+	items := summaryCommentItems(checkpoint.FixItems, &checkpoint, lookupReplyExplanations(checkpoint))
+	for index := range items {
+		if items[index].FixItem.Source != "forgejo-reviewer-summary" {
+			continue
+		}
+		for _, result := range summary.Results {
+			if result.ReviewItemID != items[index].FixItem.ID {
+				continue
+			}
+			items[index].Explanation = result.Explanation
+			switch result.Result {
+			case forge.FixerItemResultFixed:
+				items[index].Status = "resolved"
+			case forge.FixerItemResultDeclined:
+				items[index].Status = "agent_declined"
+			default:
+				items[index].Status = "pending"
+			}
+		}
 	}
-	b.WriteString("\n")
-	b.WriteString(marker)
-	return strings.TrimSpace(b.String()), nil
+	return buildFixerSummaryCommentBody(repo, prNumber, summary.ObservedHeadSHA, resolveCommentCommitSHA(checkpoint, nil, false), items) + "\n\n" + marker, nil
 }
 
 // replyToFixedComment posts a reply on the review thread acknowledging the fix
@@ -4419,7 +4454,7 @@ func (r *Runner) refreshResolveCommentState(ctx context.Context, input stepInput
 	if err != nil {
 		return "", PullRequestDetail{}, err
 	}
-	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, liveDetail)
+	liveDetail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, input.Repo, liveDetail)
 	if err != nil {
 		return "", PullRequestDetail{}, err
 	}
@@ -4771,9 +4806,10 @@ func fixerRoundSummaryMarker(headSHA string) string {
 
 // publishRoundSummaryComment posts (or edits) a single PR conversation comment
 // summarizing this fixer round: the commit, every fix item with its outcome,
-// agent explanations when present, and links to each thread. The summary is
-// best-effort and never blocks the resolve step.
-func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint, fixItems []FixItem, commitSHA string, explanationByID map[string]string) {
+// agent explanations when present, and links to each thread. GitHub keeps its
+// best-effort behavior; native Forgejo results require this acknowledgement.
+func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint, fixItems []FixItem, commitSHA string, explanationByID map[string]string) error {
+	native := hasForgejoNativeReviewComments(fixItems)
 	headSHA := commitSHA
 	if headSHA == "" && checkpoint.ReconcileCommits != nil {
 		headSHA = checkpoint.ReconcileCommits.FinalHeadSHA
@@ -4782,19 +4818,21 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 		headSHA = detailHeadSHA(checkpoint.Detail)
 	}
 	if headSHA == "" {
-		return
+		return fmt.Errorf("fixer acknowledgement requires a head commit")
 	}
-	evidence := resolveFixEvidence(*checkpoint, input.Loop.MetadataJSON, checkpoint.FixItemsHash)
-	if evidence == nil || !evidence.Valid || evidence.HeadSHA == "" {
-		return
+	if !native {
+		evidence := resolveFixEvidence(*checkpoint, input.Loop.MetadataJSON, checkpoint.FixItemsHash)
+		if evidence == nil || !evidence.Valid || evidence.HeadSHA == "" {
+			return nil
+		}
+		if !roundProducedNewCommits(checkpoint) && (checkpoint.ReconcileCommits == nil || evidence.HeadSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
+			return nil
+		}
+		headSHA = evidence.HeadSHA
 	}
-	if !roundProducedNewCommits(checkpoint) && (checkpoint.ReconcileCommits == nil || evidence.HeadSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
-		return
-	}
-	headSHA = evidence.HeadSHA
 	commentItems := summaryCommentItems(fixItems, checkpoint, explanationByID)
 	if len(commentItems) == 0 {
-		return
+		return nil
 	}
 	body := buildFixerSummaryCommentBody(input.Repo, input.PRNumber, headSHA, commitSHA, commentItems)
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
@@ -4803,33 +4841,37 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 			checkpoint.SummaryComment.State = "update_failed"
 			checkpoint.SummaryComment.Error = err.Error()
 			checkpoint.SummaryComment.UpdatedAt = r.nowISO()
-			return
+			return err
 		}
 		checkpoint.SummaryComment.State = "updated"
 		checkpoint.SummaryComment.Error = ""
 		checkpoint.SummaryComment.FixItemsHash = checkpoint.FixItemsHash
 		checkpoint.SummaryComment.UpdatedAt = r.nowISO()
-		return
+		return nil
 	}
 	trustedLogin := ""
 	if login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath); err == nil {
 		trustedLogin = login
+	} else if native {
+		checkpoint.SummaryComment = &checkpointSummaryComment{HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "create_failed", Error: err.Error(), UpdatedAt: r.nowISO()}
+		return err
 	}
 	if existingID, existingURL := findExistingFixerSummaryCommentID(checkpoint.Detail, headSHA, trustedLogin); existingID != 0 {
 		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 			checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existingID, URL: existingURL, HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "update_failed", Error: err.Error(), UpdatedAt: r.nowISO()}
-			return
+			return err
 		}
 		checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: existingID, URL: existingURL, HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "updated", UpdatedAt: r.nowISO()}
-		return
+		return nil
 	}
 	created, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 	if err != nil {
 		checkpoint.SummaryComment = &checkpointSummaryComment{HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "create_failed", Error: err.Error(), UpdatedAt: r.nowISO()}
-		return
+		return err
 	}
 	checkpoint.SummaryComment = &checkpointSummaryComment{CommentID: created.ID, URL: created.URL, HeadSHA: headSHA, FixItemsHash: checkpoint.FixItemsHash, State: "created", UpdatedAt: r.nowISO()}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.summary.posted", projectID: input.Project.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"commentId": created.ID, "url": created.URL, "headSha": headSHA, "items": len(commentItems)}})
+	return nil
 }
 
 // roundProducedNewCommits returns true when the current fixer round actually
@@ -4942,6 +4984,20 @@ func formatFixerSummaryBullet(item fixerSummaryItem) string {
 		b.WriteString(threadURL)
 		b.WriteString(")")
 	}
+	if item.FixItem.Source == NativeReviewCommentSource {
+		switch item.Status {
+		case forgejoFixedUnresolvedStatus:
+			b.WriteString(" — code fixed; comment remains open")
+		case "resolved", "already_resolved":
+			b.WriteString(" — comment closed")
+		case "skipped_noop":
+			b.WriteString(" — left open; no repair claimed")
+		case "deleted":
+			b.WriteString(" — comment removed")
+		default:
+			b.WriteString(" — comment remains open")
+		}
+	}
 	if explanation := strings.TrimSpace(item.Explanation); explanation != "" {
 		b.WriteString("\n  - ")
 		b.WriteString(strings.ReplaceAll(explanation, "\n", "\n    "))
@@ -4991,7 +5047,7 @@ func summaryItemLabel(item FixItem) string {
 
 func summaryStatusIcon(status string) string {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "resolved", "already_resolved":
+	case "resolved", "already_resolved", forgejoFixedUnresolvedStatus:
 		return "✅"
 	case "agent_declined", declinePendingAdjudicationStatus:
 		return "⏸️"
@@ -5022,6 +5078,12 @@ func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA, truste
 	for _, comment := range detail.IssueComments {
 		body, _ := stringFromAny(comment["body"])
 		if !strings.Contains(body, marker) {
+			continue
+		}
+		// Compatibility comments also use the shared visible round template,
+		// but retain a separate hidden handoff. A native-only update must not
+		// erase that handoff and make an already consumed legacy round reappear.
+		if strings.Contains(body, "<!-- "+forge.FixerSummaryMarker) {
 			continue
 		}
 		if !isTrustedFixerSummaryComment(comment, trustedLogin, body) {
@@ -5100,6 +5162,10 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
+	detail, err = r.prepareForgejoDiscoveryDetail(ctx, input.Project, input.Repo, detail)
+	if err != nil {
+		return checkpoint, err
+	}
 	checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
 	if (specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
 		if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
@@ -5113,7 +5179,20 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 			}
 		}
 	}
-	checkpoint.Recheck = &checkpointRecheck{RemainingFixItems: collectFixItems(detail)}
+	remaining, err := r.unsatisfiedForgejoSummaryItems(input.Project.ID, pullRequestCheckpointDetail(detail), collectFixItems(detail))
+	if err != nil {
+		return checkpoint, err
+	}
+	remaining, err = r.suppressFixedForgejoNativeItems(ctx, input.Project, input.Repo, input.PRNumber, detail.HeadSHA, &input.Loop, remaining)
+	if err != nil {
+		return checkpoint, err
+	}
+	checkpoint.Recheck = &checkpointRecheck{RemainingFixItems: remaining}
+	if r.isForgejoProject(input.Project.ID) && len(remaining) == 0 {
+		if _, err := r.clearPendingFixerRediscovery(ctx, input.Loop); err != nil {
+			return checkpoint, err
+		}
+	}
 	verifiedNoPushHead := resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, checkpoint.FixItemsHash)
 	hasVerifiedNoPushHead := verifiedNoPushHead != "" && strings.TrimSpace(detail.HeadSHA) == verifiedNoPushHead
 	if shouldBlockResolveWithoutFix(checkpoint, checkpoint.Recheck.RemainingFixItems, hasVerifiedNoPushHead) {
@@ -5155,6 +5234,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
 		pause, _ := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
 		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, pause, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
+		if failedStep == stepResolveComments && hasForgejoNativeReviewComments(checkpoint.FixItems) && checkpoint.ResumePolicy == loops.ResumePolicyReplayStep {
+			restartFromDiscover = false
+		}
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint) &&
 			!shouldResumeHITLRepair(loop.MetadataJSON, latestRun.Status, failedStep, checkpoint)
 	}
@@ -5790,7 +5872,18 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		fixItems := collectFixItems(detail)
+		detail, err = r.prepareForgejoDiscoveryDetail(ctx, project, repo, detail)
+		if err != nil {
+			return nil, err
+		}
+		fixItems, err := r.unsatisfiedForgejoSummaryItems(project.ID, pullRequestCheckpointDetail(detail), collectFixItems(detail))
+		if err != nil {
+			return nil, err
+		}
+		fixItems, err = r.suppressFixedForgejoNativeItems(ctx, project, repo, *loop.PRNumber, detail.HeadSHA, &loop, fixItems)
+		if err != nil {
+			return nil, err
+		}
 		threadIDs := unresolvedThreadIDs(fixItems)
 		if len(threadIDs) == 0 {
 			seenTargets[targetKey] = struct{}{}
@@ -7224,7 +7317,7 @@ func nonNativeComments(comments []map[string]any) []map[string]any {
 func actionableNativeReviewComments(comments []NativeReviewComment, currentUser string) []NativeReviewComment {
 	filtered := make([]NativeReviewComment, 0, len(comments))
 	for _, comment := range comments {
-		if comment.IsResolved || sameGitHubLogin(comment.Author, currentUser) {
+		if comment.IsResolved || !eligibleNativeReviewComment(comment, currentUser) {
 			continue
 		}
 		filtered = append(filtered, comment)
@@ -7232,10 +7325,10 @@ func actionableNativeReviewComments(comments []NativeReviewComment, currentUser 
 	return filtered
 }
 
-func nonSelfNativeReviewComments(comments []NativeReviewComment, currentUser string) []NativeReviewComment {
+func eligibleNativeReviewComments(comments []NativeReviewComment, currentUser string) []NativeReviewComment {
 	filtered := make([]NativeReviewComment, 0, len(comments))
 	for _, comment := range comments {
-		if sameGitHubLogin(comment.Author, currentUser) {
+		if !eligibleNativeReviewComment(comment, currentUser) {
 			continue
 		}
 		filtered = append(filtered, comment)
@@ -7421,7 +7514,12 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		if summary == "" {
 			summary = "Failing check"
 		}
-		result = append(result, FixItem{Type: "check", Name: name, Summary: summary})
+		description, _ := stringFromAny(check["description"])
+		checkURL, _ := stringFromAny(check["url"])
+		if checkURL == "" {
+			checkURL, _ = stringFromAny(check["detailsUrl"])
+		}
+		result = append(result, FixItem{Type: "check", Name: name, Summary: summary, Body: description, URL: checkURL, ActionRunID: int64FromAny(check["actionRunId"])})
 	}
 	if hasConflicts {
 		result = append(result, FixItem{Type: "conflict", Files: []string{}})
@@ -7644,6 +7742,9 @@ func buildFixerMinimalPRSeed(repo string, prNumber int64, detail *checkpointDeta
 }
 
 func seededPullRequestURL(repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem) string {
+	if detail != nil && strings.TrimSpace(detail.URL) != "" {
+		return strings.TrimSpace(detail.URL)
+	}
 	if inferred := inferSeededPullRequestURL(prNumber, detail, fixItems); inferred != "" {
 		return inferred
 	}
@@ -7753,7 +7854,18 @@ func fixerAgentSideFetchContract(repo string, prNumber int64, detail *checkpoint
 }
 
 func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+	if providerURL := forge.ConfiguredPullRequestURL(instructionConfig, projectID, repo, prNumber); providerURL != "" && (detail == nil || detail.URL == "") {
+		copy := checkpointDetail{}
+		if detail != nil {
+			copy = *detail
+		}
+		copy.URL = providerURL
+		detail = &copy
+	}
 	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber), buildFixerMinimalPRSeed(repo, prNumber, detail, fixItems), fixerAgentSideFetchContract(repo, prNumber, detail, fixItems)}
+	if providerContext := forge.ForgejoAgentContext(instructionConfig, projectID, repo, prNumber); providerContext != "" {
+		parts = append(parts, providerContext)
+	}
 	if headSHA := detailHeadSHA(detail); headSHA != "" {
 		parts = append(parts, "Head SHA: "+headSHA)
 	}
@@ -7854,7 +7966,8 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 	if hasNativeForgejoComment {
 		parts = append(parts,
 			"For EVERY Forgejo native review comment fix item (`source: \"forgejo_review_comment\"`), also include exactly one entry in a top-level `repair_results` array on the final "+agent.CompletionMarker+" JSON line.",
-			"Each `repair_results` entry for a Forgejo native review comment must include: `source` = `forgejo_review_comment`, the exact `providerCommentId`, `action` = `fixed`, `declined`, or `deferred`, a concrete `explanation`, and the exact `observedFingerprint` from the fix item.",
+			"Each `repair_results` entry for a Forgejo native review comment must include: `source` = `forgejo_review_comment`, the exact `providerCommentId`, `action` = `fixed`, `declined`, or `deferred` (a later HUMAN-IN-THE-LOOP instruction may also enable `needs_human`), a concrete `explanation`, and the exact `observedFingerprint` from the fix item.",
+			"Do not post replies, resolve comments, submit reviews, edit PR metadata, or perform other mutating Forgejo API actions; Looper publishes the structured repair results after validation. A fixed result means the branch addresses the finding, even if Forgejo cannot close the comment.",
 			"Use Forgejo comment terminology for those entries: decide whether the individual review comment is fixed, declined, or deferred. Do not refer to Forgejo native review comments as threads in `repair_results`.",
 			"Create structured `repair_results` entries only for listed Forgejo native review comment fix items, never for collateral-only changes. Briefly mention material collateral in the explanation for the listed item it supports.",
 		)
@@ -8420,9 +8533,31 @@ func detailLabels(detail *checkpointDetail) []string {
 }
 
 func mergeCheckpointDetailPreservingLabels(existing *checkpointDetail, live PullRequestDetail) *checkpointDetail {
-	merged := &checkpointDetail{State: live.State, IsDraft: live.IsDraft, Labels: cloneStrings(live.Labels), HeadSHA: live.HeadSHA, HeadRefName: live.HeadRefName, BaseRefName: live.BaseRefName, BaseSHA: live.BaseSHA, ReviewDecision: live.ReviewDecision, Comments: cloneObjectSlice(live.Comments), IssueComments: cloneObjectSlice(live.IssueComments), Checks: cloneObjectSlice(live.Checks), HasConflicts: live.HasConflicts}
+	merged := &checkpointDetail{URL: live.URL, State: live.State, IsDraft: live.IsDraft, Labels: cloneStrings(live.Labels), HeadSHA: live.HeadSHA, HeadRefName: live.HeadRefName, BaseRefName: live.BaseRefName, BaseSHA: live.BaseSHA, ReviewDecision: live.ReviewDecision, Comments: cloneObjectSlice(live.Comments), IssueComments: cloneObjectSlice(live.IssueComments), Checks: cloneObjectSlice(live.Checks), HasConflicts: live.HasConflicts}
 	if existing != nil {
 		merged.Labels = cloneStrings(existing.Labels)
+		// Keep the legacy review round that supplied the agent's fix items.
+		// Refreshes during push/resolve may update head and fixer comments, but
+		// cannot grant old decisions authority over a newer reviewer round.
+		// Discovery and recheck read live detail directly, so new rounds remain
+		// actionable even when this checkpoint replays publication after restart.
+		var reviewerComments []map[string]any
+		for _, comment := range existing.IssueComments {
+			body, _ := stringFromAny(comment["body"])
+			if strings.Contains(body, "<!-- "+forge.ReviewerSummaryMarker) {
+				reviewerComments = append(reviewerComments, comment)
+			}
+		}
+		if len(reviewerComments) > 0 {
+			comments := merged.IssueComments[:0]
+			for _, comment := range merged.IssueComments {
+				body, _ := stringFromAny(comment["body"])
+				if !strings.Contains(body, "<!-- "+forge.ReviewerSummaryMarker) {
+					comments = append(comments, comment)
+				}
+			}
+			merged.IssueComments = append(comments, cloneObjectSlice(reviewerComments)...)
+		}
 	}
 	return merged
 }
@@ -8590,10 +8725,15 @@ func upsertThreadFixEvidence(store *fixEvidenceStoreV2, next threadFixEvidence) 
 		if entries[i].ThreadFingerprint != next.ThreadFingerprint {
 			continue
 		}
+		if next.ResolveState == "pending" && entries[i].ResolveState == forgejoFixedUnresolvedStatus && entries[i].EvidenceHeadSHA == next.EvidenceHeadSHA {
+			// A replayed push cannot replace the explicit agent decision with
+			// generic push evidence, even when it refers to the same commit.
+			return store
+		}
 		if strings.TrimSpace(next.ReplyState) == "pending" && strings.TrimSpace(entries[i].ReplyState) != "" && strings.TrimSpace(entries[i].ReplyState) != "pending" {
 			next.ReplyState = entries[i].ReplyState
 		}
-		if strings.TrimSpace(next.ResolveState) == "pending" && strings.TrimSpace(entries[i].ResolveState) != "" && strings.TrimSpace(entries[i].ResolveState) != "pending" {
+		if strings.TrimSpace(next.ResolveState) == "pending" && strings.TrimSpace(entries[i].ResolveState) != "" && strings.TrimSpace(entries[i].ResolveState) != "pending" && (entries[i].ResolveState != forgejoFixedUnresolvedStatus || entries[i].EvidenceHeadSHA == next.EvidenceHeadSHA) {
 			next.ResolveState = entries[i].ResolveState
 		}
 		if strings.TrimSpace(next.Explanation) == "" {
@@ -9059,7 +9199,7 @@ func hasRecoverableThreadEvidence(loopMetadataJSON *string, fixItems []FixItem) 
 			if strings.TrimSpace(entry.Explanation) == "" {
 				continue
 			}
-			if entry.ResolveState == "resolved" || entry.ResolveState == "already_resolved" {
+			if entry.ResolveState == "resolved" || entry.ResolveState == "already_resolved" || entry.ResolveState == forgejoFixedUnresolvedStatus {
 				continue
 			}
 			return true

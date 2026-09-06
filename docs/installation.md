@@ -19,6 +19,8 @@ For source development:
 
 `looperd` auto-detects tool paths from `PATH`, but startup validation fails if required tools cannot be resolved. `git` is always required. `gh` is required when any configured project uses the GitHub provider, but a Forgejo-only config starts without `gh` when the Forgejo provider and token environment variable are valid.
 
+Forgejo reviewer/fixer conflict checks require Git 2.38+ (`merge-tree --write-tree`). Repair ancestry checks need enough local history to distinguish a divergent head; an ambiguous shallow clone reports an error until its history is completed. Tea-backed Forgejo authentication is also supported with an explicit existing login.
+
 ## Install
 
 Looper uses Go binaries as the default supported implementation.

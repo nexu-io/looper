@@ -14,14 +14,13 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-const fixerHITLInstruction = `HUMAN-IN-THE-LOOP: This mechanism applies only to non-native comment fix items represented in review_thread_replies. Classify every listed item before editing. Use "needs_human" when PR scope or product intent is materially ambiguous, repository rules conflict with the request, the request reverses an intentional design or an earlier fixer decision, the same behavior needs a second repair, satisfying it appears to require a new concept or subsystem, or a high-stakes sign-off is required. Do not use it for routine, reversible implementation choices that are clearly inside the documented PR intent. Never use "needs_human" in Forgejo repair_results; follow that contract's fixed, declined, or deferred actions.
+const fixerHITLInstruction = `HUMAN-IN-THE-LOOP: This mechanism applies to listed review comments, including Forgejo native comments. Classify every listed item before editing. Use "needs_human" when PR scope or product intent is materially ambiguous, repository rules conflict with the request, the request reverses an intentional design or an earlier fixer decision, the same behavior needs a second repair, satisfying it appears to require a new concept or subsystem, or a high-stakes sign-off is required. Do not use it for routine, reversible implementation choices that are clearly inside the documented PR intent. For Forgejo native comments, use "needs_human" in repair_results with the exact source, providerCommentId, observedFingerprint, and explanation.
 
-If any item needs human direction, set that fix item's review_thread_replies action to "needs_human", put the concrete conflict and decision needed in "explanation", and STOP THE ENTIRE TURN BEFORE MAKING EDITS. Do not commit, push, dismiss reviews, post replies, resolve threads, or otherwise mutate remote state. Looper will pause and resume you after an operator answers through its existing control plane. Choosing "needs_human" for a genuine authority or scope decision is a correct result, not a failure.`
+If any item needs human direction, set that fix item's review_thread_replies action (or Forgejo repair_results action) to "needs_human", put the concrete conflict and decision needed in "explanation", and STOP THE ENTIRE TURN BEFORE MAKING EDITS. Do not commit, push, dismiss reviews, post replies, resolve threads, or otherwise mutate remote state. Looper will pause and resume you after an operator answers through its existing control plane. Choosing "needs_human" for a genuine authority or scope decision is a correct result, not a failure.`
 
 func fixerHITLPromptFor(fixItems []FixItem) string {
 	for _, item := range fixItems {
-		if item.Type == "comment" && item.Source != NativeReviewCommentSource &&
-			strings.TrimSpace(item.ID) != "" && strings.TrimSpace(item.ThreadID) != "" {
+		if item.Type == "comment" && strings.TrimSpace(item.ID) != "" && (item.ThreadID != "" || item.ProviderCommentID > 0) {
 			return fixerHITLInstruction
 		}
 	}
@@ -78,6 +77,7 @@ func validateNeedsHumanReplies(stdout, stderr string, fixItems []FixItem, accept
 			Action      string `json:"action"`
 			Explanation string `json:"explanation"`
 		} `json:"review_thread_replies"`
+		Native []nativeRepairResultEntry `json:"repair_results"`
 	}
 	if err := json.Unmarshal([]byte(payload), &result); err != nil {
 		if strings.Contains(strings.ToLower(payload), `"`+string(replyActionNeedsHuman)+`"`) {
@@ -110,6 +110,24 @@ func validateNeedsHumanReplies(stdout, stderr string, fixItems []FixItem, accept
 			strings.TrimSpace(reply.ThreadID) != item.ThreadID ||
 			sanitizeReplyExplanation(reply.Explanation) == "" {
 			return fmt.Errorf("invalid needs_human decision for fix item %q", reply.FixItemID)
+		}
+		seen[item.ID] = struct{}{}
+	}
+	nativeItems := map[int64]FixItem{}
+	for _, item := range fixItems {
+		if item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
+			nativeItems[item.ProviderCommentID] = item
+		}
+	}
+	for _, reply := range result.Native {
+		if normalizeReplyAction(reply.Action) != string(replyActionNeedsHuman) {
+			continue
+		}
+		rawCount++
+		item, ok := nativeItems[reply.ProviderCommentID]
+		_, duplicate := seen[item.ID]
+		if !ok || duplicate || reply.Source != NativeReviewCommentSource || reply.ObservedFingerprint == "" || reply.ObservedFingerprint != item.ObservedFingerprint || sanitizeReplyExplanation(reply.Explanation) == "" {
+			return fmt.Errorf("invalid needs_human decision for native review comment %d", reply.ProviderCommentID)
 		}
 		seen[item.ID] = struct{}{}
 	}

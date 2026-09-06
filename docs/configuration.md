@@ -404,7 +404,7 @@ Oh My Pi support is fresh-run only. Daemon native resume and interactive takeove
 Looper supports three provider kinds:
 
 - `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
-- `forgejo` — REST-backed planner, worker, native reviewer-request/review flows, summary-comment compatibility, and manual/direct native-review-comment fixer runs. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
+- `forgejo` — REST-backed planner, worker, native reviewer/fixer loops, summary-comment compatibility, and opt-in reviewer auto-merge. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
 - `plane` — a **task-source** provider: issues (work-items) are read from a [Plane](https://plane.so) project, while pull requests, diffs, and reviews stay on the project's GitHub code repo. Use this to let Looper consume Plane work-items directly as its issue source without creating a redundant GitHub issue. See [Plane provider + Feishu HITL setup](plane-provider.md) for the full guide, including the one-command `looper bootstrap --provider plane …` flow.
 
 Forgejo provider example:
@@ -476,11 +476,17 @@ Forgejo rules:
 - Forgejo projects require a `provider` and repo (`owner/name`). They can be written in config, persisted by `looper project add --provider <id>`, or created with `--forgejo-url` plus either `--forgejo-token-env` or `--auth tea --tea-login`. The repo may be detected only from an origin matching that provider. CLI/API-added provider bindings become active immediately through the atomic Project Catalog; already-started work retains its previous snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 - Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
-- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses native review-request discovery and native review publication, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.
+- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses native review-request discovery and native review publication, and fixer automatically consumes native findings and legacy summary items. Auto-merge defaults to disabled and can be enabled explicitly; coordinator and thread resolution remain unsupported.
 - Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
 - `looper status` reads the Forgejo version, identity, repository permissions, and OpenAPI document with a bounded timeout and no mutations. Capability output separates Looper's configured support from the server-observed contract; missing or disabled OpenAPI is `unknown`. The probe is fresh for each status request and is not persisted or used as a daemon startup gate.
 
-Forgejo reviewer discovery defaults to native review requests. Configured reviewer labels remain an optional source; when labels and review requests are both enabled, Forgejo uses their union with deterministic PR-number dedupe. Native clean and blocking outcomes follow `reviewEvents` (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`). Set `roles.reviewer.behavior.publishMode = "summary_comment"` and configure reviewer labels to retain the legacy top-level Reviewer Summary compatibility flow. Native operations require the corresponding endpoint in the Forgejo OpenAPI contract; older instances fail with a provider capability error instead of silently switching modes.
+Forgejo reviewer discovery defaults to native review requests. Configured reviewer labels remain an optional source; when labels and review requests are both enabled, Forgejo uses their union with deterministic PR-number dedupe. Native clean and blocking outcomes follow `reviewEvents` (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`). An authorized self-review uses `COMMENT` when Forgejo rejects an approval or change request by the PR author; the structured clean/blocking outcome is preserved. Set `roles.reviewer.behavior.publishMode = "summary_comment"` and configure reviewer labels to retain the legacy top-level comment protocol. Both publication modes use the common GitHub message templates and disclosure, without visible protocol titles or round numbers. Native operations require the corresponding endpoint in the Forgejo OpenAPI contract; older instances fail with a provider capability error instead of silently switching modes.
+
+Forgejo Fixer automatically consumes unresolved native review comments, including findings published by the same account's Looper Reviewer. It repairs, validates, and pushes without requiring a remote resolve API. A matching structured `fixed` result records that the code was fixed while the remote comment remains open. Unchanged acknowledged findings do not repeat after polling or restart; edited comments, new findings, or a head that no longer contains the repair become eligible again. Deferred or declined findings are not acknowledged as fixed. Existing manual hold and role budgets still apply. A new PR head can trigger the next Reviewer pass; Forgejo does not support GitHub's same-head decline adjudication.
+
+Current-head commit statuses and Forgejo Actions are included in CI context. Exact local Git checks distinguish an actual merge conflict from other `mergeable=false` states, and compare acknowledged repair commits with the current head. These checks require Git 2.38+ and may fetch missing objects from the configured origin without changing the checkout.
+
+Set `roles.reviewer.autoMerge.enabled = true` explicitly to opt into Forgejo auto-merge. Existing Looper scope, criteria-verified clean review, repository strategy, branch protection, and permission checks still apply: a tracked PR needs a `looper:*` label and a closing issue reference whose issue has `triaged` or a `dispatch/*` label and explicit acceptance criteria. A self-review downgraded to `COMMENT` does not authorize auto-merge. Looper uses an immediate merge request bound to the reviewed head; blocked checks retry through the existing Reviewer publish checkpoint and retry budget. If that budget or the consecutive-failure limit is exhausted, the loop requires the existing continue/recheck flow after CI is ready. Forgejo's scheduled merge does not retain the expected head, so Looper does not use it. Looper never forces the merge or deletes the branch through this path.
 
 ### Plane task-source provider
 
@@ -494,6 +500,32 @@ Forgejo reviewer discovery defaults to native review requests. Configured review
 ### Forgejo live sandbox e2e
 
 Forgejo live sandbox e2e is a local/manual developer check, not a normal CI job. It is skipped unless explicitly enabled:
+
+For the full native Reviewer → Fixer → Reviewer flow with an authenticated Codex and an existing tea login, run:
+
+```bash
+python3 scripts/forgejo-review-fix-smoke.py \
+  --base-url https://code.example.com \
+  --repo owner/looper-sandbox \
+  --tea-login sandbox
+```
+
+This builds the current source, uses isolated runtime paths, creates one fixture PR on its own branch, checks repair and restart behavior, and closes the PR and removes its branch and label. It uses real Codex calls. Evidence is saved under `dist/looper-smoke-<run>/`. The default branch is not changed. See [implementation and acceptance notes](DESIGN-forgejo-reviewer-fixer.md).
+
+To verify the real provider adapters for conflicts, commit statuses, and head-bound merge using tea without an agent:
+
+```bash
+LOOPER_FORGEJO_LIVE_CONTRACTS=1 \
+LOOPER_FORGEJO_LIVE_BASE_URL=https://code.example.com \
+LOOPER_FORGEJO_LIVE_REPO=owner/looper-sandbox \
+LOOPER_FORGEJO_LIVE_TEA_LOGIN=sandbox \
+LOOPER_FORGEJO_LIVE_MERGE=1 \
+go test ./internal/runtime -run '^TestForgejoLiveProviderContracts$' -v -count=1 -timeout=15m
+```
+
+The extra `LOOPER_FORGEJO_LIVE_MERGE=1` permits required-check protection and immediate merge into the test's own temporary base branch. Omit it to check conflicts and statuses without merging. The test closes its PRs, removes its branches and protection rule, and verifies that the existing default branch is unchanged. Closed PRs and statuses on test commits remain as audit history. Missing prerequisites fail an explicitly enabled run; ordinary `go test ./...` skips the live test.
+
+The existing token-backed provider integration suite is also available:
 
 ```bash
 LOOPER_E2E_FORGEJO=1 \
@@ -745,15 +777,15 @@ Reviewer auto-merge lives under `roles.reviewer.autoMerge.*`:
 
 | Path | Purpose | Default | Valid values | Validation |
 | --- | --- | --- | --- | --- |
-| `roles.reviewer.autoMerge.enabled` | Enables Reviewer's auto-merge opt-in flow for in-scope code PRs | `false` | `true`, `false` | When `true`, project startup fails fast unless the repo allows auto-merge, the configured merge strategy is enabled in repo settings, the repo is known, and GitHub validation is configured |
-| `roles.reviewer.autoMerge.strategy` | Merge strategy passed to `gh pr merge --auto` | `"squash"` | `"squash"`, `"merge"`, `"rebase"` | Config validation rejects any other value; when `enabled=true`, startup also fails fast if the repo disallows the chosen strategy |
-| `roles.reviewer.autoMerge.requireBranchProtection` | Requires base-branch protection with required checks before Reviewer opts in | `true` | `true`, `false` | When `true` and `enabled=true`, startup fails fast unless the default/base branch is known and GitHub reports branch protection with required checks |
+| `roles.reviewer.autoMerge.enabled` | Enables Reviewer's auto-merge opt-in flow for in-scope code PRs | `false` | `true`, `false` | When `true`, project startup fails fast unless the provider supports the merge flow, the configured strategy is enabled in repo settings, and the repo is known |
+| `roles.reviewer.autoMerge.strategy` | Merge strategy used by the selected provider | `"squash"` | `"squash"`, `"merge"`, `"rebase"` | Config validation rejects any other value; when `enabled=true`, startup also fails fast if the repo disallows the chosen strategy |
+| `roles.reviewer.autoMerge.requireBranchProtection` | Requires base-branch protection with required checks before Reviewer opts in | `true` | `true`, `false` | When `true` and `enabled=true`, startup fails fast unless the default/base branch is known and the provider reports branch protection with required checks |
 | `roles.reviewer.autoMerge.transientRetries` | Retry budget for transient merge-watch failures | `3` | positive integers | Config validation rejects values less than `1` |
 | `roles.reviewer.autoMerge.scope` | v1 scope guard for which PRs Looper may opt into auto-merge | `"looper-only"` | `"looper-only"` | Config validation rejects any other value; startup validation also rejects unsupported scopes |
 
 Project-level overrides use the same shape under `projects[].roles.reviewer.autoMerge.*`.
 
-When `roles.reviewer.autoMerge.enabled = true`, Looper performs a repo-aware startup validation pass: the project must have a known GitHub repo, GitHub auto-merge must be enabled for that repo, the configured strategy must be allowed, and — if `requireBranchProtection=true` — the effective base branch must exist with required checks enabled.
+When `roles.reviewer.autoMerge.enabled = true`, Looper performs provider-aware startup validation: the project must have a known repo, the configured strategy must be allowed, and — if `requireBranchProtection=true` — the effective base branch must exist with required checks enabled. GitHub additionally requires the repository's auto-merge setting and uses `gh pr merge --auto`. Forgejo uses head-bound immediate merge with existing Reviewer publish retries; its server-side scheduled merge is not used. Coordinator merge-watch settings do not enable a Forgejo coordinator.
 
 ## Project override rules
 
@@ -1222,8 +1254,9 @@ Forgejo provider profile differences:
 - planner discovers labeled issues through the Forgejo REST provider
 - worker discovers only issues already assigned to the current Forgejo user and does not claim work by adding itself as assignee
 - reviewer defaults to native review requests and native PR review events; configured labels can be used alone or combined, and `publishMode = "summary_comment"` retains the legacy summary flow
-- fixer auto-discovery still follows Reviewer Summary items only, while manual/direct Forgejo fixer runs also consume unresolved native Forgejo review comments and may resolve those native comments after validation + push + post-push verification
-- coordinator, auto-merge, review-thread resolution, routed network mode, and webhook modes are unsupported for Forgejo in the MVP and fail fast if explicitly enabled
+- fixer automatically consumes native review comments and legacy summary items; validated fixes are acknowledged locally and in a common PR comment while native comments remain open
+- auto-merge defaults to disabled and can be enabled explicitly under the same review, scope, and branch policies
+- coordinator, review-thread resolution, routed network mode, and webhook modes remain unsupported for Forgejo and fail fast if explicitly enabled
 
 Common fields:
 

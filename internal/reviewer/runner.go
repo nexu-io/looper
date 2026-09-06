@@ -164,6 +164,7 @@ type PullRequestSummary struct {
 
 type PullRequestDetail struct {
 	Number             int64
+	URL                string
 	Title              string
 	Body               string
 	State              string
@@ -270,7 +271,10 @@ type VerifyReviewMarkerInput struct {
 	AllowedReviewEvents []ReviewEvent
 	AuthorLogin         string
 	AllowCleanComment   bool
-	CWD                 string
+	// Forgejo rejects self-authored change requests; the trusted wrapper keeps
+	// outcome=blocking and publishes COMMENT for this transport fallback only.
+	AllowBlockingComment bool
+	CWD                  string
 }
 
 type ReviewMarkerResult struct {
@@ -604,6 +608,8 @@ type reviewerCheckpoint struct {
 }
 
 type checkpointDetail struct {
+	URL                string                     `json:"url,omitempty"`
+	ChecksSummary      string                     `json:"checksSummary,omitempty"`
 	Title              string                     `json:"title,omitempty"`
 	State              string                     `json:"state,omitempty"`
 	IsDraft            bool                       `json:"isDraft,omitempty"`
@@ -1534,7 +1540,8 @@ func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, proj
 			return "", err
 		}
 		policy := r.effectiveReviewEvents(project.ID, loop.MetadataJSON)
-		return looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, r.allowedReviewEventsForPolicy(policy), sameReviewAuthorLogin(currentLogin, detail.Author)), nil
+		selfAuthored := sameReviewAuthorLogin(currentLogin, detail.Author)
+		return looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, r.allowedReviewEventsForPolicy(policy), selfAuthored, selfAuthored && r.forgejoProject(project.ID)), nil
 	})
 	if err != nil || engagedHead == "" {
 		return loop, err
@@ -1583,12 +1590,12 @@ func (r *Runner) reviewsForEngagementBackfill(ctx context.Context, project stora
 	return refreshed.Reviews, nil
 }
 
-func looperReviewEngagementHead(reviews []map[string]any, login, loopID, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment bool) string {
+func looperReviewEngagementHead(reviews []map[string]any, login, loopID, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment, allowBlockingComment bool) string {
 	events := make([]string, len(allowedEvents))
 	for i, event := range allowedEvents {
 		events[i] = string(event)
 	}
-	return githubinfra.ReviewEngagementHead(reviews, loopID, currentHeadSHA, login, events, allowCleanComment)
+	return githubinfra.ReviewEngagementHead(reviews, loopID, currentHeadSHA, login, events, allowCleanComment, allowBlockingComment)
 }
 
 func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
@@ -2700,7 +2707,7 @@ func (r *Runner) skipMissingPullRequest(ctx context.Context, input stepInput, ch
 }
 
 func checkpointDetailFromDetail(detail PullRequestDetail) *checkpointDetail {
-	return &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), ReviewRequestUsers: cloneGitHubUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
+	return &checkpointDetail{URL: detail.URL, ChecksSummary: detail.ChecksSummary, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), ReviewRequestUsers: cloneGitHubUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
 }
 
 func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
@@ -5170,8 +5177,26 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
-				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
-				return checkpoint, nil
+				approvedPendingMerge := false
+				if r.forgejoProject(input.Project.ID) && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled {
+					// Forgejo consumes the request when this pending review submits
+					// APPROVE. A publish retry may finish that same head's merge,
+					// without admitting a new review or rerunning the agent.
+					marker, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
+					if err != nil {
+						return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+					}
+					if cleanApprovedReviewMarker(marker) {
+						if err := validateCleanApprovedReviewMarkerBody(marker, cleanReviewAuthorLogin(checkpoint, detail)); err != nil {
+							return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+						}
+						approvedPendingMerge = true
+					}
+				}
+				if !approvedPendingMerge {
+					checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
+					return checkpoint, nil
+				}
 			}
 		}
 		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
@@ -5464,7 +5489,8 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 	marker := agentNativeReviewMarker(input.Loop.ID, headSHA, idempotencyKey)
 	allowedEvents := r.allowedReviewEventsForPolicy(r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON))
 	allowCleanComment := sameReviewAuthorLogin(currentLogin, prAuthorLogin)
-	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	allowBlockingComment := allowCleanComment && r.forgejoProject(input.Project.ID)
+	found, err := r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, AllowBlockingComment: allowBlockingComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}
@@ -5473,12 +5499,12 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return found, nil
 	}
 	bareLoopMarker := agentNativeBareLoopReviewMarker(input.Loop.ID, headSHA)
-	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: bareLoopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: bareLoopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, AllowBlockingComment: allowBlockingComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}
 	loopMarker := agentNativeLoopReviewMarker(input.Loop.ID, headSHA)
-	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: loopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: loopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, AllowBlockingComment: allowBlockingComment, CWD: input.Project.RepoPath})
 	if err != nil || found.Found {
 		return found, err
 	}
@@ -5862,7 +5888,11 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 	if resolvePullRequestPhase(detail.Labels) == "spec" {
 		return nil, nil
 	}
-	if r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
+	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
+	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
+		return nil, nil
+	}
+	if reviewEvents.Clean != config.ReviewerReviewEventApprove {
 		return nil, nil
 	}
 	autoMergeCfg := r.reviewerAutoMergeConfigForProject(input.Project.ID)
@@ -5929,8 +5959,12 @@ func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepIn
 		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "enabling auto-merge"); err != nil {
 			return nil, err
 		}
-		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, HeadSHA: pending.HeadSHA, CWD: input.Project.RepoPath}); err != nil && !isAlreadyEnabledAutoMergeError(err) {
-			return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, HeadSHA: pending.HeadSHA, CWD: input.Project.RepoPath}); err != nil {
+			// Forgejo uses immediate, head-bound merge. It cannot treat a
+			// server-side scheduled/"already enabled" response as completion.
+			if r.forgejoProject(input.Project.ID) || !isAlreadyEnabledAutoMergeError(err) {
+				return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			}
 		}
 		return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
 	}
@@ -6855,37 +6889,20 @@ func renderReviewerSummaryComment(summary forge.ReviewerSummary, visibleSummary 
 		return "", err
 	}
 	visibleSummary = strings.TrimSpace(visibleSummary)
-	open := 0
-	resolved := 0
-	superseded := 0
-	lines := []string{"## Reviewer Summary", fmt.Sprintf("Review round: %d", summary.ReviewRoundID)}
+	lines := []string{}
 	if visibleSummary != "" {
-		lines = append(lines, "", visibleSummary)
+		lines = append(lines, visibleSummary)
 	}
 	for _, item := range summary.Items {
-		switch item.Status {
-		case forge.ReviewItemStatusOpen:
-			open++
-		case forge.ReviewItemStatusResolved:
-			resolved++
-		case forge.ReviewItemStatusSuperseded:
-			superseded++
+		if item.Status != forge.ReviewItemStatusOpen {
+			continue
+		}
+		lines = append(lines, "", "### "+item.Title, "", item.Body)
+		if len(item.Files) > 0 {
+			lines = append(lines, "", "Files: "+strings.Join(item.Files, ", "))
 		}
 	}
-	lines = append(lines, "", fmt.Sprintf("Open: %d · Resolved: %d · Superseded: %d", open, resolved, superseded))
-	if open > 0 {
-		lines = append(lines, "", "### Open items")
-		for _, item := range summary.Items {
-			if item.Status != forge.ReviewItemStatusOpen {
-				continue
-			}
-			line := fmt.Sprintf("- **%s** `%s`", item.ReviewItemID, item.Title)
-			if len(item.Files) > 0 {
-				line += fmt.Sprintf(" (%s)", strings.Join(item.Files, ", "))
-			}
-			lines = append(lines, line, "  "+item.Body)
-		}
-	}
+
 	return strings.Join(lines, "\n") + "\n\n" + marker, nil
 }
 
@@ -9582,11 +9599,11 @@ func fixerDeclineAdjudicationContract() string {
 	return `Fixer decline adjudication: a validated Fixer declined reply on an existing Looper-authored review thread is a scope dispute, not dismissal authority. Do not open a duplicate thread for the same finding. Adjudicate on the existing thread only: (1) accept the decline when the item is out of scope (leave the thread for later resolution ownership — do not invent a new thread), (2) reject the decline with new concrete authority evidence and keep the thread unresolved so Fixer remains eligible, or (3) disposition needs_human when judgment is required. A second attempted fix to the same subsystem, or a repeated reviewer–fixer scope conflict without new evidence, must be needs_human — not another automatic argument round.`
 }
 
-func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewerCheckpoint, scope config.ReviewerScope) string {
+func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewerCheckpoint, scope config.ReviewerScope, configuredURL string) string {
 	seed := map[string]any{
 		"repo":           repo,
 		"pr_number":      prNumber,
-		"url":            seededPullRequestURL(repo, prNumber),
+		"url":            firstNonEmpty(configuredURL, seededPullRequestURL(repo, prNumber)),
 		"head_sha":       snapshotHeadSHA(checkpoint),
 		"expected_state": "OPEN",
 		"expected_draft": false,
@@ -9596,6 +9613,9 @@ func buildReviewerMinimalPRSeed(repo string, prNumber int64, checkpoint reviewer
 		},
 	}
 	if checkpoint.Detail != nil {
+		if checkpoint.Detail.URL != "" {
+			seed["url"] = checkpoint.Detail.URL
+		}
 		seed["base_ref"] = checkpoint.Detail.BaseRefName
 		seed["head_ref"] = checkpoint.Detail.HeadRefName
 		seed["expected_state"] = firstNonEmpty(strings.ToUpper(strings.TrimSpace(checkpoint.Detail.State)), "OPEN")
@@ -9668,9 +9688,10 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	forgejoNative := reviewerProjectProviderKind(instructionConfig, projectID) == config.ProviderKindForgejo && !commentOnlyPublish
+	isForgejo := reviewerProjectProviderKind(instructionConfig, projectID) == config.ProviderKindForgejo
+	forgejoNative := isForgejo && !commentOnlyPublish
 	forgeName := "GitHub"
-	if forgejoNative {
+	if isForgejo {
 		forgeName = "Forgejo"
 	}
 	currentHeadSHA := snapshotHeadSHA(checkpoint)
@@ -9678,7 +9699,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	laterPass := isRepairFrontierPass(lastPublishedHeadSHA, currentHeadSHA)
 	publishInstruction := fmt.Sprintf("For actionable must_fix findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell (inline comments only for must_fix). For no-actionable-finding results, follow the clean-result publishing instructions for this run. After the agent step, finish with `__LOOPER_RESULT__` JSON that includes `summary`, optional `outcome`, and `findings` using the same disposition fields as comment-only (`disposition`, `severity`, `scopeBasis`, `scopeEvidence`, `title`, `body`, optional `path`/`line`). Looper **does** parse this findings list: `follow_up` is retained locally only and must not be submitted; `needs_human` parks the pair and must not be submitted as change-request comments. Do not smuggle follow_up/needs_human into unstructured top-level review body prose as the only carrier of a blocking finding.", forgeName)
 	if looperCLIPath == "" {
-		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
+		publishInstruction = fmt.Sprintf("A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any %s review, do not add or remove any %s reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.", forgeName, forgeName)
 	}
 	outcomeInstruction := "Use outcome=clean only when there are no must_fix findings, outcome=non_blocking for must_fix feedback that should not block merge, and outcome=blocking for must_fix findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
 	cleanResultCompletionInstruction := "Group findings only when they share the same root cause; keep unrelated concerns as separate findings. Accumulate every independent in-scope must_fix before publishing — do not intentionally defer an already observed in-scope issue. The publication budget limits review publications, not findings per publication. If there is no concrete must_fix feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback."
@@ -9696,7 +9717,13 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanResultCompletionInstruction = "Group findings only when they share the same root cause; keep unrelated concerns separate. Accumulate every independent in-scope must_fix before finalizing. If there is no concrete must_fix feedback, start the final summary with `No actionable findings`. Do not invent feedback."
 		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata and diff before invoking you. Use the prepared local worktree plus the supplied metadata/diff as the review context; do not use GitHub CLI/API commands or native review/thread features."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope, forge.ConfiguredPullRequestURL(instructionConfig, projectID, repo, prNumber)), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, currentHeadSHA), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
+	if providerContext := forge.ForgejoAgentContext(instructionConfig, projectID, repo, prNumber); providerContext != "" {
+		parts = append(parts, providerContext)
+	}
+	if checkpoint.Detail != nil && checkpoint.Detail.ChecksSummary != "" && (checkpoint.Snapshot == nil || checkpoint.Snapshot.ChecksSummary == "") {
+		parts = append(parts, "Checks: "+checkpoint.Detail.ChecksSummary)
+	}
 	if laterPass {
 		parts = append(parts, fmt.Sprintf("Last reviewed head SHA: %s", lastPublishedHeadSHA), fmt.Sprintf("Current head SHA for this pass: %s", currentHeadSHA), repairFrontierPassContract(lastPublishedHeadSHA, currentHeadSHA, commentOnlyPublish))
 	}
@@ -9729,12 +9756,18 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	cleanNoopInstruction := "For no-actionable-finding results when the clean review policy is COMMENT, do not submit a clean COMMENT or APPROVE review; finish successfully with the `No actionable findings` summary only. After Looper validates that no clean review marker was required for this run, the runner will reconcile the clean-signal +1 reaction."
 	cleanInstruction := cleanNoopInstruction
 	if autoMergeEnabled && phase != "spec" {
-		cleanInstruction = "For no-actionable-finding results on this implementation PR, do not submit a clean GitHub review yourself. Finish successfully with a summary beginning `No actionable findings`; the runner will verify the linked issue's acceptance criteria and decide whether to publish APPROVE, COMMENT, or no clean review."
+		cleanInstruction = "For no-actionable-finding results on this implementation PR, do not submit a clean review yourself. Finish successfully with a summary beginning `No actionable findings`; the runner will verify the linked issue's acceptance criteria and decide whether to publish APPROVE, COMMENT, or no clean review."
 	}
 	if looperCLIPath == "" {
 		cleanInstruction = "For no-actionable-finding results, do not use the clean COMMENT no-op path and do not finish successfully because the trusted review-submit wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 	}
 	blockingInstruction := "Submit blocking and non-blocking finding reviews as COMMENT."
+	threadSemantics := "Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use the review body only for clean summaries or a short overview of already-submitted inline must_fix findings."
+	inlineRequirement := "Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment."
+	if forgejoNative {
+		threadSemantics = "Inline comments remain native Forgejo review comments. The current Forgejo instance has no supported resolve endpoint; do not claim comments were resolved or attempt GitHub thread APIs. Use the review body only for clean prose or a short overview of inline must_fix findings."
+		inlineRequirement = "Native inline review comments are required for code-anchored actionable feedback. Submit each finding in the PR review `comments` array at its changed-file anchor, not in the review body or a separate conversation comment."
+	}
 	specLabelInstruction := "Do not transition spec-review labels yourself. Looper may transition spec-review labels only after it validates a matching APPROVED clean review marker for the current head."
 	policyFlags := fmt.Sprintf("--clean-review-event %s --blocking-review-event %s", reviewEvents.Clean, reviewEvents.Blocking)
 	reviewerModeFlag := ""
@@ -9751,9 +9784,17 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	}
 	if reviewEvents.Blocking == config.ReviewerReviewEventRequestChanges {
 		blockingInstruction = "If the review has blocking findings, submit REQUEST_CHANGES with outcome=blocking. If findings are non-blocking, submit COMMENT with outcome=non_blocking. Never submit REQUEST_CHANGES for non-blocking findings."
+		if forgejoNative {
+			blockingInstruction += " For a Forgejo PR authored by the authenticated user, the trusted wrapper downgrades REQUEST_CHANGES to COMMENT while retaining outcome=blocking and inline findings; use the wrapper normally and preserve that blocking outcome."
+		}
 		actionableReviewSubmitCommand = fmt.Sprintf("`%s review submit %s#%d --event COMMENT --commit-id %s%s %s` for non-blocking findings or `%s review submit %s#%d --event REQUEST_CHANGES --commit-id %s%s %s` for blocking findings", looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags, looperCLICommand, repo, prNumber, snapshotHeadSHA(checkpoint), reviewerModeFlag, policyFlags)
 	}
 	existingMarkerEventInstruction := "Idempotency outcome matching is strict: only treat an existing `outcome=clean` marker as satisfied when it is on a COMMENTED review if clean policy is COMMENT, or on an APPROVED review if clean policy is APPROVE. A COMMENTED `outcome=clean` marker is also valid when the authenticated GitHub user authored the pull request and the trusted wrapper downgraded self-approval. Only treat an existing `outcome=blocking` marker as satisfied when it is on a CHANGES_REQUESTED review if blocking policy is REQUEST_CHANGES. Treat `outcome=non_blocking` or legacy `outcome=actionable` markers as satisfied only when they are on a COMMENTED review. Ignore matching markers on disallowed review states and publish the correct review for this run instead."
+	if forgejoNative {
+		cleanInstruction = strings.ReplaceAll(cleanInstruction, "authenticated GitHub user", "authenticated Forgejo user")
+		cleanInstruction = strings.ReplaceAll(cleanInstruction, "because GitHub rejects self-approval", "because Forgejo rejects self-approval")
+		existingMarkerEventInstruction = "The trusted wrapper verifies native Forgejo marker id, head, outcome and review state. Blocking REQUEST_CHANGES and clean APPROVE reviews may use the verified self-authored COMMENT fallback; the original outcome is preserved. A remote inline comment remaining open is not evidence that its finding remains unfixed: inspect the current code and Fixer evidence."
+	}
 	reviewRequestInstruction := fmt.Sprintf("Before posting, confirm the current %s user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`.", forgeName)
 	if manual {
 		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
@@ -9793,7 +9834,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors. If a must_fix location is not exactly on the supplied diff, attach it to the nearest anchorable changed-file location. Do not downgrade must_fix findings to a top-level review-body item; every must_fix must remain an inline comment."
 	}
 	if looperCLIPath == "" {
-		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
+		githubOperationContract = fmt.Sprintf("%s operation contract: a trusted Looper CLI path was not detected for this reviewer run, so review publication is unavailable. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, or the provider review API directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`.", forgeName)
 		submitPayloadInstruction = ""
 	}
 	reviewPassContract := "Review pass contract: complete one full review pass before publishing. Collect PR metadata, changed-file list, live diffs, prior unresolved feedback, and necessary surrounding context; then scan every changed file/range in scope. Do not stop after the first issue. If an in-scope must_fix issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass."
@@ -9811,7 +9852,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"Finalization gate before submit: verify that the scoped changed files/ranges were reviewed, all observed in-scope must_fix findings are included in this publication, repeated patterns are consolidated only for a shared root cause, non-blocking/nit feedback is not escalated, every published comment has disposition=must_fix with scopeBasis/scopeEvidence plus concrete evidence and a suggested fix, and the review outcome matches the highest published severity.",
 		freshnessInstruction,
 		reviewRequestInstruction,
-		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you have actionable findings but do not have concrete actionable prose yet, exit non-zero instead of posting logs. For a clean APPROVE review, write the required author mention, change/verification summary, and warm acknowledgement; never use an LGTM, empty, or disclosure-only clean body as a fallback.",
+		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the review body. If you have actionable findings but do not have concrete actionable prose yet, exit non-zero instead of posting logs. For a clean APPROVE review, write the required author mention, change/verification summary, and warm acknowledgement; never use an LGTM, empty, or disclosure-only clean body as a fallback.",
 		"Shell payload safety contract: never build review JSON inside a double-quoted shell string because Markdown backticks and dollar expressions can execute or expand. Serialize the payload with a JSON-aware tool or pass a literal single-quoted heredoc to the trusted review-submit wrapper.",
 		"Worktree hygiene contract: do not create review payload or scratch files inside the managed worktree (including top-level `/.looper-review-*.json`). Pipe review JSON via a literal single-quoted heredoc on stdin, or write temporary files only under an OS temp directory outside the worktree.",
 		"Content safety recovery contract: if `looper review submit` fails with an outbound content safety gate rejection, rewrite the rejected body/comments/paths in plain prose without secret-shaped env assignments, credential URLs, env dumps, or high-entropy tokens, then resubmit in the same session; do not exit non-zero solely because of that rejection, and never paste the rejected value into logs, prompts, or the next payload.",
@@ -9830,9 +9871,9 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"Cross-cutting or otherwise unanchorable must_fix findings still require an inline comment on a representative changed-file location; do not submit them as body-only top-level feedback.",
 		"Flag vague unlocated must_fix feedback as a follow-up quality-gating failure; every must_fix must be an inline comment with an exact file, section, symbol, or behavior reference.",
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
-		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
-		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use the review body only for clean summaries or a short overview of already-submitted inline must_fix findings.",
-		"For non-blocking or blocking must_fix reviews, the review body should be a short overview plus markers/disclosure; every must_fix finding must live in inline `comments` so maintainers can resolve them individually.",
+		inlineRequirement,
+		threadSemantics,
+		"For non-blocking or blocking must_fix reviews, the review body should be a short overview plus markers/disclosure; every must_fix finding must live in inline `comments` so maintainers can address them individually.",
 		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",

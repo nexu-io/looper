@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 )
@@ -22,14 +23,40 @@ func (s *Service) validateReviewerAutoMergeForProject(ctx context.Context, proje
 	if autoMergeCfg.Scope != config.ReviewerAutoMergeScopeLooperOnly {
 		return reviewerAutoMergeValidationError(projectRepoLabel(repo, projectID), fmt.Sprintf("scope %q is unsupported in v1", autoMergeCfg.Scope))
 	}
-	if s.GetRepositorySettings == nil || (autoMergeCfg.RequireBranchProtection && s.GetBranchProtection == nil) {
+	getSettings, getProtection := s.GetRepositorySettings, s.GetBranchProtection
+	for _, project := range cfg.Projects {
+		if project.ID != projectID || config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+			continue
+		}
+		if roles.Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment {
+			return reviewerAutoMergeValidationError(projectRepoLabel(repo, projectID), `publishMode "summary_comment" cannot submit the native APPROVE review auto-merge requires`)
+		}
+		for _, provider := range cfg.Providers {
+			if provider.ID != project.Provider {
+				continue
+			}
+			client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(stringValue(repo)))
+			if err != nil {
+				return err
+			}
+			getSettings = func(ctx context.Context, _ githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+				settings, err := client.GetRepositoryMergeSettings(ctx)
+				return githubinfra.RepositorySettings{AllowSquashMerge: settings.AllowSquashMerge, AllowMergeCommit: settings.AllowMergeCommit, AllowRebaseMerge: settings.AllowRebaseMerge, AllowAutoMerge: true}, err
+			}
+			getProtection = func(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+				branch, err := client.GetBranchProtection(ctx, input.Branch)
+				return githubinfra.BranchProtection{Enabled: branch.Protected, HasRequiredChecks: branch.Protected && branch.EnableStatusCheck && len(branch.StatusCheckContexts) > 0, RequiredChecks: branch.StatusCheckContexts}, err
+			}
+		}
+	}
+	if getSettings == nil || (autoMergeCfg.RequireBranchProtection && getProtection == nil) {
 		return reviewerAutoMergeValidationError(projectRepoLabel(repo, projectID), "GitHub auto-merge validation is not configured")
 	}
 	repoName := strings.TrimSpace(stringValue(repo))
 	if repoName == "" {
 		return reviewerAutoMergeValidationError(projectID, "GitHub repo is unknown")
 	}
-	settings, err := s.GetRepositorySettings(ctx, githubinfra.RepositorySettingsInput{Repo: repoName})
+	settings, err := getSettings(ctx, githubinfra.RepositorySettingsInput{Repo: repoName})
 	if err != nil {
 		return fmt.Errorf("read repo settings for %s: %w", repoName, err)
 	}
@@ -52,7 +79,7 @@ func (s *Service) validateReviewerAutoMergeForProject(ctx context.Context, proje
 		if branch == "" {
 			return reviewerAutoMergeValidationError(repoName, "default branch is unknown")
 		}
-		protection, err := s.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repoName, Branch: branch})
+		protection, err := getProtection(ctx, githubinfra.BranchProtectionInput{Repo: repoName, Branch: branch})
 		if err != nil {
 			return fmt.Errorf("read branch protection for %s@%s: %w", repoName, branch, err)
 		}
