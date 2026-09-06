@@ -1009,7 +1009,7 @@ func writeHumanLoopInspect(w io.Writer, output loopInspectOutput) error {
 			}
 		}
 		if output.Handoff.Kind == loops.HITLKindReviewScopeHuman {
-			if _, err := fmt.Fprintln(w, "unpause releases the scope hold; failed, interrupted, human takeover, or a manual pause remain."); err != nil {
+			if _, err := fmt.Fprintln(w, "unpause releases the scope hold; other blockers remain, such as unanswered agent/HITL asks, failed or interrupted runs, human takeover, or a manual pause."); err != nil {
 				return err
 			}
 		}

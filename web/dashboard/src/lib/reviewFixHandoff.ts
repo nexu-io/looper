@@ -37,7 +37,7 @@ const BUDGET_LEAD =
   "Continue/Unpause releases the budget hold and refills only exhausted meters; other holds, including scope holds, may still prevent the pair from running. Stop terminates both; exhaustion is not approval.";
 
 const SCOPE_LEAD =
-  "Continue/Unpause releases the scope hold; independent blockers (failed, interrupted, human takeover, or a manual pause) remain; Stop terminates both.";
+  "Continue/Unpause releases the scope hold; other blockers remain, such as unanswered agent/HITL asks, failed or interrupted runs, human takeover, or a manual pause; Stop terminates both.";
 
 function parseMetadata(raw?: string | null): LoopMetadata {
   if (!raw?.trim()) return {};

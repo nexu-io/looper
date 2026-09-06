@@ -83,6 +83,20 @@ describe("readReviewFixHandoff", () => {
     expect(handoff?.lead).not.toContain("resumes the pair");
   });
 
+  it("explains that an unrelated agent ask survives scope release", () => {
+    const handoff = readReviewFixHandoff({
+      seq: 12,
+      status: "awaiting_human",
+      metadataJson: JSON.stringify({
+        hitl: { kind: "agent_question", status: "awaiting" },
+        reviewScopeHuman: { heldBy: "reviewer" },
+      }),
+    });
+    expect(handoff?.kind).toBe("review_scope_human");
+    expect(handoff?.lead).toContain("unanswered agent/HITL asks");
+    expect(handoff?.lead).toContain("such as");
+  });
+
   it("ignores ordinary paused loops", () => {
     expect(
       readReviewFixHandoff({

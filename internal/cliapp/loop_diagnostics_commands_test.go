@@ -478,7 +478,7 @@ func TestWriteHumanLoopInspectScopeHoldUsesRelease(t *testing.T) {
 	if !strings.Contains(got, "Release: looper unpause 9 / looper stop 9") {
 		t.Fatalf("human inspect = %q, want Release commands", got)
 	}
-	if !strings.Contains(got, "unpause releases the scope hold; failed, interrupted, human takeover, or a manual pause remain.") {
+	if !strings.Contains(got, "unpause releases the scope hold; other blockers remain, such as unanswered agent/HITL asks, failed or interrupted runs, human takeover, or a manual pause.") {
 		t.Fatalf("human inspect = %q, want independent-blocker note", got)
 	}
 	if strings.Contains(got, "Resume:") {

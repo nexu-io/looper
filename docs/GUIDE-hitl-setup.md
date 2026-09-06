@@ -13,7 +13,8 @@ Review-fix budget and scope holds still fire when HITL is off. They pause the
 pair with no ask. `looper unpause <seq>` releases the hold: a budget hold
 refills only exhausted meters, while other holds may still prevent the pair
 from running; a scope hold clears only the overlay and leaves independent
-blockers such as failed, interrupted, human takeover, or a manual pause. `looper stop <seq>` terminates both roles.
+blockers such as unanswered agent/HITL asks, failed or interrupted runs, human
+takeover, or a manual pause. `looper stop <seq>` terminates both roles.
 Enabling HITL only changes presentation (Continue/Stop card), not whether the
 pair halts.
 

@@ -13,7 +13,7 @@ import (
 // Exercise persisted holds and their Continue transitions, then check the
 // operator output against the lifecycle that actually remains.
 func TestHandoffGuidancePreservesUnderlyingLifecycle(t *testing.T) {
-	for _, initial := range []string{"failed", "budget"} {
+	for _, initial := range []string{"failed", "budget", "awaiting_human"} {
 		t.Run(initial, func(t *testing.T) {
 			ctx := context.Background()
 			_, repos := writeEmptyRunStatsCommandFixtureWithRepos(t)
@@ -28,6 +28,14 @@ func TestHandoffGuidancePreservesUnderlyingLifecycle(t *testing.T) {
 			fixer.ID, fixer.Seq, fixer.Type, fixer.Status = "handoff_fixer", 2, "fixer", "failed"
 			if initial == "budget" {
 				fixer.Status = "queued"
+			}
+			if initial == "awaiting_human" {
+				fixer.Status = initial
+				meta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{Kind: "agent_question", Status: "awaiting", Question: "Which approach should Fixer take?", AskedAt: now})
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixer.MetadataJSON = &meta
 			}
 			for _, loop := range []storage.LoopRecord{reviewer, fixer} {
 				if err := repos.Loops.Upsert(ctx, loop); err != nil {
@@ -63,7 +71,7 @@ func TestHandoffGuidancePreservesUnderlyingLifecycle(t *testing.T) {
 			parsed := parseLoopDiagnosticMetadata(held.MetadataJSON)
 			message := "unusable worktree path preserved"
 			run := &storage.RunRecord{Status: "failed", ErrorMessage: &message}
-			if initial == "budget" {
+			if initial != "failed" {
 				run = nil
 			}
 			diagnosis := diagnoseLoop(held, run, nil, parsed, true)
@@ -86,6 +94,27 @@ func TestHandoffGuidancePreservesUnderlyingLifecycle(t *testing.T) {
 				after := getFixer()
 				if after.Status != "paused" || !loops.IsReviewScopeHumanHold(after) || loops.IsReviewFixBudgetHold(after) {
 					t.Fatalf("expected remaining scope hold: %+v", after)
+				}
+			} else if initial == "awaiting_human" {
+				if err := writeHumanLoopInspect(&buf, output); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(buf.String(), "unanswered agent/HITL asks") || !strings.Contains(buf.String(), "such as") {
+					t.Fatalf("missing remaining-ask guidance: %s", &buf)
+				}
+				result, err := loops.ApplyReviewScopeHumanAnswer(ctx, repos, parked, "Continue", now)
+				if err != nil || !result.Applied {
+					t.Fatalf("scope Continue: %v, %v", result, err)
+				}
+				after := getFixer()
+				if after.Status != "awaiting_human" || loops.IsReviewScopeHumanHold(after) || after.NextRunAt != nil {
+					t.Fatalf("expected unanswered ask to keep loop blocked: %+v", after)
+				}
+				for _, loop := range []storage.LoopRecord{held, after} {
+					ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+					if !ok || ask.Kind != "agent_question" || ask.Status != "awaiting" || ask.Question != "Which approach should Fixer take?" {
+						t.Fatalf("agent ask was not preserved: %+v", ask)
+					}
 				}
 			} else {
 				baseline := diagnoseLoop(fixer, run, nil, loopDiagnosticMetadata{}, true).RecommendedAction
