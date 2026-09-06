@@ -689,6 +689,8 @@ Unlimited reviewer ⇄ fixer ping-pong is a cost and quality problem: each side 
 
 Continue / no-HITL `unpause` refills only meters currently at/over their live cap and releases the pair. Stop / no-HITL `looper stop` terminates both roles. Product terminals (ready label, identical output, closed PR) still win and do not open a budget ask. Budget exhaustion never approves, resolves, or merges. Event: `loop.review_fix_budget.exhausted` (`level: action_required`). A `needs_human` scope dispute with HITL off pauses the pair with reason `review_scope_human_required` and the same `unpause`/`stop` pair; `unpause` resumes against current evidence without refilling a meter unless one is also exhausted.
 
+`looper describe <seq>` / `looper loop inspect <seq>` and the dashboard loop page show the current hold reason and the exact `looper unpause <seq>` / `looper stop <seq>` commands. Live caps, current head, last reviewed signal, exhausted-role meters, unresolved findings, pending decisions, late blockers, and outcome/progress are not rebuilt on those surfaces (park-time `loop.review_fix_budget.exhausted` / `loop.review_scope_human.required` events still snapshot decision-time evidence).
+
 **Failure prevented:** expanding-scope review/fix that never converges, including on default HITL-off installs. **Cost:** paired pause/unpause/stop plus an action-required event. **Why not reuse the old knobs:** those were reviewer-only infra counters that stranded long PRs and were explicitly demoted in #209.
 
 ### Same-head disposition (always on for GitHub)

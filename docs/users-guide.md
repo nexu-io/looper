@@ -537,12 +537,12 @@ looper run reconcile-stale
 Typical usage:
 
 - `looper ps`: see which loops are currently running (includes a truncated failure reason when present)
-- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`
+- `looper describe <id>`: show why a loop is blocked (manual intervention reason, diagnosis); same as `looper loop inspect`. For a review-fix budget or scope hold, also names the hold reason and the next command (`looper unpause <seq>` / `looper stop <seq>`).
 - `looper logs <id> --follow`: stream logs live
 - `looper jump <id>`: print the shell command for the loop's worktree; use `eval "$(looper jump 12)"` to actually change directories, or pass `--print-path` to print just the path
 - `looper worktree cleanup`: inspect Looper-managed worktree cleanup candidates without deleting anything; add `--confirm` for one immediate cleanup pass or `--json` for structured output
-- `looper unpause <id>`: on a review-fix budget or `needs_human` hold, Continue the pair (refill exhausted meters only); otherwise resume that one paused loop
-- `looper stop <id>`: stop an active loop; on a review-fix hold, terminate both roles in the lane
+- `looper unpause <id>`: on a review-fix budget hold, Continue the pair (refill exhausted meters only); on a `needs_human` scope hold, release only the overlay and leave independent blockers; otherwise resume that one paused loop
+- `looper stop <id>`: stop an active loop, or terminate a budget/scope-held pair
 - `looper run reconcile-stale`: interrupt stale running runs, repair blocked queue state, and requeue eligible loops after sleep/wake or other local process loss; `looper daemon restart` is still a reasonable fallback if you want a full daemon restart
 
 ## 15. Minimal end-to-end example

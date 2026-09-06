@@ -9,6 +9,15 @@ milestones), and one-command local takeover. For the design rationale see
 **Everything here is off by default** — a looper with none of these flags behaves
 exactly as before. Turn them on one at a time.
 
+Review-fix budget and scope holds still fire when HITL is off. They pause the
+pair with no ask. `looper unpause <seq>` releases the hold: a budget hold
+refills only exhausted meters, while other holds may still prevent the pair
+from running; a scope hold clears only the overlay and leaves independent
+blockers such as unanswered agent/HITL asks, failed or interrupted runs, human
+takeover, or a manual pause. `looper stop <seq>` terminates both roles.
+Enabling HITL only changes presentation (Continue/Stop card), not whether the
+pair halts.
+
 ---
 
 ## What each capability needs (at a glance)
