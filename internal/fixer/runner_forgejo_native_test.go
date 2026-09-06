@@ -50,7 +50,7 @@ func TestBuildFixerPromptAddsForgejoNativeCommentRepairResultsInstruction(t *tes
 	t.Parallel()
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature/fix"}
-	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1"), Summary: "rename helper", Body: "Please rename this helper.", Path: "internal/fixer/runner.go", DiffHunk: "@@ -1,2 +1,2 @@"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "Please rename this helper."), Summary: "rename helper", Body: "Please rename this helper.", Path: "internal/fixer/runner.go", DiffHunk: "@@ -1,2 +1,2 @@"}}, false, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
 	for _, want := range []string{
 		"Forgejo native review comment fix item",
 		"`repair_results`",
@@ -63,7 +63,7 @@ func TestBuildFixerPromptAddsForgejoNativeCommentRepairResultsInstruction(t *tes
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
-	if !strings.Contains(prompt, `"providerCommentId":101`) || !strings.Contains(prompt, NativeReviewCommentFingerprint(101, "updated-1")) {
+	if !strings.Contains(prompt, `"providerCommentId":101`) || !strings.Contains(prompt, NativeReviewCommentFingerprint(101, "Please rename this helper.")) {
 		t.Fatalf("prompt missing native item identifiers/fingerprint:\n%s", prompt)
 	}
 	for _, unwanted := range []string{"review_thread_replies", "threadId", "threadCommentsObserved"} {
@@ -93,8 +93,8 @@ func TestCollectFixItemsFromForgejoNativeReviewCommentPreservesNativeFields(t *t
 		"id":                  "101",
 		"databaseId":          int64(101),
 		"threadId":            "101",
-		"threadFingerprint":   NativeReviewCommentFingerprint(101, "updated-1"),
-		"observedFingerprint": NativeReviewCommentFingerprint(101, "updated-1"),
+		"threadFingerprint":   NativeReviewCommentFingerprint(101, "Please rename this helper."),
+		"observedFingerprint": NativeReviewCommentFingerprint(101, "Please rename this helper."),
 		"source":              NativeReviewCommentSource,
 		"body":                "Please rename this helper.",
 		"url":                 "https://forgejo.test/acme/looper/pulls/42#discussion_r101",
@@ -105,7 +105,7 @@ func TestCollectFixItemsFromForgejoNativeReviewCommentPreservesNativeFields(t *t
 	if len(items) != 1 {
 		t.Fatalf("len(items) = %d, want 1", len(items))
 	}
-	if got := items[0]; got.Source != NativeReviewCommentSource || got.ID != NativeReviewCommentFixItemID(101) || got.ThreadID != NativeReviewCommentThreadID(101) || got.ProviderCommentID != 101 || got.ObservedFingerprint != NativeReviewCommentFingerprint(101, "updated-1") || got.Body != "Please rename this helper." || got.DiffHunk != "@@ -1,2 +1,2 @@" || got.URL == "" {
+	if got := items[0]; got.Source != NativeReviewCommentSource || got.ID != NativeReviewCommentFixItemID(101) || got.ThreadID != NativeReviewCommentThreadID(101) || got.ProviderCommentID != 101 || got.ObservedFingerprint != NativeReviewCommentFingerprint(101, "Please rename this helper.") || got.Body != "Please rename this helper." || got.DiffHunk != "@@ -1,2 +1,2 @@" || got.URL == "" {
 		t.Fatalf("item = %#v, want forgejo native review comment fields", got)
 	}
 }
@@ -136,8 +136,8 @@ func TestCollectFixItemsAllowsForgejoNativeAndSummaryItemsToCoexist(t *testing.T
 			"id":                  NativeReviewCommentFixItemID(101),
 			"databaseId":          int64(101),
 			"threadId":            "101",
-			"threadFingerprint":   NativeReviewCommentFingerprint(101, "updated-1"),
-			"observedFingerprint": NativeReviewCommentFingerprint(101, "updated-1"),
+			"threadFingerprint":   NativeReviewCommentFingerprint(101, "Please rename this helper."),
+			"observedFingerprint": NativeReviewCommentFingerprint(101, "Please rename this helper."),
 			"source":              NativeReviewCommentSource,
 			"body":                "Please rename this helper.",
 			"url":                 "https://forgejo.test/acme/looper/pulls/42#discussion_r101",
@@ -165,7 +165,7 @@ func TestCollectFixItemsAllowsForgejoNativeAndSummaryItemsToCoexist(t *testing.T
 
 func TestRunCollectFixesStepIncludesManualForgejoNativeCommentsAndFiltersLooperAuthored(t *testing.T) {
 	t.Parallel()
-	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}, {ProviderCommentID: 102, Body: "my own comment", Author: "looper", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true}}}
+	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "fix this"), ResolverPresent: true}, {ProviderCommentID: 102, Body: "my own comment", Author: "looper", ObservedFingerprint: NativeReviewCommentFingerprint(102, "my own comment"), ResolverPresent: true}}}
 	runner := New(Options{GitHub: github})
 	checkpoint, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
 	if err != nil {
@@ -178,7 +178,7 @@ func TestRunCollectFixesStepIncludesManualForgejoNativeCommentsAndFiltersLooperA
 
 func TestRunCollectFixesStepAllowsRepairWhenNativeResolverMissing(t *testing.T) {
 	t.Parallel()
-	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: false}}}
+	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "fix this"), ResolverPresent: false}}}
 	runner := New(Options{GitHub: github})
 	_, err := runner.runCollectFixesStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{MetadataJSON: stringPtr(`{"manual":true}`)}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}}})
 	if err != nil {
@@ -189,7 +189,7 @@ func TestRunCollectFixesStepAllowsRepairWhenNativeResolverMissing(t *testing.T) 
 func TestRunCollectFixesStepDoesNotRequireResolveCapabilityToRepair(t *testing.T) {
 	t.Parallel()
 	github := &capabilityProbeGitHub{
-		fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}}},
+		fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "fix this"), ResolverPresent: true}}},
 		state:             forge.ProbeStateUnknown,
 	}
 	runner := New(Options{GitHub: github})

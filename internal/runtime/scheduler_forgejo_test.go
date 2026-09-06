@@ -748,7 +748,7 @@ func TestFixerGitHubAdapterForgejoListNativeReviewComments(t *testing.T) {
 	if len(comments) != 3 {
 		t.Fatalf("comments = %#v, want 3", comments)
 	}
-	if got := comments[0]; got.ObservedFingerprint != fixer.NativeReviewCommentFingerprint(101, "2026-07-01T00:00:00Z") || got.ResolverPresent || got.IsResolved {
+	if got := comments[0]; got.ObservedFingerprint != fixer.NativeReviewCommentFingerprint(101, "Open comment") || got.ResolverPresent || got.IsResolved {
 		t.Fatalf("comments[0] = %#v, want absent resolver preserved as open", got)
 	}
 	if got := comments[1]; !got.ResolverPresent || got.IsResolved {
@@ -756,6 +756,57 @@ func TestFixerGitHubAdapterForgejoListNativeReviewComments(t *testing.T) {
 	}
 	if got := comments[2]; !got.ResolverPresent || !got.IsResolved || got.Author != "carol" {
 		t.Fatalf("comments[2] = %#v, want resolved comment with author preserved", got)
+	}
+}
+
+func TestFixerGitHubAdapterForgejoNativeFingerprintTracksBodyInsteadOfPushTimestamp(t *testing.T) {
+	t.Setenv("FORGEJO_TOKEN", "secret")
+	// Forgejo 16 live PR 25/comment 2433 changed only updated_at after a
+	// fixer push. The comment body and original review anchors stayed unchanged.
+	comment := map[string]any{
+		"id": 2433, "body": "Return the final price after subtracting the discount.\n\n<!-- looper:stamp v=1 -->",
+		"user": map[string]any{"login": "reviewer", "id": 1}, "resolver": nil,
+		"pull_request_review_id": 41, "created_at": "2026-09-06T11:09:23Z", "updated_at": "2026-09-06T11:09:23Z",
+		"path": "price.py", "commit_id": "0168818d2a7e524c3204841196c7f05ccf6e8787", "original_commit_id": "",
+		"diff_hunk": "@@ -0,0 +1,3 @@\n+def discounted_price(price, discount_percent):\n+    return price * discount_percent / 100",
+		"position":  3, "original_position": 0, "extra_lines_count": 0,
+		"html_url": "https://forge.example/acme/looper/pulls/25#issuecomment-2433", "pull_request_url": "https://forge.example/acme/looper/pulls/25",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/25/reviews":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 41, "state": "COMMENT", "comments_count": 1, "commit_id": comment["commit_id"], "user": comment["user"]}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls/25/reviews/41/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{comment})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project", Provider: "forgejo", Repo: "acme/looper", RepoPath: t.TempDir()}},
+	}
+	adapter := fixerGitHubAdapter{config: &cfg}
+	read := func() fixer.NativeReviewComment {
+		t.Helper()
+		comments, err := adapter.ListNativeReviewComments(context.Background(), fixer.ListNativeReviewCommentsInput{Repo: "acme/looper", PRNumber: 25})
+		if err != nil || len(comments) != 1 {
+			t.Fatalf("native REST comment: count=%d err=%v", len(comments), err)
+		}
+		return comments[0]
+	}
+	beforePush := read()
+	comment["updated_at"] = "2026-09-06T11:12:03Z"
+	afterPush := read()
+	if afterPush.UpdatedAt == beforePush.UpdatedAt || afterPush.Body != beforePush.Body || afterPush.ObservedFingerprint != beforePush.ObservedFingerprint {
+		t.Fatalf("push-only metadata caused content drift: before=%+v after=%+v", beforePush, afterPush)
+	}
+	comment["body"] = beforePush.Body + "\nAlso preserve decimal prices."
+	afterEdit := read()
+	if afterEdit.UpdatedAt != afterPush.UpdatedAt || afterEdit.ObservedFingerprint == afterPush.ObservedFingerprint {
+		t.Fatalf("body edit with unchanged timestamp did not cause content drift: before=%+v after=%+v", afterPush, afterEdit)
 	}
 }
 

@@ -174,13 +174,16 @@ Forgejo validation notes:
 - Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
 - The provider profile disables unsupported GitHub-shaped defaults. Explicit opt-ins to Forgejo-unsupported behavior fail fast.
 
-Forgejo MVP role limits:
+Forgejo role support:
 
 - planner and worker are supported
 - worker only processes issues already assigned to the current Forgejo user; it does not self-assign
-- reviewer discovers by labels and publishes a top-level Reviewer Summary PR comment; default normal-review label is `looper:review`, while spec PRs use `looper:spec-reviewing`
-- fixer consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment; it does not resolve native review threads
-- coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
+- reviewer defaults to native review requests and `single_review` publication; configured labels are an additional discovery source. Explicitly permitted self-review uses `COMMENT` when Forgejo rejects the author's `APPROVE` or `REQUEST_CHANGES` event.
+- fixer automatically consumes native findings and legacy summary items, including the same account's Looper reviewer findings. It repairs, validates, pushes, and publishes the common fixer message without requiring a resolve API; acknowledged unchanged findings do not repeat after restart. Remote comments remain open.
+- both native and `summary_comment` compatibility modes use the GitHub message templates and disclosure, without visible protocol titles or round metadata.
+- reviewer auto-merge defaults off. Explicit opt-in retains clean review, Looper scope, linked issue / criteria, strategy and protection requirements. Self-review `COMMENT` does not authorize merge. Forgejo uses an immediate request bound to the reviewed head and existing bounded retries, not the server's unguarded scheduled-merge queue.
+- current-head commit statuses and Actions are available to reviewer/fixer. Exact conflict and ancestry checks require Git 2.38+ and sufficient repository history.
+- coordinator, review-thread resolution, GitHub's same-head decline adjudication, routed network mode, and webhooks remain unsupported for Forgejo.
 
 ## Role model guidance
 

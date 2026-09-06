@@ -2461,7 +2461,7 @@ func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input 
 				URL:                 comment.HTMLURL,
 				Path:                comment.Path,
 				DiffHunk:            comment.DiffHunk,
-				ObservedFingerprint: fixer.NativeReviewCommentFingerprint(comment.ID, comment.UpdatedAt),
+				ObservedFingerprint: fixer.NativeReviewCommentFingerprint(comment.ID, comment.Body),
 				ResolverPresent:     comment.Resolver.Present,
 				IsResolved:          comment.Resolver.Value != nil,
 				Author:              comment.User.Login,

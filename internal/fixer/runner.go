@@ -278,8 +278,12 @@ type NativeReviewComment struct {
 	ReviewAuthor        string
 }
 
-func NativeReviewCommentFingerprint(commentID int64, updatedAt string) string {
-	return fmt.Sprintf("%s:%d:%s", NativeReviewCommentSource, commentID, strings.TrimSpace(updatedAt))
+// NativeReviewCommentFingerprint binds an observed decision to the comment's
+// identity and exact feedback. Forgejo may change updated_at after a push even
+// when the feedback is unchanged, so timestamps are not content revisions.
+func NativeReviewCommentFingerprint(commentID int64, body string) string {
+	digest := sha256.Sum256([]byte(body))
+	return fmt.Sprintf("%s:%d:sha256:%x", NativeReviewCommentSource, commentID, digest)
 }
 
 func NativeReviewCommentFixItemID(commentID int64) string {

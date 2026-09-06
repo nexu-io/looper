@@ -68,8 +68,8 @@ func (g *nativeLifecycleGit) Push(ctx context.Context, input PushInput) error {
 	return nil
 }
 
-func ownNativeFinding(id int64, updated string) NativeReviewComment {
-	return NativeReviewComment{ProviderCommentID: id, Body: "Fix the calculation.\n<!-- looper:stamp -->", Author: "looper", ResolverPresent: true, Path: "price.go", URL: fmt.Sprintf("https://forge.example/acme/looper/pulls/42#issuecomment-%d", id), UpdatedAt: updated, ObservedFingerprint: NativeReviewCommentFingerprint(id, updated), ReviewAuthor: "looper", ReviewState: "COMMENTED", ReviewCommitID: "head-1", ReviewBody: "Please fix the calculation.\n<!-- looper:review id=reviewer:review-loop head=head-1 outcome=blocking -->"}
+func ownNativeFinding(id int64, body string) NativeReviewComment {
+	return NativeReviewComment{ProviderCommentID: id, Body: body, Author: "looper", ResolverPresent: true, Path: "price.go", URL: fmt.Sprintf("https://forge.example/acme/looper/pulls/42#issuecomment-%d", id), UpdatedAt: "2026-09-06T11:09:23Z", ObservedFingerprint: NativeReviewCommentFingerprint(id, body), ReviewAuthor: "looper", ReviewState: "COMMENTED", ReviewCommitID: "head-1", ReviewBody: "Please fix the calculation.\n<!-- looper:review id=reviewer:review-loop head=head-1 outcome=blocking -->"}
 }
 
 func nativeAgentResult(items []NativeReviewComment, action string) AgentResult {
@@ -91,9 +91,15 @@ func TestForgejoNativeLifecycleWithoutResolveSurvivesRestartAndLaterFix(t *testi
 	t.Parallel()
 	ctx := context.Background()
 	fixture := newRunnerFixture(t)
-	finding := ownNativeFinding(101, "u1")
+	finding := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
 	github := &nativeLifecycleGateway{probe: forge.ProbeStateUnsupported, detail: PullRequestDetail{Number: 42, URL: "https://forge.example/acme/looper/pulls/42", State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix", BaseRefName: "main", BaseSHA: "base-1", Author: "looper"}, fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}}, nativeComments: []NativeReviewComment{finding}}}
 	git := &nativeLifecycleGit{remote: github, fakeGitGateway: fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/fix", HeadSHA: "head-1"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}, inspectResults: []InspectHeadResult{{HeadSHA: "head-1"}, {HeadSHA: "fixed-head", NewCommitSHAs: []string{"fixed-head"}}, {HeadSHA: "fixed-head"}}}}
+	git.afterPush = func() {
+		// Actual Forgejo behavior: pushing changes updated_at while all comment
+		// content stays identical. The agent's original decision still applies.
+		github.nativeComments[0].UpdatedAt = "2026-09-06T11:12:03Z"
+		github.nativeComments[0].ObservedFingerprint = NativeReviewCommentFingerprint(finding.ProviderCommentID, finding.Body)
+	}
 	agent := &fakeAgentExecutor{results: []AgentResult{nativeAgentResult([]NativeReviewComment{finding}, "fixed")}}
 	runner := nativeLifecycleRunner(t, fixture, github, git, agent)
 	discovered, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -116,6 +122,9 @@ func TestForgejoNativeLifecycleWithoutResolveSurvivesRestartAndLaterFix(t *testi
 	checkpoint := parseCheckpoint(run.CheckpointJSON)
 	if checkpoint.Detail.URL != github.detail.URL || checkpoint.ResolvedComments.Items[0].Status != forgejoFixedUnresolvedStatus || len(checkpoint.Recheck.RemainingFixItems) != 0 {
 		t.Fatalf("checkpoint = %#v", checkpoint)
+	}
+	if github.nativeComments[0].UpdatedAt == finding.UpdatedAt || checkpoint.Repair.ReplyExplanations[0].ObservedFingerprint != finding.ObservedFingerprint {
+		t.Fatal("timestamp refresh did not preserve the agent's original content decision")
 	}
 	if len(github.createIssueComments) != 1 || !strings.Contains(github.createIssueComments[0].Body, "code fixed; comment remains open") || strings.Contains(github.createIssueComments[0].Body, "Forgejo Fixer Summary") {
 		t.Fatalf("comments = %#v", github.createIssueComments)
@@ -144,15 +153,55 @@ func TestForgejoNativeLifecycleWithoutResolveSurvivesRestartAndLaterFix(t *testi
 	t.Cleanup(func() { _ = coordinator.Close() })
 	fixture.coordinator, fixture.repos = coordinator, storage.NewRepositories(coordinator.DB())
 	runner = nativeLifecycleRunner(t, fixture, github, git, agent)
+	github.nativeComments[0].UpdatedAt = "2026-09-06T11:15:03Z"
+	github.nativeComments[0].ObservedFingerprint = NativeReviewCommentFingerprint(finding.ProviderCommentID, finding.Body)
 	for poll := 0; poll < 3; poll++ {
 		discovered, err = runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 		if err != nil || len(discovered.QueueItems) != 0 {
 			t.Fatalf("restart poll = %#v, %v", discovered, err)
 		}
 	}
+	// A real body edit must re-arm that same comment, even when the server
+	// reports the exact same timestamp. Complete a second agent repair to prove
+	// the old acknowledgement is not borrowed for the new feedback.
+	edited := github.nativeComments[0]
+	edited.Body = "Fix the calculation for negative values."
+	edited.ObservedFingerprint = NativeReviewCommentFingerprint(edited.ProviderCommentID, edited.Body)
+	if edited.UpdatedAt != github.nativeComments[0].UpdatedAt || edited.ObservedFingerprint == finding.ObservedFingerprint {
+		t.Fatal("body edit fixture must change only content at the same timestamp")
+	}
+	github.nativeComments = []NativeReviewComment{edited}
+	discovered, err = runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil || len(discovered.QueueItems) != 1 {
+		t.Fatalf("same-timestamp body edit discovery = %#v, %v", discovered, err)
+	}
+	git.createResult.HeadSHA, git.prepareResult.HeadSHA = "fixed-head", "fixed-head"
+	git.inspectIndex = 0
+	git.inspectResults = []InspectHeadResult{{HeadSHA: "fixed-head"}, {HeadSHA: "edited-fixed-head", NewCommitSHAs: []string{"edited-fixed-head"}}, {HeadSHA: "edited-fixed-head"}}
+	git.afterPush = func() {
+		github.detail.HeadSHA = "edited-fixed-head"
+		github.nativeComments[0].UpdatedAt = "2026-09-06T11:18:03Z"
+		github.nativeComments[0].ObservedFingerprint = NativeReviewCommentFingerprint(edited.ProviderCommentID, edited.Body)
+	}
+	agent.results = append(agent.results, nativeAgentResult([]NativeReviewComment{edited}, "fixed"))
+	fixture.advance(time.Hour)
+	claim, err = fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "test-fixer-edited", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("body edit claim = %#v, %v", claim, err)
+	}
+	result, err = runner.ProcessClaimedItem(ctx, *claim)
+	if err != nil || result.Status != "success" || len(agent.starts) != 2 || len(git.pushCalls) != 2 || len(github.resolveNativeCalls) != 0 {
+		t.Fatalf("body edit repair = %#v, %v agent/push/resolve=%d/%d/%d", result, err, len(agent.starts), len(git.pushCalls), len(github.resolveNativeCalls))
+	}
+	run, _ = fixture.repos.Runs.GetByID(ctx, result.RunID)
+	checkpoint = parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.Repair.ReplyExplanations[0].ObservedFingerprint != edited.ObservedFingerprint || checkpoint.ResolvedComments.Items[0].Status != forgejoFixedUnresolvedStatus || len(checkpoint.Recheck.RemainingFixItems) != 0 {
+		t.Fatalf("edited content acknowledgement = %#v", checkpoint)
+	}
+	loop, _ = fixture.repos.Loops.GetByID(ctx, result.LoopID)
 	// A later unrelated push record must neither forget the old decision nor
 	// claim that a newly discovered finding was fixed.
-	other := ownNativeFinding(102, "u2")
+	other := ownNativeFinding(102, "Check the discount boundary.")
 	otherItem := normalizeFixItems(nativeReviewCommentsToMaps([]NativeReviewComment{other}), nil, false)[0]
 	if err := runner.persistFixEvidenceStoreV2(ctx, *loop, upsertThreadFixEvidence(nil, threadFixEvidence{ThreadID: otherItem.ThreadID, ThreadFingerprint: otherItem.ObservedFingerprint, EvidenceHeadSHA: "later-head", Source: "fallback_push", ResolveState: "pending"})); err != nil {
 		t.Fatal(err)
@@ -173,7 +222,7 @@ func TestForgejoNativeLifecycleWithoutResolveSurvivesRestartAndLaterFix(t *testi
 func TestForgejoNativeAcknowledgementOnlySuppressesExactAgentDecision(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	finding := ownNativeFinding(101, "u1")
+	finding := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
 	item := normalizeFixItems(nativeReviewCommentsToMaps([]NativeReviewComment{finding}), nil, false)[0]
 	for _, tc := range []struct {
 		name, state, source, head, compare, fingerprint string
@@ -182,7 +231,8 @@ func TestForgejoNativeAcknowledgementOnlySuppressesExactAgentDecision(t *testing
 		{"same head", forgejoFixedUnresolvedStatus, "agent_repair_result", "fixed-head", "", item.ObservedFingerprint, 0},
 		{"descendant", forgejoFixedUnresolvedStatus, "agent_repair_result", "later-head", "ahead", item.ObservedFingerprint, 0},
 		{"force push", forgejoFixedUnresolvedStatus, "agent_repair_result", "rewritten-head", "diverged", item.ObservedFingerprint, 1},
-		{"edited", forgejoFixedUnresolvedStatus, "agent_repair_result", "fixed-head", "", NativeReviewCommentFingerprint(101, "u2"), 1},
+		{"edited", forgejoFixedUnresolvedStatus, "agent_repair_result", "fixed-head", "", NativeReviewCommentFingerprint(101, "Fix the calculation for negative values."), 1},
+		{"legacy timestamp", forgejoFixedUnresolvedStatus, "agent_repair_result", "fixed-head", "", NativeReviewCommentSource + ":101:2026-09-06T11:09:23Z", 1},
 		{"pending push", "pending", "fallback_push", "fixed-head", "", item.ObservedFingerprint, 1},
 		{"push not agent", forgejoFixedUnresolvedStatus, "fallback_push", "fixed-head", "", item.ObservedFingerprint, 1},
 		{"declined", "declined", "agent_repair_result", "fixed-head", "", item.ObservedFingerprint, 1},
@@ -216,7 +266,7 @@ func TestForgejoNativeSummaryFailureReplaysAfterRestartWithoutRepairingAgain(t *
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			fixture := newRunnerFixture(t)
-			finding := ownNativeFinding(101, "u1")
+			finding := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
 			gateway := &nativeLifecycleGateway{probe: forge.ProbeStateUnsupported, acceptFailedCreate: tc.accepted, detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix", BaseRefName: "main", BaseSHA: "base-1", Author: "looper"}, fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}}, nativeComments: []NativeReviewComment{finding}}}
 			outage := &forge.ForgejoHTTPError{StatusCode: 503, Method: "POST", Path: "/comments", Message: "temporary outage"}
 			if tc.update {
@@ -341,10 +391,10 @@ func TestForgejoMixedRoundPublishesBeforeRediscoveringNewFeedback(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			fixture := newRunnerFixture(t)
-			finding := ownNativeFinding(101, "u1")
+			finding := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
 			original := []NativeReviewComment{finding}
 			if tc.editedNative {
-				original = append(original, ownNativeFinding(103, "u1"))
+				original = append(original, ownNativeFinding(103, "Fix negative values."))
 			}
 			gateway := &nativeLifecycleGateway{probe: forge.ProbeStateUnsupported, acceptFailedCreate: tc.responseLost, detail: forgejoDiscoveryDetail(t, "head-1", 1), fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", listOpen: []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}}, nativeComments: original}}
 			if tc.publicationFails {
@@ -353,10 +403,10 @@ func TestForgejoMixedRoundPublishesBeforeRediscoveringNewFeedback(t *testing.T) 
 			git := &nativeLifecycleGit{remote: gateway, fakeGitGateway: fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "feature/fix", HeadSHA: "head-1"}, prepareResult: PrepareWorktreeResult{HeadSHA: "head-1", Clean: true}, inspectResults: []InspectHeadResult{{HeadSHA: "head-1"}, {HeadSHA: "fixed-head", NewCommitSHAs: []string{"fixed-head"}}, {HeadSHA: "fixed-head"}}}}
 			git.afterPush = func() {
 				if tc.newNative {
-					gateway.nativeComments = append([]NativeReviewComment{finding}, ownNativeFinding(102, "u2"))
+					gateway.nativeComments = append([]NativeReviewComment{finding}, ownNativeFinding(102, "Check the discount boundary."))
 				}
 				if tc.editedNative {
-					gateway.nativeComments = []NativeReviewComment{finding, ownNativeFinding(103, "u2")}
+					gateway.nativeComments = []NativeReviewComment{finding, ownNativeFinding(103, "Fix negative values and zero.")}
 				}
 				if tc.newLegacy {
 					live := forgejoDiscoveryDetailWithItems(t, "fixed-head", 2, []forge.ReviewItem{
@@ -571,8 +621,8 @@ func TestForgejoNativeReplayDoesNotAcknowledgeEditedComment(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatal(err)
 	}
-	old := ownNativeFinding(101, "u1")
-	newComment := ownNativeFinding(102, "u2")
+	old := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
+	newComment := ownNativeFinding(102, "Check the discount boundary.")
 	github := &nativeLifecycleGateway{probe: forge.ProbeStateUnsupported, detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "fixed-head"}, fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{old, newComment}}}
 	items := normalizeFixItems(nativeReviewCommentsToMaps([]NativeReviewComment{old}), nil, false)
 	result := nativeAgentResult([]NativeReviewComment{old}, "fixed")
@@ -588,7 +638,7 @@ func TestForgejoNativeReplayDoesNotAcknowledgeEditedComment(t *testing.T) {
 	}
 	// resolve refresh has overwritten the live FixItems, but the decision still
 	// carries the old fingerprint. Editing that same ID must re-arm it.
-	github.nativeComments = []NativeReviewComment{ownNativeFinding(101, "edited")}
+	github.nativeComments = []NativeReviewComment{ownNativeFinding(101, "Fix the calculation for negative values.")}
 	input.Checkpoint = parseCheckpoint(stringPtr(mustJSON(t, updated)))
 	updated, err = runner.runResolveCommentsStep(ctx, input)
 	if err == nil || !strings.Contains(err.Error(), "changed") || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
@@ -602,9 +652,54 @@ func TestForgejoNativeReplayDoesNotAcknowledgeEditedComment(t *testing.T) {
 	}
 }
 
+func TestForgejoNativeLegacyTimestampDecisionRequiresFreshCollection(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newRunnerFixture(t)
+	project, _ := fixture.repos.Projects.GetByID(ctx, "project_1")
+	loop := storage.LoopRecord{ID: "legacy-native-fingerprint", ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatal(err)
+	}
+	live := ownNativeFinding(101, "Fix the calculation.")
+	legacy := live
+	legacy.ObservedFingerprint = NativeReviewCommentSource + ":101:" + legacy.UpdatedAt
+	items := normalizeFixItems(nativeReviewCommentsToMaps([]NativeReviewComment{legacy}), nil, false)
+	result := nativeAgentResult([]NativeReviewComment{legacy}, "fixed")
+	checkpoint := fixerCheckpoint{
+		Detail:     &checkpointDetail{HeadSHA: "fixed-head"},
+		FixItems:   items,
+		Repair:     &checkpointRepair{ReplyExplanations: parseNativeRepairResults(result.Stdout, "", items)},
+		Validation: &ValidationResult{Passed: true, HeadSHA: "fixed-head"},
+		Push:       &checkpointPush{Pushed: true, HeadSHA: "fixed-head"},
+	}
+	gateway := &nativeLifecycleGateway{probe: forge.ProbeStateUnsupported, detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "fixed-head"}, fakeGitHubGateway: fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{live}}}
+	runner := New(Options{Repos: fixture.repos, GitHub: gateway, CustomInstructions: forgejoFixerDiscoveryConfig(t, fixture)})
+	input := stepInput{Project: *project, Loop: loop, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint}
+	updated, err := runner.runResolveCommentsStep(ctx, input)
+	if err == nil || updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover || updated.ResolvedComments.Items[0].Status != "skipped_thread_drift" {
+		t.Fatalf("legacy fingerprint replay = %#v, %v", updated, err)
+	}
+	if updated.Repair.ReplyExplanations[0].ObservedFingerprint != legacy.ObservedFingerprint || len(gateway.resolveNativeCalls) != 0 {
+		t.Fatal("legacy decision was rewritten or applied to a content fingerprint")
+	}
+	input.Checkpoint = fixerCheckpoint{Detail: pullRequestCheckpointDetail(gateway.detail)}
+	collected, err := runner.runCollectFixesStep(ctx, input)
+	if err != nil || len(collected.FixItems) != 1 || collected.FixItems[0].ObservedFingerprint != live.ObservedFingerprint {
+		t.Fatalf("fresh content collection = %#v, %v", collected.FixItems, err)
+	}
+	if parsed := parseNativeRepairResults(result.Stdout, "", collected.FixItems); len(parsed) != 0 {
+		t.Fatalf("legacy decision granted authority after collection = %#v", parsed)
+	}
+	metadata, _ := runner.freshNativeFixMetadata(ctx, &loop)
+	if evidence, ok := findThreadFixEvidence(loadFixEvidenceStoreV2(metadata), collected.FixItems[0]); ok && evidence.ResolveState == forgejoFixedUnresolvedStatus {
+		t.Fatal("legacy timestamp decision suppressed the new content fingerprint")
+	}
+}
+
 func TestForgejoNativeProvenanceAndPushEvidenceIsolation(t *testing.T) {
 	t.Parallel()
-	base := ownNativeFinding(101, "u1")
+	base := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
 	for _, tc := range []struct {
 		name   string
 		mutate func(*NativeReviewComment)
@@ -647,7 +742,7 @@ func TestForgejoNativeNeedsHumanUsesSharedPreMutationSuspension(t *testing.T) {
 	ctx := context.Background()
 	fixture := newRunnerFixture(t)
 	project, _ := fixture.repos.Projects.GetByID(ctx, "project_1")
-	finding := ownNativeFinding(101, "u1")
+	finding := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
 	items := normalizeFixItems(nativeReviewCommentsToMaps([]NativeReviewComment{finding}), nil, false)
 	result := nativeAgentResult([]NativeReviewComment{finding}, "needs_human")
 	agent := &fakeAgentExecutor{results: []AgentResult{result}}
@@ -688,7 +783,7 @@ func TestForgejoNativeMixedCollectionKeepsOnlyUnconsumedItemsAndCIContext(t *tes
 		t.Fatal(err)
 	}
 	detail.IssueComments = append(detail.IssueComments, map[string]any{"id": int64(2), "author": map[string]any{"login": "looper"}, "body": marker})
-	github := &fakeGitHubGateway{nativeComments: []NativeReviewComment{ownNativeFinding(101, "u1")}}
+	github := &fakeGitHubGateway{nativeComments: []NativeReviewComment{ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")}}
 	cfg := forgejoFixerDiscoveryConfig(t, fixture)
 	runner := New(Options{GitHub: github, Repos: fixture.repos, CustomInstructions: cfg})
 	checkpoint, err := runner.runCollectFixesStep(ctx, stepInput{Project: *project, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: fixerCheckpoint{Detail: pullRequestCheckpointDetail(detail)}})
@@ -743,7 +838,7 @@ func TestForgejoNativeUnfixedDecisionsRemainOpenAndReachExistingNoProgressHold(t
 			if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
 				t.Fatal(err)
 			}
-			comment := ownNativeFinding(101, "u1")
+			comment := ownNativeFinding(101, "Fix the calculation.\n<!-- looper:stamp -->")
 			github := &nativeLifecycleGateway{probe: forge.ProbeStateUnsupported, detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "fixed-head"}, fakeGitHubGateway: fakeGitHubGateway{nativeComments: []NativeReviewComment{comment}}}
 			items := normalizeFixItems(nativeReviewCommentsToMaps([]NativeReviewComment{comment}), nil, false)
 			result := nativeAgentResult([]NativeReviewComment{comment}, action)

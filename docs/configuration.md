@@ -512,6 +512,19 @@ python3 scripts/forgejo-review-fix-smoke.py \
 
 This builds the current source, uses isolated runtime paths, creates one fixture PR on its own branch, checks repair and restart behavior, and closes the PR and removes its branch and label. It uses real Codex calls. Evidence is saved under `dist/looper-smoke-<run>/`. The default branch is not changed. See [implementation and acceptance notes](DESIGN-forgejo-reviewer-fixer.md).
 
+To verify the real provider adapters for conflicts, commit statuses, and head-bound merge using tea without an agent:
+
+```bash
+LOOPER_FORGEJO_LIVE_CONTRACTS=1 \
+LOOPER_FORGEJO_LIVE_BASE_URL=https://code.example.com \
+LOOPER_FORGEJO_LIVE_REPO=owner/looper-sandbox \
+LOOPER_FORGEJO_LIVE_TEA_LOGIN=sandbox \
+LOOPER_FORGEJO_LIVE_MERGE=1 \
+go test ./internal/runtime -run '^TestForgejoLiveProviderContracts$' -v -count=1 -timeout=15m
+```
+
+The extra `LOOPER_FORGEJO_LIVE_MERGE=1` permits required-check protection and immediate merge into the test's own temporary base branch. Omit it to check conflicts and statuses without merging. The test closes its PRs, removes its branches and protection rule, and verifies that the existing default branch is unchanged. Closed PRs and statuses on test commits remain as audit history. Missing prerequisites fail an explicitly enabled run; ordinary `go test ./...` skips the live test.
+
 The existing token-backed provider integration suite is also available:
 
 ```bash

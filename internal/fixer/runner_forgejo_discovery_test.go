@@ -18,7 +18,7 @@ func TestForgejoAutoDiscoveryUsesReviewerSummaryAndNativeComments(t *testing.T) 
 		currentUser:    "looper",
 		listOpen:       []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
 		viewResponses:  []PullRequestDetail{detail},
-		nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Rename this helper", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true}},
+		nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Rename this helper", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Rename this helper"), ResolverPresent: true}},
 	}
 	cfg := forgejoFixerDiscoveryConfig(t, fixture)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
@@ -108,7 +108,7 @@ func TestForgejoAutoDiscoveryAcceptsOpenNativeCommentsRegardlessOfResolverField(
 				currentUser:    "looper",
 				listOpen:       []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1", Author: "looper"}},
 				viewResponses:  []PullRequestDetail{detail},
-				nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: tc.resolverPresent, IsResolved: tc.resolved}},
+				nativeComments: []NativeReviewComment{{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Fix this"), ResolverPresent: tc.resolverPresent, IsResolved: tc.resolved}},
 			}
 			cfg := forgejoFixerDiscoveryConfig(t, fixture)
 			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: cfg})
@@ -138,8 +138,8 @@ func TestForgejoAutomaticCollectAttachesNativeComments(t *testing.T) {
 	untrusted["author"] = map[string]any{"login": "mallory"}
 	detail.IssueComments = append(detail.IssueComments, untrusted)
 	github := &fakeGitHubGateway{currentUser: "looper", nativeComments: []NativeReviewComment{
-		{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true},
-		{ProviderCommentID: 102, Body: "Unsupported", Author: "bob", ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: false},
+		{ProviderCommentID: 101, Body: "Fix this", Author: "alice", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Fix this"), ResolverPresent: true},
+		{ProviderCommentID: 102, Body: "Unsupported", Author: "bob", ObservedFingerprint: NativeReviewCommentFingerprint(102, "Unsupported"), ResolverPresent: false},
 	}}
 	runner := New(Options{GitHub: github, CustomInstructions: cfg})
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")

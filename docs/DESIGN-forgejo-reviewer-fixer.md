@@ -36,6 +36,8 @@ Forgejo 拒绝在自己创建的 PR 上提交 REQUEST_CHANGES；已获准的自�
 
 优先删除“无法 resolve 就不允许修复”的能力门槛。复用已有 fixer evidence 的 `ResolveState=fixed_unresolved`，明确表示“代码已处理、远端仍未关闭”，不引入第二套 receipt / ledger 或数据库迁移。repair checkpoint 增加 agent 当时看到的评论指纹，防止 resolve 重试时把旧决定套给已编辑评论；缺少指纹的旧 checkpoint 重新采集，不从新快照补猜。成本是保留新状态值与旧 checkpoint 的兼容路径，并让发现、重试与展示保持同一含义。仅忽略所有远端未解决评论会丢失新评论、编辑和 deferred 结果；仅删除能力门槛则会在重启后重复修复。
 
+真实验收发现，普通 push 后 Forgejo 会改变评论的 `updated_at`，而正文和其他返回字段完全不变。因此删除以该时间戳代表内容版本的假设，已有指纹改为 comment ID 加原始正文的 SHA-256，不新增持久化字段。定位投影和时间戳不参与计算；实际正文编辑即使没有更晚的时间戳也能被发现。成本是旧时间戳格式的 checkpoint / evidence 不再匹配，需要安全地重新评估一次，以及正文变化会触发重新处理。直接去掉漂移判断会让旧 agent 决定作用于新内容；直接把全文重复塞入指纹则增加 prompt 与 checkpoint 体积，均不采用。哈希只检测输入变化，fixed 的权威仍是 agent 的结构化结果。
+
 原生评论没有远端 resolve/reply 结果时，公共修复说明是该轮唯一的远端处理反馈，不能沿用 GitHub 补充总结的 best-effort 语义。先在已有 run checkpoint 保存 agent 决定，说明发布成功或按同一 marker 查回后，再写入用于 discovery 去重的 evidence；发布失败仅重放已有步骤，不重复 agent 或推送。这个顺序避免增加“等待消息”的队列状态和额外 discovery 门禁。HTTP 结果只表示消息是否送达，不改变 agent 对代码是否 fixed 的决定。
 
 混合旧 summary 与原生评论时，同一条公共回评先保存本轮成功结果，再重新采集新增或编辑的反馈。复用 checkpoint 中 agent 已观察的旧 reviewer round，避免新 round 借用旧决定；发布时仍刷新 fixer 评论以恢复响应丢失后的同一条消息。发现与 recheck 直接读取最新 reviewer round，因此手动循环关闭 autoDiscovery 后也能看到新反馈。没有增加快照字段或消息层；旧协议仍以 round 版本为边界，不扩展支持人工在同一 round 内改写隐藏协议内容。
@@ -56,6 +58,41 @@ go build -o dist/looperd ./cmd/looperd
 
 既有 Forgejo 项目不需要迁移数据库。原生流程使用 `roles.reviewer.behavior.publishMode=single_review`，并启用 reviewer/fixer 的 autoDiscovery。同一账号同时创建和评审 PR 时，需要显式允许 self-review；可以使用配置的 reviewer label 触发，不依赖自请求评审。保留 `threadResolution.enabled=false`。这些设置均可放在目标项目的 `projects[].roles` 下；具体结构见 [配置说明](configuration.md#provider-support)。兼容 `summary_comment` 的旧项目可以继续运行，也使用相同的可见模板。
 
+例如，对已在配置文件中声明的 Forgejo 项目，将以下 `roles` 合并到对应 `projects[]` 条目，可通过 `needs-review` 标签运行同账号 reviewer / fixer。先在仓库创建该标签，并添加到要处理的 PR；保留项目已有的 provider、repo、repoPath 和其他角色设置。不要为 CLI/API 管理的项目另建同 ID 配置条目；项目归属规则见 [项目配置来源](configuration.md#project-authority-and-import)。
+
+```json
+{
+  "roles": {
+    "reviewer": {
+      "discovery": {
+        "autoDiscovery": true,
+        "triggers": {
+          "enableSelfReview": true,
+          "requireReviewRequest": false,
+          "labels": ["needs-review"]
+        }
+      },
+      "behavior": {
+        "publishMode": "single_review",
+        "loop": {"enabledByDefault": true},
+        "threadResolution": {"enabled": false}
+      },
+      "autoMerge": {"enabled": false}
+    },
+    "fixer": {
+      "autoDiscovery": true,
+      "triggers": {"labels": ["needs-review"]}
+    }
+  }
+}
+```
+
+修改目标配置后，用新构建的 CLI 做离线校验，再按既有服务部署方式切换到新 `looperd` 二进制。配置若使用 TOML，请替换下面路径；本次实现没有安装二进制或重启日常 daemon。
+
+```sh
+./dist/looper config validate --config "$HOME/.looper/config.json"
+```
+
 自动合并单独显式开启，仍要求既有 Looper scope / linked issue / acceptance criteria / 分支保护。等待 CI 使用现有有界重试，达到队列重试或连续失败上限后，需要在 CI 就绪后继续或重新检查；不是无限期后台排队。自审降级为 COMMENT 不授予合并权限。
 
 完整源码检查：
@@ -69,7 +106,27 @@ go build ./...
 
 Sandbox 使用 `core/looper-sandbox`、独立配置 / 数据库 / worktree / 端口及专属分支和标签。测试结束关闭本轮 PR 并删除本轮测试分支、标签；不合并到 sandbox 默认分支，不操作现有 looperd。远端请求同时校验 HTTP 状态，不能只依赖 tea 退出码。
 
-实际验证结果与最终配置步骤在验收阶段补齐。
+## 实际验收结果（2026-09-06）
+
+实例版本为 `16.0.3+gitea-1.22.0`，使用 `core/looper-sandbox` 和已有 tea 登录 `powerformer-code`。
+
+| 验收 | 结果 |
+| --- | --- |
+| [PR #28](https://code.powerformer.net/core/looper-sandbox/pulls/28)：真实 Codex 原生闭环 | Reviewer 找到折扣计算错误 → 自动 Fixer 推送 `151738696dce05c524c861e335db3b8f345d6034` 并回评 → 新 head Reviewer 发布 clean；共 3 次 agent 执行、2 条 native review、1 条 fixer 回评 |
+| 同一数据库重启 | 执行数仍为 3，无新增 run、push、review 或修复消息；队列为空闲状态 |
+| 修复与消息 | 远端提交通过最初的 3 个 unittest（另存于 agent 工作区外）；comment `2446` 保持未解决，fixer 回评明确写明 `code fixed; comment remains open`；reviewer/fixer 均使用公共 Powered by Looper 署名，无专用 Summary 标题 |
+| [PR #26](https://code.powerformer.net/core/looper-sandbox/pulls/26) / [#27](https://code.powerformer.net/core/looper-sandbox/pulls/27)：真实 provider 合约 | 两个角色正确区分真实冲突与干净 PR；当前提交 status failure → success 去重、URL/描述映射通过；脏工作区、refs、index、FETCH_HEAD 保持不变 |
+| 受保护的临时 base | CI 失败拒绝合并（405），错误 SHA 和推送后过期 SHA 拒绝合并（409）；正确新 SHA 只合入临时 base，真实 Git 祖先关系验证通过 |
+| 清理 | PR #24 / #25 / #26 / #28 已关闭未合并，#27 仅合入临时 base；本轮分支、标签、保护规则全部删除，自有测试进程停止。main 前后均为 `ef6a1f22b225a7ae990d2773b825ffeb072b0dc1` |
+| Go 检查 | gofmt、vet、build 与完整 test 通过。并行检查时一条未修改的 worker E2E 触发既有 2 秒本机 HTTP 超时，单独重跑完整测试通过；没有修改阈值或断言 |
+
+验收期间发现并修复了生产代码的时间戳指纹问题。另修正了测试采集器对不分页评论接口的假设，统一按实际 `X-Total-Pages` / `Link` 读取；最终重启校验复用了已成功的三次真实执行，没有额外调用 agent。原始执行器因采集器修正而中断，续验通过后由其原有 finally 路径完成清理；不将该执行器的退出码冒充整段脚本零退出。
+
+本机证据分别保存在 `dist/forgejo-acceptance-20260906-native-v3/`（远端快照、SQLite、原始测试、续验代码/日志、result.json、cleanup.json）和 `dist/forgejo-completion-20260906/`（provider 日志与 Go 检查）。之前的 native 尝试保留在相邻目录，便于核对已修复问题。
+
+真实验收覆盖原生主闭环、commit status、冲突和即时合并接口。503 / 响应丢失 / SQLite 重放、编辑与新 finding、force-push、混合旧协议、外部 reviewer、HITL 和合并授权策略由自动化合约测试覆盖。未声称真实运行 Forgejo Actions workflow；其读取、映射和失败状态通过 provider 合约验证。
+
+仍不支持远端 review-thread resolve、Forgejo coordinator、routed network/webhook 和 GitHub 的同 head decline adjudication。自动合并继续默认关闭、有界重试；不会使用 Forgejo 未保留审核 SHA 的 scheduled merge。
 
 已有 `tea` 登录和 Codex 登录时，可执行隔离的真实 agent 验收：
 
@@ -81,3 +138,16 @@ python3 scripts/forgejo-review-fix-smoke.py \
 ```
 
 脚本从当前源码构建二进制，手动发起第一轮原生 reviewer（不使用 force），随后自动执行 fixer 与新 head 的 reviewer，并重启同一隔离数据库验证不会重复推送或发布 review。最后运行远端修复 commit 的 fixture 测试、检查公共署名与可见消息格式，并关闭自身 PR、删除自身分支和标签。真实 Codex 调用使用当前账号，会消耗模型额度。证据保存在 `dist/looper-smoke-<run>/`，包括远端快照、run/checkpoint、fixture 测试结果与 cleanup 结果。
+
+不调用 agent 的真实 provider 合约验收：
+
+```sh
+LOOPER_FORGEJO_LIVE_CONTRACTS=1 \
+LOOPER_FORGEJO_LIVE_BASE_URL=https://code.powerformer.net \
+LOOPER_FORGEJO_LIVE_REPO=core/looper-sandbox \
+LOOPER_FORGEJO_LIVE_TEA_LOGIN=powerformer-code \
+LOOPER_FORGEJO_LIVE_MERGE=1 \
+go test ./internal/runtime -run '^TestForgejoLiveProviderContracts$' -v -count=1 -timeout=15m
+```
+
+该测试建立自己的 base 和两个 head 分支，验证真实冲突、当前提交的 status 映射、脏工作区不被改变，以及受保护分支上 CI / SHA 的合并约束。第二个开关才允许修改自有 base 的保护并合并到该分支；省略它则只检查冲突和状态。它验证传输与 adapter 行为，reviewer 的 clean / criteria / scope 授权另由生命周期合约覆盖。清理结果与默认分支前后 SHA 输出到测试日志。

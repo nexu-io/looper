@@ -13,32 +13,34 @@ import (
 )
 
 func nativeReply(fixItemID, action string) replyExplanationEntry {
-	updated := "u1"
-	for id, value := range map[int64]string{102: "u2", 103: "u3", 104: "u4"} {
+	commentID, _ := strconv.ParseInt(strings.TrimPrefix(fixItemID, NativeReviewCommentSource+":"), 10, 64)
+	body := "Comment one."
+	for id, value := range map[int64]string{102: "Comment two.", 103: "Comment three.", 104: "Comment four."} {
 		if fixItemID == NativeReviewCommentFixItemID(id) {
-			updated = value
+			body = value
 		}
 	}
-	return replyExplanationEntry{FixItemID: fixItemID, Action: action, Explanation: "Reviewed the Forgejo native comment.", ObservedFingerprint: fixItemID + ":" + updated}
+	return replyExplanationEntry{FixItemID: fixItemID, Action: action, Explanation: "Reviewed the Forgejo native comment.", ObservedFingerprint: NativeReviewCommentFingerprint(commentID, body)}
 }
 
-func nativeFixItem(commentID int64, updatedAt string) FixItem {
+func nativeFixItem(commentID int64, body string) FixItem {
 	return FixItem{
 		Type:                "comment",
 		Source:              NativeReviewCommentSource,
 		ID:                  NativeReviewCommentFixItemID(commentID),
 		ThreadID:            strconv.FormatInt(commentID, 10),
 		ProviderCommentID:   commentID,
-		ObservedFingerprint: NativeReviewCommentFingerprint(commentID, updatedAt),
+		Body:                body,
+		ObservedFingerprint: NativeReviewCommentFingerprint(commentID, body),
 		ResolverPresent:     true,
 	}
 }
 
 func TestRunResolveCommentsStepForgejoNativeAllowsAlreadyFixedWithoutNewPush(t *testing.T) {
 	t.Parallel()
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"}}}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"}}}}
 	runner := New(Options{GitHub: github})
-	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: false}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: false}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 	if err != nil {
 		t.Fatalf("runResolveCommentsStep() error = %v, already-fixed decisions do not require a fake commit", err)
@@ -48,11 +50,11 @@ func TestRunResolveCommentsStepForgejoNativeAllowsAlreadyFixedWithoutNewPush(t *
 func TestRunResolveCommentsStepForgejoNativeNoopDoesNotRequirePush(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
-		{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"},
-		{ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true, Author: "bob"},
+		{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"},
+		{ProviderCommentID: 102, Body: "Comment two.", ObservedFingerprint: NativeReviewCommentFingerprint(102, "Comment two."), ResolverPresent: true, Author: "bob"},
 	}}}
 	runner := New(Options{GitHub: github})
-	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1"), nativeFixItem(102, "u2")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: false}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "declined"), nativeReply(NativeReviewCommentFixItemID(102), "deferred")}}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one."), nativeFixItem(102, "Comment two.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: false}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "declined"), nativeReply(NativeReviewCommentFixItemID(102), "deferred")}}}
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 	if err != nil {
 		t.Fatalf("runResolveCommentsStep() error = %v", err)
@@ -72,11 +74,11 @@ func TestRunResolveCommentsStepForgejoNativeNoopDoesNotRequirePush(t *testing.T)
 func TestRunResolveCommentsStepForgejoNativeMissingDecisionRetriesDiscovery(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
-		{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"},
-		{ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true, Author: "bob"},
+		{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"},
+		{ProviderCommentID: 102, Body: "Comment two.", ObservedFingerprint: NativeReviewCommentFingerprint(102, "Comment two."), ResolverPresent: true, Author: "bob"},
 	}}}
 	runner := New(Options{GitHub: github})
-	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 	if err == nil || !strings.Contains(err.Error(), "omitted or invalidated thread decisions") {
 		t.Fatalf("runResolveCommentsStep() error = %v, want missing-decision retry", err)
@@ -96,7 +98,7 @@ func TestRunResolveCommentsStepForgejoNativeMissingDecisionRetriesDiscovery(t *t
 func TestRunResolveCommentsStepManualForgejoRereadsNativeCommentsWithEmptyInitialSnapshot(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
-		{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"},
+		{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"},
 	}}}
 	runner := New(Options{GitHub: github})
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{{Type: "comment", Source: "forgejo-reviewer-summary", ID: "summary-1", ThreadID: "summary-1"}}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "summary-1", ThreadID: "summary-1", Action: "fixed", Explanation: "Fixed the summary item."}}}}
@@ -119,11 +121,11 @@ func TestRunResolveCommentsStepManualForgejoRereadsNativeCommentsWithEmptyInitia
 func TestRunResolveCommentsStepForgejoNativeRereadSkipsLooperAuthoredComments(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
-		{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"},
-		{ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true, Author: "looper"},
+		{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"},
+		{ProviderCommentID: 102, Body: "Comment two.", ObservedFingerprint: NativeReviewCommentFingerprint(102, "Comment two."), ResolverPresent: true, Author: "looper"},
 	}}}
 	runner := New(Options{GitHub: github})
-	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 	if err != nil {
 		t.Fatalf("runResolveCommentsStep() error = %v", err)
@@ -146,13 +148,13 @@ func TestRunResolveCommentsStepForgejoNativeRereadSkipsLooperAuthoredComments(t 
 func TestRunResolveCommentsStepForgejoNativeResolvesFixedOnlyAndSkipsStates(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{
-		{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"},
-		{ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "u2"), ResolverPresent: true, IsResolved: true, Author: "bob"},
-		{ProviderCommentID: 103, ObservedFingerprint: NativeReviewCommentFingerprint(103, "u3"), ResolverPresent: true, Author: "cara"},
-		{ProviderCommentID: 104, ObservedFingerprint: NativeReviewCommentFingerprint(104, "u4-new"), ResolverPresent: true, Author: "dana"},
+		{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"},
+		{ProviderCommentID: 102, Body: "Comment two.", ObservedFingerprint: NativeReviewCommentFingerprint(102, "Comment two."), ResolverPresent: true, IsResolved: true, Author: "bob"},
+		{ProviderCommentID: 103, Body: "Comment three.", ObservedFingerprint: NativeReviewCommentFingerprint(103, "Comment three."), ResolverPresent: true, Author: "cara"},
+		{ProviderCommentID: 104, Body: "Comment four has been edited.", ObservedFingerprint: NativeReviewCommentFingerprint(104, "Comment four has been edited."), ResolverPresent: true, Author: "dana"},
 	}}}
 	runner := New(Options{GitHub: github})
-	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1"), nativeFixItem(102, "u2"), nativeFixItem(103, "u3"), nativeFixItem(104, "u4")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed"), nativeReply(NativeReviewCommentFixItemID(102), "fixed"), nativeReply(NativeReviewCommentFixItemID(103), "declined"), nativeReply(NativeReviewCommentFixItemID(104), "fixed")}}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one."), nativeFixItem(102, "Comment two."), nativeFixItem(103, "Comment three."), nativeFixItem(104, "Comment four.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed"), nativeReply(NativeReviewCommentFixItemID(102), "fixed"), nativeReply(NativeReviewCommentFixItemID(103), "declined"), nativeReply(NativeReviewCommentFixItemID(104), "fixed")}}}
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 	if err == nil || !strings.Contains(err.Error(), "review thread content changed") {
 		t.Fatalf("runResolveCommentsStep() error = %v, want native thread drift retry", err)
@@ -179,7 +181,7 @@ func TestRunResolveCommentsStepForgejoNativeSkipsDeleted(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}}
 	runner := New(Options{GitHub: github})
-	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
+	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 	if err != nil {
 		t.Fatalf("runResolveCommentsStep() error = %v", err)
@@ -200,9 +202,9 @@ func TestRunResolveCommentsStepForgejoNativeClassifiesHTTPAndTimeoutErrors(t *te
 		"timeout retry": {err: errors.New("request timed out"), kind: FailureRetryableAfterResume, text: "will retry"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"}}}, resolveNativeErr: errValue.err}
+			github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"}}}, resolveNativeErr: errValue.err}
 			runner := New(Options{GitHub: github})
-			checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
+			checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 			_, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 			var loopErr *loopError
 			if !errors.As(err, &loopErr) || loopErr.kind != errValue.kind || !strings.Contains(loopErr.Error(), errValue.text) {
@@ -218,9 +220,9 @@ func TestRunResolveCommentsStepForgejoNativeUnsupportedResolutionRetainsFixedDec
 		&forge.ForgejoHTTPError{StatusCode: 404, Method: "POST", Path: "/resolve", Message: "missing"},
 		&forge.ForgejoHTTPError{StatusCode: 405, Method: "POST", Path: "/resolve", Message: "method"},
 	} {
-		github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{{ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "u1"), ResolverPresent: true, Author: "alice"}}}, resolveNativeErr: errValue}
+		github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head"}}, nativeCommentBatches: [][]NativeReviewComment{{{ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one."), ResolverPresent: true, Author: "alice"}}}, resolveNativeErr: errValue}
 		runner := New(Options{GitHub: github})
-		checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "u1")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
+		checkpoint := fixerCheckpoint{Detail: &checkpointDetail{State: "OPEN"}, FixItems: []FixItem{nativeFixItem(101, "Comment one.")}, Validation: &ValidationResult{Passed: true, HeadSHA: "new-head"}, Push: &checkpointPush{Pushed: true}, Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{nativeReply(NativeReviewCommentFixItemID(101), "fixed")}}}
 		updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 		if err != nil {
 			t.Fatalf("runResolveCommentsStep() error = %v", err)
@@ -234,15 +236,15 @@ func TestRunResolveCommentsStepForgejoNativeUnsupportedResolutionRetainsFixedDec
 func TestParseNativeRepairResultsAcceptsExplicitActionsAndDefaultsMissingToDeferred(t *testing.T) {
 	t.Parallel()
 	fixItems := []FixItem{
-		{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")},
-		{Type: "comment", ID: "c2", ThreadID: "102", Source: NativeReviewCommentSource, ProviderCommentID: 102, ObservedFingerprint: NativeReviewCommentFingerprint(102, "updated-2")},
-		{Type: "comment", ID: "c3", ThreadID: "103", Source: NativeReviewCommentSource, ProviderCommentID: 103, ObservedFingerprint: NativeReviewCommentFingerprint(103, "updated-3")},
-		{Type: "comment", ID: "c4", ThreadID: "104", Source: NativeReviewCommentSource, ProviderCommentID: 104, ObservedFingerprint: NativeReviewCommentFingerprint(104, "updated-4")},
+		{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one.")},
+		{Type: "comment", ID: "c2", ThreadID: "102", Source: NativeReviewCommentSource, ProviderCommentID: 102, Body: "Comment two.", ObservedFingerprint: NativeReviewCommentFingerprint(102, "Comment two.")},
+		{Type: "comment", ID: "c3", ThreadID: "103", Source: NativeReviewCommentSource, ProviderCommentID: 103, Body: "Comment three.", ObservedFingerprint: NativeReviewCommentFingerprint(103, "Comment three.")},
+		{Type: "comment", ID: "c4", ThreadID: "104", Source: NativeReviewCommentSource, ProviderCommentID: 104, Body: "Comment four.", ObservedFingerprint: NativeReviewCommentFingerprint(104, "Comment four.")},
 	}
 	stdout := `__LOOPER_RESULT__={"repair_results":[` +
-		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"Renamed the helper.","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "updated-1") + `"},` +
-		`{"source":"forgejo_review_comment","providerCommentId":102,"action":"declined","explanation":"Out of scope.","observedFingerprint":"` + NativeReviewCommentFingerprint(102, "updated-2") + `"},` +
-		`{"source":"forgejo_review_comment","providerCommentId":103,"action":"deferred","explanation":"Need product input.","observedFingerprint":"` + NativeReviewCommentFingerprint(103, "updated-3") + `"}` +
+		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"Renamed the helper.","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "Comment one.") + `"},` +
+		`{"source":"forgejo_review_comment","providerCommentId":102,"action":"declined","explanation":"Out of scope.","observedFingerprint":"` + NativeReviewCommentFingerprint(102, "Comment two.") + `"},` +
+		`{"source":"forgejo_review_comment","providerCommentId":103,"action":"deferred","explanation":"Need product input.","observedFingerprint":"` + NativeReviewCommentFingerprint(103, "Comment three.") + `"}` +
 		`]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
 	if len(got) != 3 {
@@ -255,7 +257,7 @@ func TestParseNativeRepairResultsAcceptsExplicitActionsAndDefaultsMissingToDefer
 
 func TestParseNativeRepairResultsMissingObservedFingerprintOmitsDecision(t *testing.T) {
 	t.Parallel()
-	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")}}
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one.")}}
 	stdout := `__LOOPER_RESULT__={"repair_results":[{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"Renamed the helper."}]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
 	if len(got) != 0 {
@@ -265,8 +267,8 @@ func TestParseNativeRepairResultsMissingObservedFingerprintOmitsDecision(t *test
 
 func TestParseNativeRepairResultsBlankExplanationOmitsDecision(t *testing.T) {
 	t.Parallel()
-	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")}}
-	stdout := `__LOOPER_RESULT__={"repair_results":[{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"   ","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "updated-1") + `"}]}`
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one.")}}
+	stdout := `__LOOPER_RESULT__={"repair_results":[{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"   ","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "Comment one.") + `"}]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
 	if len(got) != 0 {
 		t.Fatalf("parseNativeRepairResults() = %#v, want missing decision omitted", got)
@@ -275,9 +277,9 @@ func TestParseNativeRepairResultsBlankExplanationOmitsDecision(t *testing.T) {
 
 func TestParseNativeRepairResultsIgnoresUnknownExplicitEntriesWithoutFallback(t *testing.T) {
 	t.Parallel()
-	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")}}
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one.")}}
 	stdout := `__LOOPER_RESULT__={"repair_results":[` +
-		`{"source":"github_review_comment","providerCommentId":101,"action":"fixed","explanation":"wrong source","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "updated-1") + `"},` +
+		`{"source":"github_review_comment","providerCommentId":101,"action":"fixed","explanation":"wrong source","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "Comment one.") + `"},` +
 		`{"source":"forgejo_review_comment","providerCommentId":999,"action":"fixed","explanation":"unknown provider","observedFingerprint":"ignored"}` +
 		`]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
@@ -288,11 +290,11 @@ func TestParseNativeRepairResultsIgnoresUnknownExplicitEntriesWithoutFallback(t 
 
 func TestParseNativeRepairResultsKeepsFirstValidDuplicate(t *testing.T) {
 	t.Parallel()
-	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, ObservedFingerprint: NativeReviewCommentFingerprint(101, "updated-1")}}
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101, Body: "Comment one.", ObservedFingerprint: NativeReviewCommentFingerprint(101, "Comment one.")}}
 	stdout := `__LOOPER_RESULT__={"repair_results":[` +
-		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"   ","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "updated-1") + `"},` +
-		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"declined","explanation":"First valid result.","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "updated-1") + `"},` +
-		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"Later duplicate should be ignored.","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "updated-1") + `"}` +
+		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"   ","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "Comment one.") + `"},` +
+		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"declined","explanation":"First valid result.","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "Comment one.") + `"},` +
+		`{"source":"forgejo_review_comment","providerCommentId":101,"action":"fixed","explanation":"Later duplicate should be ignored.","observedFingerprint":"` + NativeReviewCommentFingerprint(101, "Comment one.") + `"}` +
 		`]}`
 	got := parseNativeRepairResults(stdout, "", fixItems)
 	if len(got) != 1 || got[0].Action != "declined" || got[0].Explanation != "First valid result." {

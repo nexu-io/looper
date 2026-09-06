@@ -32,7 +32,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 ## Features
 
 - 🚢 **Start from an issue, not a prompt.** Label an issue `looper:plan`, assign it to yourself, and a spec PR shows up. Once it reaches `looper:spec-ready`, implementation begins.
-- 🐙 **The forge is the source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline. GitHub is fully supported; Forgejo supports planner, worker, native reviewer requests/reviews, and summary-comment compatibility flows.
+- 🐙 **The forge is the source of truth.** Issues, PRs, labels, reviews, and assignees *are* the workflow — no external task tracker, no YAML pipeline. GitHub is fully supported; Forgejo supports planner, worker, native reviewer/fixer loops, summary-comment compatibility, and opt-in reviewer auto-merge.
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`, `grok-build`, `pi`, `omp`) so you're not locked into one model or CLI.
@@ -72,7 +72,7 @@ looper project add .
 
 Add each repo you want Looper to watch after bootstrap. Full install, upgrade, uninstall, and from-source instructions: **[docs/installation.md](docs/installation.md)**.
 
-Once `looper status` succeeds and your forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable), drive loops manually:
+Once `looper status` succeeds and your forge credentials are configured (`gh auth status` for GitHub, or a configured Forgejo token environment variable or tea login), drive loops manually:
 
 ```bash
 # plan a spec from an issue
@@ -295,6 +295,10 @@ go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -coun
 ```
 
 Forgejo live sandbox e2e is local/manual only and skipped unless explicitly enabled. Use a dedicated existing sandbox repo; tests create and clean run-scoped issues, branches, PRs, labels, and comments:
+
+For a real Codex Reviewer → Fixer → Reviewer cycle with an existing tea login, run `python3 scripts/forgejo-review-fix-smoke.py --base-url https://code.example.com --repo owner/looper-sandbox --tea-login sandbox`. It verifies the pushed repair, common message templates, and restart stability in an isolated runtime, then cleans its own resources. See [Forgejo live checks](docs/configuration.md#forgejo-live-sandbox-e2e) for the provider conflict/status/guarded-merge check and [implementation notes](docs/DESIGN-forgejo-reviewer-fixer.md) for configuration and acceptance results.
+
+The token-backed provider suite remains available:
 
 ```bash
 LOOPER_E2E_FORGEJO=1 \
