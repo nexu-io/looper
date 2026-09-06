@@ -1225,11 +1225,10 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 			if err != nil {
 				return nil, err
 			}
-			conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HasConflicts: conflicted, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			// Exact merge-tree checks stay on ViewPullRequest. List runs before
+			// eligibility filtering, and one mergeable=false draft whose commits
+			// cannot be fetched or merge-tree'd must not abort the whole list.
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -1262,11 +1261,10 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 			if err != nil {
 				return nil, err
 			}
-			conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HasConflicts: conflicted, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+			// Exact merge-tree checks stay on ViewPullRequest. List runs before
+			// eligibility filtering, and one mergeable=false draft whose commits
+			// cannot be fetched or merge-tree'd must not abort the whole list.
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}

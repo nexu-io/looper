@@ -87,8 +87,8 @@ func TestForgejoAdaptersExposeConflictsChecksAndNativeReviewHandoff(t *testing.T
 		t.Fatalf("review detail = %#v, %v", review, err)
 	}
 	prs, err := reviewerAdapter.ListOpenPullRequests(ctx, reviewer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: cwd})
-	if err != nil || len(prs) != 1 || !prs[0].HasConflicts || inlineReads != 1 {
-		t.Fatalf("discovery = %#v, %v; inline reads = %d, want no extra inline fetch", prs, err, inlineReads)
+	if err != nil || len(prs) != 1 || prs[0].HasConflicts || inlineReads != 1 {
+		t.Fatalf("discovery = %#v, %v; inline reads = %d, want listed PR without list-time conflict check", prs, err, inlineReads)
 	}
 	fixerAdapter := fixerGitHubAdapter{config: &cfg}
 	fix, err := fixerAdapter.ViewPullRequest(ctx, fixer.ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, CWD: cwd})

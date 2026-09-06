@@ -136,6 +136,55 @@ func TestForgejoConflictChecksRespectGitConfigurationAndUnknownState(t *testing.
 	}
 }
 
+func TestForgejoListPullRequestsDefersExactConflictChecks(t *testing.T) {
+	t.Setenv("FORGEJO_CONFLICT_TOKEN", "test-token")
+	missingGit := filepath.Join(t.TempDir(), "missing-configured-git")
+	requestedReviewer := map[string]any{"id": 7, "login": "reviewer"}
+	draft := map[string]any{
+		"number": 1, "title": "WIP", "state": "open", "draft": true, "mergeable": false,
+		"head":                map[string]any{"sha": strings.Repeat("a", 40), "ref": "wip"},
+		"base":                map[string]any{"sha": strings.Repeat("b", 40), "ref": "main"},
+		"user":                map[string]any{"login": "alice"},
+		"requested_reviewers": []map[string]any{requestedReviewer},
+	}
+	ready := map[string]any{
+		"number": 2, "title": "Ready", "state": "open", "mergeable": true,
+		"head":                map[string]any{"sha": strings.Repeat("c", 40), "ref": "ready"},
+		"base":                map[string]any{"sha": strings.Repeat("b", 40), "ref": "main"},
+		"user":                map[string]any{"login": "bob"},
+		"requested_reviewers": []map[string]any{requestedReviewer},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/swagger.v1.json":
+			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/{index}/reviews":{"get":{}},"/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments":{"get":{}},"/repos/{owner}/{repo}/pulls/{index}/requested_reviewers":{"post":{}}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/acme/looper/pulls":
+			_ = json.NewEncoder(w).Encode([]any{draft, ready})
+		default:
+			_ = json.NewEncoder(w).Encode([]any{})
+		}
+	}))
+	defer server.Close()
+	cwd := t.TempDir()
+	cfg := config.Config{
+		Tools:     config.ToolPathsConfig{GitPath: &missingGit},
+		Providers: []config.ProviderConfig{{ID: "forgejo", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: stringPtr("FORGEJO_CONFLICT_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "project", Provider: "forgejo", Repo: "acme/looper", RepoPath: cwd}},
+	}
+	adapter := reviewerGitHubAdapter{config: &cfg}
+	ctx := context.Background()
+	assertListed := func(t *testing.T, prs []reviewer.PullRequestSummary, err error) {
+		t.Helper()
+		if err != nil || len(prs) != 2 || prs[0].Number != 1 || !prs[0].IsDraft || prs[1].Number != 2 || prs[0].HasConflicts || prs[1].HasConflicts {
+			t.Fatalf("listed = %#v, %v; want both PRs without aborting on the mergeable=false draft", prs, err)
+		}
+	}
+	open, err := adapter.ListOpenPullRequests(ctx, reviewer.ListOpenPullRequestsInput{Repo: "acme/looper", CWD: cwd})
+	assertListed(t, open, err)
+	requested, err := adapter.ListReviewRequestedPullRequests(ctx, reviewer.ListReviewRequestedPullRequestsInput{Repo: "acme/looper", CWD: cwd, Reviewer: "reviewer"})
+	assertListed(t, requested, err)
+}
+
 func forgejoConflictRepo(t *testing.T) (cwd, base, conflictedHead, cleanHead string) {
 	t.Helper()
 	cwd = t.TempDir()
