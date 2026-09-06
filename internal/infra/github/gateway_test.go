@@ -1540,6 +1540,30 @@ func TestGatewayFindReviewMarkerMatchesExpectedHeadWithLoopIDPrefix(t *testing.T
 	}
 }
 
+func TestGatewayFindReviewMarkerMatchesExactBareLoopID(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[
+				{"state":"CHANGES_REQUESTED","body":"<!-- looper:review id=reviewer:loop-12 head=abc123 outcome=blocking -->"},
+				{"state":"CHANGES_REQUESTED","body":"<!-- looper:review id=reviewer:loop-1 head=abc123 outcome=blocking -->"}
+			]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=reviewer:loop-1 head=abc123", AllowedReviewEvents: []string{"REQUEST_CHANGES"}})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Outcome != "blocking" || marker.Event != "REQUEST_CHANGES" {
+		t.Fatalf("FindReviewMarker() = %#v, want exact bare loop id without matching loop-12", marker)
+	}
+}
+
 func TestGatewayFindReviewMarkerRequiresWellFormedMarker(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -2939,4 +2963,15 @@ func TestGatewayGetCurrentUserIdentityFallsBackToViewerForIntegrationTokens(t *t
 type reviewSubmitDiagnosticEvent struct {
 	Name   string
 	Fields map[string]any
+}
+
+func TestReviewEngagementDoesNotRecoverOldHeadWhenCurrentHeadAlreadyReviewed(t *testing.T) {
+	t.Parallel()
+	old := map[string]any{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "commit_id": "old", "body": "<!-- looper:review id=reviewer:loop head=old outcome=blocking -->"}
+	current := map[string]any{"user": map[string]any{"login": "bob"}, "state": "CHANGES_REQUESTED", "commit_id": "new", "body": "<!-- looper:review id=reviewer:loop head=new outcome=blocking -->"}
+	for _, reviews := range [][]map[string]any{{old, current}, {current, old}} {
+		if got := ReviewEngagementHead(reviews, "loop", "new", "bob", []string{"COMMENT", "REQUEST_CHANGES"}, false); got != "" {
+			t.Fatalf("current head granted full follow-up via %q", got)
+		}
+	}
 }

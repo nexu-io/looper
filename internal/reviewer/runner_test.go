@@ -3755,7 +3755,8 @@ func TestDiscoverPullRequestsSuppressesRepeatedNotRequestedSkipUntilRequested(t 
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	// No prior publication: a cached request miss remains valid until eligibility changes.
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
 	loop := storage.LoopRecord{ID: "loop_not_requested_followup", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -3795,7 +3796,8 @@ func TestDiscoverPullRequestsDoesNotSuppressNotRequestedSkipAfterHeadChange(t *t
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	// No prior publication: a cached request miss remains valid until eligibility changes.
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
 	loop := storage.LoopRecord{ID: "loop_not_requested_head_change", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -3817,8 +3819,7 @@ func TestDiscoverPullRequestsDoesNotSuppressNotRequestedSkipAfterHeadChange(t *t
 		t.Fatalf("second QueueItems = %#v, want no repeated re-enqueue for same head", second.QueueItems)
 	}
 
-	meta := parseJSONObject(loop.MetadataJSON)
-	if reviewerDiscoverySuppressedByLastSkip(meta, PullRequestSummary{Number: 42, HeadSHA: "newer-head", ReviewRequests: []string{}}, "bob", DiscoveryPolicy{RequireReviewRequest: true}) {
+	if reviewerDiscoverySuppressedByLastSkip(loop, PullRequestSummary{Number: 42, HeadSHA: "newer-head", ReviewRequests: []string{}}, "bob", DiscoveryPolicy{RequireReviewRequest: true}) {
 		t.Fatalf("reviewerDiscoverySuppressedByLastSkip() = true, want false after head change")
 	}
 }
@@ -3912,7 +3913,7 @@ func TestReviewerDiscoverySuppressedByLastSkipDoesNotUseCurrentReviewRequestsInR
 			GitHubUserID: 42,
 		},
 	}
-	if reviewerDiscoverySuppressedByLastSkip(meta, pr, "bob", policy) {
+	if reviewerDiscoverySuppressedByLastSkip(storage.LoopRecord{MetadataJSON: stringPtr(mustMarshalJSON(meta))}, pr, "bob", policy) {
 		t.Fatalf("reviewerDiscoverySuppressedByLastSkip() = true, want false when routed claim still allows reviewer")
 	}
 }
@@ -6165,7 +6166,7 @@ func TestProcessClaimedItemRecoversMissingCompletionMarkerWhenReviewMarkerExists
 func TestProcessClaimedItemRecoversMissingCompletionMarkerWithLegacyReviewMarkerID(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerExactMissing: true, reviewMarkerBody: "posted review <!-- looper:review id=reviewer:legacy-loop:abc123 head=abc123 outcome=actionable -->"}
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerExactMissing: true, reviewMarkerBody: "posted review <!-- looper:review id=reviewer:legacy-loop head=abc123 outcome=actionable -->"}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "posted maybe", Stdout: "posted maybe"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -6191,9 +6192,9 @@ func TestProcessClaimedItemRecoversMissingCompletionMarkerWithLegacyReviewMarker
 			t.Fatalf("review marker input %d has empty author login; tolerant lookup must stay author-scoped", i)
 		}
 	}
-	wantIDPrefix := fmt.Sprintf("id_prefix=reviewer:%s:", result.LoopID)
-	if !contains(github.reviewMarkerInputs[1].Marker, wantIDPrefix) {
-		t.Fatalf("tolerant marker = %q, want loop-scoped id prefix", github.reviewMarkerInputs[1].Marker)
+	wantBareID := fmt.Sprintf("id=reviewer:%s ", result.LoopID)
+	if !contains(github.reviewMarkerInputs[1].Marker, wantBareID) {
+		t.Fatalf("tolerant marker = %q, want exact bare loop id without prefix collisions", github.reviewMarkerInputs[1].Marker)
 	}
 }
 
@@ -6266,8 +6267,8 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	if len(agent.starts) != 1 {
 		t.Fatalf("len(agent.starts) after retry = %d, want marker recheck without review rerun", len(agent.starts))
 	}
-	if github.reviewMarkerCalls != 3 {
-		t.Fatalf("review marker calls = %d, want exact and tolerant initial lookups plus retry", github.reviewMarkerCalls)
+	if github.reviewMarkerCalls != 4 {
+		t.Fatalf("review marker calls = %d, want exact, bare-loop, and suffixed-loop initial lookups plus retry", github.reviewMarkerCalls)
 	}
 	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
@@ -13139,6 +13140,11 @@ type fakeGitHubGateway struct {
 	listHeadSHA                     string
 	removeReviewRequestOnSecondView bool
 	viewCalls                       int
+	loadReviewsCalls                int
+	// omitReviewsOnView simulates DiscoverySnapshot/fixer-profile views that
+	// intentionally omit the reviews field while engagement recovery can still
+	// load them via LoadPullRequestReviews.
+	omitReviewsOnView               bool
 	author                          string
 	labels                          []string
 	reviewDecision                  string
@@ -13323,7 +13329,16 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 			users = append(users, networkpolicy.GitHubUser{Login: login})
 		}
 	}
-	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
+	reviews := cloneCommentMaps(g.reviews)
+	if g.omitReviewsOnView {
+		reviews = nil
+	}
+	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: reviews}, nil
+}
+
+func (g *fakeGitHubGateway) LoadPullRequestReviews(context.Context, ViewPullRequestInput) ([]map[string]any, error) {
+	g.loadReviewsCalls++
+	return cloneCommentMaps(g.reviews), nil
 }
 
 func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
@@ -13408,6 +13423,9 @@ func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input 
 		}
 	}
 	headSHA := "abc123"
+	if g.viewHeadSHA != "" {
+		headSHA = g.viewHeadSHA
+	}
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}

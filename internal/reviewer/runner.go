@@ -33,6 +33,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/reviewengagement"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
@@ -1153,7 +1154,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 			reviewSignal = decision.signal
 		}
 	}
-	if !dispositionOnly && reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp {
+	if !dispositionOnly && reviewerDiscoverySuppressedByLastSkip(loopResult.record, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp {
 		allowFollowUp, followErr := r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy)
 		if followErr != nil {
 			return followErr
@@ -1494,6 +1495,11 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		result.Skipped++
 		return nil
 	}
+	var err error
+	loop, err = r.backfillPublishedHeadFromLooperReview(ctx, project, loop, detail, *currentLogin)
+	if err != nil {
+		return err
+	}
 	requireReviewRequest := requireReviewRequestForLoop(loop, reviewRequestRequiredForCandidate(policy, detail.Labels), detail.HeadSHA)
 	allowThreadResolutionFollowUp := false
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && requireReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, *currentLogin) {
@@ -1516,6 +1522,73 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 		return nil
 	}
 	return r.enqueueReviewerDiscoveryCandidate(ctx, project, repo, policy, currentLogin, summaryFromDetail(detail), &loop, allowThreadResolutionFollowUp, result)
+}
+
+func (r *Runner) backfillPublishedHeadFromLooperReview(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, detail PullRequestDetail, currentLogin string) (storage.LoopRecord, error) {
+	if reviewengagement.PublishedHead(loop.MetadataJSON) != "" {
+		return loop, nil
+	}
+	engagedHead, err := reviewengagement.Resolve(loop.MetadataJSON, detail.HeadSHA, func() (string, error) {
+		reviews, err := r.reviewsForEngagementBackfill(ctx, project, loop, detail)
+		if err != nil {
+			return "", err
+		}
+		policy := r.effectiveReviewEvents(project.ID, loop.MetadataJSON)
+		return looperReviewEngagementHead(reviews, currentLogin, loop.ID, detail.HeadSHA, r.allowedReviewEventsForPolicy(policy), sameReviewAuthorLogin(currentLogin, detail.Author)), nil
+	})
+	if err != nil || engagedHead == "" {
+		return loop, err
+	}
+	return r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		// A concurrent publication wins over historical recovery.
+		if reviewengagement.PublishedHead(updated.MetadataJSON) != "" || !reviewengagement.Enabled(updated.MetadataJSON) {
+			return
+		}
+		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": engagedHead})
+		if err == nil {
+			updated.MetadataJSON = stringPtr(metadataJSON)
+		}
+	})
+}
+
+// pullRequestReviewsLoader loads submitted PR reviews for engagement recovery.
+// Discovery profiles (and DiscoverySnapshot's fixer-profile view) may omit reviews;
+// loaders must return the reviewer-profile review payload instead of reusing that cache.
+type pullRequestReviewsLoader interface {
+	LoadPullRequestReviews(context.Context, ViewPullRequestInput) ([]map[string]any, error)
+}
+
+func (r *Runner) reviewsForEngagementBackfill(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, detail PullRequestDetail) ([]map[string]any, error) {
+	// A present reviews list (including empty) is authoritative. Only reload when
+	// the field was omitted (nil), e.g. fixer-profile / DiscoverySnapshot views.
+	// Treating len==0 as omitted double-fetches every discovery tick for loops
+	// with no reviews and aborts discovery if the redundant load fails.
+	if detail.Reviews != nil {
+		return detail.Reviews, nil
+	}
+	if r.github == nil || loop.Repo == nil || loop.PRNumber == nil {
+		return nil, nil
+	}
+	input := ViewPullRequestInput{Repo: *loop.Repo, PRNumber: *loop.PRNumber, CWD: project.RepoPath}
+	if loader, ok := r.github.(pullRequestReviewsLoader); ok {
+		return loader.LoadPullRequestReviews(ctx, input)
+	}
+	// Fallback for gateways that only expose ViewPullRequest: try a fresh detail
+	// fetch. Callers that attach DiscoverySnapshot and resolve ViewPullRequest to
+	// the fixer profile still omit reviews; prefer implementing pullRequestReviewsLoader.
+	refreshed, err := r.github.ViewPullRequest(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return refreshed.Reviews, nil
+}
+
+func looperReviewEngagementHead(reviews []map[string]any, login, loopID, currentHeadSHA string, allowedEvents []ReviewEvent, allowCleanComment bool) string {
+	events := make([]string, len(allowedEvents))
+	for i, event := range allowedEvents {
+		events[i] = string(event)
+	}
+	return githubinfra.ReviewEngagementHead(reviews, loopID, currentHeadSHA, login, events, allowCleanComment)
 }
 
 func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo string, prNumber int64) ([]storage.LoopRecord, error) {
@@ -2109,6 +2182,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(startStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(startStep)}})
 	r.logInfo("reviewer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(startStep), "resumed": resumedRun.Resumed})
+	engagementResolved := false
 	for _, step := range stepsFrom(startStep) {
 		stepStartedAt := r.now()
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
@@ -2116,7 +2190,26 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
-		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
+		// Resolve before the first eligibility/action step, including resumes that
+		// start after filter. Reuse discovered review data instead of a second PR read.
+		if !engagementResolved && step != stepDiscover && checkpoint.Detail != nil {
+			engagementResolved = true
+			if reviewengagement.Enabled(loop.MetadataJSON) && reviewengagement.PublishedHead(loop.MetadataJSON) == "" {
+				login, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+				err = lookupErr
+				if err == nil {
+					detail := PullRequestDetail{HeadSHA: checkpoint.Detail.HeadSHA, Author: checkpoint.Detail.Author, Reviews: checkpoint.Detail.Reviews}
+					recovered, recoverErr := r.backfillPublishedHeadFromLooperReview(ctx, *project, *loop, detail, login)
+					err = recoverErr
+					if err == nil {
+						loop = &recovered
+					}
+				}
+			}
+		}
+		if err == nil {
+			checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
+		}
 		if err != nil {
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
@@ -5326,7 +5419,7 @@ func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input s
 		return false, checkpoint, nil
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if isManualReviewerLoop(input.Loop) || !policy.RequireReviewRequest || checkpoint.Detail == nil {
+	if checkpoint.Detail == nil || !requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Detail.HeadSHA) {
 		return false, checkpoint, nil
 	}
 	currentLogin := strings.TrimSpace(checkpoint.Detail.CurrentLogin)
@@ -5376,9 +5469,13 @@ func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepIn
 		return found, err
 	}
 	if isConvergenceReviewID(idempotencyKey) {
-		// Same-head convergence must not reuse the prior head-only loop-prefix
-		// marker; that would keep the previous blocking review as published.
+		// Same-head convergence must not reuse a prior head-only marker.
 		return found, nil
+	}
+	bareLoopMarker := agentNativeBareLoopReviewMarker(input.Loop.ID, headSHA)
+	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: bareLoopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
+	if err != nil || found.Found {
+		return found, err
 	}
 	loopMarker := agentNativeLoopReviewMarker(input.Loop.ID, headSHA)
 	found, err = r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: loopMarker, AllowedReviewEvents: allowedEvents, AuthorLogin: currentLogin, AllowCleanComment: allowCleanComment, CWD: input.Project.RepoPath})
@@ -6864,12 +6961,10 @@ func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
 }
 
 func (r *Runner) allowedReviewEventsForPolicy(policy config.ReviewerReviewEventsConfig) []ReviewEvent {
-	events := []ReviewEvent{ReviewEventComment}
-	if policy.Clean == config.ReviewerReviewEventApprove {
-		events = append(events, ReviewEventApprove)
-	}
-	if policy.Blocking == config.ReviewerReviewEventRequestChanges {
-		events = append(events, ReviewEventRequestChanges)
+	allowed := reviewengagement.AllowedEvents(policy)
+	events := make([]ReviewEvent, len(allowed))
+	for i, event := range allowed {
+		events[i] = ReviewEvent(event)
 	}
 	return events
 }
@@ -6893,23 +6988,7 @@ func (r *Runner) reviewEventsForProject(projectID string) config.ReviewerReviewE
 }
 
 func (r *Runner) effectiveReviewEvents(projectID string, metadataJSON *string) config.ReviewerReviewEventsConfig {
-	// Prefer snapshotted loop metadata when present; otherwise use the live
-	// per-project policy so newly auto-discovered loops honor project overrides.
-	policy := r.reviewEventsForProject(projectID)
-	meta := parseJSONObject(metadataJSON)
-	if reviewEvents, ok := meta["reviewEvents"].(map[string]any); ok {
-		if clean, ok := stringFromAny(reviewEvents["clean"]); ok && strings.TrimSpace(clean) != "" {
-			if isValidCleanReviewEvent(clean) {
-				policy.Clean = config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(clean)))
-			}
-		}
-		if blocking, ok := stringFromAny(reviewEvents["blocking"]); ok && strings.TrimSpace(blocking) != "" {
-			if isValidBlockingReviewEvent(blocking) {
-				policy.Blocking = config.ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(blocking)))
-			}
-		}
-	}
-	return policy
+	return reviewengagement.Policy(metadataJSON, r.reviewEventsForProject(projectID))
 }
 
 func isValidCleanReviewEvent(value string) bool {
@@ -7552,19 +7631,7 @@ func requireReviewRequestForLoop(loop storage.LoopRecord, requireReviewRequest b
 }
 
 func reviewerFollowUpHasNewHead(loop storage.LoopRecord, headSHA string) bool {
-	if strings.TrimSpace(headSHA) == "" {
-		return false
-	}
-	meta := parseJSONObject(loop.MetadataJSON)
-	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
-		return false
-	}
-	loopMeta := reviewerLoopMetadata(meta)
-	if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
-		return false
-	}
-	lastPublishedHeadSHA, ok := stringFromAny(meta["lastPublishedHeadSha"])
-	return ok && lastPublishedHeadSHA != "" && lastPublishedHeadSHA != headSHA
+	return reviewengagement.HasNewHead(loop.MetadataJSON, headSHA)
 }
 
 func needsReviewerEligibilityRediscovery(checkpoint reviewerCheckpoint, startStep ReviewerStep) bool {
@@ -8528,7 +8595,8 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 	return string(encoded), nil
 }
 
-func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
+func reviewerDiscoverySuppressedByLastSkip(loop storage.LoopRecord, pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
 	raw, _ := meta["lastFilterSkip"].(map[string]any)
 	if raw == nil {
 		return false
@@ -8588,7 +8656,9 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 			decision := routedReviewerClaimDecision(policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
 			return !decision.Allowed && decision.Reason == "local GitHub identity is not requested for review"
 		}
-		if !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
+		// A cached request miss cannot override the loop's current follow-up
+		// authority, including publication bookkeeping recovered after the skip.
+		if !requireReviewRequestForLoop(loop, policy.RequireReviewRequest, pr.HeadSHA) || !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 			return false
 		}
 	}
@@ -9897,6 +9967,10 @@ func agentNativeReviewMarker(loopID string, headSHA string, idempotencyKey strin
 		idempotencyKey = fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
 	}
 	return fmt.Sprintf("looper:review id=%s head=%s", idempotencyKey, headSHA)
+}
+
+func agentNativeBareLoopReviewMarker(loopID string, headSHA string) string {
+	return fmt.Sprintf("looper:review id=reviewer:%s head=%s", loopID, headSHA)
 }
 
 func agentNativeLoopReviewMarker(loopID string, headSHA string) string {

@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/projects"
+	"github.com/nexu-io/looper/internal/reviewengagement"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -601,6 +602,20 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 	}
 	defer func() { _ = db.Close() }()
 	repos := storage.NewRepositories(db)
+	resolve := func(loop storage.LoopRecord) (bool, error) {
+		previous, err := reviewengagement.Resolve(loop.MetadataJSON, headSHA, func() (string, error) {
+			cwd, err := r.getwd()
+			if err != nil {
+				return "", err
+			}
+			gateway, err := reviewSubmitGatewayForConfig(cfg, repo, cwd, nil)
+			if err != nil {
+				return "", err
+			}
+			return recoverReviewSubmitEngagement(cmd.Context(), gateway, cfg, loop, repo, prNumber, headSHA, cwd)
+		})
+		return previous != "" && previous != strings.TrimSpace(headSHA), err
+	}
 	runID := strings.TrimSpace(getStringFlag(cmd, "reviewer-run-id"))
 	if runID != "" {
 		manual, err := trustedManualReviewerRun(cmd.Context(), repos, repo, prNumber, runID)
@@ -610,9 +625,9 @@ func (r *commandRuntime) trustedReviewRequestSubmitBypass(cmd *cobra.Command, cf
 		if manual {
 			return true, nil
 		}
-		return trustedFollowUpNewHeadReviewerRun(cmd.Context(), repos, repo, prNumber, runID, headSHA)
+		return trustedFollowUpNewHeadReviewerRun(cmd.Context(), repos, repo, prNumber, runID, resolve)
 	}
-	return trustedCurrentFollowUpNewHeadReviewerBypass(cmd.Context(), repos, repo, prNumber, headSHA)
+	return trustedCurrentFollowUpNewHeadReviewerBypass(cmd.Context(), repos, repo, prNumber, resolve)
 }
 
 // resolveReviewSubmitAnchors establishes complete base/head anchor authority.
@@ -1000,7 +1015,7 @@ func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, 
 // trustedFollowUpNewHeadReviewerRun reports whether --reviewer-run-id is the
 // current running reviewer run for an enabled follow-up loop whose last
 // published head differs from the head being submitted.
-func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string, headSHA string) (bool, error) {
+func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string, resolve func(storage.LoopRecord) (bool, error)) (bool, error) {
 	loop, err := trustedCurrentReviewerLoopForRun(ctx, repos, repo, prNumber, runID)
 	if err != nil {
 		return false, err
@@ -1008,13 +1023,13 @@ func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repos
 	if loop == nil {
 		return false, nil
 	}
-	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
+	return resolve(*loop)
 }
 
 // trustedCurrentFollowUpNewHeadReviewerBypass honors the runner's
 // follow_up_new_head requireReviewRequest bypass when agents submit without
 // --reviewer-run-id. Authority is the current running reviewer loop for the PR.
-func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, headSHA string) (bool, error) {
+func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, resolve func(storage.LoopRecord) (bool, error)) (bool, error) {
 	if repos == nil || repos.Runs == nil || repos.Loops == nil {
 		return false, fmt.Errorf("validate follow-up review request bypass: storage is not configured")
 	}
@@ -1039,7 +1054,7 @@ func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *sto
 	if !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
 		return false, nil
 	}
-	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
+	return resolve(*loop)
 }
 
 // trustedCurrentReviewerLoopForRun returns the loop for runID only when that
@@ -1086,26 +1101,46 @@ func trustedCurrentReviewerLoopForRun(ctx context.Context, repos *storage.Reposi
 	return loop, nil
 }
 
-// reviewSubmitFollowUpHasNewHead mirrors reviewer.reviewerFollowUpHasNewHead:
-// enabled follow-up loops may publish without a fresh review request when the
-// head being submitted differs from the last published review head.
 func reviewSubmitFollowUpHasNewHead(metadataJSON *string, headSHA string) bool {
-	headSHA = strings.TrimSpace(headSHA)
-	if headSHA == "" {
-		return false
+	return reviewengagement.HasNewHead(metadataJSON, headSHA)
+}
+
+// Recovery never trusts submitted argv or payload markers. The caller has
+// already bound this lookup to the current running reviewer loop in storage.
+func recoverReviewSubmitEngagement(ctx context.Context, gateway reviewSubmitGateway, cfg config.Config, loop storage.LoopRecord, repo string, prNumber int64, headSHA, cwd string) (string, error) {
+	login, err := gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", err
 	}
-	meta := parseReviewSubmitJSONObject(metadataJSON)
-	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
-		return false
-	}
-	if loopMeta, ok := meta["loop"].(map[string]any); ok {
-		if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
-			return false
+	var detail githubinfra.PullRequestDetail
+	switch gh := gateway.(type) {
+	case *githubinfra.Gateway:
+		detail, err = gh.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	case forgejoReviewSubmitGateway:
+		detail, err = gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		if err == nil {
+			var reviews []forge.PullRequestReview
+			reviews, err = gh.client.ListPullRequestReviews(ctx, prNumber)
+			for _, review := range reviews {
+				detail.Reviews = append(detail.Reviews, map[string]any{"user": map[string]any{"login": review.User.Login}, "state": review.State, "body": review.Body, "commit_id": review.CommitID})
+			}
 		}
+	default:
+		return "", fmt.Errorf("review engagement recovery requires a provider review loader")
 	}
-	lastPublished, _ := meta["lastPublishedHeadSha"].(string)
-	lastPublished = strings.TrimSpace(lastPublished)
-	return lastPublished != "" && lastPublished != headSHA
+	if err != nil {
+		return "", err
+	}
+	if err := validateExpectedHeadCommit(headSHA, detail.HeadSHA); err != nil {
+		return "", err
+	}
+	matched, err := reviewSubmitProjectForRepo(cfg, repo, cwd)
+	if err != nil {
+		return "", err
+	}
+	policyCfg := reviewSubmitConfigWithMatchedProject(cfg, matched)
+	policy := reviewengagement.Policy(loop.MetadataJSON, config.ProjectRoleConfigs(policyCfg, loop.ProjectID).Reviewer.Behavior.ReviewEvents)
+	return githubinfra.ReviewEngagementHead(detail.Reviews, loop.ID, headSHA, login, reviewengagement.AllowedEvents(policy), sameGitHubLogin(login, detail.Author)), nil
 }
 
 func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {
