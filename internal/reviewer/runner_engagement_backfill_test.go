@@ -10,60 +10,73 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestDiscoverPullRequestsRequeuesLooperEngagedFollowUpWithoutPublishedHeadMetadata(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	const loopID = "loop_follow_engaged_without_metadata"
-	github := &fakeGitHubGateway{
-		currentLogin:   "bob",
-		reviewRequests: []string{},
-		viewHeadSHA:    "new-head",
-		reviews: []map[string]any{{
-			"author": map[string]any{"login": "bob"},
-			"commit": map[string]any{"oid": "old-head"},
-			"state":  "CHANGES_REQUESTED",
-			"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=blocking -->",
-		}},
-	}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"posted clean follow-up review"}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}, LoopConfig: testReviewerLoopConfig()})
-	nowISO := fixture.nowISO()
-	repo := "acme/looper"
-	prNumber := int64(42)
-	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","headSha":"old-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
-	loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
+func TestDiscoverPullRequestsRequeuesLooperEngagedFollowUpAfterCurrentHeadSkip(t *testing.T) {
+	for _, recovered := range []bool{false, true} {
+		name := "missing publication"
+		if recovered {
+			name = "already recovered publication"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			const loopID = "loop_follow_engaged_without_metadata"
+			github := &fakeGitHubGateway{
+				currentLogin:   "bob",
+				reviewRequests: []string{},
+				viewHeadSHA:    "new-head",
+				reviews: []map[string]any{{
+					"author": map[string]any{"login": "bob"},
+					"commit": map[string]any{"oid": "old-head"},
+					"state":  "CHANGES_REQUESTED",
+					"body":   "<!-- looper:review id=reviewer:" + loopID + " head=old-head outcome=blocking -->",
+				}},
+			}
+			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"posted clean follow-up review"}`, ParseStatus: "parsed"}}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventRequestChanges}, LoopConfig: testReviewerLoopConfig()})
+			nowISO := fixture.nowISO()
+			repo := "acme/looper"
+			prNumber := int64(42)
+			metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+			if recovered {
+				metadata = strings.Replace(metadata, `"followUpdates":true`, `"followUpdates":true,"lastPublishedHeadSha":"old-head"`, 1)
+			}
+			loop := storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+			if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
 
-	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
-	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	if len(result.QueueItems) != 1 {
-		t.Fatalf("len(QueueItems) = %d, want 1 engaged follow-up", len(result.QueueItems))
-	}
-	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
-	if err != nil {
-		t.Fatalf("Loops.GetByID() error = %v", err)
-	}
-	if persistedLoop == nil || persistedLoop.MetadataJSON == nil || !contains(*persistedLoop.MetadataJSON, `"lastPublishedHeadSha":"old-head"`) {
-		t.Fatalf("loop after discovery = %#v, want GitHub engagement head backfilled", persistedLoop)
-	}
-	fixture.advance(time.Hour)
-	claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claimed == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want engaged follow-up", claimed, err)
-	}
-	processed, err := runner.ProcessClaimedItem(context.Background(), *claimed)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if processed.Status != "success" || len(agent.starts) != 1 {
-		t.Fatalf("ProcessClaimedItem() = %#v, agent starts = %d; want full follow-up review", processed, len(agent.starts))
+			result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("DiscoverPullRequests() error = %v", err)
+			}
+			if len(result.QueueItems) != 1 {
+				t.Fatalf("len(QueueItems) = %d, want 1 engaged follow-up", len(result.QueueItems))
+			}
+			persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+			if err != nil {
+				t.Fatalf("Loops.GetByID() error = %v", err)
+			}
+			if persistedLoop == nil || persistedLoop.MetadataJSON == nil || !contains(*persistedLoop.MetadataJSON, `"lastPublishedHeadSha":"old-head"`) {
+				t.Fatalf("loop after discovery = %#v, want GitHub engagement head backfilled", persistedLoop)
+			}
+			fixture.advance(time.Hour)
+			claimed, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+			if err != nil || claimed == nil {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v), want engaged follow-up", claimed, err)
+			}
+			processed, err := runner.ProcessClaimedItem(context.Background(), *claimed)
+			if err != nil {
+				t.Fatalf("ProcessClaimedItem() error = %v", err)
+			}
+			if processed.Status != "success" || len(agent.starts) != 1 {
+				t.Fatalf("ProcessClaimedItem() = %#v, agent starts = %d; want full follow-up review", processed, len(agent.starts))
+			}
+
+		})
 	}
 }
 
@@ -476,5 +489,36 @@ func TestEngagementBackfillDoesNotOverwriteConcurrentPublication(t *testing.T) {
 		if parsed["lastPublishedHeadSha"] != "new-head" || intFromAny(reviewerLoopMetadata(parsed)["iterationCount"]) != 2 {
 			t.Fatalf("recovery overwrote publication: %s", *record.MetadataJSON)
 		}
+	}
+}
+
+func TestRecoveredFollowUpInvalidatesOnlyObsoleteRequestSkip(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, previous                    string
+		follow, enabled, routed, wantSuppressed bool
+	}{
+		{"new head", "not_requested", "old-head", true, true, false, false},
+		{"no publication", "not_requested", "", true, true, false, true},
+		{"same head", "not_requested", "new-head", true, true, false, true},
+		{"follow disabled", "not_requested", "old-head", false, true, false, true},
+		{"loop disabled", "not_requested", "old-head", true, false, false, true},
+		{"other skip reason", "conflicted", "old-head", true, true, false, true},
+		{"routed request missing", "not_requested", "old-head", true, true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := mustMarshalJSON(map[string]any{
+				"followUpdates": tc.follow, "lastPublishedHeadSha": tc.previous, "loop": map[string]any{"enabled": tc.enabled},
+				"lastFilterSkip": map[string]any{"kind": tc.kind, "headSha": "new-head", "reviewerLogin": "bob"},
+			})
+			policy := DiscoveryPolicy{RequireReviewRequest: true}
+			if tc.routed {
+				policy.RoutedClaimPolicy = networkpolicy.ProjectPolicy{Mode: config.NetworkModeRouted, NodeName: "red", GitHubLogin: "bob", GitHubUserID: 42}
+			}
+			pr := PullRequestSummary{Number: 42, HeadSHA: "new-head", Author: "alice", HasConflicts: true, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}, Labels: []string{"looper:target:red"}}
+			if got := reviewerDiscoverySuppressedByLastSkip(storage.LoopRecord{MetadataJSON: &raw}, pr, "bob", policy); got != tc.wantSuppressed {
+				t.Fatalf("suppressed = %v, want %v", got, tc.wantSuppressed)
+			}
+		})
 	}
 }

@@ -3755,7 +3755,8 @@ func TestDiscoverPullRequestsSuppressesRepeatedNotRequestedSkipUntilRequested(t 
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	// No prior publication: a cached request miss remains valid until eligibility changes.
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
 	loop := storage.LoopRecord{ID: "loop_not_requested_followup", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -3795,7 +3796,8 @@ func TestDiscoverPullRequestsDoesNotSuppressNotRequestedSkipAfterHeadChange(t *t
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	metadata := `{"followUpdates":true,"lastPublishedHeadSha":"old-head","lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
+	// No prior publication: a cached request miss remains valid until eligibility changes.
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"not_requested","reason":"Skipped pull request acme/looper#42 because current user is not requested for review","recordedAt":"2026-05-01T00:00:00Z","headSha":"new-head","reviewerLogin":"bob"},"loop":{"enabled":true,"iterationCount":1,"iterationsByHead":{"old-head":1}}}`
 	loop := storage.LoopRecord{ID: "loop_not_requested_head_change", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -3817,8 +3819,7 @@ func TestDiscoverPullRequestsDoesNotSuppressNotRequestedSkipAfterHeadChange(t *t
 		t.Fatalf("second QueueItems = %#v, want no repeated re-enqueue for same head", second.QueueItems)
 	}
 
-	meta := parseJSONObject(loop.MetadataJSON)
-	if reviewerDiscoverySuppressedByLastSkip(meta, PullRequestSummary{Number: 42, HeadSHA: "newer-head", ReviewRequests: []string{}}, "bob", DiscoveryPolicy{RequireReviewRequest: true}) {
+	if reviewerDiscoverySuppressedByLastSkip(loop, PullRequestSummary{Number: 42, HeadSHA: "newer-head", ReviewRequests: []string{}}, "bob", DiscoveryPolicy{RequireReviewRequest: true}) {
 		t.Fatalf("reviewerDiscoverySuppressedByLastSkip() = true, want false after head change")
 	}
 }
@@ -3912,7 +3913,7 @@ func TestReviewerDiscoverySuppressedByLastSkipDoesNotUseCurrentReviewRequestsInR
 			GitHubUserID: 42,
 		},
 	}
-	if reviewerDiscoverySuppressedByLastSkip(meta, pr, "bob", policy) {
+	if reviewerDiscoverySuppressedByLastSkip(storage.LoopRecord{MetadataJSON: stringPtr(mustMarshalJSON(meta))}, pr, "bob", policy) {
 		t.Fatalf("reviewerDiscoverySuppressedByLastSkip() = true, want false when routed claim still allows reviewer")
 	}
 }

@@ -1154,7 +1154,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 			reviewSignal = decision.signal
 		}
 	}
-	if !dispositionOnly && reviewerDiscoverySuppressedByLastSkip(meta, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp {
+	if !dispositionOnly && reviewerDiscoverySuppressedByLastSkip(loopResult.record, pr, *currentLogin, policy) && !allowThreadResolutionFollowUp {
 		allowFollowUp, followErr := r.allowThreadResolutionFollowUpAfterNotRequestedSkip(ctx, project.RepoPath, repo, pr, *currentLogin, meta, policy)
 		if followErr != nil {
 			return followErr
@@ -8595,7 +8595,8 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 	return string(encoded), nil
 }
 
-func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
+func reviewerDiscoverySuppressedByLastSkip(loop storage.LoopRecord, pr PullRequestSummary, currentLogin string, policy DiscoveryPolicy) bool {
+	meta := parseJSONObject(loop.MetadataJSON)
 	raw, _ := meta["lastFilterSkip"].(map[string]any)
 	if raw == nil {
 		return false
@@ -8655,7 +8656,9 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 			decision := routedReviewerClaimDecision(policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
 			return !decision.Allowed && decision.Reason == "local GitHub identity is not requested for review"
 		}
-		if !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
+		// A cached request miss cannot override the loop's current follow-up
+		// authority, including publication bookkeeping recovered after the skip.
+		if !requireReviewRequestForLoop(loop, policy.RequireReviewRequest, pr.HeadSHA) || !reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 			return false
 		}
 	}
