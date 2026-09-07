@@ -7,11 +7,14 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/release"
 )
 
 func TestResolveLooperdTarget(t *testing.T) {
@@ -365,7 +368,35 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func newTestHTTPClient(fn roundTripFunc) *http.Client {
-	return &http.Client{Transport: fn}
+	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		rewritten := rewriteReleaseMetadataURLForTests(req.URL.String())
+		if rewritten != req.URL.String() {
+			cloned := req.Clone(req.Context())
+			parsed, err := url.Parse(rewritten)
+			if err != nil {
+				return nil, err
+			}
+			cloned.URL = parsed
+			req = cloned
+		}
+		return fn(req)
+	})}
+}
+
+func rewriteReleaseMetadataURLForTests(raw string) string {
+	switch raw {
+	case defaultReleaseManifestBaseURL + "/channels/stable.json", defaultReleaseManifestBaseURL + "/manifest.json":
+		return buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, "")
+	}
+	prefix := defaultReleaseManifestBaseURL + "/"
+	const suffix = "/manifest.json"
+	if strings.HasPrefix(raw, prefix) && strings.HasSuffix(raw, suffix) {
+		tag := strings.TrimSuffix(strings.TrimPrefix(raw, prefix), suffix)
+		if tag != "" && !strings.Contains(tag, "/") {
+			return buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, tag)
+		}
+	}
+	return raw
 }
 
 func jsonResponse(t *testing.T, status int, body string) *http.Response {
@@ -396,5 +427,128 @@ func binaryResponse(t *testing.T, status int, body []byte) *http.Response {
 		Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
 		Body:          io.NopCloser(bytes.NewReader(body)),
 		ContentLength: int64(len(body)),
+	}
+}
+
+func TestBuildReleaseManifestURL(t *testing.T) {
+	t.Parallel()
+
+	if got, want := buildReleaseManifestURL(defaultReleaseManifestBaseURL, ""), defaultReleaseManifestBaseURL+"/channels/stable.json"; got != want {
+		t.Fatalf("latest URL = %q, want %q", got, want)
+	}
+	if got, want := buildReleaseManifestURL(defaultReleaseManifestBaseURL+"/", "v0.13.0"), defaultReleaseManifestBaseURL+"/v0.13.0/manifest.json"; got != want {
+		t.Fatalf("tag URL = %q, want %q", got, want)
+	}
+}
+
+func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
+	t.Parallel()
+
+	githubPayload, err := decodeReleaseMetadata([]byte(`{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"}]}`))
+	if err != nil {
+		t.Fatalf("decode GitHub payload error = %v", err)
+	}
+	if githubPayload.TagName != "v1.2.3" || len(githubPayload.Assets) != 1 {
+		t.Fatalf("github payload = %#v", githubPayload)
+	}
+
+	manifestPayload, err := decodeReleaseMetadata([]byte(`{
+		"manifestVersion": 1,
+		"version": "1.2.3",
+		"tag": "v1.2.3",
+		"artifacts": {
+			"looperd-darwin-arm64.tar.gz": {
+				"url": "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz",
+				"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"size": 12
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("decode manifest payload error = %v", err)
+	}
+	if manifestPayload.TagName != "v1.2.3" {
+		t.Fatalf("manifest tag = %q, want v1.2.3", manifestPayload.TagName)
+	}
+	names := map[string]string{}
+	for _, asset := range manifestPayload.Assets {
+		names[asset.Name] = asset.BrowserDownloadURL
+	}
+	if names["looperd-darwin-arm64.tar.gz"] != "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz" {
+		t.Fatalf("archive URL = %q", names["looperd-darwin-arm64.tar.gz"])
+	}
+	if names["looperd-darwin-arm64.tar.gz.sha256"] != "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz.sha256" {
+		t.Fatalf("checksum URL = %q", names["looperd-darwin-arm64.tar.gz.sha256"])
+	}
+	if release.ManifestVersion != 1 {
+		t.Fatalf("manifest version constant drifted: %d", release.ManifestVersion)
+	}
+}
+
+func TestFetchReleaseMetadataPrefersCDNManifest(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+	app := New(Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			seen = append(seen, req.URL.String())
+			if req.URL.String() != defaultReleaseManifestBaseURL+"/channels/stable.json" {
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+			}
+			return jsonResponse(t, http.StatusOK, `{
+				"manifestVersion": 1,
+				"version": "1.2.3",
+				"tag": "v1.2.3",
+				"artifacts": {
+					"looperd-darwin-arm64.tar.gz": {
+						"url": "https://example.invalid/looperd-darwin-arm64.tar.gz",
+						"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+						"size": 12
+					}
+				}
+			}`), nil
+		})},
+	})
+	runtime := newCommandRuntime(app, nil)
+	payload, err := runtime.fetchReleaseMetadata(context.Background(), "")
+	if err != nil {
+		t.Fatalf("fetchReleaseMetadata() error = %v", err)
+	}
+	if payload.TagName != "v1.2.3" {
+		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	if len(seen) != 1 || seen[0] != defaultReleaseManifestBaseURL+"/channels/stable.json" {
+		t.Fatalf("requests = %#v", seen)
+	}
+}
+
+func TestFetchReleaseMetadataFallsBackToGitHubAPI(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+	app := New(Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			seen = append(seen, req.URL.String())
+			switch req.URL.String() {
+			case defaultReleaseManifestBaseURL + "/channels/stable.json":
+				return jsonResponse(t, http.StatusForbidden, `{"message":"rate limited"}`), nil
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[]}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		})},
+	})
+	runtime := newCommandRuntime(app, nil)
+	payload, err := runtime.fetchReleaseMetadata(context.Background(), "")
+	if err != nil {
+		t.Fatalf("fetchReleaseMetadata() error = %v", err)
+	}
+	if payload.TagName != "v1.2.3" {
+		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("requests = %#v", seen)
 	}
 }
