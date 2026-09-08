@@ -324,44 +324,54 @@ func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
 }
 
 func decodeReleaseMetadata(body []byte) (githubReleasePayload, error) {
+	var manifest release.Manifest
+	if err := json.Unmarshal(body, &manifest); err == nil && looksLikeReleaseManifest(manifest) {
+		return githubReleaseFromManifest(manifest), nil
+	}
+
 	var payload githubReleasePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return githubReleasePayload{}, err
 	}
-	if payload.Assets != nil || strings.TrimSpace(payload.TagName) != "" {
-		return payload, nil
-	}
+	return payload, nil
+}
 
-	var manifest release.Manifest
-	if err := json.Unmarshal(body, &manifest); err != nil {
-		return githubReleasePayload{}, err
-	}
-	if manifest.ManifestVersion != release.ManifestVersion && len(manifest.Artifacts) == 0 && strings.TrimSpace(manifest.Tag) == "" {
-		return payload, nil
-	}
-	return githubReleaseFromManifest(manifest), nil
+func looksLikeReleaseManifest(manifest release.Manifest) bool {
+	return manifest.ManifestVersion == release.ManifestVersion || len(manifest.Artifacts) > 0 || strings.TrimSpace(manifest.Tag) != ""
 }
 
 func githubReleaseFromManifest(manifest release.Manifest) githubReleasePayload {
-	assets := make([]githubReleaseAsset, 0, len(manifest.Artifacts)*2)
-	for name, artifact := range manifest.Artifacts {
-		downloadURL := strings.TrimSpace(artifact.URL)
-		if downloadURL == "" {
-			continue
-		}
-		assets = append(assets, githubReleaseAsset{Name: name, BrowserDownloadURL: downloadURL})
-		if !strings.HasSuffix(name, ".sha256") {
-			assets = append(assets, githubReleaseAsset{
-				Name:               name + ".sha256",
-				BrowserDownloadURL: downloadURL + ".sha256",
-			})
-		}
-	}
 	tag := strings.TrimSpace(manifest.Tag)
 	if tag == "" && strings.TrimSpace(manifest.Version) != "" {
 		tag = "v" + strings.TrimPrefix(manifest.Version, "v")
 	}
+	assets := make([]githubReleaseAsset, 0, len(manifest.Artifacts)*2)
+	for name := range manifest.Artifacts {
+		name = strings.TrimSpace(name)
+		if tag == "" || !isGitHubReleaseAssetName(name) {
+			continue
+		}
+		assets = append(assets, githubReleaseAsset{
+			Name:               name,
+			BrowserDownloadURL: githubReleaseDownloadURL(defaultReleaseOwner, defaultReleaseRepo, tag, name),
+		})
+		if strings.HasSuffix(name, ".sha256") {
+			continue
+		}
+		assets = append(assets, githubReleaseAsset{
+			Name:               name + ".sha256",
+			BrowserDownloadURL: githubReleaseDownloadURL(defaultReleaseOwner, defaultReleaseRepo, tag, name+".sha256"),
+		})
+	}
 	return githubReleasePayload{TagName: tag, Assets: assets}
+}
+
+func githubReleaseDownloadURL(owner, repo, tag, name string) string {
+	return fmt.Sprintf("https://github.com/%s/%s/releases/download/%s/%s", owner, repo, tag, name)
+}
+
+func isGitHubReleaseAssetName(name string) bool {
+	return name != "" && !strings.ContainsAny(name, "/\\") && !strings.Contains(name, "..")
 }
 
 func parseChecksum(value string) (string, error) {

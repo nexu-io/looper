@@ -13,6 +13,7 @@ set -eu
 
 BUCKET="${R2_RELEASES_BUCKET:-looper-releases}"
 MANIFEST="${RELEASE_MANIFEST:-release-assets/manifest.json}"
+PUBLIC_BASE="${RELEASE_MANIFEST_BASE_URL:-https://releases.looper.powerformer.com}"
 CONTENT_TYPE="application/json; charset=utf-8"
 VERSIONED_CACHE="public, max-age=31536000, immutable"
 POINTER_CACHE="public, max-age=60"
@@ -53,9 +54,79 @@ put_object() {
     --remote
 }
 
-put_object "${TAG}/manifest.json" "$VERSIONED_CACHE"
-put_object "channels/${CHANNEL}.json" "$POINTER_CACHE"
+# Return 0 if the channel pointer should be replaced with TAG.
+# Missing pointer (404) or an older/equal existing tag → update.
+# A strictly newer existing tag → skip, so a rerun of an old release
+# cannot pin upgrades backwards.
+should_update_pointer() {
+  channel="$1"
+  incoming_tag="$2"
+  pointer_url="${PUBLIC_BASE}/channels/${channel}.json"
+  existing_file="$(mktemp)"
+  status="$(curl --silent --show-error --output "$existing_file" --write-out "%{http_code}" "$pointer_url" || true)"
+  case "$status" in
+    404)
+      rm -f "$existing_file"
+      return 0
+      ;;
+    200)
+      ;;
+    *)
+      rm -f "$existing_file"
+      echo "failed to read existing channel pointer ${pointer_url} (HTTP ${status:-000})" >&2
+      exit 1
+      ;;
+  esac
 
-if [ "$CHANNEL" = "stable" ]; then
-  put_object "manifest.json" "$POINTER_CACHE"
+  python_status=0
+  python3 - "$existing_file" "$incoming_tag" <<'PY' || python_status=$?
+import json, re, sys
+
+def version_key(tag):
+    tag = str(tag or "").strip()
+    if tag.startswith("v"):
+        tag = tag[1:]
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$", tag)
+    if match is None:
+        return None
+    prerelease = match.group(4)
+    if prerelease is None:
+        pre_key = (1,)
+    else:
+        pre_key = (0,) + tuple(int(part) if part.isdigit() else part for part in prerelease.split("."))
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), pre_key)
+
+existing = json.load(open(sys.argv[1], encoding="utf-8"))
+existing_key = version_key(existing.get("tag") or existing.get("version") or "")
+incoming_key = version_key(sys.argv[2])
+if existing_key is None or incoming_key is None:
+    sys.stderr.write("cannot compare channel pointer versions\n")
+    raise SystemExit(2)
+raise SystemExit(0 if incoming_key >= existing_key else 1)
+PY
+  rm -f "$existing_file"
+  case "$python_status" in
+    0)
+      return 0
+      ;;
+    1)
+      return 1
+      ;;
+    *)
+      echo "failed to compare channel pointer versions" >&2
+      exit 1
+      ;;
+  esac
+
+}
+
+put_object "${TAG}/manifest.json" "$VERSIONED_CACHE"
+
+if should_update_pointer "$CHANNEL" "$TAG"; then
+  put_object "channels/${CHANNEL}.json" "$POINTER_CACHE"
+  if [ "$CHANNEL" = "stable" ]; then
+    put_object "manifest.json" "$POINTER_CACHE"
+  fi
+else
+  echo "skipping channel pointer update: existing ${CHANNEL} pointer is newer than ${TAG}"
 fi

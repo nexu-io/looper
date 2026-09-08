@@ -485,6 +485,41 @@ func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 	}
 }
 
+func TestGithubReleaseFromManifestIgnoresArtifactURL(t *testing.T) {
+	t.Parallel()
+
+	payload := githubReleaseFromManifest(release.Manifest{
+		Tag: "v1.2.3",
+		Artifacts: map[string]release.Artifact{
+			"looperd-darwin-arm64.tar.gz": {URL: "https://evil.example/looperd"},
+			"../escape.tar.gz":            {URL: "https://evil.example/escape"},
+			"nested/path.tar.gz":          {URL: "https://evil.example/nested"},
+		},
+	})
+	if payload.TagName != "v1.2.3" {
+		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+
+	names := map[string]string{}
+	for _, asset := range payload.Assets {
+		names[asset.Name] = asset.BrowserDownloadURL
+	}
+
+	wantArchive := "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz"
+	if names["looperd-darwin-arm64.tar.gz"] != wantArchive {
+		t.Fatalf("archive URL = %q, want %q", names["looperd-darwin-arm64.tar.gz"], wantArchive)
+	}
+	if names["looperd-darwin-arm64.tar.gz.sha256"] != wantArchive+".sha256" {
+		t.Fatalf("checksum URL = %q, want %q", names["looperd-darwin-arm64.tar.gz.sha256"], wantArchive+".sha256")
+	}
+	if _, ok := names["../escape.tar.gz"]; ok {
+		t.Fatalf("path-escape asset was accepted: %#v", names)
+	}
+	if _, ok := names["nested/path.tar.gz"]; ok {
+		t.Fatalf("nested path asset was accepted: %#v", names)
+	}
+}
+
 func TestFetchReleaseMetadataPrefersCDNManifest(t *testing.T) {
 	t.Parallel()
 
@@ -516,6 +551,17 @@ func TestFetchReleaseMetadataPrefersCDNManifest(t *testing.T) {
 	}
 	if payload.TagName != "v1.2.3" {
 		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	urls := map[string]string{}
+	for _, asset := range payload.Assets {
+		urls[asset.Name] = asset.BrowserDownloadURL
+	}
+	wantArchive := "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz"
+	if urls["looperd-darwin-arm64.tar.gz"] != wantArchive {
+		t.Fatalf("cdn artifact URL = %q, want %q", urls["looperd-darwin-arm64.tar.gz"], wantArchive)
+	}
+	if urls["looperd-darwin-arm64.tar.gz.sha256"] != wantArchive+".sha256" {
+		t.Fatalf("cdn checksum URL = %q, want %q", urls["looperd-darwin-arm64.tar.gz.sha256"], wantArchive+".sha256")
 	}
 	if len(seen) != 1 || seen[0] != defaultReleaseManifestBaseURL+"/channels/stable.json" {
 		t.Fatalf("requests = %#v", seen)
