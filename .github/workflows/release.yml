@@ -543,6 +543,9 @@ jobs:
       - build-looperd
       - publish-loopernet-image
     runs-on: ubuntu-latest
+    concurrency:
+      group: looper-r2-pointer-${{ needs.prepare-go-release.outputs.release-channel }}
+      cancel-in-progress: false
 
     steps:
       - name: Check out repository

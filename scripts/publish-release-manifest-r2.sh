@@ -13,7 +13,6 @@ set -eu
 
 BUCKET="${R2_RELEASES_BUCKET:-looper-releases}"
 MANIFEST="${RELEASE_MANIFEST:-release-assets/manifest.json}"
-PUBLIC_BASE="${RELEASE_MANIFEST_BASE_URL:-https://releases.looper.powerformer.com}"
 CONTENT_TYPE="application/json; charset=utf-8"
 VERSIONED_CACHE="public, max-age=31536000, immutable"
 POINTER_CACHE="public, max-age=60"
@@ -55,28 +54,28 @@ put_object() {
 }
 
 # Return 0 if the channel pointer should be replaced with TAG.
-# Missing pointer (404) or an older/equal existing tag → update.
+# Missing pointer or an older/equal existing tag → update.
 # A strictly newer existing tag → skip, so a rerun of an old release
-# cannot pin upgrades backwards.
+# cannot pin upgrades backwards. Reads R2 directly so CDN max-age=60
+# cannot feed a stale pointer into the check.
 should_update_pointer() {
   channel="$1"
   incoming_tag="$2"
-  pointer_url="${PUBLIC_BASE}/channels/${channel}.json"
   existing_file="$(mktemp)"
-  status="$(curl --silent --show-error --output "$existing_file" --write-out "%{http_code}" "$pointer_url" || true)"
-  case "$status" in
-    404)
-      rm -f "$existing_file"
+  get_err="$(mktemp)"
+  key="channels/${channel}.json"
+  if wrangler_bin r2 object get "${BUCKET}/${key}" --file "$existing_file" --remote 2>"$get_err"; then
+    rm -f "$get_err"
+  else
+    if grep -Eqi 'not found|does not exist|404|NoSuchKey' "$get_err"; then
+      rm -f "$existing_file" "$get_err"
       return 0
-      ;;
-    200)
-      ;;
-    *)
-      rm -f "$existing_file"
-      echo "failed to read existing channel pointer ${pointer_url} (HTTP ${status:-000})" >&2
-      exit 1
-      ;;
-  esac
+    fi
+    cat "$get_err" >&2
+    rm -f "$existing_file" "$get_err"
+    echo "failed to read existing channel pointer r2://${BUCKET}/${key}" >&2
+    exit 1
+  fi
 
   python_status=0
   python3 - "$existing_file" "$incoming_tag" <<'PY' || python_status=$?
@@ -93,7 +92,13 @@ def version_key(tag):
     if prerelease is None:
         pre_key = (1,)
     else:
-        pre_key = (0,) + tuple(int(part) if part.isdigit() else part for part in prerelease.split("."))
+        parts = []
+        for part in prerelease.split("."):
+            if part.isdigit():
+                parts.append((0, int(part), ""))
+            else:
+                parts.append((1, 0, part))
+        pre_key = (0,) + tuple(parts)
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)), pre_key)
 
 existing = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -117,8 +122,8 @@ PY
       exit 1
       ;;
   esac
-
 }
+
 
 put_object "${TAG}/manifest.json" "$VERSIONED_CACHE"
 
