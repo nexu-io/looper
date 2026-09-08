@@ -232,6 +232,9 @@ func (r *commandRuntime) fetchReleaseMetadataFromURL(ctx context.Context, releas
 	if err != nil {
 		return githubReleasePayload{}, fmt.Errorf("decode GitHub release payload: %w", err)
 	}
+	if isCDNReleaseMetadataURL(releaseURL) && !cdnPayloadIsLooperManifest(body) {
+		return githubReleasePayload{}, fmt.Errorf("CDN release metadata must be a looper manifest: %s", releaseURL)
+	}
 	if payload.Assets == nil {
 		return githubReleasePayload{}, fmt.Errorf("GitHub release payload is missing assets array: %s", releaseURL)
 	}
@@ -366,32 +369,28 @@ func decodeReleaseMetadata(body []byte) (githubReleasePayload, error) {
 			return githubReleaseFromManifest(manifest), nil
 		}
 	}
-
 	var payload githubReleasePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return githubReleasePayload{}, err
 	}
-	return rewriteGitHubReleaseAssetURLs(payload), nil
+	return payload, nil
+
 }
 
 func looksLikeReleaseManifest(manifest release.Manifest) bool {
 	return manifest.ManifestVersion == release.ManifestVersion
 }
 
-func rewriteGitHubReleaseAssetURLs(payload githubReleasePayload) githubReleasePayload {
-	tag := strings.TrimSpace(payload.TagName)
-	assets := make([]githubReleaseAsset, 0, len(payload.Assets))
-	for _, asset := range payload.Assets {
-		name := strings.TrimSpace(asset.Name)
-		if tag == "" || !isGitHubReleaseAssetName(name) {
-			continue
-		}
-		assets = append(assets, githubReleaseAsset{
-			Name:               name,
-			BrowserDownloadURL: githubReleaseDownloadURL(defaultReleaseOwner, defaultReleaseRepo, tag, name),
-		})
+func cdnPayloadIsLooperManifest(body []byte) bool {
+	var manifest release.Manifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return false
 	}
-	return githubReleasePayload{TagName: tag, Assets: assets}
+	return looksLikeReleaseManifest(manifest)
+}
+
+func isCDNReleaseMetadataURL(raw string) bool {
+	return strings.HasPrefix(strings.TrimRight(strings.TrimSpace(raw), "/"), defaultReleaseManifestBaseURL)
 }
 
 func githubReleaseFromManifest(manifest release.Manifest) githubReleasePayload {

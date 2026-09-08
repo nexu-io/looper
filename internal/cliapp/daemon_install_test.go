@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -369,34 +368,17 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func newTestHTTPClient(fn roundTripFunc) *http.Client {
 	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		rewritten := rewriteReleaseMetadataURLForTests(req.URL.String())
-		if rewritten != req.URL.String() {
-			cloned := req.Clone(req.Context())
-			parsed, err := url.Parse(rewritten)
-			if err != nil {
-				return nil, err
-			}
-			cloned.URL = parsed
-			req = cloned
+		if isCDNReleaseMetadataURL(req.URL.String()) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Status:     "403 Forbidden",
+				Body:       io.NopCloser(strings.NewReader(`{"message":"test CDN skipped"}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Request:    req,
+			}, nil
 		}
 		return fn(req)
 	})}
-}
-
-func rewriteReleaseMetadataURLForTests(raw string) string {
-	switch raw {
-	case defaultReleaseManifestBaseURL + "/channels/stable.json", defaultReleaseManifestBaseURL + "/manifest.json":
-		return buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, "")
-	}
-	prefix := defaultReleaseManifestBaseURL + "/"
-	const suffix = "/manifest.json"
-	if strings.HasPrefix(raw, prefix) && strings.HasSuffix(raw, suffix) {
-		tag := strings.TrimSuffix(strings.TrimPrefix(raw, prefix), suffix)
-		if tag != "" && !strings.Contains(tag, "/") {
-			return buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, tag)
-		}
-	}
-	return raw
 }
 
 func jsonResponse(t *testing.T, status int, body string) *http.Response {
@@ -451,7 +433,7 @@ func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 	if githubPayload.TagName != "v1.2.3" || len(githubPayload.Assets) != 1 {
 		t.Fatalf("github payload = %#v", githubPayload)
 	}
-	if githubPayload.Assets[0].BrowserDownloadURL != "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64" {
+	if githubPayload.Assets[0].BrowserDownloadURL != "https://evil.example/looperd-darwin-arm64" {
 		t.Fatalf("github asset URL = %q", githubPayload.Assets[0].BrowserDownloadURL)
 	}
 
@@ -706,6 +688,40 @@ func TestFetchReleaseMetadataFallsBackWhenCDNAssetsIncomplete(t *testing.T) {
 	}
 	if payload.TagName != "v1.2.3" {
 		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("requests = %#v", seen)
+	}
+}
+
+func TestFetchCDNGitHubShapedPayloadFallsBackToGitHubAPI(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+	app := New(Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			seen = append(seen, req.URL.String())
+			switch req.URL.String() {
+			case defaultReleaseManifestBaseURL + "/channels/stable.json":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64.tar.gz","browser_download_url":"https://evil.example/looperd"}]}`), nil
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64.tar.gz","browser_download_url":"https://example.invalid/looperd-darwin-arm64.tar.gz"}]}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		})},
+	})
+	runtime := newCommandRuntime(app, nil)
+	payload, err := runtime.fetchReleaseMetadata(context.Background(), "")
+	if err != nil {
+		t.Fatalf("fetchReleaseMetadata() error = %v", err)
+	}
+	if payload.TagName != "v1.2.3" {
+		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	if len(payload.Assets) != 1 || payload.Assets[0].BrowserDownloadURL != "https://example.invalid/looperd-darwin-arm64.tar.gz" {
+		t.Fatalf("assets = %#v", payload.Assets)
 	}
 	if len(seen) != 2 {
 		t.Fatalf("requests = %#v", seen)
