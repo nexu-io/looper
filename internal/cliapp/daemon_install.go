@@ -358,19 +358,40 @@ func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
 
 func decodeReleaseMetadata(body []byte) (githubReleasePayload, error) {
 	var manifest release.Manifest
-	if err := json.Unmarshal(body, &manifest); err == nil && looksLikeReleaseManifest(manifest) {
-		return githubReleaseFromManifest(manifest), nil
+	if err := json.Unmarshal(body, &manifest); err == nil {
+		if manifest.ManifestVersion != 0 && manifest.ManifestVersion != release.ManifestVersion {
+			return githubReleasePayload{}, fmt.Errorf("unsupported release manifest version %d", manifest.ManifestVersion)
+		}
+		if looksLikeReleaseManifest(manifest) {
+			return githubReleaseFromManifest(manifest), nil
+		}
 	}
 
 	var payload githubReleasePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return githubReleasePayload{}, err
 	}
-	return payload, nil
+	return rewriteGitHubReleaseAssetURLs(payload), nil
 }
 
 func looksLikeReleaseManifest(manifest release.Manifest) bool {
-	return manifest.ManifestVersion == release.ManifestVersion || len(manifest.Artifacts) > 0 || strings.TrimSpace(manifest.Tag) != ""
+	return manifest.ManifestVersion == release.ManifestVersion
+}
+
+func rewriteGitHubReleaseAssetURLs(payload githubReleasePayload) githubReleasePayload {
+	tag := strings.TrimSpace(payload.TagName)
+	assets := make([]githubReleaseAsset, 0, len(payload.Assets))
+	for _, asset := range payload.Assets {
+		name := strings.TrimSpace(asset.Name)
+		if tag == "" || !isGitHubReleaseAssetName(name) {
+			continue
+		}
+		assets = append(assets, githubReleaseAsset{
+			Name:               name,
+			BrowserDownloadURL: githubReleaseDownloadURL(defaultReleaseOwner, defaultReleaseRepo, tag, name),
+		})
+	}
+	return githubReleasePayload{TagName: tag, Assets: assets}
 }
 
 func githubReleaseFromManifest(manifest release.Manifest) githubReleasePayload {

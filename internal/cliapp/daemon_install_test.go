@@ -444,12 +444,15 @@ func TestBuildReleaseManifestURL(t *testing.T) {
 func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 	t.Parallel()
 
-	githubPayload, err := decodeReleaseMetadata([]byte(`{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://example.invalid/looperd-darwin-arm64"}]}`))
+	githubPayload, err := decodeReleaseMetadata([]byte(`{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://evil.example/looperd-darwin-arm64"}]}`))
 	if err != nil {
 		t.Fatalf("decode GitHub payload error = %v", err)
 	}
 	if githubPayload.TagName != "v1.2.3" || len(githubPayload.Assets) != 1 {
 		t.Fatalf("github payload = %#v", githubPayload)
+	}
+	if githubPayload.Assets[0].BrowserDownloadURL != "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64" {
+		t.Fatalf("github asset URL = %q", githubPayload.Assets[0].BrowserDownloadURL)
 	}
 
 	manifestPayload, err := decodeReleaseMetadata([]byte(`{
@@ -517,6 +520,29 @@ func TestGithubReleaseFromManifestIgnoresArtifactURL(t *testing.T) {
 	}
 	if _, ok := names["nested/path.tar.gz"]; ok {
 		t.Fatalf("nested path asset was accepted: %#v", names)
+	}
+}
+
+func TestDecodeReleaseMetadataRejectsUnsupportedManifestVersion(t *testing.T) {
+	t.Parallel()
+
+	_, err := decodeReleaseMetadata([]byte(`{
+		"manifestVersion": 2,
+		"version": "1.2.3",
+		"tag": "v1.2.3",
+		"artifacts": {
+			"looperd-darwin-arm64.tar.gz": {
+				"url": "https://example.invalid/looperd-darwin-arm64.tar.gz",
+				"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"size": 12
+			}
+		}
+	}`))
+	if err == nil {
+		t.Fatal("decodeReleaseMetadata() error = nil, want unsupported version")
+	}
+	if !strings.Contains(err.Error(), "unsupported release manifest version 2") {
+		t.Fatalf("error = %q", err)
 	}
 }
 
