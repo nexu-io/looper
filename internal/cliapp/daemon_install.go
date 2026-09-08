@@ -107,7 +107,10 @@ func (r *commandRuntime) prepareManagedDaemonInstall(ctx context.Context, force 
 		}
 	}
 
-	release, err := r.fetchReleaseMetadata(ctx, tag)
+	release, err := r.fetchReleaseMetadataMatching(ctx, tag, func(payload githubReleasePayload) error {
+		_, err := findReleaseAssetSet(payload, looperdBinaryName+"-"+target)
+		return err
+	})
 	if err != nil {
 		return preparedDaemonInstall{}, err
 	}
@@ -159,18 +162,48 @@ func commitPreparedDaemonInstall(prepared preparedDaemonInstall) error {
 }
 
 func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (githubReleasePayload, error) {
+	return r.fetchReleaseMetadataMatching(ctx, tag, nil)
+}
+
+func (r *commandRuntime) fetchReleaseMetadataMatching(ctx context.Context, tag string, accept func(githubReleasePayload) error) (githubReleasePayload, error) {
 	var lastErr error
 	for _, releaseURL := range releaseMetadataURLs(tag) {
 		payload, err := r.fetchReleaseMetadataFromURL(ctx, releaseURL)
-		if err == nil {
-			return payload, nil
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		lastErr = err
+		if err := requireMatchingReleaseTag(payload, tag); err != nil {
+			lastErr = err
+			continue
+		}
+		if accept != nil {
+			if err := accept(payload); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		return payload, nil
 	}
 	if lastErr == nil {
 		return githubReleasePayload{}, fmt.Errorf("Failed to fetch GitHub release metadata from %s (status missing)", buildGitHubReleaseAPIURL(defaultReleaseOwner, defaultReleaseRepo, tag))
 	}
 	return githubReleasePayload{}, lastErr
+}
+
+func requireMatchingReleaseTag(payload githubReleasePayload, requested string) error {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return nil
+	}
+	got := strings.TrimSpace(payload.TagName)
+	if got == "" {
+		return fmt.Errorf("release metadata is missing tag_name")
+	}
+	if normalizeVersion(got) != normalizeVersion(requested) {
+		return fmt.Errorf("release metadata tag %q does not match requested %q", got, requested)
+	}
+	return nil
 }
 
 func (r *commandRuntime) fetchReleaseMetadataFromURL(ctx context.Context, releaseURL string) (githubReleasePayload, error) {

@@ -598,3 +598,90 @@ func TestFetchReleaseMetadataFallsBackToGitHubAPI(t *testing.T) {
 		t.Fatalf("requests = %#v", seen)
 	}
 }
+
+func TestFetchReleaseMetadataRejectsMismatchedVersionedTag(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+	app := New(Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			seen = append(seen, req.URL.String())
+			switch req.URL.String() {
+			case defaultReleaseManifestBaseURL + "/v1.2.3/manifest.json":
+				return jsonResponse(t, http.StatusOK, `{
+					"manifestVersion": 1,
+					"version": "9.9.9",
+					"tag": "v9.9.9",
+					"artifacts": {
+						"looperd-darwin-arm64.tar.gz": {
+							"url": "https://example.invalid/wrong",
+							"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+							"size": 12
+						}
+					}
+				}`), nil
+			case "https://api.github.com/repos/nexu-io/looper/releases/tags/v1.2.3":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64.tar.gz","browser_download_url":"https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz"}]}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		})},
+	})
+	runtime := newCommandRuntime(app, nil)
+	payload, err := runtime.fetchReleaseMetadata(context.Background(), "v1.2.3")
+	if err != nil {
+		t.Fatalf("fetchReleaseMetadata() error = %v", err)
+	}
+	if payload.TagName != "v1.2.3" {
+		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("requests = %#v", seen)
+	}
+}
+
+func TestFetchReleaseMetadataFallsBackWhenCDNAssetsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+	app := New(Deps{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			seen = append(seen, req.URL.String())
+			switch req.URL.String() {
+			case defaultReleaseManifestBaseURL + "/channels/stable.json":
+				return jsonResponse(t, http.StatusOK, `{
+					"manifestVersion": 1,
+					"version": "1.2.3",
+					"tag": "v1.2.3",
+					"artifacts": {
+						"looperd-linux-amd64.tar.gz": {
+							"url": "https://example.invalid/looperd-linux-amd64.tar.gz",
+							"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+							"size": 12
+						}
+					}
+				}`), nil
+			case "https://api.github.com/repos/nexu-io/looper/releases/latest":
+				return jsonResponse(t, http.StatusOK, `{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64.tar.gz","browser_download_url":"https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz"},{"name":"looperd-darwin-arm64.tar.gz.sha256","browser_download_url":"https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz.sha256"}]}`), nil
+			default:
+				t.Fatalf("unexpected request URL %q", req.URL.String())
+				return nil, nil
+			}
+		})},
+	})
+	runtime := newCommandRuntime(app, nil)
+	payload, err := runtime.fetchReleaseMetadataMatching(context.Background(), "", func(payload githubReleasePayload) error {
+		_, err := findReleaseAssetSet(payload, "looperd-darwin-arm64")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("fetchReleaseMetadataMatching() error = %v", err)
+	}
+	if payload.TagName != "v1.2.3" {
+		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("requests = %#v", seen)
+	}
+}
