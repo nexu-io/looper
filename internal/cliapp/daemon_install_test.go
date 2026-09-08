@@ -505,6 +505,30 @@ func TestGithubReleaseFromManifestIgnoresArtifactURL(t *testing.T) {
 	}
 }
 
+func TestGithubReleaseFromManifestCanonicalizesTag(t *testing.T) {
+	t.Parallel()
+
+	payload := githubReleaseFromManifest(release.Manifest{
+		Tag: "1.2.3",
+		Artifacts: map[string]release.Artifact{
+			"looperd-darwin-arm64.tar.gz": {URL: "https://evil.example/looperd"},
+		},
+	})
+	if payload.TagName != "v1.2.3" {
+		t.Fatalf("tag = %q, want v1.2.3", payload.TagName)
+	}
+	want := "https://github.com/nexu-io/looper/releases/download/v1.2.3/looperd-darwin-arm64.tar.gz"
+	found := ""
+	for _, asset := range payload.Assets {
+		if asset.Name == "looperd-darwin-arm64.tar.gz" {
+			found = asset.BrowserDownloadURL
+		}
+	}
+	if found != want {
+		t.Fatalf("archive URL = %q, want %q", found, want)
+	}
+}
+
 func TestDecodeReleaseMetadataRejectsUnsupportedManifestVersion(t *testing.T) {
 	t.Parallel()
 

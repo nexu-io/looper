@@ -394,10 +394,7 @@ func isCDNReleaseMetadataURL(raw string) bool {
 }
 
 func githubReleaseFromManifest(manifest release.Manifest) githubReleasePayload {
-	tag := strings.TrimSpace(manifest.Tag)
-	if tag == "" && strings.TrimSpace(manifest.Version) != "" {
-		tag = "v" + strings.TrimPrefix(manifest.Version, "v")
-	}
+	tag := canonicalReleaseTag(manifest.Tag, manifest.Version)
 	assets := make([]githubReleaseAsset, 0, len(manifest.Artifacts)*2)
 	for name := range manifest.Artifacts {
 		name = strings.TrimSpace(name)
@@ -425,6 +422,18 @@ func githubReleaseDownloadURL(owner, repo, tag, name string) string {
 
 func isGitHubReleaseAssetName(name string) bool {
 	return name != "" && !strings.ContainsAny(name, "/\\") && !strings.Contains(name, "..")
+}
+
+func canonicalReleaseTag(tag, version string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		tag = strings.TrimSpace(version)
+	}
+	tag = strings.TrimPrefix(tag, "v")
+	if tag == "" {
+		return ""
+	}
+	return "v" + tag
 }
 
 func parseChecksum(value string) (string, error) {
