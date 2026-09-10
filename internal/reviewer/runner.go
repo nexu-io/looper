@@ -1213,16 +1213,6 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		result.Skipped++
 		return nil
 	}
-	if r.shouldCreateReviewerBudgetPark(loopResult.record) {
-		activeRetry, retryErr := r.hasActiveRetryableTransientQueue(ctx, loopResult.record.ID)
-		if retryErr != nil {
-			return retryErr
-		}
-		if activeRetry {
-			result.Skipped++
-			return nil
-		}
-	}
 	if parked, err := r.parkReviewerBudgetIfExhausted(ctx, loopResult.record); err != nil {
 		return err
 	} else if parked {
@@ -2085,18 +2075,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
-	if r.shouldCreateReviewerBudgetPark(*loop) {
-		closed, viewErr := r.viewPullRequestClosedForBudgetAdmission(ctx, *project, derefString(loop.Repo), derefInt64(loop.PRNumber))
-		if viewErr != nil {
-			return ProcessResult{}, viewErr
+	if r.shouldCreateReviewerBudgetPark(*loop) && r.livePullRequestClosed(ctx, *project, derefString(loop.Repo), derefInt64(loop.PRNumber)) {
+		if err := r.terminateLoop(ctx, *loop, "pr_closed_or_merged"); err != nil {
+			return ProcessResult{}, err
 		}
-		if closed {
-			if err := r.terminateLoop(ctx, *loop, "pr_closed_or_merged"); err != nil {
-				return ProcessResult{}, err
-			}
-			summary := fmt.Sprintf("Skipped terminal reviewer loop %s: pr_closed_or_merged", loop.ID)
-			return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
-		}
+		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: pr_closed_or_merged", loop.ID)
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
 	}
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
 		var holdErr *holdSkipError
@@ -8917,45 +8901,14 @@ func (r *Runner) shouldParkReviewerBudget(loop storage.LoopRecord, checkpoint re
 }
 
 func (r *Runner) livePullRequestClosed(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) bool {
-	closed, err := r.viewPullRequestClosedForBudgetAdmission(ctx, project, repo, prNumber)
-	if err != nil {
-		return false
-	}
-	return closed
-}
-
-// viewPullRequestClosedForBudgetAdmission reports whether the PR is not open.
-// Transport failures return an error tagged BoundaryGitHubAPI so claim
-// finalization classifies them as retryable instead of parking the pair.
-func (r *Runner) viewPullRequestClosedForBudgetAdmission(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) (bool, error) {
 	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
-		return false, nil
+		return false
 	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 	if err != nil {
-		return false, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		return false
 	}
-	return normalizePRState(detail.State) != "open", nil
-}
-
-func (r *Runner) hasActiveRetryableTransientQueue(ctx context.Context, loopID string) (bool, error) {
-	if r.repos == nil || r.repos.Queue == nil || strings.TrimSpace(loopID) == "" {
-		return false, nil
-	}
-	item, err := r.repos.Queue.GetLatestByLoopID(ctx, loopID)
-	if err != nil {
-		return false, err
-	}
-	if item == nil {
-		return false, nil
-	}
-	switch item.Status {
-	case "queued", "running":
-	default:
-		return false, nil
-	}
-	kind := strings.TrimSpace(derefString(item.LastErrorKind))
-	return kind == string(FailureRetryableTransient) || kind == string(FailureRetryableAfterResume), nil
+	return normalizePRState(detail.State) != "open"
 }
 
 func (r *Runner) shouldCreateReviewerBudgetPark(loop storage.LoopRecord) bool {

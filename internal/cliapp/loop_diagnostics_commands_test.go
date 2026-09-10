@@ -462,8 +462,8 @@ func TestDiagnoseLoopBudgetHoldDoesNotClassifyHistoricalGitHubTransient(t *testi
 	if got.FailureClass != "review_fix_budget" {
 		t.Fatalf("FailureClass = %q, want review_fix_budget not historical github_transient", got.FailureClass)
 	}
-	if got.Message != "review-fix budget exhausted" {
-		t.Fatalf("Message = %q, want role-neutral review-fix budget exhausted", got.Message)
+	if got.Source != "loop" || got.Message != "review-fix budget exhausted" {
+		t.Fatalf("diagnosis = %#v, want current budget hold source and message", got)
 	}
 	if !strings.Contains(got.RecommendedAction, "looper unpause 12") || !strings.Contains(got.RecommendedAction, "looper stop 12") {
 		t.Fatalf("RecommendedAction = %q, want unpause/stop", got.RecommendedAction)
