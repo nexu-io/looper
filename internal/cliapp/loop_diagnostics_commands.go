@@ -609,7 +609,7 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 			diagnosis.FailureClass = "review_fix_budget"
 			diagnosis.Retryable = &retryable
 			diagnosis.Source = "loop"
-			diagnosis.Message = "review-fix publish budget exhausted"
+			diagnosis.Message = "review-fix budget exhausted"
 		}
 	}
 	// Expand <seq> before emitting JSON/human output so operators and scripts

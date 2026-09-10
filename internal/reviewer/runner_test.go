@@ -1995,7 +1995,7 @@ func TestProcessClaimedItemParksExhaustedBudgetBeforeRun(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemDoesNotParkBudgetOnGitHubTransportFailure(t *testing.T) {
+func TestProcessClaimedQueueItemDoesNotParkBudgetOnGitHubTransportFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
@@ -2013,7 +2013,8 @@ func TestProcessClaimedItemDoesNotParkBudgetOnGitHubTransportFailure(t *testing.
 	if err := fixture.repos.Loops.Upsert(context.Background(), fixer); err != nil {
 		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
 	}
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_budget_transport", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:budget-transport", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: 5, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	queueItem := storage.QueueItemRecord{ID: "queue_reviewer_budget_transport", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:budget-transport", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queueItem); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -2026,9 +2027,9 @@ func TestProcessClaimedItemDoesNotParkBudgetOnGitHubTransportFailure(t *testing.
 	github := &fakeGitHubGateway{viewErrs: []error{&shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com"}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: cfg.Roles.Reviewer.Behavior.Loop, CustomInstructions: &cfg})
 
-	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_budget_transport", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: target, Repo: &repo, PRNumber: &prNumber, Status: "running"})
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), queueItem)
 	if err == nil || !strings.Contains(githubinfra.ErrorMessage(err), "error connecting to api.github.com") {
-		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want GitHub transport error", result, err)
+		t.Fatalf("ProcessClaimedQueueItem() = (%#v, %v), want GitHub transport error", result, err)
 	}
 	if len(agent.starts) != 0 {
 		t.Fatalf("agent.starts = %#v, want none", agent.starts)
@@ -2043,6 +2044,13 @@ func TestProcessClaimedItemDoesNotParkBudgetOnGitHubTransportFailure(t *testing.
 	sibling, err := fixture.repos.Loops.GetByID(context.Background(), fixer.ID)
 	if err != nil || sibling == nil || sibling.Status != "waiting" || loops.IsSiblingReviewFixBudgetPause(sibling.MetadataJSON) {
 		t.Fatalf("fixer sibling = (%#v, %v), want still waiting", sibling, err)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil || queue == nil || queue.Status != "queued" {
+		t.Fatalf("queue = (%#v, %v), want retryable queued item, not failed/paused", queue, err)
+	}
+	if queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+		t.Fatalf("queue last_error_kind = %v, want retryable_transient", queue.LastErrorKind)
 	}
 }
 

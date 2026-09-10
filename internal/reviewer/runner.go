@@ -8925,14 +8925,15 @@ func (r *Runner) livePullRequestClosed(ctx context.Context, project storage.Proj
 }
 
 // viewPullRequestClosedForBudgetAdmission reports whether the PR is not open.
-// Transport failures return an error so callers can retry instead of parking.
+// Transport failures return an error tagged BoundaryGitHubAPI so claim
+// finalization classifies them as retryable instead of parking the pair.
 func (r *Runner) viewPullRequestClosedForBudgetAdmission(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) (bool, error) {
 	if r.github == nil || strings.TrimSpace(repo) == "" || prNumber == 0 {
 		return false, nil
 	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 	if err != nil {
-		return false, err
+		return false, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 	}
 	return normalizePRState(detail.State) != "open", nil
 }
