@@ -427,6 +427,9 @@ func TestDiagnoseLoopBudgetHoldRecommendsUnpauseStop(t *testing.T) {
 	if strings.Contains(diagnosis.RecommendedAction, "retry") {
 		t.Fatalf("RecommendedAction = %q, must not recommend retry for budget hold", diagnosis.RecommendedAction)
 	}
+	if diagnosis.Retryable == nil || *diagnosis.Retryable {
+		t.Fatalf("Retryable = %#v, want false for operator-gated budget hold", diagnosis.Retryable)
+	}
 	handoff := reviewFixInspectHandoff(loop, parsed)
 	if handoff == nil || handoff.Kind != "review_fix_budget" {
 		t.Fatalf("handoff = %#v, want review_fix_budget", handoff)
@@ -464,6 +467,9 @@ func TestDiagnoseLoopBudgetHoldDoesNotClassifyHistoricalGitHubTransient(t *testi
 	}
 	if got.Source != "loop" || got.Message != "review-fix budget exhausted" {
 		t.Fatalf("diagnosis = %#v, want current budget hold source and message", got)
+	}
+	if got.Retryable == nil || *got.Retryable {
+		t.Fatalf("Retryable = %#v, want false not historical github_transient retryable", got.Retryable)
 	}
 	if !strings.Contains(got.RecommendedAction, "looper unpause 12") || !strings.Contains(got.RecommendedAction, "looper stop 12") {
 		t.Fatalf("RecommendedAction = %q, want unpause/stop", got.RecommendedAction)

@@ -605,7 +605,7 @@ func diagnoseLoop(loop storage.LoopRecord, run *storage.RunRecord, queue *storag
 			diagnosis.RecommendedAction = release
 		}
 		if loops.IsReviewFixBudgetHold(loop) {
-			retryable := true
+			retryable := false
 			diagnosis.FailureClass = "review_fix_budget"
 			diagnosis.Retryable = &retryable
 			diagnosis.Source = "loop"
