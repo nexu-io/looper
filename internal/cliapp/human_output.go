@@ -302,6 +302,7 @@ type activeRunOutput struct {
 	LastFailureReason *string `json:"lastFailureReason"`
 	CurrentStep       *string `json:"currentStep"`
 	StartedAt         *string `json:"startedAt"`
+	AvailableAt       *string `json:"availableAt"`
 	EndedAt           *string `json:"endedAt"`
 	Target            struct {
 		Label string `json:"label"`
@@ -667,10 +668,45 @@ func writeHumanActiveRuns(w io.Writer, payload json.RawMessage) error {
 		if item.LastFailureReason != nil {
 			reason = truncateCLIText(*item.LastFailureReason, 48)
 		}
-		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": status, "age": formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt)), "reason": reason})
+		age := formatRelativeAge(firstNonEmptyCLIString(item.EndedAt, item.StartedAt))
+		if item.Status == "queued" && (status == "queued" || status == "backing_off") {
+			availableAt := item.AvailableAt
+			// Older daemons expose the eligibility time as startedAt.
+			// Its queue age is unknown; do not render it as a fresh enqueue.
+			if availableAt == nil {
+				age = "-"
+				availableAt = item.StartedAt
+			}
+			if timing := formatQueueWait(availableAt, time.Now()); timing != "" {
+				if reason != "" {
+					timing += "; " + reason
+				}
+				reason = timing
+			}
+		}
+		rows = append(rows, tableRow{"#": item.Seq, "type": item.Type, "target": item.Target.Label, "step": item.CurrentStep, "agent": agentVendor(item.Agent), "pid": agentPID(item.Agent), "status": status, "age": age, "reason": reason})
 	}
 	printTable(w, []string{"#", "type", "target", "step", "agent", "pid", "status", "age", "reason"}, rows)
 	return nil
+}
+
+func formatQueueWait(availableAt *string, now time.Time) string {
+	if availableAt == nil {
+		return ""
+	}
+	eligible, err := time.Parse(time.RFC3339Nano, *availableAt)
+	if err != nil {
+		return ""
+	}
+	remaining := eligible.Sub(now)
+	if remaining <= 0 {
+		return "waiting for scheduler"
+	}
+	// Round up so a task still waiting never says eligible in 0s.
+	if remaining%time.Second != 0 {
+		remaining = remaining.Truncate(time.Second) + time.Second
+	}
+	return "eligible in " + remaining.String()
 }
 
 func truncateCLIText(value string, max int) string {
