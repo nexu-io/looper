@@ -112,11 +112,17 @@ func newForgejoClient(ref RepositoryRef, token string, session *hostingidentity.
 	if strings.TrimSpace(token) == "" && session == nil {
 		return nil, fmt.Errorf("forgejo client: token is required")
 	}
+	httpClient := &http.Client{Timeout: defaultForgejoTimeout}
+	if session != nil {
+		if identityClient := session.HTTPClient(); identityClient != nil {
+			httpClient = identityClient
+		}
+	}
 	client := &ForgejoClient{
 		baseURL:    baseURL,
 		token:      token,
 		session:    session,
-		httpClient: &http.Client{Timeout: defaultForgejoTimeout},
+		httpClient: httpClient,
 		repo: RepositoryRef{
 			ProviderID: strings.TrimSpace(ref.ProviderID),
 			Kind:       ProviderKindForgejo,

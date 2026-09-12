@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
@@ -34,6 +35,13 @@ func (session *Session) Target() config.RepositoryIdentity        { return sessi
 func (session *Session) APIURL() string                           { return session.apiURL }
 func (session *Session) CacheKey() string                         { return session.cacheKey }
 func (session *Session) Snapshot() config.ResolvedHostingIdentity { return session.resolved }
+func (session *Session) HTTPClient() *http.Client {
+	if session == nil || session.manager == nil || session.manager.client == nil {
+		return nil
+	}
+	copy := *session.manager.client
+	return &copy
+}
 
 func (session *Session) failure(operation, reason string) error {
 	return &Error{Identity: session.Name(), Operation: operation, Reason: reason}

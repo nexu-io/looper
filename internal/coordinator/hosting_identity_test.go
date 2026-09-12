@@ -60,7 +60,7 @@ func coordinatorHostingIdentityManager(t *testing.T) (*hostingidentity.Manager, 
 		t.Fatal(err)
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v3/app":
 			_, _ = w.Write([]byte(`{"id":1,"slug":"coordinator-app"}`))
@@ -76,7 +76,7 @@ func coordinatorHostingIdentityManager(t *testing.T) (*hostingidentity.Manager, 
 		}
 	}))
 	t.Cleanup(server.Close)
-	manager := hostingidentity.NewManager(hostingidentity.Options{ReadFile: func(string) ([]byte, error) { return keyPEM, nil }})
+	manager := hostingidentity.NewManager(hostingidentity.Options{ReadFile: func(string) ([]byte, error) { return keyPEM, nil }, HTTPClient: server.Client()})
 	return manager, server.URL
 }
 

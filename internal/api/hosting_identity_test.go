@@ -13,6 +13,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -93,7 +94,7 @@ func TestManualCreateUsesSelectedBotBeforeCheckingHolds(t *testing.T) {
 func TestManualForgejoHoldCheckUsesRoleBotInsteadOfTea(t *testing.T) {
 	fixture := newTestFixture(t)
 	var reads atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "token selected-review-token" {
 			t.Error("manual hold request used the wrong Forgejo identity")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -125,8 +126,9 @@ func TestManualForgejoHoldCheckUsesRoleBotInsteadOfTea(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Bot", RepoPath: cfg.Projects[0].RepoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.Format(javaScriptISOString), UpdatedAt: fixture.now.Format(javaScriptISOString)}); err != nil {
 		t.Fatal(err)
 	}
+	manager := hostingidentity.NewManager(hostingidentity.Options{HTTPClient: server.Client()})
 	handler := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(fixture.runtime, cfg)})
-	err := handler.validateManualHoldBypassForLoopTarget(context.Background(), "project_1", domain.LoopTypeReviewer, domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}, false)
+	err := handler.validateManualHoldBypassForLoopTarget(hostingidentity.WithManager(context.Background(), manager), "project_1", domain.LoopTypeReviewer, domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42}, false)
 	if err == nil || !strings.Contains(err.Error(), "--force") || reads.Load() != 1 {
 		t.Fatalf("selected Forgejo hold check: reads=%d, error=%v", reads.Load(), err)
 	}

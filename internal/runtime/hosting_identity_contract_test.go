@@ -30,7 +30,7 @@ func TestHostingIdentityRoleDiscoveryUsesSelectedForgejoAccount(t *testing.T) {
 	var mu sync.Mutex
 	var filters []string
 	var pullActors []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		actor := map[string]string{"token planner-token": "planner-bot", "token worker-token": "worker-bot", "token reviewer-token": "reviewer-bot", "token fixer-token": "fixer-bot"}[r.Header.Get("Authorization")]
 		if actor == "" {
 			t.Errorf("unexpected authentication on %s", r.URL.Path)
@@ -93,7 +93,7 @@ func TestHostingIdentityRoleDiscoveryUsesSelectedForgejoAccount(t *testing.T) {
 	cfg.Roles.Fixer.Triggers.AuthorFilter = config.FixerAuthorFilterCurrentUser
 	cfg.Roles.Planner.Triggers = config.IssueRoleTriggersConfig{Labels: []string{"ready"}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	cfg.Roles.Worker.Triggers = cfg.Roles.Planner.Triggers
-	manager := hostingidentity.NewManager(hostingidentity.Options{LookupEnv: func(name string) (string, bool) {
+	manager := hostingidentity.NewManager(hostingidentity.Options{HTTPClient: server.Client(), LookupEnv: func(name string) (string, bool) {
 		value := map[string]string{"PLANNER_IDENTITY": "planner-token", "WORKER_IDENTITY": "worker-token", "REVIEWER_IDENTITY": "reviewer-token", "FIXER_IDENTITY": "fixer-token"}[name]
 		return value, value != ""
 	}})
