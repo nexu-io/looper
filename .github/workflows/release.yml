@@ -23,6 +23,7 @@ on:
           - stable
           - beta
 
+# Native multi-pending queues: https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/
 concurrency:
   queue: max
   group: release-${{ github.event_name == 'workflow_dispatch' && format('{0}-{1}-{2}', github.ref_name, inputs.version_bump, inputs.release_channel) || github.ref_name }}

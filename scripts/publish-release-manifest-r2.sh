@@ -94,8 +94,10 @@ def version_key(tag):
     else:
         parts = []
         for part in prerelease.split("."):
-            if part.isdigit():
-                parts.append((0, int(part), ""))
+            # Match the Go updater: leading-zero identifiers are text;
+            # canonical numeric identifiers compare by length then digits.
+            if part.isdigit() and (part == "0" or not part.startswith("0")):
+                parts.append((0, len(part), part))
             else:
                 parts.append((1, 0, part))
         pre_key = (0,) + tuple(parts)
