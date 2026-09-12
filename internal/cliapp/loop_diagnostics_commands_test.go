@@ -427,6 +427,9 @@ func TestDiagnoseLoopBudgetHoldRecommendsUnpauseStop(t *testing.T) {
 	if strings.Contains(diagnosis.RecommendedAction, "retry") {
 		t.Fatalf("RecommendedAction = %q, must not recommend retry for budget hold", diagnosis.RecommendedAction)
 	}
+	if diagnosis.Retryable == nil || *diagnosis.Retryable {
+		t.Fatalf("Retryable = %#v, want false for operator-gated budget hold", diagnosis.Retryable)
+	}
 	handoff := reviewFixInspectHandoff(loop, parsed)
 	if handoff == nil || handoff.Kind != "review_fix_budget" {
 		t.Fatalf("handoff = %#v, want review_fix_budget", handoff)
@@ -449,6 +452,43 @@ func TestDiagnoseLoopBudgetHoldRecommendsUnpauseStop(t *testing.T) {
 	}
 	if strings.Contains(got, "looper retry 12") {
 		t.Fatalf("human inspect = %q, must not suggest retry", got)
+	}
+}
+
+func TestDiagnoseLoopBudgetHoldDoesNotClassifyHistoricalGitHubTransient(t *testing.T) {
+	t.Parallel()
+	meta := `{"pauseReason":"review_fix_budget_exhausted","reviewFixBudget":{"exhaustedBy":"reviewer","pauseReason":"review_fix_budget_exhausted"}}`
+	loop := storage.LoopRecord{ID: "loop_budget", Seq: 12, Type: "reviewer", Status: "paused", MetadataJSON: &meta}
+	runMsg := "Command exited with code 1: error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com"
+	run := &storage.RunRecord{Status: "failed", ErrorMessage: &runMsg}
+	got := diagnoseLoop(loop, run, nil, parseLoopDiagnosticMetadata(loop.MetadataJSON), true)
+	if got.FailureClass != "review_fix_budget" {
+		t.Fatalf("FailureClass = %q, want review_fix_budget not historical github_transient", got.FailureClass)
+	}
+	if got.Source != "loop" || got.Message != "review-fix budget exhausted" {
+		t.Fatalf("diagnosis = %#v, want current budget hold source and message", got)
+	}
+	if got.Retryable == nil || *got.Retryable {
+		t.Fatalf("Retryable = %#v, want false not historical github_transient retryable", got.Retryable)
+	}
+	if !strings.Contains(got.RecommendedAction, "looper unpause 12") || !strings.Contains(got.RecommendedAction, "looper stop 12") {
+		t.Fatalf("RecommendedAction = %q, want unpause/stop", got.RecommendedAction)
+	}
+	if strings.Contains(strings.ToLower(got.RecommendedAction), "github") {
+		t.Fatalf("RecommendedAction = %q, must not send operators to GitHub recovery", got.RecommendedAction)
+	}
+}
+
+func TestDiagnoseLoopBudgetHoldMessageIsRoleNeutralForFixerExhaustion(t *testing.T) {
+	t.Parallel()
+	meta := `{"pauseReason":"sibling_review_fix_budget","reviewFixBudget":{"siblingOf":"fixer","pauseReason":"sibling_review_fix_budget"}}`
+	loop := storage.LoopRecord{ID: "loop_budget_reviewer_sibling", Seq: 4, Type: "reviewer", Status: "paused", MetadataJSON: &meta}
+	got := diagnoseLoop(loop, nil, nil, parseLoopDiagnosticMetadata(loop.MetadataJSON), true)
+	if got.FailureClass != "review_fix_budget" {
+		t.Fatalf("FailureClass = %q, want review_fix_budget", got.FailureClass)
+	}
+	if got.Message != "review-fix budget exhausted" || strings.Contains(got.Message, "publish") {
+		t.Fatalf("Message = %q, want role-neutral review-fix budget exhausted", got.Message)
 	}
 }
 
