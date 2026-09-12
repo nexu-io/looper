@@ -116,9 +116,12 @@ func TestRunGHSelectsHostAndPrivateConfig(t *testing.T) {
 			ctx, session := subprocessBinding(t, tc.host, config.HostingIdentityGitHubApp)
 			var configDir string
 			options := shell.Options{Command: "gh", Args: []string{"label", "list", "--repo", "org/repo"}, CWD: "/workspace", Stdin: "body", Env: map[string]string{
-				"PATH": "/bin", "GH_TOKEN": "personal", "GH_ENTERPRISE_TOKEN": "personal-enterprise", "UNSELECTED_TOKEN": "other", "GIT_ASKPASS": "/helper", "SSH_AUTH_SOCK": "/agent", "HTTPS_PROXY": "http://proxy", "OPENAI_API_KEY": "model", "GH_CONFIG_DIR": "/personal/config",
+				"PATH": "/bin", "GH_TOKEN": "personal", "GH_ENTERPRISE_TOKEN": "personal-enterprise", "UNSELECTED_TOKEN": "other", "GIT_ASKPASS": "/helper", "SSH_AUTH_SOCK": "/agent", "HTTPS_PROXY": "http://proxy", "OPENAI_API_KEY": "model", "GH_CONFIG_DIR": "/personal/config", "SSL_CERT_FILE": "/operator/ca.pem", "SSL_CERT_DIR": "/operator/certs",
 			}}
 			_, err := RunGH(ctx, options, func(_ context.Context, got shell.Options) (shell.Result, error) {
+				if got.Env["SSL_CERT_FILE"] != "/operator/ca.pem" || got.Env["SSL_CERT_DIR"] != "/operator/certs" {
+					t.Fatal("privileged CLI lost operator TLS trust")
+				}
 				if got.Env[tc.tokenVar] != subprocessToken || got.Env["GH_HOST"] != strings.TrimPrefix(tc.host, "https://") || got.Env["GH_REPO"] != strings.TrimPrefix(tc.host, "https://")+"/org/repo" {
 					t.Fatal("CLI did not receive exactly the selected host/repository/token")
 				}

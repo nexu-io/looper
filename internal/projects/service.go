@@ -577,7 +577,7 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 			baseBranch = *project.BaseBranch
 		}
 		validationCtx := ctx
-		if _, selected, resolveErr := config.ResolveHostingIdentity(cfg, project.ID, "worker"); resolveErr != nil {
+		if _, selected, resolveErr := config.ResolveHostingIdentity(cfg, project.ID, "reviewer"); resolveErr != nil {
 			return resolveErr
 		} else if selected {
 			validationCtx = botProbeCtx
@@ -587,7 +587,7 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 			return validationErr
 		}
 		if warning != "" && s.Logger != nil {
-			s.Logger.Warn("project hosting identity probe failed", map[string]any{"projectId": project.ID, "role": "worker", "error": warning})
+			s.Logger.Warn("project hosting identity probe failed", map[string]any{"projectId": project.ID, "role": "reviewer", "error": warning})
 		}
 
 		createdAt := nowISO

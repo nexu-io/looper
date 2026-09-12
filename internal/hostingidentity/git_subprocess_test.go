@@ -199,9 +199,15 @@ func TestRunGitHTTPSUsesSelectedAuthAndPreservesSSHRemote(t *testing.T) {
 				result, err := RunGit(ctx, shell.Options{
 					Command: gitPath, CWD: repo, Args: args, Timeout: 20 * time.Second, Tracker: tracker,
 					StartGate: func(start func() error) error { gateCalls.Add(1); return start() },
-					Env:       map[string]string{"PATH": os.Getenv("PATH"), "HOME": personalHome, "GH_TOKEN": "personal", "OTHER_ROLE_TOKEN": "unselected", "SSH_AUTH_SOCK": "/personal/agent", "HTTPS_PROXY": "http://invalid.proxy", "GIT_CONFIG_PARAMETERS": "injected"},
+					Env:       map[string]string{"PATH": os.Getenv("PATH"), "HOME": personalHome, "GH_TOKEN": "personal", "OTHER_ROLE_TOKEN": "unselected", "SSH_AUTH_SOCK": "/personal/agent", "HTTPS_PROXY": "http://invalid.proxy", "GIT_CONFIG_PARAMETERS": "injected", "SSL_CERT_FILE": certificate, "SSL_CERT_DIR": filepath.Dir(certificate), "GIT_SSL_NO_VERIFY": "true", "GIT_SSL_KEY": "/personal/client.key"},
 				}, func(ctx context.Context, options shell.Options) (shell.Result, error) {
 					processCalls.Add(1)
+					if options.Env["GIT_SSL_CAINFO"] != certificate || options.Env["GIT_SSL_CAPATH"] != filepath.Dir(certificate) {
+						t.Fatal("Git lost the daemon's CA file or directory")
+					}
+					if options.Env["GIT_SSL_NO_VERIFY"] != "" || options.Env["GIT_SSL_KEY"] != "" {
+						t.Fatal("Git inherited TLS verification bypass or client private key")
+					}
 					if options.Tracker != tracker || options.StartGate == nil || options.Timeout != 20*time.Second {
 						t.Fatal("Git transport dropped process containment/start-admission options")
 					}
@@ -216,9 +222,6 @@ func TestRunGitHTTPSUsesSelectedAuthAndPreservesSSHRemote(t *testing.T) {
 							t.Fatal("Git inherited unselected credentials or transport overrides")
 						}
 					}
-					// Trust only this fixture's self-signed TLS certificate through
-					// the injected daemon runner; production keeps TLS verification on.
-					options.Env["GIT_SSL_CAINFO"] = certificate
 					return shell.Run(ctx, options)
 				})
 				if err != nil {

@@ -467,6 +467,19 @@ place tokens or private-key contents in configuration or `agent.env`. Legacy
 provider `tokenEnv` and explicit `teaLogin` authentication remain available to
 projects without a selected identity.
 
+Configuring hosting bot identities also requires a trusted `looper` CLI, including
+when starting the daemon with `go run ./cmd/looperd`. Build it with
+`go build -o dist/looper ./cmd/looper` and set `tools.looperPath` to that binary's
+absolute path, or install `looper` on `PATH`. Missing CLI configuration is rejected
+before daemon startup and on config reload.
+
+For instances using a private CA, supply `SSL_CERT_FILE` or `SSL_CERT_DIR` in the
+daemon environment with absolute paths to the public CA bundle or certificate
+directory. Trusted hosting subprocesses preserve those variables; network Git
+maps them to `GIT_SSL_CAINFO` and `GIT_SSL_CAPATH` while keeping TLS verification
+enabled. Client private keys and personal authentication settings are still
+excluded from these subprocesses.
+
 An identity must match the project's provider and instance, including a Forgejo
 deployment path prefix. Bot projects must specify `repo = "owner/name"`. Plane
 projects bind their hosting identity to the GitHub code repository; the Plane

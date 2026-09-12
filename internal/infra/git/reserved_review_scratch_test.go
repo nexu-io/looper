@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 )
 
 func TestIsReservedReviewerScratchBaseName(t *testing.T) {
@@ -187,5 +190,78 @@ func mustGit(t *testing.T, cwd string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// A missing promised HEAD tree must preserve scratch without consulting the
+// daemon's personal SSH transport, including in a linked reviewer worktree.
+func TestScrubReservedReviewerScratchBotPartialCloneWorktree(t *testing.T) {
+	for _, missingTree := range []bool{false, true} {
+		t.Run(map[bool]string{false: "available_tree", true: "missing_promised_tree"}[missingTree], func(t *testing.T) {
+			root := t.TempDir()
+			repo, worktree := filepath.Join(root, "repo"), filepath.Join(root, "review")
+			mustGit(t, root, "init", repo)
+			mustGit(t, repo, "config", "user.email", "test@example.com")
+			mustGit(t, repo, "config", "user.name", "test")
+			if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			mustGit(t, repo, "add", "README.md")
+			mustGit(t, repo, "commit", "-m", "base")
+			mustGit(t, repo, "worktree", "add", "--detach", worktree, "HEAD")
+			scratch := filepath.Join(worktree, ".looper-review-partial.json")
+			payload := []byte("scratch\n")
+			if err := os.WriteFile(scratch, payload, 0600); err != nil {
+				t.Fatal(err)
+			}
+			mustGit(t, repo, "remote", "add", "origin", "git@example.invalid:org/repo.git")
+			mustGit(t, repo, "config", "remote.origin.promisor", "true")
+			mustGit(t, repo, "config", "remote.origin.partialclonefilter", "blob:none")
+			if missingTree {
+				cmd := exec.Command("git", "rev-parse", "HEAD^{tree}")
+				cmd.Dir = repo
+				output, err := cmd.Output()
+				if err != nil {
+					t.Fatal(err)
+				}
+				tree := strings.TrimSpace(string(output))
+				if err := os.Remove(filepath.Join(repo, ".git", "objects", tree[:2], tree[2:])); err != nil {
+					t.Fatal(err)
+				}
+			}
+			marker := filepath.Join(root, "personal-ssh-used")
+			ssh := filepath.Join(root, "personal-ssh")
+			if err := os.WriteFile(ssh, []byte("#!/bin/sh\nprintf used > "+shellQuote(marker)+"\nexit 1\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GIT_SSH_COMMAND", ssh)
+			cfg := config.Config{
+				Identities: map[string]config.HostingIdentityConfig{"reviewer": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: filepath.Join(root, "unavailable.pem")}},
+				Projects:   []config.ProjectRefConfig{{ID: "project", Repo: "org/repo", Identity: "reviewer"}},
+			}
+			ctx, err := hostingidentity.Bind(context.Background(), cfg, "project", "reviewer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = New(Options{GitPath: "git"}).ScrubReservedReviewerScratch(ctx, worktree)
+			if missingTree {
+				if err == nil {
+					t.Fatal("missing HEAD tree must fail without deleting scratch")
+				}
+				if got, err := os.ReadFile(scratch); err != nil || string(got) != string(payload) {
+					t.Fatalf("scratch changed: %q, %v", got, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+					t.Fatalf("untracked scratch not removed: %v", err)
+				}
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("scratch probe invoked personal SSH: %v", err)
+			}
+		})
 	}
 }

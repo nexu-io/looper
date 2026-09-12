@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,4 +65,64 @@ func TestSmokeLooperdBootsWithUnavailableBotAndRunsLegacyWorker(t *testing.T) {
 		t.Fatalf("external authentication failure changed daemon admission: %#v", service)
 	}
 	proc.Stop(context.Background())
+}
+
+func TestSmokeLooperdFailsFastWithBotIdentityWithoutHostingCLI(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"bot_missing_cli", "bot_configured_cli", "legacy_missing_cli"} {
+		t.Run(scenario, func(t *testing.T) {
+			home := harness.NewTempHome(t)
+			repo := harness.CreateSeededRepo(t, "git")
+			fakeGH := harness.NewFakeGH(t, bins, harness.GHSchema{JSONFieldAllowlist: map[string][]string{}})
+			fakeAgent := harness.NewFakeAgent(t, bins)
+			cfg := configWithFakeTools(t, bins, home, repo, fakeGH, fakeAgent, harness.MustFreePort(t))
+			cfg.Tools.GitPath = &gitPath
+			cfg.Projects[0].Repo = "acme/repo"
+			if scenario != "bot_configured_cli" {
+				cfg.Tools.LooperPath = nil
+			}
+			if scenario != "legacy_missing_cli" {
+				cfg.Identities = map[string]config.HostingIdentityConfig{"bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: filepath.Join(home.Root, "missing.pem")}}
+				cfg.Projects[0].Identity = "bot"
+			}
+			cfg.Roles.Planner.AutoDiscovery = false
+			cfg.Roles.Worker.AutoDiscovery = false
+			cfg.Roles.Reviewer.Discovery.AutoDiscovery = false
+			cfg.Roles.Fixer.AutoDiscovery = false
+			harness.WriteConfig(t, home.ConfigPath, cfg, nil)
+			env := fakeGH.EnvMap()
+			// Match go run ./cmd/looperd with no separately installed looper on PATH.
+			env["PATH"] = t.TempDir()
+			proc := harness.StartLooperd(t, bins, home, home.ConfigPath, env, cfg.Server.Host, cfg.Server.Port)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, err := proc.WaitForReady(ctx)
+			if scenario != "bot_missing_cli" {
+				if err != nil {
+					t.Fatalf("valid tool configuration failed startup: %v", err)
+				}
+				proc.Stop(context.Background())
+				return
+			}
+			if err == nil {
+				t.Fatal("bot daemon became ready without its hosting CLI")
+			}
+			stderr, readErr := os.ReadFile(filepath.Join(home.ArtifactsDir, "looperd.stderr.log"))
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			for _, hint := range []string{"tools.looperPath", "go build -o dist/looper ./cmd/looper"} {
+				if !strings.Contains(string(stderr), hint) {
+					t.Fatalf("startup error lacks %q: %s", hint, stderr)
+				}
+			}
+			if _, err := os.Stat(home.DBPath); !os.IsNotExist(err) {
+				t.Fatalf("invalid tools reached database startup: %v", err)
+			}
+		})
+	}
 }

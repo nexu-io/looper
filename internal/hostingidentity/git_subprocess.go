@@ -69,6 +69,15 @@ func RunGit(ctx context.Context, options shell.Options, runner func(context.Cont
 	// credential helpers and global config. No personal authentication source
 	// participates in this credential-bearing subprocess.
 	options.Env["HOME"] = dir
+	// Git/libcurl uses its own CA variables. Carry the daemon's public trust
+	// roots across the private HOME boundary without inheriting client keys or
+	// settings that disable certificate verification.
+	if caFile := options.Env["SSL_CERT_FILE"]; caFile != "" {
+		options.Env["GIT_SSL_CAINFO"] = caFile
+	}
+	if caDir := options.Env["SSL_CERT_DIR"]; caDir != "" {
+		options.Env["GIT_SSL_CAPATH"] = caDir
+	}
 	selectedURL := strings.TrimRight(session.Target().BaseURL, "/") + "/" + session.Target().Repo + ".git"
 	probe := options
 	// Include worktree config and conditional includes as well as .git/config.
@@ -152,7 +161,7 @@ func RunGit(ctx context.Context, options shell.Options, runner func(context.Cont
 
 func safeGitCommand(command string) bool {
 	switch command {
-	case "fetch", "push", "ls-remote", "status", "rev-parse", "rev-list", "show-ref", "for-each-ref", "diff", "diff-tree", "show", "log", "cat-file", "ls-files", "check-ref-format", "merge-base", "merge-tree", "worktree", "branch", "symbolic-ref", "reflog", "config", "add", "commit", "checkout", "restore", "switch", "reset", "clean", "merge", "rebase", "cherry-pick", "revert", "update-ref", "submodule":
+	case "fetch", "push", "ls-remote", "status", "rev-parse", "rev-list", "show-ref", "for-each-ref", "diff", "diff-tree", "show", "log", "cat-file", "ls-files", "ls-tree", "check-ref-format", "merge-base", "merge-tree", "worktree", "branch", "symbolic-ref", "reflog", "config", "add", "commit", "checkout", "restore", "switch", "reset", "clean", "merge", "rebase", "cherry-pick", "revert", "update-ref", "submodule":
 		return true
 	default:
 		return false

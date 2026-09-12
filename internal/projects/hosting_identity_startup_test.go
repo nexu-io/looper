@@ -90,3 +90,77 @@ func TestHostingIdentityForgejoSummaryModeStillRejectsAutoMerge(t *testing.T) {
 		t.Fatalf("summary-comment semantics swallowed by bot diagnostics: %q, %v", warning, err)
 	}
 }
+
+func TestHostingIdentityStartupProbeBudgetFollowsReviewer(t *testing.T) {
+	for _, botRole := range []string{"worker", "reviewer"} {
+		t.Run(botRole+"_bot", func(t *testing.T) {
+			cfg := projectHostingIdentityConfig(t)
+			if botRole == "reviewer" {
+				cfg.Roles.Reviewer.Identity = "reviewer-bot"
+			} else {
+				cfg.Roles.Worker.Identity = "worker-bot"
+			}
+			cfg.Roles.Reviewer.AutoMerge.Enabled = true
+			cfg.Roles.Reviewer.AutoMerge.RequireBranchProtection = true
+			cfg.Projects = []config.ProjectRefConfig{
+				{ID: "first", Name: "First", Repo: "owner/first", RepoPath: t.TempDir()},
+				{ID: "second", Name: "Second", Repo: "owner/second", RepoPath: t.TempDir()},
+			}
+			db := openCoordinator(t)
+			repos := storage.NewRepositories(db.DB())
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			callerDeadline, _ := ctx.Deadline()
+			var firstDeadline time.Time
+			calls := 0
+			assertProbe := func(probeCtx context.Context) {
+				t.Helper()
+				calls++
+				deadline, ok := probeCtx.Deadline()
+				session, selected := hostingidentity.FromContext(probeCtx)
+				if !ok {
+					t.Fatal("probe lost its caller deadline")
+				}
+				if botRole == "worker" {
+					if selected || !deadline.Equal(callerDeadline) {
+						t.Fatalf("legacy reviewer inherited bot budget: selected=%v, deadline=%v; caller=%v", selected, deadline, callerDeadline)
+					}
+				} else {
+					if !selected || session.Role() != "reviewer" || session.Name() != "reviewer-bot" {
+						t.Fatalf("wrong reviewer binding: %v", session)
+					}
+					if !deadline.Before(callerDeadline) || time.Until(deadline) > 3*time.Second {
+						t.Fatalf("reviewer bot lost startup budget: %v", deadline)
+					}
+					if firstDeadline.IsZero() {
+						firstDeadline = deadline
+					} else if !deadline.Equal(firstDeadline) {
+						t.Fatalf("bot projects did not share one startup deadline: %v != %v", deadline, firstDeadline)
+					}
+				}
+			}
+			service := &Service{DB: db.DB(), Repos: repos, Config: cfg,
+				GetRepositorySettings: func(ctx context.Context, _ githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+					assertProbe(ctx)
+					return githubinfra.RepositorySettings{AllowAutoMerge: true, AllowSquashMerge: true}, nil
+				},
+				GetBranchProtection: func(ctx context.Context, _ githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+					assertProbe(ctx)
+					return githubinfra.BranchProtection{Enabled: true, HasRequiredChecks: true}, nil
+				},
+			}
+			if err := service.SyncConfigured(ctx, cfg, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 4 {
+				t.Fatalf("settings/protection probes = %d, want 4", calls)
+			}
+			for _, project := range cfg.Projects {
+				record, err := repos.Projects.GetByID(ctx, project.ID)
+				if err != nil || record == nil {
+					t.Fatalf("project was not admitted: %v, %v", record, err)
+				}
+			}
+		})
+	}
+}

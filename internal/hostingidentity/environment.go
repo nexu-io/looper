@@ -89,7 +89,7 @@ func privilegedEnv(source map[string]string) map[string]string {
 		}
 	}
 	clean := make(map[string]string)
-	for _, name := range []string{"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SYSTEMROOT", "WINDIR"} {
+	for _, name := range []string{"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SYSTEMROOT", "WINDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
 		if value, ok := source[name]; ok {
 			clean[name] = value
 		}
