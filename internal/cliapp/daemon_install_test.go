@@ -426,7 +426,7 @@ func TestBuildReleaseManifestURL(t *testing.T) {
 func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 	t.Parallel()
 
-	githubPayload, err := decodeReleaseMetadata([]byte(`{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://evil.example/looperd-darwin-arm64"}]}`))
+	githubPayload, err := decodeReleaseMetadata([]byte(`{"tag_name":"v1.2.3","assets":[{"name":"looperd-darwin-arm64","browser_download_url":"https://evil.example/looperd-darwin-arm64"}]}`), false)
 	if err != nil {
 		t.Fatalf("decode GitHub payload error = %v", err)
 	}
@@ -448,7 +448,7 @@ func TestDecodeReleaseMetadataAcceptsManifestAndGitHubPayloads(t *testing.T) {
 				"size": 12
 			}
 		}
-	}`))
+	}`), true)
 	if err != nil {
 		t.Fatalf("decode manifest payload error = %v", err)
 	}
@@ -543,7 +543,7 @@ func TestDecodeReleaseMetadataRejectsUnsupportedManifestVersion(t *testing.T) {
 				"size": 12
 			}
 		}
-	}`))
+	}`), true)
 	if err == nil {
 		t.Fatal("decodeReleaseMetadata() error = nil, want unsupported version")
 	}

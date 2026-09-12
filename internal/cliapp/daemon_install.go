@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"time"
 
 	"github.com/nexu-io/looper/internal/release"
 	"github.com/spf13/cobra"
@@ -21,6 +22,8 @@ const (
 	defaultReleaseManifestBaseURL = "https://releases.looper.powerformer.com"
 	looperdBinaryName             = "looperd"
 	looperdUserAgent              = "looper-cli"
+	releaseMetadataTimeout        = 5 * time.Second
+	maxReleaseMetadataBytes       = 1 << 20
 )
 
 type daemonInstallResult struct {
@@ -168,6 +171,9 @@ func (r *commandRuntime) fetchReleaseMetadata(ctx context.Context, tag string) (
 func (r *commandRuntime) fetchReleaseMetadataMatching(ctx context.Context, tag string, accept func(githubReleasePayload) error) (githubReleasePayload, error) {
 	var lastErr error
 	for _, releaseURL := range releaseMetadataURLs(tag) {
+		if err := ctx.Err(); err != nil {
+			return githubReleasePayload{}, err
+		}
 		payload, err := r.fetchReleaseMetadataFromURL(ctx, releaseURL)
 		if err != nil {
 			lastErr = err
@@ -207,6 +213,10 @@ func requireMatchingReleaseTag(payload githubReleasePayload, requested string) e
 }
 
 func (r *commandRuntime) fetchReleaseMetadataFromURL(ctx context.Context, releaseURL string) (githubReleasePayload, error) {
+	// Bound each source independently, including reading its response body,
+	// so a stalled CDN leaves the caller's context usable for GitHub.
+	ctx, cancel := context.WithTimeout(ctx, releaseMetadataTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, releaseURL, nil)
 	if err != nil {
 		return githubReleasePayload{}, fmt.Errorf("build release metadata request: %w", err)
@@ -216,7 +226,7 @@ func (r *commandRuntime) fetchReleaseMetadataFromURL(ctx context.Context, releas
 
 	resp, err := r.httpClient().Do(req)
 	if err != nil {
-		return githubReleasePayload{}, fmt.Errorf("fetch GitHub release metadata: %w", err)
+		return githubReleasePayload{}, fmt.Errorf("fetch release metadata from %s: %w", releaseURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -224,16 +234,16 @@ func (r *commandRuntime) fetchReleaseMetadataFromURL(ctx context.Context, releas
 		return githubReleasePayload{}, fmt.Errorf("Failed to fetch GitHub release metadata from %s (status %s)", releaseURL, resp.Status)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseMetadataBytes+1))
 	if err != nil {
-		return githubReleasePayload{}, fmt.Errorf("read GitHub release payload: %w", err)
+		return githubReleasePayload{}, fmt.Errorf("read release metadata from %s: %w", releaseURL, err)
 	}
-	payload, err := decodeReleaseMetadata(body)
+	if len(body) > maxReleaseMetadataBytes {
+		return githubReleasePayload{}, fmt.Errorf("release metadata from %s exceeds %d bytes", releaseURL, maxReleaseMetadataBytes)
+	}
+	payload, err := decodeReleaseMetadata(body, isCDNReleaseMetadataURL(releaseURL))
 	if err != nil {
-		return githubReleasePayload{}, fmt.Errorf("decode GitHub release payload: %w", err)
-	}
-	if isCDNReleaseMetadataURL(releaseURL) && !cdnPayloadIsLooperManifest(body) {
-		return githubReleasePayload{}, fmt.Errorf("CDN release metadata must be a looper manifest: %s", releaseURL)
+		return githubReleasePayload{}, fmt.Errorf("decode release metadata from %s: %w", releaseURL, err)
 	}
 	if payload.Assets == nil {
 		return githubReleasePayload{}, fmt.Errorf("GitHub release payload is missing assets array: %s", releaseURL)
@@ -359,38 +369,39 @@ func buildGitHubReleaseAPIURL(owner, repo, tag string) string {
 	return base + "/latest"
 }
 
-func decodeReleaseMetadata(body []byte) (githubReleasePayload, error) {
-	var manifest release.Manifest
-	if err := json.Unmarshal(body, &manifest); err == nil {
-		if manifest.ManifestVersion != 0 && manifest.ManifestVersion != release.ManifestVersion {
+func decodeReleaseMetadata(body []byte, fromCDN bool) (githubReleasePayload, error) {
+	// The endpoint determines the schema. Never interpret CDN content as a
+	// GitHub API response, whose download URLs are trusted by callers.
+	if fromCDN {
+		var manifest release.Manifest
+		if err := json.Unmarshal(body, &manifest); err != nil {
+			return githubReleasePayload{}, err
+		}
+		if manifest.ManifestVersion != release.ManifestVersion {
 			return githubReleasePayload{}, fmt.Errorf("unsupported release manifest version %d", manifest.ManifestVersion)
 		}
-		if looksLikeReleaseManifest(manifest) {
-			return githubReleaseFromManifest(manifest), nil
+		tag := canonicalReleaseTag(manifest.Tag, manifest.Version)
+		if err := release.ValidateTag(tag); err != nil {
+			return githubReleasePayload{}, err
 		}
+		if _, err := parseSemver(tag); err != nil {
+			return githubReleasePayload{}, err
+		}
+		payload := githubReleaseFromManifest(manifest)
+		if len(payload.Assets) == 0 {
+			return githubReleasePayload{}, fmt.Errorf("release manifest is missing usable artifacts")
+		}
+		return payload, nil
 	}
 	var payload githubReleasePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return githubReleasePayload{}, err
 	}
 	return payload, nil
-
-}
-
-func looksLikeReleaseManifest(manifest release.Manifest) bool {
-	return manifest.ManifestVersion == release.ManifestVersion
-}
-
-func cdnPayloadIsLooperManifest(body []byte) bool {
-	var manifest release.Manifest
-	if err := json.Unmarshal(body, &manifest); err != nil {
-		return false
-	}
-	return looksLikeReleaseManifest(manifest)
 }
 
 func isCDNReleaseMetadataURL(raw string) bool {
-	return strings.HasPrefix(strings.TrimRight(strings.TrimSpace(raw), "/"), defaultReleaseManifestBaseURL)
+	return strings.HasPrefix(raw, defaultReleaseManifestBaseURL+"/")
 }
 
 func githubReleaseFromManifest(manifest release.Manifest) githubReleasePayload {

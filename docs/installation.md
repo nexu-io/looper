@@ -132,6 +132,7 @@ Current behavior:
 - after a daemon upgrade, restart manually with `looper daemon restart`
 - each GitHub release also publishes `manifest.json` to Cloudflare R2 at `https://releases.looper.powerformer.com/`
 - `looper upgrade --check` reads latest versions from that CDN first (`/channels/stable.json`), then falls back to GitHub Releases metadata
+- each metadata source has a 5-second timeout and a 1 MiB response limit; malformed, unsupported, oversized, or stalled CDN metadata falls back to GitHub
 - manifest-gated rollback and channel switching are not implemented yet
 
 CDN object layout:

@@ -52,8 +52,8 @@ type BuildManifestInput struct {
 
 func BuildManifest(input BuildManifestInput) (Manifest, error) {
 	tag := strings.TrimSpace(input.Tag)
-	if !releaseTagPattern.MatchString(tag) {
-		return Manifest{}, fmt.Errorf("tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: %q", tag)
+	if err := ValidateTag(tag); err != nil {
+		return Manifest{}, err
 	}
 
 	version := strings.TrimSpace(input.Version)
@@ -125,6 +125,14 @@ func BuildManifest(input BuildManifestInput) (Manifest, error) {
 		MinDaemonForCli: minDaemonForCli,
 		Artifacts:       assets,
 	}, nil
+}
+
+// ValidateTag checks the tag syntax shared by release publishing and consumers.
+func ValidateTag(tag string) error {
+	if !releaseTagPattern.MatchString(tag) {
+		return fmt.Errorf("tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: %q", tag)
+	}
+	return nil
 }
 
 func CurrentSchemaVersion() string {
